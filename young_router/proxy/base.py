@@ -1308,6 +1308,24 @@ _UPSTREAM_TOOL_HISTORY_REJECTION_MARKERS = (
     "tool calls and tool results do not match",
     "tool_calls and tool_results do not match",
 )
+# A provider validator refusing a field it was sent by name.  This proxy builds
+# several containers on purpose -- ``extra_body`` carries the Responses-only
+# passthrough, ``litellm_params`` is a routing container, and
+# ``_young_router_*`` keys are its own bookkeeping -- and every one of them is
+# illegal input on a wire that validates its payload.  The refusal names the
+# field, so the cause is readable and must not arrive as an unexplained stop.
+_UPSTREAM_FIELD_REJECTION_MARKERS = (
+    "extra inputs are not permitted",
+    "extra_forbidden",
+    "unexpected keyword",
+    "unexpected argument",
+    "unexpected field",
+    "unknown field",
+    "unrecognized field",
+    "additional properties are not allowed",
+    "additional_properties_not_allowed",
+    "not permitted",
+)
 _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES = {
     "APIConnectionError",
     "APIError",
@@ -1426,6 +1444,10 @@ _HOSTED_WEB_SEARCH_TOOL_TYPES = {
     "web_search_preview",
 }
 _WEB_SEARCH_NATIVE_EVENT_SEEN_METADATA_KEY = "native_web_search_event_seen"
+# Set when a bridge declared the provider's own server-side search on a wire
+# that cannot carry a Hosted tool.  The route then runs the search itself and
+# the client sees `web_search_call` / citation items instead of nothing.
+_WEB_SEARCH_PROVIDER_DECLARED_METADATA_KEY = "web_search_provider_declared"
 
 
 @dataclass(frozen=True)

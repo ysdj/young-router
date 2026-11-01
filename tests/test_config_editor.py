@@ -598,7 +598,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             saved["model_list"][0]["litellm_params"]["api_key"],
         )
 
-    def test_claude_login_round_trip_uses_only_environment_reference(self) -> None:
+    def test_a_retired_claude_login_reads_back_as_a_plain_key(self) -> None:
         path = self.write_config(
             """
             providers:
@@ -626,11 +626,18 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
 
         payload = config_load.load_config(path)
         provider = payload["providers"][0]
-        self.assertEqual("claude_login", provider["auth_kind"])
+        # A document that still names the retired kind stays loadable — the
+        # strict whitelist would otherwise refuse the whole file and take every
+        # unrelated provider with it — and it reads back as the plain key this
+        # build can actually serve.  The dead credential reference goes with
+        # the kind: a flow this build cannot run has nothing left to describe.
+        self.assertEqual("api_key", provider["auth_kind"])
+        self.assertEqual("", provider["auth_credential_ref"])
         config_api.save_config(payload["providers"], path)
         source = path.read_text(encoding="utf-8")
 
-        self.assertIn("os.environ/YOUNG_ROUTER_AUTH_EXAMPLE", source)
+        self.assertNotIn("claude_login", source)
+        self.assertNotIn("credential_ref", source)
         self.assertNotIn("sk-ant-oat", source)
 
     def test_workbuddy_login_round_trip_keeps_the_loopback_reference(self) -> None:
@@ -2611,14 +2618,14 @@ class YamlTextParseReuseTests(unittest.TestCase):
             """
         ).lstrip()
         parses = 0
-        real_safe_load = config_schema.yaml.safe_load
+        real_yaml_load = config_schema._yaml_load
 
-        def counting_safe_load(document: str, *args: object, **kwargs: object) -> object:
+        def counting_yaml_load(document: str) -> object:
             nonlocal parses
             parses += 1
-            return real_safe_load(document, *args, **kwargs)
+            return real_yaml_load(document)
 
-        with unittest.mock.patch.object(config_schema.yaml, "safe_load", counting_safe_load):
+        with unittest.mock.patch.object(config_schema, "_yaml_load", counting_yaml_load):
             first = config_schema.load_yaml_text(text, Path("config.yaml"))
             # A second copy of the same document, as the commit path builds it.
             second = config_schema.load_yaml_text(str(text), Path("config.yaml"))

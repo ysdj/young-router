@@ -107,6 +107,47 @@ class NativeCodexCatalogTests(unittest.TestCase):
         self.assertEqual([], failed)
         self.assertEqual([], invalid)
 
+    def test_the_client_version_comes_from_the_installed_client(self) -> None:
+        """A roster gate answers an old claim with an empty list, not a refusal.
+
+        The ChatGPT model roster silently returns `{"models": []}` for a
+        `client_version` older than the installed client, which is
+        indistinguishable from an account that serves nothing: the pane
+        reported "供应商未返回模型" for an account holding five models.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / "codex-cli"
+            executable = package / "bin" / "codex"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o755)
+            (package / "codex-package.json").write_text(
+                json.dumps({"entrypoint": "bin/codex", "version": "0.166.0-alpha.5.1"}),
+                encoding="utf-8",
+            )
+            original_candidates = native_codex_catalog.native_codex_executable_candidates
+            native_codex_catalog.native_codex_executable_candidates = lambda: (executable,)
+            native_codex_catalog._CLIENT_VERSION_CACHE.clear()
+            try:
+                version = native_codex_catalog.native_codex_client_version()
+            finally:
+                native_codex_catalog.native_codex_executable_candidates = original_candidates
+                native_codex_catalog._CLIENT_VERSION_CACHE.clear()
+        # The client's own claim, pre-release suffix included: it is the version
+        # the roster is asked under, not a value this app normalizes.
+        self.assertEqual("0.166.0-alpha.5.1", version)
+
+    def test_a_host_with_no_client_reports_no_version(self) -> None:
+        original_candidates = native_codex_catalog.native_codex_executable_candidates
+        native_codex_catalog.native_codex_executable_candidates = lambda: ()
+        native_codex_catalog._CLIENT_VERSION_CACHE.clear()
+        try:
+            self.assertEqual("", native_codex_catalog.native_codex_client_version())
+        finally:
+            native_codex_catalog.native_codex_executable_candidates = original_candidates
+            native_codex_catalog._CLIENT_VERSION_CACHE.clear()
+
 
 if __name__ == "__main__":
     unittest.main()

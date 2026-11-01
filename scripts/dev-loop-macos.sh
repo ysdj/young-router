@@ -18,9 +18,18 @@
 #   scripts/dev-loop-macos.sh            sync whatever changed, restart
 #   scripts/dev-loop-macos.sh --js       rebundle and install the UI only
 #   scripts/dev-loop-macos.sh --python   sync the Python tree only
+#   scripts/dev-loop-macos.sh --metro    set up Metro dev server for sub-second
+#                                        Fast Refresh (one-time, keeps running)
 #   scripts/dev-loop-macos.sh --proxy    run an isolated proxy on a scratch
 #                                        port, leaving the app alone
 #   scripts/dev-loop-macos.sh --check    report which half is stale, act not
+#
+# `--metro` is the fastest JS iteration: it sets the installed app to load from
+# Metro's dev server, starts Metro, and keeps it running. JS edits land in under
+# one second with Fast Refresh and state preserved. Run it once, leave Metro
+# running, and edit. Stop Metro (Ctrl-C) or clear the override
+# (`defaults delete young.router.app MetroServerURL && restart-app.sh`) to go
+# back to the bundled JS.
 #
 # `--proxy` is the data-plane loop: it starts a second proxy from the checkout's
 # `young_router/` against a scratch runtime root and a port of its own, so a
@@ -58,6 +67,7 @@ while (($# > 0)); do
   case "$1" in
     --js) MODE="js" ;;
     --python) MODE="python" ;;
+    --metro) MODE="metro" ;;
     --proxy) MODE="proxy" ;;
     --check) MODE="check" ;;
     -h|--help) usage; exit 0 ;;
@@ -79,6 +89,40 @@ CORE_SYNC_EXCLUDES=(
   --exclude 'veridrop' --exclude 'connect-workbuddy'
   --exclude 'dsh-vision-router' --exclude 'our-free-model'
 )
+
+# --- Metro dev server for sub-second Fast Refresh ------------------------------
+#
+# This mode sets the installed app to load from Metro instead of the packaged
+# bundle, starts Metro in this terminal, and keeps it running. JS edits land in
+# under one second with Fast Refresh and state preserved. Run it once, leave
+# Metro running, and edit. Stop Metro (Ctrl-C) or clear the override to go back.
+if [[ "$MODE" == "metro" ]]; then
+  command -v node >/dev/null 2>&1 || {
+    echo "dev-loop-macos: node is required to run Metro" >&2
+    exit 3
+  }
+  METRO_PORT="${YOUNG_ROUTER_METRO_PORT:-8081}"
+  METRO_URL="http://localhost:${METRO_PORT}/index.bundle?platform=macos&dev=true&minify=false"
+
+  echo "dev-loop-macos: setting MetroServerURL to $METRO_URL"
+  defaults write young.router.app MetroServerURL "$METRO_URL"
+
+  # Restart the app so it picks up the override and connects to Metro
+  if ! "$RESTART_APP" >/dev/null 2>&1; then
+    echo "dev-loop-macos: the app did not restart cleanly" >&2
+    exit 1
+  fi
+
+  echo "dev-loop-macos: Metro will serve on port $METRO_PORT"
+  echo "  - JS edits land in under 1 second with Fast Refresh"
+  echo "  - Stop Metro (Ctrl-C) or clear the override to go back:"
+  echo "      defaults delete young.router.app MetroServerURL && scripts/restart-app.sh"
+  echo ""
+
+  # Start Metro and keep it in the foreground
+  cd "$RN_ROOT/apps/macos"
+  exec npx react-native start --port "$METRO_PORT"
+fi
 
 # --- the isolated proxy loop ------------------------------------------------
 #

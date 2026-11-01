@@ -54,6 +54,37 @@ _SOURCE_PRIORITIES = {
 _UPSTREAM_MAX_BYTES = 8 * 1024 * 1024
 _PI_REASONING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 _CODEX_REASONING_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+# A published listing -- Pi's ``supported_efforts`` and this app's Codex catalog
+# alike -- states ``ultra`` wherever it states ``max``.  ``ultra`` is the tier
+# Codex's own catalog places above ``max`` (it asks the client for task
+# delegation on top of maximum reasoning), and pi.dev's ladder stops at ``max``,
+# so the level never reaches a route's provider-wire capability and would
+# otherwise vanish from any route that can serve the hardest thinking.  The
+# request path clamps a client's ``ultra`` back down to ``max`` for the same
+# reason: the wire value stays one this proxy maps.
+_ULTRA_REASONING_LEVEL = "ultra"
+
+
+def published_reasoning_levels(
+    levels: Sequence[str],
+    *,
+    pi_spelling: bool = False,
+) -> list[str]:
+    """Return reasoning levels the way a listing must state them.
+
+    ``pi_spelling`` renders this app's Codex-side ``none`` as Pi's ``off``: the
+    array is read by a Pi client, whose ladder names the disabled step ``off``
+    and has no member called ``none``.
+    """
+
+    published: list[str] = []
+    for level in levels:
+        rendered = "off" if pi_spelling and level == "none" else level
+        if rendered not in published:
+            published.append(rendered)
+    if "max" in published and _ULTRA_REASONING_LEVEL not in published:
+        published.insert(published.index("max") + 1, _ULTRA_REASONING_LEVEL)
+    return published
 
 
 @dataclass(frozen=True)
@@ -1135,6 +1166,17 @@ class ModelContextRegistry:
             return SEARCH_TOOL_CAPABILITY_BRIDGE
         return SEARCH_TOOL_CAPABILITY_UNSUPPORTED
 
+    def route_model_ids(self, public_name: str) -> list[str]:
+        """The deployment model ids one public route fans out to, in order.
+
+        Empty means the name is not a route in this configuration, which is a
+        different answer from "a route with no deployments": callers reading
+        per-route metadata need both and must not substitute the public name
+        for the first.
+        """
+
+        return self._load_route_model_ids(public_name)
+
     def _load_route_model_ids(self, public_name: str) -> list[str]:
         if self.runtime_config_path is None:
             return []
@@ -1439,4 +1481,5 @@ __all__ = [
     "default_context_cache_path",
     "gpt_family_model_name",
     "legacy_context_cache_paths",
+    "published_reasoning_levels",
 ]

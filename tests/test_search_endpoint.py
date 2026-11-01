@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import pathlib
 import unittest
@@ -82,6 +83,83 @@ class _PageTextTests(unittest.TestCase):
             "</main></body></html>"
         )
         self.assertIn("Description", self._text(html))
+
+
+    def test_a_title_row_of_links_is_content_not_a_menu(self) -> None:
+        """A story title is one short link block; erasing it erases the page.
+
+        Live session 2026-11-01: a Codex turn asked Claude Opus 5.5 for the top
+        Hacker News story and the answer was "the fetch only returned scores
+        and authors, no titles".  The filter judged each block alone, and HN
+        puts every title in one short, almost entirely linked
+        ``<span class="titleline">`` -- so the only text the reader wanted was
+        dropped as navigation while the score lines underneath survived.
+        """
+
+        rows = "".join(
+            '<tr><td class="title"><span class="titleline">'
+            f'<a href="https://example.test/{index}">Story title {index}</a>'
+            '<span class="sitebit comhead"> (<a href="from?site=x">'
+            f"site{index}.test</a>)</span></span></td></tr>"
+            '<tr><td class="subtext">'
+            f'<span class="score">{index} points</span> by <a href="user?id=u">u</a>'
+            "</td></tr>"
+            for index in range(5)
+        )
+        html = f"<html><head><title>Hacker News</title></head><body><table>{rows}</table></body></html>"
+
+        text = self._text(html)
+
+        # Every title survives, and so does the line that follows it.
+        for index in range(5):
+            self.assertIn(f"Story title {index}", text)
+            self.assertIn(f"{index} points", text)
+
+    def test_a_long_run_of_link_blocks_is_still_a_menu(self) -> None:
+        """The run is the signal, so a real menu has to keep disappearing.
+
+        A page whose whole navigation is short link blocks and whose only prose
+        is one paragraph: the menu is long, the prose is not a link, and the
+        run therefore exceeds the threshold.  This is the npm shape that the
+        per-block filter used to handle, asserted through the run rule.
+        """
+
+        menu = "".join(
+            f'<div><a href="/n/{index}">nav entry {index}</a></div>'
+            for index in range(12)
+        )
+        html = (
+            "<html><body>"
+            f"{menu}"
+            "<p>The prose this reader actually came for.</p>"
+            "</body></html>"
+        )
+
+        text = self._text(html)
+
+        self.assertIn("the prose this reader actually came for", text.lower())
+        self.assertNotIn("nav entry 4", text)
+
+    def test_a_trailing_run_after_content_is_kept(self) -> None:
+        """A run the page ends on was never proven to be a menu.
+
+        Nothing follows it, so there is no evidence it is navigation; dropping
+        it would silently truncate the last thing the reader asked for.
+        """
+
+        html = (
+            "<html><body><main>"
+            "<p>Body first.</p>"
+            '<div><a href="/a">First citation</a></div>'
+            '<div><a href="/b">Second citation</a></div>'
+            "</main></body></html>"
+        )
+
+        text = self._text(html)
+
+        self.assertIn("Body first.", text)
+        self.assertIn("First citation", text)
+        self.assertIn("Second citation", text)
 
 
 class SearchEndpointShapeTests(unittest.TestCase):
@@ -253,8 +331,13 @@ class SearchEndpointShapeTests(unittest.TestCase):
         )
         self.assertIn("cua_repl", output)
         self.assertIn("playwright-cli", output)
-        self.assertIn("不要再次调用 web.run", output)
         self.assertIn("https://www.bing.com/search?q=", output)
+        # The refusal must not read as permission to stop working: a bare
+        # "do not retry, do not curl" left the model answering from memory
+        # with invented citations (live 2026-11-01, ``claude-opus-5-5``).
+        self.assertNotIn("不要再次调用 web.run", output)
+        self.assertIn("不代表你不能继续查证", output)
+        self.assertIn("不要凭空给出链接或细节", output)
 
     def test_payload_matches_the_response_codex_decodes(self) -> None:
         payload = search_endpoint.tips_payload("m", _body(), "no backend")
@@ -1008,3 +1091,229 @@ class SearchEndpointRegistrationTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(search_endpoint, "proxy_general_settings", lambda: settings):
             response = await search_endpoint.alpha_search(request, _StubResponse)
         self.assertEqual(401, response.status_code)
+
+
+class _AnthropicSearchBackendTests(unittest.TestCase):
+    """A Claude relay's only search is Claude's own server-side search.
+
+    Measured live 2026-11-01 against all three ``claude-opus-5-5`` deployments:
+    ``/alpha/search`` is a 404 ("only available for OpenAI and Composite
+    groups"), and the ``web_search_20250305`` declaration runs nothing when the
+    same call also carries the client's tools -- the relay hands the declaration
+    back as an ordinary function call.  Declared alone on a clean call it runs,
+    and returns ``server_tool_use`` + ``web_search_tool_result``.
+    """
+
+    RESPONSE = {
+        "id": "msg_probe",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search"},
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": "srvtoolu_1",
+                "content": [
+                    {
+                        "type": "web_search_result",
+                        "title": "甪直古镇",
+                        "url": "https://example.test/luzhi",
+                        "page_age": "2025-02-07T00:00:00Z",
+                    },
+                    {
+                        "type": "web_search_result",
+                        "title": "甪直萝卜干",
+                        "url": "https://example.test/radish",
+                        "page_age": None,
+                    },
+                ],
+            },
+            {"type": "text", "text": "这里的地址是 https://invented.test/not-a-result"},
+        ],
+    }
+
+    def _params(self, model="anthropic/claude-opus-5-5"):
+        return {
+            "api_base": "https://relay.test/v1",
+            "api_key": "sk-probe",
+            "model": model,
+        }
+
+    def _client(self, status=200, payload=None):
+        """A client that answers each search with pages for its own query.
+
+        The backend checks that the pages answer the query asked, and every
+        query in ``_body()`` is a different one, so a single canned reply would
+        make the second query look unrelated.
+        """
+
+        def respond(_url, request_body=None, headers=None, **kwargs):
+            query = ""
+            body_in = request_body if isinstance(request_body, dict) else kwargs.get("json") or {}
+            messages = body_in.get("messages") or []
+            if messages:
+                text = str(messages[0].get("content") or "")
+                if "甪直" in text:
+                    query = "甪直" + (
+                        "萝卜" if "萝卜" in text else "酱菜" if "酱菜" in text else "古镇"
+                    )
+            response = mock.Mock()
+            response.status_code = status
+            if payload is not None:
+                response.json.return_value = payload
+            else:
+                body = copy.deepcopy(self.RESPONSE)
+                for item in body["content"]:
+                    if item.get("type") != "web_search_tool_result":
+                        continue
+                    for result in item.get("content") or []:
+                        result["title"] = f"{query} 介绍"
+                        result["url"] = f"https://example.test/{query}"
+                response.json.return_value = body
+            return response
+
+        client = mock.Mock()
+        client.post = mock.AsyncMock(side_effect=respond)
+        return client
+
+    def test_a_claude_route_is_recognized_by_its_model_not_its_host(self) -> None:
+        self.assertTrue(
+            search_endpoint.is_anthropic_search_route(self._params())
+        )
+        self.assertFalse(
+            search_endpoint.is_anthropic_search_route(
+                self._params("openai/deepseek-v4.1-flash")
+            )
+        )
+
+    def test_the_search_is_a_clean_call_that_declares_only_the_provider_tool(self) -> None:
+        import asyncio
+
+        client = self._client()
+        served, _reason = asyncio.run(
+            search_endpoint._anthropic_search(
+                self._params(), _body(), client
+            )
+        )
+
+        self.assertIsNotNone(served)
+        sent = client.post.await_args
+        self.assertTrue(sent.args[0].endswith("/messages"))
+        payload = sent.kwargs["json"]
+        self.assertEqual(
+            [
+                {
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": 5,
+                }
+            ],
+            payload["tools"],
+        )
+        # No client tools and no conversation: those are what made the relay
+        # hand the declaration back instead of running it.
+        self.assertEqual(1, len(payload["messages"]))
+        self.assertNotIn("web.run", json.dumps(payload))
+        self.assertEqual("claude-opus-5-5", payload["model"])
+
+    def test_only_provider_result_blocks_become_results(self) -> None:
+        # The answer text is model prose and can name pages the search never
+        # returned; parsing it is the fabrication this backend replaces.
+        results = search_endpoint._anthropic_search_results(self.RESPONSE)
+
+        self.assertEqual(
+            ["https://example.test/luzhi", "https://example.test/radish"],
+            [row["url"] for row in results],
+        )
+        self.assertNotIn(
+            "https://invented.test/not-a-result",
+            json.dumps(results),
+        )
+
+    def test_a_route_that_ran_no_search_is_reported_not_served(self) -> None:
+        import asyncio
+
+        client = self._client(payload={"content": [{"type": "text", "text": "ok"}]})
+        served, reason = asyncio.run(
+            search_endpoint._anthropic_search(self._params(), _body(), client)
+        )
+
+        self.assertIsNone(served)
+        # No usable result block: reported as no answer so the next deployment
+        # is asked, instead of the model being handed an empty result set that
+        # reads like "the web has nothing on this".
+        self.assertTrue(
+            "没有返回搜索结果" in reason or "与查询无关" in reason, reason
+        )
+
+    def test_a_non_claude_route_never_calls_the_backend(self) -> None:
+        import asyncio
+
+        client = self._client()
+        served, reason = asyncio.run(
+            search_endpoint._anthropic_search(
+                self._params("openai/gpt-6.1-sol"), _body(), client
+            )
+        )
+
+        self.assertIsNone(served)
+        self.assertIn("不是 Claude 模型", reason)
+        client.post.assert_not_called()
+
+
+class _SearchResultRelevanceTests(unittest.TestCase):
+    """A result set that answers a different question is not an answer.
+
+    Measured live 2026-11-01: one relay answered ``甪直特产`` with its own search
+    vendor documentation -- ``support.google.com``, ``docs.firecrawl.dev``, a
+    Google Hacking tutorial -- ten results deep, which is enough to look like a
+    successful search.  Handing that to the model is how a turn ends up
+    confident about nothing.
+    """
+
+    VENDOR_RESULTS = [
+        {"title": "Firecrawl", "url": "https://docs.firecrawl.dev/features/search"},
+        {
+            "title": "Find the URL of a page or image",
+            "url": "https://support.google.com/websearch/answer/118238",
+        },
+        {
+            "title": "Reading the Search Engine Results Page",
+            "url": "https://www.google.com/edu/coursebuilder/lesson2_4",
+        },
+    ]
+
+    def test_search_vendor_documentation_does_not_answer_a_place_name(self) -> None:
+        self.assertFalse(
+            search_endpoint._anthropic_search_answered_the_query(
+                self.VENDOR_RESULTS, ["甪直特产"]
+            )
+        )
+
+    def test_a_page_naming_the_query_does_answer_it(self) -> None:
+        self.assertTrue(
+            search_endpoint._anthropic_search_answered_the_query(
+                [{"title": "甪直古镇", "url": "https://zh.wikipedia.org/wiki/甪直古镇"}],
+                ["甪直特产"],
+            )
+        )
+
+    def test_a_latin_query_matches_a_latin_result(self) -> None:
+        self.assertTrue(
+            search_endpoint._anthropic_search_answered_the_query(
+                [{"title": "Luzhi", "url": "https://en.wikipedia.org/wiki/Luzhi"}],
+                ["Luzhi specialties"],
+            )
+        )
+
+    def test_a_latin_query_does_not_match_vendor_documentation(self) -> None:
+        self.assertFalse(
+            search_endpoint._anthropic_search_answered_the_query(
+                self.VENDOR_RESULTS, ["Luzhi specialties"]
+            )
+        )
+
+    def test_no_results_is_not_an_answer(self) -> None:
+        self.assertFalse(
+            search_endpoint._anthropic_search_answered_the_query([], ["甪直特产"])
+        )

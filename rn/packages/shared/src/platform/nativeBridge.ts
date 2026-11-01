@@ -38,11 +38,10 @@ export interface NativeLeafBridge {
   textPrompt?(title: string, value: string, confirmLabel: string, cancelLabel: string): Promise<string | null>;
   showReadOnlyText(title: string, text: string, closeLabel: string, language: "json" | "toml" | "text", html: string): Promise<void>;
   showProviderAuth?(options: {
-    provider: "openai" | "claude";
+    provider: "openai";
     fingerprint?: string;
     verificationURL: string;
     userCode?: string;
-    callbackURL?: string;
     title: string;
     closeLabel: string;
     /** The window's own reload action: a page that stalled can be retried. */

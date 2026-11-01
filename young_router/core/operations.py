@@ -77,6 +77,18 @@ SERVICE_STATUS_CACHE_SECONDS = 10.0
 # Settings schema documents the same 1..600 second range; a larger host
 # environment value must not hold a failed start open indefinitely.
 MAX_SERVICE_HEALTH_WAIT_SECONDS = 600.0
+# How long start/restart waits for the liveness endpoint when no runtime
+# setting says otherwise.  The proxy master prints nothing until its whole
+# runtime is imported, and that import alone measured 51 s on a warm disk here
+# with another ~5 s for the sixteen workers; a 60 s default left a successful
+# boot one slow disk away from being torn down and retried forever.
+DEFAULT_SERVICE_HEALTH_WAIT_SECONDS = 180.0
+# A recorded child younger than this is *booting*, not wedged.  LiteLLM's own
+# import is what fills most of the window, so a status read in that gap must be
+# "starting": calling it 不健康 is what put a 重启服务 button in front of a boot
+# that was already on its way up.  It is deliberately wider than the default
+# health wait, so a start that is still waiting is never described as failed.
+SERVICE_STARTUP_GRACE_SECONDS = 240.0
 _RUNTIME_SETTINGS_PROCESS_AUTHORITATIVE_KEYS = frozenset(
     {
         "YOUNG_ROUTER_CODEX_DESCENDANT_CLEANUP",
@@ -360,6 +372,9 @@ class CoreServiceController:
         self.litellm_bin = configured_bin
         self._environment = dict(environment or {})
         self._status_cache: tuple[float, dict[str, Any]] | None = None
+        # The last positive liveness answer: (port, when, healthy).  Reset with
+        # the status cache so an operation's own probe starts clean.
+        self._health_cache: tuple[int, float, bool] | None = None
         # Set by ``attach_workbuddy`` when Core owns a WorkBuddy worker; a
         # bare controller (tests, CLI probes) simply has none.
         self._workbuddy: object | None = None
@@ -481,6 +496,7 @@ class CoreServiceController:
 
     def _invalidate_status_cache(self) -> None:
         self._status_cache = None
+        self._health_cache = None
 
     @staticmethod
     def _process_alive(pid: int) -> bool:
@@ -579,8 +595,13 @@ class CoreServiceController:
         try:
             environment = os.environ.copy()
             environment["LC_ALL"] = "C"
+            # ``stat`` and ``lstart`` come from the same read.  Asking for
+            # them together is what lets `_process_identity` answer "is it
+            # alive" and "is it the same process" with one spawned ``ps``
+            # instead of two, on a call the service row makes several times per
+            # snapshot.
             result = subprocess.run(
-                ["ps", "-o", "lstart=", "-p", str(pid)],
+                ["ps", "-o", "stat=", "-o", "lstart=", "-p", str(pid)],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -591,8 +612,15 @@ class CoreServiceController:
             )
         except (OSError, subprocess.SubprocessError):
             return None
-        started = " ".join(result.stdout.split())
-        if result.returncode != 0 or not started:
+        fields = result.stdout.split()
+        if result.returncode != 0 or not fields:
+            return None
+        state = fields[0]
+        if not state or state.startswith("Z"):
+            # A zombie is not a process this installation owns any more.
+            return None
+        started = " ".join(fields[1:])
+        if not started:
             return None
         # Store only a fixed-size process identity, not a user path or command.
         digest = hashlib.sha256(started.encode("utf-8")).hexdigest()
@@ -600,9 +628,41 @@ class CoreServiceController:
 
     @classmethod
     def _process_identity(cls, pid: int) -> str | None:
-        if not cls._process_alive(pid):
-            return None
-        return cls._windows_process_identity(pid) if os.name == "nt" else cls._posix_process_identity(pid)
+        # A single read of the service row asks for the same process identity up
+        # to a dozen times: the recorded pid, the recorded core, and this Core's
+        # own identity all resolve through here, and each answer costs two
+        # spawned ``ps`` processes.  Every open window polls that read, so the
+        # spawns dominated a snapshot.  The lstart/stat answer for one pid can
+        # only change when the pid does, so remembering it for a moment is
+        # exactly safe; a process that exited and was replaced is a different
+        # pid, and one that exits inside the window was alive when asked.
+        memo = cls._process_identity_memo
+        now = time.monotonic()
+        cached = memo.get(pid)
+        if cached is not None:
+            # This Core's own start time can never change while it runs, so its
+            # identity never expires.  Every service read resolves it, and a
+            # TTL on it only bought the same spawned ``ps`` again.
+            if pid == os.getpid() or now - cached[0] < cls._PROCESS_IDENTITY_TTL_SECONDS:
+                return cached[1]
+        identity = None
+        if os.name == "nt":
+            # Windows answers liveness and identity through two handle-free
+            # kernel calls; the POSIX branch answers both from one read.
+            if cls._process_alive(pid):
+                identity = cls._windows_process_identity(pid)
+        else:
+            identity = cls._posix_process_identity(pid)
+        if len(memo) > 64:
+            memo.clear()
+        memo[pid] = (now, identity)
+        return identity
+
+    #: How long one pid's start-time identity is reused.  Short enough that a
+    #: stale answer cannot outlive the click that replaces the proxy, long
+    #: enough to cover the reads one service row performs.
+    _PROCESS_IDENTITY_TTL_SECONDS = 1.0
+    _process_identity_memo: "dict[int, tuple[float, str | None]]" = {}
 
     @staticmethod
     def _posix_process_has_token(pid: int, token: str) -> bool:
@@ -986,13 +1046,72 @@ class CoreServiceController:
             return None
         return pid
 
+    @staticmethod
+    def _process_group_members(pgid: int) -> list[int]:
+        """Every live pid whose process group is ``pgid``, read off the table."""
+
+        if os.name == "nt" or not hasattr(os, "killpg"):
+            return []
+        try:
+            result = subprocess.run(
+                ["ps", "-Ao", "pid=,pgid="],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if result.returncode != 0:
+            return []
+        members: list[int] = []
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) != 2:
+                continue
+            try:
+                member, group = int(fields[0]), int(fields[1])
+            except ValueError:
+                continue
+            if group == pgid:
+                members.append(member)
+        return members
+
+    def _recorded_proxy_group_is_ours(self) -> bool:
+        """Whether a surviving process group is the child this Core recorded.
+
+        The launch opens a new session, so the group id *is* the recorded pid.
+        A master can die while the forkservers and workers it created keep the
+        listening socket they inherited: the port still answers, the pid the
+        record names is gone, and every ownership check that starts from that
+        pid therefore finds nothing.  The tree is still this installation's,
+        and the evidence is two-sided: a process is still in the recorded
+        group, and it still carries the owner token minted into that child's
+        environment.
+        """
+
+        record = self._read_owner_record()
+        if record is None or os.name == "nt":
+            return False
+        members = [pid for pid in self._process_group_members(record.pid) if pid != os.getpid()]
+        return any(self._posix_process_has_token(pid, record.token) for pid in members)
+
     def _recorded_proxy_is_orphaned(self) -> int | None:
         """Return only a verified proxy whose recorded Core has exited."""
 
         pid = self._recorded_pid()
         record = self._read_owner_record()
-        if pid is None or record is None:
+        if record is None:
             return None
+        if pid is None:
+            # The master died before its tree did.  Projecting this as stopped
+            # is what makes a normal start end the survivors first: without it
+            # the port answers, no pid is owned, and the service row said
+            # "unknown" with no control at all -- a state only a relaunch could
+            # leave, over a proxy this installation had started itself.
+            return record.pid if self._recorded_proxy_group_is_ours() else None
         current_core = self._core_identity()
         if current_core is not None:
             current_pid, current_identity = current_core
@@ -1003,8 +1122,40 @@ class CoreServiceController:
             return None
         return pid
 
+    def _recorded_proxy_within_startup_grace(self) -> bool:
+        """Whether the owned child was launched inside its own boot window.
+
+        The pid file is written the instant the child is spawned, so its mtime
+        is this installation's launch record.  A child inside the window has
+        not answered a probe yet because it cannot: the interpreter is still
+        importing the runtime the proxy loads.  Every window that polled in
+        that gap used to be told 不健康 and shown one recovery control for a
+        proxy that was already starting correctly.
+        """
+
+        try:
+            launched = self.paths.pid.stat().st_mtime
+        except OSError:
+            return False
+        return time.time() - launched < SERVICE_STARTUP_GRACE_SECONDS
+
     def _health(self, port: int | None = None) -> bool:
+        """Whether the managed proxy answers its own liveness endpoint.
+
+        Every snapshot asks this, and on a stopped proxy the answer is a
+        connection refusal that costs a full TCP setup per window per poll.
+        A *positive* answer is reused for a moment because a proxy that just
+        answered cannot have stopped without this process knowing -- an
+        operation here, or the death its own next liveness check reports.  A
+        negative one is never reused: that probe is what notices a proxy which
+        started while no window was waiting on the start itself.
+        """
+
         target_port = self._effective_port() if port is None else port
+        memo = self._health_cache
+        now = time.monotonic()
+        if memo is not None and memo[0] == target_port and memo[2] and now - memo[1] < SERVICE_STATUS_CACHE_SECONDS:
+            return True
         request = urllib.request.Request(
             f"http://127.0.0.1:{target_port}/health/liveliness",
             headers=browser_request_headers(),
@@ -1016,9 +1167,11 @@ class CoreServiceController:
                 status = getattr(response, "status", None)
                 if status is None:
                     status = response.getcode()
-                return isinstance(status, int) and 200 <= status < 300
+                healthy = isinstance(status, int) and 200 <= status < 300
         except Exception:
-            return False
+            healthy = False
+        self._health_cache = (target_port, now, healthy)
+        return healthy
 
     def _health_refused(self, port: int | None = None) -> bool:
         """Whether the health listener is gone (connections are refused).
@@ -1158,7 +1311,7 @@ class CoreServiceController:
         if healthy and pid is not None:
             state = "running"
         elif pid is not None:
-            state = "unhealthy"
+            state = "starting" if self._recorded_proxy_within_startup_grace() else "unhealthy"
         elif self._recorded_proxy_is_orphaned() is not None:
             # A verified child of a dead Core is recoverable by normal start;
             # it is not an unrelated listener occupying the configured port.
@@ -1215,6 +1368,12 @@ class CoreServiceController:
     def start(self) -> dict[str, Any]:
         current = self.status(force=True)
         if current["state"] == "running":
+            return current
+        # A start that is still inside the child's own boot window already has
+        # a proxy on the way up.  Launching a second one would bind the next
+        # free port and leave the first unreachable, so the honest answer is
+        # the state that launch is in.
+        if current["state"] == "starting" and self._pid() is not None:
             return current
         # A recorded proxy whose master is still alive but whose listener is
         # gone is a zombie: workers exited while the uvicorn supervisor
@@ -1316,7 +1475,10 @@ class CoreServiceController:
                 self._stop_process_group(process.pid)
             self._remove_owner_files()
             raise RuntimeError("LiteLLM service could not start") from exc
-        deadline = time.monotonic() + min(max(float(environment.get("LITELLM_HEALTH_WAIT_SECONDS", "60")), 1), MAX_SERVICE_HEALTH_WAIT_SECONDS)
+        deadline = time.monotonic() + min(
+            max(float(environment.get("LITELLM_HEALTH_WAIT_SECONDS", DEFAULT_SERVICE_HEALTH_WAIT_SECONDS)), 1),
+            MAX_SERVICE_HEALTH_WAIT_SECONDS,
+        )
         while time.monotonic() < deadline:
             if self._health():
                 return self.status(force=True)
@@ -1370,6 +1532,30 @@ class CoreServiceController:
         return True
 
     @staticmethod
+    def _process_group_alive(pgid: int) -> bool:
+        """Whether any running process is left in ``pgid``.
+
+        ``killpg(.., 0)`` is the cheap probe.  macOS answers ``EPERM`` while the
+        group's only remaining member is a zombie this process cannot reap yet;
+        a zombie holds no listener and is not a process a stop has to wait for,
+        so that answer counts as gone.
+        """
+
+        if not hasattr(os, "killpg"):
+            return False
+        try:
+            os.killpg(pgid, 0)
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _group_alive(pid: int) -> bool:
+        if hasattr(os, "killpg"):
+            return CoreServiceController._process_group_alive(pid)
+        return CoreServiceController._process_alive(pid)
+
+    @staticmethod
     def _stop_process_group(pid: int) -> None:
         try:
             if hasattr(os, "killpg"):
@@ -1379,9 +1565,14 @@ class CoreServiceController:
         except OSError:
             return
         deadline = time.monotonic() + _proxy_drain_grace_seconds()
-        while time.monotonic() < deadline and CoreServiceController._process_alive(pid):
+        # The group outlives its leader: a dying master can leave forkservers
+        # and workers that still hold the listening socket.  Waiting on the
+        # leader alone returned the moment *it* exited, so SIGKILL was never
+        # sent and those survivors kept the port (and the service state stuck
+        # at unknown).  Wait on the whole group instead.
+        while time.monotonic() < deadline and CoreServiceController._group_alive(pid):
             time.sleep(0.1)
-        if CoreServiceController._process_alive(pid):
+        if CoreServiceController._group_alive(pid):
             try:
                 if hasattr(os, "killpg"):
                     os.killpg(pid, signal.SIGKILL)

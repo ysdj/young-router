@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -924,9 +925,18 @@ class OurFreeModelAdapterTests(unittest.TestCase):
         self.assertEqual(our_free_model.staged_root().name, "our-free-model")
         self.assertEqual(our_free_model.load_root().name, "our-free-model")
         esbuild = our_free_model.load_root() / "node_modules" / ".bin" / "esbuild"
+        # The environment carries the ESBuild install the package reuses and,
+        # when this build staged one, the Bun executable its free lane dials
+        # through.  A machine with neither still answers an empty mapping, so
+        # the assertion is over what is actually present rather than over a
+        # shape that assumes the stage ran.
+        bun = our_free_model.bun_command()
         self.assertEqual(
             our_free_model.upstream_environment(),
-            {"ESBUILD_BINARY_PATH": str(esbuild)} if esbuild.is_file() else {},
+            {
+                **({"ESBUILD_BINARY_PATH": str(esbuild)} if esbuild.is_file() else {}),
+                **({our_free_model._UPSTREAM_BUN_ENV: bun} if bun else {}),
+            },
         )
         self.assertEqual(our_free_model.worker_path().name, "our_free_model_worker.mjs")
         self.assertEqual(
@@ -1418,3 +1428,154 @@ class StatedWindowIsDisplayedTests(unittest.TestCase):
             self.assertEqual(
                 domain.snapshot()["model_contexts"]["shared"]["context_window"], 131_072
             )
+
+
+class OurFreeModelTransportTests(unittest.TestCase):
+    """The lane's free tier is reached through Bun, and the build must ship one.
+
+    The staged upstream moved its official OpenCode inference lane onto Bun and
+    refuses that lane -- the roster read included -- when it finds no native
+    executable.  An installed app is launched by Finder, which supplies no
+    login ``PATH``, so a host that installed Bun itself still fails from the app
+    window: the bridge is what has to name the executable.
+    """
+
+    def test_the_bridge_publishes_the_bun_it_resolved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bun = Path(directory) / "bun"
+            bun.write_text("#!/bin/sh\n", encoding="utf-8")
+            bun.chmod(0o755)
+            with mock.patch.object(our_free_model, "bun_command", return_value=str(bun)):
+                self.assertEqual(
+                    our_free_model.upstream_environment()["OUR_FREE_MODEL_BUN"], str(bun)
+                )
+
+    def test_an_unresolved_bun_leaves_the_package_its_own_discovery(self) -> None:
+        # The package searches ``PATH`` and ``~/.bun/bin`` on its own, so an
+        # empty answer must add no variable at all: publishing an empty or
+        # relative value would make that fallback read a path that is not one.
+        with mock.patch.object(our_free_model, "bun_command", return_value=""):
+            self.assertNotIn("OUR_FREE_MODEL_BUN", our_free_model.upstream_environment())
+
+    def test_an_explicit_override_wins_over_the_bundled_copy(self) -> None:
+        from young_router import node_runtime
+
+        with tempfile.TemporaryDirectory() as directory:
+            bundled = Path(directory) / "runtime" / "bin"
+            bundled.mkdir(parents=True)
+            staged = bundled / "bun"
+            staged.write_text("#!/bin/sh\n", encoding="utf-8")
+            staged.chmod(0o755)
+            override = Path(directory) / "my-bun"
+            override.write_text("#!/bin/sh\n", encoding="utf-8")
+            override.chmod(0o755)
+            with mock.patch.object(node_runtime, "core_root", return_value=Path(directory)):
+                saved = os.environ.get(our_free_model._BUN_ENV)
+                os.environ[our_free_model._BUN_ENV] = str(override)
+                try:
+                    self.assertEqual(our_free_model.bun_command(), str(override))
+                finally:
+                    if saved is None:
+                        os.environ.pop(our_free_model._BUN_ENV, None)
+                    else:
+                        os.environ[our_free_model._BUN_ENV] = saved
+                os.environ.pop(our_free_model._BUN_ENV, None)
+                try:
+                    self.assertEqual(node_runtime.bundled_executable(
+                        env_name=our_free_model._BUN_ENV, name="bun"
+                    ), str(staged))
+                finally:
+                    pass
+
+
+class WorkerOrphanWatchTests(unittest.TestCase):
+    """A worker outlives its Core unless it notices the reparenting itself.
+
+    Nothing signals a child when its parent is killed: it is reparented and
+    keeps its listener.  Measured on this app, one install path that replaced
+    the bundle mid-start left seventeen free-model workers behind, each still
+    holding its gateway and control ports for hours while the Core that owned
+    them was gone.  Both managed workers therefore watch ``process.ppid``, and
+    this drives the real worker source rather than restating it.
+    """
+
+    SCRIPT = """
+import { spawn } from 'node:child_process'
+const child = spawn(process.execPath, [process.argv[1]], { stdio: ['ignore', 'pipe', 'inherit'], detached: true })
+let seen = ''
+child.stdout.on('data', chunk => { seen += String(chunk) })
+child.unref()
+setTimeout(() => { process.stdout.write(seen); process.exit(0) }, Number(process.argv[2]))
+"""
+
+    def _worker_sources(self) -> list[Path]:
+        adapters = Path("young_router/adapters")
+        return [
+            adapters / "our_free_model_worker.mjs",
+            adapters / "workbuddy_worker.mjs",
+        ]
+
+    def test_each_managed_worker_watches_for_a_reparented_core(self) -> None:
+        # The source-level half: the watch has to exist in both workers, and it
+        # has to re-read ``ppid`` rather than compare against a captured one.
+        for source in self._worker_sources():
+            text = source.read_text(encoding="utf-8")
+            self.assertIn("ORPHAN_POLL_MS", text, f"{source.name} has no orphan poll")
+            self.assertIn("process.ppid", text, f"{source.name} never reads its parent")
+            self.assertRegex(
+                text,
+                r"if \(process\.ppid === parent\) return",
+                f"{source.name} must re-read ppid on every tick",
+            )
+
+    def test_a_reparented_process_sees_a_changed_ppid(self) -> None:
+        # The runtime half, on this host's own Node: a child spawned detached
+        # and left behind really does observe a different ``ppid``, which is
+        # what makes the watch above work.  A platform where the value never
+        # changed would turn the watch into a no-op that looks correct -- and
+        # reading it once at startup is the same no-op, because the value the
+        # parent is replaced with only appears on a later read.
+        node = our_free_model.node_command()
+        with tempfile.TemporaryDirectory() as directory:
+            result = Path(directory) / "observed.txt"
+            probe = Path(directory) / "probe.mjs"
+            # ``ppid`` is written twice: once while the launching parent is
+            # still alive, and once after it exits.  Only the second read can
+            # show the reparenting, which is exactly why a worker that captured
+            # the value at startup would never notice its Core had gone.
+            probe.write_text(
+                "import { appendFileSync } from 'node:fs'\n"
+                "appendFileSync(process.argv[2], `${process.ppid}\\n`)\n"
+                "setTimeout(() => {\n"
+                "  appendFileSync(process.argv[2], `${process.ppid}\\n`)\n"
+                "  process.exit(0)\n"
+                "}, 800)\n",
+                encoding="utf-8",
+            )
+            launcher = Path(directory) / "launcher.mjs"
+            launcher.write_text(
+                "import { spawn } from 'node:child_process'\n"
+                "const child = spawn(process.execPath, [process.argv[2], process.argv[3]], { stdio: 'ignore', detached: true })\n"
+                "child.unref()\n"
+                "setTimeout(() => process.exit(0), 250)\n",
+                encoding="utf-8",
+            )
+            __import__("subprocess").run(
+                [node, str(launcher), str(probe), str(result)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            deadline = time.monotonic() + 20.0
+            while time.monotonic() < deadline:
+                if result.is_file() and len(result.read_text().split()) >= 2:
+                    break
+                time.sleep(0.02)
+            reads = result.read_text(encoding="utf-8").split()
+        self.assertEqual(len(reads), 2, f"the detached probe reported {reads}")
+        started, observed = reads
+        self.assertNotEqual(
+            started, observed, "ppid did not change after the parent exited"
+        )
+        self.assertEqual(observed, "1", "the reparented child did not reach init")

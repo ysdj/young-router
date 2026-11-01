@@ -485,6 +485,10 @@ class YoungRouterHook(CustomLogger):
             )
         )
         image_generation_saved_paths: list[str] = []
+        # Which image calls this response already told the client it opened.  One
+        # response's frames share it, so a route that streams a real opening
+        # frame is left alone and only the done-only completion is repaired.
+        image_generation_opened_item_ids: set[str] = set()
 
         async def deliver_stream(stream: AsyncIterator[Any]) -> AsyncIterator[Any]:
             async for stream_chunk in stream:
@@ -492,12 +496,12 @@ class YoungRouterHook(CustomLogger):
                     yield deliver_chunk(image_chunk)
 
         def image_generation_chunks_for_delivery(stream_chunk: Any) -> list[Any]:
-            if not emit_image_generation_saved_paths:
-                return [stream_chunk]
             return _image_generation_module._image_generation_stream_chunks_for_delivery(
                 stream_chunk,
                 request_data,
                 image_generation_saved_paths,
+                image_generation_opened_item_ids,
+                attach_paths=emit_image_generation_saved_paths,
             )
 
         response = _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(response, request_data)

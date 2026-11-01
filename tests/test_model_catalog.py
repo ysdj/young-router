@@ -1254,7 +1254,7 @@ class ModelCatalogTests(unittest.TestCase):
 
             model = catalog_payload(["custom-fable"], registry=registry)["models"][0]
             self.assertEqual(
-                ["minimal", "low", "medium", "high", "xhigh", "max"],
+                ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
                 [item["effort"] for item in model["supported_reasoning_levels"]],
             )
             self.assertEqual("medium", model["default_reasoning_level"])
@@ -1265,6 +1265,92 @@ class ModelCatalogTests(unittest.TestCase):
             assert cached_capability is not None
             self.assertEqual(capability.supported_levels, cached_capability.supported_levels)
             self.assertEqual(capability.thinking_level_map, cached_capability.thinking_level_map)
+
+    def test_a_custom_route_publishes_ultra_beside_every_max_and_never_alone(self) -> None:
+        """A route that reaches ``max`` also states ``ultra``, one step above it.
+
+        ``ultra`` is Codex's own tier over ``max`` -- maximum reasoning plus task
+        delegation -- and pi.dev's ladder has no such step, so the route
+        capability (what the request path clamps against) never carries it.  The
+        catalog is the client's slider, and a route able to serve the hardest
+        thinking must read with the same top tier as the client's own models.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(
+                "model_list:\n"
+                "  - model_name: route-with-max\n"
+                "    litellm_params:\n"
+                "      custom_llm_provider: relay\n"
+                "      model: agent-max\n"
+                "  - model_name: route-through-high\n"
+                "    litellm_params:\n"
+                "      custom_llm_provider: relay\n"
+                "      model: agent-high\n",
+                encoding="utf-8",
+            )
+            cache = root / "contexts.json"
+            cache.write_text(
+                json.dumps(
+                    {
+                        "records": {
+                            "relay/agent-max": {
+                                "context_window": 1000,
+                                "max_context_window": 1000,
+                                "source": MODEL_CONTEXT_SOURCES[0],
+                                "priority": 40,
+                                "reasoning": True,
+                                "thinking_level_map": {
+                                    "off": None,
+                                    "xhigh": "xhigh",
+                                    "max": "max",
+                                },
+                            },
+                            "relay/agent-high": {
+                                "context_window": 1000,
+                                "max_context_window": 1000,
+                                "source": MODEL_CONTEXT_SOURCES[0],
+                                "priority": 40,
+                                "reasoning": True,
+                                "thinking_level_map": {
+                                    "off": None,
+                                    "xhigh": None,
+                                    "max": None,
+                                },
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry = ModelContextRegistry(
+                runtime_config_path=runtime, cache_path=cache, refresh_enabled=False
+            )
+            with_max = catalog_payload(["route-with-max"], registry=registry)["models"][0]
+            through_high = catalog_payload(["route-through-high"], registry=registry)[
+                "models"
+            ][0]
+            # The capability itself stays provider-wire only: the proxy maps a
+            # client's ``ultra`` down rather than sending the word upstream.
+            capability = registry.reasoning_for("route-with-max")
+
+        self.assertEqual(
+            ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+            [item["effort"] for item in with_max["supported_reasoning_levels"]],
+        )
+        self.assertEqual(
+            "Maximum reasoning with automatic task delegation",
+            with_max["supported_reasoning_levels"][-1]["description"],
+        )
+        self.assertEqual(
+            ["minimal", "low", "medium", "high"],
+            [item["effort"] for item in through_high["supported_reasoning_levels"]],
+        )
+        self.assertIsNotNone(capability)
+        assert capability is not None
+        self.assertNotIn("ultra", capability.supported_levels)
 
     def test_pi_reasoning_catalog_uses_safe_intersection_across_routes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1487,6 +1573,151 @@ class SharedContextCacheTests(unittest.TestCase):
 
         self.assertEqual(200_000, effective.context_window)
         self.assertEqual(1_048_576, default.context_window)
+
+    def test_a_route_ladder_is_the_one_the_request_path_maps(self) -> None:
+        """The catalog and the Pi-facing listing must state one ladder.
+
+        ``reasoning_for`` answers ``None`` for a relay alias whose deployments
+        resolve nothing by their provider-qualified id, and the catalog then
+        kept the inherited native profile's ``low``..``ultra``.  The same route
+        reported ``low``/``high``/``max`` on ``/v1/models``, so one route had two
+        ladders and a default it does not have.  Observed live 2026-11-02 with
+        ``deepseek-v4.1-flash``: catalog ``low``..``ultra``, listing
+        ``off,high,max,ultra``.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory) / "config.yaml"
+            runtime.write_text(
+                "model_list:\n"
+                "  - model_name: deepseek-v4.1-flash\n"
+                "    litellm_params:\n"
+                "      model: openai/deepseek-v4.1-flash\n"
+                "  - model_name: deepseek-v4.1-flash\n"
+                "    litellm_params:\n"
+                "      model: openai/deepseek-flash\n",
+                encoding="utf-8",
+            )
+            cache = Path(directory) / "contexts.json"
+            cache.write_text(
+                json.dumps(
+                    self._cache(
+                        {
+                            "openai/deepseek-v4.1-flash": {
+                                **self._profile(1_000_000),
+                                "reasoning": True,
+                                "supported_reasoning_levels": ["none", "high", "max"],
+                                "default_reasoning_level": "high",
+                            }
+                        }
+                    )
+                ),
+                encoding="utf-8",
+            )
+            registry = ModelContextRegistry(
+                runtime_config_path=runtime,
+                cache_path=cache,
+                refresh_enabled=False,
+            )
+            # The group's own route lookup refuses -- one deployment resolves
+            # nothing -- while the public name still answers.
+            self.assertIsNone(registry.reasoning_for("deepseek-v4.1-flash"))
+            self.assertIsNotNone(
+                registry.reasoning_for_model_id("deepseek-v4.1-flash")
+            )
+
+            with mock.patch(
+                "young_router.core.model_catalog.load_native_catalog",
+                return_value=[
+                    {
+                        "slug": "native-agent",
+                        "base_instructions": "Native prompt",
+                        "model_messages": {"instructions_template": "Native prompt"},
+                        "default_reasoning_level": "low",
+                        "supported_reasoning_levels": [
+                            {"effort": level, "description": f"Native {level}"}
+                            for level in ("low", "medium", "high", "xhigh", "max", "ultra")
+                        ],
+                    }
+                ],
+            ), mock.patch("litellm.model_cost", {}):
+                model = catalog_payload(
+                    ["deepseek-v4.1-flash"],
+                    registry=registry,
+                )["models"][0]
+
+        self.assertEqual(
+            ["none", "high", "max", "ultra"],
+            [item["effort"] for item in model["supported_reasoning_levels"]],
+        )
+        self.assertEqual("high", model["default_reasoning_level"])
+
+    def test_an_image_route_publishes_only_its_disabled_step(self) -> None:
+        """A reasoning slider on an image route is a control that does nothing.
+
+        The entry inherits a text profile's ladder, so an image route advertised
+        six thinking levels it cannot honour while its listing stated ``off``.
+        The modality comes from the public catalog, not from the name.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "contexts.json"
+            cache.write_text(
+                json.dumps(
+                    self._cache(
+                        {
+                            "openai/gpt-image-public": {
+                                **self._profile(272_000),
+                                "image_model_metadata": {
+                                    "type": "image",
+                                    "input_modalities": ["text", "image"],
+                                    "output_modalities": ["image"],
+                                },
+                            },
+                            "openai/text-route": {
+                                **self._profile(272_000),
+                                "reasoning": True,
+                                "supported_reasoning_levels": ["low", "high"],
+                                "default_reasoning_level": "high",
+                            },
+                        }
+                    )
+                ),
+                encoding="utf-8",
+            )
+            registry = ModelContextRegistry(cache_path=cache, refresh_enabled=False)
+            native_profile = {
+                "slug": "native-agent",
+                "base_instructions": "Native prompt",
+                "model_messages": {"instructions_template": "Native prompt"},
+                "default_reasoning_level": "low",
+                "supported_reasoning_levels": [
+                    {"effort": level, "description": f"Native {level}"}
+                    for level in ("low", "medium", "high", "xhigh", "max", "ultra")
+                ],
+            }
+            with mock.patch(
+                "young_router.core.model_catalog.load_native_catalog",
+                return_value=[native_profile],
+            ), mock.patch("litellm.model_cost", {}):
+                image_model = catalog_payload(
+                    ["openai/gpt-image-public"],
+                    registry=registry,
+                )["models"][0]
+                text_model = catalog_payload(
+                    ["openai/text-route"],
+                    registry=registry,
+                )["models"][0]
+
+        self.assertEqual(
+            ["none"],
+            [item["effort"] for item in image_model["supported_reasoning_levels"]],
+        )
+        self.assertEqual("none", image_model["default_reasoning_level"])
+        self.assertEqual(
+            ["low", "high"],
+            [item["effort"] for item in text_model["supported_reasoning_levels"]],
+        )
 
     def test_a_cache_that_disappears_keeps_the_records_already_in_hand(self) -> None:
         """Losing the file is not evidence a resolved window became unknown."""

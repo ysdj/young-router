@@ -11,6 +11,11 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const MAX_BODY_BYTES = 1024 * 1024
+//: How often a running worker re-reads its parent's identity.  One ``ppid``
+//: read is a syscall on a value the kernel already tracks, so this is cheaper
+//: than the listener it protects; the interval only decides how long an
+//: orphaned worker keeps its ports after its Core is killed.
+const ORPHAN_POLL_MS = 2000
 const ALLOWED_SETTINGS = new Set([
   'defaultMaxTokens',
   'exposeRegionModels',
@@ -392,6 +397,24 @@ async function main(argv) {
   }
   process.once('SIGINT', shutdown)
   process.once('SIGTERM', shutdown)
+  // A worker whose Core is gone is holding a listener and a lease that no one
+  // owns any more, and nothing signals it: the Core is the parent, and a
+  // killed parent orphans its children instead of hanging them up.  Measured
+  // on this app, one install path that replaced the bundle mid-start left
+  // seventeen of these behind, each still holding its gateway and control
+  // ports for hours.  The lease that proves the Core is alive is the file it
+  // handed over, and its own removal happened above -- so the process's
+  // parent identity is what is left to watch.  ``process.ppid`` is read fresh
+  // on every tick rather than captured once, because it is answered from the
+  // live parent record: it reported the original pid for a while and then the
+  // reparented one, so a single read at startup cannot decide this.
+  const parent = process.ppid
+  const orphanWatch = setInterval(() => {
+    if (process.ppid === parent) return
+    clearInterval(orphanWatch)
+    shutdown()
+  }, ORPHAN_POLL_MS)
+  orphanWatch.unref?.()
 }
 
 main(process.argv.slice(2)).catch(error => {

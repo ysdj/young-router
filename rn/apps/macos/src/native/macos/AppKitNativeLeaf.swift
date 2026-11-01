@@ -338,13 +338,6 @@ private enum NativeRelayOriginPolicy {
             // the wizard closes.
             open(route: "providers-models", title: parentTitle)
         }
-        if windowRoute == "image-context", settingsWindowKey() == nil,
-           let parentTitle = routeWindowTitle("runtime-settings") {
-            // The image-context window is opened from a runtime category, so a
-            // deep link or a menu action that arrives with no settings window
-            // open still has the workspace it belongs over.
-            open(route: "runtime-settings", title: parentTitle)
-        }
         if Self.settingsPaneRoutes.contains(windowRoute),
            let existingKey = settingsWindowKey(), existingKey != windowRoute,
            let existing = routeWindows[existingKey] {
@@ -387,12 +380,12 @@ private enum NativeRelayOriginPolicy {
             // the screen only when the user opens the document it edits.
             configureImmediatePresentation(window)
             withoutAnimations { window.orderOut(nil) }
-        } else if windowRoute == "provider-wizard" || windowRoute == "file-editor" || windowRoute == "image-context" {
-            // The wizard, the file editor, and the image-context window are
-            // children of the workspace they open from: each is its own movable
-            // window with the rest of the app locked until it closes, exactly
-            // like the model chooser. A window that is already up is only
-            // brought forward, never given a second modal session.
+        } else if windowRoute == "provider-wizard" || windowRoute == "file-editor" {
+            // The wizard and the file editor are children of the workspace they
+            // open from: each is its own movable window with the rest of the
+            // app locked until it closes, exactly like the model chooser. A
+            // window that is already up is only brought forward, never given a
+            // second modal session.
             if isChildPanel(window) {
                 NSApp.activate(ignoringOtherApps: true)
                 configureImmediatePresentation(window)
@@ -1573,16 +1566,14 @@ private enum NativeRelayOriginPolicy {
         presentChildPanel(controller.panel, in: activeWindow(), prepare: { controller.loadContent() })
     }
 
-    /// Present an official provider login. Claude OAuth uses the system
-    /// browser so its first-party Cloudflare challenge and an existing browser
-    /// session work normally; device-code providers remain in an isolated
-    /// WebView. Core owns the callback and credential exchange in either case.
+    /// Present an official provider login in an isolated WebView. Core owns the
+    /// device-code exchange; this surface only shows the page the person must
+    /// use and never reads a value out of it.
     func showProviderAuth(
         provider: String,
         fingerprint: String?,
         verificationURL: String,
         userCode: String?,
-        callbackURL: String?,
         title: String,
         closeTitle: String,
         reloadTitle: String,
@@ -1596,7 +1587,6 @@ private enum NativeRelayOriginPolicy {
                     fingerprint: fingerprint,
                     verificationURL: verificationURL,
                     userCode: userCode,
-                    callbackURL: callbackURL,
                     title: title,
                     closeTitle: closeTitle,
                     reloadTitle: reloadTitle,
@@ -1607,16 +1597,9 @@ private enum NativeRelayOriginPolicy {
             return
         }
         guard let url = NativeProviderAuthPolicy.url(provider: provider, string: verificationURL),
-              (callbackURL == nil || NativeProviderAuthPolicy.callbackURL(provider: provider, string: callbackURL) != nil),
-              (userCode == nil || (userCode.map(NativeProviderAuthPolicy.validCode) ?? false)),
-              (userCode != nil || callbackURL != nil),
+              (userCode.map(NativeProviderAuthPolicy.validCode) ?? false),
               !title.isEmpty,
               !closeTitle.isEmpty else {
-            completion()
-            return
-        }
-        if provider == "claude" {
-            NSWorkspace.shared.open(url)
             completion()
             return
         }
@@ -1630,15 +1613,14 @@ private enum NativeRelayOriginPolicy {
             }
             authFingerprint = normalized
         } else {
-            authFingerprint = "\(provider)|\(url.absoluteString)|\(callbackURL ?? "")"
+            authFingerprint = "\(provider)|\(url.absoluteString)"
         }
         // Re-presentation for the same account replaces its stale challenge;
         // other account fingerprints keep their own window and stay usable once
         // the newest one closes.
         activeProviderAuthControllers[authFingerprint]?.cancelFromReact()
-        // The flow's own navigation rule, parsed here and handed to the shell:
-        // the window never decides what a provider may show.
-        let policyCallbackURL = NativeProviderAuthPolicy.callbackURL(provider: provider, string: callbackURL)
+        // The flow's own navigation rule, handed to the shell: the window never
+        // decides what page a provider may show.
         // The same window the relay sign-in opens: one shell, one browser, one
         // action bar.  What differs is only the flow the window carries — this
         // one hands the page over to the person and lets Core follow the device
@@ -1659,7 +1641,7 @@ private enum NativeRelayOriginPolicy {
             handoff: NativeHandoffSignIn(
                 url: url,
                 allows: { target in
-                    NativeProviderAuthPolicy.allows(provider: provider, url: target, callbackURL: policyCallbackURL)
+                    NativeProviderAuthPolicy.allows(provider: provider, url: target)
                 },
                 title: title,
                 instruction: localized("providerAuthInstruction", fallback: "Complete sign-in on the official provider page. The code below is shown only for this device-code flow."),
@@ -2787,14 +2769,6 @@ private enum NativeRelayOriginPolicy {
                 minSize: NSSize(width: 720, height: 420),
                 maxSize: nil
             )
-        case "image-context":
-            // A task list beside a grid of pictures: room for four cards, and
-            // wide enough for the longest explainer line at its own size.
-            return RouteWindowLayout(
-                contentSize: NSSize(width: 900, height: 620),
-                minSize: NSSize(width: 720, height: 480),
-                maxSize: nil
-            )
         default:
             return RouteWindowLayout(
                 contentSize: NSSize(width: 1052, height: 600),
@@ -2827,7 +2801,6 @@ private enum NativeRelayOriginPolicy {
         case "codex-settings", "claude-settings": return localized("routeCodexSettings", fallback: "External")
         case "runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime")
         case "data-management": return localized("routeDataManagement", fallback: "Data Management")
-        case "image-context": return localized("routeImageContext", fallback: "Image Context")
         case "logs": return localized("routeLogs", fallback: "Logs")
         default: return nil
         }
@@ -2845,10 +2818,6 @@ private enum NativeRelayOriginPolicy {
         case "home": return localized("routeHome", fallback: "Young Router")
         case "provider-wizard": return localized("routeProviderWizard", fallback: "Add Provider")
         case "file-editor": return localized("routeFileEditor", fallback: "Edit File")
-        // A route missing here cannot be opened at all: ``open(route:)`` bails
-        // out when the title is nil, which is why the image-context window was
-        // once invisible while its button, its layout, and its surface existed.
-        case "image-context": return localized("routeImageContext", fallback: "Image Context")
         default: return nil
         }
     }
@@ -5515,28 +5484,7 @@ private enum NativeProviderAuthPolicy {
         return url
     }
 
-    static func callbackURL(provider: String, string: String?) -> URL? {
-        guard let string, !string.isEmpty,
-              let url = URL(string: string),
-              provider == "claude",
-              url.scheme?.lowercased() == "http",
-              let host = url.host?.lowercased(), host == "localhost" || host == "127.0.0.1",
-              url.user == nil, url.password == nil, url.fragment == nil,
-              url.path == "/callback",
-              let port = url.port, port > 0, port <= 65_535 else {
-            return nil
-        }
-        return url
-    }
-
-    static func allows(provider: String, url: URL, callbackURL: URL? = nil) -> Bool {
-        if let callbackURL,
-           url.scheme?.lowercased() == callbackURL.scheme?.lowercased(),
-           url.host?.lowercased() == callbackURL.host?.lowercased(),
-           url.port == callbackURL.port,
-           url.path == callbackURL.path {
-            return true
-        }
+    static func allows(provider: String, url: URL) -> Bool {
         guard url.scheme?.lowercased() == "https",
               let host = url.host?.lowercased(),
               !host.isEmpty,
@@ -5563,14 +5511,6 @@ private enum NativeProviderAuthPolicy {
             }
             if host == "challenges.cloudflare.com" {
                 return true
-            }
-            return false
-        case "claude":
-            if host == "claude.com" || host == "claude.ai" {
-                return path == "/" || path == "/cai/oauth/authorize" || path.hasPrefix("/login") || path.hasPrefix("/oauth") || path.hasPrefix("/auth") || path.hasPrefix("/cai/")
-            }
-            if host == "platform.claude.com" || host == "console.anthropic.com" || host == "auth.anthropic.com" {
-                return path == "/" || path.hasPrefix("/login") || path.hasPrefix("/oauth") || path.hasPrefix("/auth")
             }
             return false
         default:

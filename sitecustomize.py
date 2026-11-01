@@ -152,10 +152,27 @@ def _install_core_parent_watchdog() -> None:
         # within a tenth of a second.
         while os.getppid() == core_pid:
             time.sleep(_PROXY_PARENT_WATCH_INTERVAL_SECONDS)
+        # A replacement Core starts its own proxy, so this group is being torn
+        # down on purpose -- and the master is the process still holding the
+        # listener, because the workers only inherit it once a forkserver has
+        # finished preloading.  Say why in the service log, signal the group,
+        # and end this process rather than letting it linger: a master that
+        # waits out the teardown kept the port bound for the whole preload, so
+        # the replacement moved to another port and the log held nothing but a
+        # traceback about a missing acknowledgement of a file descriptor.
+        try:
+            print(
+                f"proxy stopping: its owning Core ({core_pid}) exited",
+                file=sys.stderr,
+                flush=True,
+            )
+        except (OSError, ValueError):
+            pass
         try:
             os.killpg(process_group, signal.SIGTERM)
         except OSError:
             pass
+        os._exit(0)
 
     threading.Thread(
         target=watch_parent,

@@ -13,8 +13,13 @@ import argparse
 import importlib
 import json
 import multiprocessing
+import multiprocessing.forkserver  # noqa: F401 - the guard reads its server state
 import os
 from pathlib import Path
+import signal
+import sys
+import threading
+import time
 from typing import Any
 import urllib.request
 
@@ -26,6 +31,19 @@ from ..lifecycle import proxy_drain_grace_seconds
 PROXY_APP = "young_router.proxy.gateway:app"
 PROXY_MODULE = "young_router.proxy.gateway"
 SYSTEM_PROXY_SNAPSHOT_ENV = "YOUNG_ROUTER_SYSTEM_PROXY_SNAPSHOT"
+# A worker handover is retried when the forkserver it was being handed to is
+# gone rather than busy.  The retry costs seconds once the runtime is imported,
+# and the alternative is a start that dies on a race it can see coming.
+WORKER_SPAWN_ATTEMPTS = 3
+WORKER_SPAWN_RETRY_SECONDS = 0.5
+# CPython's own words for that condition: it raises the first when the server
+# vanished between the connect and the acknowledgement, and the second when it
+# was already reaped by the next attempt's ``ensure_running``.
+_FORKSERVER_GONE_ERRORS = (
+    "did not receive acknowledgement of fd",
+    "forkserver process has died",
+)
+_STOP_SIGNALS = ("SIGTERM", "SIGINT")
 
 
 def _bounded_port(value: str) -> int:
@@ -99,6 +117,164 @@ def _prime_forkserver() -> None:
     multiprocessing.forkserver._forkserver.ensure_running()
 
 
+class ProxyStartCancelled(RuntimeError):
+    """The proxy was asked to stop before any worker existed."""
+
+
+def _handover_error_names_a_gone_forkserver(exc: BaseException) -> bool:
+    """Whether ``exc`` means the forkserver is gone, not that it refused."""
+
+    text = str(exc)
+    if any(marker in text for marker in _FORKSERVER_GONE_ERRORS):
+        return True
+    return isinstance(exc, (ConnectionRefusedError, FileNotFoundError, ProcessLookupError))
+
+
+def _forkserver_exit_clause(pid: int | None) -> str:
+    """How the preloading forkserver ended, as a clause, without reaping it.
+
+    ``waitid`` with ``WNOWAIT`` is the one way to learn a child's exit status
+    while ``multiprocessing`` still owns the reaping, so the launcher can name
+    what happened instead of reporting a missing acknowledgement of a file
+    descriptor.
+    """
+
+    if pid is None:
+        return "the proxy's forkserver went away"
+    try:
+        info = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except (AttributeError, ChildProcessError, OSError):
+        info = None
+    if info is None:
+        return f"the proxy's forkserver ({pid}) went away"
+    if info.si_code == os.CLD_EXITED:
+        return f"the proxy's forkserver ({pid}) exited with status {info.si_status}"
+    if info.si_code in (os.CLD_KILLED, os.CLD_DUMPED):
+        try:
+            name = signal.Signals(info.si_status).name
+        except ValueError:
+            name = f"signal {info.si_status}"
+        return f"the proxy's forkserver ({pid}) was killed by {name}"
+    return f"the proxy's forkserver ({pid}) stopped answering"
+
+
+class _WorkerHandoverGuard:
+    """Hand the workers to the forkserver, and survive a forkserver that dies.
+
+    The launcher hands every worker to one forkserver, and that forkserver
+    preloads the whole LiteLLM runtime before it forks: the preload *is* the
+    launcher's startup budget.  It is also the one window in which a
+    process-group ``SIGTERM`` -- a replacement Core stopping the proxy it
+    recorded -- kills the forkserver silently while uvicorn's own handler only
+    queues that signal for this process.  This launcher then died inside
+    ``connect_to_new_process`` with CPython's "did not receive acknowledgement
+    of fd", which names neither the process nor the cause, so the app retried a
+    start that had already been torn down.
+
+    Two duties, both owned here: record that this process was asked to stop, so
+    a planned teardown is not reported as a startup failure, and retry a
+    handover whose forkserver is gone -- ``ensure_running`` starts a fresh one
+    and the import cache is warm, so the retry is cheaper than a dead start.
+    """
+
+    def __init__(self, attempts: int = WORKER_SPAWN_ATTEMPTS) -> None:
+        self._attempts = max(1, int(attempts))
+        self._stop_requested = False
+        self._recorders_installed = False
+        self._lock = threading.Lock()
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_requested
+
+    def install(self) -> None:
+        """Wrap the handover the supervisor performs for every worker.
+
+        ``multiprocessing.forkserver`` binds that method onto the module and
+        ``popen_forkserver`` calls the module-level name, so the wrapper has to
+        replace the module's binding; a class attribute is never reached.
+        """
+
+        module = multiprocessing.forkserver
+        original = getattr(module, "connect_to_new_process", None)
+        if original is None or getattr(original, "_young_router_handover_guard", False):
+            return
+        guard = self
+
+        def connect_to_new_process(fds: Any) -> Any:
+            guard._record_stop_signals()
+            cause: BaseException | None = None
+            for attempt in range(1, guard._attempts + 1):
+                try:
+                    return original(fds)
+                except (RuntimeError, OSError) as exc:
+                    if not _handover_error_names_a_gone_forkserver(exc):
+                        raise
+                    cause = exc
+                    if guard._stop_requested:
+                        raise ProxyStartCancelled(
+                            f"{_forkserver_exit_clause(_forkserver_pid())} while this proxy was being stopped"
+                        ) from exc
+                    if attempt >= guard._attempts:
+                        break
+                    time.sleep(WORKER_SPAWN_RETRY_SECONDS)
+            raise RuntimeError(
+                f"{_forkserver_exit_clause(_forkserver_pid())} before it forked a worker"
+                f" ({guard._attempts} handover attempts, last error: {cause})"
+            ) from cause
+
+        connect_to_new_process._young_router_handover_guard = True  # type: ignore[attr-defined]
+        module.connect_to_new_process = connect_to_new_process  # type: ignore[assignment]
+
+    def _record_stop_signals(self) -> None:
+        """Note a stop signal, then let uvicorn's own handler keep its answer.
+
+        uvicorn installs its handlers while its supervisor is constructed, which
+        is after this process could have installed any of its own: recording
+        here, chained onto whatever it installed, is what keeps a planned stop
+        distinguishable from a forkserver that died on its own.
+        """
+
+        if self._recorders_installed:
+            return
+        with self._lock:
+            if self._recorders_installed:
+                return
+            self._recorders_installed = True
+        for name in _STOP_SIGNALS:
+            signum = getattr(signal, name, None)
+            if signum is None:
+                continue
+            try:
+                previous = signal.getsignal(signum)
+                if not callable(previous):
+                    # The default disposition already answers a stop; a recorder
+                    # that replaced it would keep this process alive instead.
+                    continue
+
+                def record(sig: int, frame: Any, previous: Any = previous) -> None:
+                    self._stop_requested = True
+                    previous(sig, frame)
+
+                signal.signal(signum, record)
+            except (ValueError, OSError, RuntimeError):
+                # Not the main thread, or a platform without the signal: the
+                # retry is then unconditional, which is still better than a
+                # start that cannot name its own failure.
+                continue
+
+
+def _forkserver_pid() -> int | None:
+    pid = getattr(multiprocessing.forkserver._forkserver, "_forkserver_pid", None)
+    return pid if isinstance(pid, int) and pid > 0 else None
+
+
+def _install_worker_handover_guard() -> _WorkerHandoverGuard:
+    guard = _WorkerHandoverGuard()
+    guard.install()
+    return guard
+
+
 def run(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     os.environ["WORKER_CONFIG"] = json.dumps(
@@ -128,27 +304,37 @@ def run(argv: list[str] | None = None) -> int:
     # terminal callback.  Close those rows before the workers start serving.
     settle_stale_recent_requests()
 
-    uvicorn.run(
-        PROXY_APP,
-        host=args.host,
-        port=args.port,
-        workers=args.workers,
-        loop="uvloop",
-        # Uvicorn otherwise cancels a still-streaming request after its 30 s
-        # default, even though the managed service gives the old worker the
-        # configured drain window.  Keep the client connection alive for that
-        # same window so an app restart does not synthesize router_restarting.
-        # The drain belongs to a replacement the Core performs on purpose: a
-        # restart or an install never waits here, it kills this process with the
-        # rest of the captured tree (``scripts/app-processes.sh stop``).
-        timeout_graceful_shutdown=proxy_drain_grace_seconds(),
-        # Codex sends each Responses turn request -- including the immutable
-        # replay prefix with signed image bytes -- as one WebSocket text frame;
-        # uvicorn's 16 MiB default closes those with code 1009 before the
-        # request reaches the pipeline (Codex then reports "websocket closed
-        # by server before response.completed" and reconnects in a loop).
-        ws_max_size=_websocket_max_frame_bytes(),
-    )
+    # The one handover that can lose the whole start: see the guard.
+    _install_worker_handover_guard()
+    try:
+        uvicorn.run(
+            PROXY_APP,
+            host=args.host,
+            port=args.port,
+            workers=args.workers,
+            loop="uvloop",
+            # Uvicorn otherwise cancels a still-streaming request after its 30 s
+            # default, even though the managed service gives the old worker the
+            # configured drain window.  Keep the client connection alive for that
+            # same window so an app restart does not synthesize router_restarting.
+            # The drain belongs to a replacement the Core performs on purpose: a
+            # restart or an install never waits here, it kills this process with the
+            # rest of the captured tree (``scripts/app-processes.sh stop``).
+            timeout_graceful_shutdown=proxy_drain_grace_seconds(),
+            # Codex sends each Responses turn request -- including the immutable
+            # replay prefix with signed image bytes -- as one WebSocket text
+            # frame; uvicorn's 16 MiB default closes those with code 1009 before
+            # the request reaches the pipeline (Codex then reports "websocket
+            # closed by server before response.completed" and reconnects in a
+            # loop).
+            ws_max_size=_websocket_max_frame_bytes(),
+        )
+    except ProxyStartCancelled as exc:
+        # A stop that lands during the preload is the answer, not a failure: the
+        # Core that owned this proxy replaced itself and starts its own, so the
+        # port is released here instead of after a traceback.
+        print(f"proxy start cancelled: {exc}", file=sys.stderr, flush=True)
+        return 0
     return 0
 
 

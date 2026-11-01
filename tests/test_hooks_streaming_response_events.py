@@ -1976,6 +1976,101 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         self.assertEqual("invalid_request_error", chunk["error"]["type"])
         self.assertEqual("context_length_exceeded", chunk["error"]["code"])
 
+    def test_a_payload_field_refusal_names_the_field_layout(self) -> None:
+        """A container this proxy built is a cause, not an unexplained stop.
+
+        Live session, 2026-11-01: a bridged Codex turn reached an Anthropic
+        route and came back HTTP 400 ``extra_body: extra inputs are not
+        permitted``.  Nothing in the terminal builder owned that answer, so the
+        reader was shown ``upstream_route_failure`` / "the router could not
+        classify the stop" for a payload defect this installation had created
+        one step earlier.  A field-naming refusal is readable, so it gets its
+        own branch: the wire type says the configuration is what has to change,
+        and the sentence invites no resend because an identical body meets the
+        identical validator.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+
+        class AnthropicBadRequestError(Exception):
+            pass
+
+        exception = AnthropicBadRequestError(
+            "litellm.BadRequestError: AnthropicException - "
+            "extra_body: extra inputs are not permitted"
+        )
+        exception.status_code = 400
+        responses_request = {
+            "model": "claude-opus-5-5",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+        }
+
+        self.assertTrue(hooks._is_upstream_request_field_rejected_error(exception))
+        self.assertEqual(
+            hooks._trace_exception(exception)["reason"],
+            "upstream-request-field-rejected",
+        )
+
+        event = streaming_module._synthesized_failed_response_event(
+            responses_request,
+            exception,
+        )
+        payload = event if isinstance(event, dict) else json.loads(event.data or "{}")
+        error = payload["response"]["error"]
+
+        self.assertEqual("invalid_request_error", error["type"])
+        self.assertEqual("invalid_prompt", error["code"])
+        self.assertNotIn("could not classify", error["message"])
+        self.assertIn("field layout", error["message"])
+        self.assertIn("claude-opus-5-5", error["message"])
+        # Pi retries a failed turn only for a phrase on its list; this cause is
+        # deterministic, so the sentence must carry none of them.
+        lowered = error["message"].lower()
+        for retry_tip in (
+            "send it again",
+            "send the message again",
+            "retry",
+            "try again",
+            "ended without",
+        ):
+            self.assertNotIn(retry_tip, lowered)
+        self.assertTrue(getattr(event, "_young_router_terminal_failure", False))
+
+        # The same cause on the Chat wire carries the same code and no tip.
+        chunk = streaming_module._synthesized_native_stream_error_chunk(
+            {
+                "model": "claude-opus-5-5",
+                "messages": [{"role": "user", "content": "Continue."}],
+                "stream": True,
+            },
+            exception,
+        )
+        self.assertEqual("invalid_request_error", chunk["error"]["type"])
+        self.assertEqual("invalid_prompt", chunk["error"]["code"])
+        self.assertNotIn("could not classify", chunk["error"]["message"])
+
+    def test_a_bare_bad_request_is_still_an_unclassified_stop(self) -> None:
+        """Only a refusal naming a field is readable; a bare 400 is not.
+
+        ``invalid_request_error`` on its own says nothing this router can name,
+        so it must keep reaching the branch that says so.  Treating every 4xx
+        as a field refusal would state a payload defect that may not exist.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class BadRequestError(Exception):
+            pass
+
+        exception = BadRequestError("invalid_request_error")
+        exception.status_code = 400
+
+        self.assertFalse(hooks._is_upstream_request_field_rejected_error(exception))
+        self.assertEqual(hooks._trace_exception(exception)["reason"], "other")
+
     def test_an_incomplete_tool_history_stop_names_the_new_task(self) -> None:
         """The stop a cut tool record produces must name the only fix.
 
@@ -2925,3 +3020,206 @@ class DeliveredTextFastPathTests(unittest.TestCase):
                 expected is True,
                 f"predicate disagrees on {chunk!r}",
             )
+
+
+class WebSearchBeforeAnswerOrderingTests(unittest.TestCase):
+    """A provider's search must reach the client before the text it produced.
+
+    Measured live 2026-11-01 in one Codex task: ``claude-opus-5-5`` ran four
+    ``web_search`` calls and then wrote the answer, but every search rendered
+    *below* the paragraph it had produced.  LiteLLM collects the searches into
+    ``provider_specific_fields`` and only emits them when the stream ends, while
+    the text streams as it arrives -- so arrival order is answer-first.
+    """
+
+    def setUp(self) -> None:
+        hooks, _proxy = load_hook_module()
+        self.flush = hooks._release_completed_web_search_events
+
+    def _iterator(self, calls, pending_tools, pending_response):
+        queued: set[str] = set()
+
+        class _Iterator:
+            _web_search_calls = calls
+            _queued_web_search_call_ids = queued
+            _pending_tool_events = pending_tools
+            _pending_response_events = pending_response
+
+            def _queue_web_search_events(self, call_id, item):
+                # The real queue emits the whole lifecycle for one call.
+                self._pending_tool_events.extend(
+                    [
+                        {
+                            "type": "response.output_item.added",
+                            "item": {"type": "web_search_call", "id": f"ws_{call_id}"},
+                        },
+                        {"type": "response.web_search_call.completed"},
+                        {
+                            "type": "response.output_item.done",
+                            "item": {"type": "web_search_call", "id": f"ws_{call_id}"},
+                        },
+                    ]
+                )
+
+        return _Iterator()
+
+    def _event(self, event_type, item=None):
+        return {"type": event_type, "item": item} if item else {"type": event_type}
+
+    def test_a_completed_search_moves_ahead_of_the_answer_text(self) -> None:
+        calls = {
+            "srvtoolu_1": {"id": "ws_srvtoolu_1", "status": "completed"},
+        }
+        text_events = [self._event("response.output_text.delta")]
+        pending_tools: list = []
+        pending_response = list(text_events)
+        iterator = self._iterator(calls, pending_tools, pending_response)
+
+        self.flush(iterator)
+
+        self.assertEqual(
+            [
+                "response.output_item.added",
+                "response.web_search_call.completed",
+                "response.output_item.done",
+            ],
+            [event["type"] for event in pending_response[:3]],
+        )
+        # The text that was already waiting now follows the search it came from.
+        self.assertEqual("response.output_text.delta", pending_response[-1]["type"])
+
+    def test_a_search_not_yet_completed_stays_where_it_is(self) -> None:
+        calls = {"srvtoolu_1": {"id": "ws_srvtoolu_1", "status": "in_progress"}}
+        pending_tools: list = []
+        pending_response = [self._event("response.output_text.delta")]
+        iterator = self._iterator(calls, pending_tools, pending_response)
+
+        self.flush(iterator)
+
+        self.assertEqual(
+            ["response.output_text.delta"],
+            [event["type"] for event in pending_response],
+        )
+        self.assertEqual([], pending_tools)
+
+    def test_an_answer_without_a_search_is_untouched(self) -> None:
+        pending_tools: list = []
+        pending_response = [self._event("response.output_text.delta")]
+        iterator = self._iterator({}, pending_tools, pending_response)
+
+        self.flush(iterator)
+
+        self.assertEqual(
+            ["response.output_text.delta"],
+            [event["type"] for event in pending_response],
+        )
+
+
+class WebSearchAfterReasoningOrderingTests(unittest.TestCase):
+    """A search belongs after the thinking that decided to run it.
+
+    The provider writes its reasoning block first (``output_index`` 0), then the
+    search (1), then the answer (2).  Releasing a completed search must keep
+    that order, or a client that renders by ``output_index`` puts the thinking
+    below the answer -- which is what happened to a ``claude-opus-5-5`` thread
+    whose summary landed under the paragraph it had reasoned about.
+    """
+
+    def setUp(self) -> None:
+        hooks, _proxy = load_hook_module()
+        self.release = hooks._release_completed_web_search_events
+
+    def _iterator(self, calls, pending_tools, pending_response):
+        queued: set[str] = set()
+
+        class _Iterator:
+            _web_search_calls = calls
+            _queued_web_search_call_ids = queued
+            _pending_tool_events = pending_tools
+            _pending_response_events = pending_response
+
+            def _queue_web_search_events(self, call_id, item):
+                self._pending_tool_events.extend(
+                    [
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": 1,
+                            "item": {"type": "web_search_call", "id": f"ws_{call_id}"},
+                        },
+                        {
+                            "type": "response.web_search_call.completed",
+                            "output_index": 1,
+                        },
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": 1,
+                            "item": {"type": "web_search_call", "id": f"ws_{call_id}"},
+                        },
+                    ]
+                )
+
+        return _Iterator()
+
+    def test_a_search_lands_after_the_reasoning_that_asked_for_it(self) -> None:
+        calls = {"t1": {"id": "ws_t1", "status": "completed"}}
+        reasoning_frames = [
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "rs_1"},
+            },
+            {"type": "response.reasoning_summary_part.added", "output_index": 0},
+            {"type": "response.reasoning_summary_text.done", "output_index": 0},
+            {"type": "response.reasoning_summary_part.done", "output_index": 0},
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "reasoning", "id": "rs_1"},
+            },
+            {"type": "response.content_part.added", "output_index": 2},
+        ]
+        iterator = self._iterator(calls, [], list(reasoning_frames))
+
+        self.release(iterator)
+
+        emitted = [
+            (event.get("output_index"), event["type"])
+            for event in iterator._pending_response_events
+        ]
+        self.assertEqual(
+            [
+                (0, "response.output_item.added"),
+                (0, "response.reasoning_summary_part.added"),
+                (0, "response.reasoning_summary_text.done"),
+                (0, "response.reasoning_summary_part.done"),
+                (0, "response.output_item.done"),
+                (1, "response.output_item.added"),
+                (1, "response.web_search_call.completed"),
+                (1, "response.output_item.done"),
+                (2, "response.content_part.added"),
+            ],
+            emitted,
+        )
+
+    def test_a_search_still_lands_ahead_of_an_answer_that_has_no_reasoning(
+        self,
+    ) -> None:
+        calls = {"t1": {"id": "ws_t1", "status": "completed"}}
+        answer_frames = [
+            {"type": "response.content_part.added", "output_index": 1},
+            {"type": "response.output_text.delta", "output_index": 1},
+        ]
+        iterator = self._iterator(calls, [], list(answer_frames))
+
+        self.release(iterator)
+
+        self.assertEqual(
+            [
+                "response.output_item.added",
+                "response.web_search_call.completed",
+                "response.output_item.done",
+                "response.content_part.added",
+                "response.output_text.delta",
+            ],
+            [event["type"] for event in iterator._pending_response_events],
+        )

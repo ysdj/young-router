@@ -13,6 +13,7 @@ from .base import (
     HostedToolPlan,
     Optional,
     _HOSTED_COMPUTER_TOOL_TYPES,
+    _UPSTREAM_URL_SURFACE_ANTHROPIC,
     _HOSTED_WEB_SEARCH_TOOL_TYPES,
     _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES,
     _RESPONSES_BRIDGE_CUSTOM_TOOL_KEY,
@@ -349,6 +350,43 @@ def _responses_bridge_web_search_options(tool: Any) -> Optional[dict]:
         options["user_location"] = user_location.copy()
 
     return options
+
+
+_ANTHROPIC_SEARCH_TOOL_TYPE = "web_search_20250305"
+_ANTHROPIC_SEARCH_TOOL_NAME = "web_search"
+# The same context-size vocabulary LiteLLM maps onto Anthropic's ``max_uses``:
+# low/medium/high is three, five and ten provider-side searches.
+_ANTHROPIC_SEARCH_CONTEXT_SIZE = "medium"
+
+
+def _responses_bridge_anthropic_search_options(
+    request_kwargs: Optional[dict],
+) -> Optional[dict]:
+    """The ``web_search_options`` an Anthropic-wire bridge must carry.
+
+    An Anthropic route has no hosted ``web_search`` tool to forward, but it does
+    serve Claude's own server-side search: LiteLLM turns ``web_search_options``
+    into ``{"type": "web_search_20250305", "name": "web_search"}`` on the
+    Messages body, and the provider then runs the search itself and answers with
+    ``server_tool_use`` / ``web_search_tool_result`` blocks.
+
+    Without this the bridge forwarded the Codex ``web`` namespace as ordinary
+    functions and never declared the search, so a route that serves search was
+    asked without it.  Observed live 2026-11-01: ``claude-opus-5-5`` answered
+    "搜索甪直特产" with no tool call at all and invented four citation links,
+    while the identical prompt with this declaration returned real
+    ``web_search_result`` pages.
+
+    Only the Anthropic surface gets it.  A Chat bridge keeps its existing
+    behaviour, where a hosted declaration is dropped rather than replaced.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return None
+    surface = _routing_module._request_current_upstream_surface(request_kwargs)
+    if surface != _UPSTREAM_URL_SURFACE_ANTHROPIC:
+        return None
+    return {"search_context_size": _ANTHROPIC_SEARCH_CONTEXT_SIZE}
 
 
 def _responses_bridge_provider_native_web_search_tool(tool: Any) -> Optional[dict]:

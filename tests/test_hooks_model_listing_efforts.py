@@ -132,7 +132,7 @@ class ModelListingEffortsTests(HookTestCase):
 
         listed = builder("claude-opus-5-5")
         self.assertEqual(
-            ["low", "medium", "high", "xhigh", "max"],
+            ["low", "medium", "high", "xhigh", "max", "ultra"],
             listed["supported_efforts"],
         )
         # The vendor shape is otherwise untouched, so a client that does not
@@ -145,6 +145,70 @@ class ModelListingEffortsTests(HookTestCase):
         # array would read to Pi as "off only", which is a different claim
         # from "this route published nothing".
         self.assertNotIn("supported_efforts", builder("gpt-image-2.5"))
+
+    def test_a_published_max_always_carries_ultra(self) -> None:
+        """Every ``max`` in a listing is followed by ``ultra``, and only then.
+
+        ``ultra`` is the tier Codex's own catalog places above ``max``, so a
+        route whose hardest thinking reaches ``max`` states it too; a route
+        that stops short of ``max`` never gains a tier it cannot serve.  The
+        array is Pi's, so this also proves the Pi-side spelling rule: the
+        disabled step is ``off``, never this app's Codex-side ``none``.
+        """
+
+        hooks, _ = load_hook_module()
+        self._runtime(
+            {
+                "anthropic/with-max": self._record(
+                    {
+                        "off": "none",
+                        "minimal": None,
+                        "low": "low",
+                        "medium": "medium",
+                        "high": "high",
+                        "xhigh": "xhigh",
+                        "max": "max",
+                    }
+                ),
+                "anthropic/through-high": self._record(
+                    {
+                        "off": "none",
+                        "minimal": None,
+                        "low": "low",
+                        "medium": "medium",
+                        "high": "high",
+                        "xhigh": None,
+                        "max": None,
+                    }
+                ),
+                "anthropic/no-map": {
+                    "context_window": 1000,
+                    "max_context_window": 1000,
+                    "source": "https://pi.dev/api/models",
+                    "priority": 40,
+                    "reasoning": True,
+                },
+            },
+            ("with-max", "anthropic/with-max"),
+            ("through-high", "anthropic/through-high"),
+            ("no-map", "anthropic/no-map"),
+        )
+        builder = self._install_listing_patch(hooks, {})
+
+        self.assertEqual(
+            ["off", "low", "medium", "high", "xhigh", "max", "ultra"],
+            builder("with-max")["supported_efforts"],
+        )
+        self.assertEqual(
+            ["off", "low", "medium", "high"],
+            builder("through-high")["supported_efforts"],
+        )
+        # Pi's own default ladder for a route that only declares reasoning:
+        # through ``high``, in Pi's names.
+        self.assertEqual(
+            ["off", "minimal", "low", "medium", "high"],
+            builder("no-map")["supported_efforts"],
+        )
 
     def test_only_levels_every_deployment_of_the_route_agrees_on_are_published(self) -> None:
         """The published surface must not exceed what the request path maps.

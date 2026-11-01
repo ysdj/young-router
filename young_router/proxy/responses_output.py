@@ -868,6 +868,145 @@ def _normalize_pending_tool_search_events(
     _append_missing_pending_tool_search_done_events(pending)
 
 
+def _release_completed_web_search_events(iterator: Any) -> None:
+    """Emit a provider search as soon as its result arrives.
+
+    LiteLLM keeps a native ``web_search`` call in
+    ``provider_specific_fields['web_search_calls']`` while the call streams and
+    only turns it into ``response.web_search_call.*`` events when the stream
+    ends (``_queue_final_tool_call_done_events``).  The answer's own text deltas
+    are queued in ``_pending_response_events``, which the iterator drains before
+    ``_pending_tool_events`` -- so every text delta overtakes a search that is
+    still waiting, and the client renders the whole answer above the searches it
+    came from.  Measured in one live Codex task, whose four searches all
+    rendered below the paragraph they produced.
+
+    A ``web_search_tool_result`` block is folded into the accumulated call on the
+    chunk that carries it, so a call that has reached ``completed`` is a search
+    that has finished -- releasing it there puts it ahead of the text that could
+    only have been written afterwards.
+    """
+
+    queue = getattr(iterator, "_queue_web_search_events", None)
+    calls = getattr(iterator, "_web_search_calls", None)
+    pending_tools = getattr(iterator, "_pending_tool_events", None)
+    pending_response = getattr(iterator, "_pending_response_events", None)
+    if (
+        not callable(queue)
+        or not isinstance(calls, dict)
+        or not isinstance(pending_tools, list)
+        or not isinstance(pending_response, list)
+    ):
+        return
+
+    queued_ids = getattr(iterator, "_queued_web_search_call_ids", None)
+    if not isinstance(queued_ids, set):
+        queued_ids = set()
+        try:
+            iterator._queued_web_search_call_ids = queued_ids
+        except Exception:
+            return
+
+    released = 0
+    for call_id, item in list(calls.items()):
+        if call_id in queued_ids:
+            continue
+        if _web_search_native_module._response_item_get(item, "status") != "completed":
+            continue
+        queue(call_id, item)
+        queued_ids.add(call_id)
+        released += 1
+    if not released:
+        return
+
+    # The lifecycle frames were appended last, but the frames already waiting
+    # include a reasoning block that the provider wrote *before* this search --
+    # the reasoning item is ``output_index`` 0 and the search is 1, so a client
+    # that reads them out of order renders the thinking below the answer (this
+    # is exactly what placed a ``claude-opus-5-5`` thinking block under the
+    # paragraph it had reasoned about).  The search is therefore inserted after
+    # every queued reasoning frame and before the answer's own text.
+    lifecycle = [
+        event
+        for event in pending_tools
+        if _response_event_type(event).startswith("response.web_search_call.")
+        or _response_item_is_web_search_output_event(event)
+    ]
+    if not lifecycle:
+        return
+    pending_tools[:] = [event for event in pending_tools if event not in lifecycle]
+    insert_at = _first_answer_frame_index(pending_response)
+    pending_response[insert_at:insert_at] = lifecycle
+
+
+def _first_answer_frame_index(pending: list[Any]) -> int:
+    """Where the answer starts, so a search can be placed ahead of it.
+
+    Everything a provider says before the answer -- its reasoning item and that
+    item's summary frames -- stays in front: those describe how the search was
+    decided, and the client renders them in the ``output_index`` order the
+    provider itself assigned.
+    """
+
+    for index, event in enumerate(pending):
+        if _response_item_is_reasoning_output_event(event):
+            continue
+        if _response_event_type(event).startswith(
+            "response.reasoning_summary"
+        ):
+            continue
+        return index
+    return len(pending)
+
+
+def _response_item_is_reasoning_output_event(event: Any) -> bool:
+    """Whether a queued event adds or finishes a ``reasoning`` item."""
+
+    if _response_event_type(event) not in {
+        "response.output_item.added",
+        "response.output_item.done",
+    }:
+        return False
+    item = (
+        event.get("item")
+        if isinstance(event, dict)
+        else getattr(event, "item", None)
+    )
+    return _web_search_native_module._response_item_get(item, "type") == (
+        "reasoning"
+    )
+
+
+def _response_event_type(event: Any) -> str:
+    """An event's ``type``, for both the pydantic events and plain dicts."""
+
+    value = (
+        event.get("type")
+        if isinstance(event, dict)
+        else getattr(event, "type", None)
+    )
+    return str(value or "")
+
+
+def _response_item_is_web_search_output_event(event: Any) -> bool:
+    """Whether a queued event adds or finishes a ``web_search_call`` item."""
+
+    if _response_event_type(event) not in {
+        "response.output_item.added",
+        "response.output_item.done",
+    }:
+        return False
+    item = (
+        event.get("item")
+        if isinstance(event, dict)
+        else getattr(event, "item", None)
+    )
+    return _web_search_native_module._response_item_get(item, "type") == (
+        "web_search_call"
+    )
+
+
+
 def _append_missing_pending_tool_search_done_events(pending: list[Any]) -> None:
     added: dict[str, tuple[int, dict[str, Any]]] = {}
     done_ids: set[str] = set()

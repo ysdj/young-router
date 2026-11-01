@@ -377,7 +377,19 @@ def save_config(
     path: pathlib.Path = CONFIG_YAML,
     expected_revision: Any = None,
     document: Any = None,
+    *,
+    probe: bool = False,
 ) -> dict[str, Any]:
+    """Render and validate one provider document, then write it.
+
+    ``probe`` renders and validates the complete candidate without touching the
+    caller's files.  Validation already does this to prove a draft is writable
+    -- it writes the current document into a scratch directory and saves the
+    candidate over it -- and then the real Apply repeated the whole render and
+    parse.  A probe answers that question once, and the answer carries the
+    rendered text the caller would have written, so the commit can validate and
+    write from a single pass.
+    """
     # Loading the editor only needs PyYAML. Import the write path here because
     # it reaches LiteLLM and otherwise adds seconds to every editor open.
     from .dump import (
@@ -538,6 +550,22 @@ def save_config(
             pathlib.Path("config.disabled-models.yaml"),
         )
         next_disabled_text = next_disabled_text.rstrip() + "\n"
+
+    if probe:
+        return {
+            "providers": provider_count,
+            "active": len(active_entries),
+            "disabled": len(disabled_entries),
+            "backup": "",
+            "disabled_path": "",
+            "disabled_backup": "",
+            "revision": _config_revision(path),
+            "dropped_group_references": sorted(set(groups_dropped)),
+            "document": {
+                CONFIG_DOCUMENT_CONFIG_KEY: next_text.rstrip() + "\n",
+                CONFIG_DOCUMENT_DISABLED_KEY: next_disabled_text,
+            },
+        }
 
     stamp = _backup_stamp()
     backup: pathlib.Path | None = None

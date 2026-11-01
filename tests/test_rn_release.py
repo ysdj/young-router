@@ -638,14 +638,21 @@ class ReactNativeReleaseTests(unittest.TestCase):
         # An empty array has to be initialized, and an exit must stop every
         # staged update rather than leave a child writing a cache that the
         # next installer begins to modify.
-        # Six: the four staged releases, the Context Attachment Manager gate
+        # Seven: the four staged releases, the Context Attachment Manager gate
         # that verifies the release this app's image context mirrors, and the
-        # Node runtime that ships beside them and is its own stager because it
-        # is not a release.
-        self.assertEqual(6, script.count('STAGING_PIDS+=("$!")'))
+        # two runtimes that ship beside them and are their own stagers because
+        # neither is a release -- Node, and the Bun the free-model lane's
+        # official OC inference runs every request through.
+        self.assertEqual(7, script.count('STAGING_PIDS+=("$!")'))
         self.assertIn('STAGING_PIDS[@]+"${STAGING_PIDS[@]}"', script)
         self.assertIn('INSTALL_LOCK_PID=$!', script)
         self.assertIn('rm -f "$INSTALL_LOCK_OWNER"', script)
+        # No staging job may be launched by a line that continues a previous
+        # one: a quoted path split across a newline inside an array assignment
+        # folds the next command into it, and the job never starts.  The build
+        # then reports a failed staging pass with no stager having run at all.
+        self.assertNotIn(')"${', script)
+        self.assertNotIn(')"$PROJECT_ROOT', script)
 
     def test_windows_payload_ships_the_core_that_was_just_built(self) -> None:
         """One build ships the Core it just tested, not the previous one.
@@ -1062,13 +1069,23 @@ class ReactNativeReleaseTests(unittest.TestCase):
             self.assertIn(f"--exclude '{staged}'", script)
 
         # One restart, after both halves, through the shared stop policy.
+        #
+        # The Metro branch is the one exception and it is not the sync: it does
+        # not carry a change into the app, it points the app at a dev server
+        # that is about to be started, so its restart is what makes the override
+        # visible and the sync path still restarts exactly once.
         restart_line = '"$RESTART_APP" >/dev/null 2>&1'
-        self.assertEqual(script.count(restart_line), 1)
+        metro_start = script.index('if [[ "$MODE" == "metro" ]]; then')
+        metro_end = script.index("\nfi\n", metro_start)
+        sync_script = script[:metro_start] + script[metro_end:]
+        self.assertEqual(script.count(restart_line), 2)
+        self.assertEqual(sync_script.count(restart_line), 1)
+        self.assertEqual(script[metro_start:metro_end].count(restart_line), 1)
         auto_branch_start = script.index("  auto)")
         auto_branch_end = script.index("esac", auto_branch_start)
         self.assertIn("sync_python", script[auto_branch_start:auto_branch_end])
         self.assertIn("sync_js", script[auto_branch_start:auto_branch_end])
-        self.assertGreater(script.index(restart_line), auto_branch_end)
+        self.assertGreater(sync_script.index(restart_line), auto_branch_end - (metro_end - metro_start))
 
     def test_the_isolated_proxy_loop_runs_the_checkout_not_the_bundle(self) -> None:
         # The data-plane loop starts a second proxy from the checkout's

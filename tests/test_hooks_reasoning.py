@@ -136,6 +136,66 @@ class HookReasoningMappingTests(HookTestCase):
         }
         self.assertIsNone(hooks._with_model_reasoning_mapping(unknown))
 
+    def test_a_client_ultra_is_clamped_onto_the_hardest_mapped_level(self) -> None:
+        """``ultra`` is the listing's top tier, never a word sent upstream.
+
+        A published listing states ``ultra`` beside every ``max`` because the
+        client's own models do, but the route's capability stops at the levels
+        a provider maps.  A client that then asks for ``ultra`` has to land on
+        ``max`` here -- forwarding the tier name verbatim would hand an
+        upstream a reasoning effort it has never heard of.
+        """
+
+        hooks, _ = load_hook_module()
+        root = Path(self.create_temp_dir())
+        self._configure_pi_cache(
+            root,
+            {
+                "custom/agent": self._record(
+                    {
+                        "off": "none",
+                        "minimal": None,
+                        "low": "low",
+                        "medium": "medium",
+                        "high": "high",
+                        "xhigh": "xhigh",
+                        "max": "max",
+                    }
+                ),
+                "custom/through-high": self._record(
+                    {
+                        "off": "none",
+                        "high": "high",
+                        "xhigh": None,
+                        "max": None,
+                    }
+                ),
+            },
+        )
+
+        deepest = {
+            "model": "agent",
+            "litellm_params": {"model": "agent", "custom_llm_provider": "custom"},
+            "reasoning_effort": "ultra",
+        }
+        mapped = hooks._with_model_reasoning_mapping(deepest)
+        self.assertIsNotNone(mapped)
+        assert mapped is not None
+        self.assertEqual("max", mapped["reasoning_effort"])
+
+        without_max = {
+            "model": "through-high",
+            "litellm_params": {
+                "model": "through-high",
+                "custom_llm_provider": "custom",
+            },
+            "reasoning_effort": "ultra",
+        }
+        mapped = hooks._with_model_reasoning_mapping(without_max)
+        self.assertIsNotNone(mapped)
+        assert mapped is not None
+        self.assertEqual("high", mapped["reasoning_effort"])
+
     async def test_pre_call_hook_applies_pi_mapping_after_deployment_selection(self) -> None:
         hooks, _ = load_hook_module()
         root = Path(self.create_temp_dir())

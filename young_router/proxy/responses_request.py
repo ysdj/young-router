@@ -287,7 +287,7 @@ def _request_replay_payload_bytes(request_kwargs: Optional[dict]) -> Optional[in
 
 def _with_responses_native_extra_body(request_kwargs: dict) -> Optional[dict]:
     if request_kwargs.get("use_chat_completions_api") is True:
-        return None
+        return _without_responses_native_extra_body(request_kwargs)
     if not _request_has_responses_shape(request_kwargs):
         return None
 
@@ -315,6 +315,41 @@ def _with_responses_native_extra_body(request_kwargs: dict) -> Optional[dict]:
 
     modified_kwargs = request_kwargs.copy()
     modified_kwargs["extra_body"] = merged_extra_body
+    return modified_kwargs
+
+
+def _without_responses_native_extra_body(request_kwargs: dict) -> Optional[dict]:
+    """Drop the Responses-wire passthrough keys from a Chat-shaped request.
+
+    ``_with_responses_native_extra_body`` copies ``client_metadata`` into
+    ``extra_body`` because that is the only container LiteLLM forwards to a
+    Responses endpoint.  A bridge then flips the same request to a Chat or
+    Anthropic wire, and LiteLLM puts that container into the provider body
+    unchanged -- where no field of it is legal input.  Observed on an Anthropic
+    route: the whole turn ended HTTP 400 ``extra_body: extra inputs are not
+    permitted``, and because the bridge had already produced a terminal event
+    the reader was shown "the router could not classify the stop".
+
+    Only the keys this module adds are removed.  A bridged request may also
+    carry ``tools`` (``_sync_bridge_extra_body_tools``) or another provider's
+    namespace, and those belong to the wire being sent.
+    """
+
+    existing_extra_body = request_kwargs.get("extra_body")
+    if not isinstance(existing_extra_body, dict):
+        return None
+    remaining = {
+        key: value
+        for key, value in existing_extra_body.items()
+        if key not in _RESPONSES_NATIVE_EXTRA_BODY_KEYS
+    }
+    if len(remaining) == len(existing_extra_body):
+        return None
+    modified_kwargs = request_kwargs.copy()
+    if remaining:
+        modified_kwargs["extra_body"] = remaining
+    else:
+        modified_kwargs.pop("extra_body", None)
     return modified_kwargs
 
 

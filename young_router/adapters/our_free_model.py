@@ -28,7 +28,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from ..core.persistence import PersistenceError, read_json
-from ..node_runtime import node_command as node_runtime_command
+from ..node_runtime import bundled_executable, node_command as node_runtime_command
 
 
 # The provider ids a saved route addresses this lane by, and the auth kind that
@@ -105,7 +105,14 @@ API_KEY_NAME = "our-free-model-local"
 _STAGED_DIRECTORY = "our-free-model"
 _DIR_ENV = "YOUNG_ROUTER_OUR_FREE_MODEL_DIR"
 _NODE_ENV = "YOUNG_ROUTER_OUR_FREE_MODEL_NODE"
+_BUN_ENV = "YOUNG_ROUTER_OUR_FREE_MODEL_BUN"
 _WORKER_ENV = "YOUNG_ROUTER_OUR_FREE_MODEL_WORKER"
+#: The upstream's own name for the executable its free lane dials through.
+#: Setting it is how this bridge makes the staged package use the Bun runtime
+#: that ships beside Node; the package discovers one on ``PATH`` on its own,
+#: and PATH is exactly what an installed app launched from Finder does not have.
+_UPSTREAM_BUN_ENV = "OUR_FREE_MODEL_BUN"
+_BUN_NAME = "bun.exe" if os.name == "nt" else "bun"
 _START_TIMEOUT_SECONDS = 45.0
 _STATUS_TIMEOUT_SECONDS = 30.0
 _MODELS_TIMEOUT_SECONDS = 90.0
@@ -187,18 +194,46 @@ def node_command() -> str:
     )
 
 
-def upstream_environment() -> dict[str, str]:
-    """Point the upstream's explicitly configurable ESBuild install at its own."""
+def bun_command() -> str:
+    """The Bun executable the staged upstream dials the free lane through.
 
+    The upstream moved its official OpenCode inference lane onto Bun and refuses
+    that lane's rows -- including the whole roster read -- when it cannot find
+    one.  An empty answer is not a failure here: the package falls back to its
+    own discovery, and a host that installed Bun itself still works.  The
+    executable is resolved, never installed: this bridge downloads nothing at
+    run time, and a build stages it beside the runtime it already ships.
+    """
+
+    return bundled_executable(
+        env_name=_BUN_ENV,
+        name=_BUN_NAME,
+    )
+
+
+def upstream_environment() -> dict[str, str]:
+    """The environment the staged upstream's worker is started with.
+
+    Two facts belong here, and both are about a path this app owns rather than
+    one the user's shell would have supplied: the ESBuild install the package
+    reuses, and the Bun executable its free lane requires.  A Finder-launched
+    app has no login ``PATH``, so anything the package would have to discover
+    there has to be named instead.
+    """
+
+    values: dict[str, str] = {}
     configured = os.environ.get("ESBUILD_BINARY_PATH", "").strip()
     binary = (
         Path(configured).expanduser()
         if configured
         else load_root() / "node_modules" / ".bin" / "esbuild"
     )
-    if not binary.is_file():
-        return {}
-    return {"ESBUILD_BINARY_PATH": str(binary)}
+    if binary.is_file():
+        values["ESBUILD_BINARY_PATH"] = str(binary)
+    bun = bun_command()
+    if bun:
+        values[_UPSTREAM_BUN_ENV] = bun
+    return values
 
 
 _PUBLISHED_LOCK = threading.Lock()
@@ -823,6 +858,7 @@ __all__ = [
     "api_base_reference",
     "api_key_reference",
     "available",
+    "bun_command",
     "node_command",
     "published_environment",
     "staged_root",

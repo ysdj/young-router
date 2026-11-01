@@ -151,6 +151,7 @@ from .base import (
     _UPSTREAM_HTML_BAD_REQUEST_MARKERS,
     _UPSTREAM_RELAY_CAPACITY_MARKERS,
     _UPSTREAM_TOOL_HISTORY_REJECTION_MARKERS,
+    _UPSTREAM_FIELD_REJECTION_MARKERS,
     _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES,
     _UPSTREAM_TEMPORARY_ERROR_MARKERS,
     _is_upstream_truncated_stream_error,
@@ -1056,6 +1057,11 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
         # longer pair up.  Another candidate may accept the same history, and
         # the route itself is not broken, so this attempt moves on instead of
         # ending the turn (the same reading as a refused thinking replay).
+        return _RECOVERY_POLICY_RECOVERY
+    if _is_upstream_request_field_rejected_error(exception):
+        # The same reading, for the field layout this proxy builds: a route
+        # whose validator refuses ``extra_body`` or ``litellm_params`` says
+        # nothing about the bytes' meaning, and a sibling may accept them.
         return _RECOVERY_POLICY_RECOVERY
     if _is_thinking_replay_contract_error(exception):
         # The route that refused is not broken -- it refuses a history that
@@ -4941,6 +4947,8 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         reason = "upstream-client-version-rejected"
     elif _is_upstream_tool_history_rejected_error(exception):
         reason = "upstream-tool-history-rejected"
+    elif _is_upstream_request_field_rejected_error(exception):
+        reason = "upstream-request-field-rejected"
     elif _is_image_generation_tool_runtime_fallback_error(exception):
         reason = "image-generation-tool-runtime-fallback"
     elif _is_upstream_deployment_failover_error(exception):
@@ -6577,6 +6585,12 @@ def _is_priority_deployment_failover_error(exception: Exception) -> bool:
     if _is_upstream_tool_history_rejected_error(exception):
         # This route refuses the replayed tool history; a peer may accept it.
         return True
+    if _is_upstream_request_field_rejected_error(exception):
+        # A wire implementation detail -- a container this proxy builds, or a
+        # key litellm adds -- is what the route refused.  A sibling of the same
+        # group may validate a different payload shape, so the attempt advances
+        # instead of ending the turn on the route whose validator is strictest.
+        return True
     if _is_upstream_deployment_failover_error(exception):
         return True
     if _is_upstream_gateway_bad_request_error(exception):
@@ -7331,6 +7345,62 @@ def _upstream_tool_history_rejected_message(model_group: str) -> str:
     )
 
 
+def _is_upstream_request_field_rejected_error(exception: Exception) -> bool:
+    """Whether every route refused the *fields* this proxy asked it to accept.
+
+    A 4xx with no cause this router knows is not automatically unexplainable.
+    The shape that matters most here is the one this proxy creates for itself:
+    a key carried in the provider's own payload vocabulary -- ``extra_body``, a
+    ``litellm_params`` container, an internal ``_young_router_*`` marker -- that
+    the route's validator rejects by name.  Observed live: an Anthropic route
+    answered HTTP 400 ``extra_body: extra inputs are not permitted``, the
+    bridge had already produced the terminal event, and the reader was shown
+    "the router could not classify the stop" for a payload defect this
+    installation could read straight off the sentence.
+
+    Read only the refusal's own field-naming shape, never a status: an
+    ordinary 400 about the conversation stays the request's verdict and keeps
+    its own message, and one whose sentence names no field at all (a bare
+    ``invalid_request_error``) still belongs to the unclassified branch.
+    """
+
+    status_code = _exception_status_code(exception)
+    if status_code is None:
+        status_code = _nested_upstream_status_code(exception)
+    if status_code not in {400, 422}:
+        return False
+    text = _exception_text(exception)
+    if not any(marker in text for marker in _UPSTREAM_FIELD_REJECTION_MARKERS):
+        return False
+    return any(
+        field in text
+        for field in (
+            "extra_body",
+            "litellm_params",
+            "_young_router_",
+            "client_metadata",
+            "prompt_cache_key",
+            "web_search_options",
+        )
+    )
+
+
+def _upstream_request_field_rejected_message(model_group: str) -> str:
+    """The one sentence for a route that refused a field this proxy sent.
+
+    Shared by both wire formats.  It says the payload shape was refused rather
+    than the conversation, names no cause the user can act on, and invites no
+    resend: an identical body reaches the identical validator.
+    """
+
+    return (
+        "The upstream rejected this request's field layout for "
+        f"{model_group}, and no other candidate route accepted it. This is a "
+        "payload-compatibility defect in the route, not something about the "
+        "conversation; the route trace records the field the upstream named."
+    )
+
+
 def _sanitized_upstream_route_failure_message(
     model: Optional[str],
     exception: Exception,
@@ -7387,6 +7457,11 @@ def _sanitized_upstream_route_failure_message(
         # Same rule: only a new task changes this verdict, so a retry tip would
         # send the client back with the identical history.
         return _upstream_tool_history_rejected_message(model_group)
+    if _is_upstream_request_field_rejected_error(exception):
+        # Same rule again, and the one this proxy is most likely to produce
+        # itself: a field layout this installation built is refused the same
+        # way on every replay.
+        return _upstream_request_field_rejected_message(model_group)
     status_code = _exception_status_code(exception)
     relay_message = _upstream_relay_capacity_message(exception)
     if _is_upstream_relay_capacity_error(exception):

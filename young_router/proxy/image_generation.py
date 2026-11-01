@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import copy
 import json
 import os
 from pathlib import Path
@@ -537,10 +538,68 @@ def _image_generation_attach_paths_to_payload(
     return changed
 
 
+#: How often one response may need an opening frame restored.  A turn that
+#: renders more images than this in one response is already beyond what the
+#: client shows, and the bound keeps a malformed stream from growing the set.
+_IMAGE_GENERATION_OPENED_ITEM_LIMIT = 64
+
+
+def _image_generation_item_opening_event(
+    payload: dict[str, Any],
+    opened_item_ids: Optional[set[str]] = None,
+) -> Optional[dict[str, Any]]:
+    """The opening frame a completed image item never stated, or ``None``.
+
+    A route that answers the whole generation in one read hands over
+    ``response.output_item.done`` and nothing else.  Codex opens an output item
+    on ``response.output_item.added`` and renders the picture into that block,
+    so a done-only item is stored -- the rollout carries the completed call --
+    while the live turn draws nothing.  Observed live 2026-11-02: a 2.2 MB PNG
+    arrived for ``gpt-image-2.5-flare``, ``task_complete`` carried no message,
+    and the transcript stayed blank.
+
+    The baseline of the restored frame is the item itself, not the item minus
+    its payload: a ``sequence_number`` is only valid in non-decreasing order, so
+    the opening must not renumber an item the client already accepted.  An item
+    this response has already opened, and every frame that is not a completed
+    image call, stay untouched.
+    """
+
+    if payload.get("type") != "response.output_item.done":
+        return None
+    item = payload.get("item")
+    if not isinstance(item, dict) or item.get("type") != "image_generation_call":
+        return None
+    if not _image_generation_result_is_present(item.get("result")):
+        return None
+    if opened_item_ids is not None:
+        item_id = _image_generation_call_identifier(item)
+        if item_id in opened_item_ids:
+            return None
+        if len(opened_item_ids) >= _IMAGE_GENERATION_OPENED_ITEM_LIMIT:
+            return None
+        opened_item_ids.add(item_id)
+    opening_item = copy.deepcopy(item)
+    opening_item["status"] = "in_progress"
+    opening_item.pop("result", None)
+    opening_item.pop("saved_path", None)
+    opening_event: dict[str, Any] = {
+        "type": "response.output_item.added",
+        "item": opening_item,
+    }
+    for key in ("output_index", "sequence_number", "model"):
+        if key in payload:
+            opening_event[key] = payload[key]
+    return opening_event
+
+
 def _image_generation_stream_text_chunk_for_delivery(
     chunk: str | bytes,
     request_data: Optional[dict],
     saved_paths: Optional[list[str]] = None,
+    opened_item_ids: Optional[set[str]] = None,
+    *,
+    attach_paths: bool = True,
 ) -> str | bytes:
     is_bytes = isinstance(chunk, bytes)
     if is_bytes:
@@ -569,14 +628,26 @@ def _image_generation_stream_text_chunk_for_delivery(
         except (TypeError, ValueError):
             updated_lines.append(line)
             continue
-        if not isinstance(payload, dict) or not _image_generation_attach_paths_to_payload(
+        if not isinstance(payload, dict):
+            updated_lines.append(line)
+            continue
+        opening_event = _image_generation_item_opening_event(
+            payload,
+            opened_item_ids,
+        )
+        paths_changed = attach_paths and _image_generation_attach_paths_to_payload(
             payload,
             request_data,
             saved_paths,
-        ):
+        )
+        if opening_event is None and not paths_changed:
             updated_lines.append(line)
             continue
         newline = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
+        if opening_event is not None:
+            updated_lines.append(
+                f"data: {json.dumps(opening_event, ensure_ascii=False)}{newline}"
+            )
         updated_lines.append(f"data: {json.dumps(payload, ensure_ascii=False)}{newline}")
         changed = True
 
@@ -587,11 +658,18 @@ def _image_generation_stream_text_chunk_for_delivery(
             payload = json.loads(text.strip())
         except (TypeError, ValueError):
             return chunk
-        if not isinstance(payload, dict) or not _image_generation_attach_paths_to_payload(
+        if not isinstance(payload, dict):
+            return chunk
+        opening_event = _image_generation_item_opening_event(
+            payload,
+            opened_item_ids,
+        )
+        paths_changed = attach_paths and _image_generation_attach_paths_to_payload(
             payload,
             request_data,
             saved_paths,
-        ):
+        )
+        if opening_event is None and not paths_changed:
             return chunk
         transformed = json.dumps(payload, ensure_ascii=False)
     return transformed.encode("utf-8") if is_bytes else transformed
@@ -638,8 +716,27 @@ def _image_generation_stream_chunks_for_delivery(
     chunk: Any,
     request_data: Optional[dict],
     saved_paths: Optional[list[str]] = None,
+    opened_item_ids: Optional[set[str]] = None,
+    *,
+    attach_paths: bool = True,
 ) -> list[Any]:
-    """Persist real image bytes and attach the native Codex path to the item."""
+    """Persist real image bytes, attach the native Codex path, and open the item.
+
+    Two paths reach this: an SSE ``str``/``bytes`` read, handled line by line so
+    the restored opening frame joins the same read, and a decoded chunk.  The
+    decoded shape is not one frame either -- a dict carrying a completed image
+    item at the top level (not nested under ``item``) is what the delivery path
+    hands over on a live stream -- so it answers a list for the same reason.
+
+    ``attach_paths`` gates only what this app *adds* -- the saved path and the
+    markdown reference pointing at it, which a client proves it can read before
+    either is yours to write.  The opening frame is delivery shape every
+    Responses client needs, so it is restated whether or not this request
+    carries that evidence.  Observed live 2026-11-02: ``codex exec`` sent no
+    client-evidence header, so ``attach_paths`` was false, the completion
+    arrived without its opening frame, and the turn finished blank again while
+    the rollout held the image.
+    """
 
     if isinstance(chunk, (str, bytes)):
         return [
@@ -647,14 +744,20 @@ def _image_generation_stream_chunks_for_delivery(
                 chunk,
                 request_data,
                 saved_paths,
+                opened_item_ids,
+                attach_paths=attach_paths,
             )
         ]
     payload = _image_generation_stream_chunk_payload(chunk)
-    if payload is not None:
-        _image_generation_attach_paths_to_payload(payload, request_data, saved_paths)
     if payload is None:
         return [chunk]
-    return [_image_generation_stream_chunk_with_payload(chunk, payload)]
+    if attach_paths:
+        _image_generation_attach_paths_to_payload(payload, request_data, saved_paths)
+    delivered = [_image_generation_stream_chunk_with_payload(chunk, payload)]
+    opening_event = _image_generation_item_opening_event(payload, opened_item_ids)
+    if opening_event is not None:
+        delivered.insert(0, opening_event)
+    return delivered
 
 
 def _response_has_image_generation_result_payload(response: Any) -> bool:

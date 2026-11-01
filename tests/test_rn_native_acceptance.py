@@ -237,7 +237,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         )[0]
         self.assertIn("for child in childPanels.filter({ $0.parent === window }).map({ $0.window }) {", close_path)
         self.assertIn("endChildPanel(child)", close_path)
-        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" || windowRoute == "image-context" {', open_route)
+        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" {', open_route)
         self.assertIn("presentChildPanel(window, in: settingsWindow())", open_route)
         self.assertIn("endChildPanel(window)", close_route)
         self.assertIn('let restoreProviderModels = selectedRoute == "provider-wizard"', close_route)
@@ -496,8 +496,16 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "RecoverEditorPage(\"page_load_failed\")",
             "html_state_generation_ == editor_state_generation_",
             "onEditorChange(std::move(event))",
+            "void ScaleChildSiteLink(",
+            "metrics.Frame.Width * scale, metrics.Frame.Height * scale",
+            "child_layout_metrics_token_",
+            "static winrt::fire_and_forget InitializeBrowserAsync(",
+            "winrt::com_ptr<CodeWebViewComponentView> self",
+            "self->ApplyProps(nullptr);",
         ):
             self.assertIn(marker, windows_controls)
+        self.assertNotIn('TraceCodeEditor("', windows_controls)
+        self.assertNotIn("ProbeEditorPage", windows_controls)
         for obsolete in (
             "/v1/host/editor/read",
             "/v1/host/editor/stage",
@@ -1202,7 +1210,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # an explicit route whitelist; a whitelist silently dropped General
         # onto a plain titled window while the shared shell still reserved its
         # title-bar inset.
-        self.assertIn('NSSet<NSString *> *standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor", @"image-context"]];', app_delegate)
+        self.assertIn('NSSet<NSString *> *standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor"]];', app_delegate)
         self.assertIn("const BOOL settingsShell = ![standaloneRoutes containsObject:route];", app_delegate)
         # The material belongs to the window; a per-table backdrop would stack
         # a second vibrancy layer over only the table's own rows.
@@ -1369,7 +1377,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # A warm editor window boots its React root off screen; the shared
         # child-surface presentation is what puts it in front of the app.
         self.assertIn("if warmOnly {", mac_leaf)
-        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" || windowRoute == "image-context" {', mac_leaf)
+        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" {', mac_leaf)
         self.assertIn("presentChildPanel(window, in: settingsWindow())", mac_leaf)
         # The editor sheet exists for exactly one document: a bare deep link or
         # an AppKit-restored window must not present an empty editor.
@@ -1383,7 +1391,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("RCT_EXTERN_METHOD(prepareFileEditor)", mac_bridge)
         self.assertIn("RCT_EXTERN__BLOCKING_SYNCHRONOUS_METHOD(pendingFileEditorTarget)", mac_bridge)
         app_delegate = (MAC_PROJECT / "YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
-        self.assertIn('standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor", @"image-context"]];', app_delegate)
+        self.assertIn('standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor"]];', app_delegate)
         self.assertIn('props[@"initialFileTarget"] = fileId;', app_delegate)
         self.assertIn("NSString *fileId, NSWindow *existingWindow", app_delegate)
         self.assertIn('if (route == L"file-editor") return {900, 560};', win_leaf)
@@ -1712,7 +1720,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
         self.assertIn("showProviderAuth?(options:", types)
         self.assertIn("fingerprint?: string;", types)
-        self.assertIn("callbackURL?: string;", types)
+        # One flow is left: OpenAI's device code.  A loopback callback address
+        # belonged to the retired Claude OAuth flow, and a field nothing can
+        # produce is an invitation to rebuild it.
+        self.assertNotIn("callbackURL?: string;", types)
         self.assertIn("showProviderAuth?(options:", bridge)
         self.assertIn("showProviderAuth?:", platform)
         self.assertIn("showProviderAuth: bridge.showProviderAuth", bridge)
@@ -1742,7 +1753,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # The navigation rule is the flow's, injected into the window: the
         # station stays on its origin, a provider page follows its own policy.
         self.assertIn(
-            "NativeProviderAuthPolicy.allows(provider: provider, url: target, callbackURL: policyCallbackURL)",
+            "NativeProviderAuthPolicy.allows(provider: provider, url: target)",
             mac,
         )
         self.assertIn("allowed = navigationAction.request.url.map(handoff.allows) ?? false", mac)
@@ -1761,9 +1772,6 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "\nprivate final class NativeRelayLoginController", 1
         )[0]
         self.assertIn('url.scheme?.lowercased() == "https"', policy)
-        self.assertIn('url.scheme?.lowercased() == "http"', policy)
-        self.assertIn('host == "localhost" || host == "127.0.0.1"', policy)
-        self.assertIn('url.path == "/callback"', policy)
         self.assertIn('host == "auth.openai.com"', policy)
         # The official sign-in's proof-of-work frame runs on its own OpenAI
         # origin. A path allowlist that omitted that host cancelled the frame,
@@ -1773,9 +1781,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('host == "auth.openai.com" || host == "login.openai.com" || host == "sentinel.openai.com"', policy)
         self.assertIn('host == "challenges.cloudflare.com"', policy)
         self.assertIn('path.hasPrefix("/ces/")', policy)
-        self.assertIn('if provider == "claude" {', mac)
-        self.assertIn('NSWorkspace.shared.open(url)', mac)
-        self.assertLess(mac.index('if provider == "claude" {'), mac.index('let authFingerprint: String'))
+        # Claude's flow is gone, and the loopback callback it needed with it:
+        # no local origin may ever be accepted by this policy again.
+        self.assertNotIn('path == "/callback"', policy)
+        self.assertNotIn('if provider == "claude" {', mac)
 
     def test_localization_crosses_the_native_leaf_contract(self) -> None:
         types = (SHARED / "types.ts").read_text(encoding="utf-8")

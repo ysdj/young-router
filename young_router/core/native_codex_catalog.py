@@ -6,6 +6,7 @@ import copy
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,9 @@ _CODEX_CLI_DEFAULT_ENTRYPOINT = "bin/codex"
 
 _CACHE_LOCK = threading.RLock()
 _CATALOG_CACHE: dict[tuple[str, int, int], tuple[dict[str, Any], ...]] = {}
+# Keyed like the catalog cache, because a replaced binary is a replaced client.
+_CLIENT_VERSION_CACHE: dict[tuple[str, int, int], str] = {}
+_VERSION_PATTERN = re.compile(r"(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)")
 
 
 def _append_candidate(result: list[Path], seen: set[str], value: object) -> None:
@@ -74,6 +78,26 @@ def _codex_cli_package_entrypoint(package_dir: Path) -> str:
     if candidate.startswith("/") or ".." in Path(candidate).parts:
         return _CODEX_CLI_DEFAULT_ENTRYPOINT
     return candidate
+
+
+def _codex_cli_package_manifest(executable: Path) -> dict[str, Any]:
+    """The manifest of the package an executable sits in, when it sits in one.
+
+    The entry point lives at ``<package>/bin/codex`` and its manifest beside the
+    ``bin`` directory; a historic layout put the binary at the app's Resources
+    root with no manifest at all.  Only a bounded walk upward is attempted, so
+    this never reads a manifest that belongs to some unrelated directory.
+    """
+
+    for parent in list(executable.parents)[:3]:
+        manifest = parent / _CODEX_CLI_PACKAGE_FILE_NAME
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(payload, Mapping):
+            return dict(payload)
+    return {}
 
 
 def codex_app_cli_candidates(resources_dir: Path) -> tuple[Path, ...]:
@@ -185,6 +209,61 @@ def read_native_catalog(
     return _models_from_payload(payload)
 
 
+def _read_client_version(executable: Path) -> str:
+    """The version one installed client reports, or nothing.
+
+    The manifest is read first because it costs no process; a layout without
+    one is asked directly.  Either answer is the client's own claim about
+    itself, which is exactly what a roster endpoint gates on.
+    """
+
+    manifest = _codex_cli_package_manifest(executable)
+    declared = manifest.get("version")
+    if isinstance(declared, str) and _VERSION_PATTERN.search(declared):
+        return _VERSION_PATTERN.search(declared).group(1)  # type: ignore[union-attr]
+    try:
+        completed = subprocess.run(
+            [os.fspath(executable), "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=NATIVE_CATALOG_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+    output = getattr(completed, "stdout", None)
+    if getattr(completed, "returncode", None) != 0 or not isinstance(output, bytes):
+        return ""
+    match = _VERSION_PATTERN.search(output.decode("utf-8", "replace"))
+    return match.group(1) if match else ""
+
+
+def native_codex_client_version() -> str:
+    """The version of the installed Codex client, or ``""`` when none is.
+
+    Not this app's identity: it is the *client* version a model roster is asked
+    for, and a roster endpoint answers an old claim with an empty list instead
+    of a refusal.  Naming a version this installation no longer is, or none at
+    all, is how an account that serves plenty of models reported none.
+    """
+
+    for executable in native_codex_executable_candidates():
+        key = _cache_key(executable)
+        if key is None:
+            continue
+        with _CACHE_LOCK:
+            cached = _CLIENT_VERSION_CACHE.get(key)
+        if cached is not None:
+            return cached
+        version = _read_client_version(executable)
+        if not version:
+            continue
+        with _CACHE_LOCK:
+            _CLIENT_VERSION_CACHE[key] = version
+        return version
+    return ""
+
+
 def _cache_key(executable: Path) -> tuple[str, int, int] | None:
     try:
         details = executable.stat()
@@ -217,6 +296,7 @@ __all__ = [
     "NATIVE_CATALOG_MAX_BYTES",
     "NATIVE_CATALOG_TIMEOUT_SECONDS",
     "load_native_catalog",
+    "native_codex_client_version",
     "native_codex_executable_candidates",
     "read_native_catalog",
 ]

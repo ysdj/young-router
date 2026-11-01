@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import inspect
 import json
 import os
@@ -10,6 +11,7 @@ import threading
 import time
 import unittest
 import urllib.request
+import uuid
 from unittest import mock
 
 from young_router.core import (
@@ -104,6 +106,9 @@ class CoreProtocolTests(unittest.TestCase):
             def image_context_sweeper(self) -> "FakeScheduler":
                 return FakeScheduler("cleanup")
 
+            def service_supervisor(self) -> "FakeScheduler":
+                return FakeScheduler("supervisor")
+
             def shutdown(self, *, stopped_by: str = "app_exit") -> None:
                 # SIGTERM is how a host or a script *replaces* Core; the record
                 # must say so rather than read as the user's own Stop.
@@ -146,10 +151,19 @@ class CoreProtocolTests(unittest.TestCase):
         ):
             self.assertEqual(0, core_main.run(["--parent-pid", "4321"]))
 
-        # Both loops start with the IPC endpoint and stop before the store they
-        # work on is shut down.
+        # Every loop starts with the IPC endpoint; the store stops the ones it
+        # owns (the proxy supervisor included) before it shuts the proxy down.
         self.assertEqual(
-            ["server.start", "scheduler.start", "cleanup.start", "scheduler.stop", "cleanup.stop", "core.shutdown", "server.stop"],
+            [
+                "server.start",
+                "scheduler.start",
+                "cleanup.start",
+                "supervisor.start",
+                "scheduler.stop",
+                "cleanup.stop",
+                "core.shutdown",
+                "server.stop",
+            ],
             events,
         )
         self.assertEqual(["core_replaced"], record_states)
@@ -159,7 +173,7 @@ class CoreProtocolTests(unittest.TestCase):
         schema = load_protocol_schema()
         self.assertEqual(1, schema["protocol_version"])
         self.assertEqual(
-            ["snapshot", "disk_state", "logs", "editor", "files", "image_context_image", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import_preview", "import"],
+            ["snapshot", "disk_state", "logs", "editor", "files", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import_preview", "import"],
             schema["methods"],
         )
         typescript = (
@@ -217,7 +231,6 @@ class CoreProtocolTests(unittest.TestCase):
             "logs": {"tab": "requests"},
             "editor": {"domain": "codex", "document": "config"},
             "files": {},
-            "image_context_image": {"task": "task-one", "id": "IMG-0001"},
             "dispatch": {"action": {"type": "set", "domain": "language", "payload": {}}},
             "subscribe": {"topics": ["snapshot"]},
             "validate": {"domain": "language", "revision": 0},
@@ -229,7 +242,6 @@ class CoreProtocolTests(unittest.TestCase):
             "import": {"import_plan_token": "plan", "sections": ["language"], "revision": 0},
         }
         invalid = {
-            "image_context_image": {"task": "task-one"},
             "snapshot": {"stale": True},
             "disk_state": {"domains": []},
             "logs": {"tab": "unknown"},
@@ -302,18 +314,6 @@ class CoreProtocolTests(unittest.TestCase):
                         "exists": False,
                     }
                 ],
-            },
-            "image_context_image": {
-                "task": "task-one",
-                "id": "IMG-0001",
-                "mime": "image/png",
-                "bytes": 3,
-                "width": None,
-                "height": None,
-                "turn": None,
-                "name": None,
-                "data_url": None,
-                "downscaled": False,
             },
             "dispatch": {"revision": 0, "action_summary": {"operation": "fetch_models"}},
             "subscribe": {"subscription_id": "subscription"},
@@ -1769,6 +1769,87 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
                 finally:
                     client.close()
                     server.stop()
+
+class CoreIPCKeepAliveTests(unittest.TestCase):
+    """One loopback socket must carry every request a window makes.
+
+    A settings control is one round trip and a typed field issues several, so
+    the handler keeps the connection open.  The stdlib only hands the next
+    request to the handler if the previous one consumed its body: an unread body
+    stays in the buffer and its bytes become the next request line.  That failed
+    two ways before it was pinned here -- ``{}`` read back as the method
+    ``{}POST`` (answered 501), and a body drained *after* the reply, which left
+    both sides waiting on each other until the client timed out.
+    """
+
+    def _connection(self, server: CoreIPCServer) -> tuple[http.client.HTTPConnection, str]:
+        connection = http.client.HTTPConnection(server.address, server.port, timeout=10)
+        connection.request(
+            "POST",
+            "/v1/hello",
+            body=b"{}",
+            headers={"Authorization": f"Bearer {server.bootstrap_token}", "Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        token = response.headers.get("X-LiteLLM-Core-Session") or ""
+        response.read()
+        self.assertEqual(200, response.status)
+        self.assertTrue(token)
+        return connection, token
+
+    def test_a_kept_alive_socket_carries_sequential_requests(self) -> None:
+        core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
+        server = CoreIPCServer(core)
+        server.start()
+        try:
+            connection, token = self._connection(server)
+            for _ in range(3):
+                body = json.dumps(
+                    {
+                        "protocol_version": 1,
+                        "request_id": uuid.uuid4().hex,
+                        "method": "snapshot",
+                        "params": {},
+                    }
+                ).encode()
+                connection.request(
+                    "POST",
+                    "/v1",
+                    body=body,
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                )
+                response = connection.getresponse()
+                payload = json.loads(response.read())
+                self.assertEqual(200, response.status, payload)
+                self.assertTrue(payload["ok"])
+            connection.close()
+        finally:
+            server.stop()
+
+    def test_a_route_that_never_reads_its_body_still_leaves_a_reusable_socket(self) -> None:
+        # ``/v1/hello`` answers without parsing anything: it is the route whose
+        # unread body corrupted the next request line.
+        core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
+        server = CoreIPCServer(core)
+        server.start()
+        try:
+            connection, token = self._connection(server)
+            body = json.dumps(
+                {"protocol_version": 1, "request_id": uuid.uuid4().hex, "method": "snapshot", "params": {}}
+            ).encode()
+            connection.request(
+                "POST",
+                "/v1",
+                body=body,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            self.assertEqual(200, response.status)
+            self.assertTrue(json.loads(response.read())["ok"])
+            connection.close()
+        finally:
+            server.stop()
+
 
 class CoreIPCTests(unittest.TestCase):
     def test_dispatch_returns_the_fetch_summary_through_authenticated_ipc(self) -> None:

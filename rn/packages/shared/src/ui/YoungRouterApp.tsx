@@ -5,7 +5,7 @@ import { createTranslator } from "../i18n";
 import { assistantSettingOptions, type AssistantSettingOption } from "../i18n/assistantSettingsI18n";
 import { runtimeCategoryLabel, runtimeFieldHelp, runtimeFieldLabel, runtimeOptionLabel, runtimeUnitLabel } from "../i18n/runtimeSettingsI18n";
 import { canonicalWindowRoute, isSettingsPaneRoute, isSettingsShellRoute, LOG_TABS, routeMenuActions, ROUTES, SETTINGS_PANES, SETTINGS_PANE_PRESENTATION } from "../routes";
-import { NativeButton, NativeBusySpinner, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeSecureTextInput, NativeSegmentedControl, NativeTable, NativeTextField, NativeToggle, WINDOWS_CONTROL } from "./NativeControls";
+import { NativeButton, NativeBusySpinner, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeSecureTextInput, NativeSegmentedControl, NativeTable, NativeTextField, NativeToggle, WINDOWS_CONTROL, nativeControlTextWidth } from "./NativeControls";
 import { CodeEditorWebView, editorMenuLabels, readOnlyCodeEditorHtml } from "./code-editor/CodeEditorWebView";
 import { modelGroupRowKey, modelIDFromRowKey, modelRowKey } from "./modelRowKeys";
 import { AccountsTable } from "./AccountsTable";
@@ -103,13 +103,23 @@ const SERVICE_STARTUP_RETRY_DELAYS_MS = [0, 5_000, 20_000, 60_000];
 // only while the state is transitional.
 const SERVICE_STATE_RECONCILE_MS = 1_000;
 // How often a window re-reads Core while it is drawing a *settled* service
-// state.  A running answer is the one claim nothing local can check: a Core can
+// state.  A settled answer is the one claim nothing local can check: a Core can
 // be replaced -- or die -- with no request in flight, and a window that only
 // re-reads while it draws a transition then keeps stating 运行中 with the port
-// beside it while nothing is listening, until the user happens to act.  It is
-// the slow interval because this is the quiet case; the transitional one is
-// above.
-const SERVICE_RUNNING_RECONCILE_MS = 15_000;
+// beside it while nothing is listening, until the user happens to act.  未知
+// is settled the same way: it is a listener this installation does not own, and
+// the moment it goes away Core starts the proxy it does own.  It is the slow
+// interval because this is the quiet case; the transitional one is above.
+const SERVICE_SETTLED_RECONCILE_MS = 15_000;
+// How often a window re-reads Core while it draws 不健康.  A failure is a claim
+// about a process nobody in this window can see, and the recovery needs no
+// action from it: Core's own supervisor replaces the proxy, another window
+// restarts it, or a settings apply brings it back.  Without this interval a
+// pane kept stating 不健康 -- with the one 重启服务 control beside it -- over a
+// proxy that had already answered its liveness endpoint for minutes, which is
+// exactly what made a manual restart look necessary.  Faster than the running
+// interval because this is the state the user is standing in front of.
+const SERVICE_UNHEALTHY_RECONCILE_MS = 5_000;
 const CORE_SNAPSHOT_RETRY_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000, 8_000, 15_000] as const;
 type EditableDiskDomain = "codex" | "claude" | "clients" | "providers_models" | "runtime" | "webdav";
 type RawEditorConflictResolution = "reload" | "keep";
@@ -128,7 +138,7 @@ type WebDavSyncAction = "sync" | "push" | "pull";
  */
 type ResultMessage = string | null | ((value: unknown) => string | null);
 
-const PROVIDER_AUTH_OPTIONS = ["api_key", "openai_login", "claude_login", "workbuddy_login", "workbuddy_global_login", "our_free_model_login"] as const satisfies readonly ProviderAuthKind[];
+const PROVIDER_AUTH_OPTIONS = ["api_key", "openai_login", "workbuddy_login", "workbuddy_global_login", "our_free_model_login"] as const satisfies readonly ProviderAuthKind[];
 
 
 function providerAuthKind(provider: UnknownRecord | undefined): ProviderAuthKind {
@@ -147,12 +157,11 @@ function providerAuthStatus(provider: UnknownRecord | undefined): ProviderAuthSt
 }
 
 /** The merged workspace shows every provider kind; this drives row labels. */
-type ProviderKind = "relay" | "openai" | "claude" | "workbuddy" | "workbuddyGlobal" | "ourFreeModel" | "apiKey";
+type ProviderKind = "relay" | "openai" | "workbuddy" | "workbuddyGlobal" | "ourFreeModel" | "apiKey";
 
 function providerKind(provider: UnknownRecord | undefined): ProviderKind {
   const auth = providerAuthKind(provider);
   if (auth === "openai_login") return "openai";
-  if (auth === "claude_login") return "claude";
   if (auth === "workbuddy_login") return "workbuddy";
   if (auth === "workbuddy_global_login") return "workbuddyGlobal";
   if (auth === "our_free_model_login") return "ourFreeModel";
@@ -170,7 +179,7 @@ function providerKind(provider: UnknownRecord | undefined): ProviderKind {
  * which address a provider carries, and whether its association section reads
  * as a service link rather than a relay station link.
  */
-type ServiceID = "openai" | "claude" | "workbuddy" | "workbuddyGlobal" | "ourFreeModel";
+type ServiceID = "openai" | "workbuddy" | "workbuddyGlobal" | "ourFreeModel";
 
 /**
  * The key slot every Our Free Model entry carries.
@@ -281,7 +290,6 @@ function laneChannelLabel(channel: string, translate: Translate): string {
 /** The address each service is addressed by, used for the wizard's URL field. */
 const SERVICE_BASE_URLS: Record<ServiceID, string> = {
   openai: "https://api.openai.com/v1",
-  claude: "https://api.anthropic.com",
   workbuddy: "https://copilot.tencent.com",
   workbuddyGlobal: "https://www.workbuddy.ai",
   // Our Free Model is served by a Core-owned worker on this machine, and
@@ -308,14 +316,13 @@ function serviceFromURL(value: string): ServiceID | undefined {
   if (matches("codebuddy.ai") || matches("codebuddy.cn") || matches("copilot.tencent.com")) return "workbuddy";
   if (matches("opencode.ai")) return "ourFreeModel";
   if (matches("api.openai.com") || matches("openai.com") || matches("chatgpt.com")) return "openai";
-  if (matches("api.anthropic.com") || matches("anthropic.com") || matches("claude.ai")) return "claude";
   return undefined;
 }
 
 /** The service behind one provider entry: its kind first, then its address. */
 function providerService(provider: UnknownRecord | undefined): ServiceID | undefined {
   const kind = providerKind(provider ?? {});
-  if (kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyGlobal" || kind === "ourFreeModel") return kind;
+  if (kind === "openai" || kind === "workbuddy" || kind === "workbuddyGlobal" || kind === "ourFreeModel") return kind;
   return serviceFromURL(stringValue(provider?.endpoint, stringValue(provider?.api_base)));
 }
 
@@ -583,8 +590,6 @@ function providerKindLabel(kind: ProviderKind, translate: Translate): string {
     ? translate("providers.type.relay")
     : kind === "openai"
       ? translate("providers.type.openai")
-      : kind === "claude"
-        ? translate("providers.type.claude")
         : kind === "workbuddy"
           ? translate("providers.type.workbuddy")
           : kind === "workbuddyGlobal"
@@ -598,7 +603,7 @@ function providerKindLabel(kind: ProviderKind, translate: Translate): string {
  * name, address, and key all belong to the service surface rather than to the
  * provider editor. */
 function isLoginProviderKind(kind: ProviderKind): boolean {
-  return kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyGlobal" || kind === "ourFreeModel";
+  return kind === "openai" || kind === "workbuddy" || kind === "workbuddyGlobal" || kind === "ourFreeModel";
 }
 
 const DATA_PACKAGE_SECTIONS: ReadonlyArray<{ domain: ConfigDomain; labelKey: string }> = [
@@ -755,6 +760,10 @@ const COLUMN_GAP = 8;
  * 290 pt pane keeps the total; this is what hands its room to the controls.
  */
 const MODEL_INSPECTOR_LABEL_WIDTH = 89;
+//: The widest the 账号 column may grow.  The inspector is 320 pt wide and the
+//: status column keeps 74, so this is everything a signed-in address can have
+//: before the two columns together stop fitting the pane.
+const AUTH_ACCOUNT_COLUMN_MAX_WIDTH = 208;
 const DSH_VISION_ROUTER_QUICK_KEYS = [
   "YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED",
   "YOUNG_ROUTER_DSH_VISION_ROUTER_BACKEND",
@@ -1313,7 +1322,15 @@ function errorMessage(reason: unknown, translate: Translate): string {
     core_unavailable: "error.coreUnavailable",
     editor_too_large: "error.editorTooLarge",
     confirmation_required: "error.confirmationRequired",
-    revision_conflict: "error.revisionConflict",
+    // A rebase already answered every conflict this window could resolve by
+    // itself: `applyOutcome`, the buffered dispatch, the editor and the child
+    // surfaces each retry once on the authoritative revision.  One that still
+    // arrives is a race between two writes of this same app, which is not a
+    // fact the user can act on and not one whose cause they could inspect:
+    // naming it only reported the write as failed without saying whether it
+    // took effect.  Say what they can observe instead — the change is not in
+    // effect — the same way every other rolled-back write reports itself.
+    revision_conflict: "common.notApplied",
     validation_failed: "error.validationFailed",
     // Core names the domain that refused the write: a provider/model draft
     // that is genuinely unusable reads as a validation failure, while a relay
@@ -1549,23 +1566,6 @@ function formatMenuTimestamp(value: string): string {
  * carries its date, because a sync that last landed weeks ago must not read
  * like one that just ran.
  */
-/**
- * A rail row's date and time.  Always both: a rail is a history, and "15:38"
- * alone cannot say whether that was this afternoon or last Tuesday, which is
- * exactly the question a list of turns has to answer.
- */
-function formatRailStamp(value: string): string {
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return value;
-  return new Intl.DateTimeFormat(undefined, {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).format(parsed);
-}
-
 function formatActionTimestamp(value: string): string {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return value;
@@ -1698,7 +1698,7 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       routeGeneralSettings: translate("status.general"),
       routeCodexSettings: translate("status.codex"), routeClaudeSettings: translate("card.claudeSettings"),
       routeRuntimeSettings: translate("card.runtimeSettings"),
-      routeDataManagement: translate("card.dataManagement"), routeProviderWizard: translate("providers.wizard.title"), routeFileEditor: translate("settings.editFile"), routeImageContext: translate("status.imageContext"), routeLogs: translate("card.logs"),
+      routeDataManagement: translate("card.dataManagement"), routeProviderWizard: translate("providers.wizard.title"), routeFileEditor: translate("settings.editFile"), routeLogs: translate("card.logs"),
       providerAuthInstruction: translate("relay.officialProviderWebViewHint"),
       providerAuthBlocked: translate("relay.officialProviderAuthBlocked"),
       logOriginal: translate("logs.originalRecord"),
@@ -1812,17 +1812,35 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
     // in this window can see either.  A Core replaced under an idle app -- or
     // one that died -- leaves the last snapshot standing, and every surface
     // that draws the 服务 row then states 运行中 (端口 12390) over a port
-    // nothing answers on.  Re-read slowly, and accept an unchanged revision:
-    // a replacement Core restores its revision from the same record, so the
-    // state is exactly the part of the answer that can move without it.
-    if (snapshot?.service.state !== "running") return;
+    // nothing answers on.  未知 is the same claim about somebody else's
+    // listener: when it goes away, Core starts the proxy this app owns, and no
+    // event announces that to this window.  Re-read slowly, and accept an
+    // unchanged revision: a replacement Core restores its revision from the
+    // same record, so the state is exactly the part of the answer that can move
+    // without it.
+    const settled = snapshot?.service.state;
+    if (settled !== "running" && settled !== "unknown") return;
+    const timer = setInterval(() => {
+      void ipc.snapshot().then((next) => {
+        if (next.revision === acceptedSnapshotRevision.current && next.service.state === settled) return;
+        receiveSnapshot(next);
+      }).catch(() => undefined);
+    }, SERVICE_SETTLED_RECONCILE_MS);
+    return () => clearInterval(timer);
+  }, [ipc, receiveSnapshot, snapshot?.service.state]);
+
+  useEffect(() => {
+    // The same re-read for the failure state, which Core repairs without this
+    // window: a recovery can land with no revision this pane asked for, so an
+    // unchanged revision must not keep the word on screen.
+    if (snapshot?.service.state !== "unhealthy") return;
     const observed = snapshot.service.state;
     const timer = setInterval(() => {
       void ipc.snapshot().then((next) => {
         if (next.revision === acceptedSnapshotRevision.current && next.service.state === observed) return;
         receiveSnapshot(next);
       }).catch(() => undefined);
-    }, SERVICE_RUNNING_RECONCILE_MS);
+    }, SERVICE_UNHEALTHY_RECONCILE_MS);
     return () => clearInterval(timer);
   }, [ipc, receiveSnapshot, snapshot?.service.state]);
 
@@ -1869,9 +1887,20 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       }
       return;
     }
+    // The provider wizard is a child window, never a surface of the root that
+    // asked for it. A request for it reaches every root (a deep link, a menu
+    // action, the workspace's own 添加向导), so a root that swapped its route
+    // into the wizard replaced the shell it was drawing with a second copy of
+    // the wizard, and the child window then opened in front of it. Opening the
+    // window is the whole answer to this request.
+    const windowRoute = canonicalWindowRoute(routeRequest);
+    if (windowRoute === "provider-wizard") {
+      native.window.open(windowRoute);
+      native.window.focus(windowRoute);
+      return;
+    }
     setRoute(routeRequest);
     if (isPrimaryHost && routeRequest !== "home") {
-      const windowRoute = canonicalWindowRoute(routeRequest);
       native.window.open(windowRoute);
       native.window.focus(windowRoute);
     }
@@ -1888,7 +1917,12 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
     if (handledNativeActions.current.has(actionKey)) return;
     if (action === "open-provider-wizard") {
       handledNativeActions.current.add(actionKey);
-      setRoute("provider-wizard");
+      // The wizard is a window of its own. The host presents it through its
+      // child-panel presenter, and the root that hears the action keeps the
+      // surface it was drawing: swapping this root's route into the wizard drew
+      // the wizard inside the settings window as well, behind the real one.
+      native.window.open("provider-wizard");
+      native.window.focus("provider-wizard");
       return;
     }
     if (!isPrimaryHost) return;
@@ -2907,10 +2941,13 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
           current.disk[name]?.changed === refreshed.disk[name]?.changed
           && current.disk[name]?.generation === refreshed.disk[name]?.generation
         ));
-        if (!sameDomains || !sameDiskState) throw reason;
+        // The rebase only ever answers for the same staged edit: a different
+        // set of domains or a different disk generation is another writer, and
+        // reporting that as applied would claim a save that did not happen.
         revision.current = current.revision;
         latestSnapshot.current = current;
         onSnapshot(current);
+        if (!sameDomains || !sameDiskState) throw reason;
         // The domains this Apply named are no longer staged at the newer
         // revision: the write it was racing already committed them, so the
         // outcome the user asked for exists. Report that instead of failing
@@ -3237,13 +3274,6 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       closeRoute();
       return;
     }
-    // The image-context window is a native child window too, but it keeps no
-    // staged draft: the shared pane applies every tick as it changes, so its
-    // window closes without a discard question.
-    if (route === "image-context") {
-      closeRoute();
-      return;
-    }
     const restoreWindow = (): void => {
       const windowRoute = canonicalWindowRoute(route);
       native.window.open(windowRoute);
@@ -3455,12 +3485,11 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   }, [route]);
 
   return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={[styles.windowSurface, shell && Platform.OS === "windows" && styles.windowSurfaceShellWindows]}>
-    {!shell && route !== "providers-models" && route !== "logs" && route !== "provider-wizard" && route !== "file-editor" && route !== "image-context" && route !== "data-management" ? <WindowTitle title={windowTitle} /> : null}
-    {route === "providers-models" || route === "provider-wizard" || route === "image-context" || route === "file-editor" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, route === "provider-wizard" && styles.providerWizardRouteContent, route === "image-context" && styles.imageContextRouteContent, settingsRoute && styles.assistantSettingsContent, route === "logs" && styles.logsContent, route === "runtime-settings" && styles.runtimeContent, route === "data-management" && styles.dataManagementContent]}>
-    {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { if (Platform.OS === "windows") { native.window.open("provider-wizard"); } else { onNavigate("provider-wizard"); native.window.open("provider-wizard"); } }} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
+    {!shell && route !== "providers-models" && route !== "logs" && route !== "provider-wizard" && route !== "file-editor" && route !== "data-management" ? <WindowTitle title={windowTitle} /> : null}
+    {route === "providers-models" || route === "provider-wizard" || route === "file-editor" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, route === "provider-wizard" && styles.providerWizardRouteContent, settingsRoute && styles.assistantSettingsContent, route === "logs" && styles.logsContent, route === "runtime-settings" && styles.runtimeContent, route === "data-management" && styles.dataManagementContent]}>
+    {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { native.window.open("provider-wizard"); native.window.focus("provider-wizard"); }} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
     {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} status={result} /> : null}
-    {route === "image-context" ? <ImageContextWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} ipc={ipc} native={native} /> : null}
     {settingsRoute ? <AssistantSettingsWorkspace busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} /> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} onStatusBar={setStatusBarControls} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
     {route === "general-settings" ? <GeneralWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} dispatch={dispatch} dispatchServiceAction={enqueueServiceDispatch} translate={translate} onStatus={setResult} onSnapshot={onSnapshot} /> : null}
@@ -3511,7 +3540,7 @@ function providerWizardKeyTarget(token: string, keyName: string): string {
   return `${WIZARD_PENDING_KEY_PREFIX}${token}\u001f${keyName}`;
 }
 
-type ServiceProviderKind = "openai_login" | "claude_login" | "workbuddy_login" | "workbuddy_global_login" | "our_free_model_login";
+type ServiceProviderKind = "openai_login" | "workbuddy_login" | "workbuddy_global_login" | "our_free_model_login";
 
 /**
  * Every provider the snapshot carries, whatever its kind.
@@ -3530,12 +3559,12 @@ function snapshotProviderRecords(snapshot: CoreSnapshot | undefined): UnknownRec
 function serviceProviderRecords(snapshot: CoreSnapshot | undefined): UnknownRecord[] {
   return snapshotProviderRecords(snapshot).filter((provider) => {
     const kind = providerAuthKind(provider);
-    return kind === "openai_login" || kind === "claude_login";
+    return kind === "openai_login";
   });
 }
 
 function serviceProviderKindLabel(kind: ServiceProviderKind, translate: Translate): string {
-  return kind === "openai_login" ? translate("relay.officialProviderOpenAI") : translate("relay.officialProviderClaude");
+  return translate("relay.officialProviderOpenAI");
 }
 
 /**
@@ -3543,7 +3572,7 @@ function serviceProviderKindLabel(kind: ServiceProviderKind, translate: Translat
  *
  * The pane's own vocabulary for a service provider is its short type
  * (`openai`, `claude`, `workbuddy`, `workbuddyGlobal`), while Core persists and
- * validates the login kind (`openai_login`, `claude_login`,
+ * validates the login kind (`openai_login`,
  * `workbuddy_login`, `workbuddy_global_login`).  Anything that retargets a
  * provider through `service_provider.patch` has to translate between the two:
  * the short name is not in Core's `_SERVICE_PROVIDER_KINDS`, so a dispatch
@@ -3551,12 +3580,11 @@ function serviceProviderKindLabel(kind: ServiceProviderKind, translate: Translat
  */
 function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProviderKind, laneChannelName?: string): string {
   const base = kind === "openai_login" ? "OpenAI"
-    : kind === "claude_login" ? "Claude"
-      : kind === "workbuddy_login" ? "WorkBuddy"
-        : kind === "workbuddy_global_login" ? "WorkBuddy Global"
-          // A lane channel states its own name: the name is what Core reads to
-          // know which channel an entry is, so two entries cannot share one.
-          : laneChannelName || "Our Free Model · OpenCode";
+    : kind === "workbuddy_login" ? "WorkBuddy"
+      : kind === "workbuddy_global_login" ? "WorkBuddy Global"
+        // A lane channel states its own name: the name is what Core reads to
+        // know which channel an entry is, so two entries cannot share one.
+        : laneChannelName || "Our Free Model · OpenCode";
   const names = new Set(providers.map((provider) => stringValue(provider.display_name, stringValue(provider.name)).trim().toLocaleLowerCase()).filter(Boolean));
   if (!names.has(base.toLocaleLowerCase())) return base;
   let suffix = 2;
@@ -3566,7 +3594,7 @@ function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProvid
 
 function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayStations, busy, translate, dispatchWithOutcome, onSecretState, onStatus, onClose, onKeyToken, relay, addOfficialAccount, status }: { snapshot?: CoreSnapshot; native: NativeLeafAdapter; providers: UnknownRecord[]; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onStatus: (status?: string) => void; onClose: () => void; onKeyToken: (token: string) => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind, name?: string) => Promise<string>; /** The window's own result: a child window keeps no strip, so its footer states it. */ status?: string }): React.JSX.Element {
   type WizardStep = "provider" | "keys" | "model";
-  type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyGlobal" | "ourFreeModel" | "ourFreeModelKilo";
+  type WizardType = "api" | "openai" | "workbuddy" | "workbuddyGlobal" | "ourFreeModel" | "ourFreeModelKilo";
   const [step, setStep] = useState<WizardStep>("provider");
   // The step the last advance left, so one press cannot advance twice.
   const stepRef = useRef<WizardStep | undefined>("provider");
@@ -3658,7 +3686,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     forceLoginFeedbackRender((value) => value + 1);
   };
 
-  const isOfficialLoginType = providerType === "openai" || providerType === "claude";
+  const isOfficialLoginType = providerType === "openai";
   const isWorkBuddyType = providerType === "workbuddy" || providerType === "workbuddyGlobal";
   // Our Free Model has no sign-in and no user secret at all: its provider is
   // created straight from the provider step, so it shares neither the key
@@ -3785,7 +3813,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const servicePickerItems: Array<{ type: WizardType; label: string }> = [
     { type: "api", label: translate("providers.wizard.typeApi") },
     { type: "openai", label: translate("providers.type.openai") },
-    { type: "claude", label: translate("providers.type.claude") },
     { type: "workbuddy", label: translate("providers.type.workbuddy") },
     { type: "workbuddyGlobal", label: translate("providers.type.workbuddyGlobal") },
     // One entry per upstream channel, because each channel is a provider of its
@@ -3868,14 +3895,13 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     }
     return true;
   };
-  // Present the device-code challenge for official account logins.
+  // Present the device-code challenge for an official account login.
   const presentAuthChallenge = (next: CoreSnapshot | undefined, kind: ServiceProviderKind, label: string, accountFingerprint: string): void => {
     const summary = asRecord(asRecord(next?.action_summaries?.providers_models).operation_summary);
     const verificationURL = stringValue(summary.verification_uri);
     const userCode = stringValue(summary.user_code);
-    const callbackURL = stringValue(summary.redirect_uri);
-    if (!verificationURL || (!userCode && !callbackURL)) return;
-    const fingerprint = `${accountFingerprint}|${kind}|${verificationURL}|${userCode}|${callbackURL}`;
+    if (!verificationURL || !userCode) return;
+    const fingerprint = `${accountFingerprint}|${kind}|${verificationURL}|${userCode}`;
     if (shownChallenge.current[accountFingerprint] === fingerprint) return;
     shownChallenge.current[accountFingerprint] = fingerprint;
     const options = {
@@ -3886,17 +3912,16 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     };
     if (native.showProviderAuth) {
       void native.showProviderAuth({
-        provider: kind === "openai_login" ? "openai" : "claude",
+        provider: "openai",
         fingerprint: accountFingerprint,
         verificationURL,
-        ...(userCode ? { userCode } : {}),
-        ...(callbackURL ? { callbackURL } : {}),
+        userCode,
         ...options,
       }).catch(() => undefined);
     } else {
       void native.showReadOnlyText({
         ...options,
-        text: [verificationURL, userCode || callbackURL].join("\n"),
+        text: [verificationURL, userCode].join("\n"),
         language: "text",
         html: readOnlyCodeEditorHtml(editorMenuLabels(translate)),
       });
@@ -3904,7 +3929,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   };
   useEffect(() => {
     if (!isOfficialLoginType || officialStatus !== "authorizing" || !providerID) return;
-    const kind: ServiceProviderKind = providerType === "claude" ? "claude_login" : "openai_login";
+    const kind: ServiceProviderKind = "openai_login";
     const timer = setInterval(() => {
       void dispatchWithOutcome("service_provider.auth_status", { provider_id: providerID }, "providers_models", true)
         .then((next) => presentAuthChallenge(next, kind, selectedProviderName || serviceProviderKindLabel(kind, translate), providerID))
@@ -3992,7 +4017,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       : value === "workbuddyGlobal" ? nextServiceProviderName(providers, "workbuddy_global_login")
         : channelName ? nextServiceProviderName(providers, "our_free_model_login", channelName)
           : value === "openai" ? nextServiceProviderName(providers, "openai_login")
-            : value === "claude" ? nextServiceProviderName(providers, "claude_login")
               : "");
     setWorkbuddyAccount(undefined);
     setSelectedModels([]);
@@ -4009,8 +4033,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     const kind: ServiceProviderKind = providerType === "workbuddy" ? "workbuddy_login"
       : providerType === "workbuddyGlobal" ? "workbuddy_global_login"
         : providerType === "ourFreeModel" ? "our_free_model_login"
-          : providerType === "claude" ? "claude_login"
-            : "openai_login";
+          : "openai_login";
     // The channel states its own name here too, or this repair would rewrite a
     // Kilo entry's suggestion back to the lane's default the moment the
     // provider list arrived.
@@ -4030,7 +4053,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     keyNameSeedSelection.current = "";
     setValidation("");
     setProviderName(path === "login"
-      ? nextServiceProviderName(providers, providerType === "claude" ? "claude_login" : "openai_login")
+      ? nextServiceProviderName(providers, "openai_login")
       : "");
   };
   const chooseExistingProvider = (value: string): void => {
@@ -4577,7 +4600,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       setProcessing(true);
       try {
         target = await addOfficialAccount(
-          providerType === "claude" ? "claude_login" : "openai_login",
+          "openai_login",
           providerName.trim(),
         );
       } catch {
@@ -4590,7 +4613,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       setProviderSelection(target);
       setValidation("");
     }
-    const kind = providerType === "claude" ? "claude_login" : "openai_login";
+    const kind: ServiceProviderKind = "openai_login";
     delete shownChallenge.current[target];
     const next = await dispatchWithOutcome("service_provider.auth_start", { provider_id: target }, "providers_models");
     presentAuthChallenge(next, kind, selectedProviderName || serviceProviderKindLabel(kind, translate), target);
@@ -4934,7 +4957,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         </View> : <>
         {step === "provider" ? <View style={styles.providerWizardFormSection}>
           <NativeFormRow label={translate("providers.wizard.providerType")}>
-            <NativePicker labels={servicePickerLabels} selectedValue={selectedServiceLabel} disabled={wizardBusy} onChange={({ nativeEvent }) => { const kinds: WizardType[] = ["api", "openai", "claude", "workbuddy", "workbuddyGlobal", "ourFreeModel", "ourFreeModelKilo"]; chooseProviderType(kinds[nativeEvent.index] ?? "api"); }} style={styles.providerWizardPicker} />
+            <NativePicker labels={servicePickerLabels} selectedValue={selectedServiceLabel} disabled={wizardBusy} onChange={({ nativeEvent }) => { const kinds: WizardType[] = ["api", "openai", "workbuddy", "workbuddyGlobal", "ourFreeModel", "ourFreeModelKilo"]; chooseProviderType(kinds[nativeEvent.index] ?? "api"); }} style={styles.providerWizardPicker} />
           </NativeFormRow>
           {providerMode === "new" && isOfficialLoginType ? <NativeFormRow label={translate("providers.wizard.authPath")}>
             <NativePicker labels={[translate("providers.wizard.pathWebLogin"), translate("providers.wizard.pathCustomKey")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathWebLogin") : translate("providers.wizard.pathCustomKey")} disabled={wizardBusy} onChange={({ nativeEvent }) => { chooseOfficialAuthPath(nativeEvent.index === 1 ? "manual" : "login"); }} style={styles.providerWizardPicker} />
@@ -4948,7 +4971,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
             <NativeFormRow required label={translate("providers.wizard.providerName")}><NativeTextField value={providerName} placeholder={translate("providers.wizard.providerNamePlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={updateProviderName} accessibilityLabel={translate("providers.wizard.providerName")} style={styles.providerWizardInput} /></NativeFormRow>
           </> : null}
           {providerMode === "new" && wizardEditsBaseURL && providerType !== "api" ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.serviceUrlFixed")}</Text> : null}
-          {providerMode === "new" && isOfficialLoginType && keyPath === "login" ? <Text style={styles.providerWizardHint}>{providerType === "openai" ? translate("relay.officialProviderWebViewHint") : translate("relay.officialProviderBrowserHint")}</Text> : null}
+          {providerMode === "new" && isOfficialLoginType && keyPath === "login" ? <Text style={styles.providerWizardHint}>{translate("relay.officialProviderWebViewHint")}</Text> : null}
           {providerMode === "new" && isWorkBuddyType ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyAppHint")}</Text> : null}
           {providerMode === "new" && isOurFreeModelType ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.ourFreeModelHint")}</Text> : null}
           {providerMode === "existing" && selectedProvider ? <Text numberOfLines={1} style={styles.providerWizardHint}>{activeProviderBaseURL || translate("common.notAvailable")}</Text> : null}
@@ -5176,9 +5199,8 @@ function presentProviderAuthChallenge(native: NativeLeafAdapter, translate: Tran
   const summary = asRecord(asRecord(next?.action_summaries?.providers_models).operation_summary);
   const verificationURL = stringValue(summary.verification_uri);
   const userCode = stringValue(summary.user_code);
-  const callbackURL = stringValue(summary.redirect_uri);
-  if (!verificationURL || (!userCode && !callbackURL)) return;
-  const fingerprint = `${accountFingerprint}|${kind}|${verificationURL}|${userCode}|${callbackURL}`;
+  if (!verificationURL || !userCode) return;
+  const fingerprint = `${accountFingerprint}|${kind}|${verificationURL}|${userCode}`;
   if (shownChallenge[accountFingerprint] === fingerprint) return;
   shownChallenge[accountFingerprint] = fingerprint;
   const options = {
@@ -5191,17 +5213,16 @@ function presentProviderAuthChallenge(native: NativeLeafAdapter, translate: Tran
   };
   if (native.showProviderAuth) {
     void native.showProviderAuth({
-      provider: kind === "openai_login" ? "openai" : "claude",
+      provider: "openai",
       fingerprint: accountFingerprint,
       verificationURL,
-      ...(userCode ? { userCode } : {}),
-      ...(callbackURL ? { callbackURL } : {}),
+      userCode,
       ...options,
     }).catch(() => undefined);
   } else {
     void native.showReadOnlyText({
       ...options,
-      text: [verificationURL, userCode || callbackURL].join("\n"),
+      text: [verificationURL, userCode].join("\n"),
       language: "text",
       html: readOnlyCodeEditorHtml(editorMenuLabels(translate)),
     });
@@ -5384,7 +5405,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         ...providerKeyChoices(provider, relaySources, providerBaseURL(provider)),
       ];
     }
-    if (providerKindSelected === "claude" || providerHoldsNoKey) return [];
+    if (providerHoldsNoKey) return [];
     const choices = providerKeyChoices(provider, relaySources, providerBaseURL(provider));
     // A service that mints its own slot carries that slot nowhere in the
     // list above, and this row is how a lane is asked for its roster — so a
@@ -5503,7 +5524,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     const timer = setInterval(() => {
       for (const entry of authorizing) {
         const kind = providerAuthKind(entry);
-        if (kind !== "openai_login" && kind !== "claude_login") continue;
+        if (kind !== "openai_login") continue;
         const providerID = editorIdentifier(entry);
         const label = stringValue(entry.display_name, stringValue(entry.name, serviceProviderKindLabel(kind, translate)));
         void dispatchWithOutcome("service_provider.auth_status", { provider_id: providerID }, "providers_models", true)
@@ -6403,9 +6424,9 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
             <NativeTable columns={[{ label: translate("providers.provider"), width: 132 }]} rows={providerRows} disabledRowKeys={disabledProviderKeys} alertRowKeys={alertProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }} style={styles.nativeProviderTable} />
           </TablePane>
           <View style={styles.providerMiddlePane} onLayout={({ nativeEvent }) => setModelTableWidth(nativeEvent.layout.width)}>
-            <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider && providerKindSelected !== "claude" ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteModel} /> : null}</>}>
+            <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteModel} /> : null}</>}>
               <View style={styles.nativeModelTable}><NativeTable columns={modelTableColumns(modelTableWidth, translate)} rows={modelRows} disabledRowKeys={disabledModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange={(key) => { if (!key) { setSelectedModel(undefined); setSelectedModelRow(undefined); setProviderSourceModel(undefined); return; } const modelID = modelIDFromRowKey(key); if (modelID === undefined) return; setSelectedModel(modelID); setSelectedModelRow(key); setProviderSourceModel(undefined); }} style={styles.modelTable} /></View>
-              {provider && providerKindSelected !== "claude" ? <View style={styles.tableBottomRow}>{fetchKeyChoices.length > 0 ? <NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /> : null}<ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || (fetchKeyChoices.length > 0 && !selectedFetchKey)} onPress={() => { void fetchModels(); }} /></View> : null}
+              {provider ? <View style={styles.tableBottomRow}>{fetchKeyChoices.length > 0 ? <NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /> : null}<ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || (fetchKeyChoices.length > 0 && !selectedFetchKey)} onPress={() => { void fetchModels(); }} /></View> : null}
             </TablePane>
           </View>
         </View>
@@ -7950,7 +7971,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   const drafts = useContext(ProviderWorkspaceDraftContext);
   const kind = providerKind(provider);
   const service = providerService(provider);
-  const isOfficialAccount = kind === "openai" || kind === "claude";
+  const isOfficialAccount = kind === "openai";
   const isWorkBuddyAccount = kind === "workbuddy" || kind === "workbuddyGlobal";
   // The one predicate, not a second spelling of it: a login service owns its
   // key, so no key editor may be drawn for it.  Re-deriving this locally from
@@ -8000,7 +8021,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   // One short line per state, and only behind the ?: the pane is 290 pt wide
   // and a paragraph there pushed the fields it describes off the page.
   const accountHelpText = [
-    kind === "openai" ? translate("relay.officialProviderWebViewHint") : translate("relay.officialProviderBrowserHint"),
+    translate("relay.officialProviderWebViewHint"),
     ...(kind === "openai" && authStatus === "signed_in" ? [translate("relay.officialProviderMultiAccountHint")] : []),
     ...(kind === "openai" ? [translate("relay.officialProviderApiKeyHint")] : []),
   ].join("\n");
@@ -8035,6 +8056,16 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
         statusLabels[providerAuthStatus(account)],
       ],
     }));
+  // The account column is as wide as the longest address it holds, up to what
+  // this 320 pt pane can spare beside the status column.  A fixed 96 pt cell
+  // ellipsized every real address to its first dozen characters, so the list
+  // could not say who was signed in; the selected account's whole address is
+  // stated under the list as well, which is where a name too long for any
+  // column is still readable.
+  const authAccountColumnWidth = Math.min(
+    AUTH_ACCOUNT_COLUMN_MAX_WIDTH,
+    Math.max(96, ...authAccountRows.map((row) => Math.ceil(nativeControlTextWidth(row.cells[0] ?? "")) + 16)),
+  );
   const model = asRecords(provider.models)[0];
   const modelNameText = model ? stringValue(model.display_name, stringValue(model.name, stringValue(model.upstream_model, translate("common.notAvailable")))) : translate("common.notAvailable");
   useEffect(() => {
@@ -8147,7 +8178,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     || stringValue(asRecord(provider.auth_observed).state) === "signed-in";
   const startLogin = async (): Promise<void> => {
     if (authPending !== undefined) return;
-    const kind = providerKind(provider) === "claude" ? "claude_login" : "openai_login";
+    const kind: ServiceProviderKind = "openai_login";
     delete shownChallenge.current[id];
     setAuthPending("auth");
     try {
@@ -8180,7 +8211,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     try {
       // One row is the service; a second account is a second account of this
       // row, and Core appends it and answers with the account's own reference.
-      const kindLogin: ServiceProviderKind = kind === "claude" ? "claude_login" : "openai_login";
+      const kindLogin: ServiceProviderKind = "openai_login";
       const next = await dispatchWithOutcome("service_provider.auth_start", { provider_id: id }, "providers_models");
       presentProviderAuthChallenge(native, translate, next, kindLogin, providerKindLabel(kind, translate), id, shownChallenge.current);
     } catch (reason) {
@@ -8334,7 +8365,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
               for the same list. */}
           {selectedAuthAccount ? <NativeButton title="" symbol="minus" compact destructive toolTip={translate("relay.officialProviderLogout")} accessibilityLabel={translate("relay.officialProviderLogout")} busy={authPending === `logout:${stringValue(selectedAuthAccount.ref)}`} disabled={(busy || loginBusy) && authPending !== `logout:${stringValue(selectedAuthAccount.ref)}`} style={styles.iconButton} onPress={() => { void logoutAccount(stringValue(selectedAuthAccount.ref)); }} /> : null}
         </>}
-        columns={[{ label: translate("relay.accounts"), width: 96 }, { label: translate("providers.authStatus"), width: 74 }]}
+        columns={[{ label: translate("relay.accounts"), width: authAccountColumnWidth }, { label: translate("providers.authStatus"), width: 74 }]}
         rows={authAccountRows}
         selectedKey={stringValue(selectedAuthAccount?.ref)}
         onSelectionChange={(key) => setSelectedAuthAccountRef(key || undefined)}
@@ -8342,9 +8373,12 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
         emptyText={translate("relay.stationNoAccounts")}
       />
       {selectedAuthAccount ? <View style={styles.accountEditor}>
-        {/* One row, the station's own shape: 账号, its value, then 状态.  The
-            account is stated as a reading — its email, its own state — because
-            it is the service's identity, not something this pane may edit.
+        {/* The editor states the one thing the list cannot: the whole account
+            name.  A table cell ellipsizes to fit its column, so the address a
+            person signed in with was only ever readable as its first twelve
+            characters, and the row below it repeated them.  Status stays in the
+            list: repeating it here was the same finding twice, and the second
+            copy had no room for the account.
 
             There is no 退出登录 here: the list's − *is* the sign-out.  An account
             is one row of this list, and ending it is removing that row — the
@@ -8354,29 +8388,11 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
             happened to something else. */}
         <View style={styles.fieldRow}>
           <Text style={styles.fieldLabel}>{translate("relay.accountField")}</Text>
-          <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{providerAuthAccount(selectedAuthAccount) || stringValue(selectedAuthAccount.label) || translate("providers.authAccount")}</Text>
-          <Text style={styles.fieldLabel}>{translate("providers.authStatus")}</Text>
-          <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{statusLabels[providerAuthStatus(selectedAuthAccount)]}</Text>
+          {/* No `numberOfLines`: this row is the one place the whole address is
+              readable, so it wraps instead of ellipsizing. */}
+          <TooltipText tooltip={providerAuthAccount(selectedAuthAccount) || stringValue(selectedAuthAccount.label) || translate("providers.authAccount")} accessibilityLabel={providerAuthAccount(selectedAuthAccount) || stringValue(selectedAuthAccount.label) || translate("providers.authAccount")} selectable style={styles.providerAuthStatusValue}>{providerAuthAccount(selectedAuthAccount) || stringValue(selectedAuthAccount.label) || translate("providers.authAccount")}</TooltipText>
         </View>
       </View> : null}
-    </View> : null}
-    {/* A Claude row keeps its own single-account block: it is one device login,
-        so there is no list of accounts to draw. */}
-    {isOfficialAccount && kind !== "openai" ? <View style={styles.officialAccountSection}>
-      <View style={styles.panelHeader}><Text style={styles.panelTitle}>{translate("providers.serviceLinks")}</Text></View>
-      {authAccount ? <View style={styles.officialStatusRow}>
-        <Text style={styles.providerAuthStatusLabel}>{translate("providers.authAccount")}</Text>
-        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{authAccount}</Text>
-      </View> : null}
-      <View style={styles.officialStatusRow}>
-        <Text style={styles.providerAuthStatusLabel}>{translate("providers.authStatus")}</Text>
-        <Text style={styles.providerAuthStatusValue}>{statusLabels[authStatus]}</Text>
-      </View>
-      <Text style={styles.providerAuthLine}>{translate("relay.officialProviderModels")}: {modelNameText}</Text>
-      <View style={styles.officialActionsRow}>
-        <NativeButton title={authLabel} primary compact busy={authPending === "auth"} disabled={(busy || loginBusy) && authPending !== "auth"} onPress={() => { void runAuthAction(); }} />
-      </View>
-      {authStatus === "error" ? <NativeSecretField autoCommit label={translate("providers.authTypeClaude")} hint={translate("relay.officialProviderTokenHint")} busy={busy} disabled={busy} domain="providers_models" field="provider_auth_token" target={id} onSecretState={onSecretState} /> : null}
     </View> : null}
     {!isLogin && station ? <StationAccountsPanel
       key={`station-accounts:${station.id}`}
@@ -8525,6 +8541,11 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
   const [listed, setListed] = useState<ClientFile>();
   const [loadError, setLoadError] = useState<string>();
   const [saving, setSaving] = useState(false);
+  const localEditorDirtyRef = useRef(false);
+  const handleEditorDirtyChange = useCallback((dirty: boolean): void => {
+    if (localEditorDirtyRef.current === dirty) return;
+    localEditorDirtyRef.current = dirty;
+  }, []);
   // This child window states its own save result beside its footer buttons.
   const [footerStatus, setFooterStatus] = useState<string>();
   // A Windows editor window is its own process, and a native confirmation owned
@@ -8602,15 +8623,16 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
         // below still runs, because closing means dropping the draft anyway.
         current = undefined;
       }
-      if (current !== undefined && current.drafts[target.domain]?.dirty !== true) {
+      const coreDraftDirty = current?.drafts[target.domain]?.dirty === true;
+      if (!coreDraftDirty && !localEditorDirtyRef.current) {
         closeWindow();
         return;
       }
-      if (current !== undefined) {
-        if (Platform.OS === "windows") {
-          setConfirmingDiscard(true);
-          return;
-        }
+      if (Platform.OS === "windows") {
+        setConfirmingDiscard(true);
+        return;
+      }
+      if (current !== undefined || localEditorDirtyRef.current) {
         const confirmed = await native.showConfirmation({
           title: translate("settings.discardDraftTitle"),
           message: translate("settings.discardDraftBody"),
@@ -8681,7 +8703,7 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
     </View>
     {target === undefined
       ? <View style={assistantFileSurfaceStyles.editorLoading}><Text style={assistantFileSurfaceStyles.filesStatus}>{translate("common.loading")}</Text></View>
-      : <RawEditor showLabel={false} showDiff codexPane syncRevision={syncRevision} style={assistantFileSurfaceStyles.editorRouteRaw} label={target.name} domain={target.domain} document={target.document} language={target.language === "yaml" ? "yaml" : target.language === "toml" ? "toml" : "json"} ipc={ipc} translate={translate} onConflict={onEditorConflict} reloadToken={reloadToken} baselineToken={baselineToken} />}
+      : <RawEditor showLabel={false} showDiff codexPane deferStage={Platform.OS === "windows"} onDirtyChange={handleEditorDirtyChange} syncRevision={Platform.OS === "windows" ? undefined : syncRevision} style={assistantFileSurfaceStyles.editorRouteRaw} label={target.name} domain={target.domain} document={target.document} language={target.language === "yaml" ? "yaml" : target.language === "toml" ? "toml" : "json"} ipc={ipc} translate={translate} onConflict={onEditorConflict} reloadToken={reloadToken} baselineToken={baselineToken} />}
     <View style={assistantFileSurfaceStyles.editorFooter}>
       {/* The child states its own result beside its buttons; the buttons keep
           their trailing edge, so a message never moves them. */}
@@ -9287,16 +9309,6 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
   </PersistentScrollView>;
 }
 
-/** The runtime category whose line opens the image-context window. */
-const IMAGE_CONTEXT_CATEGORY = "Codex Images";
-// Cards load their own picture, so only a handful are worth fetching: enough to
-// recognise a conversation by, and small enough that opening the window stays
-// instant.  Anything bigger than a card can show opens in the preview.
-// How many thumbnails the panel asks for at once.  A task can hold seventy
-// images, and asking for all of them in one burst made Core refuse a share of
-// the answers, which the grid then reported as unreadable pictures.
-const THUMBNAIL_CONCURRENCY = 3;
-
 function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, clearSecret, native, ipc, onStatus }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; onSecretState: (state: SecretState) => void; clearSecret: NativeSecretClear; native: NativeLeafAdapter; ipc: IpcClient; onStatus: (status?: string) => void }): React.JSX.Element {
   const state = domainState(snapshot, "runtime");
   const allSettings = asRecords(state.settings).length > 0 ? asRecords(state.settings) : asRecords(state.categories).flatMap((category) => asRecords(category.settings));
@@ -9327,286 +9339,9 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
         {/* The surface is keyed by its category, so a switch starts at the top of
             the new category instead of inheriting the previous scroll offset. */}
         <PersistentScrollView key={selectedCategory} style={styles.runtimeScrollSurface} contentContainerStyle={styles.runtimeWorkspace}>
-          {selectedCategory === "" ? <EmptyState translate={translate} /> : <View style={styles.runtimeFieldList}>{(groups[selectedCategory] ?? []).map((item) => <RuntimeField key={identifier(item)} item={item} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} dshSyncToken={dshSyncToken} native={native} onStatus={onStatus} />)}
-            {selectedCategory === IMAGE_CONTEXT_CATEGORY ? <ImageContextWindowLink snapshot={snapshot} busy={busy} translate={translate} onOpen={() => openImageContextWindow(native)} /> : null}
-          </View>}
+          {selectedCategory === "" ? <EmptyState translate={translate} /> : <View style={styles.runtimeFieldList}>{(groups[selectedCategory] ?? []).map((item) => <RuntimeField key={identifier(item)} item={item} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} dshSyncToken={dshSyncToken} native={native} onStatus={onStatus} />)}</View>}
         </PersistentScrollView>
       </View>
-    </View>
-  </View>;
-}
-
-/**
- * The task list is a child window, the way 添加向导 and the raw file editor are:
- * its own movable titled window over the settings window, which stays locked
- * until it closes.  Every host suspends drawing here and resumes in that
- * window, so no pane ever draws the list itself — an in-pane overlay is not a
- * child surface and is not an option for one.
- */
-function openImageContextWindow(native: NativeLeafAdapter): void {
-  native.window.open("image-context");
-  native.window.focus("image-context");
-}
-
-/**
- * A task's images, and which of them go out with its next turn.
- *
- * The pass decides that from one file per task; this window is how a person
- * sees and changes that file without leaving the app.  It reads the replay the
- * fetch tool answers from -- so every thumbnail is the image the model would
- * receive -- and writes the same selection Context Attachment Manager writes,
- * which is why a task curated in either place behaves the same.
- *
- * One task at a time, chosen from a list that can be searched, because a task
- * per conversation grows without bound and a settings pane is the wrong shape
- * for that.  The window keeps the pass's own bookkeeping visible — what is sent
- * next turn, and which images are held back — and lets a person override any
- * single image.
- */
-/** The line the runtime pane keeps: what the pass is doing, and a way in. */
-function ImageContextWindowLink({ snapshot, busy, translate, onOpen }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; onOpen: () => void }): React.JSX.Element {
-  const state = domainState(snapshot, "image_context");
-  const tasks = asRecords(state.tasks);
-  const environment = asRecord(state.environment);
-  return <View style={styles.runtimeField}>
-    <View style={styles.runtimeImageRow}>
-      <ActionButton title={translate("imageContext.open")} titleWidth="auto" disabled={busy} onPress={onOpen} />
-      <Text style={styles.externalSettingsHelpText}>{translate("imageContext.openHint", { tasks: String(tasks.length) })}</Text>
-    </View>
-    <View style={styles.runtimeImageRow}>
-      <Text style={styles.runtimeImageRowLabel}>{translate("imageContext.modelFetch")}</Text>
-      <Text style={styles.runtimeImageRowValue}>{translate(stringValue(environment.fetch_kind) === "file" ? "imageContext.fetchFile" : stringValue(environment.fetch_kind) === "tool" ? "imageContext.fetchTool" : "imageContext.fetchAsk")}</Text>
-    </View>
-  </View>;
-}
-
-function ImageContextWorkspace({ snapshot, busy, translate, dispatch, ipc, native }: { snapshot?: CoreSnapshot; busy: boolean; translate: Translate; dispatch: Dispatch; ipc: IpcClient; native: NativeLeafAdapter }): React.JSX.Element {
-  const state = domainState(snapshot, "image_context");
-  const tasks = asRecords(state.tasks);
-  const environment = asRecord(state.environment);
-  const task = asRecord(state.task);
-  const images = asRecords(task.images);
-  const selectedTaskId = stringValue(asRecord(task.task).id);
-  const [query, setQuery] = useState("");
-  const [pictures, setPictures] = useState<Record<string, string | null>>({});
-  const [helpOpen, setHelpOpen] = useState(false);
-  // 查看大图 shows the picture in this window's own detail column rather than
-  // in a floating card over it: the column is what the window is about, and an
-  // overlay here was a self-made dialog that the window behind it could not
-  // lock, could not be dragged, and covered the rows it belonged to.
-  const [fullSize, setFullSize] = useState<{ id: string; dataUrl: string | null; downscaled: boolean } | undefined>(undefined);
-  // Keyed by the task, never by the snapshot's revision: every Core change
-  // publishes a new revision, and resetting here closed the enlarged image (and
-  // re-fetched every thumbnail) on each one.
-  useEffect(() => {
-    setPictures({});
-    setFullSize(undefined);
-  }, [selectedTaskId]);
-  // The search covers what the rows show: the thread's name as Codex states
-  // it, the id for a task the index does not name, and the clock.
-  const visibleTasks = query.trim()
-    ? tasks.filter((entry) => [stringValue(entry.title), stringValue(entry.id), formatRailStamp(stringValue(entry.updated_at))]
-      .some((value) => value.toLowerCase().includes(query.trim().toLowerCase())))
-    : tasks;
-  // A card shows the picture itself: a list of ids asked the reader to imagine
-  // what the window is about.  Every card is asked for, because a card that
-  // waits for a click is a card that says "loading" until then -- but each one
-  // asks for a thumbnail (Core scales it to a card's size), so a task of seventy
-  // images costs a couple of megabytes rather than a hundred.
-  // The dependency is the set of ids, not the array: `asRecords` answers a new
-  // array on every render, and an effect keyed on that cancelled itself before
-  // any picture arrived.  The pictures map is read through a ref for the same
-  // reason -- as a dependency it re-ran the effect on every arrival and threw
-  // away the answers still in flight.
-  const asked = useRef<Record<string, true>>({});
-  const picturesRef = useRef(pictures);
-  picturesRef.current = pictures;
-  // A live task appends images while the grid is filling, so this effect runs
-  // again every few seconds.  An answer that arrives after it re-ran is still
-  // the answer for this task, so the only thing worth cancelling is a task the
-  // reader left -- cancelling per run threw away reads that had already been
-  // paid for and left half the cards blank.
-  const openTaskRef = useRef(selectedTaskId);
-  openTaskRef.current = selectedTaskId;
-  const imageIds = images.map((image) => stringValue(image.id)).filter(Boolean).join(",");
-  useEffect(() => {
-    if (!selectedTaskId || !imageIds) return;
-    const task = selectedTaskId;
-    const pending = imageIds.split(",").filter((id) => picturesRef.current[id] === undefined && !asked.current[`${task}:${id}`]);
-    if (pending.length === 0) return;
-    const load = async (id: string): Promise<void> => {
-      const key = `${task}:${id}`;
-      if (asked.current[key]) return;
-      asked.current[key] = true;
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        try {
-          const answer = await ipc.imageContextImage(task, id, true);
-          if (openTaskRef.current !== task) return;
-          setPictures((current) => ({ ...current, [id]: stringValue(answer.data_url) || null }));
-          return;
-        } catch {
-          if (attempt === 0) continue;
-          // A read that failed twice is stated as failed, and the id is left
-          // unasked so the next render retries it instead of keeping the
-          // verdict forever.
-          delete asked.current[key];
-          if (openTaskRef.current !== task) return;
-          setPictures((current) => ({ ...current, [id]: null }));
-        }
-      }
-    };
-    void (async () => {
-      // Three at a time, in order: the newest pictures arrive first, and Core
-      // never sees a burst it answers by refusing.
-      for (let index = 0; index < pending.length; index += THUMBNAIL_CONCURRENCY) {
-        if (openTaskRef.current !== task) return;
-        await Promise.all(pending.slice(index, index + THUMBNAIL_CONCURRENCY).map(load));
-      }
-    })();
-  }, [ipc, selectedTaskId, imageIds]);
-  // The task's own switch lives in Context Attachment Manager's panel, not
-  // here: this window reads it, because it is what a tick means for its images.
-  const automatic = booleanValue(task.auto);
-  const sent = numberValue(asRecord(task.next).sent, 0);
-  const omitted = numberValue(asRecord(task.next).omitted, 0);
-  const fetchKind = stringValue(environment.fetch_kind);
-  const openPreview = (id: string): void => {
-    // Core answers a picture for every stored image: an original while it fits
-    // a message, and a scaled copy of it otherwise, which `downscaled` states
-    // so the caption never calls a smaller copy the original.
-    void ipc.imageContextImage(selectedTaskId, id).then(
-      (answer) => setFullSize({ id, dataUrl: stringValue(answer.data_url) || null, downscaled: booleanValue(answer.downscaled) }),
-      () => setFullSize({ id, dataUrl: null, downscaled: false }),
-    );
-  };
-  const setIncluded = (id: string, included: boolean): void => {
-    // A tick means two different things, because automatic selection does two
-    // different things: with it on, earlier turns are omitted by the pass
-    // itself, so a tick can only mean "send this every turn" (pinned).
-    void dispatch(automatic ? "pin" : "set", automatic ? { task: selectedTaskId, id, pinned: included } : { task: selectedTaskId, id, included }, "image_context");
-  };
-  // The rail is the shared one, so this window keeps the app's one rail width,
-  // row rhythm, and selection capsule instead of a list of its own.  A row is
-  // one line: what the reader chooses by is how many pictures a task holds and
-  // when it last changed; its id is the detail header's hint.  Core stamps
-  // ``updated_at`` in UTC (ISO-8601, trailing Z), so it is formatted here —
-  // slicing the string printed UTC and read as a clock eight hours behind.
-  // Each row is the thread's name with its own clock under it, the way a source
-  // list states an entry and its date: the name is what the reader picks by,
-  // and the time stays legible at the rail's one width instead of being cut off
-  // beside it.  A task Codex has not named shows the clock alone.
-  const railRows = useMemo(() => visibleTasks.map((entry) => ({
-    key: stringValue(entry.id),
-    cells: [stringValue(entry.title) || formatRailStamp(stringValue(entry.updated_at))],
-  })), [visibleTasks]);
-  const railDetails = useMemo(() => visibleTasks.map((entry) => (stringValue(entry.title)
-    ? formatRailStamp(stringValue(entry.updated_at))
-    // A thread Codex has not named leads with its clock, so its second line
-    // states the one fact left that tells it apart from the next one.
-    : translate("imageContext.railCount", { images: String(numberValue(entry.images, 0)) }))), [visibleTasks, translate]);
-  const selectedTask = tasks.find((entry) => stringValue(entry.id) === selectedTaskId);
-  // The thread's name leads, because that is what both Codex and this window
-  // call the task; the id stays only for a task the index cannot name, where
-  // it is still more useful than nothing.
-  const headerHint = selectedTask
-    ? `${stringValue(selectedTask.title) || selectedTaskId} · ${translate("imageContext.taskChip", { images: String(numberValue(selectedTask.images, 0)), at: formatRailStamp(stringValue(selectedTask.updated_at)) })}`
-    : translate("imageContext.leadTitle");
-  return <View style={styles.imageContextWindow}>
-    <View style={styles.imageContextBody}>
-      <View style={styles.imageContextRailColumn}>
-        <View style={styles.imageContextSearch}>
-          <NativeTextField value={query} onChangeText={setQuery} placeholder={translate("imageContext.search")} accessibilityLabel={translate("imageContext.search")} search />
-        </View>
-        {/* The shared rail fills the column under the search field: a rail with
-            no height is a rail with no rows. */}
-        <SettingsRail rows={railRows} details={railDetails} selectedKey={selectedTaskId} style={styles.imageContextRailFill} onSelectionChange={(taskId) => { if (taskId) void dispatch("open", { task: taskId }, "image_context"); }} />
-      </View>
-      <View style={[styles.settingsRailDetail, Platform.OS === "windows" && styles.settingsRailDetailWindows]}>
-        <SettingsDetailHeader
-          title={fullSize ? translate("imageContext.viewerTitle", { id: fullSize.id }) : translate("imageContext.leadTitle")}
-          hint={headerHint}
-          actions={<>
-            {/* The explainer rides a help mark beside the surface it explains,
-                instead of a paragraph band over every task the window shows. */}
-            <HelpTip open={helpOpen} text={translate("imageContext.lead")} title={translate("imageContext.leadTitle")} onToggle={() => setHelpOpen((current) => !current)} />
-            {fullSize ? <ActionButton title={translate("imageContext.back")} titleWidth="auto" onPress={() => setFullSize(undefined)} /> : null}
-          </>}
-        />
-        {fullSize ? <View style={styles.imageContextViewer}>
-          <View style={styles.imageContextViewerFrame}>
-            {fullSize.dataUrl
-              ? <Image source={{ uri: fullSize.dataUrl }} style={styles.imageContextViewerPicture} />
-              : <Text style={styles.imageContextEmpty}>{translate("imageContext.noPreview")}</Text>}
-          </View>
-          {/* A scaled copy is stated as one: the pass still sends the stored
-              bytes, and a caption calling this "the image" would be false. */}
-          {fullSize.downscaled ? <Text style={styles.runtimeHelpText}>{translate("imageContext.scaledPreview")}</Text> : null}
-        </View> : <PersistentScrollView style={styles.runtimeScrollSurface} contentContainerStyle={styles.runtimeWorkspace}>
-          {tasks.length === 0 ? <Text style={styles.imageContextEmpty}>{translate("imageContext.empty")}</Text> : <View style={styles.runtimeFieldList}>
-            <View style={styles.runtimeField}>
-              <View style={styles.runtimeInputRow}>
-                <Text style={styles.imageContextStandfirst}>{translate("imageContext.next", { sent: String(sent), omitted: String(omitted) })}</Text>
-              </View>
-            </View>
-            {/* The pictures keep a list's own frame: it is what tells the reader
-                where the grid ends, and the cells inside it are its rows. */}
-            <View style={styles.imageContextGridFrame}>
-              <View style={styles.imageContextGrid}>
-                {images.map((item) => {
-                  const id = stringValue(item.id);
-                  const included = automatic ? booleanValue(item.pinned) : !booleanValue(item.unchecked);
-                  const picture = pictures[id];
-                  return <Pressable
-                    key={id}
-                    accessibilityRole="button"
-                    accessibilityLabel={translate("imageContext.preview")}
-                    disabled={busy}
-                    style={styles.imageContextCard}
-                    onPress={() => openPreview(id)}
-                  >
-                    <View style={styles.imageContextThumb}>
-                      {/* Three states, three answers: a picture, a read still
-                          running, and a read that failed.  One "click to
-                          enlarge" label for all of them left a blank card
-                          saying nothing about what it was waiting for. */}
-                      {picture
-                        ? <Image source={{ uri: picture }} style={styles.imageContextThumbPicture} />
-                        // Three states again, and the middle one is silent: a
-                        // read in flight is an empty card, not a word.  A card
-                        // that said "loading" for every picture stayed a wall of
-                        // the same sentence, and one that called a read in
-                        // flight "unreadable" was simply wrong.
-                        : picture === null
-                          ? <Text style={styles.imageContextThumbFallback}>{translate("imageContext.thumbFailed")}</Text>
-                          : null}
-                    </View>
-                    <Text numberOfLines={1} style={styles.imageContextCardLabel}>{translate("imageContext.imageLine", { id, size: `${numberValue(item.width, 0)}×${numberValue(item.height, 0)}` })}</Text>
-                    <NativeCheckbox label={translate(automatic ? "imageContext.everyTurn" : "imageContext.send")} value={included} disabled={busy} onValueChange={(next) => setIncluded(id, next)} />
-                  </Pressable>;
-                })}
-              </View>
-            </View>
-            <View style={styles.runtimeHelpSlot}><Text style={styles.runtimeHelpText}>{translate(automatic ? "imageContext.everyTurnHint" : "imageContext.sendHint")}</Text></View>
-            <View style={styles.runtimeField}>
-              <View style={styles.runtimeInputRow}>
-                <Text style={styles.runtimeFieldLabel}>{translate("imageContext.modelFetch")}</Text>
-                <Text style={styles.imageContextRowValue}>{translate(fetchKind === "file" ? "imageContext.fetchFile" : fetchKind === "tool" ? "imageContext.fetchTool" : "imageContext.fetchAsk")}</Text>
-              </View>
-            </View>
-            <View style={styles.runtimeField}>
-              <View style={styles.runtimeInputRow}>
-                <ActionButton title={translate("imageContext.forget")} titleWidth="auto" disabled={busy || !selectedTaskId} onPress={() => { void dispatch("forget", { task: selectedTaskId }, "image_context"); }} />
-              </View>
-              <View style={styles.runtimeHelpSlot}><Text style={styles.runtimeHelpText}>{translate("imageContext.forgetHint")}</Text></View>
-            </View>
-          </View>}
-        </PersistentScrollView>}
-      </View>
-    </View>
-    {/* The way out sits at the end of the window, under the content it closes,
-        the way the app's other child surfaces put theirs. */}
-    <View style={styles.imageContextFooter}>
-      <ActionButton title={translate("status.close")} titleWidth="auto" onPress={() => native.window.close("image-context")} />
     </View>
   </View>;
 }
@@ -12402,7 +12137,7 @@ function PickerField({ label, value, values, onSelect, disabled, labelWidth, lab
   return <View style={[styles.formRow, compactStyles.formRow]}><Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }]}>{label}</Text><NativePicker labels={options.map((option) => option.label)} selectedValue={selectedLabel} disabled={disabled} onChange={({ nativeEvent }) => { const option = options[nativeEvent.index]; if (option) onSelect(option.value); }} style={[styles.picker, compactStyles.picker, allowShrink && styles.pickerShrink, controlWidth === undefined ? null : { width: controlWidth, flex: 0 }]} />{accessory ?? null}</View>;
 }
 
-function RawEditor({ label, domain, document, language, ipc, translate, showLabel = true, showDiff = true, codexPane = false, onConflict, reloadToken = 0, baselineToken = 0, syncRevision, style }: { label: string; domain: AssistantSettingsDomain; document: RawEditorDocument; language: "toml" | "json" | "yaml"; ipc: IpcClient; translate: Translate; showLabel?: boolean; showDiff?: boolean; codexPane?: boolean; onConflict: RawEditorConflictHandler; reloadToken?: number; baselineToken?: number; syncRevision?: number; style?: StyleProp<ViewStyle> }): React.JSX.Element {
+function RawEditor({ label, domain, document, language, ipc, translate, showLabel = true, showDiff = true, codexPane = false, onConflict, onDirtyChange, deferStage = false, reloadToken = 0, baselineToken = 0, syncRevision, style }: { label: string; domain: AssistantSettingsDomain; document: RawEditorDocument; language: "toml" | "json" | "yaml"; ipc: IpcClient; translate: Translate; showLabel?: boolean; showDiff?: boolean; codexPane?: boolean; onConflict: RawEditorConflictHandler; onDirtyChange?: (dirty: boolean) => void; deferStage?: boolean; reloadToken?: number; baselineToken?: number; syncRevision?: number; style?: StyleProp<ViewStyle> }): React.JSX.Element {
   const [documentKey, setDocumentKey] = useState("");
   const [draft, setDraft] = useState("");
   const [baseline, setBaseline] = useState("");
@@ -12430,12 +12165,6 @@ function RawEditor({ label, domain, document, language, ipc, translate, showLabe
   const appliedBaselineTokenRef = useRef(baselineToken);
 
   const normalizeEditorText = (value: string): string => value.replace(/\r\n?/g, "\n");
-  // The native field drops the document's final line break, so a file that
-  // ended with one would be saved without it. A draft keeps the ending its
-  // document had.
-  const withDocumentEnding = (value: string): string => (
-    baselineRef.current.endsWith("\n") && !value.endsWith("\n") ? `${value}\n` : value
-  );
 
   const setPending = useCallback((pending: boolean): void => {
     registry?.setDirty(fieldId.current, pending);
@@ -12475,6 +12204,7 @@ function RawEditor({ label, domain, document, language, ipc, translate, showLabe
           lastStagedRevisionRef.current = staged.revision;
           observedSyncRevisionRef.current = staged.revision;
           stagedTextRef.current = submitted;
+          onDirtyChange?.(draftRef.current !== baselineRef.current);
           if (!flushStageRef.current) {
             if (draftRef.current === stagedTextRef.current) {
               if (mountedRef.current) {
@@ -12550,7 +12280,7 @@ function RawEditor({ label, domain, document, language, ipc, translate, showLabe
     });
     stagePromise.current = tracked;
     return tracked;
-  }, [document, domain, ipc, onConflict, registry, setPending, stageEditorText, translate]);
+  }, [document, domain, ipc, onConflict, onDirtyChange, registry, setPending, stageEditorText, translate]);
 
   const scheduleStage = useCallback((): void => {
     if (stageTimer.current !== undefined) return;
@@ -12572,12 +12302,13 @@ function RawEditor({ label, domain, document, language, ipc, translate, showLabe
     }
     draftRef.current = baselineRef.current;
     stagedTextRef.current = baselineRef.current;
+    onDirtyChange?.(false);
     setDraft(baselineRef.current);
     setEditorRenderRevision((value) => value + 1);
     setStatus("ready");
     setError(undefined);
     registry?.setDirty(fieldId.current, false);
-  }, [registry]);
+  }, [onDirtyChange, registry]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -12621,6 +12352,7 @@ function RawEditor({ label, domain, document, language, ipc, translate, showLabe
       appliedBaselineTokenRef.current = baselineToken;
       registry?.setDirty(fieldId.current, false);
       setStatus("ready");
+      onDirtyChange?.(false);
       setLoading(false);
     }).catch((reason: unknown) => {
       if (!active) return;
@@ -12633,6 +12365,7 @@ function RawEditor({ label, domain, document, language, ipc, translate, showLabe
   useEffect(() => {
     if (!initializedRef.current || syncRevision === undefined) return;
     if (observedSyncRevisionRef.current === syncRevision) return;
+    if (deferStage && draftRef.current !== stagedTextRef.current) return;
     if (stagePromise.current) {
       observedSyncRevisionRef.current = undefined;
       return;
@@ -12700,63 +12433,34 @@ function RawEditor({ label, domain, document, language, ipc, translate, showLabe
     };
     void synchronize();
     return () => { active = false; };
-  }, [document, domain, ipc, onConflict, setPending, syncRevision, translate]);
+  }, [deferStage, document, domain, ipc, onConflict, setPending, syncRevision, translate]);
 
   return <View style={[styles.rawEditor, codexPane && styles.codexRawEditorBase, style]}>
     {showLabel ? <View style={[styles.rawEditorHeader, codexPane && styles.codexRawEditorHeader]}><Text style={[styles.fieldLabel, codexPane && styles.codexRawEditorLabel]}>{label}</Text></View> : null}
     {documentKey
       ? <View style={styles.rawNativeEditorFrame}>
-        {Platform.OS === "windows"
-          // The child editor window hosts this surface in its own XAML island.
-          // A WebView2 inside that island renders blank there (the island does
-          // not hand it the window DPI, and the browser site is arranged before
-          // the scale settles), so Windows edits the same draft in the native
-          // multiline field the runtime JSON editor already uses.  Every stage
-          // and conflict path below is shared with the rich editor.
-          ? <NativeTextField
-            // Uncontrolled on purpose: the native field owns its own text so a
-            // keystroke never re-renders this pane. Remounting on a new
-            // document or revision rebases it onto that text.
-            key={`${documentKey}:${editorRenderRevision}`}
-            multiline
-            defaultValue={draft}
-            accessibilityLabel={label}
-            style={styles.rawNativeTextField}
-            onChangeText={(text) => {
-              // The field hands back Windows line breaks (a lone carriage return
-              // per paragraph). Storing those bytes staged a document whose
-              // every line ended without a newline, so Core rejected an
-              // untouched TOML file as invalid; the draft keeps the same line
-              // endings the file and the rich editor use.
-              const normalized = withDocumentEnding(normalizeEditorText(text));
-              if (!initializedRef.current || normalized === normalizeEditorText(draftRef.current)) return;
-              draftRef.current = normalized;
-              const pending = normalized !== stagedTextRef.current;
-              setPending(pending);
-              if (pending) scheduleStage();
-            }}
-          />
-          : <CodeEditorWebView
-            documentKey={`${documentKey}:${editorRenderRevision}`}
-            value={draft}
-            baseline={baseline}
-            language={language}
-            readOnly={false}
-            showDiff={showDiff}
-            menuLabels={editorMenuLabels(translate)}
-            style={[styles.rawNativeEditor, codexPane && styles.codexRawNativeEditor]}
-            onChange={(text) => {
-              if (!initializedRef.current || normalizeEditorText(text) === normalizeEditorText(draftRef.current)) return;
-              draftRef.current = text;
-              const pending = text !== stagedTextRef.current;
-              setPending(pending);
-              if (pending) scheduleStage();
-            }}
-            onError={() => {
-              setStatus("error");
-              setError(translate("common.secureEditorReadFailed"));
-            }}
-          />}
+        <CodeEditorWebView
+          documentKey={`${documentKey}:${editorRenderRevision}`}
+          value={draft}
+          baseline={baseline}
+          language={language}
+          readOnly={false}
+          showDiff={showDiff}
+          menuLabels={editorMenuLabels(translate)}
+          style={[styles.rawNativeEditor, codexPane && styles.codexRawNativeEditor]}
+          onChange={(text) => {
+            if (!initializedRef.current || normalizeEditorText(text) === normalizeEditorText(draftRef.current)) return;
+            draftRef.current = text;
+            onDirtyChange?.(text !== baselineRef.current);
+            const pending = text !== stagedTextRef.current;
+            setPending(pending);
+            if (pending && !deferStage) scheduleStage();
+          }}
+          onError={() => {
+            setStatus("error");
+            setError(translate("common.secureEditorReadFailed"));
+          }}
+        />
         {loading ? <View pointerEvents="none" style={styles.rawEditorOverlay}><Text style={styles.cardHint}>{translate("common.secureEditorLoading")}</Text></View> : null}
       </View>
       : <View style={[styles.rawEditorLoading, codexPane && styles.codexRawEditorLoading]}><Text style={styles.cardHint}>{loading ? translate("common.loading") : translate("error.coreUnavailable")}</Text></View>}
@@ -12810,6 +12514,8 @@ function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"
                 ? translate("providers.probeInlineAuthError")
                 : uniformStatus === "rate_limited"
                   ? translate("providers.probeInlineRateLimited")
+                : uniformStatus === "model_unavailable"
+                  ? translate("providers.probeInlineModelUnavailable")
                 : uniformStatus === "unsupported"
                   ? translate("providers.probeInlineUnsupported")
                   : uniformStatus === "http_error"
@@ -12888,6 +12594,8 @@ function probeFailureKey(degradation: UnknownRecord): TranslationKey {
       return "providers.probeInlineEgressBlocked";
     case "rate_limited":
       return "providers.probeInlineRateLimited";
+    case "model_unavailable":
+      return "providers.probeInlineModelUnavailable";
     case "unsupported":
       return "providers.probeInlineUnsupported";
     case "http_error":
@@ -13115,36 +12823,17 @@ const styles = StyleSheet.create({
   runtimeImageThumbPicture: { width: 148, height: 96, resizeMode: "contain" },
   runtimeImageThumbFallback: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
   runtimeImageCellLabel: { color: systemColors.label, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
-  imageContextWindow: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window, overflow: "hidden" },
-  imageContextBody: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" },
   // The search field sits above the shared rail, inside the same column, so the
   // rail's one right divider is still the only rule between the two sides.
-  imageContextRailColumn: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0 },
-  imageContextRailFill: { flex: 1, minHeight: 0, paddingTop: 0 },
-  imageContextSearch: { paddingHorizontal: 8, paddingTop: 8, paddingBottom: 4 },
-  imageContextFooter: { flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 10, paddingHorizontal: SETTINGS_PANE_INSET, paddingVertical: 8, borderTopWidth: 1, borderTopColor: systemColors.separator },
-  imageContextRowValue: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE },
-  imageContextEmpty: { padding: SETTINGS_PANE_INSET, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 18 },
-  imageContextStandfirst: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   // The grid keeps a list's own frame: the cards are its rows, and the frame is
   // how the reader sees where the list ends.
-  imageContextGridFrame: { width: "100%", borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground, overflow: "hidden" },
   // Cells wrap, the way the runtime pane's image cells do, so a narrow window
   // drops to three or two per row instead of clipping the last column.
-  imageContextGrid: { flexDirection: "row", flexWrap: "wrap", gap: 12, padding: 10 },
-  imageContextCard: { width: 148, gap: 3 },
-  imageContextThumb: { width: 148, height: 96, borderRadius: 4, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.window, alignItems: "center", justifyContent: "center", overflow: "hidden" },
-  imageContextThumbPicture: { width: 148, height: 96, resizeMode: "contain" },
-  imageContextThumbFallback: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
-  imageContextCardLabel: { color: systemColors.label, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
   // 查看大图 fills the detail column and never floats over it: the picture, its
   // id in the header, and one way back beside it.
-  imageContextViewer: { flex: 1, minWidth: 0, minHeight: 0, gap: 8, padding: SETTINGS_PANE_INSET },
-  imageContextViewerFrame: { flex: 1, minWidth: 0, minHeight: 0, borderRadius: 6, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, alignItems: "center", justifyContent: "center", overflow: "hidden" },
   // A flexible box, not a percentage one: the frame's height is only known after
   // layout, and an Image sized "100%" of it was measured against the picture's
   // own aspect and drew taller than the frame, so a tall page was cut off.
-  imageContextViewerPicture: { flex: 1, alignSelf: "stretch", minHeight: 0, resizeMode: "contain" },
   routeTraceWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 6 },
   routeTraceRequestPane: { width: "31%", minWidth: 252, maxWidth: 360, minHeight: 0, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground },
   routeTraceRequestScroll: { flex: 1, minHeight: 0 },
@@ -13220,7 +12909,7 @@ const styles = StyleSheet.create({
   root: { flex: 1, minWidth: 420 },
   menuBarHost: { flex: 1 }, error: { margin: 20, color: systemColors.red, fontSize: UI_FONT_SIZE },
   startupLoading: { flex: 1, alignItems: "center", justifyContent: "center" }, startupLoadingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
-  windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowSurfaceShellWindows: { backgroundColor: WINDOWS_CONTROL.fill }, windowsChildModalSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, rawNativeTextField: { flex: 1, alignSelf: "stretch", fontFamily: Platform.select({ windows: "Cascadia Mono", default: "monospace" }), fontSize: UI_TIP_FONT_SIZE, paddingTop: 8, paddingBottom: 8, paddingHorizontal: 10 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, imageContextRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, logsContent: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowSurfaceShellWindows: { backgroundColor: WINDOWS_CONTROL.fill }, windowsChildModalSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, logsContent: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   // Settings window: a native source-list sidebar next to the active pane.
   settingsShellFrame: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, settingsShellHeader: { flexShrink: 0, flexDirection: "row", minWidth: 0, backgroundColor: systemColors.window, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, minWidth: 0, flexShrink: 0, minHeight: 0 }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderIntegrated: { width: 200, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsSidebarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderRightWidth: 1, borderRightColor: WINDOWS_CONTROL.strokeSubtle }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { height: 8, flexShrink: 0 }, settingsSidebarList: { flex: 1, minWidth: 0, minHeight: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneHeaderIntegrated: { flex: 1, minWidth: 0, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailIntegrated: { paddingTop: 0 }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: systemColors.window }, settingsRailDetailHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
   routeStatusBar: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, justifyContent: "space-between", paddingHorizontal: 16, paddingVertical: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusBarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderTopColor: WINDOWS_CONTROL.strokeSubtle }, routeStatusTextWindows: { color: WINDOWS_CONTROL.textSecondary },

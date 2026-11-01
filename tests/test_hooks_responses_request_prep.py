@@ -1756,6 +1756,108 @@ class HookResponsesRequestPrepTests(HookTestCase):
         if modified is not None:
             self.assertNotIn("extra_body", modified)
 
+    async def test_a_bridged_request_drops_the_responses_passthrough_container(self) -> None:
+        """A container added for the Responses wire may not ride onto Chat.
+
+        ``_with_responses_native_extra_body`` copies ``client_metadata`` into
+        ``extra_body`` because that is the only container LiteLLM forwards to a
+        Responses endpoint.  A preemptive Chat/Anthropic bridge then flips the
+        same request to a wire that validates its payload, and LiteLLM puts
+        that container into the provider body unchanged.  Observed live on an
+        Anthropic route: the entry was rejected HTTP 400 ``extra_body: extra
+        inputs are not permitted``, and because the bridge had already produced
+        a terminal event the reader was shown "the router could not classify
+        the stop" for a defect this proxy had built itself.
+        """
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        responses_request = {
+            "call_type": "aresponses",
+            "model": "claude-opus-5-5",
+            "input": [{"role": "user", "content": "hi"}],
+            "client_metadata": {"thread_id": "thread-test-bridge"},
+            "stream": True,
+        }
+
+        # Pass one: the native Responses request, where the passthrough is the
+        # only way the route can see the client's own metadata.
+        first = await hook.async_pre_call_deployment_hook(
+            responses_request, call_type="aresponses"
+        )
+        self.assertIsNotNone(first)
+        assert first is not None
+        self.assertEqual(
+            first["extra_body"]["client_metadata"]["thread_id"],
+            "thread-test-bridge",
+        )
+
+        # Pass two: the same request after a preemptive bridge flipped its wire.
+        bridge = dict(first)
+        bridge["use_chat_completions_api"] = True
+        bridge["litellm_metadata"] = {
+            "responses_chat_bridge": True,
+            "responses_chat_bridge_preemptive": True,
+        }
+        second = await hook.async_pre_call_deployment_hook(
+            bridge, call_type="aresponses"
+        )
+        final = second or bridge
+        self.assertTrue(final.get("use_chat_completions_api"))
+        self.assertNotIn(
+            "extra_body",
+            final,
+            "a Responses passthrough container reached the Chat wire",
+        )
+        # The client's own metadata is still on the request; only the
+        # Responses-only container is gone.
+        self.assertEqual(
+            final["client_metadata"]["thread_id"], "thread-test-bridge"
+        )
+
+    async def test_a_bridge_keeps_a_provider_container_it_did_not_add(self) -> None:
+        """Only this proxy's own passthrough keys are stripped from the bridge.
+
+        A bridged request can also carry ``tools`` inside ``extra_body``
+        (``_sync_bridge_extra_body_tools``) or another provider's namespace.
+        Dropping the whole container would send a Chat request with no tools, so
+        the rule is the key list, not the container.
+        """
+        hooks, _ = load_hook_module()
+        passthrough = {
+            "call_type": "aresponses",
+            "model": "claude-opus-5-5",
+            "input": [{"role": "user", "content": "hi"}],
+            "use_chat_completions_api": True,
+            "extra_body": {
+                "client_metadata": {"thread_id": "thread-test-bridge"},
+                "tools": [{"type": "function", "name": "keep"}],
+            },
+        }
+
+        stripped = hooks._responses_request_module._with_responses_native_extra_body(
+            passthrough
+        )
+        self.assertIsNotNone(stripped)
+        assert stripped is not None
+        self.assertEqual(
+            stripped["extra_body"],
+            {"tools": [{"type": "function", "name": "keep"}]},
+        )
+
+        # A request with nothing of ours in the container is left alone, so the
+        # hook's ``None`` contract still means "changed nothing".
+        self.assertIsNone(
+            hooks._responses_request_module._with_responses_native_extra_body(
+                {
+                    "call_type": "aresponses",
+                    "model": "claude-opus-5-5",
+                    "input": "hi",
+                    "use_chat_completions_api": True,
+                    "extra_body": {"tools": []},
+                }
+            )
+        )
+
     async def test_pre_call_deployment_hook_preserves_codex_compaction_history_byte_for_byte(self) -> None:
         hooks, _ = load_hook_module()
         contract = hooks._codex_contract_module

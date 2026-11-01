@@ -6,7 +6,6 @@ export type IpcMethod =
   | "logs"
   | "editor"
   | "files"
-  | "image_context_image"
   | "dispatch"
   | "subscribe"
   | "validate"
@@ -29,7 +28,6 @@ export type AppRoute =
   | "relay-accounts"
   | "relay-add"
   | "provider-wizard"
-  | "image-context"
   | "logs";
 
 export type LogTab =
@@ -49,8 +47,7 @@ export type ConfigDomain =
   | "webdav"
   | "logs"
   | "language"
-  | "relay_accounts"
-  | "image_context";
+  | "relay_accounts";
 
 export type LanguagePreference = "system" | "en" | "zh-Hans";
 
@@ -225,7 +222,6 @@ export interface ApplyIssue {
 export type ProviderAuthKind =
   | "api_key"
   | "openai_login"
-  | "claude_login"
   | "workbuddy_login"
   | "workbuddy_global_login"
   | "our_free_model_login";
@@ -463,7 +459,6 @@ export interface IpcParams {
     }
     | { editor_token: string; text: string };
   files: Record<string, never>;
-  image_context_image: { task: string; id: string; thumb?: boolean };
   dispatch: { action: DispatchAction; revision?: number };
   subscribe: { topics?: "snapshot"[] };
   validate: { domain: ConfigDomain; revision?: number };
@@ -473,21 +468,6 @@ export interface IpcParams {
   export: { sections: ConfigDomain[]; destination_token: string };
   import_preview: { source_token: string; revision: number };
   import: { import_plan_token: string; sections: ConfigDomain[]; revision: number };
-}
-
-/** One stored image of one task, for a panel preview. */
-export interface ImageContextImage {
-  task: string;
-  id: string;
-  mime: string;
-  bytes: number;
-  width: number | null;
-  height: number | null;
-  turn: number | null;
-  name: string | null;
-  data_url: string | null;
-  /** True when `data_url` is a scaled copy instead of the stored bytes. */
-  downscaled: boolean;
 }
 
 export interface IpcResults {
@@ -517,7 +497,6 @@ export interface IpcResults {
     baseline: string;
   };
   files: { revision: number; files: ClientFile[] };
-  image_context_image: ImageContextImage;
   dispatch: { revision: number; action_summary?: Record<string, unknown> };
   subscribe: { subscription_id: string };
   validate: { validate: ValidationSummary };
@@ -607,7 +586,6 @@ export interface IpcClient {
   logs(tab: LogTab, revision?: number): Promise<IpcResults["logs"]>;
   editor(domain: EditorDomain, document: EditorDocument): Promise<IpcResults["editor"]>;
   files(): Promise<IpcResults["files"]>;
-  imageContextImage(task: string, id: string, thumb?: boolean): Promise<IpcResults["image_context_image"]>;
   stageEditor(editorToken: string, text: string): Promise<IpcResults["editor"]>;
   dispatch(action: DispatchAction, revision?: number): Promise<IpcResults["dispatch"]>;
   subscribe(listener: (event: IpcEvent) => void, topics?: IpcEventTopic[]): () => void;
@@ -712,7 +690,6 @@ export interface NativeLocalization {
   routeDataManagement: string;
   routeProviderWizard: string;
   routeFileEditor: string;
-  routeImageContext: string;
   routeLogs: string;
   /**
    * The words a child surface states beside its own footer buttons while a save
@@ -858,12 +835,11 @@ export interface NativeLeafAdapter {
    * credential material to the shared UI.
    */
   showProviderAuth?(options: {
-    provider: "openai" | "claude";
+    provider: "openai";
     /** Stable per-account identity used to isolate concurrent native auth windows. */
     fingerprint?: string;
     verificationURL: string;
     userCode?: string;
-    callbackURL?: string;
     title: string;
     closeLabel: string;
     /** The window's own reload action: a page that stalled can be retried. */

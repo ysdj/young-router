@@ -24,11 +24,10 @@ type NativeModule = {
   showConfirmation?: (title: string, message: string, confirmLabel: string, cancelLabel: string, destructive: boolean) => Promise<boolean>;
   showReadOnlyText?: (title: string, text: string, closeLabel: string, language: "json" | "toml" | "text", html: string) => Promise<void>;
   showProviderAuth?: (options: {
-    provider: "openai" | "claude";
+    provider: "openai";
     fingerprint?: string;
     verificationURL: string;
     userCode?: string;
-    callbackURL?: string;
     title: string;
     closeLabel: string;
     reloadLabel: string;

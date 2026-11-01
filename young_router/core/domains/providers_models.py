@@ -385,6 +385,12 @@ class ProvidersModelsDomain:
         # for the debounced Apply validator to distinguish that case from a
         # newly added key, which still needs the secure editor.
         self._model_edit_existing_key_ids: set[str] = set()
+        # The last validation answer and the draft digest it was computed for.
+        # A domain read validates the same draft several times per commit (the
+        # store's pre-Apply pass and the adapter's own), and each pass serializes
+        # the whole provider document; `_validate` answers from here while the
+        # digest is unchanged and every draft replacement drops it.
+        self._validation_cache: tuple[str, dict[str, Any]] | None = None
         # What the last live WorkBuddy read observed, per region.  A snapshot
         # projects this instead of calling the worker: see
         # `_workbuddy_projection_status`.
@@ -640,8 +646,6 @@ class ProvidersModelsDomain:
                 auth_kind = "api_key"
             if auth_kind == "openai_login":
                 return "chatgpt"
-            if auth_kind == "claude_login":
-                return "anthropic"
         surface = str(model.get("upstream_url_surface", "")).strip()
         return "anthropic" if surface == "anthropic" else "openai"
 
@@ -677,8 +681,6 @@ class ProvidersModelsDomain:
         """
 
         auth_kind = ProvidersModelsDomain._provider_auth_state(provider)["kind"]
-        if auth_kind == "claude_login":
-            return "anthropic", "fixed"
         if auth_kind == "openai_login":
             return "openai/responses", "fixed"
         if auth_kind in workbuddy_module.WORKBUDDY_AUTH_KINDS:
@@ -1849,10 +1851,34 @@ class ProvidersModelsDomain:
         return summary
 
     _CHATGPT_MODELS_ENDPOINT = "https://chatgpt.com/backend-api/codex/models"
-    # The roster answers only a caller that names the client it is: without a
-    # client_version the request is refused as malformed before the account is
-    # even read.
-    _CHATGPT_CLIENT_VERSION = "0.48.0"
+    # The roster answers only a caller that names the client it is, and it reads
+    # that claim as a *gate*: a version older than the client itself lists
+    # silently answers `{"models": []}`, which is indistinguishable from an
+    # account that serves nothing.  The claim is therefore the installed
+    # client's own version (see `native_codex_client_version`), and a machine
+    # that ships no client keeps the floor the endpoint accepts at all.
+    _CHATGPT_CLIENT_VERSION_FLOOR = "0.100.0"
+
+    @classmethod
+    def _chatgpt_client_version(cls) -> str:
+        """The version the roster is asked under.
+
+        The installed Codex client states it; a host with no client, and a
+        client older than the roster endpoint serves at all, keep the floor.
+        """
+
+        from ..native_codex_catalog import native_codex_client_version
+
+        installed = native_codex_client_version()
+        if not installed:
+            return cls._CHATGPT_CLIENT_VERSION_FLOOR
+        try:
+            older = tuple(int(part) for part in installed.split("-", 1)[0].split(".")) < tuple(
+                int(part) for part in cls._CHATGPT_CLIENT_VERSION_FLOOR.split(".")
+            )
+        except ValueError:
+            return cls._CHATGPT_CLIENT_VERSION_FLOOR
+        return cls._CHATGPT_CLIENT_VERSION_FLOOR if older else installed
 
     def _fetch_account_models(
         self,
@@ -1888,7 +1914,7 @@ class ProvidersModelsDomain:
         account_id = credential.get("account_id", "")
         if account_id:
             headers["chatgpt-account-id"] = account_id
-        endpoint = f"{self._CHATGPT_MODELS_ENDPOINT}?client_version={self._CHATGPT_CLIENT_VERSION}"
+        endpoint = f"{self._CHATGPT_MODELS_ENDPOINT}?client_version={self._chatgpt_client_version()}"
         request = urllib.request.Request(endpoint, headers=headers, method="GET")
         try:
             with isolated_http_opener().open(request, timeout=self._MODEL_LIST_TIMEOUT_SECONDS) as response:
@@ -2073,8 +2099,19 @@ class ProvidersModelsDomain:
         api_base: str,
         credential: str,
         model_name: str,
+        account_id: str = "",
     ) -> dict[str, Any]:
+        """Ask one surface whether this route answers there.
+
+        ``account_id`` marks a probe sent as a signed-in ChatGPT account: that
+        door speaks the Responses wire only, refuses a non-streaming request,
+        and names the turn's account in its own header.  Everything else about
+        the probe — request shape, status vocabulary, original request — is the
+        same, so one implementation still answers for every route.
+        """
+
         root = service_root(api_base)
+        account_backed = bool(account_id) and surface == "openai/responses"
         headers = browser_request_headers()
         headers["Content-Type"] = "application/json"
         if surface == "anthropic":
@@ -2096,20 +2133,49 @@ class ProvidersModelsDomain:
                 "messages": [{"role": "user", "content": "Reply with OK."}],
             }
         else:
-            endpoint = f"{root}/v1/responses" if isinstance(root, str) and root else ""
+            endpoint = (
+                # The account door has no `/v1` segment: its base already ends
+                # at the resource root the adapter appends `responses` to.
+                f"{root}/responses"
+                if account_backed and isinstance(root, str) and root
+                else f"{root}/v1/responses" if isinstance(root, str) and root else ""
+            )
             headers["Authorization"] = f"Bearer {credential}"
-            payload = {
-                "model": model_name,
-                "max_output_tokens": 8,
-                "stream": False,
-                "input": "Reply with OK.",
-            }
+            payload = (
+                # The account door states the turn as a list of items, keeps no
+                # stored turn (`store: false`), and answers only a stream; it
+                # also refuses any budget below 16.
+                {
+                    "model": model_name,
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "Reply with OK."}],
+                        }
+                    ],
+                    "max_output_tokens": cls._CHATGPT_MODEL_PROBE_MAX_OUTPUT_TOKENS,
+                    "store": False,
+                    "stream": True,
+                    "instructions": "Reply with OK.",
+                }
+                if account_backed
+                else {
+                    "model": model_name,
+                    "max_output_tokens": 8,
+                    "stream": False,
+                    "input": "Reply with OK.",
+                }
+            )
+            if account_backed:
+                headers["chatgpt-account-id"] = account_id
+                headers["Accept"] = "text/event-stream"
 
         original_request = {
             "method": "POST",
             "url": endpoint,
             "headers": {
-                "Accept": "application/json",
+                "Accept": "text/event-stream" if account_backed else "application/json",
                 "Content-Type": "application/json",
                 **({"anthropic-version": "2023-06-01"} if surface == "anthropic" else {}),
             },
@@ -2145,7 +2211,7 @@ class ProvidersModelsDomain:
                     body = response.read(cls._MAX_MODEL_PROBE_BYTES + 1)
                 break
             except urllib.error.HTTPError as exc:
-                return result(False, cls._probe_status_for_http_error(exc))
+                return result(False, cls._probe_status_for_http_error(exc, account_backed=account_backed))
             except Exception as exc:
                 failure = cls._probe_failure_status(exc)
                 if attempt + 1 >= cls._MODEL_PROBE_ATTEMPTS or not cls._probe_transport_retryable(exc):
@@ -2153,6 +2219,13 @@ class ProvidersModelsDomain:
                 time.sleep(cls._MODEL_PROBE_RETRY_DELAY_SECONDS)
         if not isinstance(status, int) or not 200 <= status < 300 or len(body) > cls._MAX_MODEL_PROBE_BYTES:
             return result(False, "http_error")
+        if account_backed:
+            # A streamed answer: any `response.created` is the route accepting
+            # the turn, and a stream that opens with an error event is not.
+            text = body.decode("utf-8", "replace")
+            if "event: response.created" in text or '"type":"response.created"' in text.replace(" ", ""):
+                return result(True, "ok")
+            return result(False, "invalid_response")
         try:
             decoded = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -2235,7 +2308,9 @@ class ProvidersModelsDomain:
         return cls._probe_failure_status(error) == "refused"
 
     @classmethod
-    def _probe_status_for_http_error(cls, error: urllib.error.HTTPError) -> str:
+    def _probe_status_for_http_error(
+        cls, error: urllib.error.HTTPError, *, account_backed: bool = False
+    ) -> str:
         """Name one rejected probe for what the upstream actually refused.
 
         A 403 is only a refused credential when it says so.  A free lane whose
@@ -2244,9 +2319,17 @@ class ProvidersModelsDomain:
         and reporting that as ``auth_error`` told the pane to look at a key
         that was never the problem.  A credential failure the upstream spells
         out still keeps its own name, so a real rejection is not softened.
+
+        An account-backed route has one more refusal to state: the account
+        answered, but not with that model.  A signed-in ChatGPT account serves
+        its own roster, and a route naming anything else is a route this
+        account does not offer — a fact about the route, not about the wire,
+        the key, or the address.
         """
 
         code = error.code
+        if code == 400 and account_backed and cls._probe_body_names_missing_model(error):
+            return "model_unavailable"
         if code in {401, 403}:
             return (
                 "egress_blocked"
@@ -2260,6 +2343,23 @@ class ProvidersModelsDomain:
             if code == 429
             else "http_error"
         )
+
+    @staticmethod
+    def _probe_body_names_missing_model(error: urllib.error.HTTPError) -> bool:
+        """Whether a rejected probe said the model is not served here."""
+
+        try:
+            body = error.read(ProvidersModelsDomain._MAX_MODEL_PROBE_BYTES + 1)
+        except Exception:
+            return False
+        if not body:
+            return False
+        try:
+            decoded = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        payload = decoded.get("error") if isinstance(decoded, Mapping) else None
+        return isinstance(payload, Mapping) and str(payload.get("code", "")).strip() == "model_not_found"
 
     @staticmethod
     def _probe_body_names_no_credential_fault(error: urllib.error.HTTPError) -> bool:
@@ -2495,6 +2595,12 @@ class ProvidersModelsDomain:
         return result
 
     _PROBE_SURFACES: tuple[str, ...] = ("openai/responses", "openai/chat", "anthropic")
+    #: The address LiteLLM's own ChatGPT adapter sends a turn to.  An
+    #: account-backed route has no base in the document; the adapter owns it,
+    #: and the probe must ask the same door the route is served through.
+    _CHATGPT_API_BASE = "https://chatgpt.com/backend-api/codex"
+    #: The smallest output budget that endpoint accepts for a ChatGPT account.
+    _CHATGPT_MODEL_PROBE_MAX_OUTPUT_TOKENS = 16
 
     @classmethod
     def _managed_base_references(cls) -> frozenset[str]:
@@ -2536,6 +2642,82 @@ class ProvidersModelsDomain:
         return False
 
     @classmethod
+    def _account_probe_mode(cls, provider: Mapping[str, Any]) -> bool:
+        """Whether this row is served by a signed-in account's own adapter."""
+
+        try:
+            return cls._provider_auth_state(provider)["kind"] == "openai_login"
+        except DomainError:
+            return False
+
+    @classmethod
+    def _account_ref_for_probe(
+        cls, provider: Mapping[str, Any], model: Mapping[str, Any]
+    ) -> str:
+        """The account a route answers with, or ``""`` when a key serves it.
+
+        The same reading the pane uses to file a route under its credential, so
+        the probe and the row can never disagree about which credential the
+        finding describes.
+        """
+
+        if not cls._account_probe_mode(provider):
+            return ""
+        if str(model.get("provider_key_id", "")).strip() or str(
+            model.get("api_key_name", "")
+        ).strip():
+            return ""
+        named = str(model.get("account_ref", "")).strip()
+        accounts = cls._provider_accounts(provider)
+        refs = {entry["ref"] for entry in accounts}
+        if named:
+            return named if named in refs else ""
+        return accounts[0]["ref"] if accounts else ""
+
+    def _account_probe_credential(
+        self,
+        provider: Mapping[str, Any],
+        account_ref: str,
+        model: Mapping[str, Any],
+    ) -> tuple[str, str, str, str]:
+        """``(key name, credential, api_base, account id)`` for one account's route.
+
+        An account-backed row stores no address of its own, and the account's
+        credential is not one of the row's keys: it is a session Core holds.
+        The probe therefore reads it here, exactly as the adapter will, and
+        keeps it out of every projection.
+        """
+
+        auth_kind = self._provider_auth_state(provider)["kind"]
+        manager = self._auth_manager()
+        credential = manager.chatgpt_request_credential(account_ref)
+        return (
+            str(model.get("api_key_name", "")).strip(),
+            str(credential.get("access_token", "")),
+            self._CHATGPT_API_BASE,
+            str(credential.get("account_id", "")),
+        )
+
+    @classmethod
+    def _plain_credential_api_base(cls, provider: Mapping[str, Any]) -> str:
+        """The address a row's *custom keys* speak at.
+
+        An account-backed row carries no base of its own: it is the account's
+        adapter that owns one.  The keys the same row also holds are plain
+        OpenAI credentials, and the service's public address is where they
+        answer - the writer already states it for them, so the probe reads the
+        same table instead of probing an empty address.
+        """
+
+        try:
+            auth_kind = cls._provider_auth_state(provider)["kind"]
+        except DomainError:
+            auth_kind = "api_key"
+        from ...config.schema import SERVICE_LOGIN_BASE_URLS
+
+        return SERVICE_LOGIN_BASE_URLS.get(auth_kind, "")
+
+    @classmethod
     def _probe_surfaces(
         cls,
         api_base: str,
@@ -2552,8 +2734,18 @@ class ProvidersModelsDomain:
         user's own upstream - a loopback server the user runs included - and
         the probe asks it about every protocol it might speak, which is how a
         local server that only serves Chat Completions is discovered.
+
+        A signed-in account is the same rule for a different reason: its
+        adapter owns both the address and the wire, so the other two surfaces
+        are not protocols this route *could* answer - they are requests to an
+        address the row does not have.
         """
 
+        if provider is not None and cls._account_ref_for_probe(provider, model):
+            configured = str(model.get("upstream_url_surface", "")).strip()
+            if configured in cls._PROBE_SURFACES:
+                return [configured]
+            return ["openai/responses"]
         if cls._is_managed_service(api_base, model, provider):
             configured = str(model.get("upstream_url_surface", "")).strip()
             if configured in cls._PROBE_SURFACES:
@@ -2572,7 +2764,21 @@ class ProvidersModelsDomain:
         provider_name = str(provider.get("name", "")).strip()
         probe_key = model_id
         api_base = self._model_api_base(provider, model)
-        _key_name, credential = self._model_credential(provider, model)
+        # Which credential a route answers with decides which *address* it is
+        # asked at.  A signed-in account stores no base of its own: its adapter
+        # owns the address, and the row's custom key speaks the plain wire at
+        # the service's public address.  Reading only the key here is what made
+        # every account-backed route probe an empty base with a placeholder key
+        # and report "incomplete config" for a route that answered fine.
+        account_ref = self._account_ref_for_probe(provider, model)
+        account_id = ""
+        if account_ref:
+            _key_name, credential, api_base, account_id = self._account_probe_credential(
+                provider, account_ref, model
+            )
+        else:
+            _key_name, credential = self._model_credential(provider, model)
+            api_base = api_base or self._plain_credential_api_base(provider)
         model_name = self._wire_model_name(model)
         surfaces = self._probe_surfaces(api_base, model, provider)
 
@@ -2584,6 +2790,7 @@ class ProvidersModelsDomain:
                     api_base=api_base,
                     credential=credential,
                     model_name=model_name,
+                    account_id=account_id,
                 )
                 for surface in surfaces
             }
@@ -3705,16 +3912,15 @@ class ProvidersModelsDomain:
             # worker owner is present -- the same owner every read goes through,
             # which a bare domain supplies and a staged package backs.
             return self.our_free_model is not None or our_free_model_module.available()
-        if auth.get("kind") in {"openai_login", "claude_login"}:
+        if auth.get("kind") == "openai_login":
             # The OpenAI status is a local file read plus a token-expiry check,
-            # so a projection may take it.  Claude's device login is answered
-            # from in-memory state and falls through to a local record read.
+            # so a projection may take it.
             credential_ref = str(auth.get("credential_ref", "")).strip()
             if not credential_ref:
                 return False
             try:
                 return bool(
-                    self._auth_manager().status(str(auth["kind"]), credential_ref).get("configured")
+                    self._auth_manager().status("openai_login", credential_ref).get("configured")
                 )
             except Exception:
                 return False
@@ -3735,37 +3941,31 @@ class ProvidersModelsDomain:
             # No sign-in exists for this lane, so there is no login this app can
             # start or end: the state reports the integration, not an account.
             return "signed_in" if self.our_free_model is not None or our_free_model_module.available() else "unsupported"
-        if kind in {"openai_login", "claude_login"}:
+        if kind == "openai_login":
             credential_ref = str(auth.get("credential_ref", "")).strip()
             if not credential_ref:
                 return "signed_out"
-            if kind == "openai_login":
-                # The row answers for the service, so its state is the best one
-                # any of its accounts is in: one signed-in account means the
-                # service serves, and an account still authorizing means the
-                # pane has a sign-in to follow even when another account is the
-                # first one listed.
-                states: list[str] = []
-                for entry in self._provider_accounts(provider):
-                    try:
-                        states.append(
-                            str(
-                                self._auth_manager()
-                                .status(kind, entry["ref"])
-                                .get("status", "signed_out")
-                            )
+            # The row answers for the service, so its state is the best one
+            # any of its accounts is in: one signed-in account means the
+            # service serves, and an account still authorizing means the
+            # pane has a sign-in to follow even when another account is the
+            # first one listed.
+            states: list[str] = []
+            for entry in self._provider_accounts(provider):
+                try:
+                    states.append(
+                        str(
+                            self._auth_manager()
+                            .status(kind, entry["ref"])
+                            .get("status", "signed_out")
                         )
-                    except Exception:
-                        states.append("error")
-                for candidate in ("signed_in", "authorizing", "expired", "error"):
-                    if candidate in states:
-                        return candidate
-                return "signed_out"
-            try:
-                status = str(self._auth_manager().status(kind, credential_ref).get("status", "signed_out"))
-            except Exception:
-                return "error"
-            return status if status in {"signed_out", "authorizing", "signed_in", "expired", "error", "unsupported"} else "error"
+                    )
+                except Exception:
+                    states.append("error")
+            for candidate in ("signed_in", "authorizing", "expired", "error"):
+                if candidate in states:
+                    return candidate
+            return "signed_out"
         return "signed_in" if self._provider_auth_configured(provider, auth) else "signed_out"
 
     def _provider_account_states(
@@ -3936,12 +4136,6 @@ class ProvidersModelsDomain:
             provider.pop("auth_credential_ref", None)
         return normalized
 
-    @staticmethod
-    def _provider_auth_env_value(credential_ref: str) -> str:
-        from ..provider_auth import credential_env_name
-
-        return f"os.environ/{credential_env_name(credential_ref)}"
-
     @classmethod
     def _configure_provider_auth(
         cls,
@@ -4025,19 +4219,6 @@ class ProvidersModelsDomain:
                     }
                 ],
             )
-        elif auth_kind == "claude_login":
-            provider["api_base"] = ""
-            cls._sync_primary_api_key(
-                provider,
-                [
-                    {
-                        "id": cls._new_provider_key_id(),
-                        "name": "claude-oauth",
-                        "value": cls._provider_auth_env_value(credential_ref),
-                        "source": {"kind": "independent"},
-                    }
-                ],
-            )
         return auth
 
     @classmethod
@@ -4049,7 +4230,6 @@ class ProvidersModelsDomain:
         selected_key = (
             keys[0]
             if auth_kind in {
-                "claude_login",
                 *workbuddy_module.WORKBUDDY_AUTH_KINDS,
                 *our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS,
             } and keys
@@ -4642,7 +4822,6 @@ class ProvidersModelsDomain:
     _SERVICE_PROVIDER_KINDS = frozenset(
         {
             "openai_login",
-            "claude_login",
             *workbuddy_module.WORKBUDDY_AUTH_KINDS,
             *our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS,
         }
@@ -4655,11 +4834,6 @@ class ProvidersModelsDomain:
         # sitting in the list until they noticed and deleted it.
         "openai_login": {
             "name": "OpenAI",
-        },
-        "claude_login": {
-            "name": "Claude",
-            "model_name": "claude-sonnet-4-5",
-            "upstream_model": "claude-sonnet-4-5",
         },
         # WorkBuddy carries no default model: the desktop app's own catalog is
         # the roster, so a newly added account imports exactly what the account
@@ -7941,18 +8115,6 @@ class ProvidersModelsDomain:
     def secret_present(self, field: str, target: str | None = None) -> bool:
         if field == "import_link" and target is None:
             return False
-        if field == "provider_auth_token" and isinstance(target, str):
-            index = self._provider_index({"provider_id": target})
-            provider = self._draft["providers"][index]
-            if not isinstance(provider, Mapping):
-                return False
-            auth = self._provider_auth_state(provider)
-            if auth["kind"] != "claude_login":
-                raise DomainError("The requested secret field is unavailable")
-            try:
-                return bool(self._auth_manager().status(auth["kind"], auth["credential_ref"]).get("configured"))
-            except Exception:
-                return False
         if field != "api_key" or not isinstance(target, str):
             raise DomainError("The requested secret field is unavailable")
         pending = self._pending_secret_target(target)
@@ -8005,23 +8167,6 @@ class ProvidersModelsDomain:
             self._import_link(value)
             self.revision += 1
             return
-        if field == "provider_auth_token" and isinstance(target, str):
-            index = self._provider_index({"provider_id": target})
-            provider = self._draft["providers"][index]
-            if not isinstance(provider, Mapping):
-                raise DomainError("The selected provider is unavailable")
-            auth = self._provider_auth_state(provider)
-            if auth["kind"] != "claude_login":
-                raise DomainError("The requested secret field is unavailable")
-            try:
-                if value:
-                    self._auth_manager().import_claude_token(auth["credential_ref"], value)
-                else:
-                    self._auth_manager().logout(auth["kind"], auth["credential_ref"])
-            except Exception:
-                raise DomainError("Claude OAuth token is invalid") from None
-            self.revision += 1
-            return
         if field != "api_key" or not isinstance(target, str):
             raise DomainError("The requested secret field is unavailable")
         pending = self._pending_secret_target(target)
@@ -8034,6 +8179,55 @@ class ProvidersModelsDomain:
         self.revision += 1
 
     def _validate(
+        self,
+        *,
+        allow_unmaterialized_relay_keys: bool = False,
+    ) -> dict[str, Any]:
+        """Validate the staged draft, reusing the answer for the same draft.
+
+        Validation serializes the complete draft to YAML and parses it back, so
+        one committed toggle used to pay for it twice: Core validates every
+        domain before any Apply writes, and the provider domain validates again
+        inside its own ``apply``.  The draft is the whole input, so the answer is
+        memoized on a digest of both inputs and dropped whenever the draft object
+        is replaced (stage, reload, restore, cancel) -- a stale answer can never
+        describe a document the domain no longer holds.
+        """
+
+        cache = getattr(self, "_validation_cache", None)
+        # The flag is part of the question: a draft with unmaterialized relay
+        # keys is valid under the preflight contract and invalid under the
+        # strict one, so one answer may never stand for both.
+        key = f"{int(allow_unmaterialized_relay_keys)}:{self._draft_digest()}"
+        if cache is not None and cache[0] == key:
+            return copy.deepcopy(cache[1])
+        result = self._validate_uncached(allow_unmaterialized_relay_keys=allow_unmaterialized_relay_keys)
+        self._validation_cache = (key, copy.deepcopy(result))
+        return result
+
+    def _draft_digest(self) -> str:
+        """An identity for the staged draft, cheap enough for every read.
+
+        The digest is only compared, never published, so a plain content hash of
+        the JSON form is exactly right: the draft holds nothing that cannot be
+        encoded, and two drafts that encode identically validate identically.
+        """
+
+        try:
+            encoded = json.dumps(
+                self._draft,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                default=str,
+            )
+        except (TypeError, ValueError):
+            # An unencodable draft is not a cacheable one; a unique key makes
+            # this read recompute instead of answering from another draft.
+            return f"unhashable:{id(self._draft)}"
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _validate_uncached(
         self,
         *,
         allow_unmaterialized_relay_keys: bool = False,
@@ -8166,17 +8360,20 @@ class ProvidersModelsDomain:
         if entry_issues:
             return {"valid": False, "issues": entry_issues}
         try:
-            with tempfile.TemporaryDirectory(prefix="litellm-core-provider-validate-") as directory:
-                target = Path(directory) / "config.yaml"
-                source = _mapping(document, "document")
-                config_text = source.get("config")
-                if not isinstance(config_text, str):
-                    raise DomainError("Provider/model configuration is invalid")
-                atomic_write_text(target, config_text)
-                disabled = source.get("disabled")
-                if isinstance(disabled, str):
-                    atomic_write_text(target.with_name("config.disabled-models.yaml"), disabled)
-                config_api.save_config(candidate_providers, target, document=source)
+            source = _mapping(document, "document")
+            if not isinstance(source.get("config"), str):
+                raise DomainError("Provider/model configuration is invalid")
+            # ``probe`` renders and validates the whole candidate in memory.
+            # This used to write the current document into a scratch directory
+            # and save the candidate over it, only to throw both away: the
+            # scratch files were never read, and the Apply that followed
+            # rendered the identical text a second time.
+            config_api.save_config(
+                candidate_providers,
+                self.config_path,
+                document=source,
+                probe=True,
+            )
         except DomainError:
             raise
         except ValueError as error:

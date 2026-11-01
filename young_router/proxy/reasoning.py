@@ -10,11 +10,24 @@ from ..core.model_contexts import (
     ReasoningCapability,
     default_context_cache_path,
     legacy_context_cache_paths,
+    published_reasoning_levels,
 )
 from . import request_context as _request_context_module
 
 
-_REASONING_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+# pi.dev's ladder, plus the tier Codex states above ``max``.  ``ultra`` is in this
+# scale so a client that asks for it is clamped onto the hardest level the route
+# actually maps (``max``) instead of being passed up the wire verbatim.
+_REASONING_LEVELS = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+)
 _registry_state: tuple[tuple[str, str, str, int | None], ModelContextRegistry] | None = None
 
 
@@ -105,6 +118,11 @@ def _model_listing_efforts(public_name: str) -> list[str] | None:
     falls back to the public name's own resolution, which is where the request
     path ends up too.  The fallback can only widen the answer from ``None``,
     never contradict a common surface that resolved.
+
+    The array is Pi's, so it is worded in Pi's ladder (``off``, never the
+    Codex-side ``none``) and carries ``ultra`` beside every ``max`` -- the same
+    rule the managed Codex catalog publishes through
+    ``published_reasoning_levels``.
     """
 
     if not isinstance(public_name, str) or not public_name.strip():
@@ -122,7 +140,7 @@ def _model_listing_efforts(public_name: str) -> list[str] | None:
         return None
     if capability is None or not capability.supported_levels:
         return None
-    return list(capability.supported_levels)
+    return published_reasoning_levels(capability.supported_levels, pi_spelling=True)
 
 
 def _canonical_reasoning_level(value: object) -> str | None:
@@ -321,6 +339,7 @@ _GOOGLE_THINKING_LEVEL_BY_EFFORT = {
     "high": "high",
     "xhigh": "high",
     "max": "high",
+    "ultra": "high",
 }
 
 

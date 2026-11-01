@@ -43,6 +43,11 @@ import Foundation
     // Core publishes IPC before starting the managed proxy, so host startup
     // only waits for the local control endpoint rather than proxy health.
     private static let coreStartupTimeout: TimeInterval = 10
+    // How long a Core gets to answer the one question that decides whether it
+    // is replaced: renewing the session it minted.  A loopback IPC answer is
+    // milliseconds; this bound is what keeps one failed request from throwing
+    // away a process that is still doing the work the app asked for.
+    private static let coreLivenessTimeout: TimeInterval = 2
     private var endpoint: Endpoint?
     private var sessionToken: String?
     private var sessionExpiresAt: Date?
@@ -592,9 +597,11 @@ import Foundation
         timeoutInterval: TimeInterval = 30
     ) throws -> (Data, HTTPURLResponse, Int, Bool) {
         var requestGeneration: Int?
+        var live: (endpoint: Endpoint, credential: String)?
         do {
             let (endpoint, token, generation, restarted) = try ensureSession()
             requestGeneration = generation
+            live = (endpoint, token)
             let (data, response) = try performRequest(
                 endpoint: endpoint,
                 route: route,
@@ -611,20 +618,45 @@ import Foundation
             }
             return (data, response, generation, restarted)
         } catch {
-            if let requestGeneration, resetCore(expectedGeneration: requestGeneration) {
-                scheduleSubscriptionRecovery()
+            // A failed request is not a dead Core. This host hands it a
+            // `service.start` that owns a whole proxy replacement, and every
+            // open window keeps polling while that runs, so one slow, refused,
+            // or server-errored *request* says nothing about the process behind
+            // it -- and discarding the process is what stops the proxy start
+            // the app is waiting for. Keep the Core unless it cannot even renew
+            // the session it minted for us.
+            if let requestGeneration, let live {
+                if let lived = try? exchangeSession(
+                    endpoint: live.endpoint,
+                    credential: live.credential,
+                    timeoutInterval: Self.coreLivenessTimeout
+                ) {
+                    lock.lock()
+                    if self.generation == requestGeneration {
+                        sessionToken = lived.token
+                        sessionExpiresAt = lived.expiresAt
+                    }
+                    lock.unlock()
+                } else if resetCore(expectedGeneration: requestGeneration) {
+                    scheduleSubscriptionRecovery()
+                }
             }
             throw error
         }
     }
 
-    private func exchangeSession(endpoint: Endpoint, credential: String) throws -> (token: String, expiresAt: Date) {
+    private func exchangeSession(
+        endpoint: Endpoint,
+        credential: String,
+        timeoutInterval: TimeInterval = 30
+    ) throws -> (token: String, expiresAt: Date) {
         let (body, response) = try performRequest(
             endpoint: endpoint,
             route: "hello",
             method: "POST",
             body: Data(),
-            token: credential
+            token: credential,
+            timeoutInterval: timeoutInterval
         )
         guard response.statusCode == 200,
               response.value(forHTTPHeaderField: "X-LiteLLM-Core-Session")?.isEmpty == false,
@@ -648,11 +680,25 @@ import Foundation
            sessionExpiresAt.timeIntervalSinceNow > 15 {
             return (endpoint, sessionToken, generation, false)
         }
-        if let endpoint, let sessionToken,
-           let renewed = try? exchangeSession(endpoint: endpoint, credential: sessionToken) {
-            self.sessionToken = renewed.token
-            self.sessionExpiresAt = renewed.expiresAt
-            return (endpoint, renewed.token, generation, false)
+        if let endpoint, let sessionToken {
+            if let renewed = try? exchangeSession(endpoint: endpoint, credential: sessionToken) {
+                self.sessionToken = renewed.token
+                self.sessionExpiresAt = renewed.expiresAt
+                return (endpoint, renewed.token, generation, false)
+            }
+            // A renewal is a request like any other, so ask once more before
+            // throwing the process away: the Core may have been busy with the
+            // proxy replacement this app is waiting for, and discarding it here
+            // is what stopped that replacement mid-start.
+            if let renewed = try? exchangeSession(
+                endpoint: endpoint,
+                credential: sessionToken,
+                timeoutInterval: Self.coreLivenessTimeout
+            ) {
+                self.sessionToken = renewed.token
+                self.sessionExpiresAt = renewed.expiresAt
+                return (endpoint, renewed.token, generation, false)
+            }
         }
 
         let shouldRecoverSubscription = subscriptionRequest != nil

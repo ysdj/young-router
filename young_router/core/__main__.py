@@ -147,6 +147,13 @@ def run(argv: list[str] | None = None) -> int:
     # The image-context cache is swept after every write; this loop is the
     # path that still runs when the pass is off and no write arrives.
     image_context_sweeper = core.image_context_sweeper()
+    # The proxy follows the app, not the other way round: a window that is not
+    # open, a background launch, and the gap after a failed start are all served
+    # by this loop, so no 不健康/已停止 state is left waiting for a click.  Only a
+    # Core a native host launched owns that promise; a bare CLI Core (no
+    # endpoint, no parent) is a diagnostic process and must not spawn a proxy.
+    manages_service = args.endpoint_file is not None or args.parent_pid is not None
+    service_supervisor = core.service_supervisor() if manages_service else None
 
     def request_stop(_signum: int, _frame: Any) -> None:
         stop.set()
@@ -159,6 +166,8 @@ def run(argv: list[str] | None = None) -> int:
         server.start()
         webdav_scheduler.start()
         image_context_sweeper.start()
+        if service_supervisor is not None:
+            service_supervisor.start()
         if args.endpoint_file is not None:
             _write_endpoint(args.endpoint_file, server)
         if args.print_endpoint:

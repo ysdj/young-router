@@ -32,7 +32,7 @@ std::wstring AllowedRoute(std::wstring route) {
   static constexpr std::wstring_view allowed[] = {
       L"home", L"providers-models", L"codex-settings", L"claude-settings",
       L"runtime-settings", L"data-management", L"provider-wizard",
-      L"file-editor", L"image-context", L"logs"};
+      L"file-editor", L"logs"};
   return std::find(std::begin(allowed), std::end(allowed), route) == std::end(allowed)
       ? std::wstring{} : route;
 }
@@ -127,7 +127,7 @@ std::wstring RequestedChildRouteFromCommandLine() {
     }
   }
   LocalFree(arguments);
-  return route == L"provider-wizard" || route == L"file-editor" || route == L"image-context"
+  return route == L"provider-wizard" || route == L"file-editor"
       ? route : std::wstring{};
 }
 
@@ -283,7 +283,7 @@ void RunReactChildHost(std::shared_ptr<ReactChildHostState> state) {
     app_window.Title(YoungRouter::WinUI3NativeLeaf::Shared()->RouteTitleFor(state->route));
     child_handle = winrt::Microsoft::UI::GetWindowFromWindowId(app_window.Id());
     const LONG content_width = state->route == L"provider-wizard" ? 620 : 900;
-    const LONG content_height = state->route == L"provider-wizard" ? 460 : state->route == L"image-context" ? 620 : 560;
+    const LONG content_height = state->route == L"provider-wizard" ? 460 : 560;
     const auto frame = FrameTrackSizeForContentDips(child_handle, content_width, content_height);
     app_window.Resize({frame.x, frame.y});
     {
@@ -319,7 +319,7 @@ void RunReactChildHost(std::shared_ptr<ReactChildHostState> state) {
 
 void OpenReactChildWindow(std::wstring_view route, std::wstring_view initial_file_target) {
   if (g_child_process_mode) return;
-  if (route != L"provider-wizard" && route != L"file-editor" && route != L"image-context") return;
+  if (route != L"provider-wizard" && route != L"file-editor") return;
   const auto parent = WinUI3NativeLeaf::Shared()->WindowHandle();
   if (parent == nullptr) return;
   {
@@ -514,7 +514,7 @@ _Use_decl_annotations_ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, PSTR 
   // 1120x680 start, then OpenRoute's 960x660 DIP) left the composition root
   // at the smaller size and the window painted the rest as empty background.
   const auto initialContentWidth = childMode && childRoute == L"provider-wizard" ? 620 : childMode ? 900 : 960;
-  const auto initialContentHeight = childMode && childRoute == L"provider-wizard" ? 460 : childMode && childRoute == L"image-context" ? 620 : childMode ? 560 : 660;
+  const auto initialContentHeight = childMode && childRoute == L"provider-wizard" ? 460 : childMode ? 560 : 660;
   // Keep the parent settings-shell geometry explicit; child windows use their
   // own content dimensions below.
   const auto initialFrame = childMode

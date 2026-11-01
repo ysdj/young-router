@@ -511,6 +511,50 @@ class SiteCustomizeTests(unittest.TestCase):
         self.assertIn("time.sleep(_PROXY_PARENT_WATCH_INTERVAL_SECONDS)", watchdog)
         self.assertNotIn("time.sleep(0.1)", watchdog)
 
+    def test_proxy_parent_watch_names_its_core_and_releases_the_group(self) -> None:
+        """A Core that goes away must say so and stop holding the listener.
+
+        This is the stop a replacement Core performs on the proxy it recorded.
+        The master is the only process holding the loopback listener until a
+        forkserver has finished preloading, so a master that waited out its own
+        teardown kept the port for the whole of that preload -- and left nothing
+        in ``server.log`` but a traceback about a file descriptor.
+        """
+
+        script = textwrap.dedent(
+            """
+            import time
+
+            for _ in range(200):
+                time.sleep(0.05)
+            print("watchdog did not stop this process", flush=True)
+            """
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "YOUNG_ROUTER_PROXY_PROCESS": "1",
+                "YOUNG_ROUTER_CORE_PID": "1",
+                "PYTHONPATH": str(ROOT),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+        )
+        result = subprocess.run(
+            [self.python(), "-c", script],
+            cwd=str(ROOT),
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+            # The watchdog only owns a proxy master, which is a process-group
+            # leader because the Core starts it with `start_new_session`.
+            start_new_session=True,
+        )
+
+        self.assertIn("proxy stopping: its owning Core (1) exited", result.stdout + result.stderr)
+        self.assertNotIn("watchdog did not stop this process", result.stdout + result.stderr)
+
     def test_disable_system_proxy_lookup_uses_environment_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)

@@ -38,10 +38,41 @@ from .base import (
     _UPSTREAM_URL_SURFACE_KEY,
     _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
     _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
+    _WEB_SEARCH_PROVIDER_DECLARED_METADATA_KEY,
     copy,
     inspect,
     litellm,
 )
+
+
+def _off_the_responses_wire(request_kwargs: dict) -> dict:
+    """Turn a Responses-shaped request into the Chat/Anthropic wire it now sends.
+
+    ``_with_responses_native_extra_body`` copies ``client_metadata`` into
+    ``extra_body`` because that is the only container LiteLLM forwards to a
+    Responses endpoint, and litellm puts that container into a Chat or Anthropic
+    provider body unchanged.  A bridge flips the wire after the passthrough has
+    already run, so the container has to come back off here -- in the builder
+    that performs the flip, not only in the pre-call hook, because the direct
+    stream bridge dispatches from these kwargs without a second hook pass.
+
+    Observed live 2026-11-01: an Anthropic route answered HTTP 400
+    ``extra_body: extra inputs are not permitted`` and the reader was shown
+    "the router could not classify the stop".
+
+    Only this proxy's own passthrough keys are removed.  ``tools`` inside the
+    same container (``_sync_bridge_extra_body_tools``) belongs to the wire
+    being sent.
+    """
+
+    stripped = _responses_request_module._without_responses_native_extra_body(
+        request_kwargs
+    )
+    if stripped is not None:
+        request_kwargs.clear()
+        request_kwargs.update(stripped)
+    request_kwargs["use_chat_completions_api"] = True
+    return request_kwargs
 
 
 def _sync_bridge_extra_body_tools(request_kwargs: dict, tools: list[dict]) -> None:
@@ -54,6 +85,67 @@ def _sync_bridge_extra_body_tools(request_kwargs: dict, tools: list[dict]) -> No
     else:
         updated_extra_body.pop("tools", None)
     request_kwargs["extra_body"] = updated_extra_body
+
+
+def _with_responses_chat_bridge_provider_search(
+    bridge_kwargs: dict,
+    bridge_metadata: dict,
+) -> None:
+    """Declare the provider's own search on a bridge that can serve one.
+
+    The bridge sends a Chat/Anthropic request, so a Hosted ``web_search``
+    declaration cannot travel: it is dropped, and the tool the client calls
+    (Codex's ``web.run`` -> ``/alpha/search``) is the only search left.  A
+    route that serves the provider's server-side search is different -- it
+    runs the search itself and answers with real pages -- and LiteLLM already
+    speaks that declaration as ``web_search_options``.
+
+    Only a route that declares the capability receives it, and only when the
+    caller asked for search at all; see
+    :func:`responses_tools._responses_bridge_anthropic_search_options`.
+    """
+
+    if bridge_kwargs.get("web_search_options") is not None:
+        return
+    options = _responses_tools_module._responses_bridge_anthropic_search_options(
+        bridge_kwargs
+    )
+    if options is None:
+        return
+    if not _request_asked_for_web_search(bridge_kwargs):
+        return
+    bridge_kwargs["web_search_options"] = options
+    bridge_metadata[_WEB_SEARCH_PROVIDER_DECLARED_METADATA_KEY] = True
+
+
+def _request_asked_for_web_search(request_kwargs: dict) -> bool:
+    """Whether the caller asked for search this turn can act on.
+
+    Codex's Responses Lite lane never declares a Hosted ``web_search`` even
+    when it wants one; it declares the ``web`` namespace whose ``run`` child is
+    that tool.  Both carriers mean the same thing here, so both are read.
+
+    The namespace child is deliberately not treated as a generic function: its
+    name is ``run``, which says nothing about search, and the namespace above it
+    is what carries the meaning.
+    """
+
+    if _tools_module._request_has_web_search_tool(request_kwargs):
+        return True
+    if "web_search_options" in request_kwargs:
+        return True
+    declared = _responses_request_module._codex_declared_tools(request_kwargs)
+    return any(_tool_declares_web_search(tool) for tool in declared)
+
+
+def _tool_declares_web_search(tool: Any) -> bool:
+    if not isinstance(tool, dict):
+        return False
+    if tool.get("type") == "namespace":
+        name = tool.get("name")
+        if isinstance(name, str) and name.strip().casefold() == "web":
+            return True
+    return _responses_request_module._codex_tool_is_web_search_declaration(tool)
 
 
 def _with_responses_chat_bridge_compatible_tools(
@@ -92,6 +184,7 @@ def _with_responses_chat_bridge_compatible_tools(
     _responses_tools_module._append_responses_chat_bridge_instruction(retry_kwargs, stats)
     if web_search_options is not None:
         retry_kwargs["web_search_options"] = web_search_options
+    _with_responses_chat_bridge_provider_search(retry_kwargs, retry_metadata)
     if sanitized_tools:
         retry_kwargs["tools"] = sanitized_tools
         _sync_bridge_extra_body_tools(retry_kwargs, sanitized_tools)
@@ -157,6 +250,7 @@ def _with_responses_tool_adapter_compatible_tools(
     _responses_tools_module._append_responses_chat_bridge_instruction(bridge_kwargs, stats)
     if web_search_options is not None:
         bridge_kwargs["web_search_options"] = web_search_options
+    _with_responses_chat_bridge_provider_search(bridge_kwargs, bridge_metadata)
     if sanitized_tools:
         bridge_kwargs["tools"] = sanitized_tools
         _sync_bridge_extra_body_tools(bridge_kwargs, sanitized_tools)
@@ -260,7 +354,7 @@ def _responses_chat_bridge_retry_kwargs(
         retry_kwargs["input"] = bridge_input
         retry_metadata["responses_chat_bridge_input_sanitized"] = input_stats
     retry_kwargs["litellm_metadata"] = retry_metadata
-    retry_kwargs["use_chat_completions_api"] = True
+    _off_the_responses_wire(retry_kwargs)
     if current_surface in _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES:
         retry_kwargs["_young_router_upstream_url_surface"] = current_surface
     return retry_kwargs
@@ -1034,7 +1128,7 @@ def _responses_chat_bridge_preemptive_kwargs(
         bridge_kwargs["input"] = bridge_input
         bridge_metadata["responses_chat_bridge_input_sanitized"] = input_stats
     bridge_kwargs["litellm_metadata"] = bridge_metadata
-    bridge_kwargs["use_chat_completions_api"] = True
+    _off_the_responses_wire(bridge_kwargs)
     current_surface = _routing_module._request_current_upstream_surface(
         request_kwargs
     )
@@ -1460,7 +1554,7 @@ def _responses_chat_bridge_empty_retry_kwargs(
     retry_metadata = litellm_metadata.copy()
     retry_metadata[_RESPONSES_CHAT_BRIDGE_EMPTY_RETRY_METADATA_KEY] = True
     retry_kwargs["litellm_metadata"] = retry_metadata
-    retry_kwargs["use_chat_completions_api"] = True
+    _off_the_responses_wire(retry_kwargs)
     _append_responses_chat_bridge_empty_retry_instruction(retry_kwargs)
     return retry_kwargs
 

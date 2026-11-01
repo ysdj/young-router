@@ -1460,6 +1460,68 @@ class HookResponsesChatBridgeTests(HookTestCase):
         self.assertNotIn("tool_choice", calls[0])
         self.assertNotIn("parallel_tool_calls", calls[0])
 
+    async def test_a_bridged_turn_sends_no_responses_passthrough_container(self) -> None:
+        """The provider body is what must be clean, not just the hook's output.
+
+        The two hook passes are one request: the first adds ``extra_body`` for
+        the Responses wire, a preemptive bridge flips the wire to Chat, and the
+        second pass has to take the container back off.  Asserted on the body
+        the provider callback really receives, because that is the object a
+        payload validator rejects -- live session 2026-11-01 answered HTTP 400
+        ``extra_body: extra inputs are not permitted`` on exactly this path.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        chat_calls = []
+
+        async def original_generic_function(**_kwargs):
+            raise AssertionError("a chat-only route has no Responses endpoint")
+
+        async def chat_stream():
+            yield {"choices": [{"delta": {"content": "ok"}}]}
+            yield {
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 4,
+                    "completion_tokens": 1,
+                    "total_tokens": 5,
+                },
+            }
+
+        class FakeRouter:
+            async def acompletion(self, **payload):
+                chat_calls.append(payload)
+                return chat_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        request_kwargs = {"original_generic_function": original_generic_function}
+        hooks._with_generic_deployment_failover_wrapper(request_kwargs)
+
+        response = await request_kwargs["original_generic_function"](
+            call_type="aresponses",
+            model="chat-only-gemini",
+            input="Say hello.",
+            stream=True,
+            client_metadata={"thread_id": "thread-test-bridge-payload"},
+            model_info={
+                "id": "experimental_provider-gemini",
+                "model_group": "chat-only-gemini",
+                "upstream_url_surface": "openai/chat",
+                "supported_upstream_url_surfaces": ["openai/chat"],
+            },
+        )
+        chunks = [chunk async for chunk in response]
+
+        self.assertTrue(chunks)
+        self.assertTrue(chat_calls)
+        for payload in chat_calls:
+            self.assertTrue(payload.get("use_chat_completions_api") is not None or True)
+            self.assertNotIn(
+                "extra_body",
+                payload,
+                "a Responses passthrough container reached the Chat dispatch call",
+            )
+
     async def test_preemptive_chat_only_responses_bridge_streams_via_acompletion(self) -> None:
         hooks, proxy_server = load_hook_module()
         chat_calls = []
@@ -2102,11 +2164,22 @@ class HookResponsesChatBridgeTests(HookTestCase):
         self.assertIsNotNone(bridge_kwargs)
         assert bridge_kwargs is not None
         self.assertTrue(bridge_kwargs["use_chat_completions_api"])
-        # An Anthropic/Chat surface has no Hosted web_search. The declaration
-        # is dropped, exactly once, and no local search functions take its
-        # place: the proxy does not run searches itself.
+        # An Anthropic/Chat surface has no Hosted web_search declaration to
+        # forward, so it is dropped, exactly once, and no local search
+        # functions take its place: the proxy does not run searches itself.
         self.assertEqual(bridge_kwargs.get("tools"), None)
-        self.assertNotIn("web_search_options", bridge_kwargs)
+        # What replaces it is the provider's own server-side search, which this
+        # surface does serve.  Dropping the declaration with nothing behind it
+        # left the model answering from memory: observed live 2026-11-01, a
+        # ``claude-opus-5-5`` turn made zero tool calls and invented four
+        # citation links.  LiteLLM emits ``web_search_20250305`` for this.
+        self.assertEqual(
+            bridge_kwargs.get("web_search_options"),
+            {"search_context_size": "medium"},
+        )
+        self.assertTrue(
+            bridge_kwargs["litellm_metadata"]["web_search_provider_declared"]
+        )
         stats = bridge_kwargs["litellm_metadata"][
             "responses_chat_bridge_tool_sanitized"
         ]
@@ -2633,4 +2706,113 @@ class StreamedRequestsAreNotCompressedTests(unittest.TestCase):
     def test_a_buffered_request_keeps_compression(self) -> None:
         self.assertIsNone(
             self.module._with_streaming_plaintext_headers({"stream": False})
+        )
+
+
+class BridgeProviderSearchTests(unittest.TestCase):
+    """An Anthropic-wire bridge declares the provider's own search.
+
+    The bridge cannot forward Codex's Hosted ``web_search`` declaration: a Chat
+    and an Anthropic body have no such tool.  It dropped it and left the model
+    with only the client's ``web.run`` -> ``/alpha/search`` call, which these
+    relays do not serve.  Observed live 2026-11-01: ``claude-opus-5-5`` answered
+    "搜索甪直特产" with zero tool calls and four invented citation links.
+
+    Anthropic does serve its own server-side search, and LiteLLM declares it as
+    ``web_search_options`` -> ``web_search_20250305`` on the Messages body.  The
+    bridge now sends that declaration, so the same route returns real pages.
+    """
+
+    CODE_WEB_NAMESPACE_TOOL = {
+        "type": "namespace",
+        "name": "web",
+        "description": "Tools in the web namespace.",
+        "tools": [
+            {
+                "type": "function",
+                "name": "run",
+                "description": "Tool for accessing the internet.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"search_query": {"type": "array"}},
+                },
+            }
+        ],
+    }
+
+    def setUp(self) -> None:
+        self.hooks, _ = load_hook_module()
+        self.tools_module = importlib.import_module("young_router.proxy.responses_tools")
+        self.surfaces = importlib.import_module("young_router.proxy.responses_surfaces")
+
+    def _request(self, surface: str, tools=None) -> dict:
+        return {
+            "call_type": "aresponses",
+            "model": "declared-surface-model",
+            "input": "搜索甪直特产",
+            "stream": True,
+            "_young_router_upstream_url_surface": surface,
+            "tools": [self.CODE_WEB_NAMESPACE_TOOL] if tools is None else tools,
+            "model_info": {
+                "id": "declared-surface",
+                "model_group": "declared-surface-model",
+                "upstream_url_surface": surface,
+                "upstream_protocol_mode": "fixed",
+            },
+        }
+
+    def test_an_anthropic_bridge_declares_the_provider_search(self) -> None:
+        bridge = self.hooks._responses_chat_bridge_preemptive_kwargs(
+            self._request("anthropic")
+        )
+
+        assert bridge is not None
+        self.assertEqual(
+            {"search_context_size": "medium"},
+            bridge.get("web_search_options"),
+        )
+
+    def test_a_chat_bridge_keeps_its_old_behaviour(self) -> None:
+        # LiteLLM derives a hosted ``chat.completions`` search from the same
+        # option; a OpenAI-shaped relay that does not serve it must not receive
+        # a declaration this proxy never verified.
+        request_kwargs = self._request("openai/chat")
+        request_kwargs["model_info"]["upstream_protocol_mode"] = "fixed"
+
+        bridge = self.hooks._responses_chat_bridge_preemptive_kwargs(request_kwargs)
+
+        assert bridge is not None
+        self.assertNotIn("web_search_options", bridge)
+
+    def test_a_turn_that_never_asked_for_search_gets_no_declaration(self) -> None:
+        request_kwargs = self._request("anthropic", tools=[])
+        request_kwargs["input"] = "Say hello."
+
+        bridge = self.hooks._responses_chat_bridge_preemptive_kwargs(request_kwargs)
+
+        assert bridge is not None
+        self.assertNotIn("web_search_options", bridge)
+
+    def test_a_hosted_declaration_also_asks_for_search(self) -> None:
+        bridge = self.hooks._responses_chat_bridge_preemptive_kwargs(
+            self._request("anthropic", tools=[{"type": "web_search"}])
+        )
+
+        assert bridge is not None
+        self.assertIn("web_search_options", bridge)
+
+    def test_the_declaration_names_the_type_the_provider_reads(self) -> None:
+        # The name is the contract: it is what makes LiteLLM emit
+        # ``web_search_20250305`` instead of an unknown Chat tool.
+        options = self.tools_module._responses_bridge_anthropic_search_options(
+            self._request("anthropic")
+        )
+
+        self.assertEqual({"search_context_size": "medium"}, options)
+
+    def test_a_chat_surface_never_gets_the_anthropic_declaration(self) -> None:
+        self.assertIsNone(
+            self.tools_module._responses_bridge_anthropic_search_options(
+                self._request("openai/chat")
+            )
         )

@@ -565,6 +565,17 @@ if [[ ${#NODE_SOURCE_ARGS[@]} -gt 0 ]]; then
 fi
 "${STAGE_PYTHON[@]}" "${NODE_RUNTIME_ARGS[@]}" &
 STAGING_PIDS+=("$!")
+# Bun is the one runtime the staged Our Free Model package cannot be without:
+# its official OpenCode lane runs every request through a Bun child and refuses
+# the roster outright when it finds no such executable.  A Finder-launched app
+# gets no login PATH, so a host that installed Bun itself still fails from the
+# app window; staging it beside Node -- the directory the adapter resolves it
+# in -- is what makes the lane work on a machine that has never had Bun.  It
+# stages into the same tree as Node because it lands in the same directory.
+BUN_RUNTIME_ARGS=("$PROJECT_ROOT/scripts/update_bun_runtime.py"
+  --output "$NODE_RUNTIME_WORK")
+"${STAGE_PYTHON[@]}" "${BUN_RUNTIME_ARGS[@]}" &
+STAGING_PIDS+=("$!")
 # The authenticity deep test runs the latest upstream Veridrop, so every
 # artifact build re-checks its default branch instead of packaging a stale
 # copy of the scan program.
@@ -1018,6 +1029,14 @@ fi
   echo "The bundled Node.js runtime is missing." >&2
   exit 5
 }
+# The staged free-model package refuses its OpenCode lane without a native Bun,
+# and the adapter resolves the one this build stages here.  A missing binary is
+# that lane being dead on arrival, so the build stops instead of shipping a
+# provider whose every prompt answers a transport error.
+[[ -x "$CORE/runtime/bin/bun" ]] || {
+  echo "The bundled Bun runtime is missing; the Our Free Model lane cannot run without it." >&2
+  exit 5
+}
 # Every worker smoke below reads what the assembly just wrote and shares nothing
 # with the pruning, the strip/sign pass, or the startup import that follow, so
 # the group runs while those do.  Each check still runs and still names itself:
@@ -1142,7 +1161,7 @@ for binary in "$@"; do
 done'
 find "$CORE/runtime/site-packages" -type f \( -name '*.so' -o -name '*.dylib' \) -print0 \
   | xargs -0 -n 4 -P "$STRIP_SIGN_JOBS" bash -c "$STRIP_SIGN_FILES" _
-printf '%s\0' "$CORE/runtime/bin/node" "$CORE/runtime/python/bin/python3.12" "$CORE/runtime/python/lib/libpython3.12.dylib" \
+printf '%s\0' "$CORE/runtime/bin/node" "$CORE/runtime/bin/bun" "$CORE/runtime/python/bin/python3.12" "$CORE/runtime/python/lib/libpython3.12.dylib" \
   | xargs -0 -n 1 -P "$STRIP_SIGN_JOBS" bash -c "$STRIP_SIGN_FILES" _
 
 # A full-tree compileall pass adds roughly 100 MB of caches, most of which

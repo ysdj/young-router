@@ -112,7 +112,7 @@ def degradation_engine(
 
 
 class ProvidersModelsDomainTests(unittest.TestCase):
-    def test_account_login_provider_stages_adapter_and_private_claude_token(self) -> None:
+    def test_account_login_provider_stages_the_openai_adapter(self) -> None:
         from young_router.core.provider_auth import ProviderAuthManager
 
         with tempfile.TemporaryDirectory() as directory:
@@ -147,33 +147,21 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             self.assertEqual("openai/responses", model["upstream_url_surface"])
             self.assertEqual("fixed", model["upstream_protocol_mode"])
 
-            snapshot = domain.dispatch(
-                "service_provider.add",
-                {
-                    "provider": {
-                        "name": "account-claude",
-                        "auth_kind": "claude_login",
-                    }
-                },
-            )
-            provider = next(item for item in snapshot["providers"] if item["name"] == "account-claude")
-            self.assertEqual("claude_login", provider["auth_kind"])
-            self.assertEqual(["claude-oauth"], provider["api_key_names"])
-            self.assertEqual("anthropic/claude-sonnet-4-5", provider["models"][0]["litellm_model"])
-            token = "sk-ant-oat" + "synthetic0" * 4
-            domain.stage_secret("provider_auth_token", provider["id"], token)
-            signed_in = next(
-                item
-                for item in domain.snapshot()["providers"]
-                if item["name"] == "account-claude"
-            )
-            self.assertEqual("signed_in", signed_in["auth_status"])
-            self.assertNotIn(token, json.dumps(signed_in))
-
-            domain.apply()
-            saved = path.read_text(encoding="utf-8")
-            self.assertIn("os.environ/YOUNG_ROUTER_AUTH_", saved)
-            self.assertNotIn(token, saved)
+            # Claude's device login is gone: the service surface refuses the
+            # kind instead of minting a row whose sign-in this build cannot run,
+            # and no secret field exists to paste a token into.
+            with self.assertRaisesRegex(DomainError, "login type is unavailable"):
+                domain.dispatch(
+                    "service_provider.add",
+                    {
+                        "provider": {
+                            "name": "account-claude",
+                            "auth_kind": "claude_login",
+                        }
+                    },
+                )
+            with self.assertRaisesRegex(DomainError, "secret field is unavailable"):
+                domain.stage_secret("provider_auth_token", provider["id"], "sk-ant-oat" + "synthetic0" * 4)
 
     def test_relay_provider_source_sets_name_and_url_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

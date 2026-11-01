@@ -67,6 +67,16 @@ _LATIN1_RESPONSE_HEADERS_PATCH_ATTR = (
 _RESPONSES_COMPLETION_STREAM_OUTPUT_ITEM_PATCH_ATTR = (
     "_young_router_responses_completion_stream_output_item_patch"
 )
+#: LiteLLM's Chat-to-Responses iterator builds its reasoning item from a delta
+#: that carries only ``reasoning_content``, so the ``response.output_item.added``
+#: frame it queues states ``id``/``type``/``status`` and no ``summary`` at all,
+#: and it never queues the ``response.reasoning_summary_part.added`` frame that
+#: opens summary index 0.  A client reads both as what it needs before it can
+#: render the thinking: the Codex desktop app drops summary deltas whose item
+#: announced no ``summary`` array, so the whole block vanished from a route that
+#: had streamed it, and the same frames landed under the answer instead.
+#: ``_open_reasoning_summary_items`` restates both beside the item the stock
+#: iterator queues.
 _RESPONSES_WEBSOCKET_HTTP_BRIDGE_PATCH_ATTR = (
     "_young_router_responses_websocket_http_bridge_patch"
 )
@@ -1801,6 +1811,74 @@ def _install_managed_responses_websocket_keepalive_patch() -> None:
     ManagedResponsesWebSocketHandler._stream_and_forward = patched_stream_and_forward
 
 
+def _is_pending_reasoning_item_event(event: Any) -> bool:
+    """Whether this queued iterator frame announces a reasoning item."""
+
+    if (
+        _web_search_native_module._response_item_get(event, "type")
+        != "response.output_item.added"
+    ):
+        return False
+    item = _web_search_native_module._response_item_get(event, "item")
+    return (
+        _web_search_native_module._response_item_get(item, "type") == "reasoning"
+    )
+
+
+def _reasoning_summary_part_added_event(item_id: Any, output_index: Any) -> Any:
+    """The frame that opens summary index 0 on a reasoning item."""
+
+    event: dict[str, Any] = {
+        "type": "response.reasoning_summary_part.added",
+        "item_id": item_id,
+        "output_index": output_index,
+        "summary_index": 0,
+        "part": {"type": "summary_text", "text": ""},
+    }
+    return _streaming_module._json_stream_event(event)
+
+
+def _open_reasoning_summary_items(pending: list[Any], queued_from: int) -> None:
+    """Give a queued reasoning item the summary array it is about to fill.
+
+    LiteLLM's Chat-to-Responses iterator builds a reasoning item from a delta
+    that carries only ``reasoning_content``, so ``_ensure_output_item_for_chunk``
+    queues an ``output_item.added`` frame stating ``id``/``type``/``status`` and
+    no ``summary`` at all, and it never queues the
+    ``response.reasoning_summary_part.added`` frame that opens summary index 0.
+
+    A client needs both before it will render a summary delta.  The Codex
+    desktop app drops a summary delta whose item announced no ``summary``
+    array, so the thinking this route streamed never reached its thinking
+    block and surfaced under the answer instead -- while this proxy's own chat
+    bridge, which states ``summary: []`` and the part frame, showed the same
+    thinking correctly.  Only a missing summary is stated and only the part
+    frame is added, so a release whose iterator already queues both keeps its
+    own frames.
+    """
+
+    opening: list[Any] = []
+    for event in pending[queued_from:]:
+        if not _is_pending_reasoning_item_event(event):
+            continue
+        item = _web_search_native_module._response_item_get(event, "item")
+        if _web_search_native_module._response_item_get(item, "summary") is None:
+            try:
+                setattr(item, "summary", [])
+            except Exception:
+                continue
+        opening.append(
+            _reasoning_summary_part_added_event(
+                _web_search_native_module._response_item_get(item, "id"),
+                _web_search_native_module._response_item_get(event, "output_index"),
+            )
+        )
+    if opening:
+        # Behind the item the frames describe and ahead of its first delta: the
+        # iterator drains this list one frame per read.
+        pending.extend(opening)
+
+
 def _install_responses_completion_stream_patch() -> None:
     try:
         from litellm.responses.litellm_completion_transformation.streaming_iterator import (
@@ -1838,6 +1916,12 @@ def _install_responses_completion_stream_patch() -> None:
     ):
 
         def patched_ensure_output_item_for_chunk(self: Any, chunk: Any) -> Any:
+            # A completed provider search is released before this chunk is
+            # allowed to start the answer: the text can only have been written
+            # afterwards, and the client renders in emission order.
+            _responses_output_module._release_completed_web_search_events(
+                self
+            )
             # Do not let a role-only Chat chunk create an empty Responses
             # message.  Wait for text, reasoning, annotations, or a tool
             # payload; tool IDs and ordering remain owned by LiteLLM.
@@ -1845,7 +1929,12 @@ def _install_responses_completion_stream_patch() -> None:
                 chunk
             ):
                 return None
-            return original_ensure_output_item_for_chunk(self, chunk)
+            pending = getattr(self, "_pending_response_events", None)
+            queued_before = len(pending) if isinstance(pending, list) else 0
+            result = original_ensure_output_item_for_chunk(self, chunk)
+            if isinstance(pending, list):
+                _open_reasoning_summary_items(pending, queued_before)
+            return result
 
         setattr(
             patched_ensure_output_item_for_chunk,
@@ -2396,6 +2485,48 @@ def _install_responses_tool_search_bridge_patch() -> None:
         )
         LiteLLMCompletionStreamingIterator._queue_final_tool_call_done_events = (
             patched_queue_final_tool_call_done_events
+        )
+
+    # A native search is collected into provider fields and only emitted when
+    # the stream ends, while the answer text streams as it arrives.  Arrival
+    # order then reads answer-first, search-below-it.  The client renders in
+    # emission order, so the completed search is released at the point the
+    # answer starts.  See ``_release_completed_web_search_events``.
+    original_queue_message = getattr(
+        LiteLLMCompletionStreamingIterator,
+        "_queue_message_item_added_events",
+        None,
+    )
+    if original_queue_message is not None and not getattr(
+        original_queue_message,
+        _RESPONSES_TOOL_SEARCH_BRIDGE_PATCH_ATTR,
+        False,
+    ):
+
+        def patched_queue_message_item_added_events(
+            self: Any,
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            # Before the answer's own item is queued: the search has to reach
+            # the client first, because it is what the answer was written from.
+            _responses_output_module._release_completed_web_search_events(
+                self
+            )
+            return original_queue_message(self, *args, **kwargs)
+
+        setattr(
+            patched_queue_message_item_added_events,
+            _RESPONSES_TOOL_SEARCH_BRIDGE_PATCH_ATTR,
+            True,
+        )
+        setattr(
+            patched_queue_message_item_added_events,
+            "_original_queue_message",
+            original_queue_message,
+        )
+        LiteLLMCompletionStreamingIterator._queue_message_item_added_events = (
+            patched_queue_message_item_added_events
         )
 
 

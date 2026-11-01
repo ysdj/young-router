@@ -270,7 +270,6 @@ ContentSize RouteMinimumContentSize(std::wstring_view route) {
   }
   if (route == L"provider-wizard") return {540, 420};
   if (route == L"file-editor") return {900, 560};
-  if (route == L"image-context") return {720, 480};
   // The hidden menu-bar host has no route surface. Keep its fallback small so
   // it never inherits a settings window's minimum size before a route opens.
   return {320, 160};
@@ -288,7 +287,6 @@ ContentSize RouteInitialContentSize(std::wstring_view route) {
   }
   if (route == L"provider-wizard") return {620, 460};
   if (route == L"file-editor") return {900, 560};
-  if (route == L"image-context") return {900, 620};
   return {320, 160};
 }
 
@@ -3174,7 +3172,6 @@ std::wstring WinUI3NativeLeaf::RouteTitle(std::wstring_view route) const {
   // A child window has no sidebar to name it, so its own route is its title.
   if (route == L"provider-wizard") return Localized("routeProviderWizard", L"Add Provider");
   if (route == L"file-editor") return Localized("routeFileEditor", L"Edit File");
-  if (route == L"image-context") return Localized("routeImageContext", L"Image Context");
   // Settings panes share one window, so its title is the app name while the
   // sidebar selection names the active pane (System Settings style).
   return Localized("appTitle", L"Young Router");

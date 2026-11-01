@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import multiprocessing
 import os
@@ -202,6 +204,135 @@ class MacOSProxyLauncherTests(unittest.TestCase):
         )
 
         self.assertEqual("False", result.stdout.strip(), result.stderr[-400:])
+
+
+class WorkerHandoverGuardTests(unittest.TestCase):
+    """The handover that used to die with CPython's fd-acknowledgement error.
+
+    A process-group ``SIGTERM`` aimed at the proxy kills the preloading
+    forkserver silently while uvicorn only queues that signal for the master, so
+    the first worker handover failed with ``did not receive acknowledgement of
+    fd`` -- a sentence that names neither the process nor the cause, and that
+    took the whole start with it.
+    """
+
+    def install_guard(self, handover: object, *, attempts: int = 3) -> "macos_proxy._WorkerHandoverGuard":
+        # The supervisor calls the module-level name, not the class attribute.
+        patcher = mock.patch.object(multiprocessing.forkserver, "connect_to_new_process", handover)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        delay = mock.patch.object(macos_proxy, "WORKER_SPAWN_RETRY_SECONDS", 0)
+        delay.start()
+        self.addCleanup(delay.stop)
+        guard = macos_proxy._WorkerHandoverGuard(attempts=attempts)
+        guard.install()
+        return guard
+
+    def test_handover_is_retried_when_the_forkserver_is_gone(self) -> None:
+        calls: list[int] = []
+
+        def handover(_fds: object) -> str:
+            calls.append(1)
+            if len(calls) < 3:
+                raise RuntimeError("did not receive acknowledgement of fd")
+            return "worker-pipes"
+
+        guard = self.install_guard(handover)
+
+        self.assertEqual(
+            "worker-pipes",
+            multiprocessing.forkserver.connect_to_new_process([]),
+        )
+        self.assertEqual(3, len(calls))
+        self.assertFalse(guard.stop_requested)
+
+    def test_handover_failure_names_the_forkserver_it_lost(self) -> None:
+        def handover(_fds: object) -> str:
+            raise RuntimeError("did not receive acknowledgement of fd")
+
+        with mock.patch.object(macos_proxy, "_forkserver_pid", return_value=None):
+            self.install_guard(handover, attempts=2)
+            with self.assertRaises(RuntimeError) as raised:
+                multiprocessing.forkserver.connect_to_new_process([])
+
+        message = str(raised.exception)
+        # The cause has to be readable in ``server.log``: which process went
+        # away, how many handovers were spent, and CPython's own sentence last.
+        self.assertIn("the proxy's forkserver", message)
+        self.assertIn("before it forked a worker", message)
+        self.assertIn("2 handover attempts", message)
+        self.assertIn("did not receive acknowledgement of fd", message)
+
+    def test_handover_is_cancelled_when_the_proxy_was_told_to_stop(self) -> None:
+        calls: list[int] = []
+
+        def handover(_fds: object) -> str:
+            calls.append(1)
+            raise RuntimeError("did not receive acknowledgement of fd")
+
+        guard = self.install_guard(handover)
+        guard._stop_requested = True
+
+        with mock.patch.object(macos_proxy, "_forkserver_pid", return_value=None):
+            with self.assertRaises(macos_proxy.ProxyStartCancelled):
+                multiprocessing.forkserver.connect_to_new_process([])
+
+        # A planned teardown is the answer, not a startup failure: no retry, and
+        # the launcher exits 0 instead of raising through uvicorn.
+        self.assertEqual(1, len(calls))
+
+    def test_handover_does_not_retry_a_forkserver_that_refused_the_work(self) -> None:
+        calls: list[int] = []
+
+        def handover(_fds: object) -> str:
+            calls.append(1)
+            raise RuntimeError("too many fds")
+
+        self.install_guard(handover)
+
+        with self.assertRaises(RuntimeError):
+            multiprocessing.forkserver.connect_to_new_process([])
+        self.assertEqual(1, len(calls))
+
+    def test_run_reports_a_cancelled_start_as_a_clean_exit(self) -> None:
+        uvicorn = SimpleNamespace(run=mock.Mock(side_effect=macos_proxy.ProxyStartCancelled("its Core exited")))
+        uvicorn_subprocess = SimpleNamespace(spawn=None)
+
+        def import_module(name: str) -> object:
+            if name == "uvicorn":
+                return uvicorn
+            if name == "uvicorn._subprocess":
+                return uvicorn_subprocess
+            raise AssertionError(name)
+
+        captured = io.StringIO()
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "young_router.proxy.state": SimpleNamespace(settle_stale_recent_requests=mock.Mock()),
+                "young_router.proxy.launcher_settings": SimpleNamespace(_websocket_max_frame_bytes=lambda: 1),
+            },
+        ), mock.patch.object(multiprocessing, "set_forkserver_preload", create=True), mock.patch.object(
+            multiprocessing, "get_context", return_value=object()
+        ), mock.patch.object(
+            macos_proxy.importlib, "import_module", side_effect=import_module
+        ), mock.patch.object(
+            macos_proxy, "_prime_forkserver"
+        ), mock.patch.object(
+            macos_proxy, "_install_worker_handover_guard"
+        ), mock.patch.object(
+            macos_proxy,
+            "_system_proxy_snapshot",
+            return_value={"source": "macos", "proxies": {}, "settings": {}},
+        ), contextlib.redirect_stderr(captured):
+            result = macos_proxy.run(
+                ["--config", "/private/runtime/config.yaml", "--host", "127.0.0.1", "--port", "4000", "--workers", "2"]
+            )
+
+        self.assertEqual(0, result)
+        # The service log says a stop was the reason, instead of a traceback
+        # about a file descriptor nobody can attribute.
+        self.assertIn("proxy start cancelled: its Core exited", captured.getvalue())
 
 
 if __name__ == "__main__":

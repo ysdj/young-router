@@ -139,7 +139,6 @@ PROVIDER_SOURCE_KINDS = {"custom", "relay"}
 PROVIDER_AUTH_KINDS = {
     "api_key",
     "openai_login",
-    "claude_login",
     "workbuddy_login",
     "workbuddy_global_login",
     "our_free_model_login",
@@ -167,6 +166,14 @@ SERVICE_LOGIN_BASE_URLS = {
 #: document loadable; the panes show the new name, and the next save stores it.
 RETIRED_PROVIDER_AUTH_KINDS = {
     "opencode2dsh_login": "our_free_model_login",
+    # Claude's own OAuth login is gone: this build no longer mints, stores, or
+    # exchanges that credential, so a stored row falls back to the plain key it
+    # now has to carry.  The mapping is what keeps such a document loadable —
+    # the strict whitelist would otherwise refuse the whole file and take every
+    # unrelated provider with it.  The credential it referenced is dropped with
+    # the kind (see `_provider_auth`): a reference to a login this build cannot
+    # complete describes nothing a reader may keep.
+    "claude_login": "api_key",
     # The WorkBuddy rename named the two gateways by region.  ``ai`` meant the
     # international one -- its ``workbuddy.ai`` address and its own credit --
     # so it becomes the global kind.  Mapping it to the desktop kind instead
@@ -463,7 +470,11 @@ def _provider_auth(value: Any, *, required: bool = False) -> dict[str, str]:
         required=False,
     )
     if kind == "api_key":
-        if credential_ref:
+        # A retired login kind answers as the plain key it became, and the
+        # reference that login kept goes with it: `api_key` cannot carry one,
+        # and a credential for a flow this build no longer runs has nothing
+        # left to describe.
+        if credential_ref and kind == stored:
             raise ValueError("API key authentication cannot reference a login credential")
         return {"kind": "api_key"}
     return {"kind": kind, "credential_ref": credential_ref}
@@ -964,6 +975,17 @@ _yaml_text_parsed: "OrderedDict[str, Any]" = OrderedDict()
 _yaml_text_parsed_lock = threading.Lock()
 
 
+def _yaml_load(text: str) -> Any:
+    """Parse YAML with the bound scanner.
+
+    One indirection so the parse this module performs is the single place a
+    test can count, and so a runtime without libyaml (``CSafeLoader``) still
+    parses with the pure-Python loader instead of failing.
+    """
+
+    return yaml.load(text, Loader=_YAML_EVENT_LOADER)
+
+
 def _yaml_text_parse(text: str) -> Any:
     """Parse one YAML text, reusing the parse of the very same document."""
 
@@ -974,7 +996,12 @@ def _yaml_text_parse(text: str) -> Any:
             _yaml_text_parsed.move_to_end(key)
             return copy.deepcopy(cached)
     _validate_yaml_event_limits(text)
-    data = yaml.safe_load(text)
+    # The bound walk above already chose the C scanner for the same reason: a
+    # settings commit validates, writes, re-reads, and reloads the same
+    # configuration text, and the pure-Python scanner is about ten times slower
+    # on each of those passes.  It emits the identical tree, and the structure
+    # limits have already been enforced from the event stream.
+    data = _yaml_load(text)
     _validate_loaded_yaml_limits(data)
     with _yaml_text_parsed_lock:
         _yaml_text_parsed[key] = data

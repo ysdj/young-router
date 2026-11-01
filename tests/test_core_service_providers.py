@@ -57,7 +57,7 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
                 },
             )
             provider_id = snapshot["providers"][0]["id"]
-            for requested in ("claude_login", "workbuddy_login", "workbuddy_global_login"):
+            for requested in ("openai_login", "workbuddy_login", "workbuddy_global_login"):
                 with self.assertRaisesRegex(DomainError, "type is fixed"):
                     domain.dispatch(
                         "provider.patch",
@@ -99,25 +99,25 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
 
         directory, domain = self._domain()
         with directory:
-            added = domain.dispatch("service_provider.add", {"kind": "claude_login"})
+            added = domain.dispatch("service_provider.add", {"kind": "openai_login"})
             provider_id = added["providers"][0]["id"]
-            for requested in ("openai_login", "workbuddy_login", "api_key"):
+            for requested in ("workbuddy_login", "api_key"):
                 with self.assertRaisesRegex(DomainError, "type is fixed"):
                     domain.dispatch(
                         "service_provider.patch",
                         {"provider_id": provider_id, "provider": {"auth_kind": requested}},
                     )
             provider = domain.snapshot()["providers"][0]
-            self.assertEqual(provider["auth_kind"], "claude_login")
-            self.assertEqual(provider["api_key_names"], ["claude-oauth"])
+            self.assertEqual(provider["auth_kind"], "openai_login")
+            self.assertEqual(provider["api_key_names"], [])
             # The name and the enabled state are still the service surface's
             # own edits, and stating the type it already holds changes nothing.
             renamed = domain.dispatch(
                 "service_provider.patch",
-                {"provider_id": provider_id, "provider": {"name": "Claude 2", "auth_kind": "claude_login"}},
+                {"provider_id": provider_id, "provider": {"name": "OpenAI 2", "auth_kind": "openai_login"}},
             )["providers"][0]
-            self.assertEqual(renamed["name"], "Claude 2")
-            self.assertEqual(renamed["auth_kind"], "claude_login")
+            self.assertEqual(renamed["name"], "OpenAI 2")
+            self.assertEqual(renamed["auth_kind"], "openai_login")
 
     def test_api_key_provider_names_are_unique_case_insensitively(self) -> None:
         directory, domain = self._domain()
@@ -342,14 +342,10 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
 
             with self.assertRaisesRegex(DomainError, "already exists"):
                 domain.dispatch("service_provider.add", {"kind": "openai_login"})
-
-            claude = domain.dispatch(
-                "service_provider.add", {"kind": "claude_login"}
-            )["providers"][1]
-            self.assertEqual("Claude", claude["name"])
-            self.assertEqual(
-                "anthropic/claude-sonnet-4-5", claude["models"][0]["litellm_model"]
-            )
+            # Claude's device login is not a service this build runs, so the
+            # create refuses it instead of minting a row nothing can sign in to.
+            with self.assertRaisesRegex(DomainError, "login type is unavailable"):
+                domain.dispatch("service_provider.add", {"kind": "claude_login"})
 
     def test_multiple_same_kind_accounts_have_distinct_refs(self) -> None:
         directory, domain = self._domain()
@@ -380,8 +376,8 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
         manager.status.return_value = {"status": "signed_out", "configured": False}
         domain = ProvidersModelsDomain(config, auth_manager=manager)
         try:
-            domain.dispatch("service_provider.add", {"kind": "claude_login", "name": "Claude One"})
-            domain.dispatch("service_provider.add", {"kind": "claude_login", "name": "Claude Two"})
+            domain.dispatch("service_provider.add", {"kind": "openai_login", "name": "OpenAI One"})
+            domain.dispatch("service_provider.add", {"kind": "openai_login", "name": "OpenAI Two"})
             providers = domain.draft_state()["providers"]
             first_id = domain.snapshot()["providers"][0]["id"]
             second_id = domain.snapshot()["providers"][1]["id"]
@@ -397,9 +393,20 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             directory.cleanup()
 
     def test_auth_status_poll_does_not_advance_core_revision_when_draft_is_unchanged(self) -> None:
+        """A poll that learns nothing is not a staged change.
+
+        An OpenAI row records which of its accounts is serving, so its poll
+        *is* a draft write once an account answers.  A row with no account
+        answers the state question with the state it is in — nothing is signed
+        in — and writes nothing: polling it can never advance the revision.
+        """
+
         directory, domain = self._domain()
         with directory:
-            domain.dispatch("service_provider.add", {"kind": "claude_login"})
+            domain.dispatch("service_provider.add", {"kind": "openai_login"})
+            # Signing out ends the row's one account, which is the state a
+            # never-signed-in row is in as well.
+            domain.dispatch("service_provider.auth_logout", {"provider_id": domain.snapshot()["providers"][0]["id"]})
             provider = domain.snapshot()["providers"][0]
             provider_id = provider["id"]
             core = CoreStore(domains=[domain])

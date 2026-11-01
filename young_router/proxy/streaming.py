@@ -1658,6 +1658,31 @@ def _synthesized_failed_response_event(
         )
         error_type = "invalid_request_error"
         error_code = "invalid_prompt"
+    elif _routing_module._is_upstream_request_field_rejected_error(exception):
+        # The route refused the *fields* this proxy sent, not the conversation:
+        # an ``extra_body`` container, a ``litellm_params`` container, or one of
+        # this proxy's own markers reached a payload validator.  Live session
+        # 2026-11-01: an Anthropic route answered HTTP 400 ``extra_body: extra
+        # inputs are not permitted`` and the reader was told the router could
+        # not classify the stop, because nothing here owned that answer.  No
+        # resend meets a different validator, and no codex/Pi retry phrase may
+        # be attached, so the stop names the defect and stops.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        message = _routing_module._upstream_request_field_rejected_message(
+            model_group
+        )
+        # ``invalid_request_error`` is the wire type that stops a client from
+        # reconnecting over a body it would send again unchanged, and
+        # ``invalid_prompt`` is the Codex code for "no resend changes this" --
+        # every unrecognised code is retryable there, so an invented one would
+        # loop the same refused payload.  The two sibling branches for a
+        # deterministic refusal (body size, tool history) use the same pair.
+        error_type = "invalid_request_error"
+        error_code = "invalid_prompt"
     elif _routing_module._is_upstream_deployment_failover_error(exception):
         message = _routing_module._sanitized_upstream_route_failure_message(
             model,
@@ -1951,6 +1976,10 @@ def _native_stream_error_code(exception: Exception) -> str:
         # configuration change, not a transport hiccup worth reconnecting for.
         return "upstream_client_outdated"
     if _routing_module._is_upstream_tool_history_rejected_error(exception):
+        return "invalid_prompt"
+    if _routing_module._is_upstream_request_field_rejected_error(exception):
+        # ``invalid_prompt`` is the Codex code for a refusal no resend changes;
+        # a code of this router's own invention would be retried there forever.
         return "invalid_prompt"
     if _routing_module._is_upstream_deployment_failover_error(exception):
         return "insufficient_quota"

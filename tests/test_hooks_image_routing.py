@@ -48,6 +48,157 @@ class HookImageRoutingTests(HookTestCase):
             self.assertEqual(saved_path.read_bytes(), base64.b64decode(VALID_IMAGE_RESULT))
             self.assertEqual(delivered[0]["saved_path"], str(saved_path))
 
+    def test_image_generation_stream_restates_the_opening_frame_a_done_only_route_omitted(self) -> None:
+        """A done-only image item draws nothing until its opening frame exists.
+
+        Codex opens an output item on ``response.output_item.added`` and renders
+        the picture into that block.  A relay that answers the whole generation
+        in one read sent only ``response.output_item.done``: the rollout kept the
+        completed call, the transcript stayed blank, and ``task_complete``
+        carried no message.  Observed live 2026-11-02 on ``gpt-image-2.5-flare``.
+        """
+
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as codex_home:
+            self.set_env("CODEX_HOME", codex_home)
+            opened: set[str] = set()
+            frame = (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "sequence_number": 7,
+                        "item": {
+                            "id": "ig_done_only",
+                            "type": "image_generation_call",
+                            "status": "completed",
+                            "result": VALID_IMAGE_RESULT,
+                        },
+                    }
+                )
+                + "\n\n"
+            )
+            delivered = hooks._image_generation_stream_text_chunk_for_delivery(
+                frame,
+                {"call_type": "aresponses"},
+                [],
+                opened,
+            )
+            payloads = [
+                json.loads(line[len("data: "):])
+                for line in delivered.splitlines()
+                if line.startswith("data: ")
+            ]
+
+            self.assertEqual(
+                ["response.output_item.added", "response.output_item.done"],
+                [payload["type"] for payload in payloads],
+            )
+            opening, done = payloads
+            self.assertEqual("in_progress", opening["item"]["status"])
+            self.assertNotIn("result", opening["item"])
+            self.assertEqual("completed", done["item"]["status"])
+            # A sequence number is only valid in non-decreasing order, so the
+            # restored frame reuses the one the item already carried.
+            self.assertEqual(7, opening["sequence_number"])
+            self.assertEqual(7, done["sequence_number"])
+
+            # One item is opened once: a replayed read adds no second block.
+            again = hooks._image_generation_stream_text_chunk_for_delivery(
+                frame,
+                {"call_type": "aresponses"},
+                [],
+                opened,
+            )
+            self.assertEqual(
+                ["response.output_item.done"],
+                [
+                    json.loads(line[len("data: "):])["type"]
+                    for line in again.splitlines()
+                    if line.startswith("data: ")
+                ],
+            )
+
+    def test_image_generation_stream_keeps_a_real_opening_frame(self) -> None:
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as codex_home:
+            self.set_env("CODEX_HOME", codex_home)
+            opened: set[str] = set()
+            chunk = {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "ig_streamed", "type": "image_generation_call", "status": "in_progress"},
+            }
+            delivered = hooks._image_generation_stream_chunks_for_delivery(
+                chunk,
+                {"call_type": "aresponses"},
+                [],
+                opened,
+            )
+            self.assertEqual([chunk], delivered)
+
+            done = {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "ig_streamed",
+                    "type": "image_generation_call",
+                    "status": "completed",
+                    "result": VALID_IMAGE_RESULT,
+                },
+            }
+            delivered_done = hooks._image_generation_stream_chunks_for_delivery(
+                done,
+                {"call_type": "aresponses"},
+                [],
+                opened,
+            )
+            # The route already opened this item, so the delivery path leaves it
+            # alone instead of drawing a second block.
+            self.assertEqual(
+                ["response.output_item.added", "response.output_item.done"],
+                [item["type"] for item in delivered_done],
+            )
+
+    def test_image_generation_stream_restates_the_opening_frame_without_client_evidence(self) -> None:
+        """The path is this app's addition; the opening frame is not.
+
+        ``codex exec`` proved no client evidence, so the saved path and its
+        markdown reference stay off -- but the completion still arrived without
+        its opening frame, and the turn finished blank while the rollout held
+        the image.  Observed live 2026-11-02 on ``gpt-image-2.5-flare``.
+        """
+
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as codex_home:
+            self.set_env("CODEX_HOME", codex_home)
+            delivered = hooks._image_generation_stream_chunks_for_delivery(
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "id": "ig_no_evidence",
+                        "type": "image_generation_call",
+                        "status": "completed",
+                        "result": VALID_IMAGE_RESULT,
+                    },
+                },
+                {"call_type": "aresponses"},
+                [],
+                set(),
+                attach_paths=False,
+            )
+            self.assertEqual(
+                ["response.output_item.added", "response.output_item.done"],
+                [item["type"] for item in delivered],
+            )
+            self.assertEqual("in_progress", delivered[0]["item"]["status"])
+            self.assertNotIn("result", delivered[0]["item"])
+            # Nothing of this app's own reached the frame.
+            self.assertNotIn("saved_path", delivered[-1]["item"])
+            self.assertFalse((Path(codex_home) / "generated_images").exists())
+
     def test_image_generation_stream_does_not_emit_path_for_invalid_result(self) -> None:
         hooks, _ = load_hook_module()
         with tempfile.TemporaryDirectory() as codex_home:
@@ -84,8 +235,15 @@ class HookImageRoutingTests(HookTestCase):
             delivered = hooks._image_generation_stream_chunks_for_delivery(
                 chunk,
                 {"call_type": "aresponses", "client_metadata": {"headers": {"session-id": "thread-nested"}}},
+                [],
+                set(),
             )
-            saved_path = Path(delivered[0]["item"]["saved_path"])
+            # [opening frame, completion] -- the completion is the last one.
+            self.assertEqual(
+                ["response.output_item.added", "response.output_item.done"],
+                [item["type"] for item in delivered],
+            )
+            saved_path = Path(delivered[-1]["item"]["saved_path"])
             self.assertEqual(
                 saved_path,
                 Path(codex_home) / "generated_images" / "thread-nested" / "ig_nested.png",
@@ -114,8 +272,13 @@ class HookImageRoutingTests(HookTestCase):
             delivered = hooks._image_generation_stream_chunks_for_delivery(
                 frame,
                 {"call_type": "aresponses", "client_metadata": {"headers": {"session-id": "thread-sse"}}},
+                [],
+                set(),
             )
-            payload = json.loads(delivered[0].split("data: ", 1)[1])
+            # The restored opening frame precedes the completion it opens.
+            frames = [line for line in delivered[0].splitlines() if line.startswith("data:")]
+            self.assertEqual(2, len(frames))
+            payload = json.loads(frames[-1].split("data: ", 1)[1])
             saved_path = Path(payload["item"]["saved_path"])
             self.assertEqual(
                 saved_path,
@@ -148,11 +311,20 @@ class HookImageRoutingTests(HookTestCase):
             delivered = hooks._image_generation_stream_chunks_for_delivery(
                 frame,
                 {"call_type": "aresponses", "client_metadata": {"headers": {"session-id": "thread-multi"}}},
+                [],
+                set(),
             )[0]
             frames = [line for line in delivered.splitlines() if line.startswith("data:")]
-            self.assertEqual(len(frames), 2)
-            image_payload = json.loads(frames[0].split("data: ", 1)[1])
-            text_payload = json.loads(frames[1].split("data: ", 1)[1])
+            # The route stated the completion alone, so the restored opening
+            # frame joins it; the text delta that followed stays where it was.
+            self.assertEqual(len(frames), 3)
+            self.assertEqual(
+                ["response.output_item.added", "response.output_item.done", "response.output_text.delta"],
+                [json.loads(frame.split("data: ", 1)[1])["type"] for frame in frames],
+            )
+            image_payload = json.loads(frames[1].split("data: ", 1)[1])
+            text_payload = json.loads(frames[2].split("data: ", 1)[1])
+            self.assertEqual("in_progress", json.loads(frames[0].split("data: ", 1)[1])["item"]["status"])
             self.assertTrue(Path(image_payload["item"]["saved_path"]).is_file())
             self.assertEqual(text_payload, {"type": "response.output_text.delta", "delta": "kept"})
 
@@ -165,6 +337,7 @@ class HookImageRoutingTests(HookTestCase):
                 "client_metadata": {"headers": {"session-id": "thread-rewrite"}},
             }
             saved_paths: list[str] = []
+            opened: set[str] = set()
             image_chunk = hooks._image_generation_stream_chunks_for_delivery(
                 {
                     "type": "response.output_item.done",
@@ -177,7 +350,8 @@ class HookImageRoutingTests(HookTestCase):
                 },
                 request_data,
                 saved_paths,
-            )[0]
+                opened,
+            )[-1]
             saved_path = image_chunk["item"]["saved_path"]
             stale_link = (
                 "![参考图](/synthetic/codex/generated_images/unknown-session/"
@@ -203,6 +377,7 @@ class HookImageRoutingTests(HookTestCase):
                 "client_metadata": {"headers": {"session-id": "thread-append"}},
             }
             saved_paths: list[str] = []
+            opened: set[str] = set()
             image_chunk = hooks._image_generation_stream_chunks_for_delivery(
                 {
                     "type": "response.output_item.done",
@@ -215,7 +390,8 @@ class HookImageRoutingTests(HookTestCase):
                 },
                 request_data,
                 saved_paths,
-            )[0]
+                opened,
+            )[-1]
             saved_path = image_chunk["item"]["saved_path"]
             message_chunk = hooks._image_generation_stream_chunks_for_delivery(
                 {
@@ -255,8 +431,10 @@ class HookImageRoutingTests(HookTestCase):
             delivered = hooks._image_generation_stream_chunks_for_delivery(
                 ModelChunk(),
                 {"call_type": "aresponses", "client_metadata": {"headers": {"session-id": "thread-model"}}},
+                [],
+                set(),
             )
-            saved_path = Path(delivered[0]["item"]["saved_path"])
+            saved_path = Path(delivered[-1]["item"]["saved_path"])
             self.assertEqual(
                 saved_path,
                 Path(codex_home) / "generated_images" / "thread-model" / "ig_model.png",
@@ -304,14 +482,17 @@ class HookImageRoutingTests(HookTestCase):
                 )
             ]
             delivered = jsonable_stream_chunk(chunks[0])
-            saved_path = Path(delivered["item"]["saved_path"])
+            self.assertEqual("response.output_item.added", delivered["type"])
+            self.assertEqual("in_progress", delivered["item"]["status"])
+            completion = jsonable_stream_chunk(chunks[1])
+            saved_path = Path(completion["item"]["saved_path"])
             self.assertEqual(
                 saved_path,
                 Path(codex_home) / "generated_images" / "thread-hook" / "ig_hook.png",
             )
             self.assertEqual(saved_path.read_bytes(), base64.b64decode(VALID_IMAGE_RESULT))
             self.assertEqual(
-                jsonable_stream_chunk(chunks[1])["delta"],
+                jsonable_stream_chunk(chunks[2])["delta"],
                 f"![参考图]({saved_path})",
             )
 

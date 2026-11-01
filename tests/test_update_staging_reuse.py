@@ -16,9 +16,11 @@ to fall back to a full install, or the build ships something no one checked.
 from __future__ import annotations
 
 import importlib
+import io
 import json
 import shutil
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,6 +34,7 @@ if str(SCRIPTS) not in sys.path:
 
 update_common = importlib.import_module("update_common")
 node_runtime = importlib.import_module("update_node_runtime")
+bun_runtime = importlib.import_module("update_bun_runtime")
 workbuddy_connect = importlib.import_module("update_connect_workbuddy")
 our_free_model = importlib.import_module("update_our_free_model")
 dsh_vision_router = importlib.import_module("update_dsh_vision_router")
@@ -507,6 +510,97 @@ class NodeRuntimeStagingTests(unittest.TestCase):
         self.install()
         mode = (self.output / "node").stat().st_mode
         self.assertTrue(mode & 0o111, "the staged Node must stay executable")
+
+
+class BunRuntimeStagingTests(unittest.TestCase):
+    """The Bun runtime the free lane needs is resolved, extracted, and kept.
+
+    The staged upstream refuses its OpenCode lane without a native Bun, and a
+    Finder-launched app supplies no login ``PATH`` for it to discover one, so
+    an artifact build has to ship the executable beside the Node runtime it
+    already carries.  These tests hold the two properties that makes safe: the
+    right platform package is resolved for the host, and a repeat build of the
+    same release writes nothing.
+    """
+
+    def setUp(self) -> None:
+        self.directory = Path(tempfile.mkdtemp(prefix="young-router-bun-stage-test-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.directory, ignore_errors=True))
+        self.output = self.directory / "runtime-bin"
+        self.license = self.directory / "LICENSE.md"
+        self.license.write_text("Bun is MIT licensed.\n", encoding="utf-8")
+        # Larger than the 16 MiB floor the stager enforces, so a real extraction
+        # is not rejected as a placeholder.
+        self.binary = b"\xcf\xfa\xed\xfe" + b"b" * (16 * 1024 * 1024 + 8)
+
+    def archive(self, executable: str = "bun") -> bytes:
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as handle:
+            payload = tarfile.TarInfo(f"package/bin/{executable}")
+            payload.size = len(self.binary)
+            payload.mode = 0o644
+            handle.addfile(payload, io.BytesIO(self.binary))
+            readme = tarfile.TarInfo("package/README.md")
+            readme.size = 4
+            handle.addfile(readme, io.BytesIO(b"read"))
+        return buffer.getvalue()
+
+    def stage(self, *, version: str = "1.4.4") -> str:
+        with mock.patch.object(
+            bun_runtime, "_platform_package", return_value=("@oven/bun-darwin-arm64", "bun")
+        ), mock.patch.object(
+            bun_runtime,
+            "package_metadata",
+            return_value=(version, "https://registry.invalid/bun.tgz", {}),
+        ), mock.patch.object(
+            bun_runtime, "download_bytes", return_value=self.archive()
+        ):
+            return bun_runtime.update(self.output, license_path=self.license)
+
+    def test_the_platform_package_follows_the_host(self) -> None:
+        for system, machine, expected in (
+            ("Darwin", "arm64", ("@oven/bun-darwin-aarch64", "bun")),
+            ("Darwin", "x86_64", ("@oven/bun-darwin-x64", "bun")),
+            ("Windows", "AMD64", ("@oven/bun-windows-x64", "bun.exe")),
+            ("Windows", "ARM64", ("@oven/bun-windows-aarch64", "bun.exe")),
+        ):
+            with mock.patch.object(bun_runtime.platform, "system", return_value=system), \
+                 mock.patch.object(bun_runtime.platform, "machine", return_value=machine):
+                self.assertEqual(bun_runtime._platform_package(), expected)
+
+    def test_an_unsupported_host_is_refused_rather_than_guessed_at(self) -> None:
+        with mock.patch.object(bun_runtime.platform, "system", return_value="Linux"), \
+             mock.patch.object(bun_runtime.platform, "machine", return_value="x86_64"):
+            with self.assertRaises(update_common.UpdateError):
+                bun_runtime._platform_package()
+
+    def test_the_extracted_binary_is_the_one_the_archive_carried(self) -> None:
+        self.assertEqual(self.stage(), "1.4.4")
+        self.assertEqual((self.output / "bun").read_bytes(), self.binary)
+        self.assertTrue((self.output / "bun").stat().st_mode & 0o111)
+        self.assertEqual((self.output / "BUN_VERSION").read_text().strip(), "1.4.4")
+        self.assertEqual((self.output / "BUN_LICENSE").read_text(), "Bun is MIT licensed.\n")
+
+    def test_a_repeat_build_of_the_same_release_writes_nothing(self) -> None:
+        self.stage()
+        before = (self.output / "bun").stat().st_mtime_ns
+        self.stage()
+        # Rewriting would move the mtime and make the packed Core see an
+        # unchanged runtime as changed on every build.
+        self.assertEqual((self.output / "bun").stat().st_mtime_ns, before)
+
+    def test_a_new_release_replaces_the_staged_binary(self) -> None:
+        self.stage()
+        self.binary = b"\xcf\xfa\xed\xfe" + b"c" * (16 * 1024 * 1024 + 8)
+        self.stage(version="1.5.0")
+        self.assertEqual((self.output / "bun").read_bytes(), self.binary)
+        self.assertEqual((self.output / "BUN_VERSION").read_text().strip(), "1.5.0")
+
+    def test_a_truncated_download_is_refused_instead_of_staged(self) -> None:
+        self.binary = b"\xcf\xfa\xed\xfe"
+        with self.assertRaises(update_common.UpdateError):
+            self.stage()
+        self.assertFalse((self.output / "bun").exists())
 
 
 class OurFreeModelStagingTests(unittest.TestCase):

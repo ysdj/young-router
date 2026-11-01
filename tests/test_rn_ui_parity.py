@@ -199,12 +199,24 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # owned by the editor's own process window never appeared above it;
         # macOS keeps its sheet. The result still rides beside the buttons.
         self.assert_ui_has('<Text numberOfLines={1} style={assistantFileSurfaceStyles.editorFooterStatus}>{confirmingDiscard ? translate("settings.discardDraftTitle") : footerStatus ?? ""}</Text>')
-        # The Windows field reports its own line breaks; a draft that kept them
-        # staged a TOML file Core rejected as invalid, so the edited text is
-        # normalized (and keeps the document's final line break) before staging.
-        self.assert_ui_has('const normalized = withDocumentEnding(normalizeEditorText(text));')
-        self.assert_ui_has('draftRef.current = normalized;')
-        self.assert_ui_has('const withDocumentEnding = (value: string): string => (')
+        # The editor reports its own draft state through onDirtyChange, because
+        # on Windows the draft never reaches Core until Save: a deferred stage
+        # leaves the Core snapshot clean while the window holds unsaved text, so
+        # Close used to throw that text away with no "discard?" asked at all.
+        self.assert_ui_has('const localEditorDirtyRef = useRef(false);')
+        self.assert_ui_has('const handleEditorDirtyChange = useCallback((dirty: boolean): void => {')
+        self.assert_ui_has('const coreDraftDirty = current?.drafts[target.domain]?.dirty === true;')
+        self.assert_ui_has('if (!coreDraftDirty && !localEditorDirtyRef.current) {')
+        self.assert_ui_has('if (current !== undefined || localEditorDirtyRef.current) {')
+        self.assert_ui_has('if (deferStage && draftRef.current !== stagedTextRef.current) return;')
+        self.assert_ui_has('if (pending && !deferStage) scheduleStage();')
+        self.assert_ui_has('deferStage={Platform.OS === "windows"}')
+        # Both hosts now edit this document in the rich WebView: the browser was
+        # under-scaled by the system DPI rather than unsupported in the child
+        # window's XAML island, so the Windows multiline field (and the
+        # line-break repair it needed) is gone rather than kept as a fallback.
+        self.assert_ui_not_has('withDocumentEnding')
+        self.assert_ui_not_has('styles.rawNativeTextField')
         self.assert_ui_has('setConfirmingDiscard(true);')
         self.assert_ui_has('<ActionButton primary danger title={translate("common.discard")} disabled={saving} onPress={discardConfirmed} />')
         # Its own actions are the only thing that may block this window: a stuck
@@ -357,6 +369,24 @@ class ReactNativeUiParityTests(unittest.TestCase):
         translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
         for key in ("common.notApplied", "common.notAppliedPartial"):
             self.assertIn(f'| "{key}"', translation_keys)
+        # A revision conflict is this app racing itself, not a cause the user
+        # can act on: it must not name a second writer or announce what the
+        # router did about it.  Every surface that can meet one already rebases
+        # once on the authoritative revision (`applyOutcome`, the buffered
+        # dispatch, the raw editor, the child surfaces), so one that still
+        # arrives reports the outcome the pane can show, exactly like any other
+        # rolled-back write.
+        self.assertIn('revision_conflict: "common.notApplied",', self.ui)
+        self.assertNotIn('revision_conflict: "error.revisionConflict"', self.ui)
+        for source in (self.en, self.zh, translation_keys):
+            self.assertNotIn('"error.revisionConflict"', source)
+        # A settled transition is the render that follows it, so the conflicts
+        # the UI resolves itself never reach this stop either.
+        for marker in (
+            'if (!isRevisionConflict(reason)) throw reason;',
+            'if (!isRevisionConflict(reason) || !isRevisionRetryableAction(type)) throw reason;',
+        ):
+            self.assert_ui_has(marker)
         # Core's own step names stay internal: a bare snake_case identifier is
         # not a cause the user can act on, so it never reaches the strip.
         self.assertIn("const INTERNAL_STEP_NAME = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/;", self.ui)
@@ -1479,12 +1509,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("void logoutAccount(stringValue(selectedAuthAccount.ref));", account_block)
         self.assertIn('selectedKey={stringValue(selectedAuthAccount?.ref)}', account_block)
         # The editor states who the account is and nothing else: no second
-        # sign-out control under the row that already carries it.
+        # sign-out control under the row that already carries it, and no second
+        # copy of a status the list above already draws.
         editor_row = account_block.split("<View style={styles.accountEditor}>", 1)[1]
         self.assertNotIn("runAuthAction", editor_row)
         self.assertNotIn("relay.officialProviderLogout", editor_row)
         self.assertIn('translate("relay.accountField")', editor_row)
-        self.assertIn('translate("providers.authStatus")', editor_row)
+        self.assertNotIn('translate("providers.authStatus")', editor_row)
 
     def test_an_account_backed_route_is_filed_under_the_account_it_answers_with(
         self,
@@ -2436,9 +2467,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         shell = self.ui.split("function SettingsShell(", 1)[1].split("\nfunction ", 1)[0]
         self.assertIn("compact={false}", shell)
         self.assertIn("sourceList", shell)
-        # Runtime, external clients, backup, and the image-context window: every
-        # surface that splits into a list and a detail renders the same pair.
-        self.assertEqual(self.ui.count("<SettingsRail"), 4)
+        # Runtime, external clients, and backup: every surface that splits into
+        # a list and a detail renders the same pair.
+        self.assertEqual(self.ui.count("<SettingsRail"), 3)
         rail_row = mac_native.split("const bool railRow = viewProps.sourceList;", 1)[1].split("label.toolTip = value;", 1)[0]
         # A rail row is the rail's own cell, and a row with a second line is
         # that same cell with the tip step under its name.
@@ -2733,11 +2764,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # credential fields (providers) still render one inline control with no
         # separate set/clear actions of their own.
         self.assertIn('<NativeSecretField labelVisible={false} plainText autoCommit', self.ui)
-        for marker in (
+        self.assertIn(
             '<NativeSecretField labelVisible={false} plainText autoCommit label={translate("providers.keyValue")}',
-            '<NativeSecretField autoCommit label={translate("providers.authTypeClaude")}',
-        ):
-            self.assertIn(marker, self.ui)
+            self.ui,
+        )
+        # Claude's paste-a-token field went with its OAuth: a retry of a login
+        # this build cannot start is not a field the pane draws.
+        self.assertNotIn('providers.authTypeClaude', self.ui)
         self.assertNotIn("clearTitle=", self.ui)
         self.assertNotIn("onClear=", self.ui)
 
@@ -2963,7 +2996,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # Close warns once, then discards the staged draft before the
             # sheet goes away; Save writes the file and closes it.
             "const closeWindow = (): void => {",
-            "current.drafts[target.domain]?.dirty !== true",
+            "const coreDraftDirty = current?.drafts[target.domain]?.dirty === true;",
+            "if (!coreDraftDirty && !localEditorDirtyRef.current) {",
             "native.showConfirmation(",
             'translate("settings.discardDraftTitle")',
             'translate("settings.discardDraftBody")',
@@ -3051,7 +3085,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertNotIn(removed, runtime_workspace)
         # The band above the surface is the one shared detail header, so the
         # runtime, external, and backup panes never drift apart.
-        self.assertEqual(self.ui.count("<SettingsDetailHeader"), 4)
+        self.assertEqual(self.ui.count("<SettingsDetailHeader"), 3)
 
     def test_dsh_router_keeps_advanced_json_below_native_quick_controls(self) -> None:
         schema = (ROOT / "young_router/core/runtime_settings_schema.py").read_text(encoding="utf-8")
@@ -3204,73 +3238,33 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("refreshSnapshot(!background)", self.ui)
         self.assertNotIn("runServiceOperation(\"health\", true)", self.ui)
 
-    def test_image_context_opens_as_a_child_window_not_a_pane_overlay(self) -> None:
-        # The image-context task list is a child surface, the way 添加向导, the
-        # raw file editor, and 分组管理 are: a movable titled window over the
-        # window that opened it.  A React backdrop drawn inside the runtime
-        # pane is not that surface -- it cannot be dragged, it is clipped by the
-        # pane it sits in, and the window behind it stays live.
+    def test_image_context_task_list_is_gone(self) -> None:
+        # The per-task list of a Codex thread's images (a browsable window, a
+        # tick per image, a delete per task) duplicated Context Attachment
+        # Manager's own panel and made this app a second owner of that state.
+        # What remains is the pass and its runtime switches; no surface, route,
+        # IPC method, or Core domain may bring the list back.
         routes = (ROOT / "rn/packages/shared/src/routes.ts").read_text(encoding="utf-8")
-        self.assertIn('{ id: "image-context", titleKey: "status.imageContext" },', routes)
-        self.assertIn('({ id }) => id !== "claude-settings" && id !== "provider-wizard" && id !== "image-context",', routes)
-        self.assertIn('route !== "file-editor" && route !== "image-context";', routes)
-        self.assertIn('| "image-context"', (ROOT / "rn/packages/shared/src/types.ts").read_text(encoding="utf-8"))
-
-        self.assertIn("function openImageContextWindow(native: NativeLeafAdapter): void {", self.ui)
-        self.assertIn('native.window.open("image-context");', self.ui)
-        self.assertIn('native.window.focus("image-context");', self.ui)
-        self.assertIn('onOpen={() => openImageContextWindow(native)}', self.ui)
-        self.assertIn('{route === "image-context" ? <ImageContextWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} ipc={ipc} native={native} /> : null}', self.ui)
-        self.assertIn('onPress={() => native.window.close("image-context")}', self.ui)
-        # No pane draws the list itself: the backdrop, the inline close handler,
-        # and the pane-owned open flag are what made it an invented modal.
-        self.assertNotIn("imageContextBackdrop", self.ui)
-        self.assertNotIn("setImageContextOpen", self.ui)
-        # 查看大图 is the same window's detail column, not a card floating over
-        # it: the overlay was clipped by the pane, covered the rows it belongs
-        # to, and read as a dialog the window could not lock.
-        self.assertNotIn("imageContextPreview", self.ui)
-        self.assertIn('{fullSize ? <View style={styles.imageContextViewer}>', self.ui)
-        self.assertIn('title={translate("imageContext.back")}', self.ui)
-        # A picture the window cannot draw is stated as a fact, never as the
-        # old refusal that told the reader to click the card for the original.
-        self.assertIn('"imageContext.noPreview": "This image has no stored bytes this app can draw."', self.en)
-        self.assertIn('setFullSize({ id, dataUrl: stringValue(answer.data_url) || null, downscaled: booleanValue(answer.downscaled) })', self.ui)
-
-        macos_leaf = MACOS_LEAF.read_text(encoding="utf-8")
-        self.assertIn('case "image-context": return localized("routeImageContext", fallback: "Image Context")', macos_leaf)
-        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" || windowRoute == "image-context" {', macos_leaf)
+        self.assertNotIn("image-context", routes)
+        self.assertNotIn("image-context", self.ui)
+        self.assertNotIn("ImageContextWorkspace", self.ui)
+        self.assertNotIn("openImageContextWindow", self.ui)
+        self.assertNotIn("imageContext", (ROOT / "rn/packages/shared/src/types.ts").read_text(encoding="utf-8"))
+        self.assertNotIn("imageContextImage", (ROOT / "rn/packages/shared/src/ipc.ts").read_text(encoding="utf-8"))
+        for path in (
+            "rn/apps/macos/src/native/macos/AppKitNativeLeaf.swift",
+            "rn/apps/macos/macos/YoungRouter-macOS/AppDelegate.mm",
+            "rn/apps/windows/src/native/windows/WinUI3NativeLeaf.cpp",
+            "rn/apps/windows/src/native/windows/WinUI3NativeLeafModule.cpp",
+            "rn/apps/windows/windows/YoungRouter/YoungRouter.cpp",
+        ):
+            self.assertNotIn("image-context", (ROOT / path).read_text(encoding="utf-8"), path)
+        # The two remaining child surfaces are the wizard and the raw editor.
+        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" {', MACOS_LEAF.read_text(encoding="utf-8"))
         self.assertIn(
-            'if windowRoute == "image-context", settingsWindowKey() == nil,\n           let parentTitle = routeWindowTitle("runtime-settings") {',
-            macos_leaf,
+            'if (route != L"provider-wizard" && route != L"file-editor") return;',
+            (ROOT / "rn/apps/windows/windows/YoungRouter/YoungRouter.cpp").read_text(encoding="utf-8"),
         )
-        app_delegate = (ROOT / "rn/apps/macos/macos/YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
-        self.assertIn('@"provider-wizard", @"file-editor", @"image-context"', app_delegate)
-
-        windows_leaf = WINDOWS_LEAF.read_text(encoding="utf-8")
-        self.assertIn('if (route == L"image-context") return Localized("routeImageContext", L"Image Context");', windows_leaf)
-        self.assertIn('if (route == L"image-context") return {720, 480};', windows_leaf)
-        self.assertIn('if (route == L"image-context") return {900, 620};', windows_leaf)
-        windows_module = (ROOT / "rn/apps/windows/src/native/windows/WinUI3NativeLeafModule.cpp").read_text(encoding="utf-8")
-        self.assertIn('route == L"image-context") && !leaf_->IsChildHost()', windows_module)
-        windows_host = (ROOT / "rn/apps/windows/windows/YoungRouter/YoungRouter.cpp").read_text(encoding="utf-8")
-        self.assertIn('if (route != L"provider-wizard" && route != L"file-editor" && route != L"image-context") return;', windows_host)
-        self.assertIn('return route == L"provider-wizard" || route == L"file-editor" || route == L"image-context"', windows_host)
-
-    def test_image_context_does_not_offer_a_per_task_switch_here(self) -> None:
-        # The automatic-selection switch belongs to Context Attachment Manager's
-        # own panel.  The window reads it -- a tick must still mean "every
-        # turn" where the pass omits -- but turning it here was a second owner
-        # for the same file, and this app no longer writes it.
-        self.assertNotIn('dispatch("auto"', self.ui)
-        self.assertNotIn('translate("imageContext.auto")', self.ui)
-        self.assertNotIn('"imageContext.auto":', self.en)
-        self.assertNotIn('"imageContext.auto":', self.zh)
-        self.assertNotIn('| "imageContext.auto"', (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8"))
-        # The rest of that document is still that panel's: a write here keeps
-        # it intact, which is what the comment at the writer states.
-        self.assertIn("const automatic = booleanValue(task.auto);", self.ui)
-        self.assertIn('dispatch(automatic ? "pin" : "set"', self.ui)
 
     def test_online_usage_is_a_select_driven_log_view_not_a_child_browser(self) -> None:
         # The 在线用量 tab is a log view: a dropdown chooses which configured
@@ -3642,10 +3636,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )
         self.assertIn("void ipc.editor(domain, document).then((descriptor) => {", raw_editor)
         self.assertIn("<View style={styles.rawNativeEditorFrame}>", raw_editor)
-        # Windows edits the shared draft in the native multiline field: a
-        # WebView2 inside the child editor window's XAML island renders blank.
-        self.assertIn('Platform.OS === "windows"', raw_editor)
-        self.assertIn("<NativeTextField", raw_editor)
+        # The raw editor shares Ace on both hosts. RNW lays out the child site
+        # in DIPs but does not apply PointScaleFactor to its actual size; the
+        # Windows native leaf applies that scale at the child-site boundary.
+        self.assertNotIn("<NativeTextField", raw_editor)
+        self.assertNotIn("styles.rawNativeTextField", raw_editor)
         self.assertIn("<CodeEditorWebView", raw_editor)
         self.assertIn('documentKey={`${documentKey}:${editorRenderRevision}`}', raw_editor)
         self.assertIn("value={draft}", raw_editor)
@@ -3748,6 +3743,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertNotIn(marker, self.code_editor_web)
         self.assertNotIn('fontSize: "13px"', self.code_editor_web)
+        self.assertIn('const ACE_EDITOR_FONT = Platform.OS === "windows" ? "16px/1.45" : "12px/1.55";', self.code_editor_wrapper)
+        self.assertIn('font: ${ACE_EDITOR_FONT} ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;', self.code_editor_wrapper)
         for marker in (
             "#code-editor-layout {",
             "body.diff-sidebar-enabled #code-editor-layout {",
@@ -4091,7 +4088,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("<ProviderIdentityFields", editor)
         self.assertEqual(1, editor.count("<ProviderIdentityFields"))
         self.assert_ui_has("function ProviderIdentityFields(")
-        self.assertLess(editor.index("<ProviderIdentityFields"), editor.index('{isOfficialAccount && kind !== "openai" ? <View'))
+        self.assertLess(editor.index("<ProviderIdentityFields"), editor.index('{kind === "openai" ? <View'))
         self.assertLess(editor.index("<ProviderIdentityFields"), editor.index("<ProviderKeysPanel"))
         identity = self.ui.split("function ProviderIdentityFields(", 1)[1].split("function ProviderEditor(", 1)[0]
         # One container, one enable row, and the fields the block itself draws.
@@ -4143,10 +4140,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('>{providerBaseURL}</Text>', identity)
         self.assertIn('tooltip={providerBaseURL} accessibilityLabel={providerBaseURL}', identity)
         # The account surface keeps its rule, as the keys and the stations do.
-        self.assertIn('{isOfficialAccount && kind !== "openai" ? <View style={styles.officialAccountSection}>', editor)
+        self.assertIn('{kind === "openai" ? <View style={styles.officialAccountSection}>', editor)
+        # Claude's single-account block is gone with its OAuth: no second
+        # account section, and no paste-a-token field anywhere in the pane.
+        self.assertEqual(1, editor.count("styles.officialAccountSection}"))
+        self.assertNotIn('field="provider_auth_token"', editor)
         # Which account the row stands for, above the actions that act on it:
         # 退出登录 over a row that only says "OpenAI" names no session.
-        self.assertIn('{translate("providers.authAccount")}', editor)
+        self.assertIn('translate("providers.authAccount")', editor)
         self.assertIn("const authAccount = providerAuthAccount(provider);", editor)
         self.assertIn('"providers.authAccount": "账号"', self.zh)
         self.assertIn('"providers.authAccount": "Account"', self.en)
@@ -4362,7 +4363,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_workbuddy_provider_types_borrow_the_desktop_app_sign_in(self) -> None:
         """WorkBuddy keeps its sign-in and its model catalog in its own app."""
         for marker in (
-            'type WizardType = "api" | "openai" | "claude" | "workbuddy" | "workbuddyGlobal" | "ourFreeModel" | "ourFreeModelKilo";',
+            'type WizardType = "api" | "openai" | "workbuddy" | "workbuddyGlobal" | "ourFreeModel" | "ourFreeModelKilo";',
             'const isWorkBuddyType = providerType === "workbuddy" || providerType === "workbuddyGlobal";',
             'const workbuddyAuthKind: ServiceProviderKind = providerType === "workbuddyGlobal" ? "workbuddy_global_login" : "workbuddy_login";',
             'dispatchWithOutcome("workbuddy_status", { refresh }, "providers_models", true);',
@@ -4382,7 +4383,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # The account links in the one association block; models keep the
             # provider's own key slot and the key-driven 获取模型 path.
             'const refreshWorkBuddyAccount = async (): Promise<void> => {',
-            'const isOfficialAccount = kind === "openai" || kind === "claude";',
+            'const isOfficialAccount = kind === "openai";',
             'const isWorkBuddyAccount = kind === "workbuddy" || kind === "workbuddyGlobal";',
             'const service = providerService(provider);',
             'translate("providers.wizard.providerType")',
@@ -4419,9 +4420,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '{translate(providerService(provider) ? "providers.serviceLinks" : "providers.accounts")}',
             '{(!isLogin || isWorkBuddyAccount) && !station ? <View style={styles.providerAccountsHeader}>',
             # An account-backed row is a real provider: it takes ＋ for a model
-            # that names the account it answers with, so only the single-login
-            # Claude row keeps its list read-only.
-            'provider && providerKindSelected !== "claude" ? <IconButton label="+"',
+            # that names the account it answers with.
+            'provider ? <IconButton label="+" title={translate("providers.newModel")}',
             # An unread account is handed to the desktop app, then confirmed.
             'const workbuddySignedIn = stringValue(workbuddyAccount?.state) === "signed-in"',
             '|| stringValue(asRecord(provider.auth_observed).state) === "signed-in";',
@@ -4514,7 +4514,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # entry: a wizard option that could only fail its import is worse
             # than no option at all.
             '{ type: "ourFreeModelKilo", label: translate("providers.type.ourFreeModelKilo") },',
-            'const kinds: WizardType[] = ["api", "openai", "claude", "workbuddy", "workbuddyGlobal", "ourFreeModel", "ourFreeModelKilo"];',
+            'const kinds: WizardType[] = ["api", "openai", "workbuddy", "workbuddyGlobal", "ourFreeModel", "ourFreeModelKilo"];',
             'const ourFreeModelProviderID = ourFreeModelProviderIDFor(providerType);',
             # A channel's entry is named after the channel, because the name is
             # what Core reads to know which one it is.
@@ -4764,7 +4764,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'export type ProviderAuthKind =\n'
             '  | "api_key"\n'
             '  | "openai_login"\n'
-            '  | "claude_login"\n'
             '  | "workbuddy_login"\n'
             '  | "workbuddy_global_login"\n'
             '  | "our_free_model_login";',
@@ -4800,7 +4799,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"providers.type.openai": "OpenAI"', self.en)
         self.assertNotIn('"providers.type.openai": "GPT"', self.zh)
         self.assertNotIn('"providers.type.openai": "GPT"', self.en)
-        self.assertIn('"providers.type.claude": "Claude"', self.zh)
         self.assertIn('"providers.type.apiKey": "API 密钥"', self.zh)
         self.assertIn('"providers.type.relay": "Relay station"', self.en)
         self.assertIn('"providers.type.apiKey": "API key"', self.en)
@@ -4817,12 +4815,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # A second account is a second account of this row, not a second
             # provider: the sign-in starts on the provider the pane shows.
             'dispatchWithOutcome("service_provider.auth_start", { provider_id: id }, "providers_models")',
-            'field="provider_auth_token"',
             "officialStatusRow",
         ):
             self.assertIn(marker, editor)
-        self.assert_ui_has("const callbackURL = stringValue(summary.redirect_uri);")
-        self.assert_ui_has("...(callbackURL ? { callbackURL } : {})")
+        # The one flow left is a device code, so its challenge is a code and a
+        # URL: a loopback redirect belonged to the retired Claude OAuth flow.
+        self.assertNotIn("callbackURL", self.ui)
         self.assertNotIn('"service_provider.auth_activate"', editor)
         self.assert_ui_has('translate("relay.officialProviderMultiAccountHint")')
         self.assertIn("function presentProviderAuthChallenge(", self.ui)
@@ -4834,8 +4832,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"service_provider.auth_status"', poll)
         self.assertIn("setInterval", poll)
         self.assertIn('"providers.authStatusUnsupported": "暂不支持登录"', self.zh)
-        self.assertIn("将打开 Claude 官方网页完成登录", self.zh)
-        self.assertIn("official Claude sign-in page opens in your browser", self.en)
+        # One official sign-in is left, and it is OpenAI's.  Claude's own OAuth
+        # is gone, so neither its hint nor its paste-a-token field may return.
+        self.assertNotIn('field="provider_auth_token"', editor)
+        self.assertNotIn("将打开 Claude 官方网页完成登录", self.zh)
+        self.assertNotIn("official Claude sign-in page opens in your browser", self.en)
 
     def test_unified_workspace_stages_relay_and_provider_drafts_together(self) -> None:
         for marker in (
@@ -5035,16 +5036,27 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # reconcile on the primary host made the one surface that shows the word
         # the one surface that could never correct it.
         self.assertIn("  }, [refreshSnapshot, snapshot?.revision, snapshot?.service.state]);", self.ui)
+        # A settled failure is re-read as well.  Core repairs an unhealthy
+        # proxy without this window, so a pane that only polled while running
+        # kept stating 不健康 (with 重启服务 beside it) over a proxy that had
+        # already answered for minutes -- the state that made a manual restart
+        # look necessary.
+        self.assertIn("const SERVICE_UNHEALTHY_RECONCILE_MS = 5_000;", self.ui)
+        self.assertIn('if (snapshot?.service.state !== "unhealthy") return;', self.ui)
+        self.assertIn("}, SERVICE_UNHEALTHY_RECONCILE_MS);", self.ui)
         self.assertNotIn('if (!isPrimaryHost || !snapshot) return;\n    // A transitional state is a claim about a proxy replacement', self.ui)
         # 运行中 is the other claim no window can verify: a Core replaced under
         # an idle app leaves the last snapshot standing, and the 服务 row then
-        # states 运行中 (端口 12390) over a port nothing answers on.  It re-reads
-        # slowly, and it accepts an unchanged revision because a replacement
-        # restores that revision from the same record.
-        self.assertIn("const SERVICE_RUNNING_RECONCILE_MS = 15_000;", self.ui)
-        self.assertIn('if (snapshot?.service.state !== "running") return;', self.ui)
+        # states 运行中 (端口 12390) over a port nothing answers on.  未知 is
+        # settled the same way -- a listener this installation does not own,
+        # whose disappearance lets Core start the proxy it does own with no
+        # event for this window.  Both re-read slowly, and they accept an
+        # unchanged revision because a replacement restores that revision from
+        # the same record.
+        self.assertIn("const SERVICE_SETTLED_RECONCILE_MS = 15_000;", self.ui)
+        self.assertIn('settled !== "running" && settled !== "unknown"', self.ui)
         self.assertIn(
-            "if (next.revision === acceptedSnapshotRevision.current && next.service.state === observed) return;",
+            "if (next.revision === acceptedSnapshotRevision.current && next.service.state === settled) return;",
             self.ui,
         )
         self.assertIn('await dispatchServiceAction(serviceRestart ? "service.restart" : "service.start");', general)
@@ -6200,7 +6212,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const isLogin = isLoginProviderKind(kind);", identity)
         # The predicate itself names every login service, the lane included.
         self.assert_ui_has(
-            'return kind === "openai" || kind === "claude" || kind === "workbuddy" || kind === "workbuddyGlobal" || kind === "ourFreeModel";'
+            'return kind === "openai" || kind === "workbuddy" || kind === "workbuddyGlobal" || kind === "ourFreeModel";'
         )
         # ...and the panel refuses Core's own slot itself, so the guarantee does
         # not rest on every caller naming the service correctly.
@@ -7130,7 +7142,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_codex_raw_editors_share_height_and_follow_disk_generation(self) -> None:
         for marker in (
-            "showLabel={false} showDiff codexPane syncRevision={syncRevision} style={assistantFileSurfaceStyles.editorRouteRaw}",
+            "showLabel={false} showDiff codexPane deferStage={Platform.OS === \"windows\"} onDirtyChange={handleEditorDirtyChange} syncRevision={Platform.OS === \"windows\" ? undefined : syncRevision} style={assistantFileSurfaceStyles.editorRouteRaw}",
             "assistantFileSurfaceStyles.fileRow",
             "assistantFileSurfaceStyles.editorRoute",
             "function FileEditorWorkspace",
@@ -7225,7 +7237,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # account it answers with, so the row is a first-class provider and not
         # a read-only projection of what the account happened to list.
         self.assertIn(
-            '{provider && providerKindSelected !== "claude" ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}',
+            '{provider ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}',
             self.ui,
         )
         self.assertIn(

@@ -11,6 +11,8 @@ from .model_contexts import ModelContextRegistry
 from .model_contexts import (
     SEARCH_TOOL_CAPABILITY_BRIDGE,
     SEARCH_TOOL_CAPABILITY_UNSUPPORTED,
+    ReasoningCapability,
+    published_reasoning_levels,
 )
 from .native_codex_catalog import load_native_catalog
 from .persistence import PersistenceError, atomic_write_json, read_json
@@ -52,6 +54,9 @@ _REASONING_DESCRIPTIONS = {
     "high": "Greater reasoning depth for complex tasks",
     "xhigh": "Extra reasoning depth for complex tasks",
     "max": "Maximum reasoning depth for the hardest tasks",
+    # Codex's own wording, kept verbatim so a custom route's slider reads the
+    # same as the client's native profile.
+    "ultra": "Maximum reasoning with automatic task delegation",
 }
 
 
@@ -291,16 +296,81 @@ def _native_profile_for_name(
     return None, False
 
 
-def _apply_reasoning_capability(model: dict[str, Any], registry: ModelContextRegistry, name: str) -> None:
+def _route_reasoning_capability(
+    registry: ModelContextRegistry,
+    name: str,
+) -> ReasoningCapability | None:
+    """The public route's reasoning surface, resolved the way Pi's listing does it.
+
+    ``reasoning_for`` is the route's *common* surface, and it answers ``None``
+    when any one of a group's deployments resolves nothing -- which is every
+    relay alias the provider catalog names differently
+    (``opencode-go/space-bunny`` while the route is called ``space-bunny``).
+    Reading only that answer left the model on the inherited native profile, so
+    the managed catalog published ``low``..``ultra`` for a route the same
+    registry reports as ``low``/``high``/``max`` on ``/v1/models``: one route,
+    two ladders, and a default the route does not have.  The public name's own
+    resolution is where the request path ends up as well, so it is the one
+    fallback and it can only narrow the answer, never contradict one that
+    resolved.
+    """
+
     capability = registry.reasoning_for(name)
+    if capability is not None and capability.supported_levels:
+        return capability
+    return registry.reasoning_for_model_id(name)
+
+
+def _route_is_image_model(registry: ModelContextRegistry, name: str) -> bool:
+    """Whether this public route serves only image generation.
+
+    The public catalogs (pi.dev, models.dev) already state the modality, so the
+    prefix heuristic the provider pane uses is not needed here.  A route earns
+    the answer when one of its deployments resolves an image contract and no
+    deployment states a thinking level above the disabled step: a group that
+    also serves a reasoning text model keeps its ladder, and a deployment the
+    registry cannot resolve (a retired alias beside two live ones) does not veto
+    the two that agree.
+    """
+
+    model_ids = registry.route_model_ids(name) or [name]
+    if not registry.image_metadata_for_model_ids(model_ids):
+        return False
+    resolved = [
+        capability
+        for capability in (
+            registry.reasoning_for_model_id(model_id) for model_id in model_ids
+        )
+        if capability is not None
+    ]
+    return all(
+        capability.supported_levels in (("none",), ())
+        for capability in resolved
+    )
+
+
+def _apply_reasoning_capability(model: dict[str, Any], capability: ReasoningCapability | None) -> None:
+    """Publish one route's provider-wire ladder on a catalog entry.
+
+    An image model states only its disabled step: the client's slider is a
+    reasoning control, and a level it cannot honour there is a knob that does
+    nothing.  Everything below is a provider-wire level, so it is worded through
+    ``published_reasoning_levels`` and therefore carries ``ultra`` beside every
+    ``max`` exactly as the Pi-facing listing does.
+    """
+
     if capability is None:
         return
+    if capability.supported_levels == ("none",):
+        levels = ["none"]
+    else:
+        levels = published_reasoning_levels(capability.supported_levels)
     model["supported_reasoning_levels"] = [
         {
             "effort": level,
             "description": _REASONING_DESCRIPTIONS.get(level, f"{level} reasoning"),
         }
-        for level in capability.supported_levels
+        for level in levels
     ]
     if capability.default_level is not None:
         model["default_reasoning_level"] = capability.default_level
@@ -396,11 +466,20 @@ def _catalog_model(
         model["default_reasoning_summary"] = DEFAULT_REASONING_SUMMARY
     # An exact native profile may contain Codex-only modes such as ``ultra``
     # that activate task delegation rather than map directly to a provider
-    # reasoning effort.  The route capability registry intentionally knows
-    # only provider-wire efforts, so applying it here would erase those native
-    # modes.  Custom public aliases still need the registry's safe surface.
-    if not exact_native_match:
-        _apply_reasoning_capability(model, registry, name)
+    # reasoning effort, so its ladder stays the client's own.  Every other
+    # entry states what its route actually maps -- and an image route states
+    # only its disabled step whether or not it has a native namesake, because
+    # the profile it inherited advertises thinking this route cannot do.
+    if _route_is_image_model(registry, name):
+        model["supported_reasoning_levels"] = [
+            {
+                "effort": "none",
+                "description": _REASONING_DESCRIPTIONS["none"],
+            }
+        ]
+        model["default_reasoning_level"] = "none"
+    elif not exact_native_match:
+        _apply_reasoning_capability(model, _route_reasoning_capability(registry, name))
     return model
 
 

@@ -10,39 +10,17 @@ from __future__ import annotations
 
 import base64
 import hashlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import re
-import secrets
 import stat
-import subprocess
 import threading
 import time
 from typing import Any, Mapping
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlencode, urlparse
-from urllib.request import Request, urlopen
-
-from ..browser_identity import browser_request_headers
 
 from .persistence import atomic_write_json, read_json
-
 _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
-_CLAUDE_TOKEN_PREFIX = "sk-ant-oat"
-_CLAUDE_TOKEN_RE = re.compile(r"sk-ant-oat[A-Za-z0-9_.:-]{16,8192}")
-_CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-_CLAUDE_OAUTH_AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
-_CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
-_CLAUDE_OAUTH_SCOPES = (
-    "user:profile",
-    "user:inference",
-    "user:sessions:claude_code",
-    "user:mcp_servers",
-    "user:file_upload",
-)
-_CLAUDE_OAUTH_TIMEOUT_SECONDS = 15 * 60
 _LEGACY_OPENAI_SESSION_REF = "chatgpt-account"
 _SAFE_STATUS = {"signed_out", "authorizing", "signed_in", "expired", "error", "unsupported"}
 _MAX_ERROR_BYTES = 160
@@ -98,76 +76,6 @@ def _safe_error(value: object) -> str:
     return text[:_MAX_ERROR_BYTES]
 
 
-def _valid_claude_token(value: object) -> bool:
-    if not isinstance(value, str) or len(value.encode("utf-8")) > 8192:
-        return False
-    return _CLAUDE_TOKEN_RE.fullmatch(value) is not None and not any(
-        char.isspace() or ord(char) < 32 for char in value
-    )
-
-
-def _base64url(value: bytes) -> str:
-    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
-
-
-def _claude_token_expired(record: dict[str, Any]) -> bool:
-    expires_at = record.get("expires_at")
-    return isinstance(expires_at, (int, float)) and time.time() >= float(expires_at)
-
-
-class _ClaudeOAuthCallbackHandler(BaseHTTPRequestHandler):
-    """Receive only the loopback OAuth callback; never expose its query data."""
-
-    server: "_ClaudeOAuthCallbackServer"
-
-    def _respond(self, status: int, body: str) -> None:
-        encoded = body.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(encoded)
-
-    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler protocol name
-        parsed = urlparse(self.path)
-        if parsed.path != "/callback":
-            self._respond(404, "<h1>Not found</h1>")
-            return
-        params = parse_qs(parsed.query, keep_blank_values=True)
-        state = params.get("state", [""])[0]
-        if state != self.server.expected_state:
-            self._respond(400, "<h1>Sign-in could not be verified</h1>")
-            return
-        error = params.get("error", [""])[0].strip()
-        if error:
-            self.server.result = {"error": "authorization_denied"}
-            self._respond(400, "<h1>Sign-in was not completed</h1>")
-            self.server.wakeup.set()
-            return
-        code = params.get("code", [""])[0].strip()
-        if not code:
-            self._respond(400, "<h1>Sign-in did not return an authorization code</h1>")
-            return
-        self.server.result = {"code": code}
-        self._respond(200, "<h1>Sign-in complete</h1><p>You can return to Young Router.</p>")
-        self.server.wakeup.set()
-
-    def log_message(self, format: str, *args: object) -> None:
-        del format, args
-
-
-class _ClaudeOAuthCallbackServer(ThreadingHTTPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-
-    def __init__(self, address: tuple[str, int], expected_state: str, wakeup: threading.Event) -> None:
-        super().__init__(address, _ClaudeOAuthCallbackHandler)
-        self.expected_state = expected_state
-        self.wakeup = wakeup
-        self.result: dict[str, str] = {}
-
-
 class ProviderAuthManager:
     """Persist and operate on one app-owned credential profile per ref."""
 
@@ -200,7 +108,6 @@ class ProviderAuthManager:
         # poll times out, and a flag could not tell that worker apart from the
         # attempt that replaced it.
         self._attempts: dict[str, int] = {}
-        self._claude_flows: dict[str, dict[str, Any]] = {}
         self._active_openai_file = self.root / "active-openai.json"
 
     def _canonical_ref(self, kind: str, ref: str) -> str:
@@ -404,92 +311,11 @@ class ProviderAuthManager:
                     if isinstance(value, str) and value:
                         result[key] = value
             return result
-        if kind == "claude_login":
-            record = self._read(ref)
-            with self._lock:
-                state = dict(self._states.get(ref, {}))
-            transient_status = state.get("status")
-            if transient_status in {"authorizing", "signed_out", "error"}:
-                result: dict[str, Any] = {
-                    "status": transient_status,
-                    "configured": False,
-                }
-                if transient_status == "authorizing":
-                    for key in ("verification_uri", "user_code", "redirect_uri"):
-                        value = state.get(key)
-                        if isinstance(value, str) and value:
-                            result[key] = value
-                return result
-            token = record.get("token")
-            if _valid_claude_token(token):
-                if _claude_token_expired(record):
-                    return {
-                        "status": "expired",
-                        "configured": True,
-                        "expires_at": record.get("expires_at"),
-                    }
-                return {
-                    "status": "signed_in",
-                    "configured": True,
-                    **({"expires_at": record["expires_at"]} if isinstance(record.get("expires_at"), (int, float)) else {}),
-                }
-            status = state.get("status", "signed_out")
-            result: dict[str, Any] = {
-                "status": status if status in _SAFE_STATUS else "signed_out",
-                "configured": False,
-            }
-            if result["status"] == "authorizing":
-                for key in ("verification_uri", "user_code", "redirect_uri"):
-                    value = state.get(key)
-                    if isinstance(value, str) and value:
-                        result[key] = value
-            return result
         return {"status": "signed_out", "configured": False}
-
-    def import_claude_token(self, credential_ref: str, token: str) -> dict[str, Any]:
-        ref = _validated_ref(credential_ref)
-        value = token.strip() if isinstance(token, str) else ""
-        if not _valid_claude_token(value):
-            raise ValueError("Claude OAuth token is invalid")
-        with self._lock:
-            if ref in self._cancel:
-                return {"status": "signed_out", "configured": False}
-            self._set_state(
-                ref,
-                kind="claude_login",
-                token=value,
-                refresh_token="",
-                expires_at=None,
-                refresh_token_expires_at=None,
-                status="signed_in",
-                configured=True,
-                last_error="",
-                verification_uri="",
-                user_code="",
-                redirect_uri="",
-            )
-        return {"status": "signed_in", "configured": True}
-
-    def _prepare_claude_start(self, ref: str) -> None:
-        existing = self._read(ref)
-        if existing.get("kind") not in (None, "claude_login"):
-            raise ValueError("Provider credential profile belongs to another login method")
-        state = {
-            "kind": "claude_login",
-            "status": "authorizing",
-            "configured": False,
-            "last_error": "",
-            "updated_at": int(time.time()),
-        }
-        self._write(
-            ref,
-            state,
-        )
-        self._states[ref] = dict(state)
 
     def start(self, kind: str, credential_ref: str) -> dict[str, Any]:
         ref = self._canonical_ref(kind, credential_ref)
-        if kind not in {"openai_login", "claude_login"}:
+        if kind not in {"openai_login"}:
             raise ValueError("Provider login method is unavailable")
         with self._lock:
             # A press of 登录 always starts the sign-in it names.  Refusing to
@@ -501,13 +327,9 @@ class ProviderAuthManager:
             generation = self._attempts.get(ref, 0) + 1
             self._attempts[ref] = generation
             self._cancel.discard(ref)
-            if kind == "claude_login":
-                self._prepare_claude_start(ref)
-            else:
-                self._set_state(ref, kind=kind, status="authorizing", configured=False, last_error="")
-            target = self._run_chatgpt if kind == "openai_login" else self._run_claude
+            self._set_state(ref, kind=kind, status="authorizing", configured=False, last_error="")
             thread = threading.Thread(
-                target=target,
+                target=self._run_chatgpt,
                 args=(ref, generation),
                 daemon=True,
                 name=f"litellm-auth-{ref}",
@@ -524,32 +346,8 @@ class ProviderAuthManager:
             # before this point must not write the credential it obtains, and
             # must not overwrite the signed-out state this call stores.
             self._attempts[ref] = self._attempts.get(ref, 0) + 1
-            flow = self._claude_flows.get(ref)
-        if flow is not None:
-            wakeup = flow.get("wakeup")
-            if isinstance(wakeup, threading.Event):
-                wakeup.set()
         try:
-            record = self._read(ref)
-            if record.get("kind") == "claude_login":
-                self._write(
-                    ref,
-                    {
-                        "kind": "claude_login",
-                        "status": "signed_out",
-                        "configured": False,
-                        "last_error": "",
-                        "updated_at": int(time.time()),
-                    },
-                )
-                with self._lock:
-                    self._states[ref] = {
-                        "kind": "claude_login",
-                        "status": "signed_out",
-                        "configured": False,
-                    }
-            else:
-                self._set_state(ref, status="signed_out", configured=False, user_code="", verification_uri="")
+            self._set_state(ref, status="signed_out", configured=False, user_code="", verification_uri="")
         except Exception:
             pass
         return {"status": "signed_out", "configured": False}
@@ -583,21 +381,7 @@ class ProviderAuthManager:
     def environment(self) -> dict[str, str]:
         active_ref = self.active_openai_ref()
         active_root = self._chatgpt_account_root(active_ref or _LEGACY_OPENAI_SESSION_REF)
-        env: dict[str, str] = {"CHATGPT_TOKEN_DIR": str(active_root), "CHATGPT_AUTH_FILE": "auth.json"}
-        for path in self.root.glob("*.json"):
-            if path.name == "auth.json":
-                continue
-            record = read_json(path)
-            if not isinstance(record, dict) or record.get("kind") != "claude_login":
-                continue
-            token = record.get("token")
-            if _valid_claude_token(token) and not _claude_token_expired(record):
-                ref = path.stem
-                try:
-                    env[credential_env_name(ref)] = token
-                except ValueError:
-                    continue
-        return env
+        return {"CHATGPT_TOKEN_DIR": str(active_root), "CHATGPT_AUTH_FILE": "auth.json"}
 
     def _is_current(self, ref: str, generation: int) -> bool:
         with self._lock:
@@ -661,198 +445,3 @@ class ProviderAuthManager:
                     self._threads.pop(ref, None)
                     self._cancel.discard(ref)
 
-    @staticmethod
-    def _claude_authorization_url(
-        *, port: int, state: str, code_challenge: str
-    ) -> tuple[str, str]:
-        redirect_uri = f"http://localhost:{port}/callback"
-        params = {
-            "code": "true",
-            "client_id": _CLAUDE_OAUTH_CLIENT_ID,
-            "response_type": "code",
-            "redirect_uri": redirect_uri,
-            "scope": " ".join(_CLAUDE_OAUTH_SCOPES),
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-            "state": state,
-        }
-        return f"{_CLAUDE_OAUTH_AUTHORIZE_URL}?{urlencode(params)}", redirect_uri
-
-    @staticmethod
-    def _exchange_claude_code(
-        *, code: str, code_verifier: str, state: str, redirect_uri: str
-    ) -> dict[str, Any]:
-        payload = json.dumps(
-            {
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": redirect_uri,
-                "client_id": _CLAUDE_OAUTH_CLIENT_ID,
-                "code_verifier": code_verifier,
-                "state": state,
-            }
-        ).encode("utf-8")
-        request = Request(
-            _CLAUDE_OAUTH_TOKEN_URL,
-            data=payload,
-            headers=browser_request_headers(),
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=30) as response:
-                body = response.read(256 * 1024)
-                status = int(response.status)
-        except HTTPError as exc:
-            raise ValueError(f"token_exchange_http_{exc.code}") from None
-        except (URLError, TimeoutError, OSError):
-            raise ValueError("token_exchange_network") from None
-        if status != 200:
-            raise ValueError(f"token_exchange_http_{status}")
-        try:
-            result = json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            raise ValueError("token_exchange_invalid_response") from None
-        if not isinstance(result, dict):
-            raise ValueError("token_exchange_invalid_response")
-        return result
-
-    def _run_claude(self, ref: str, generation: int) -> None:
-        server: _ClaudeOAuthCallbackServer | None = None
-        server_thread: threading.Thread | None = None
-        try:
-            if not self._is_current(ref, generation):
-                return
-            code_verifier = _base64url(secrets.token_bytes(32))
-            code_challenge = _base64url(hashlib.sha256(code_verifier.encode("ascii")).digest())
-            state = _base64url(secrets.token_bytes(32))
-            wakeup = threading.Event()
-            server = _ClaudeOAuthCallbackServer(("127.0.0.1", 0), state, wakeup)
-            authorization_url, redirect_uri = self._claude_authorization_url(
-                port=int(server.server_address[1]),
-                state=state,
-                code_challenge=code_challenge,
-            )
-            server_thread = threading.Thread(
-                target=server.serve_forever,
-                daemon=True,
-                name=f"litellm-claude-oauth-callback-{ref}",
-            )
-            with self._lock:
-                self._claude_flows[ref] = {
-                    "server": server,
-                    "wakeup": wakeup,
-                    "redirect_uri": redirect_uri,
-                }
-            server_thread.start()
-            self._set_state(
-                ref,
-                kind="claude_login",
-                status="authorizing",
-                configured=False,
-                verification_uri=authorization_url,
-                user_code="",
-                redirect_uri=redirect_uri,
-                auth_method="web_oauth",
-                last_error="",
-            )
-            with self._lock:
-                private = self._read(ref)
-                for key in ("verification_uri", "user_code", "redirect_uri", "auth_method"):
-                    private.pop(key, None)
-                self._write(ref, private)
-            deadline = time.monotonic() + _CLAUDE_OAUTH_TIMEOUT_SECONDS
-            while not wakeup.wait(timeout=0.25):
-                if not self._is_current(ref, generation):
-                    return
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("oauth_timeout")
-            if not self._is_current(ref, generation):
-                return
-            callback_result = dict(server.result)
-            if callback_result.get("error"):
-                raise ValueError("authorization_denied")
-            code = callback_result.get("code", "")
-            if not isinstance(code, str) or not code:
-                raise ValueError("authorization_code_missing")
-            tokens = self._exchange_claude_code(
-                code=code,
-                code_verifier=code_verifier,
-                state=state,
-                redirect_uri=redirect_uri,
-            )
-            access_token = tokens.get("access_token")
-            if not _valid_claude_token(access_token):
-                raise ValueError("oauth_token_invalid")
-            expires_in = tokens.get("expires_in")
-            expires_at = (
-                time.time() + float(expires_in)
-                if isinstance(expires_in, (int, float)) and float(expires_in) > 0
-                else None
-            )
-            refresh_token = tokens.get("refresh_token")
-            if not isinstance(refresh_token, str):
-                refresh_token = ""
-            refresh_expires_in = tokens.get("refresh_token_expires_in")
-            refresh_expires_at = (
-                time.time() + float(refresh_expires_in)
-                if isinstance(refresh_expires_in, (int, float)) and float(refresh_expires_in) > 0
-                else None
-            )
-            scopes = tokens.get("scope")
-            if not isinstance(scopes, str):
-                scopes = " ".join(_CLAUDE_OAUTH_SCOPES)
-            with self._lock:
-                if self._attempts.get(ref, 0) != generation:
-                    return
-                self._write(
-                    ref,
-                    {
-                        "kind": "claude_login",
-                        "token": access_token,
-                        "refresh_token": refresh_token,
-                        "expires_at": expires_at,
-                        "refresh_token_expires_at": refresh_expires_at,
-                        "scopes": scopes,
-                        "client_id": _CLAUDE_OAUTH_CLIENT_ID,
-                        "status": "signed_in",
-                        "configured": True,
-                        "last_error": "",
-                        "updated_at": int(time.time()),
-                    },
-                )
-                self._states[ref] = {
-                    "kind": "claude_login",
-                    "status": "signed_in",
-                    "configured": True,
-                    "last_error": "",
-                    "updated_at": int(time.time()),
-                }
-        except TimeoutError:
-            if self._is_current(ref, generation):
-                self._set_state(ref, kind="claude_login", status="error", configured=False, last_error="timeout")
-        except Exception as exc:
-            if self._is_current(ref, generation):
-                self._set_state(ref, kind="claude_login", status="error", configured=False, last_error=_safe_error(exc))
-        finally:
-            if server is not None:
-                try:
-                    server.shutdown()
-                except Exception:
-                    pass
-                try:
-                    server.server_close()
-                except Exception:
-                    pass
-            if server_thread is not None and server_thread is not threading.current_thread():
-                server_thread.join(timeout=1)
-            with self._lock:
-                if self._claude_flows.get(ref, {}).get("server") is server:
-                    self._claude_flows.pop(ref, None)
-                if self._threads.get(ref) is threading.current_thread():
-                    self._threads.pop(ref, None)
-
-    def token(self, credential_ref: str) -> str:
-        ref = _validated_ref(credential_ref)
-        record = self._read(ref)
-        value = record.get("token")
-        return value if _valid_claude_token(value) else ""

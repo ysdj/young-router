@@ -59,6 +59,16 @@ from urllib.parse import quote, urljoin
 # where they are used instead of at module scope.
 SEARCH_PATHS = ("/v1/alpha/search", "/alpha/search")
 DEEPSEEK_HOST = "api.deepseek.com"
+# Anthropic's own server-side search, executed by the provider.  It is the only
+# search backend some relays serve: they answer ``/alpha/search`` with 404 and
+# they do not run a hosted ``web_search`` tool when the call also carries the
+# client's own tools -- but they do run this declaration on a call that carries
+# nothing else.
+ANTHROPIC_SEARCH_TOOL_TYPE = "web_search_20250305"
+ANTHROPIC_SEARCH_TOOL_NAME = "web_search"
+ANTHROPIC_SEARCH_MAX_USES = 5
+ANTHROPIC_SEARCH_MODEL_PREFIX = "claude"
+ANTHROPIC_API_VERSION = "2023-06-01"
 ALPHA_SEARCH_UNSUPPORTED_TTL_ENV = "YOUNG_ROUTER_ALPHA_SEARCH_UNSUPPORTED_TTL_SECONDS"
 DEFAULT_UNSUPPORTED_TTL_SECONDS = 300.0
 MAX_QUERIES = 4
@@ -323,6 +333,14 @@ def is_deepseek_deployment(params: Mapping[str, Any]) -> bool:
     return DEEPSEEK_HOST in base
 
 
+def is_anthropic_search_route(params: Mapping[str, Any]) -> bool:
+    """Whether this deployment names a Claude model, whatever its relay."""
+
+    return upstream_model_name(params).casefold().startswith(
+        ANTHROPIC_SEARCH_MODEL_PREFIX
+    )
+
+
 def _commands(body: Mapping[str, Any]) -> Mapping[str, Any]:
     commands = body.get("commands")
     return commands if isinstance(commands, Mapping) else {}
@@ -467,8 +485,17 @@ class _TextExtractor(HTMLParser):
     So the menu is not text here:
 
     * an ``<article>``/``<main>`` bounds the document when the page has one;
-    * blocks whose text is almost entirely link labels are dropped;
+    * a *run* of consecutive short link-only blocks is a menu and is dropped;
     * a block repeated verbatim at the end is a table of contents drawn twice.
+
+    The run, not the single block, is what makes a menu.  Judging a block on
+    its own dropped every one-line link on a page whose content *is* links, and
+    the live case was a front page: Hacker News puts each story title in one
+    ``<span class="titleline"><a>title</a><span>(site)</span></span>``, so the
+    titles -- the only text the reader wanted -- vanished and the model was
+    left with the score and author lines underneath them.  A lone link is a
+    heading, a title, or a citation; only its neighbours can tell it apart
+    from a menu, so the decision waits until the run is known.
     """
 
     _SKIP = {
@@ -487,11 +514,15 @@ class _TextExtractor(HTMLParser):
     }
     _CELL = {"td", "th"}
     _HEADING = {"h1", "h2", "h3", "h4", "h5", "h6"}
-    # A block this short that is this much link label is a menu entry, not
-    # prose.  Long blocks are kept even when they are links: a reference list
-    # or a table of API names is content the reader asked for.
+    # A *run* of short, mostly-link blocks is a menu.  Long blocks are kept
+    # even when they are links (a reference list, a table of API names), and a
+    # single short link block is content -- the run is what tells them apart.
     _MENU_LINK_RATIO = 0.8
     _MENU_MAX_CHARS = 200
+    # A menu is the site's whole navigation, so it is long by nature.  Below
+    # this many consecutive entries the run is a list of links someone put in
+    # the prose -- a story title row, a citation stack -- and it stays.
+    _MENU_MIN_RUN = 3
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -503,6 +534,10 @@ class _TextExtractor(HTMLParser):
         self._scoped = False
         self._parts: list[str] = []
         self._blocks: list[str] = []
+        # The menu heuristic is a decision about a *run* of blocks, so a run of
+        # would-be menu entries is held back until the next real block proves
+        # whether it was a menu.
+        self._pending_menu: list[str] = []
         self._link_depth = 0
         self._link_chars = 0
         self._block_chars = 0
@@ -594,11 +629,37 @@ class _TextExtractor(HTMLParser):
             and len(text) < self._MENU_MAX_CHARS
             and link_chars / block_chars > self._MENU_LINK_RATIO
         ):
+            # Maybe a menu entry.  Wait for the next block: a run of two is a
+            # citation stack or a title row, not navigation.
+            self._pending_menu.append(text)
             return
+        self._release_menu_run()
         self._blocks.append(text)
+
+    def _release_menu_run(self) -> None:
+        """Keep a short run of link-only blocks; drop a long one.
+
+        Hacker News' front page is why this exists: every story title is one
+        short ``<span class="titleline"><a>…</a></span>``, so per-block
+        filtering erased all the titles and left the scores underneath them.
+        A menu is a long run by nature, so length is the signal -- and it is
+        only knowable once the run has ended.
+        """
+
+        pending = self._pending_menu
+        self._pending_menu = []
+        if not pending:
+            return
+        if len(pending) >= self._MENU_MIN_RUN:
+            return
+        self._blocks.extend(pending)
 
     def text(self) -> str:
         self._flush()
+        # A page that ends inside its menu still has to answer: the run is only
+        # released when something proves it was a menu, so a trailing run is
+        # the page's last content.
+        self._release_menu_run()
         lines: list[str] = []
         for block in self._blocks:
             for line in block.splitlines():
@@ -805,16 +866,26 @@ def _browser_urls(queries: list[str]) -> list[str]:
 
 
 def tips_output(model: str, queries: list[str], reason: str) -> str:
-    """The terminal answer a route without a search backend gives the model."""
+    """The terminal answer a route without a search backend gives the model.
+
+    The wording is the contract.  It used to open with "do not call web.run
+    again, do not curl", which the model read as permission to answer from
+    memory: observed live 2026-11-01, a ``claude-opus-5-5`` turn over this exact
+    payload made no tool call at all and invented four citation links.  A
+    refusal that names no next step is an instruction to stop working, so the
+    text now carries the one concrete step that still works on this machine and
+    says nothing about giving up.
+    """
 
     lines = [
-        f"搜索没有执行：{reason}（模型 {model or '未知'}）。",
-        "不要再次调用 web.run 重试，也不要用 shell / curl / requests 抓搜索结果页——"
-        "这些站点会返回反爬页面，白白消耗上下文。",
-        "请改用本机已有的浏览器工具，一步到位：",
+        f"这次搜索没有执行：{reason}（模型 {model or '未知'}）。",
+        "这个结论只针对搜索本身，不代表你不能继续查证或用其他工具。",
+        "下一步用本机已有的浏览器把页面读回来，再基于真实页面作答：",
         "  1) 内置浏览器：调用 cua_repl 的 js，执行 "
         'await cua.createBrowserTab("iab", "<下面的地址>"); 然后读取页面文本。',
         '  2) 终端 Playwright：npx playwright-cli open "<下面的地址>"。',
+        "不要用 curl / requests 直接抓搜索结果页——这些站点会返回反爬页面，白白消耗上下文。",
+        "在拿到真实页面内容之前，不要凭空给出链接或细节。",
     ]
     for url in _browser_urls(queries):
         lines.append(f"  入口：{url}")
@@ -1241,6 +1312,225 @@ def _page_result(
     return result
 
 
+async def _anthropic_search(
+    params: Mapping[str, Any],
+    body: Mapping[str, Any],
+    client: Any,
+) -> tuple[Optional[dict[str, Any]], str]:
+    """Search through the Claude route's own server-side web search.
+
+    This is the one search a Claude relay in this installation can actually
+    run.  Measured live 2026-11-01 against all three ``claude-opus-5-5``
+    deployments:
+
+    * ``POST {base}/alpha/search`` -> 404, "Codex alpha search is only
+      available for OpenAI and Composite groups".
+    * A Messages call declaring ``web_search_20250305`` **together with the
+      client's tools** returns the declaration to the caller as an ordinary
+      function call and runs nothing (``web_search_results`` empty).
+    * The same call declaring it **alone** returns ``server_tool_use`` +
+      ``web_search_tool_result`` with real pages.
+
+    So the search is one extra, clean Messages call: no client tools, no
+    conversation, just the queries.  It borrows nothing -- the request goes to
+    the same deployment with the same key and model -- and the pages are handed
+    back in the shape ``web.run`` already returns.
+
+    ``unsupported`` means this route cannot serve it at all (not an Anthropic
+    model, or the relay answered with a deterministic refusal); anything else
+    is reported as a transient failure so the caller can try the next
+    deployment without poisoning the memory.
+    """
+
+    base = deployment_api_base(params)
+    key = deployment_api_key(params)
+    model = upstream_model_name(params)
+    if not base or not key:
+        return None, "这条路线缺少搜索参数"
+    if not is_anthropic_search_route(params):
+        return None, "这条路线不是 Claude 模型"
+    queries = search_queries(body)
+    if not queries:
+        return None, "这次调用没有要搜索的关键词"
+
+    session = _session_for(_session_key(body))
+    grouped: list[tuple[Optional[str], list[dict[str, Any]]]] = []
+    claimed: set[str] = set()
+    for query in queries:
+        status, payload = await _post_messages_with_search(
+            base, key, model, query, client
+        )
+        if status != 200:
+            return None, f"Claude 搜索接口不可用（{status}）"
+        rows: list[dict[str, Any]] = []
+        for result in _anthropic_search_results(payload):
+            url = str(result.get("url") or "").strip()
+            if not url or url in claimed:
+                continue
+            claimed.add(url)
+            rows.append(result)
+            if len(claimed) >= MAX_RESULTS:
+                break
+        if not _anthropic_search_answered_the_query(rows, [query]):
+            # This deployment's engine answered about something else.  Say so
+            # and let the caller ask the next deployment rather than handing
+            # the model a result set that only looks like an answer.
+            return None, "搜索结果与查询无关"
+        grouped.append((query, rows))
+        if len(claimed) >= MAX_RESULTS:
+            break
+
+    output, structured = render_groups(grouped, session)
+    if not structured:
+        # The provider answered 200 but ran no search.  That is a capability
+        # answer, not a transport failure, so it is reported as one and the
+        # next deployment is asked rather than the same call repeated.
+        return None, "Claude 没有返回搜索结果"
+    return _payload(output, structured), ""
+
+
+async def _post_messages_with_search(
+    base: str,
+    key: str,
+    model: str,
+    query: str,
+    client: Any,
+) -> tuple[int, Any]:
+    """One clean Messages call that runs the provider's own search."""
+
+    payload = {
+        "model": model,
+        "max_tokens": 1024,
+        "tools": [
+            {
+                "type": ANTHROPIC_SEARCH_TOOL_TYPE,
+                "name": ANTHROPIC_SEARCH_TOOL_NAME,
+                "max_uses": ANTHROPIC_SEARCH_MAX_USES,
+            }
+        ],
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    f"Search the web for: {query}\n\n"
+                    "Reply with one line per page the search returned: the "
+                    "page title, then its URL. Do not summarise and do not "
+                    "add anything else."
+                ),
+            }
+        ],
+    }
+    response = await client.post(
+        f"{base}/messages",
+        json=payload,
+        headers={
+            "x-api-key": key,
+            "authorization": f"Bearer {key}",
+            "anthropic-version": ANTHROPIC_API_VERSION,
+            "content-type": "application/json",
+        },
+    )
+    try:
+        return response.status_code, response.json()
+    except ValueError:
+        return response.status_code, None
+
+
+def _anthropic_search_results(payload: Any) -> list[dict[str, Any]]:
+    """The pages a ``web_search_tool_result`` block reported.
+
+    Only the provider's own result block counts.  The answer text is model prose
+    and may name pages the search never returned, so it is never parsed for
+    URLs: that is exactly the fabrication this backend exists to replace.
+    """
+
+    if not isinstance(payload, Mapping):
+        return []
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return []
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for block in content:
+        if not isinstance(block, Mapping):
+            continue
+        if block.get("type") != "web_search_tool_result":
+            continue
+        items = block.get("content")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            if item.get("type") != "web_search_result":
+                continue
+            url = str(item.get("url") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            results.append(
+                {
+                    "title": str(item.get("title") or "").strip() or _domain(url),
+                    "url": url,
+                    "snippet": _published_label(item.get("page_age")),
+                }
+            )
+    return results
+
+
+def _anthropic_search_answered_the_query(
+    results: list[dict[str, Any]], queries: list[str]
+) -> bool:
+    """Whether the pages look like an answer, not the engine describing itself.
+
+    One measured failure mode: the same relay answered a Chinese place-name
+    query with its own search documentation -- ``support.google.com``,
+    ``docs.firecrawl.dev``, a Google Hacking tutorial -- and the result set was
+    large enough to look successful.  Handing that to the model is how a turn
+    ends up confident about nothing, so a set whose titles share no term with
+    the query and whose domains are search vendors is reported as no answer and
+    the next deployment is asked instead.
+    """
+
+    if not results:
+        return False
+    haystack = " ".join(
+        str(result.get("title") or "") + " " + str(result.get("url") or "")
+        for result in results
+    ).casefold()
+    for query in queries:
+        for token in _query_tokens(query):
+            if token in haystack:
+                return True
+    # No query term appears anywhere: the engine answered about something else.
+    return False
+
+
+def _query_tokens(query: str) -> list[str]:
+    """The parts of a query a result may reasonably match.
+
+    A CJK query has no spaces, so every two-character window is a term; a Latin
+    one splits on non-word characters.  Single characters are skipped: they
+    match almost any result and would make the check meaningless.
+    """
+
+    text = query.strip().casefold()
+    if not text:
+        return []
+    if any("\u4e00" <= character <= "\u9fff" for character in text):
+        cjk = "".join(
+            character if "\u4e00" <= character <= "\u9fff" else " "
+            for character in text
+        )
+        tokens: list[str] = []
+        for run in cjk.split():
+            tokens.extend(run[index : index + 2] for index in range(len(run) - 1))
+            if len(run) >= 2:
+                tokens.append(run)
+        return [token for token in tokens if len(token) >= 2]
+    return [token for token in re.split(r"[^\w]+", text) if len(token) >= 3]
+
+
 async def _deepseek_search(
     params: Mapping[str, Any], body: Mapping[str, Any], client: Any
 ) -> tuple[Optional[dict[str, Any]], str]:
@@ -1423,6 +1713,29 @@ async def _search(body: Mapping[str, Any], model: str) -> dict[str, Any]:
                     break
                 tried.append(f"{base or '?'}:deepseek:{reason or 'empty'}")
                 continue
+            # A Claude route serves the provider's own server-side search even
+            # when it refuses ``/alpha/search`` -- and this is the only backend
+            # such a route has.  It is asked before the forward because the
+            # forward is a 404 on every Claude relay in this installation.
+            try:
+                served, reason = await _anthropic_search(params, body, client)
+            except Exception as exc:
+                served, reason = None, type(exc).__name__
+            if served is not None and _has_content(served):
+                _trace(
+                    "alpha_search_served",
+                    model=model,
+                    base=base,
+                    backend="anthropic",
+                    queries=len(queries),
+                )
+                _remember_answer_references(served, session)
+                payload = served
+                break
+            if not is_anthropic_search_route(params):
+                tried.append(f"{base or '?'}:anthropic:not-a-claude-route")
+            else:
+                tried.append(f"{base or '?'}:anthropic:{reason or 'empty'}")
             try:
                 state, served = await _alpha_search_forward(params, body, client)
             except Exception as exc:

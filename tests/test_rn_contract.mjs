@@ -27,7 +27,6 @@ try {
   assert.ok(original.includes('export type ProviderAuthKind =\n'
     + '  | "api_key"\n'
     + '  | "openai_login"\n'
-    + '  | "claude_login"\n'
     + '  | "workbuddy_login"\n'
     + '  | "workbuddy_global_login"\n'
     + '  | "our_free_model_login";'));

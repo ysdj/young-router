@@ -44,7 +44,6 @@ SUBSCRIPTION_QUEUE_LIMIT = 32
 
 _SECRET_FIELDS: dict[tuple[str, str], bool] = {
     ("providers_models", "api_key"): True,
-    ("providers_models", "provider_auth_token"): True,
     ("codex", "api_key"): False,
     ("claude", "deployment_token"): False,
     ("claude", "desktop_gateway_api_key"): False,
@@ -65,7 +64,6 @@ _SECRET_FIELDS: dict[tuple[str, str], bool] = {
 _SECRET_READ_LOCK_TIMEOUT_SECONDS = 0.05
 _PLAINTEXT_SECRET_FIELDS = {
     ("providers_models", "api_key"),
-    ("providers_models", "provider_auth_token"),
     ("codex", "api_key"),
     ("claude", "deployment_token"),
     ("claude", "desktop_gateway_api_key"),
@@ -113,11 +111,15 @@ _DOMAIN_ALIASES = {
     "relay_accounts": "relay_accounts",
     "language": "language",
     "logs": "logs",
-    "image-context": "image_context",
-    "image_context": "image_context",
 }
 
 SERVICE_STATES = frozenset({"starting", "running", "unhealthy", "stopped", "unknown"})
+# Domains whose own ``apply`` validates the whole staged draft before it writes
+# anything, so Core's pre-Apply pass would ask the same question twice.  It is a
+# list, not a guess: a domain that stops validating itself must be removed
+# here, and the provider domain's Apply both validates and saves through one
+# render (``config.api.save_config(..., probe=True)``).
+_VALIDATES_ON_APPLY = frozenset({"providers_models"})
 # The operations that go all the way to the managed proxy process.  A cached
 # status read is not one of them: each of these can wait out the whole drain
 # budget while the proxy finishes the turns it already accepted, so none may run
@@ -127,6 +129,29 @@ SERVICE_PROXY_OPERATIONS = frozenset({"start", "start_async", "restart", "reload
 # transitional answer is "starting", so a window that asked for one sees the
 # proxy leave its state immediately instead of after the whole replacement.
 SERVICE_TRANSITION_OPERATIONS = frozenset({"start", "start_async", "restart", "reload"})
+# What the person last asked of the proxy.  It is recorded beside the service
+# state because the two answer different questions: the state says what the
+# child is doing now, the intent says whether this installation is supposed to
+# keep one running at all.  Automatic recovery reads the intent, so it can
+# restart a proxy that died and still never undo 停止服务.
+SERVICE_INTENTS = frozenset({"running", "stopped"})
+# How long an owned proxy may fail its own liveness endpoint before automatic
+# recovery replaces it.  A burst of long turns can make one 0.5 s probe miss
+# while the proxy is still serving them; a listener that answers nothing for
+# this long is not serving anybody.
+SERVICE_RECOVERY_PATIENCE_SECONDS = 90.0
+# The wait after each failed automatic recovery, by attempt number.  A start
+# that keeps failing (no configuration, a port that will never open) must not
+# spin: it retries on this ladder and keeps retrying at the last step, because
+# the repair for those is a person editing something, not a relaunch.
+SERVICE_RECOVERY_RETRY_SECONDS = (15.0, 60.0, 180.0, 300.0)
+
+
+def _service_recovery_delay(failed_attempts: int) -> float:
+    """How long the next automatic recovery attempt waits."""
+
+    index = min(max(int(failed_attempts), 1), len(SERVICE_RECOVERY_RETRY_SECONDS)) - 1
+    return SERVICE_RECOVERY_RETRY_SECONDS[index]
 
 # Import previews identify only settings that have a Core-owned adapter. Logs
 # are a read-only projection and must never become a staged configuration
@@ -155,8 +180,6 @@ def _default_domain_state(name: str) -> dict[str, Any]:
         return {"tabs": list(LOG_TABS), "revision": 0}
     if name == "codex":
         return {"config_exists": False, "auth_file_exists": False, "revision": 0}
-    if name == "image_context":
-        return {"tasks": [], "environment": {}, "revision": 0}
     return {"revision": 0}
 
 
@@ -960,6 +983,10 @@ class CoreStore:
     # A quit must not wait for a full proxy restart: the worker stops whatever
     # it started as soon as it observes the stopping flag.
     _SERVICE_RELOAD_SHUTDOWN_JOIN_SECONDS = 1.0
+    # Nor may it wait out a replacement another lane has already begun.  The
+    # stop below is the last word either way: it ends whatever that lane
+    # started, so waiting longer only postpones the quit.
+    _SERVICE_TRANSITION_SHUTDOWN_WAIT_SECONDS = 5.0
 
     def __init__(
         self,
@@ -987,6 +1014,10 @@ class CoreStore:
         self._drafts: dict[str, dict[str, Any]] = {}
         self._subscribers: dict[str, Callable[[dict[str, Any]], None]] = {}
         self._revision = 0
+        # The last domain projection and the revision it describes: a
+        # window that is catching up asks for a revision it already
+        # heard about several times per commit.  See ``snapshot``.
+        self._snapshot_cache: tuple[int, dict[str, Any]] | None = None
         self._service: dict[str, Any] = {"state": "unknown"}
         # Post-apply proxy restarts take several seconds; they run on their own
         # thread so the committed edit and every later IPC request stay fast.
@@ -1001,6 +1032,24 @@ class CoreStore:
         # Manual lifecycle operations and the background post-apply restart
         # replace the same proxy, so they take turns on one transition guard.
         self._service_transition_guard = threading.Lock()
+        # What the person last asked of the proxy (``SERVICE_INTENTS``), loaded
+        # from the Core record so a replacement Core honours a 停止服务 that was
+        # given to the previous one.
+        self._service_intent = "running"
+        # Automatic recovery's own memory: since when the owned child has been
+        # failing its liveness probe, how many recovery attempts failed in a
+        # row, and when the next one may run.  Guarded by ``self._lock``.
+        self._service_supervision_unhealthy_since: float | None = None
+        self._service_supervision_attempts = 0
+        self._service_supervision_retry_at = 0.0
+        # Set before the proxy is stopped for a quit or a Core replacement, so
+        # no supervision pass can start a replacement behind the stop.
+        self._service_supervision_stopping = False
+        self._service_supervision_guard = threading.Lock()
+        # The recovery loop is created on request, started by the Core entry
+        # point, and stopped with the store -- like the WebDAV and image-context
+        # loops beside it.
+        self._service_supervisor: Any | None = None
         # A proxy operation replaces the proxy, which the drain budget now lets
         # take minutes.  It must therefore not hold ``self._lock`` while it
         # runs: every ``snapshot`` needs that lock, the native hosts cap one
@@ -1019,13 +1068,13 @@ class CoreStore:
         # the same lie in the other direction.
         self._service_start_operations = 0
         self._last_actions: dict[str, dict[str, Any]] = {}
+        # The image-context cache's own day, applied from outside the request
+        # path: the store sweeps on writes, which is what stops when the pass
+        # is off.  Created on request and started by the entry point.
+        self._image_context_sweeper: Any | None = None
         # The WebDAV interval loop is created on request, started by the Core
         # entry point, and stopped with the store.
         self._webdav_scheduler: Any | None = None
-        # The image-context cache's own day, applied from outside the request
-        # path: the store sweeps on writes, which is what stops when the pass
-        # is off.  Also created on request and started by the entry point.
-        self._image_context_sweeper: Any | None = None
         # When a user action last reached this store.  An automatic WebDAV sync
         # holds the store for its whole round trip, so it waits for quiet.
         self._last_activity = time.monotonic()
@@ -1075,7 +1124,6 @@ class CoreStore:
         from .domains.clients import ClientSettingsDomain
         from .domains.codex import CodexSettingsDomain
         from .domains.language import LanguageSettingsDomain
-        from .domains.image_context import ImageContextDomain
         from .domains.logs import LogsDomain
         from .domains.providers_models import ProvidersModelsDomain
         from .domains.relay_accounts import RelayAccountsDomain
@@ -1217,15 +1265,6 @@ class CoreStore:
             adapters.append(clients_factory())
         except Exception:
             adapters.append(RecoverableDomain("clients", clients_factory))
-        # The image-context panel reads this app's own replay cache and writes
-        # one task's selection file; it owns no document a user edits.
-        image_context_factory: Callable[[], DomainAdapter] = lambda: ImageContextDomain()
-        adapter_factories = [image_context_factory]
-        for factory in adapter_factories:
-            try:
-                adapters.append(factory())
-            except Exception:
-                adapters.append(RecoverableDomain("image_context", factory))
         language_factory: Callable[[], DomainAdapter] = lambda: LanguageSettingsDomain(language_path)
         try:
             adapters.append(language_factory())
@@ -1306,6 +1345,13 @@ class CoreStore:
 
         self._stop_webdav_scheduler()
         self._stop_image_context_sweeper()
+        # Nobody may start a proxy behind this stop.  The flag is set before
+        # the loop is joined, so a pass that is between its check and its own
+        # start sees it; a pass already inside the replacement holds the
+        # transition guard, and the stop below waits for exactly that.
+        with self._lock:
+            self._service_supervision_stopping = True
+        self._stop_service_supervisor()
         with self._service_reload_guard:
             self._service_reload_stopping = True
             reload_thread = self._service_reload_thread
@@ -1320,10 +1366,17 @@ class CoreStore:
                 self._service = {"state": "stopped"}
                 self._stop_managed_workers()
                 return dict(self._service)
-            try:
-                result = handler("stop")
-            except Exception as exc:
-                raise CoreError("service_error", safe_exception_message(exc)) from None
+        acquired = self._service_transition_guard.acquire(
+            timeout=self._SERVICE_TRANSITION_SHUTDOWN_WAIT_SECONDS
+        )
+        try:
+            result = handler("stop")
+        except Exception as exc:
+            raise CoreError("service_error", safe_exception_message(exc)) from None
+        finally:
+            if acquired:
+                self._service_transition_guard.release()
+        with self._lock:
             if not isinstance(result, Mapping):
                 raise CoreError("service_error", "LiteLLM service returned invalid status")
             self._set_service_from_result(result, increment=False)
@@ -1365,6 +1418,9 @@ class CoreStore:
         service = payload.get("service")
         if isinstance(service, Mapping) and service.get("state") in SERVICE_STATES:
             self._service = _safe_public(service)
+        intent = payload.get("service_intent")
+        if isinstance(intent, str) and intent in SERVICE_INTENTS:
+            self._service_intent = intent
 
     @property
     def revision(self) -> int:
@@ -1479,6 +1535,7 @@ class CoreStore:
             "version": CORE_METADATA_VERSION,
             "revision": self._revision,
             "service": _safe_public(self._service),
+            "service_intent": self._service_intent,
         }
         if stopped_by is not None:
             document["stopped_by"] = stopped_by
@@ -1487,10 +1544,24 @@ class CoreStore:
         except PersistenceError as exc:
             raise CoreError("state_unavailable", safe_exception_message(exc)) from None
 
-    def _emit(self) -> None:
-        snapshot = self.snapshot()
-        event = make_event("snapshot", snapshot["revision"], snapshot)
+    def _emit(self, snapshot: Mapping[str, Any] | None = None) -> None:
+        """Publish one state event to every subscribed window.
+
+        ``snapshot`` lets a caller that just built the projection hand it over
+        instead of asking for the same projection twice: Apply already answers
+        its caller with one, and rebuilding it under this lock only to serialize
+        it for the fan-out was half of a commit's cost.
+        """
+
+        projected = self.snapshot() if snapshot is None else snapshot
+        event = make_event("snapshot", projected["revision"], projected)
         callbacks = tuple(self._subscribers.values())
+        if not callbacks:
+            return
+        # One serialization, then each subscriber gets its own parse of the
+        # same bytes: a window that mutates its copy must not reach another's,
+        # and a deepcopy of the whole projection was slower than the JSON the
+        # event is about to become anyway.
         for callback in callbacks:
             try:
                 callback(copy.deepcopy(event))
@@ -1520,98 +1591,148 @@ class CoreStore:
         freezes all of them — a provider projection that reached a live worker
         once did exactly that.  A read of external state belongs to a user's
         own action, on its own lane, reporting on its own control.
+
+        A window that is catching up asks for a revision it just heard about,
+        and it asks several times per commit: the debounced Apply takes its own
+        pre-Apply read, the action's response refreshes it again, and the
+        coalesced event fans out a third.  Each of those reprojected ten domain
+        snapshots — every one of which redacts and bounds its own state — under
+        this lock.  That half is a function of the shared revision alone, so it
+        is memoized on it, and every mutation bumps that revision under this
+        same lock before publishing.  The service row and ``disk`` stay live:
+        both move without a revision (a controller's ownership answer, a file
+        that appeared), and a window must see either on its very next read.
         """
 
         with self._lock:
-            # The managed proxy can outlive a replaced Core briefly.  Project
-            # the controller's current ownership/health result into every
-            # snapshot so a persisted transitional state cannot leave the
-            # native menu displaying "Starting" after the service is ready.
-            # This read-only projection deliberately neither persists nor
-            # emits: snapshot callers need the live status without creating a
-            # synthetic Core state transition.
-            reload_thread = self._service_reload_thread
-            planned_restart = reload_thread is not None and reload_thread.is_alive()
-            transitional = self._service.get("state") == "starting"
-            owns_transition = (planned_restart or self._service_proxy_operations > 0) and transitional
-            status_handler = self._service_handlers.get("status")
-            if status_handler is not None:
-                # A planned restart owns the transitional state: the controller
-                # reports stopped/unhealthy -- or nothing at all, while its own
-                # replacement is in flight -- and a cached status must not hide
-                # the planned restart from the menu or the settings panes.
-                #
-                # A start is the exception, and only in one direction: it
-                # never has an earlier proxy to report, so a running answer is
-                # the truth and the window must see it even while the start's
-                # own follow-up work is still under this lock.  Anything else
-                # (the child died, or the listener was taken) leaves the
-                # announcement standing until the operation answers.
-                if not owns_transition or self._service_start_operations > 0:
-                    result = status_handler("status")
-                    if not isinstance(result, Mapping):
-                        raise CoreError("service_error", "LiteLLM service returned invalid status")
-                    if not owns_transition or str(result.get("state")) == "running":
-                        self._set_service_from_result(result, increment=False)
+            # The disk probe runs *before* the memo is consulted, because it is
+            # the one read here that can change a domain: adopting an external
+            # edit reloads the adapter and advances the revision.  Consulting
+            # the memo first answered the pre-reload projection while ``disk``
+            # already described the reload, so a window saw the file's new
+            # generation beside the values that file replaced.
             self._refresh_external_disk_state()
-            # Relay snapshots display reverse dependency counts, while the
-            # provider/model domain remains the sole source of binding truth.
-            # Project only stable IDs and counts across this in-process seam;
-            # no API base or credential is copied into the relay snapshot.
-            relay = self._domains.get("relay_accounts")
-            providers_domain = self._domains.get("providers_models")
-            dependency_summary = getattr(providers_domain, "dependency_summary", None)
-            set_binding_summary = getattr(relay, "set_binding_summary", None)
-            if callable(dependency_summary) and callable(set_binding_summary):
-                try:
-                    summary = dependency_summary()
-                    provider_keys = summary.get("provider_keys", []) if isinstance(summary, Mapping) else []
-                    resources: list[dict[str, Any]] = []
-                    if isinstance(provider_keys, Sequence) and not isinstance(provider_keys, (str, bytes, bytearray)):
-                        for item in provider_keys:
-                            if not isinstance(item, Mapping):
-                                continue
-                            source = item.get("source")
-                            if not isinstance(source, Mapping) or source.get("kind") != "relay":
-                                continue
-                            count = item.get("model_count", 0)
-                            if type(count) is not int or count < 0:
-                                continue
-                            resources.append(
-                                {
-                                    "station_id": source.get("station_id"),
-                                    "account_id": source.get("account_id"),
-                                    "resource_id": source.get("resource_id"),
-                                    "linked_model_count": count,
-                                    "binding_status": "linked" if count else "independent",
-                                }
-                            )
-                    set_binding_summary({"resources": resources})
-                except Exception:
-                    # A reverse-count projection is informational. Domain
-                    # validation during Apply still enforces binding health.
-                    pass
-            domain_states = {name: self._adapter_snapshot(name) for name in self._domains}
-            providers = self._providers_summary(domain_states)
-            webdav = self._webdav_summary(domain_states)
-            logs = self._logs_summary(domain_states)
-            language = self._language_summary(domain_states)
-            return {
-                "protocol_version": PROTOCOL_VERSION,
-                "revision": self._revision,
-                "service": copy.deepcopy(_safe_public(self._service)),
-                "providers_models": providers,
-                "drafts": copy.deepcopy(self._drafts),
-                "disk": copy.deepcopy(self._disk),
-                "webdav": webdav,
-                "logs": logs,
-                "language": language,
-                "action_summaries": copy.deepcopy(self._last_actions),
-                # The typed RN snapshot consumes the named fields above.  The
-                # namespaced map keeps the contract extensible for Codex,
-                # Claude, runtime, and future domains without another reducer.
-                "domains": copy.deepcopy(domain_states),
-            }
+            cached = self._snapshot_cache
+            if cached is None or cached[0] != self._revision:
+                cached = (self._revision, self._project_domains())
+                self._snapshot_cache = cached
+            return self._assemble_snapshot(cached[1])
+
+    def _service_row_is_live(self) -> None:
+        """Project the controller's live answer into this read.
+
+        The managed proxy can outlive a replaced Core briefly.  This is a
+        read-only projection that deliberately neither persists nor emits:
+        snapshot callers need the live status without creating a synthetic Core
+        state transition.  The caller holds ``self._lock``.
+        """
+
+        reload_thread = self._service_reload_thread
+        planned_restart = reload_thread is not None and reload_thread.is_alive()
+        transitional = self._service.get("state") == "starting"
+        owns_transition = (planned_restart or self._service_proxy_operations > 0) and transitional
+        status_handler = self._service_handlers.get("status")
+        if status_handler is None:
+            return
+        # A planned restart owns the transitional state: the controller reports
+        # stopped/unhealthy — or nothing at all, while its own replacement is in
+        # flight — and a cached status must not hide the planned restart from
+        # the menu or the settings panes.
+        #
+        # A start is the exception, and only in one direction: it never has an
+        # earlier proxy to report, so a running answer is the truth and the
+        # window must see it even while the start's own follow-up work is still
+        # under this lock.  Anything else (the child died, or the listener was
+        # taken) leaves the announcement standing until the operation answers.
+        if not owns_transition or self._service_start_operations > 0:
+            result = status_handler("status")
+            if not isinstance(result, Mapping):
+                raise CoreError("service_error", "LiteLLM service returned invalid status")
+            if not owns_transition or str(result.get("state")) == "running":
+                self._set_service_from_result(result, increment=False)
+
+    def _project_domains(self) -> dict[str, Any]:
+        """Every domain projection a snapshot summarizes.
+
+        This is the expensive half, and it is a function of the shared revision
+        alone, which is what makes it memoizable.  The caller holds the lock.
+        """
+
+        # Relay snapshots display reverse dependency counts, while the
+        # provider/model domain remains the sole source of binding truth.
+        # Project only stable IDs and counts across this in-process seam;
+        # no API base or credential is copied into the relay snapshot.
+        relay = self._domains.get("relay_accounts")
+        providers_domain = self._domains.get("providers_models")
+        dependency_summary = getattr(providers_domain, "dependency_summary", None)
+        set_binding_summary = getattr(relay, "set_binding_summary", None)
+        if callable(dependency_summary) and callable(set_binding_summary):
+            try:
+                summary = dependency_summary()
+                provider_keys = summary.get("provider_keys", []) if isinstance(summary, Mapping) else []
+                resources: list[dict[str, Any]] = []
+                if isinstance(provider_keys, Sequence) and not isinstance(provider_keys, (str, bytes, bytearray)):
+                    for item in provider_keys:
+                        if not isinstance(item, Mapping):
+                            continue
+                        source = item.get("source")
+                        if not isinstance(source, Mapping) or source.get("kind") != "relay":
+                            continue
+                        count = item.get("model_count", 0)
+                        if type(count) is not int or count < 0:
+                            continue
+                        resources.append(
+                            {
+                                "station_id": source.get("station_id"),
+                                "account_id": source.get("account_id"),
+                                "resource_id": source.get("resource_id"),
+                                "linked_model_count": count,
+                                "binding_status": "linked" if count else "independent",
+                            }
+                        )
+                set_binding_summary({"resources": resources})
+            except Exception:
+                # A reverse-count projection is informational. Domain
+                # validation during Apply still enforces binding health.
+                pass
+        domain_states = {name: self._adapter_snapshot(name) for name in self._domains}
+        return {
+            "providers_models": self._providers_summary(domain_states),
+            "webdav": self._webdav_summary(domain_states),
+            "logs": self._logs_summary(domain_states),
+            "language": self._language_summary(domain_states),
+            # The typed RN snapshot consumes the named fields above.  The
+            # namespaced map keeps the contract extensible for Codex,
+            # Claude, runtime, and future domains without another reducer.
+            "domains": domain_states,
+        }
+
+    def _assemble_snapshot(self, domains: Mapping[str, Any]) -> dict[str, Any]:
+        """Combine the memoized domain half with the live halves of a snapshot.
+
+        The service row is read on every call because the controller answers it
+        live and a planned restart is not a revision.  ``disk`` is read here for
+        the same reason: the watcher publishes a detected change without a
+        mutation.  Everything copied out belongs to the caller.
+        """
+
+        # ``disk`` and the service row are both live, so they are read here on
+        # every call: the watcher publishes a detected file change, and the
+        # controller answers ownership, without either one being a revision.
+        self._service_row_is_live()
+        return {
+            "protocol_version": PROTOCOL_VERSION,
+            "revision": self._revision,
+            "service": copy.deepcopy(_safe_public(self._service)),
+            "providers_models": copy.deepcopy(domains["providers_models"]),
+            "drafts": copy.deepcopy(self._drafts),
+            "disk": copy.deepcopy(self._disk),
+            "webdav": copy.deepcopy(domains["webdav"]),
+            "logs": copy.deepcopy(domains["logs"]),
+            "language": domains["language"],
+            "action_summaries": copy.deepcopy(self._last_actions),
+            "domains": copy.deepcopy(domains["domains"]),
+        }
 
     def disk_state(self, domains: Sequence[str]) -> dict[str, Any]:
         """Refresh only the external-file markers needed by the settings UI."""
@@ -2715,6 +2836,33 @@ class CoreStore:
         if expected_revision != self._revision:
             raise RevisionConflict(expected_revision, self._revision)
 
+    def _check_revision_before_refresh(self, expected_revision: object | None, revision_before_refresh: int, revision_after_refresh: int | None = None) -> None:
+        """Accept a revision that only this call's own refresh invalidated.
+
+        ``apply`` refreshes external files before it takes the caller's
+        revision, because a clean draft may have to reload the file it applies
+        over.  That reload advances the shared revision, and a caller cannot
+        have seen it: it read a snapshot, made an edit, and asked to commit it.
+        Comparing the caller's number against the *post*-refresh revision
+        rejected exactly that write -- the pane then reported the commit as not
+        applied while the edit was staged correctly, which reads as the app
+        refusing a change for no visible reason.
+
+        The caller's number is therefore compared against the revision this
+        call started from.  A caller that was already behind when it arrived
+        still conflicts, because the refresh changed nothing about its staleness.
+        """
+
+        if expected_revision is None:
+            return
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise CoreError("invalid_revision", "Revision is invalid")
+        current = self._revision if revision_after_refresh is None else revision_after_refresh
+        if expected_revision == revision_before_refresh:
+            return
+        if expected_revision != current:
+            raise RevisionConflict(expected_revision, current)
+
     def _mark_domain(self, name: str, *, dirty: bool | None = None, validation: Mapping[str, Any] | None = None, base_revision: int | None = None) -> None:
         record = self._drafts.setdefault(name, {"dirty": False, "base_revision": self._revision, "validation": {"valid": True, "issues": []}})
         if dirty is not None:
@@ -2872,6 +3020,29 @@ class CoreStore:
         scheduler = self._webdav_scheduler
         if scheduler is not None:
             scheduler.stop()
+
+    # -- proxy supervision -------------------------------------------------
+    def service_supervisor(self) -> Any:
+        """The loop that restores the proxy without a person's click.
+
+        Created on request and started by the Core entry point, exactly like
+        the loops above.  A pass does nothing unless this installation still
+        intends to run a proxy, so an explicit 停止服务 is never undone.
+        """
+
+        if self._service_supervisor is None:
+            from .service_supervisor import ServiceSupervisor
+
+            self._service_supervisor = ServiceSupervisor(supervise=self.supervise_service_once)
+        return self._service_supervisor
+
+    def _stop_service_supervisor(self) -> None:
+        supervisor = self._service_supervisor
+        if supervisor is not None:
+            try:
+                supervisor.stop()
+            except Exception:
+                pass
 
     # -- image-context cleanup --------------------------------------------
     def image_context_sweeper(self) -> Any:
@@ -3556,7 +3727,7 @@ class CoreStore:
         payload = action.get("payload")
         forbidden: set[str] = set()
         if name == "providers_models":
-            forbidden = {"api_key", "api_keys", "provider_auth_token"}
+            forbidden = {"api_key", "api_keys"}
             if normalized in {"provider_clear_key", "clear_provider_key", "set_raw", "setraw"}:
                 raise CoreError("secret_requires_native", "Use the native secure input for this secret field")
         elif name == "codex":
@@ -3627,6 +3798,10 @@ class CoreStore:
             if operation in {"start", "start_async"}:
                 self._service_start_operations += 1
             try:
+                # What the person asked for is recorded before the process is
+                # touched: a stop that lands mid-recovery must still win, and a
+                # start that fails is still a start this installation owes.
+                self._record_service_intent(operation)
                 if operation in SERVICE_TRANSITION_OPERATIONS and self._service.get("state") != "starting":
                     # Publish the transition now so every window sees the proxy
                     # leave its state without waiting for the replacement.  The
@@ -3689,6 +3864,25 @@ class CoreStore:
                 self._service_proxy_operations = max(0, self._service_proxy_operations - 1)
                 if operation in {"start", "start_async"}:
                     self._service_start_operations = max(0, self._service_start_operations - 1)
+
+    def _record_service_intent(self, operation: str) -> None:
+        """Record what the person asked of the proxy, not what it last did.
+
+        The caller holds ``self._lock``.  Only the operations a person can
+        dispatch move the intent; a background reload changes the proxy's
+        document, never whether this installation keeps one running.
+        """
+
+        intent = {
+            "start": "running",
+            "start_async": "running",
+            "restart": "running",
+            "stop": "stopped",
+        }.get(operation)
+        if intent is None or intent == self._service_intent:
+            return
+        self._service_intent = intent
+        self._persist_metadata()
 
     def _publish_service_transition(self) -> None:
         """Publish the proxy leaving its state, without erasing its record.
@@ -4046,6 +4240,152 @@ class CoreStore:
                 increment=False,
             )
             self._emit()
+
+    def supervise_service_once(self) -> bool:
+        """Restore an unwatched proxy instead of leaving 不健康 to a click.
+
+        One pass reads the controller's real status and acts only on a state
+        this Core can own:
+
+        * ``running``/``starting`` are progress, and they reset the patience.
+        * ``unhealthy`` is an owned child that cannot answer its own liveness
+          endpoint.  It keeps ``SERVICE_RECOVERY_PATIENCE_SECONDS`` of
+          continuous failure first, because a burst of long turns can make one
+          0.5 s probe miss while the proxy is still serving them; after that
+          the process is replaced.
+        * ``stopped`` with the intent still ``running`` is a proxy that died,
+          failed to start, or was never launched by a window -- it is started.
+        * ``unknown`` is a listener this installation does not own.  It is
+          never touched.
+
+        No pass runs while an explicit lifecycle operation or the post-apply
+        reload owns the proxy, and none runs after Core began stopping.  The
+        recovery takes the same transition guard an explicit operation does,
+        so a person's stop and this pass can never both win.
+
+        Returns whether this pass touched the proxy.
+        """
+
+        # One pass at a time.  The loop is single-threaded, but a caller may
+        # also ask for one pass directly, and two recoveries must not overlap.
+        if not self._service_supervision_guard.acquire(blocking=False):
+            return False
+        try:
+            return self._supervise_service_once()
+        finally:
+            self._service_supervision_guard.release()
+
+    def _supervise_service_once(self) -> bool:
+        with self._lock:
+            if self._service_supervision_stopping or self._service_intent != "running":
+                self._service_supervision_unhealthy_since = None
+                return False
+            if self._service_proxy_operations > 0:
+                return False
+            reload_thread = self._service_reload_thread
+            if reload_thread is not None and reload_thread.is_alive():
+                return False
+            handlers = dict(self._service_handlers)
+        # A forced read: the settled cache would hide the death this pass is
+        # looking for until it expired.
+        status_handler = handlers.get("health") or handlers.get("status")
+        if status_handler is None:
+            return False
+        try:
+            current = status_handler("health" if handlers.get("health") is not None else "status")
+        except Exception:
+            return False
+        if not isinstance(current, Mapping):
+            return False
+        state = str(current.get("state"))
+        now = time.monotonic()
+        if state in {"running", "starting"}:
+            self._service_supervision_unhealthy_since = None
+            self._service_supervision_attempts = 0
+            self._service_supervision_retry_at = 0.0
+            return False
+        if state == "unhealthy":
+            if self._service_supervision_unhealthy_since is None:
+                self._service_supervision_unhealthy_since = now
+                return False
+            if now - self._service_supervision_unhealthy_since < SERVICE_RECOVERY_PATIENCE_SECONDS:
+                return False
+        elif state != "stopped":
+            # "unknown" is somebody else's listener on the configured port.
+            self._service_supervision_unhealthy_since = None
+            return False
+        if now < self._service_supervision_retry_at:
+            return False
+        operation = "restart" if state == "unhealthy" else "start"
+        handler = handlers.get(operation)
+        if handler is None:
+            return False
+        with self._service_transition_guard:
+            with self._lock:
+                # Re-read the decision under the guard: a stop, a Core shutdown,
+                # or a person's own start may have landed since the probe.
+                if self._service_supervision_stopping or self._service_intent != "running":
+                    return False
+                if self._service_proxy_operations > 0:
+                    return False
+                # Hold the replacement count for this pass exactly as an
+                # explicit operation does: every window must draw 启动中 while
+                # the proxy is being replaced, never the failure it is
+                # replacing.
+                self._service_proxy_operations += 1
+                self._publish_service_transition()
+                self._revision += 1
+                self._persist_metadata()
+                self._emit()
+            try:
+                try:
+                    result = handler(operation)
+                except Exception:
+                    result = None
+                with self._lock:
+                    if isinstance(result, Mapping):
+                        self._set_service_from_result(result, increment=False)
+                    recovered = isinstance(result, Mapping) and str(result.get("state")) == "running"
+                    if recovered:
+                        self._service_supervision_unhealthy_since = None
+                        self._service_supervision_attempts = 0
+                        self._service_supervision_retry_at = 0.0
+                        # A recovery that replaced the process satisfies a runtime
+                        # setting that was still owed a replacement, and it is where
+                        # a client that points at this proxy follows a port change.
+                        self._service_reload_replace_process = False
+                        self._follow_codex_local_api()
+                        self._sync_codex_image_context_mcp(["codex"])
+                    else:
+                        self._service_supervision_attempts += 1
+                        self._service_supervision_retry_at = now + _service_recovery_delay(
+                            self._service_supervision_attempts
+                        )
+                        if self._service_supervision_unhealthy_since is not None:
+                            # The wedged child was replaced but its replacement is not
+                            # healthy yet; afford it its own patience rather than
+                            # restarting it on the very next pass.
+                            self._service_supervision_unhealthy_since = now
+            finally:
+                with self._lock:
+                    self._service_proxy_operations = max(0, self._service_proxy_operations - 1)
+                if self._service_supervision_stopping:
+                    # A quit landed while this pass was replacing the proxy, and
+                    # its own stop may have run before this child existed.  End
+                    # it here rather than leave an orphan holding the port.  The
+                    # stop is idempotent: one that already ran finds no owner.
+                    stopper = handlers.get("stop")
+                    if stopper is not None:
+                        try:
+                            stopper("stop")
+                        except Exception:
+                            pass
+        with self._lock:
+            # ``snapshot`` re-reads the controller once no replacement is in
+            # flight, so a failed pass publishes the real state instead of
+            # leaving the 启动中 it had to claim while it tried.
+            self._emit()
+        return True
 
     def _stop_service_after_reload_shutdown(self) -> None:
         stopper = self._shutdown_handler
@@ -4639,7 +4979,8 @@ class CoreStore:
                 "issues": self._relay_apply_issues(1),
             }
 
-        self._emit()
+        snapshot = self.snapshot()
+        self._emit(snapshot)
         return {
             "revision": self._revision,
             "applied": True,
@@ -4659,11 +5000,16 @@ class CoreStore:
         confirmation: str | Sequence[str] | None = None,
     ) -> dict[str, Any]:
         with self._lock:
-            # Refresh before accepting the caller revision or taking rollback
-            # snapshots. A clean draft may reload here and advance revision;
-            # a dirty draft records a conflict without touching the file.
+            # The caller's revision names the projection it read its edit from.
+            # A refresh *inside* this Apply can advance the shared revision by
+            # adopting a clean draft whose file changed since that read, and
+            # that bump is not something the caller did or could see.  Compare
+            # against the revision this Apply started from: a caller that was
+            # already stale when it arrived still conflicts, while one whose
+            # only mismatch is the reload this call just performed does not.
+            revision_before_refresh = self._revision
             self._refresh_external_disk_state()
-            self._check_revision(revision)
+            self._check_revision_before_refresh(revision, revision_before_refresh)
             if domain is not None and domains is not None:
                 raise CoreError("invalid_domain", "Choose either one domain or a domain list")
             if domains is not None:
@@ -4821,7 +5167,15 @@ class CoreStore:
                 # Validation is complete before any persistence boundary is
                 # crossed, so a bad later section cannot partially apply an
                 # earlier one.
+                #
+                # A domain that also validates its own draft while applying is
+                # not validated twice: it answers for the same staged draft,
+                # and its Apply re-checks it before it writes anything either
+                # way.  ``_validates_on_apply`` names those domains, so a new
+                # one cannot skip this pass by accident.
                 for name in names:
+                    if name in _VALIDATES_ON_APPLY:
+                        continue
                     if not self.validate(name)["valid"]:
                         raise CoreError("validation_failed", "Fix the validation errors")
                 for name in names:
@@ -4935,24 +5289,6 @@ class CoreStore:
             validation={"valid": True, "issues": []},
             base_revision=self._revision + 1,
         )
-
-    def image_context_image(self, task: str, image_id: str, thumb: bool = False) -> dict[str, Any]:
-        """One stored image of one task, for the panel's preview.
-
-        Read straight from the domain rather than through a snapshot: a snapshot
-        redacts and bounds every string it exposes, and a picture is neither.
-        """
-
-        adapter = self._domains.get("image_context")
-        read = getattr(adapter, "image", None)
-        if not callable(read):
-            raise CoreError("invalid_image", "The requested image is unavailable")
-        try:
-            return read(task, image_id, thumb=thumb) if thumb else read(task, image_id)
-        except CoreError:
-            raise
-        except Exception:
-            raise CoreError("invalid_image", "The requested image is unavailable") from None
 
     def reload(self, domain: str | None = None, *, revision: int | None = None) -> dict[str, Any]:
         with self._lock:
@@ -5442,7 +5778,10 @@ __all__ = [
     "PACKAGE_FORMAT",
     "PACKAGE_VERSION",
     "RevisionConflict",
+    "SERVICE_INTENTS",
     "SERVICE_PROXY_OPERATIONS",
+    "SERVICE_RECOVERY_PATIENCE_SECONDS",
+    "SERVICE_RECOVERY_RETRY_SECONDS",
     "SERVICE_STATES",
     "SERVICE_TRANSITION_OPERATIONS",
 ]

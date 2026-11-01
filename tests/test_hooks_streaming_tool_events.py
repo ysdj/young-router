@@ -2368,3 +2368,80 @@ class HookStreamingToolEventTests(HookTestCase):
         self.assertEqual(chunks[1]["item"]["name"], "view_image")
         self.assertEqual(chunks[-1]["type"], "response.completed")
         self.assertEqual(chunks[-1]["response"]["output"][0]["name"], "view_image")
+
+    def test_queued_reasoning_item_announces_its_summary_part(self) -> None:
+        """A thinking route's item must state the summary array a client fills.
+
+        LiteLLM's Chat-to-Responses iterator builds a reasoning item from a
+        delta that carries only ``reasoning_content``: the ``output_item.added``
+        frame it queues states ``id``/``type``/``status`` and no ``summary``, and
+        the ``reasoning_summary_part.added`` frame that opens summary index 0 is
+        never queued at all.  The Codex desktop app renders a summary delta only
+        into an item that announced that array, so a route that streamed its
+        thinking lost it from the thinking block -- MiniMax answered with its
+        thinking under the answer, while DeepSeek happened to survive.  The
+        frames are restated here so every thinking route reaches the client in
+        the shape this proxy's own chat bridge already produces.
+        """
+
+        hooks, _ = load_hook_module()
+        responses_module = types.ModuleType("litellm.responses")
+        bridge_module = types.ModuleType(
+            "litellm.responses.litellm_completion_transformation"
+        )
+        streaming_module = types.ModuleType(
+            "litellm.responses.litellm_completion_transformation.streaming_iterator"
+        )
+
+        class QueuedItem:
+            def __init__(self, payload):
+                self.__dict__.update(payload)
+
+            def get(self, key, default=None):
+                return self.__dict__.get(key, default)
+
+        class LiteLLMCompletionStreamingIterator:
+            def _ensure_output_item_for_chunk(self, chunk):
+                self.sent_output_item_added_event = True
+                # Exactly what the stock iterator queues for a thinking delta:
+                # no ``summary`` key on the item, and no part frame beside it.
+                self._pending_response_events.append(
+                    QueuedItem(
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": 0,
+                            "item": QueuedItem(
+                                {
+                                    "id": "rs_think",
+                                    "type": "reasoning",
+                                    "status": "in_progress",
+                                }
+                            ),
+                        }
+                    )
+                )
+
+        LiteLLMCompletionStreamingIterator.__init__ = lambda self: setattr(
+            self, "_pending_response_events", []
+        )
+        streaming_module.LiteLLMCompletionStreamingIterator = LiteLLMCompletionStreamingIterator
+        sys.modules["litellm.responses"] = responses_module
+        sys.modules["litellm.responses.litellm_completion_transformation"] = bridge_module
+        sys.modules[
+            "litellm.responses.litellm_completion_transformation.streaming_iterator"
+        ] = streaming_module
+
+        hooks._install_responses_completion_stream_patch()
+        iterator = LiteLLMCompletionStreamingIterator()
+        iterator._ensure_output_item_for_chunk(
+            {"choices": [{"delta": {"reasoning_content": "thinking"}}]}
+        )
+
+        pending = iterator._pending_response_events
+        item = pending[0].get("item")
+        self.assertEqual(item.get("summary"), [])
+        part = pending[1]
+        self.assertEqual(part.get("type"), "response.reasoning_summary_part.added")
+        self.assertEqual(part.get("item_id"), "rs_think")
+        self.assertEqual(part.get("output_index"), 0)
+        self.assertEqual(part.get("summary_index"), 0)

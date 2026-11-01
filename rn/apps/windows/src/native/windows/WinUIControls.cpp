@@ -116,28 +116,9 @@ struct CodeWebViewComponentView
     try {
       island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
       webview_ = WebView2{};
-      // The island this browser lives in does not always report the window DPI
-      // when it is first arranged, and the WebView then draws its logical page
-      // straight into the physical client: at 200% the editor filled exactly the
-      // top-left quarter.  The element's own rasterization scale is what decides
-      // that, so set it to the ratio between the window and the island once,
-      // here, where both values are known.
-      try {
-        double island_scale = 1.0;
-        try {
-          island_scale = island_.ContentIsland().RasterizationScale();
-        } catch (...) {
-          island_scale = 1.0;
-        }
-        if (!(island_scale > 0.0)) island_scale = 1.0;
-        const auto dpi = GetDpiForSystem();
-        const double window_scale = static_cast<double>(dpi == 0 ? USER_DEFAULT_SCREEN_DPI : dpi) / USER_DEFAULT_SCREEN_DPI;
-        const double element_scale = window_scale / island_scale;
-        if (element_scale > 0.0 && std::abs(element_scale - 1.0) > 0.01) {
-          webview_.RasterizationScale(element_scale);
-        }
-      } catch (...) {
-      }
+      // The XamlIsland is attached to RNW's ChildSiteLink, which supplies the
+      // monitor scale after connection. Let WebView2 track that scale itself;
+      // overriding it from GetDpiForSystem double-scales this child surface.
       auto weak = get_weak();
       navigation_completed_token_ = webview_.NavigationCompleted(
           [weak](auto const&, auto const& args) {
@@ -149,23 +130,35 @@ struct CodeWebViewComponentView
           });
       island_.Content(webview_);
       island_view.Connect(island_.ContentIsland());
-      // A XamlIsland created in this process starts at a rasterization scale of
-      // 1.0 and only adopts the host window's DPI with its first arrange pass.
-      // EnsureCoreWebView2Async builds the browser site against the island as
-      // it is right now, so starting it immediately drew the whole page at 1x
-      // into a client measured in physical pixels: on a 200% monitor the
-      // editor filled exactly the top-left quarter.  The island's content
-      // never changes from here on -- only the moment the browser backend is
-      // allowed to come up moves.
+      ScaleChildSiteLink(island_view, island_view.LayoutMetrics());
+      auto child_link_weak = get_weak();
+      child_layout_metrics_token_ = island_view.LayoutMetricsChanged(
+          [child_link_weak](auto const& sender, auto const& args) {
+            if (auto current = child_link_weak.get(); current && !current->disposed_) {
+              current->ScaleChildSiteLink(
+                  sender.as<ContentIslandComponentView>(), args.NewLayoutMetrics());
+            }
+          });
       StartBrowserWhenScaled(island_view);
     } catch (...) {
       EmitEditorError("initialize_failed");
     }
   }
 
-  // Poll the island scale across a few dispatcher turns; it leaves 1.0 when
-  // the site adopted the window DPI.  After a bounded wait it starts anyway:
-  // a 1x browser still renders a usable editor, a missing one renders none.
+  // Fabric layout is in DIPs, but RNW forwards this child-site size without
+  // applying PointScaleFactor; the linked XAML island needs the physical size.
+  void ScaleChildSiteLink(
+      ContentIslandComponentView const& island_view,
+      winrt::Microsoft::ReactNative::LayoutMetrics const& metrics) noexcept {
+    try {
+      auto link = island_view.ChildSiteLink();
+      if (!link) return;
+      const auto scale = std::max(1.0f, metrics.PointScaleFactor);
+      link.ActualSize({metrics.Frame.Width * scale, metrics.Frame.Height * scale});
+    } catch (...) {
+    }
+  }
+
   void StartBrowserWhenScaled(ContentIslandComponentView const& island_view) noexcept {
     auto queue = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread();
     if (!queue) {
@@ -215,7 +208,13 @@ struct CodeWebViewComponentView
 
   void PrepareForRecycle(
       winrt::Microsoft::ReactNative::ComponentView const& view) noexcept {
-    if (disposed_) return;
+    if (child_layout_metrics_token_.value != 0) {
+      try {
+        view.LayoutMetricsChanged(child_layout_metrics_token_);
+      } catch (...) {
+      }
+      child_layout_metrics_token_ = {};
+    }
     disposed_ = true;
     ReleaseWebView();
     std::deque<std::string>{}.swap(emitted_editor_texts_);
@@ -245,43 +244,41 @@ struct CodeWebViewComponentView
   }
 
   void InitializeBrowser() noexcept {
-    auto weak = get_weak();
-    // Hold this component across every await: the browser backend takes long
-    // enough that React can release its only reference while it is still
-    // starting, and the coroutine then resumed on a destroyed object -- the
-    // editor stayed permanently blank with no error the surface could show.
-    auto strong = get_strong();
-    [weak, strong]() -> winrt::fire_and_forget {
-      auto self = weak.get();
-      if (!self || self->disposed_) co_return;
-      try {
-        const auto data_folder = CodeEditorWebViewDataFolder();
-        if (data_folder.empty()) throw winrt::hresult_error(E_FAIL);
-        web::CoreWebView2EnvironmentOptions environment_options;
-        auto environment = co_await web::CoreWebView2Environment::CreateWithOptionsAsync(
-            winrt::hstring{}, winrt::hstring(data_folder), environment_options);
-        self = weak.get();
-        if (!self || self->disposed_ || !self->webview_) co_return;
-        auto controller_options = environment.CreateCoreWebView2ControllerOptions();
-        co_await self->webview_.EnsureCoreWebView2Async(environment, controller_options);
-        self = weak.get();
-        if (!self || self->disposed_ || !self->webview_) co_return;
-        self->core_ = self->webview_.CoreWebView2();
-        self->web_message_token_ = self->core_.WebMessageReceived(
-            [weak](auto const&, auto const& args) {
-              if (auto current = weak.get()) current->HandleWebMessage(args);
-            });
-        self->browser_ready_ = true;
-        // The props may have arrived while the backend was still starting; that
-        // pass could not navigate. Re-apply them now that a page can load.
-        self->ApplyProps(nullptr);
-        self->NavigateToCurrentHtml();
-      } catch (...) {
-        if (auto current = weak.get(); current && !current->disposed_) {
-          current->EmitEditorError("webview_initialization_failed");
-        }
+    InitializeBrowserAsync(get_strong());
+  }
+
+  // Coroutine parameters live in the coroutine frame; captures on an immediately
+  // invoked coroutine lambda do not keep its temporary closure alive at co_await.
+  static winrt::fire_and_forget InitializeBrowserAsync(
+      winrt::com_ptr<CodeWebViewComponentView> self) {
+    if (!self || self->disposed_) co_return;
+    try {
+      const auto data_folder = CodeEditorWebViewDataFolder();
+      if (data_folder.empty()) throw winrt::hresult_error(E_FAIL);
+      web::CoreWebView2EnvironmentOptions environment_options;
+      auto environment = co_await web::CoreWebView2Environment::CreateWithOptionsAsync(
+          winrt::hstring{}, winrt::hstring(data_folder), environment_options);
+      if (self->disposed_ || !self->webview_) co_return;
+      auto controller_options = environment.CreateCoreWebView2ControllerOptions();
+      co_await self->webview_.EnsureCoreWebView2Async(environment, controller_options);
+      if (self->disposed_ || !self->webview_) co_return;
+      self->core_ = self->webview_.CoreWebView2();
+      const auto island_scale = self->island_.ContentIsland().RasterizationScale();
+      if (island_scale > 0.0) self->webview_.RasterizationScale(island_scale);
+      auto weak = self->get_weak();
+      self->web_message_token_ = self->core_.WebMessageReceived(
+          [weak](auto const&, auto const& args) {
+            if (auto current = weak.get()) current->HandleWebMessage(args);
+          });
+      self->browser_ready_ = true;
+      // The props may have arrived while the backend was still starting; that
+      // pass could not navigate. Re-apply them now that a page can load.
+      self->ApplyProps(nullptr);
+    } catch (...) {
+      if (!self->disposed_) {
+        self->EmitEditorError("webview_initialization_failed");
       }
-    }();
+    }
   }
 
   void ApplyProps(
@@ -383,45 +380,47 @@ struct CodeWebViewComponentView
   }
 
   void InsertClipboardText() noexcept {
-    auto weak = get_weak();
-    [weak]() -> winrt::fire_and_forget {
-      auto self = weak.get();
-      if (!self || self->disposed_) co_return;
-      try {
-        auto content = winrt::Windows::ApplicationModel::DataTransfer::Clipboard::GetContent();
-        if (!content.Contains(winrt::Windows::ApplicationModel::DataTransfer::StandardDataFormats::Text())) co_return;
-        auto clipboard_text = co_await content.GetTextAsync();
-        auto current = weak.get();
-        if (!current || current->disposed_) co_return;
-        std::wstring value = clipboard_text.c_str();
-        // Keep the injected payload bounded; the editor document itself is
-        // capped at 2 MiB in the shared UI.
-        constexpr size_t maximum_length = 262144;
-        if (value.size() > maximum_length) value.resize(maximum_length);
-        auto payload = winrt::Windows::Data::Json::JsonObject{};
-        payload.Insert(L"type", winrt::Windows::Data::Json::JsonValue::CreateStringValue(L"insertText"));
-        payload.Insert(L"text", winrt::Windows::Data::Json::JsonValue::CreateStringValue(winrt::hstring{value}));
-        auto script = winrt::hstring(L"window.LiteLLMCodeEditor && window.LiteLLMCodeEditor.receive(") +
-            payload.Stringify() + L");";
-        current->ExecuteEditorScript(std::move(script));
-      } catch (...) {
-      }
-    }();
+    InsertClipboardTextAsync(get_strong());
+  }
+
+  static winrt::fire_and_forget InsertClipboardTextAsync(
+      winrt::com_ptr<CodeWebViewComponentView> self) {
+    if (!self || self->disposed_) co_return;
+    try {
+      auto content = winrt::Windows::ApplicationModel::DataTransfer::Clipboard::GetContent();
+      if (!content.Contains(winrt::Windows::ApplicationModel::DataTransfer::StandardDataFormats::Text())) co_return;
+      auto clipboard_text = co_await content.GetTextAsync();
+      if (self->disposed_) co_return;
+      std::wstring value = clipboard_text.c_str();
+      // Keep the injected payload bounded; the editor document itself is
+      // capped at 2 MiB in the shared UI.
+      constexpr size_t maximum_length = 262144;
+      if (value.size() > maximum_length) value.resize(maximum_length);
+      auto payload = winrt::Windows::Data::Json::JsonObject{};
+      payload.Insert(L"type", winrt::Windows::Data::Json::JsonValue::CreateStringValue(L"insertText"));
+      payload.Insert(L"text", winrt::Windows::Data::Json::JsonValue::CreateStringValue(winrt::hstring{value}));
+      auto script = winrt::hstring(L"window.LiteLLMCodeEditor && window.LiteLLMCodeEditor.receive(") +
+          payload.Stringify() + L");";
+      self->ExecuteEditorScript(std::move(script));
+    } catch (...) {
+    }
   }
 
   void ExecuteEditorScript(winrt::hstring script) noexcept {
-    auto weak = get_weak();
-    [weak, script = std::move(script)]() -> winrt::fire_and_forget {
-      auto self = weak.get();
-      if (!self || self->disposed_ || !self->webview_) co_return;
-      try {
-        co_await self->webview_.ExecuteScriptAsync(script);
-      } catch (...) {
-        if (auto current = weak.get(); current && !current->disposed_) {
-          current->EmitEditorError("javascript_evaluation_failed");
-        }
+    ExecuteEditorScriptAsync(get_strong(), std::move(script));
+  }
+
+  static winrt::fire_and_forget ExecuteEditorScriptAsync(
+      winrt::com_ptr<CodeWebViewComponentView> self,
+      winrt::hstring script) {
+    if (!self || self->disposed_ || !self->webview_) co_return;
+    try {
+      co_await self->webview_.ExecuteScriptAsync(script);
+    } catch (...) {
+      if (!self->disposed_) {
+        self->EmitEditorError("javascript_evaluation_failed");
       }
-    }();
+    }
   }
 
   void HandleWebMessage(
@@ -536,6 +535,7 @@ struct CodeWebViewComponentView
   winrt::Microsoft::Web::WebView2::Core::CoreWebView2 core_{nullptr};
   winrt::event_token web_message_token_{};
   winrt::event_token navigation_completed_token_{};
+  winrt::event_token child_layout_metrics_token_{};
 };
 
 void RegisterCodeWebViewRecycleHandler(

@@ -68,6 +68,16 @@ try {
   & uv run --no-project --python 3.12 $NodeRuntimeUpdater `
     --output $NodeRuntime
   if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled Node.js runtime." }
+  # Bun is the one runtime the staged Our Free Model package cannot be without:
+  # its official OpenCode lane runs every request through a Bun child and
+  # refuses the roster outright when it finds no such executable.  A host that
+  # installed Bun itself is not enough -- the app is launched outside a login
+  # shell -- so the build stages it beside Node, where the adapter resolves it.
+  # It stages into the Node tree because both land in Core/runtime/bin.
+  $BunRuntimeUpdater = Join-Path $ProjectRoot "scripts\update_bun_runtime.py"
+  & uv run --no-project --python 3.12 $BunRuntimeUpdater `
+    --output $NodeRuntime
+  if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled Bun runtime." }
   # The authenticity deep test runs the latest upstream Veridrop, so every
   # artifact build re-checks its default branch instead of packaging a stale
   # copy of the scan program.
@@ -209,6 +219,9 @@ try {
     --python (Join-Path $RuntimeBin "python.exe") 2>&1
   if ($LASTEXITCODE -ne 0) { throw "Could not complete the bundled Veridrop dependencies: $VeridropDeps" }
   Copy-Item -LiteralPath (Join-Path $NodeRuntime "node.exe") -Destination $RuntimeBin -Force
+  Copy-Item -LiteralPath (Join-Path $NodeRuntime "bun.exe") -Destination $RuntimeBin -Force
+  Copy-Item -LiteralPath (Join-Path $NodeRuntime "BUN_VERSION") -Destination $RuntimeBin -Force
+  Copy-Item -LiteralPath (Join-Path $NodeRuntime "BUN_LICENSE") -Destination $RuntimeBin -Force
   $GeneratedScripts = Join-Path $RuntimeBin "Scripts"
   if (Test-Path $GeneratedScripts) {
     Remove-Item -LiteralPath $GeneratedScripts -Recurse -Force
@@ -422,6 +435,9 @@ print('young-router-veridrop-import-ok')
   }
   if (-not (Test-Path (Join-Path $BundledBin "node.exe"))) {
     throw "The Windows build output does not contain Core/runtime/bin/node.exe."
+  }
+  if (-not (Test-Path (Join-Path $BundledBin "bun.exe"))) {
+    throw "The Windows build output does not contain Core/runtime/bin/bun.exe, so the Our Free Model lane cannot run."
   }
   if (-not (Test-Path $BundledVersion) -or (Get-Content -Raw $BundledVersion).Trim() -ne $LiteLLMVersion) {
     throw "The Windows build output does not contain the pinned LiteLLM release lock."

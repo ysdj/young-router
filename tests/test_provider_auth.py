@@ -1,119 +1,55 @@
 from __future__ import annotations
 
-import stat
 import threading
 from pathlib import Path
 import tempfile
 import time
 import unittest
 from unittest.mock import patch
-from urllib.parse import parse_qs, urlparse
-from urllib.request import urlopen
-
 from young_router.core.persistence import atomic_write_json
-from young_router.core.provider_auth import ProviderAuthManager, credential_env_name
+from young_router.core.provider_auth import ProviderAuthManager
 
 
 class ProviderAuthManagerTests(unittest.TestCase):
-    def test_claude_browser_oauth_does_not_require_cli(self) -> None:
-        token = "sk-ant-oat" + "browser-login-" + "a" * 20
+    def test_a_claude_login_is_not_a_login_this_build_runs(self) -> None:
+        """Claude's own OAuth is gone, and its absence is the whole contract.
+
+        The manager used to own a second browser OAuth flow: a loopback
+        callback server, a PKCE exchange, a token file, and an environment
+        variable per profile.  A sign-in this build can no longer complete must
+        not be startable at all — a `start` that half-ran would leave a
+        provider waiting on a challenge nobody can answer.
+        """
+
         with tempfile.TemporaryDirectory() as directory:
             manager = ProviderAuthManager(Path(directory))
-            ref = "claude-browser-profile"
-            exchange: dict[str, str] = {}
+            with self.assertRaises(ValueError):
+                manager.start("claude_login", "claude-profile")
+            self.assertFalse(hasattr(manager, "import_claude_token"))
+            self.assertFalse(hasattr(manager, "token"))
+            # Nothing was staged for a flow that refused to start.
+            self.assertFalse(
+                (Path(directory) / ".litellm-runtime" / "provider-auth" / "claude-profile.json").exists()
+            )
 
-            def fake_exchange(*, code: str, code_verifier: str, state: str, redirect_uri: str):
-                exchange.update(
-                    code=code,
-                    code_verifier=code_verifier,
-                    state=state,
-                    redirect_uri=redirect_uri,
-                )
-                return {
-                    "access_token": token,
-                    "refresh_token": "synthetic-refresh-token",
-                    "expires_in": 3_600,
-                    "refresh_token_expires_in": 7_200,
-                    "scope": "user:profile user:inference",
-                }
+    def test_the_environment_carries_only_the_openai_session(self) -> None:
+        """One login kind publishes an environment; nothing else may.
 
-            with patch.object(manager, "_exchange_claude_code", side_effect=fake_exchange):
-                manager.start("claude_login", ref)
-                deadline = time.monotonic() + 3
-                challenge: dict[str, object] = {}
-                while time.monotonic() < deadline:
-                    challenge = manager.status("claude_login", ref)
-                    if challenge.get("verification_uri"):
-                        break
-                    time.sleep(0.01)
-                self.assertEqual("authorizing", challenge.get("status"))
-                verification_uri = str(challenge["verification_uri"])
-                redirect_uri = str(challenge["redirect_uri"])
-                authorization = urlparse(verification_uri)
-                self.assertEqual("claude.com", authorization.hostname)
-                self.assertEqual("/cai/oauth/authorize", authorization.path)
-                params = parse_qs(authorization.query)
-                self.assertEqual([redirect_uri], params["redirect_uri"])
-                self.assertEqual(["S256"], params["code_challenge_method"])
-                self.assertIn("user:inference", params["scope"][0])
-                state = params["state"][0]
+        The extra variables were one per Claude profile, read back out of the
+        credential directory.  With that flow gone, anything left in the
+        directory is not this app's credential to publish.
+        """
 
-                with urlopen(f"{redirect_uri}?code=synthetic-code&state={state}", timeout=2) as response:
-                    self.assertEqual(200, response.status)
-                deadline = time.monotonic() + 3
-                while time.monotonic() < deadline and manager.status("claude_login", ref)["status"] == "authorizing":
-                    time.sleep(0.01)
-
-            self.assertEqual("signed_in", manager.status("claude_login", ref)["status"])
-            self.assertEqual(token, manager.environment()[credential_env_name(ref)])
-            self.assertEqual("synthetic-code", exchange["code"])
-            self.assertEqual(redirect_uri, exchange["redirect_uri"])
-
-    def test_claude_browser_oauth_rejects_wrong_callback_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = ProviderAuthManager(Path(directory))
-            ref = "claude-state-profile"
-            manager.start("claude_login", ref)
-            deadline = time.monotonic() + 3
-            challenge: dict[str, object] = {}
-            while time.monotonic() < deadline:
-                challenge = manager.status("claude_login", ref)
-                if challenge.get("redirect_uri"):
-                    break
-                time.sleep(0.01)
-            redirect_uri = str(challenge["redirect_uri"])
-            with self.assertRaises(Exception):
-                urlopen(f"{redirect_uri}?code=synthetic-code&state=wrong", timeout=2)
-            self.assertEqual("authorizing", manager.status("claude_login", ref)["status"])
-            manager.cancel(ref)
-            deadline = time.monotonic() + 3
-            while time.monotonic() < deadline:
-                worker = manager._threads.get(ref)
-                if worker is None or not worker.is_alive():
-                    break
-                time.sleep(0.01)
-            self.assertEqual("signed_out", manager.status("claude_login", ref)["status"])
-
-    def test_claude_token_is_private_and_not_projected(self) -> None:
-        token = "sk-ant-oat" + "synthetic-token-" + "a" * 16
-        with tempfile.TemporaryDirectory() as directory:
-            manager = ProviderAuthManager(Path(directory))
-            ref = "claude-profile"
-            result = manager.import_claude_token(ref, token)
-            self.assertEqual("signed_in", result["status"])
-            self.assertEqual("signed_in", manager.status("claude_login", ref)["status"])
-            self.assertEqual(token, manager.environment()[credential_env_name(ref)])
-
-            credential_file = Path(directory) / ".litellm-runtime" / "provider-auth" / f"{ref}.json"
-            self.assertEqual(0o600, stat.S_IMODE(credential_file.stat().st_mode))
-            self.assertNotIn(token, str(manager.status("claude_login", ref)))
-
-            with self.assertRaises(ValueError):
-                manager.import_claude_token(ref, "sk-ant-oat")
-            with self.assertRaises(ValueError):
-                manager.import_claude_token(ref, "sk-ant-oat" + "short")
-            with self.assertRaises(ValueError):
-                manager.import_claude_token(ref, token + "!")
+            leftover = manager.root / "leftover-profile.json"
+            leftover.write_text('{"kind": "claude_login", "token": "sk-ant-oat' + "a" * 24 + '"}', encoding="utf-8")
+            environment = manager.environment()
+            self.assertEqual(
+                {"CHATGPT_TOKEN_DIR", "CHATGPT_AUTH_FILE"},
+                set(environment),
+            )
+            self.assertNotIn("YOUNG_ROUTER_AUTH_", " ".join(environment))
 
     def test_chatgpt_accounts_are_independent_and_activation_selects_runtime_slot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

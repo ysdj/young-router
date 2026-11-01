@@ -46,6 +46,20 @@ import { normalizeChatCompletionStreamLine } from './workbuddy_stream.mjs'
 
 const REQUEST_BODY_LIMIT = 64 * 1024 * 1024
 
+/** How often a running worker re-reads its parent's identity.
+ *
+ * The Core is this worker's parent, and nothing signals a child when its
+ * parent is killed: the child is reparented and keeps its listener.  Seventeen
+ * such workers survived one install path on this app, each holding its own
+ * gateway and control ports for hours.  ``process.ppid`` is read fresh on
+ * every tick because it answers from the live parent record -- a single read
+ * at startup reports the original pid long after reparenting, so the first
+ * value is the baseline and any other value is the orphan case.  The drain
+ * below is what a graceful stop owns; this path is for a Core that is already
+ * gone and therefore has nothing left to drain for.
+ */
+const ORPHAN_POLL_MS = 2000
+
 function parseArguments(argv) {
   const options = { port: 0, token: '', root: '', entry: '' }
   for (let index = 0; index < argv.length; index += 1) {
@@ -691,6 +705,16 @@ async function main() {
   const shutdown = () => beginShutdown()
   process.on('SIGTERM', shutdown)
   process.on('SIGINT', shutdown)
+  const parent = process.ppid
+  const orphanWatch = setInterval(() => {
+    if (process.ppid === parent) return
+    clearInterval(orphanWatch)
+    // Not ``beginShutdown``: its drain waits on responses whose sockets died
+    // with the Core's proxy, so an orphan has nothing to finish and would
+    // spend the whole bound holding its ports.
+    finishShutdown()
+  }, ORPHAN_POLL_MS)
+  orphanWatch.unref?.()
   await new Promise(() => {})
   return 0
 }

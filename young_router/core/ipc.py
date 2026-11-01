@@ -187,6 +187,12 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
 
     server_version = "YoungRouterCore/1"
     sys_version = ""
+    # Every settings control is one loopback round trip, and a control a user
+    # drags or types into issues several.  HTTP/1.0 closes the socket after each
+    # answer, so each of those paid a fresh TCP handshake on the same machine;
+    # keeping the connection open lets the host reuse it for the next request.
+    # The protocol is still one request per response, framed by Content-Length.
+    protocol_version = "HTTP/1.1"
 
     @property
     def _owner(self) -> "CoreIPCServer":
@@ -206,6 +212,8 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         return token if len(token.encode("utf-8")) <= 512 else ""
 
     def _read_body(self) -> bytes:
+        # The body belongs to this request, whether or not it is used: a route
+        # that reads it marks it consumed so the reply does not drain it twice.
         raw_length = self.headers.get("Content-Length", "")
         try:
             length = int(raw_length)
@@ -214,12 +222,65 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         if length < 0 or length > MAX_MESSAGE_BYTES:
             raise ProtocolError("message_too_large", "IPC message exceeds the size limit")
         body = self.rfile.read(length)
+        self._body_consumed = True
         if len(body) != length:
             raise ProtocolError("invalid_message", "IPC request body is incomplete")
         return body
 
+    def _consume_unread_body(self) -> None:
+        """Consume a request body this handler never read, before answering.
+
+        A keep-alive connection hands the next request to this handler on the
+        same socket, so an unread body is not discarded by the stdlib: its bytes
+        stay in the buffer and the next request line starts with what was left
+        of it -- ``{}`` read back as the method ``{}POST``, which the server
+        answers 501.
+
+        This runs *before* the reply is written.  Reading it afterwards makes
+        the two sides wait on each other: the peer is waiting for a response it
+        has been told is coming, and this side is waiting for bytes the peer has
+        already sent and will not resend.  Any frame this cannot drain means the
+        connection cannot be reused, so it is closed instead of guessed at.
+        """
+
+        if getattr(self, "_body_consumed", False):
+            return
+        self._body_consumed = True
+        raw_length = self.headers.get("Content-Length", "")
+        if not raw_length:
+            return
+        try:
+            length = int(raw_length)
+        except (TypeError, ValueError):
+            self.close_connection = True
+            return
+        if length <= 0:
+            return
+        if length > MAX_MESSAGE_BYTES:
+            self.close_connection = True
+            return
+        remaining = length
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 65536))
+            if not chunk:
+                self.close_connection = True
+                return
+            remaining -= len(chunk)
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib signature
+        # Loopback IPC: the host reports its own failures, and a log line per
+        # request would both leak settings traffic onto stderr and cost more
+        # than the request itself.
+        return
+
     def _send(self, status: int, payload: Mapping[str, Any], *, session_token: str | None = None) -> None:
         encoded = _encode_response_body(payload)
+        # A body this handler never read would otherwise become the next
+        # request line on this kept-alive socket.
+        self._consume_unread_body()
+        # An error also leaves the peer free to reuse the connection: the
+        # framing is complete either way, and closing on every 4xx is what made
+        # a rejected request cost a reconnect.
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -1071,17 +1132,6 @@ class CoreIPCServer:
                     result = self.stage_editor_capability(
                         editor_token, text, session_token=session_token
                     )
-            elif request.method == "image_context_image":
-                # Image bytes never travel in a snapshot: a projection redacts
-                # and bounds every string it exposes, so a picture asked for
-                # here is its own answer, the way an editor document is.
-                task = params.get("task")
-                image_id = params.get("id")
-                if not isinstance(task, str) or not isinstance(image_id, str):
-                    raise CoreError("invalid_image", "The requested image is unavailable")
-                # A grid asks for a thumbnail, the enlarged view for the
-                # preview: one method, two sizes, chosen by the caller.
-                result = self.core.image_context_image(task, image_id, thumb=params.get("thumb") is True)
             elif request.method == "dispatch":
                 action = params.get("action")
                 expected = params.get("revision")

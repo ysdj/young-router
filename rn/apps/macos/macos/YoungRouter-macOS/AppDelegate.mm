@@ -73,7 +73,7 @@
     // shell, so an explicit whitelist here silently gives a missed pane
     // (General) a plain titled window while the shell still reserves its
     // title-bar inset.
-    NSSet<NSString *> *standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor", @"image-context"]];
+    NSSet<NSString *> *standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor"]];
     const BOOL settingsShell = ![standaloneRoutes containsObject:route];
     NSView *rootView = (NSView *)[rootViewFactory viewWithModuleName:@"YoungRouter" initialProperties:props];
     // RCTSurfaceHostingView defaults to an opaque white background on macOS.
@@ -166,7 +166,7 @@
       continue;
     }
     NSString *route = [[url path] stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/"]];
-    NSSet<NSString *> *routes = [NSSet setWithArray:@[@"home", @"general-settings", @"providers-models", @"codex-settings", @"claude-settings", @"runtime-settings", @"data-management", @"provider-wizard", @"image-context", @"logs"]];
+    NSSet<NSString *> *routes = [NSSet setWithArray:@[@"home", @"general-settings", @"providers-models", @"codex-settings", @"claude-settings", @"runtime-settings", @"data-management", @"provider-wizard", @"logs"]];
     if (![routes containsObject:route]) {
       continue;
     }
@@ -200,6 +200,16 @@
 #if DEBUG
   return [[RCTBundleURLProvider sharedSettings] jsBundleURLForBundleRoot:@"index"];
 #else
+  // Release builds can load from Metro when this override is set, enabling
+  // Fast Refresh without switching to a Debug configuration. Cleared or an
+  // invalid URL falls back to the packaged bundle.
+  NSString *metroURL = [[NSUserDefaults standardUserDefaults] stringForKey:@"MetroServerURL"];
+  if (metroURL && [metroURL hasPrefix:@"http"]) {
+    NSURL *url = [NSURL URLWithString:metroURL];
+    if (url) {
+      return url;
+    }
+  }
   return [[NSBundle mainBundle] URLForResource:@"main" withExtension:@"jsbundle"];
 #endif
 }

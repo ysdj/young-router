@@ -65,6 +65,11 @@ function inlineCommand(command: InitialEditorCommand | undefined): string {
   return `<script>window.LiteLLMCodeEditorInitialCommand = ${serialized};</script>`;
 }
 
+// The page is shared by both hosts. Windows renders the WebView2 editor with
+// the larger Ace font it was tuned against; macOS keeps its original 12px, so
+// the Windows readability change never alters the macOS editor.
+const ACE_EDITOR_FONT = Platform.OS === "windows" ? "16px/1.45" : "12px/1.55";
+
 function codeEditorHtml(command?: InitialEditorCommand, labels?: CodeEditorMenuLabels): string {
   return `<!doctype html>
 <html>
@@ -173,7 +178,7 @@ function codeEditorHtml(command?: InitialEditorCommand, labels?: CodeEditorMenuL
       #editor .ace_editor {
         position: absolute;
         inset: 0;
-        font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        font: ${ACE_EDITOR_FONT} ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
         color: var(--editor-fg);
         background: var(--editor-bg);
       }

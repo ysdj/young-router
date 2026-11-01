@@ -15,6 +15,16 @@ import yaml
 
 from ..api_base import normalize_configured_api_base
 
+# PyYAML's pure-Python scanner is ~10x slower than the libyaml one, and this
+# module composes the whole configuration several times per commit: once per
+# ``_replace_top_level_sections``, and again for every scalar the dumper asks
+# to quote.  ``schema`` already takes the C loader for the same reason on the
+# read path; the write path is where the cost lands on a settings commit, so it
+# takes the same bound loader.  Both loaders emit identical events and dumps
+# for every document either accepts.
+_YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+_YAML_DUMPER = getattr(yaml, "CSafeDumper", yaml.SafeDumper)
+
 from .schema import (
     DEFAULT_API_KEY_NAME,
     MENU_ACCOUNT_REF_KEY,
@@ -62,7 +72,7 @@ def _parse_scalar(text: str) -> Any:
     if not stripped:
         return None
     try:
-        return yaml.safe_load(stripped)
+        return yaml.load(stripped, Loader=_YAML_LOADER)
     except Exception:
         return stripped
 
@@ -165,8 +175,9 @@ def _random_deployment_id(seen: set[str] | None = None) -> str:
 
 
 def _plain_scalar(value: Any) -> str:
-    text = yaml.safe_dump(
+    text = yaml.dump(
         value,
+        Dumper=_YAML_DUMPER,
         allow_unicode=True,
         default_flow_style=True,
         sort_keys=False,
@@ -410,13 +421,7 @@ def _entry_from_editor(
             ),
         }
     )
-    adapter = (
-        "chatgpt"
-        if auth["kind"] == "openai_login"
-        else "anthropic"
-        if auth["kind"] == "claude_login"
-        else None
-    )
+    adapter = "chatgpt" if auth["kind"] == "openai_login" else None
     litellm_model = canonical_litellm_model(
         model.get("litellm_model", ""),
         upstream_url_surface,
@@ -627,8 +632,9 @@ def _dump_yaml_value(value: Any, indent: int) -> list[str]:
         return [_alias_scalar(str(value["__alias__"]))]
     if not isinstance(value, (dict, list)):
         return [_plain_scalar(value)]
-    dumped = yaml.safe_dump(
+    dumped = yaml.dump(
         value,
+        Dumper=_YAML_DUMPER,
         allow_unicode=True,
         default_flow_style=False,
         sort_keys=False,
@@ -682,8 +688,9 @@ def _dump_model_list_section(key: str, entries: list[dict[str, Any]]) -> str:
 
 
 def _dump_section(key: str, value: Any) -> str:
-    return yaml.safe_dump(
+    return yaml.dump(
         {key: value},
+        Dumper=_YAML_DUMPER,
         allow_unicode=True,
         default_flow_style=False,
         sort_keys=False,
@@ -692,7 +699,7 @@ def _dump_section(key: str, value: Any) -> str:
 
 
 def _find_top_level_section(text: str, key: str) -> tuple[int, int] | None:
-    document = yaml.compose(text)
+    document = yaml.compose(text, Loader=_YAML_LOADER)
     if not isinstance(document, yaml.nodes.MappingNode):
         return None
 
@@ -723,7 +730,7 @@ def _replace_top_level_section(text: str, key: str, block: str) -> str:
 
 
 def _replace_top_level_sections(text: str, blocks: dict[str, str]) -> str:
-    document = yaml.compose(text)
+    document = yaml.compose(text, Loader=_YAML_LOADER)
     if not isinstance(document, yaml.nodes.MappingNode):
         raise ValueError("config.yaml must be a YAML mapping")
 
