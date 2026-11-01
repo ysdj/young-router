@@ -1411,5 +1411,99 @@ class PublicModelLimitTests(unittest.TestCase):
         self.assertEqual(272_000, record.context_window)
 
 
+class SharedContextCacheTests(unittest.TestCase):
+    """One cache file, read by more than one registry instance.
+
+    A pane snapshot resolves through a registry that never refreshes, while the
+    Codex domain's registry owns the refresh and rewrites the same file.  A
+    copy read once would keep answering from the file as it stood before that
+    write, which is how a public model added after a refresh was drawn with the
+    unknown-model window while pi.dev named the profile behind it.
+    """
+
+    @staticmethod
+    def _cache(records: dict) -> dict:
+        return {"fetched_at": 1_000_000.0, "records": records}
+
+    @staticmethod
+    def _profile(window: int) -> dict:
+        return {
+            "context_window": window,
+            "max_context_window": window,
+            "effective_context_window_percent": 95,
+            "source": MODEL_CONTEXT_SOURCES[0],
+            "priority": 40,
+        }
+
+    def test_a_registry_reads_a_cache_another_writer_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "model-contexts.json"
+            cache.write_text(json.dumps(self._cache({})), encoding="utf-8")
+            reader = ModelContextRegistry(cache_path=cache, refresh_enabled=False)
+            self.assertEqual(272_000, reader.record_for("gemini-4-argon").context_window)
+
+            # The refreshing registry publishes the profile pi.dev states, and
+            # the model only exists after that: the window a public model added
+            # now must not be the unknown-model default the first read answered
+            # with.
+            cache.write_text(
+                json.dumps(self._cache({"opencode/gemini-4-argon": self._profile(1_048_576)})),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(1_048_576, reader.record_for("gemini-4-argon").context_window)
+            self.assertEqual(1_048_576, reader.default_record_for("gemini-4-argon").context_window)
+
+    def test_a_declared_public_window_still_wins_over_the_reloaded_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(
+                "model_list:\n"
+                "  - model_name: gemini-4-argon\n"
+                "    litellm_params:\n"
+                "      model: openai/gemini-4-argon\n"
+                "    model_info:\n"
+                "      max_input_tokens: 200000\n",
+                encoding="utf-8",
+            )
+            cache = root / "model-contexts.json"
+            cache.write_text(json.dumps(self._cache({})), encoding="utf-8")
+            registry = ModelContextRegistry(
+                runtime_config_path=runtime,
+                cache_path=cache,
+                refresh_enabled=False,
+            )
+            self.assertEqual(200_000, registry.record_for("gemini-4-argon").context_window)
+
+            cache.write_text(
+                json.dumps(self._cache({"opencode/gemini-4-argon": self._profile(1_048_576)})),
+                encoding="utf-8",
+            )
+
+            effective = registry.record_for("gemini-4-argon")
+            default = registry.default_record_for("gemini-4-argon")
+
+        self.assertEqual(200_000, effective.context_window)
+        self.assertEqual(1_048_576, default.context_window)
+
+    def test_a_cache_that_disappears_keeps_the_records_already_in_hand(self) -> None:
+        """Losing the file is not evidence a resolved window became unknown."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "model-contexts.json"
+            cache.write_text(
+                json.dumps(self._cache({"opencode/gemini-4-argon": self._profile(1_048_576)})),
+                encoding="utf-8",
+            )
+            registry = ModelContextRegistry(cache_path=cache, refresh_enabled=False)
+            self.assertEqual(1_048_576, registry.record_for("gemini-4-argon").context_window)
+
+            cache.unlink()
+
+            self.assertEqual(1_048_576, registry.record_for("gemini-4-argon").context_window)
+
+
 if __name__ == "__main__":
     unittest.main()

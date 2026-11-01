@@ -500,6 +500,67 @@ class PublicModelDomainTests(unittest.TestCase):
         # keeps showing the registry default rather than a custom claim.
         self.assertIsNone(self.model("00000003")["max_input_tokens"])
 
+    def test_a_public_model_added_after_a_refresh_reads_the_refreshed_cache(self) -> None:
+        """The pane resolves against the cache the refresh has already replaced.
+
+        The pane's registry never refreshes; the Codex domain's registry owns
+        the refresh and rewrites the one cache file.  A reading taken before
+        that write kept answering the unknown-model window for every model the
+        refresh is what taught this installation about -- so a model added
+        right afterwards was drawn as 272,000 while pi.dev named its profile.
+        """
+
+        import json
+
+        def profile() -> dict:
+            return {
+                "context_window": 1_048_576,
+                "max_context_window": 1_048_576,
+                "effective_context_window_percent": 95,
+                "source": "https://pi.dev/api/models",
+                "priority": 40,
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / ".litellm-runtime"
+            runtime.mkdir()
+            path = runtime / "config.yaml"
+            # A ``model_list`` entry is rejected outright without a
+            # ``model_info`` object, so the load fails before this test can
+            # reach the cache it is here to read.
+            path.write_text(
+                "model_list:\n"
+                "  - model_name: gemini-4-argon\n"
+                "    litellm_params:\n"
+                "      model: openai/gemini-4-argon\n"
+                "    model_info: {}\n",
+                encoding="utf-8",
+            )
+            # The installation's cache is resolved from the root the document
+            # belongs to, and ``.litellm-runtime`` is that root's child.
+            cache = root / "model-contexts.json"
+            cache.write_text(json.dumps({"fetched_at": 1_000_000.0, "records": {}}), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            before = domain.snapshot()["model_contexts"]["gemini-4-argon"]
+
+            # The Codex domain's registry publishes the profile while this
+            # domain is still live, exactly as a refresh runs beside an open pane.
+            cache.write_text(
+                json.dumps(
+                    {
+                        "fetched_at": 1_000_060.0,
+                        "records": {"opencode/gemini-4-argon": profile()},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            after = domain.snapshot()["model_contexts"]["gemini-4-argon"]
+
+        self.assertEqual(272000, before["context_window"])
+        self.assertEqual(1_048_576, after["context_window"])
+        self.assertEqual(1_048_576, after["max_context_window"])
+
     def _saved(self) -> dict:
         import yaml
 

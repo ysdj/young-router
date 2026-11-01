@@ -147,7 +147,38 @@ def _reasoning_fields_from_payload(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _image_model_metadata_from_payload(value: Mapping[str, Any]) -> dict[str, Any]:
-    """Extract the bounded public image-model contract from a catalog record."""
+    """Extract the bounded public image-model contract from a catalog record.
+
+    A cache entry has already been through the normalizer and carries its answer
+    as ``image_model_metadata``.  Reading such an entry back must keep that
+    answer: the fields it was derived from (``modalities``, ``architecture``)
+    are not part of the stored contract, so re-deriving would drop the metadata
+    every time the cache was reloaded.
+    """
+
+    stored = value.get("image_model_metadata")
+    if isinstance(stored, Mapping):
+        return _image_metadata_contract(stored)
+    architecture = value.get("architecture")
+    architecture = architecture if isinstance(architecture, Mapping) else {}
+    modalities = value.get("modalities")
+    modalities = modalities if isinstance(modalities, Mapping) else {}
+    output_modalities = architecture.get("output_modalities", modalities.get("output"))
+    if not isinstance(output_modalities, list):
+        output_modalities = []
+    model_type = str(value.get("type") or "").strip().lower()
+    is_image = (
+        model_type == "image"
+        or "image" in {str(item).strip().lower() for item in output_modalities}
+        or "image" in str(architecture.get("modality") or "").lower().split("->")[-1]
+    )
+    if not is_image:
+        return {}
+    return _image_metadata_contract(value)
+
+
+def _image_metadata_contract(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize one image-model contract, whether derived or already stored."""
 
     architecture = value.get("architecture")
     architecture = architecture if isinstance(architecture, Mapping) else {}
@@ -159,14 +190,6 @@ def _image_model_metadata_from_payload(value: Mapping[str, Any]) -> dict[str, An
         input_modalities = []
     if not isinstance(output_modalities, list):
         output_modalities = []
-    model_type = str(value.get("type") or "").strip().lower()
-    is_image = (
-        model_type == "image"
-        or "image" in {str(item).strip().lower() for item in output_modalities}
-        or "image" in str(architecture.get("modality") or "").lower().split("->")[-1]
-    )
-    if not is_image:
-        return {}
     metadata: dict[str, Any] = {"type": "image"}
     for key, items in (("input_modalities", input_modalities), ("output_modalities", output_modalities)):
         normalized = [
@@ -732,6 +755,15 @@ class ModelContextRegistry:
         # The record keys grouped by their last path segment, for `_lookup`.
         self._record_tail_index: dict[str, tuple[str, ...]] = {}
         self._cache_loaded = False
+        # Identity of the cache file this instance's records came from.  The
+        # cache has more than one writer -- this registry's own refresh, and the
+        # one a refresh-less reader like a pane snapshot uses -- so records read
+        # once would keep answering from a cache another writer has already
+        # replaced.  That is how a public model added after a refresh was drawn
+        # with the unknown-model window while pi.dev named its profile: the
+        # pane's registry had read the file before the profile landed and never
+        # looked again.
+        self._cache_file_identity: tuple[int, int, int] | None = None
         # Every catalog entry resolves the same runtime configuration (route
         # deployments, model ids, search capability).  Parsing that document
         # once per file generation replaces the per-model re-reads that made a
@@ -845,6 +877,9 @@ class ModelContextRegistry:
             return
         try:
             atomic_write_json(self.cache_path, self._cache_payload())
+            # This instance's records are now what the file states, so the
+            # next lookup must not read the write back as someone else's.
+            self._cache_file_identity = self._cache_file_state()
             self._remove_legacy_caches()
         except PersistenceError:
             pass
@@ -870,10 +905,49 @@ class ModelContextRegistry:
             self._write_cache()
         return record
 
+    def _cache_file_state(self) -> tuple[int, int, int] | None:
+        """The identity of the cache file as it stands on disk right now.
+
+        ``None`` means no cache file is configured or none can be read.  The
+        inode belongs to the identity because the cache is written atomically:
+        a replacement arrives as a new file, and one whose size happens to
+        match the previous copy must still be noticed.
+        """
+
+        if self.cache_path is None:
+            return None
+        try:
+            details = self.cache_path.stat()
+        except OSError:
+            return None
+        return (details.st_ino, details.st_mtime_ns, details.st_size)
+
+    def _adopt_external_cache_write(self) -> None:
+        """Re-read the cache when another writer has replaced it.
+
+        This instance's records describe one version of that file; once a
+        different one lands, answering from the copy in hand reports windows
+        the file no longer states.  The provider-registry fallbacks memoized
+        from that copy go with it, because they answer for the same snapshot.
+        A cache that has disappeared keeps the records already in hand: the
+        file going away is not evidence that a resolved window became unknown,
+        and the bundled fallback may not stand in for it.
+        """
+
+        if not self._cache_loaded:
+            return
+        identity = self._cache_file_state()
+        if identity is None or identity == self._cache_file_identity:
+            return
+        self._cache_loaded = False
+        self._provider_lookups = {}
+        self._load_cache()
+
     def _load_cache(self) -> None:
         if self._cache_loaded:
             return
         self._cache_loaded = True
+        self._cache_file_identity = self._cache_file_state()
         self._records = RecordLookupIndex({key: dict(value) for key, value in _BUNDLED_RECORDS.items()})
         if self.cache_path is None:
             return
@@ -1067,6 +1141,7 @@ class ModelContextRegistry:
         return result
 
     def refresh_if_due(self, *, force: bool = False) -> bool:
+        self._adopt_external_cache_write()
         self._load_cache()
         if not self.refresh_enabled:
             return False
@@ -1182,6 +1257,7 @@ class ModelContextRegistry:
         the effective policy the managed catalog writes.
         """
 
+        self._adopt_external_cache_write()
         self._load_cache()
         unknown, _ = self._runtime_values()
         return self._context_record_from_records(
@@ -1233,6 +1309,7 @@ class ModelContextRegistry:
     ) -> dict[str, Any] | None:
         """Return public image metadata, optionally refreshing public catalogs."""
 
+        self._adopt_external_cache_write()
         self._load_cache()
         if refresh:
             self.refresh_if_due()
@@ -1260,6 +1337,7 @@ class ModelContextRegistry:
     ) -> dict[str, dict[str, Any]]:
         """Resolve image metadata for concrete route model ids."""
 
+        self._adopt_external_cache_write()
         self._load_cache()
         if refresh:
             self.refresh_if_due()
@@ -1273,6 +1351,7 @@ class ModelContextRegistry:
     def reasoning_for_model_id(self, model_id: str) -> ReasoningCapability | None:
         """Return Pi/Codex reasoning policy for one concrete deployment model."""
 
+        self._adopt_external_cache_write()
         self._load_cache()
         normalized_id = model_id.strip().casefold()
         if "@" in normalized_id:
