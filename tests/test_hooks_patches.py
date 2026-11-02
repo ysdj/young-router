@@ -428,6 +428,59 @@ class HookPatchTests(HookTestCase):
         self.assertIs(type(plain_stamped), dict)
         self.assertEqual(plain_stamped["model"], "public-model")
 
+    def test_stream_chunk_builder_reads_a_dict_function_call(self) -> None:
+        """A relay's legacy ``function_call`` is a dict, not a typed object.
+
+        LiteLLM's builder reads ``function_call.name`` and raises inside the
+        logging pass after the answer started; the wrapper turns that into a
+        500 and the turn is cut at whatever token the logger reached.
+        """
+
+        hooks, _ = load_hook_module()
+        from litellm.litellm_core_utils import streaming_chunk_builder_utils
+
+        chunks = [
+            {
+                "id": "c1",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "m",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "function_call": {"name": "lookup", "arguments": '{"q":'},
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "c1",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "m",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"function_call": {"arguments": '"x"}'}},
+                        "finish_reason": "function_call",
+                    }
+                ],
+            },
+        ]
+
+        hooks._install_stream_chunk_builder_dict_function_call_patch()
+        processor = streaming_chunk_builder_utils.ChunkProcessor(
+            chunks,
+            [{"role": "user", "content": "hi"}],
+        )
+        function_call = processor.get_combined_function_call_content(chunks)
+
+        self.assertEqual(function_call.name, "lookup")
+        self.assertEqual(function_call.arguments, '{"q":"x"}')
+
     def test_anthropic_unversioned_messages_endpoint_skips_only_the_duplicate_suffix(self) -> None:
         hooks, _ = load_hook_module()
         litellm_module = sys.modules["litellm"]

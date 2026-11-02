@@ -147,6 +147,79 @@ def _install_stream_chunk_restamp_patch() -> None:
     )
 
 
+_STREAM_CHUNK_BUILDER_DICT_FUNCTION_CALL_PATCH_ATTR = (
+    "_young_router_stream_chunk_builder_dict_function_call_patch"
+)
+
+
+def _install_stream_chunk_builder_dict_function_call_patch() -> None:
+    """Read a dict-shaped legacy ``function_call`` in the streaming usage builder.
+
+    ``stream_chunk_builder`` assembles the final response from the chunks it
+    saw so LiteLLM can price and log the turn.  Its
+    ``get_combined_function_call_content`` reads ``function_call.name`` and
+    ``.arguments`` as attributes, but the legacy ``function_call`` field
+    arrives as a plain dict from OpenAI-compatible relays.  That
+    ``AttributeError`` is re-raised as a 500 ("Error building chunks for
+    logging/streaming usage calculation") *while the answer is streaming*, so
+    a delivered answer is cut at whatever token the logging pass reached.
+    Observed live 2026-11-02 on flux-code's Chat stream: ten cuts in an hour,
+    every one after visible output.
+
+    The replacement keeps LiteLLM's shape and only reads both spellings.
+    """
+
+    try:
+        from litellm.litellm_core_utils import streaming_chunk_builder_utils
+    except Exception:
+        return
+    processor = getattr(streaming_chunk_builder_utils, "ChunkProcessor", None)
+    original = getattr(processor, "get_combined_function_call_content", None)
+    if not callable(original) or getattr(
+        original,
+        _STREAM_CHUNK_BUILDER_DICT_FUNCTION_CALL_PATCH_ATTR,
+        False,
+    ):
+        return
+
+    def patched_get_combined_function_call_content(
+        self: Any,
+        function_call_chunks: Any,
+    ) -> Any:
+        argument_list: list[str] = []
+        first = function_call_chunks[0]["choices"][0]["delta"].get("function_call", "")
+        name = first.get("name") if isinstance(first, dict) else getattr(first, "name", "")
+        for chunk in function_call_chunks:
+            for choice in chunk.get("choices") or ():
+                function_call = (choice.get("delta") or {}).get("function_call")
+                if not function_call:
+                    continue
+                arguments = (
+                    function_call.get("arguments")
+                    if isinstance(function_call, dict)
+                    else getattr(function_call, "arguments", "")
+                )
+                argument_list.append(arguments or "")
+        return streaming_chunk_builder_utils.FunctionCall(
+            name=name or "",
+            arguments="".join(argument_list),
+        )
+
+    setattr(
+        patched_get_combined_function_call_content,
+        _STREAM_CHUNK_BUILDER_DICT_FUNCTION_CALL_PATCH_ATTR,
+        True,
+    )
+    setattr(
+        patched_get_combined_function_call_content,
+        "_original_get_combined_function_call_content",
+        original,
+    )
+    processor.get_combined_function_call_content = (
+        patched_get_combined_function_call_content
+    )
+
+
 def _install_responses_websocket_http_bridge_patch() -> None:
     """Serve Responses WebSocket clients through the managed HTTP bridge.
 
@@ -2772,6 +2845,7 @@ def install_all() -> None:
     _install_same_deployment_retry_policy_patch()
     _install_responses_websocket_http_bridge_patch()
     _install_stream_chunk_restamp_patch()
+    _install_stream_chunk_builder_dict_function_call_patch()
     _install_websocket_frame_limit_patch()
     # A stream this process truncates while it is being replaced is not
     # upstream evidence, so the teardown is marked wherever uvicorn is run.
