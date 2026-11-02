@@ -27,15 +27,6 @@
 #                                        port, leaving the app alone
 #   scripts/dev-loop-macos.sh --check    report which half is stale, act not
 #
-# Delivery is part of the change.  The installed app imports its Python from
-# `Core/young_router/` inside the bundle, not from this checkout, and there is
-# no hot reload: a fix is not running until this script has synced it and the
-# new process has started after the sync.  `--check` must answer `python
-# current`.  A tree another session is editing cannot be synced safely -- the
-# sync would install their half-work -- so serialise writers (or use a
-# worktree) instead of leaving a committed fix in a stale bundle, and say which
-# state the process is in.
-#
 # `--metro` plus `--reload` is the JS loop.  `RCTHost` registers itself as a
 # reload listener in every configuration, and a reload re-reads the bundle URL
 # and rebuilds the JS instance in place, so a UI edit costs one bundle fetch
