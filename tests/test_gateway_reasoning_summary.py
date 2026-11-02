@@ -161,5 +161,62 @@ class ReasoningSummaryStreamTests(unittest.TestCase):
         self.assertEqual([], response["output"][1].get("summary", []))
 
 
+
+    def test_content_part_done_is_mirrored_into_summary_frames(self) -> None:
+        texts: dict[str, str] = {}
+        seen: set[str] = set()
+        chunk = _event(
+            {
+                "type": "response.content_part.done",
+                "item_id": "r1",
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "reasoning_text", "text": "step one"},
+            }
+        )
+
+        events = patches.reasoning_summary_chunks_for_delivery(chunk, texts, seen)
+
+        self.assertEqual(
+            [
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+            ],
+            [event["type"] for event in events],
+        )
+        delta = next(
+            event for event in events if event["type"].endswith(".delta")
+        )
+        self.assertEqual("step one", delta["delta"])
+        self.assertEqual("step one", texts["r1"])
+        self.assertIn("r1", seen)
+        self.assertEqual([], patches.reasoning_summary_chunks_for_delivery(chunk, texts, seen))
+
+    def test_output_item_done_and_completed_carry_the_summary(self) -> None:
+        texts = {"r1": "the whole thought"}
+        done_item = _event(
+            {
+                "type": "response.output_item.done",
+                "item": {"type": "reasoning", "id": "r1", "status": "completed", "summary": []},
+            }
+        )
+        patches.reasoning_summary_chunks_for_delivery(done_item, texts, set())
+        self.assertEqual(
+            [{"type": "summary_text", "text": "the whole thought"}],
+            done_item["item"]["summary"],
+        )
+
+        response = {
+            "output": [{"type": "reasoning", "id": "r1", "summary": [], "status": "completed"}]
+        }
+        completed = _event({"type": "response.completed", "response": response})
+        patches.reasoning_summary_chunks_for_delivery(completed, texts, set())
+        self.assertEqual(
+            [{"type": "summary_text", "text": "the whole thought"}],
+            response["output"][0]["summary"],
+        )
+
 if __name__ == "__main__":
     unittest.main()

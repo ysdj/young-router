@@ -1965,12 +1965,8 @@ def _reasoning_summary_part_done_event(item_id: Any, output_index: Any, text: st
     return _streaming_module._json_stream_event(event)
 
 
-def _apply_reasoning_summary_to_response(iterator: Any, response: Any) -> None:
-    output = _web_search_native_module._response_item_get(response, "output")
-    if not isinstance(output, (list, tuple)):
-        return
-    texts = getattr(iterator, "_young_router_reasoning_summary_text", None)
-    if not isinstance(texts, dict):
+def _apply_reasoning_summary_to_output(output: Any, texts: Any) -> None:
+    if not isinstance(output, (list, tuple)) or not isinstance(texts, dict):
         return
     for item in output:
         if _web_search_native_module._response_item_get(item, "type") != "reasoning":
@@ -1979,6 +1975,76 @@ def _apply_reasoning_summary_to_response(iterator: Any, response: Any) -> None:
         text = texts.get(item_id)
         if isinstance(text, str) and text:
             _set_item_field(item, "summary", [{"type": "summary_text", "text": text}])
+
+
+def _apply_reasoning_summary_to_response(iterator: Any, response: Any) -> None:
+    output = _web_search_native_module._response_item_get(response, "output")
+    texts = getattr(iterator, "_young_router_reasoning_summary_text", None)
+    _apply_reasoning_summary_to_output(output, texts)
+
+
+def reasoning_summary_chunks_for_delivery(
+    chunk: Any,
+    texts: dict[str, str],
+    seen: set[str],
+) -> list[Any]:
+    """Render the raw reasoning a Chat upstream streams as summary frames.
+
+    The Chat-to-Responses iterator emits the real reasoning text only inside a
+    ``content_part.done`` whose part is ``reasoning_text``; it never emits
+    ``reasoning_summary_*`` frames, and its pending-event list is not the queue
+    this proxy's delivery loop reads.  The Pi renders thinking from the summary
+    frames (and from the item's ``summary``), so mirror the done text there as
+    the chunk passes through the one delivery path every chunk takes.  ``seen``
+    lets a real summary delta from the iterator win instead of duplicating it.
+    """
+
+    get = _web_search_native_module._response_item_get
+    chunk_type = get(chunk, "type")
+    if chunk_type == "response.reasoning_summary_text.delta":
+        item_id = get(chunk, "item_id")
+        if item_id is not None:
+            seen.add(item_id)
+        return []
+    if chunk_type == "response.output_item.added":
+        item = get(chunk, "item")
+        if get(item, "type") == "reasoning" and get(item, "summary") is None:
+            _set_item_field(item, "summary", [])
+        return []
+    if chunk_type == "response.content_part.done":
+        part = get(chunk, "part")
+        if get(part, "type") != "reasoning_text":
+            return []
+        text = get(part, "text")
+        item_id = get(chunk, "item_id")
+        output_index = get(chunk, "output_index")
+        if (
+            not isinstance(text, str)
+            or not text
+            or item_id is None
+            or item_id in seen
+        ):
+            return []
+        texts[item_id] = text
+        seen.add(item_id)
+        return [
+            _reasoning_summary_part_added_event(item_id, output_index),
+            _reasoning_summary_text_event(item_id, output_index, "delta", text),
+            _reasoning_summary_text_event(item_id, output_index, "done", text),
+            _reasoning_summary_part_done_event(item_id, output_index, text),
+        ]
+    if chunk_type == "response.output_item.done":
+        item = get(chunk, "item")
+        if get(item, "type") == "reasoning":
+            text = texts.get(get(item, "id"))
+            if isinstance(text, str) and text:
+                _set_item_field(item, "summary", [{"type": "summary_text", "text": text}])
+        return []
+    if chunk_type == "response.completed":
+        response = get(chunk, "response")
+        _apply_reasoning_summary_to_output(get(response, "output"), texts)
+        return []
+    return []
 
 
 def _open_reasoning_summary_items(

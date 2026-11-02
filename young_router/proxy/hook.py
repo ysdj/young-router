@@ -15,6 +15,7 @@ from . import web_search_native as _web_search_native_module
 from . import reasoning as _reasoning_module
 from . import routing as _routing_module
 from . import state as _state_module
+from . import patches as _patches_module
 from . import streaming as _streaming_module
 from . import tools as _tools_module
 from . import trace as _trace_module
@@ -490,8 +491,17 @@ class YoungRouterHook(CustomLogger):
         # frame is left alone and only the done-only completion is repaired.
         image_generation_opened_item_ids: set[str] = set()
 
+        reasoning_summary_texts: dict[str, str] = {}
+        reasoning_summary_seen: set[str] = set()
+
         async def deliver_stream(stream: AsyncIterator[Any]) -> AsyncIterator[Any]:
             async for stream_chunk in stream:
+                for summary_chunk in _patches_module.reasoning_summary_chunks_for_delivery(
+                    stream_chunk,
+                    reasoning_summary_texts,
+                    reasoning_summary_seen,
+                ):
+                    yield deliver_chunk(summary_chunk)
                 for image_chunk in image_generation_chunks_for_delivery(stream_chunk):
                     yield deliver_chunk(image_chunk)
 
