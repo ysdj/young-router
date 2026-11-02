@@ -1185,35 +1185,6 @@ def _is_route_recovery_poll_error(exception: Exception) -> bool:
     return _recovery_policy_for_exception(exception) != _RECOVERY_POLICY_ERROR
 
 
-def _strip_replayed_reasoning_items(request_kwargs: Optional[dict]) -> bool:
-    """Drop the replayed thinking/tool graph that a route refuses to verify.
-
-    A history written by one thinking-mode route can carry reasoning items whose
-    encrypted payload only the route that produced them can validate.  A second
-    route refuses that replay even though the plain conversation is answerable.
-    Keep the messages (and the tools) and retry; the alternative is an endless
-    400 from every route in the group.
-    """
-
-    if not isinstance(request_kwargs, dict):
-        return False
-    input_value = request_kwargs.get("input")
-    if not isinstance(input_value, list):
-        return False
-    kept = [
-        item
-        for item in input_value
-        if not (
-            isinstance(item, dict)
-            and item.get("type") in {"reasoning", "function_call", "function_call_output"}
-        )
-    ]
-    if len(kept) == len(input_value):
-        return False
-    request_kwargs["input"] = kept
-    return True
-
-
 def _should_return_route_recovery_stream(
     exception: Exception,
     request_kwargs: Optional[dict],
