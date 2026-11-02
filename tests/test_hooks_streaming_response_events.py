@@ -8,6 +8,200 @@ import re
 
 
 class HookStreamingResponseEventTests(HookTestCase):
+
+    async def test_synthetic_timeout_notice_is_not_delivered(self) -> None:
+        """A relay's timeout guard is an answer-shaped failure, not an answer.
+
+        flux-code answers an over-long turn with a normal completion whose id
+        is ``chatcmpl-timeout-guard`` and whose text is a billing notice.  The
+        stream must fail before that text reaches the client, so routing can
+        cool the route and serve the turn elsewhere.
+        """
+
+        load_hook_module()
+        from young_router.proxy import streaming
+
+        notice = (
+            "[req_ed0265f2] [deepseek-v4.1-flash-mod]\n"
+            "**Request exceeded 570s limit**\n"
+            "**Recommended tools:**\n"
+            "- These responses are optimized for opencode, Claude Code, and Codex."
+        )
+        chunk = {
+            "id": "chatcmpl-timeout-guard",
+            "object": "chat.completion.chunk",
+            "model": "deepseek-v4.1-flash-mod",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": notice},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+        async def source():
+            yield chunk
+
+        delivered = []
+        with self.assertRaises(Exception) as raised:
+            async for delivered_chunk in streaming._stream_with_idle_timeout(
+                source(),
+                {"model": "deepseek-v4.1-flash", "stream": True},
+            ):
+                delivered.append(delivered_chunk)
+
+        self.assertEqual(delivered, [])
+        self.assertIn("synthetic timeout notice", str(raised.exception))
+
+    async def test_an_answer_quoting_the_notice_is_delivered(self) -> None:
+        load_hook_module()
+        from young_router.proxy import streaming
+
+        chunk = {
+            "id": "chatcmpl-normal",
+            "object": "chat.completion.chunk",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "content": (
+                            "The relay's **Request exceeded 570s limit** notice "
+                            "is not an answer."
+                        )
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
+        async def source():
+            yield chunk
+
+        delivered = []
+        async for delivered_chunk in streaming._stream_with_idle_timeout(
+            source(),
+            {"model": "deepseek-v4.1-flash", "stream": True},
+        ):
+            delivered.append(delivered_chunk)
+
+        self.assertEqual(1, len(delivered))
+
+    def test_encoded_timeout_guard_response_id_is_recognized(self) -> None:
+        load_hook_module()
+        from young_router.proxy import streaming
+        import base64
+
+        def encoded(upstream_id: str) -> str:
+            raw = (
+                "litellm:custom_llm_provider:openai;model_id:3c115d5f;"
+                f"response_id:{upstream_id}"
+            )
+            return "resp_" + base64.b64encode(raw.encode()).decode()
+
+        self.assertTrue(
+            streaming._synthetic_timeout_notice_id(
+                encoded("chatcmpl-timeout-guard")
+            )
+        )
+        self.assertFalse(
+            streaming._synthetic_timeout_notice_id(encoded("chatcmpl-6ae8a53a"))
+        )
+        # The id recorded by Pi on 2026-11-02, unpadded, exactly as delivered.
+        self.assertTrue(
+            streaming._synthetic_timeout_notice_id(
+                "resp_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOm9wZW5haTttb2Rl"
+                "bF9pZDozYzExNWQ1ZjtyZXNwb25zZV9pZDpjaGF0Y21wbC10aW1lb3V0"
+                "LWd1YXJk"
+            )
+        )
+
+    async def test_non_streaming_timeout_guard_is_rejected(self) -> None:
+        load_hook_module()
+        from young_router.proxy import streaming
+
+        response = {
+            "id": "chatcmpl-timeout-guard",
+            "object": "chat.completion",
+            "model": "deepseek-v4.1-flash-mod",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": (
+                            "[req_x] [deepseek-v4.1-flash-mod]\n"
+                            "**Request exceeded 570s limit**\n"
+                            "**Recommended tools:**\n"
+                            "- These responses are optimized for opencode, "
+                            "Claude Code, and Codex."
+                        ),
+                    }
+                }
+            ],
+        }
+
+        with self.assertRaises(Exception) as raised:
+            async for _ in streaming._non_streaming_response_as_stream(
+                response,
+                {"model": "deepseek-v4.1-flash", "stream": False},
+            ):
+                pass
+        self.assertIn("synthetic timeout notice", str(raised.exception))
+
+    async def test_chat_bridge_rejects_the_notice_before_its_text(self) -> None:
+        load_hook_module()
+        from young_router.proxy import responses_execution
+
+        notice = (
+            "[req_x] [deepseek-v4.1-flash-mod]\n"
+            "**Request exceeded 570s limit**\n"
+            "**Recommended tools:**\n"
+            "- These responses are optimized for opencode, Claude Code, and Codex."
+        )
+
+        class MarkedChatStream:
+            _young_router_selected_deployment_marker = {
+                "model_info": {
+                    "id": "3c115d5f",
+                    "model_group": "deepseek-v4.1-flash",
+                },
+                "litellm_params": {"model": "deepseek-v4.1-flash"},
+            }
+
+            def __aiter__(self):
+                return self._iterate()
+
+            async def _iterate(self):
+                yield {
+                    "id": "chatcmpl-timeout-guard",
+                    "object": "chat.completion.chunk",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": notice},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+
+        events = []
+        with self.assertRaises(Exception) as raised:
+            async for event in responses_execution.responses_chat_bridge_stream(
+                {"model": "deepseek-v4.1-flash", "stream": True},
+                MarkedChatStream(),
+            ):
+                events.append(event)
+
+        self.assertNotIn(
+            "response.output_text.delta",
+            [event.get("type") for event in events if isinstance(event, dict)],
+        )
+        self.assertEqual(
+            "3c115d5f",
+            getattr(raised.exception, "failed_deployment_id", None),
+        )
+        self.assertIn("synthetic timeout notice", str(raised.exception))
+
     async def test_context_failed_terminal_propagates_without_replay(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []

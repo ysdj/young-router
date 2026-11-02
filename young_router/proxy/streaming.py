@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import re
 from typing import Callable
 
@@ -1519,6 +1520,116 @@ def _stream_chunk_text_fragment(chunk: Any) -> tuple[str, bool]:
         return (text, True) if isinstance(text, str) else ("", True)
     return "", False
 
+_SYNTHETIC_TIMEOUT_NOTICE_ID = "chatcmpl-timeout-guard"
+_SYNTHETIC_TIMEOUT_NOTICE_MARKERS = ("**Request exceeded ", " limit**")
+_SYNTHETIC_TIMEOUT_NOTICE_TOOL_MARKERS = (
+    "Recommended tools:",
+    "opencode, Claude Code, and Codex",
+)
+
+def _synthetic_timeout_notice_id(value: Any) -> bool:
+    """Whether a response id names a relay's synthetic timeout guard.
+
+    A relay answers an over-long turn with an ordinary completion whose id is
+    ``chatcmpl-timeout-guard``; LiteLLM re-encodes that id into the
+    ``resp_<base64>`` Responses id, so both spellings have to be read.
+    """
+
+    if not isinstance(value, str) or not value:
+        return False
+    if value.endswith(_SYNTHETIC_TIMEOUT_NOTICE_ID):
+        return True
+    if not value.startswith("resp_"):
+        return False
+    encoded = value[5:]
+    try:
+        decoded = base64.b64decode(
+            encoded + "=" * (-len(encoded) % 4)
+        ).decode("utf-8", "replace")
+    except Exception:
+        return False
+    return _SYNTHETIC_TIMEOUT_NOTICE_ID in decoded
+
+def _synthetic_timeout_notice_text(text: Any) -> bool:
+    """Whether this text is the notice, not an answer that quotes it.
+
+    The guard's whole message opens with its own request tag and states the
+    limit; a real answer may mention the same words, so only a fragment that
+    starts at the tag counts.
+    """
+
+    if not isinstance(text, str):
+        return False
+    stripped = text.lstrip()
+    if not stripped.startswith("[req_"):
+        return False
+    if not all(marker in stripped for marker in _SYNTHETIC_TIMEOUT_NOTICE_MARKERS):
+        return False
+    return any(marker in stripped for marker in _SYNTHETIC_TIMEOUT_NOTICE_TOOL_MARKERS)
+
+def _stream_chunk_synthetic_timeout_notice(chunk: Any) -> bool:
+    dumped = _stream_chunk_dump(chunk)
+    if not isinstance(dumped, dict):
+        return False
+    response = dumped.get("response")
+    for value in (
+        dumped.get("id"),
+        response.get("id") if isinstance(response, dict) else None,
+    ):
+        if _synthetic_timeout_notice_id(value):
+            return True
+    for choice in dumped.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        for key in ("delta", "message"):
+            part = choice.get(key)
+            if isinstance(part, dict) and _synthetic_timeout_notice_text(
+                part.get("content")
+            ):
+                return True
+    for key in ("delta", "text", "output_text"):
+        if _synthetic_timeout_notice_text(dumped.get(key)):
+            return True
+    return False
+
+def _synthetic_timeout_notice_exception(chunk: Any, request_data: Any) -> Exception:
+    from litellm.exceptions import APIError
+
+    dumped = _stream_chunk_dump(chunk)
+    upstream_id = dumped.get("id") if isinstance(dumped, dict) else None
+    exception = APIError(
+        status_code=502,
+        message=(
+            "upstream returned a synthetic timeout notice instead of an answer"
+            + (
+                f" ({upstream_id})"
+                if isinstance(upstream_id, str) and upstream_id
+                else ""
+            )
+        ),
+        llm_provider="openai",
+        model=str(dumped.get("model") or "") if isinstance(dumped, dict) else "",
+    )
+    if isinstance(request_data, dict):
+        try:
+            _routing_module._apply_current_selected_deployment_to_request(request_data)
+            _routing_module._mark_exception_for_deployment_failover(
+                exception, request_data
+            )
+        except Exception:
+            pass
+    _trace_module._request_route_trace(
+        "upstream_synthetic_timeout_notice_rejected",
+        request_data,
+        upstream_response_id=upstream_id,
+        response_id_type=_stream_chunk_type(dumped),
+    )
+    return exception
+
+def _raise_if_synthetic_timeout_notice(chunk: Any, request_data: Any) -> None:
+    if _stream_chunk_synthetic_timeout_notice(chunk):
+        raise _synthetic_timeout_notice_exception(chunk, request_data)
+
 def _local_shutdown_completed_response_event(
     request_data: dict,
     completion_state: Any,
@@ -2789,6 +2900,7 @@ async def _stream_with_idle_timeout(
                 idle_seconds=timeout_seconds,
                 saw_chunk=saw_chunk,
             ) from None
+        _raise_if_synthetic_timeout_notice(chunk, request_data)
         was_saw_chunk = saw_chunk
         saw_chunk = True
         chunk_count += 1
@@ -4509,6 +4621,7 @@ async def _non_streaming_response_as_stream(
     response: Any,
     request_data: dict,
 ) -> AsyncIterator[Any]:
+    _raise_if_synthetic_timeout_notice(response, request_data)
     if _request_is_responses_stream(request_data):
         if not _responses_non_streaming_response_has_usable_output(
             response,

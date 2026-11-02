@@ -384,6 +384,7 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
     }
 
     async for chunk in chat_stream:
+        _streaming_module._raise_if_synthetic_timeout_notice(chunk, bridge_kwargs)
         chunk_usage = _chat_stream_usage(chunk)
         if chunk_usage is not None:
             usage = chunk_usage
@@ -643,6 +644,20 @@ def responses_chat_bridge_stream(
     bridge_kwargs: dict,
     upstream_response: Any,
 ) -> Any:
+    # The selected deployment is pinned on the stream object, not on the
+    # bridge's own kwargs copy.  Carrying it here is what lets a rejection
+    # inside the converter name the route it must cool down; without it the
+    # recovery poll would pick the same failing deployment first.
+    marker = getattr(
+        upstream_response,
+        "_young_router_selected_deployment_marker",
+        None,
+    )
+    if isinstance(marker, dict):
+        _routing_module._apply_selected_deployment_marker_to_request(
+            bridge_kwargs,
+            marker,
+        )
     return _with_restored_reasoning_marker(
         _responses_chat_bridge_text_stream_from_chat_stream(
             upstream_response,
