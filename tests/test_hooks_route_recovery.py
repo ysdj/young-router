@@ -958,13 +958,13 @@ class HookRouteRecoveryTests(HookTestCase):
 
         self.assertFalse(hooks._route_recovery_poll_keep_going(refusal))
 
-    async def test_reasoning_text_refusal_ends_poll_after_an_empty_attempt(self) -> None:
-        """A swallowed refusal is still the poll's last word.
+    async def test_reasoning_text_refusal_retries_a_sibling(self) -> None:
+        """A route that refuses this history is excluded, not polled forever.
 
         The fallback round can turn the upstream 400 into an empty stream, so
-        the terminal test in the exception handler never runs.  The observed
-        result was the same 400 replayed every five seconds for hours while
-        the client waited; the empty attempt must apply the same test.
+        the exception handler never sees it.  The remedy is not to return the
+        400 to a client that will retry the same history: exclude that route
+        and let the next attempt select a sibling that can answer it.
         """
 
         hooks, _proxy_server = load_hook_module()
@@ -973,10 +973,19 @@ class HookRouteRecoveryTests(HookTestCase):
         self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
         attempts = []
 
-        async def empty_attempt(request_data, exception, **kwargs):
-            attempts.append(kwargs.get("attempt"))
-            if False:
-                yield None
+        async def sibling_attempt(request_data, exception, **kwargs):
+            attempts.append(request_data.get("_excluded_deployment_ids"))
+            if len(attempts) == 1:
+                if False:
+                    yield None
+                return
+            yield {
+                "type": "response.output_text.delta",
+                "item_id": "msg_recovered",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "recovered on a sibling",
+            }
 
         request_data = {
             "model": "balanced-chat",
@@ -996,11 +1005,11 @@ class HookRouteRecoveryTests(HookTestCase):
         with mock.patch.object(
             hooks._streaming_module,
             "_stream_route_recovery_poll_attempt",
-            empty_attempt,
+            sibling_attempt,
         ), mock.patch.object(
             hooks._streaming_module,
             "_stream_native_route_recovery_poll_attempt",
-            empty_attempt,
+            sibling_attempt,
         ):
             chunks = [
                 chunk
@@ -1010,8 +1019,16 @@ class HookRouteRecoveryTests(HookTestCase):
                 )
             ]
 
-        self.assertEqual(attempts, [1])
-        assert_upstream_route_failed_terminal(self, chunks)
+        self.assertEqual(len(attempts), 2)
+        self.assertIn("79f0dc70", attempts[0] or [])
+        self.assertIn("79f0dc70", attempts[1] or [])
+        self.assertTrue(
+            any(
+                isinstance(chunk, dict)
+                and chunk.get("delta") == "recovered on a sibling"
+                for chunk in chunks
+            )
+        )
 
     def test_first_event_timeout_keeps_polling_a_delivered_then_idle_stream(self) -> None:
         """Only a zero-byte wait is terminal; a delivered stream is not.

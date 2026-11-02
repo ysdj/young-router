@@ -1413,9 +1413,27 @@ async def _stream_route_recovery_poll(
                 )
                 # A refused attempt can come back as an empty stream rather
                 # than an exception: the fallback round swallowed the upstream
-                # refusal.  The same terminal test still applies, or a 400 is
-                # replayed every interval for the whole recovery window.
-                if not _streaming_module._route_recovery_poll_keep_going(last_exception):
+                # refusal.  This 400 is deterministic for the route that
+                # produced it, but another deployment may accept the same
+                # history.  Exclude it and let the next attempt select a
+                # sibling instead of replaying the refusal for hours or
+                # ending the turn with a bare 400.
+                if _routing_module._is_thinking_replay_contract_error(last_exception):
+                    _routing_module._sync_failed_deployment_exclusions(
+                        request_data,
+                        last_exception,
+                    )
+                    _trace_module._request_route_trace(
+                        "route_recovery_poll_route_excluded",
+                        request_data,
+                        poll_attempt=attempt,
+                        elapsed_seconds=round(time.monotonic() - started_at_monotonic, 3),
+                        excluded_deployment_ids=request_data.get(
+                            "_excluded_deployment_ids"
+                        ),
+                        exception=_routing_module._trace_exception(last_exception),
+                    )
+                elif not _streaming_module._route_recovery_poll_keep_going(last_exception):
                     _trace_module._request_route_trace(
                         "route_recovery_poll_terminal_error", request_data,
                         poll_attempt=attempt,
@@ -1432,7 +1450,22 @@ async def _stream_route_recovery_poll(
                         exception=_routing_module._trace_exception(poll_exception),
                     )
                     raise
-                if not _streaming_module._route_recovery_poll_keep_going(poll_exception):
+                if _routing_module._is_thinking_replay_contract_error(poll_exception):
+                    _routing_module._sync_failed_deployment_exclusions(
+                        request_data,
+                        poll_exception,
+                    )
+                    last_exception = poll_exception
+                    _trace_module._request_route_trace(
+                        "route_recovery_poll_route_excluded", request_data,
+                        poll_attempt=attempt,
+                        elapsed_seconds=round(time.monotonic() - started_at_monotonic, 3),
+                        excluded_deployment_ids=request_data.get(
+                            "_excluded_deployment_ids"
+                        ),
+                        exception=_routing_module._trace_exception(last_exception),
+                    )
+                elif not _streaming_module._route_recovery_poll_keep_going(poll_exception):
                     last_exception = poll_exception
                     _trace_module._request_route_trace(
                         "route_recovery_poll_terminal_error", request_data,
