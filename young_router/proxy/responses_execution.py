@@ -295,6 +295,15 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
     dropped_reasoning = False
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
+    # The leak's closing tags can straddle two chat deltas, so keep a short
+    # tail and test the accumulated text rather than one fragment.
+    tool_markup_tail = ""
+    # ``""`` while the answer still looks like it may open with the content
+    # array; ``None`` once it provably does not.  The wrapper is held until it
+    # either matches the whole prefix or diverges, so neither its JSON nor a
+    # normal answer that starts with ``[`` is delayed by more than ~20 chars.
+    content_array_probe: Optional[str] = ""
+    content_array_mode = False
     usage = None
     reasoning_open = False
     message_index: Optional[int] = None
@@ -412,6 +421,21 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
             }
         if not delta:
             continue
+        if content_array_mode:
+            text_parts.append(delta)
+            continue
+        if content_array_probe is not None:
+            content_array_probe += delta
+            probe = content_array_probe.lstrip()
+            if _streaming_module._CONTENT_ARRAY_TEXT_PREFIX.startswith(probe):
+                continue
+            if probe.startswith(_streaming_module._CONTENT_ARRAY_TEXT_PREFIX):
+                text_parts.append(content_array_probe)
+                content_array_probe = None
+                content_array_mode = True
+                continue
+            delta = content_array_probe
+            content_array_probe = None
         if message_index is None:
             if reasoning_open:
                 for event in reasoning_done_events():
@@ -421,6 +445,12 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
             for event in message_added_events(message_index):
                 yield event
         text_parts.append(delta)
+        tool_markup_tail = (tool_markup_tail + delta)[-256:]
+        if _streaming_module._text_has_leaked_tool_call_markup(tool_markup_tail):
+            raise _streaming_module._leaked_tool_call_markup_exception(
+                chunk,
+                bridge_kwargs,
+            )
         yield {
             "type": "response.output_text.delta",
             "item_id": message_id,
@@ -429,6 +459,11 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
             "delta": delta,
         }
 
+    if content_array_probe:
+        # The stream ended while the answer was still a prefix of the wrapper
+        # (a short answer such as ``[``): it was ordinary text all along.
+        text_parts.append(content_array_probe)
+        content_array_probe = None
     if reasoning_open:
         for event in reasoning_done_events():
             yield event
@@ -444,6 +479,24 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
         dropped=dropped_reasoning,
     )
     text = "".join(text_parts)
+    if content_array_mode:
+        unwrapped = _streaming_module._unwrap_content_array_text(text)
+        if unwrapped != text:
+            _trace_module._request_route_trace(
+                "upstream_content_array_text_unwrapped",
+                bridge_kwargs,
+                chars=len(text),
+            )
+        text = unwrapped
+        text_parts = [text]
+        if text:
+            yield {
+                "type": "response.output_text.delta",
+                "item_id": message_id,
+                "output_index": message_index,
+                "content_index": 0,
+                "delta": text,
+            }
     message = {
         "id": message_id,
         "type": "message",
@@ -2278,6 +2331,29 @@ def _ordered_deployment_fallback_entry(
         for deployment in image_tool_candidates
         if _responses_request_module._deployment_id(deployment) not in excluded_ids
     ]
+    # A route that is already serving its concurrency cap cannot take this
+    # attempt, so it is not a fallback target.  The refusal this attempt is
+    # advancing from may itself have been that cap, in which case the peer is
+    # the free route the candidate filter could not offer -- but only while one
+    # exists: a group with no free route keeps its own pool, so the caller sees
+    # the route's limit instead of a group that suddenly has no deployments.
+    concurrency_available, concurrency_saturated, concurrency_filtered = (
+        _routing_module._with_active_model_concurrency(
+            available_deployments,
+            request_kwargs=request_kwargs,
+        )
+    )
+    if concurrency_saturated:
+        _trace_module._request_route_trace(
+            "fallback_model_concurrency_filter", request_kwargs, model_group=model_group,
+            concurrency_filtered=concurrency_filtered,
+            concurrency_all_candidates=bool(
+                concurrency_saturated and not concurrency_filtered
+            ),
+            concurrency_saturated=concurrency_saturated,
+        )
+    if concurrency_available:
+        available_deployments = concurrency_available
     constrained_no_deployments = no_deployments_available and any(
         _responses_request_module._deployment_order(deployment) == failed_order
         and _responses_request_module._deployment_id(deployment) in excluded_ids

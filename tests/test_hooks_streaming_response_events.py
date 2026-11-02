@@ -202,6 +202,251 @@ class HookStreamingResponseEventTests(HookTestCase):
         )
         self.assertIn("synthetic timeout notice", str(raised.exception))
 
+    async def test_leaked_tool_call_markup_is_rejected_in_the_bridge(self) -> None:
+        """A route that leaks DSML tags as text must fail, not answer.
+
+        flux-code's ``-mod`` variant returns DeepSeek's tool-call closing tags
+        in ``content``; Codex then renders a call it cannot execute and the
+        turn stops.  The bridge rejects the leak before the delta carrying it
+        reaches the client.
+        """
+
+        load_hook_module()
+        from young_router.proxy import responses_execution
+
+        leaked = (
+            '[{"text": "版式参数已确认。", "text": "收集字体"}]'
+            "</| DSLM | invoke>\n</| DSLM | calls>"
+        )
+
+        class MarkedChatStream:
+            _young_router_selected_deployment_marker = {
+                "model_info": {
+                    "id": "3c115d5f",
+                    "model_group": "deepseek-v4.1-flash",
+                },
+                "litellm_params": {"model": "deepseek-v4.1-flash"},
+            }
+
+            def __aiter__(self):
+                return self._iterate()
+
+            async def _iterate(self):
+                yield {
+                    "id": "chatcmpl-normal",
+                    "object": "chat.completion.chunk",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": leaked},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+
+        events = []
+        with self.assertRaises(Exception) as raised:
+            async for event in responses_execution.responses_chat_bridge_stream(
+                {"model": "deepseek-v4.1-flash", "stream": True},
+                MarkedChatStream(),
+            ):
+                events.append(event)
+
+        deltas = [
+            event.get("delta")
+            for event in events
+            if isinstance(event, dict)
+            and event.get("type") == "response.output_text.delta"
+        ]
+        self.assertFalse(
+            any("</| DSLM | calls>" in str(delta) for delta in deltas)
+        )
+        self.assertEqual(
+            "3c115d5f",
+            getattr(raised.exception, "failed_deployment_id", None),
+        )
+        self.assertIn("tool-call markup", str(raised.exception))
+
+    async def test_split_tool_call_markup_is_still_rejected(self) -> None:
+        load_hook_module()
+        from young_router.proxy import responses_execution
+
+        async def chat_stream():
+            yield {
+                "id": "chatcmpl-normal",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "prefix </| DSLM | in"},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield {
+                "id": "chatcmpl-normal",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {"index": 0, "delta": {"content": "voke>"}, "finish_reason": None}
+                ],
+            }
+
+        with self.assertRaises(Exception) as raised:
+            async for _ in responses_execution.responses_chat_bridge_stream(
+                {"model": "deepseek-v4.1-flash", "stream": True},
+                chat_stream(),
+            ):
+                pass
+        self.assertIn("tool-call markup", str(raised.exception))
+
+    async def test_discussing_dsml_is_not_rejected(self) -> None:
+        load_hook_module()
+        from young_router.proxy import responses_execution
+
+        async def chat_stream():
+            yield {
+                "id": "chatcmpl-normal",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "content": (
+                                "DeepSeek V4 emits DSML tool calls; a native "
+                                "route parses them into tool_calls."
+                            )
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+
+        events = [
+            event
+            async for event in responses_execution.responses_chat_bridge_stream(
+                {"model": "deepseek-v4.1-flash", "stream": True},
+                chat_stream(),
+            )
+        ]
+        text = "".join(
+            event.get("delta", "")
+            for event in events
+            if isinstance(event, dict)
+            and event.get("type") == "response.output_text.delta"
+        )
+        self.assertIn("DSML", text)
+
+    async def test_stream_funnel_rejects_leaked_tool_call_markup(self) -> None:
+        load_hook_module()
+        from young_router.proxy import streaming
+
+        async def source():
+            yield {
+                "id": "chatcmpl-normal",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "done</| DSLM | calls>"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+
+        delivered = []
+        with self.assertRaises(Exception) as raised:
+            async for chunk in streaming._stream_with_idle_timeout(
+                source(),
+                {"model": "deepseek-v4.1-flash", "stream": True},
+            ):
+                delivered.append(chunk)
+        self.assertEqual([], delivered)
+        self.assertIn("tool-call markup", str(raised.exception))
+
+    async def test_content_array_text_is_unwrapped(self) -> None:
+        """flux-code serializes the Responses content array as the answer.
+
+        The client must receive the inner text, not the JSON wrapper, and the
+        answer may arrive split across several chat deltas.
+        """
+
+        load_hook_module()
+        from young_router.proxy import responses_execution
+
+        async def chat_stream():
+            yield {
+                "id": "chatcmpl-normal",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "content": '[{"type":"text","text":"Investigation'
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            }
+            yield {
+                "id": "chatcmpl-normal",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": ' complete.\\n\\nDone."}]'},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+
+        events = [
+            event
+            async for event in responses_execution.responses_chat_bridge_stream(
+                {"model": "deepseek-v4.1-flash", "stream": True},
+                chat_stream(),
+            )
+        ]
+        deltas = "".join(
+            event.get("delta", "")
+            for event in events
+            if isinstance(event, dict)
+            and event.get("type") == "response.output_text.delta"
+        )
+        self.assertNotIn('"type":"text"', deltas)
+        self.assertEqual("Investigation complete.\n\nDone.", deltas)
+
+    async def test_a_normal_bracket_answer_is_not_held(self) -> None:
+        load_hook_module()
+        from young_router.proxy import responses_execution
+
+        async def chat_stream():
+            yield {
+                "id": "chatcmpl-normal",
+                "object": "chat.completion.chunk",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "[1, 2, 3]"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+
+        events = [
+            event
+            async for event in responses_execution.responses_chat_bridge_stream(
+                {"model": "deepseek-v4.1-flash", "stream": True},
+                chat_stream(),
+            )
+        ]
+        deltas = "".join(
+            event.get("delta", "")
+            for event in events
+            if isinstance(event, dict)
+            and event.get("type") == "response.output_text.delta"
+        )
+        self.assertEqual("[1, 2, 3]", deltas)
+
     async def test_context_failed_terminal_propagates_without_replay(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []

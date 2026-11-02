@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import re
 from typing import Callable
 
@@ -1630,6 +1631,102 @@ def _raise_if_synthetic_timeout_notice(chunk: Any, request_data: Any) -> None:
     if _stream_chunk_synthetic_timeout_notice(chunk):
         raise _synthetic_timeout_notice_exception(chunk, request_data)
 
+# A DeepSeek-V4 chat route must parse its native DSML tool-call markup into
+# ``tool_calls``.  flux-code's ``-mod`` variant does not: the closing tags of
+# its own dialect arrive as answer text (observed 2026-11-03 on a Codex turn,
+# ``</| DSLM | invoke>`` / ``</| DSLM | calls>``), so the client renders a
+# call it cannot execute and the turn stops.  These exact tags are the leak's
+# signature; the model's documentation of the format is not.
+_LEAKED_TOOL_CALL_MARKUP_MARKERS = (
+    "</| DSLM | calls>",
+    "</| DSLM | invoke>",
+)
+
+# A route trained on the Responses wire sometimes returns the request's own
+# content array serialized as the answer text (observed 2026-11-03 from
+# flux-code's ``-mod`` variant: ``[{"type":"text","text":"..."}]``).  The
+# client renders that JSON instead of the answer, so the bridge unwraps it.
+_CONTENT_ARRAY_TEXT_PREFIX = '[{"type":"text","text":"'
+
+def _unwrap_content_array_text(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    bare = text.strip()
+    if not bare.startswith(_CONTENT_ARRAY_TEXT_PREFIX):
+        return text
+    try:
+        parts = json.loads(bare)
+    except Exception:
+        return text
+    if not isinstance(parts, list) or not parts:
+        return text
+    texts: list[str] = []
+    for item in parts:
+        if not isinstance(item, dict) or item.get("type") != "text":
+            return text
+        value = item.get("text")
+        if not isinstance(value, str):
+            return text
+        texts.append(value)
+    return "\n".join(texts)
+
+def _text_has_leaked_tool_call_markup(text: Any) -> bool:
+    if not isinstance(text, str):
+        return False
+    return any(marker in text for marker in _LEAKED_TOOL_CALL_MARKUP_MARKERS)
+
+def _stream_chunk_leaked_tool_call_markup(chunk: Any) -> bool:
+    dumped = _stream_chunk_dump(chunk)
+    if not isinstance(dumped, dict):
+        return False
+    for choice in dumped.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        for key in ("delta", "message"):
+            part = choice.get(key)
+            if isinstance(part, dict) and _text_has_leaked_tool_call_markup(
+                part.get("content")
+            ):
+                return True
+    for key in ("delta", "text", "output_text"):
+        if _text_has_leaked_tool_call_markup(dumped.get(key)):
+            return True
+    return False
+
+def _leaked_tool_call_markup_exception(chunk: Any, request_data: Any) -> Exception:
+    from litellm.exceptions import APIError
+
+    dumped = _stream_chunk_dump(chunk)
+    exception = APIError(
+        status_code=502,
+        message=(
+            "upstream leaked its native tool-call markup as answer text "
+            "instead of a tool call"
+        ),
+        llm_provider="openai",
+        model=str(dumped.get("model") or "") if isinstance(dumped, dict) else "",
+    )
+    if isinstance(request_data, dict):
+        try:
+            _routing_module._apply_current_selected_deployment_to_request(request_data)
+            _routing_module._mark_exception_for_deployment_failover(
+                exception, request_data
+            )
+        except Exception:
+            pass
+    _trace_module._request_route_trace(
+        "upstream_tool_call_markup_leak_rejected",
+        request_data,
+        upstream_response_id=(
+            dumped.get("id") if isinstance(dumped, dict) else None
+        ),
+    )
+    return exception
+
+def _raise_if_leaked_tool_call_markup(chunk: Any, request_data: Any) -> None:
+    if _stream_chunk_leaked_tool_call_markup(chunk):
+        raise _leaked_tool_call_markup_exception(chunk, request_data)
+
 def _local_shutdown_completed_response_event(
     request_data: dict,
     completion_state: Any,
@@ -2901,6 +2998,7 @@ async def _stream_with_idle_timeout(
                 saw_chunk=saw_chunk,
             ) from None
         _raise_if_synthetic_timeout_notice(chunk, request_data)
+        _raise_if_leaked_tool_call_markup(chunk, request_data)
         was_saw_chunk = saw_chunk
         saw_chunk = True
         chunk_count += 1
@@ -4622,6 +4720,7 @@ async def _non_streaming_response_as_stream(
     request_data: dict,
 ) -> AsyncIterator[Any]:
     _raise_if_synthetic_timeout_notice(response, request_data)
+    _raise_if_leaked_tool_call_markup(response, request_data)
     if _request_is_responses_stream(request_data):
         if not _responses_non_streaming_response_has_usable_output(
             response,
