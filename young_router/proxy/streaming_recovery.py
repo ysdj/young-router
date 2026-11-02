@@ -909,6 +909,21 @@ def _route_recovery_poll_keep_going(exception: Exception) -> bool:
     # identical bytes for the rest of the recovery window.
     if _routing_module._is_request_body_size_rejection_error(exception):
         return False
+    # The poll replays the same bytes at the same route.  A validator that
+    # refused them once (the observed case is DeepSeek's 400 for a replayed
+    # thinking history without its ``reasoning_text``) refuses them again, so
+    # waiting out the recovery window only holds the client open for hours.
+    status_code = _routing_module._exception_status_code(exception)
+    if (
+        status_code in {400, 422}
+        # "No healthy deployments" is also a 400, but it is the poll's own
+        # signal to refresh the order pool; it is not a validator refusing
+        # these bytes.
+        and not _routing_module._is_no_deployments_available_error(exception)
+    ):
+        return False
+    if _routing_module._is_thinking_replay_contract_error(exception):
+        return False
     # A first-event timeout with nothing buffered means the route was sent the
     # request and answered with zero bytes.  That is a route that cannot serve
     # this request at all, not a transient pause: every later attempt replays

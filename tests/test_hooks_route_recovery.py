@@ -938,6 +938,26 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertEqual(len(calls), 1)
         assert_upstream_route_failed_terminal(self, chunks)
 
+    def test_reasoning_text_refusal_ends_the_poll(self) -> None:
+        """The poll replays identical history, so a 400 cannot recover.
+
+        A DeepSeek route refused the request with HTTP 400 because the
+        replayed thinking history had no ``reasoning_text``.  The main request
+        may try a sibling, but the recovery poll keeps sending the same bytes
+        to the same route; it must surface the refusal instead of holding the
+        client open for the whole recovery window.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        refusal = RuntimeError(
+            "litellm.BadRequestError: OpenAIException - {\"error\":{\"message\":"
+            "\"the `reasoning_text` in the thinking mode must be passed back "
+            "to the api.\"}}"
+        )
+        refusal.status_code = 400
+
+        self.assertFalse(hooks._route_recovery_poll_keep_going(refusal))
+
     def test_first_event_timeout_keeps_polling_a_delivered_then_idle_stream(self) -> None:
         """Only a zero-byte wait is terminal; a delivered stream is not.
 
