@@ -161,6 +161,42 @@ class HookImageRoutingTests(HookTestCase):
                 [item["type"] for item in delivered_done],
             )
 
+    def test_a_stream_chunk_nothing_rewrote_keeps_its_own_wire_form(self) -> None:
+        """An untouched chunk must stay the object LiteLLM serializes.
+
+        LiteLLM writes a decoded stream chunk as ``data: {chunk}``.  A plain
+        dict there reaches the client as a Python repr instead of JSON, so a
+        ``/v1/chat/completions`` stream becomes unparseable the moment the
+        delivery pass dumps every chunk it sees.  The pass may only replace a
+        chunk it actually rewrote.
+        """
+
+        hooks, _ = load_hook_module()
+
+        class DecodedChatChunk:
+            """A BaseModel-shaped chunk, as LiteLLM hands one to the hook."""
+
+            def __init__(self) -> None:
+                self.payload = {
+                    "id": "chatcmpl-proof",
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": 0, "delta": {"content": "hi"}}],
+                }
+
+            def model_dump(self) -> dict:
+                return dict(self.payload)
+
+        chunk = DecodedChatChunk()
+
+        delivered = hooks._image_generation_stream_chunks_for_delivery(
+            chunk,
+            {},
+            [],
+        )
+
+        self.assertEqual([chunk], delivered)
+        self.assertIs(chunk, delivered[0])
+
     def test_image_generation_stream_restates_the_opening_frame_without_client_evidence(self) -> None:
         """The path is this app's addition; the opening frame is not.
 

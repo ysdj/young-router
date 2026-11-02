@@ -751,10 +751,22 @@ def _image_generation_stream_chunks_for_delivery(
     payload = _image_generation_stream_chunk_payload(chunk)
     if payload is None:
         return [chunk]
-    if attach_paths:
-        _image_generation_attach_paths_to_payload(payload, request_data, saved_paths)
-    delivered = [_image_generation_stream_chunk_with_payload(chunk, payload)]
+    paths_changed = attach_paths and _image_generation_attach_paths_to_payload(
+        payload,
+        request_data,
+        saved_paths,
+    )
     opening_event = _image_generation_item_opening_event(payload, opened_item_ids)
+    if opening_event is None and not paths_changed:
+        # Nothing was rewritten, so keep the chunk's own wire form.  Handing
+        # back the dict it dumped to is invisible on a Responses stream (its
+        # events are dicts either way) but not on the native chat wire, where
+        # ``async_data_generator`` writes ``data: {chunk}``: a dict there is a
+        # Python repr rather than JSON, and no chat client can parse the
+        # stream.  The text path above has always kept an untouched read for
+        # the same reason.
+        return [chunk]
+    delivered = [_image_generation_stream_chunk_with_payload(chunk, payload)]
     if opening_event is not None:
         delivered.insert(0, opening_event)
     return delivered
