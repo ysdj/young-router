@@ -958,6 +958,61 @@ class HookRouteRecoveryTests(HookTestCase):
 
         self.assertFalse(hooks._route_recovery_poll_keep_going(refusal))
 
+    async def test_reasoning_text_refusal_ends_poll_after_an_empty_attempt(self) -> None:
+        """A swallowed refusal is still the poll's last word.
+
+        The fallback round can turn the upstream 400 into an empty stream, so
+        the terminal test in the exception handler never runs.  The observed
+        result was the same 400 replayed every five seconds for hours while
+        the client waited; the empty attempt must apply the same test.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_POLICY_REQUEST_ERROR_ENV, None)
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        attempts = []
+
+        async def empty_attempt(request_data, exception, **kwargs):
+            attempts.append(kwargs.get("attempt"))
+            if False:
+                yield None
+
+        request_data = {
+            "model": "balanced-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "metadata": {"request_id": "route-recovery-empty-refusal"},
+            "model_info": {"id": "79f0dc70", "order": 1},
+        }
+        refusal = RuntimeError(
+            "litellm.BadRequestError: OpenAIException - {\"error\":{\"message\":"
+            "\"the `reasoning_text` in the thinking mode must be passed back "
+            "to the api.\"}}"
+        )
+        refusal.status_code = 400
+        refusal.failed_deployment_id = "79f0dc70"
+
+        with mock.patch.object(
+            hooks._streaming_module,
+            "_stream_route_recovery_poll_attempt",
+            empty_attempt,
+        ), mock.patch.object(
+            hooks._streaming_module,
+            "_stream_native_route_recovery_poll_attempt",
+            empty_attempt,
+        ):
+            chunks = [
+                chunk
+                async for chunk in hooks._stream_route_recovery_poll(
+                    request_data,
+                    refusal,
+                )
+            ]
+
+        self.assertEqual(attempts, [1])
+        assert_upstream_route_failed_terminal(self, chunks)
+
     def test_first_event_timeout_keeps_polling_a_delivered_then_idle_stream(self) -> None:
         """Only a zero-byte wait is terminal; a delivered stream is not.
 

@@ -1411,6 +1411,18 @@ async def _stream_route_recovery_poll(
                     elapsed_seconds=round(time.monotonic() - started_at_monotonic, 3),
                     exception=_routing_module._trace_exception(last_exception),
                 )
+                # A refused attempt can come back as an empty stream rather
+                # than an exception: the fallback round swallowed the upstream
+                # refusal.  The same terminal test still applies, or a 400 is
+                # replayed every interval for the whole recovery window.
+                if not _streaming_module._route_recovery_poll_keep_going(last_exception):
+                    _trace_module._request_route_trace(
+                        "route_recovery_poll_terminal_error", request_data,
+                        poll_attempt=attempt,
+                        elapsed_seconds=round(time.monotonic() - started_at_monotonic, 3),
+                        exception=_routing_module._trace_exception(last_exception),
+                    )
+                    break
             except Exception as poll_exception:
                 if _routing_module._is_context_size_error(poll_exception):
                     _trace_module._request_route_trace(
