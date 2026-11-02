@@ -861,6 +861,144 @@ class HookStreamingResponseEventTests(HookTestCase):
         self.assertEqual(completed["response"]["output"][0]["status"], "completed")
         self.assertIn("Compaction summary is usable.", json.dumps(completed))
 
+    async def test_responses_stream_output_limit_below_the_client_budget_fails_instead_of_completing(self) -> None:
+        """A relay's own cap is not the client's limit.
+
+        flux-code reports its cap as ``reason: max_output_tokens`` while the
+        client asked for 393216.  Completing that terminal delivered half an
+        answer with no error; the truncation must reach the client as a
+        failure so the turn can be retried on another route.
+        """
+
+        hooks, proxy_server = load_hook_module()
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                raise AssertionError("a cut answer must not be replayed")
+
+        proxy_server.llm_router = FakeRouter()
+
+        async def original_stream():
+            yield {"type": "response.created", "response": {"id": "resp-cut"}}
+            yield {"type": "response.output_text.delta", "delta": "Plan, part one. "}
+            yield {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp-cut",
+                    "object": "response",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "output": [
+                        {
+                            "id": "msg-cut",
+                            "type": "message",
+                            "status": "incomplete",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "Plan, part one. ",
+                                    "annotations": [],
+                                }
+                            ],
+                        }
+                    ],
+                    "usage": {"input_tokens": 44459, "output_tokens": 1770, "total_tokens": 46229},
+                },
+            }
+
+        hook = hooks.YoungRouterHook()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue the plan."}],
+            "stream": True,
+            "max_output_tokens": 393216,
+            "tools": [],
+            "tool_choice": "auto",
+            "model_info": {"id": "order1-a", "order": 1},
+        }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hook.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=original_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        types = [chunk["type"] for chunk in chunks]
+        self.assertNotIn("response.completed", types)
+        self.assertEqual(types[-1], "response.failed")
+        self.assertIn("Plan, part one.", json.dumps(chunks))
+        # A stop the route caused must keep Pi's retry classifier engaged:
+        # "ended without" is the phrase it matches.
+        self.assertIn(
+            "ended without",
+            chunks[-1]["response"]["error"]["message"],
+        )
+
+    async def test_responses_stream_output_limit_at_the_client_budget_still_completes(self) -> None:
+        hooks, proxy_server = load_hook_module()
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                raise AssertionError("the client's own limit is not a route failure")
+
+        proxy_server.llm_router = FakeRouter()
+
+        async def original_stream():
+            yield {"type": "response.created", "response": {"id": "resp-limit"}}
+            yield {"type": "response.output_text.delta", "delta": "Short but complete."}
+            yield {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp-limit",
+                    "object": "response",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "output": [
+                        {
+                            "id": "msg-limit",
+                            "type": "message",
+                            "status": "incomplete",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "Short but complete.",
+                                    "annotations": [],
+                                }
+                            ],
+                        }
+                    ],
+                    "usage": {"input_tokens": 12, "output_tokens": 2048, "total_tokens": 2060},
+                },
+            }
+
+        hook = hooks.YoungRouterHook()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Answer within the budget."}],
+            "stream": True,
+            "max_output_tokens": 2048,
+            "tools": [],
+            "tool_choice": "auto",
+            "model_info": {"id": "order1-a", "order": 1},
+        }
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hook.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=original_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual([chunk["type"] for chunk in chunks][-1], "response.completed")
+        self.assertNotIn("incomplete_details", chunks[-1]["response"])
+
     async def test_responses_stream_output_limit_error_message_after_text_completes_without_retry(self) -> None:
         hooks, proxy_server = load_hook_module()
 

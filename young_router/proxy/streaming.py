@@ -1024,6 +1024,59 @@ _OUTPUT_TOKEN_LIMIT_INCOMPLETE_REASONS = {
     "max_tokens",
 }
 
+def _request_output_token_budget(request_data: Optional[dict]) -> Optional[int]:
+    """The output budget the client stated, when it stated one."""
+
+    data = request_data or {}
+    for key in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
+        value = data.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if value > 0:
+            return int(value)
+    return None
+
+
+def _responses_incomplete_output_tokens(chunk: Any) -> Optional[int]:
+    """The output tokens a terminal event reports, from either wire shape."""
+
+    event = _jsonable(chunk)
+    if not isinstance(event, dict):
+        event = _stream_chunk_dump(chunk)
+    response = event.get("response") if isinstance(event, dict) else None
+    usage = response.get("usage") if isinstance(response, dict) else None
+    if not isinstance(usage, dict) and isinstance(event, dict):
+        usage = event.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    value = usage.get("output_tokens")
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        value = usage.get("completion_tokens")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def _incomplete_stopped_below_client_budget(
+    chunk: Any,
+    request_data: Optional[dict],
+) -> bool:
+    """True when the route stopped well short of the budget the client set.
+
+    A relay that resells a smaller model reports its own cap as
+    ``reason: max_output_tokens``.  The client asked for far more, so the
+    terminal is the route's truncation, not the client's limit; presenting it
+    as a normal completion is how a half answer arrives with no error.
+    """
+
+    budget = _request_output_token_budget(request_data)
+    if budget is None:
+        return False
+    output_tokens = _responses_incomplete_output_tokens(chunk)
+    if output_tokens is None or output_tokens <= 0:
+        return False
+    return output_tokens < max(1, budget - 128)
+
+
 def _output_limit_incomplete_reason_from_text(value: str) -> Optional[str]:
     lowered = value.strip().lower()
     if not lowered:
@@ -1089,6 +1142,11 @@ def _responses_output_limit_incomplete_as_completed_chunk(
     reason = _responses_incomplete_terminal_reason(chunk)
     if reason not in _OUTPUT_TOKEN_LIMIT_INCOMPLETE_REASONS:
         return None
+    if _incomplete_stopped_below_client_budget(chunk, request_data):
+        # The route capped the answer below the budget this client asked for.
+        # Leave the terminal event alone so the delivery path reports the
+        # truncation instead of dressing it as a normal completion.
+        return None
     event = _jsonable(chunk)
     if not isinstance(event, dict):
         return None
@@ -1123,6 +1181,11 @@ def _responses_output_limit_terminal_state_as_completed_chunk(
         return None
     reason = _responses_incomplete_terminal_reason(chunk)
     if reason not in _OUTPUT_TOKEN_LIMIT_INCOMPLETE_REASONS:
+        return None
+    if _incomplete_stopped_below_client_budget(chunk, request_data):
+        # The route capped the answer below the budget this client asked for.
+        # Leave the terminal event alone so the delivery path reports the
+        # truncation instead of dressing it as a normal completion.
         return None
     completed_response = completion_state.completed_payload(request_data)
     if _responses_output_module._response_is_effectively_empty(completed_response):
@@ -5194,6 +5257,26 @@ async def _yield_guarded_original_stream(
                 in _OUTPUT_TOKEN_LIMIT_INCOMPLETE_REASONS
             )
             if output_limit_terminal:
+                if _incomplete_stopped_below_client_budget(chunk, request_data):
+                    _trace_module._request_route_trace(
+                        "responses_stream_upstream_output_limit_truncated",
+                        request_data,
+                        reason=_responses_incomplete_terminal_reason(chunk),
+                        requested_max_output_tokens=_request_output_token_budget(request_data),
+                        output_tokens=_responses_incomplete_output_tokens(chunk),
+                    )
+                    if (
+                        completed_output_has_visible_assistant_text()
+                        or synthesized_text().strip()
+                    ):
+                        yield failed_terminal_event(
+                            "upstream stopped at its own output limit below the requested budget"
+                        )
+                        return
+                    raise _responses_incomplete_stream_exception(
+                        "upstream stopped at its own output limit below the requested budget",
+                        request_data=request_data,
+                    )
                 completed = completed_terminal_event(
                     "output token limit terminal response event",
                     allow_tool_call_only=True,
@@ -5343,6 +5426,26 @@ async def _yield_guarded_original_stream(
                     in _OUTPUT_TOKEN_LIMIT_INCOMPLETE_REASONS
                 )
                 if output_limit_terminal:
+                    if _incomplete_stopped_below_client_budget(chunk, request_data):
+                        _trace_module._request_route_trace(
+                            "responses_stream_upstream_output_limit_truncated",
+                            request_data,
+                            reason=_responses_incomplete_terminal_reason(chunk),
+                            requested_max_output_tokens=_request_output_token_budget(request_data),
+                            output_tokens=_responses_incomplete_output_tokens(chunk),
+                        )
+                        if (
+                            completed_output_has_visible_assistant_text()
+                            or synthesized_text().strip()
+                        ):
+                            yield failed_terminal_event(
+                                "upstream stopped at its own output limit below the requested budget"
+                            )
+                            return
+                        raise _responses_incomplete_stream_exception(
+                            "upstream stopped at its own output limit below the requested budget",
+                            request_data=request_data,
+                        )
                     completed = completed_terminal_event(
                         "output token limit terminal response event",
                         allow_tool_call_only=True,
