@@ -56,6 +56,10 @@ function inlineMenuLabels(labels: CodeEditorMenuLabels | undefined): string {
   return `<script>window.LiteLLMCodeEditorMenuLabels = ${serialized};</script>`;
 }
 
+function inlinePlatform(): string {
+  return `<script>window.LiteLLMCodeEditorPlatform = ${JSON.stringify(Platform.OS)};document.documentElement.style.setProperty("--editor-scale", "1");</script>`;
+}
+
 function inlineCommand(command: InitialEditorCommand | undefined): string {
   if (!command) return "";
   const serialized = JSON.stringify(command)
@@ -153,6 +157,7 @@ function codeEditorHtml(command?: InitialEditorCommand, labels?: CodeEditorMenuL
       body.diff-sidebar-enabled #code-editor-layout {
         grid-template-columns: minmax(0, 1fr) clamp(132px, 28vw, 184px);
       }
+
       #editor {
         position: relative;
         width: 100%;
@@ -350,6 +355,38 @@ function codeEditorHtml(command?: InitialEditorCommand, labels?: CodeEditorMenuL
         color: var(--editor-gutter-fg);
         text-align: center;
       }
+      ${Platform.OS === "windows" ? `
+      /* The composition host sizes the WebView surface in physical pixels.
+         Ace sets its own font size from the host display scale, so the editor
+         keeps 1:1 pointer math; the read-only rail and overlays scale with the
+         same factor. */
+      body.diff-sidebar-enabled #code-editor-layout {
+        grid-template-columns: minmax(0, 1fr) calc(184px * var(--editor-scale));
+      }
+      #diff-sidebar {
+        width: 184px;
+        zoom: var(--editor-scale);
+      }
+      #editor-scrollbar {
+        top: calc(3px * var(--editor-scale));
+        right: calc(2px * var(--editor-scale));
+        bottom: calc(3px * var(--editor-scale));
+        width: calc(11px * var(--editor-scale));
+        border-radius: calc(6px * var(--editor-scale));
+      }
+      #editor-menu {
+        min-width: calc(136px * var(--editor-scale));
+        padding: calc(4px * var(--editor-scale));
+        border-radius: calc(6px * var(--editor-scale));
+        font-size: calc(12px * var(--editor-scale));
+      }
+      .editor-menu-item {
+        padding: calc(4px * var(--editor-scale)) calc(10px * var(--editor-scale));
+        border-radius: calc(4px * var(--editor-scale));
+      }
+      .editor-menu-separator {
+        height: calc(1px * var(--editor-scale));
+      }` : ""}
       body { color: var(--editor-fg); }
     </style>
   </head>
@@ -365,6 +402,7 @@ function codeEditorHtml(command?: InitialEditorCommand, labels?: CodeEditorMenuL
         <div id="diff-sidebar-list"></div>
       </aside>
     </div>
+    ${inlinePlatform()}
     ${inlineCommand(command)}
     ${inlineMenuLabels(labels)}
     <script>${CODE_EDITOR_WEB_BUNDLE.replace(/<\/script/gi, "<\\/script")}</script>

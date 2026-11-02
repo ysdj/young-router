@@ -37,7 +37,7 @@ type ReplaceDocumentCommand = {
 };
 type SetBaselineCommand = { type: "setBaseline"; baseline: string };
 type InsertTextCommand = { type: "insertText"; text: string };
-type HostCommand = ReplaceDocumentCommand | SetBaselineCommand | InsertTextCommand | { type: "focus" };
+type HostCommand = ReplaceDocumentCommand | SetBaselineCommand | InsertTextCommand | { type: "scale"; scale: number } | { type: "focus" };
 
 type AceSession = {
   getValue: () => string;
@@ -58,6 +58,7 @@ type AceSelection = { clearSelection?: () => void };
 type AceEditor = {
   session: AceSession;
   renderer: AceRenderer;
+  setFontSize: (size: number) => void;
   selection?: AceSelection;
   setValue: (value: string, cursorPosition?: number) => void;
   getValue: () => string;
@@ -75,6 +76,7 @@ type AceApi = { edit: (element: HTMLElement, options?: Record<string, unknown>) 
 declare global {
   interface Window {
     LiteLLMCodeEditorInitialCommand?: unknown;
+    LiteLLMCodeEditorPlatform?: string;
     LiteLLMCodeEditorMenuLabels?: unknown;
     LiteLLMCodeEditor?: { receive: (message: unknown) => void };
     ace?: AceApi;
@@ -646,6 +648,19 @@ function configureEditor(command: ReplaceDocumentCommand): void {
   aceEditor.setOption("showFoldWidgets", true);
   aceEditor.setOption("displayIndentGuides", true);
 }
+let appliedEditorScale = 0;
+function applyEditorScale(scale?: number): void {
+  if (!aceEditor) return;
+  const platform = window.LiteLLMCodeEditorPlatform;
+  const baseFontSize = platform === "windows" ? 16 : 12;
+  const effectiveScale = platform === "windows" ? Math.max(1, Number(scale) || 1) : 1;
+  if (effectiveScale === appliedEditorScale) return;
+  appliedEditorScale = effectiveScale;
+  // Set Ace's own font size so character width and line height stay in sync;
+  // CSS-only scaling leaves pointer-to-caret math at the old metrics.
+  aceEditor.setFontSize(baseFontSize * effectiveScale);
+  document.documentElement.style.setProperty("--editor-scale", String(effectiveScale));
+}
 function createEditor(command: ReplaceDocumentCommand): void {
   const aceApi = window.ace;
   if (!aceApi) throw new Error("Ace failed to load.");
@@ -723,6 +738,8 @@ function receive(input: unknown): void {
     // The host reads the system pasteboard for the context menu's Paste item
     // and injects it here; the editor document itself stays capped at 2 MiB.
     insertHostText(message.text);
+  } else if (message.type === "scale" && typeof message.scale === "number") {
+    applyEditorScale(message.scale);
   } else if (message.type === "focus") {
     aceEditor?.focus();
   }

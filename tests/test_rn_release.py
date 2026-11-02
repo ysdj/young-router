@@ -1087,6 +1087,98 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("sync_js", script[auto_branch_start:auto_branch_end])
         self.assertGreater(sync_script.index(restart_line), auto_branch_end - (metro_end - metro_start))
 
+    def test_the_windows_loop_carries_javascript_and_reads_the_app_window(self) -> None:
+        # The Windows host builds in a copy of its own (node_modules cannot live
+        # on the Mac share), so the loop's two jobs are named in one place: carry
+        # the JavaScript surface into the installed package, and read the window
+        # back.  A native source is refused by name, because the exe is the only
+        # thing that can carry it.
+        script = (ROOT / "scripts" / "dev-loop-windows.ps1").read_text(encoding="utf-8")
+        self.assertIn("YOUNG_ROUTER_WINDOWS_TREE", script)
+        self.assertIn("node_modules", script)
+        self.assertIn("index.windows.bundle", script)
+        self.assertIn("shell:AppsFolder", script)
+        self.assertIn("native sources the host executable cannot carry", script)
+        self.assertIn("pnpm run build:windows", script)
+        self.assertIn("-AllowStaleNative", script)
+        # The bundle lands in the package the running host loads it from, and
+        # the restart is the last thing the sync does.
+        self.assertIn("Join-Path $installDirectory 'YoungRouter\\Bundle'", script)
+        self.assertLess(script.index("index.windows.bundle"), script.index("shell:AppsFolder"))
+
+        reader = (ROOT / "scripts" / "windows-ui.ps1").read_text(encoding="utf-8")
+        # A Chinese element name from Git Bash and a click on an unfocused
+        # window are the two failures this reader exists to prevent.
+        self.assertIn("NameB64", reader)
+        self.assertIn("AttachThreadInput", reader)
+        self.assertIn("CopyFromScreen", reader)
+        self.assertIn("GetWindowRect", reader)
+
+    def test_the_js_loop_reloads_the_bundle_in_place_and_only_from_a_known_good_one(self) -> None:
+        # A UI edit's shortest path is a reload, not a restart: `RCTHost`
+        # registers itself as a reload listener in every configuration, and a
+        # reload re-reads the bundle URL and rebuilds the JS instance while Core
+        # and the proxy keep running.  Two properties keep that from turning
+        # into a host that will not start:
+        #
+        #   * a Release host has no red box, so a bundle that fails to compile
+        #     reaches `RCTFatal` and aborts.  `--metro` fetches the bundle and
+        #     `--reload` probes it before either points the app at it, and the
+        #     restart that makes the override visible happens only after that;
+        #   * the override outlives a crash, so the host itself drops it when a
+        #     bundle load fails -- otherwise one bad edit would make every later
+        #     launch abort before a window could be used to undo it.
+        script = (ROOT / "scripts" / "dev-loop-macos.sh").read_text(encoding="utf-8")
+        app_delegate = (ROOT / "rn/apps/macos/macos/YoungRouter-macOS/AppDelegate.mm").read_text(
+            encoding="utf-8"
+        )
+
+        # The reload trigger is a link the app answers by reloading, and it is
+        # dispatched on the main queue the way the route links are.
+        self.assertIn('RELOAD_URL="young-router://reload"', script)
+        self.assertIn('[url host] isEqualToString:@"reload"]', app_delegate)
+        self.assertIn('RCTTriggerReloadCommandListeners(@"young-router reload link")', app_delegate)
+        self.assertIn("#import <React/RCTReloadCommand.h>", app_delegate)
+
+        # Both entry points prove the bundle compiles before the app can load
+        # it: the fetch in `--metro` precedes the override write, and the probe
+        # in `--reload` precedes the link.
+        metro_start = script.index('if [[ "$MODE" == "metro" ]]; then')
+        metro_end = script.index("\nfi\n", metro_start)
+        metro = script[metro_start:metro_end]
+        self.assertLess(metro.index('status="$(curl -s -o'), metro.index("defaults write young.router.app MetroServerURL"))
+        self.assertLess(metro.index("defaults write young.router.app MetroServerURL"), metro.index('"$RESTART_APP"'))
+        # `dev=false`: this bundle runs inside a Release host, and `__DEV__` is
+        # what arms the renderer's "Event cannot be both direct and bubbling"
+        # check.  The generated AppKit picker and segmented control configs
+        # declare `topChange` directly while the macOS base config declares it as
+        # bubbling, so a dev bundle aborts on first render and the window shows
+        # nothing -- a loop that cannot show what it changed.  The packaged
+        # bundle is built without `__DEV__`, so the loop serves that same shape.
+        self.assertIn("dev=false&minify=false", metro)
+        self.assertNotIn("dev=true", metro.split('METRO_URL="', 1)[1].split("\\n", 1)[0])
+
+        reload_start = script.index('if [[ "$MODE" == "reload" ]]; then')
+        reload_end = script.index("\nfi\n", reload_start)
+        reload = script[reload_start:reload_end]
+        self.assertLess(reload.index('status="$(curl -s -o'), reload.index('open "$RELOAD_URL"'))
+        # A stopped Metro is refused rather than reloaded against, because the
+        # failure would abort the host rather than leave a red box on screen.
+        self.assertIn('if [[ "$status" != "200" ]]; then', reload)
+        # The reload restarts nothing: Core and the proxy must outlive it.
+        self.assertNotIn("$RESTART_APP", reload)
+
+        # The override is dropped on a failed load, before the abort, so the next
+        # launch is the packaged bundle again.
+        self.assertIn("RCTJavaScriptDidFailToLoadNotification", app_delegate)
+        clear = app_delegate.split("- (void)clearMetroOverrideWhenBundleFails:", 1)[1].split(
+            "- (void)installNativeStatusItem", 1
+        )[0]
+        self.assertLess(clear.index('removeObjectForKey:@"MetroServerURL"'), clear.index("synchronize"))
+        # Only a host that opted into Metro installs the observer, so a Release
+        # host that never used the loop keeps its stock failure path.
+        self.assertIn('if (defaults && [defaults stringForKey:@"MetroServerURL"] == nil) {', clear)
+
     def test_the_isolated_proxy_loop_runs_the_checkout_not_the_bundle(self) -> None:
         # The data-plane loop starts a second proxy from the checkout's
         # `young_router/` on a scratch port and a scratch runtime root.  Three

@@ -84,7 +84,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
 
     def test_catalog_switch_answers_without_a_restart_field(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             return_value=(["public-a"], True),
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -111,7 +111,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
 
     def test_acknowledge_action_is_no_longer_available(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             return_value=(["public-a"], True),
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -131,7 +131,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -162,7 +162,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -193,7 +193,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -221,7 +221,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -258,7 +258,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -300,7 +300,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -342,7 +342,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -387,7 +387,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -429,7 +429,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",

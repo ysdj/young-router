@@ -3465,6 +3465,16 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   // toggles: checked installs this app's public model list as Codex's own
   // catalog, unchecked removes the pointer so Codex keeps its built-in list.
   const codexModelCatalogEnabled = booleanValue(codexModelCatalogState(snapshot).enabled);
+  // The saved route Codex was put on — the one "use this app's API" returns to.
+  // Core remembers it because a client on the proxy names a public model that
+  // several saved routes may share.
+  const codexDesignatedRoute = codexState.designated_route as UnknownRecord | undefined;
+  // Claude is one rail entry and two apps: each carries its own switch, its own
+  // designated route, and its own generated model list.  Core owns both, so the
+  // pane only reads what it published.
+  const claudeState = asRecord(domainState(snapshot, "claude"));
+  const claudeClients = asRecord(claudeState.clients);
+  const claudeModelRows = asRecords(claudeState.models);
   // One strip per window. Backup & sync reports per tab, so the strip shows the
   // active tab's own result; every other route reports its own work here.
   const routeStatus = result;
@@ -3490,7 +3500,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { native.window.open("provider-wizard"); native.window.focus("provider-wizard"); }} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
     {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} status={result} /> : null}
-    {settingsRoute ? <AssistantSettingsWorkspace busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} /> : null}
+    {settingsRoute ? <AssistantSettingsWorkspace busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} codexRoute={codexDesignatedRoute ? { model: stringValue(codexDesignatedRoute.model), provider: stringValue(codexDesignatedRoute.provider), deployment_id: stringValue(codexDesignatedRoute.deployment_id), label: clientRouteLabel(stringValue(codexDesignatedRoute.provider), stringValue(codexDesignatedRoute.model)) } : undefined} standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} claudeClients={{ claudeCode: asRecord(claudeClients.claudeCode), claudeDesktop: asRecord(claudeClients.claudeDesktop) }} claudeModels={claudeModelRows} onClaudeUseLocalApi={(app, selection) => dispatch("use_local_api", { ...selection, client: app }, "claude")} onClaudeUseSavedModel={(app, selection) => dispatch("use_saved_model", { ...selection, client: app }, "claude")} onToggleClaudeModelList={(app, enabled) => dispatch("claude.models.set", { client: app, enabled }, "claude")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} /> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} onStatusBar={setStatusBarControls} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
     {route === "general-settings" ? <GeneralWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} dispatch={dispatch} dispatchServiceAction={enqueueServiceDispatch} translate={translate} onStatus={setResult} onSnapshot={onSnapshot} /> : null}
     {route === "runtime-settings" ? <RuntimeWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} native={native} ipc={ipc} onStatus={setResult} /> : null}
@@ -8453,11 +8463,20 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
  */
 const CLIENT_FILE_GROUPS: ReadonlyArray<{ client: ClientFile["client"]; titleKey: string; hintKey: string }> = [
   { client: "codex", titleKey: "clients.codex", hintKey: "settings.codexFilesHint" },
-  { client: "claudeCode", titleKey: "claude.codeSection", hintKey: "clients.claudeCodeFilesHint" },
-  { client: "claudeDesktop", titleKey: "claude.desktopSection", hintKey: "clients.claudeDesktopFilesHint" },
+  // Claude is one entry with two apps inside it: the CLI and the desktop app
+  // keep separate files, so the detail lists them by app instead of the rail
+  // offering the same product twice.
+  { client: "claude", titleKey: "clients.claude", hintKey: "clients.claudeFilesHint" },
   { client: "pi", titleKey: "clients.pi", hintKey: "clients.piFilesHint" },
   { client: "dsh", titleKey: "clients.dsh", hintKey: "clients.dshFilesHint" },
   { client: "opencode", titleKey: "clients.opencode", hintKey: "clients.opencodeFilesHint" },
+];
+
+/** The apps inside the one Claude rail entry, in the pane's display order. */
+type ClaudeClientApp = "claudeCode" | "claudeDesktop";
+const CLAUDE_APP_GROUPS: ReadonlyArray<{ app: ClaudeClientApp; titleKey: string }> = [
+  { app: "claudeCode", titleKey: "claude.codeSection" },
+  { app: "claudeDesktop", titleKey: "claude.desktopSection" },
 ];
 
 /**
@@ -8466,6 +8485,13 @@ const CLIENT_FILE_GROUPS: ReadonlyArray<{ client: ClientFile["client"]; titleKey
  * it while the switch is on; every other listed file opens directly.
  */
 const CODEX_MODEL_CATALOG_FILE_ID = "codex_model_catalog";
+
+/**
+ * The Claude Code document Core writes a generated picker into.  Claude Code
+ * keeps its model list in its own settings file rather than a separate one, so
+ * this is the file whose manual edit can be overwritten while that switch is on.
+ */
+const CLAUDE_CODE_SETTINGS_FILE_ID = "claude.settings";
 
 /**
  * The external-settings file editor. Each host presents it as its own
@@ -8730,12 +8756,275 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
 const NATIVE_ACTION_MENU_ITEM_LIMIT = 32;
 
 /** One saved provider route, as the pane's controls name and send it. */
+/**
+ * One saved route, as the designate control and the off direction read it.
+ *
+ * The public model name is a route's identity on this app's proxy, and several
+ * saved routes may share one, so the deployment id travels with it: a label
+ * alone cannot tell two routes of one model apart.
+ */
 type ClientRoute = { model: string; provider: string; deployment_id: string; label: string };
 
-function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatalogEnabled, standaloneSearch, onToggleStandaloneSearch, codexFeatures, clientProvider, clientModel, localApiActive, onToggleCodexModelCatalog, onToggleCodexFeature, onUseLocalApi, onUseSavedModel, translate, ipc, filesToken, onOpenFile }: { busy: boolean; native: NativeLeafAdapter; codexModels: UnknownRecord[]; codexModelCatalogEnabled: boolean; standaloneSearch: boolean; onToggleStandaloneSearch: (enabled: boolean) => Promise<void>; codexFeatures?: UnknownRecord; clientProvider: string; clientModel: string; localApiActive: boolean; onToggleCodexModelCatalog: (enabled: boolean) => Promise<void>; onToggleCodexFeature: (feature: string, enabled: boolean) => Promise<void>; onUseLocalApi: (selection: UnknownRecord) => Promise<void>; onUseSavedModel: (selection: UnknownRecord) => Promise<void>; translate: Translate; ipc: IpcClient; filesToken: number; onOpenFile: (file: ClientFile) => void }): React.JSX.Element {
+function clientRouteLabel(provider: string, model: string): string {
+  return [provider.trim(), model.trim()].filter((part) => part.length > 0).join(" / ");
+}
+
+/**
+ * The saved-route menu one designate control opens.
+ *
+ * Every client asks the same question of the same list, so the menu is built
+ * once: a provider is the menu's own level so a long model list stays
+ * navigable, and each provider keeps its models in stored order.  One route is
+ * one row — a provider can serve one public name from two routes (two keys, a
+ * fallback ordering), and collapsing them by name offered only the first — so
+ * where a name is shared the row says which key it answers with.
+ */
+function savedRouteMenuGroups(models: UnknownRecord[], translate: Translate): Array<{ title: string; labels: string[]; selections: UnknownRecord[] }> {
+  const rows = models.flatMap((row) => {
+    const model = stringValue(row.model).trim();
+    const provider = stringValue(row.provider).trim();
+    const deploymentId = stringValue(row.deployment_id).trim();
+    if (!model || !provider || !deploymentId) return [];
+    return [{ model, provider, deploymentId, keyName: stringValue(row.api_key_name).trim() }];
+  });
+  const shared = new Map<string, number>();
+  for (const row of rows) {
+    const identity = `${row.provider}\u001f${row.model}`;
+    shared.set(identity, (shared.get(identity) ?? 0) + 1);
+  }
+  const providers = new Map<string, { labels: string[]; selections: UnknownRecord[] }>();
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const identity = `${row.provider}\u001f${row.deploymentId}`;
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    const duplicated = (shared.get(`${row.provider}\u001f${row.model}`) ?? 0) > 1;
+    const entry = providers.get(row.provider) ?? { labels: [], selections: [] };
+    entry.labels.push(duplicated ? `${row.model} · ${row.keyName || translate("providers.undefinedKey")}` : row.model);
+    entry.selections.push({ model: row.model, provider: row.provider, deployment_id: row.deploymentId });
+    providers.set(row.provider, entry);
+  }
+  return [...providers].map(([provider, entry]) => ({ title: provider, labels: entry.labels, selections: entry.selections }));
+}
+
+/**
+ * One client's backend, as fields of the shared settings grid.
+ *
+ * Codex and both Claude apps answer the same question — this app's proxy, or
+ * one saved provider route — so the controls are drawn once here instead of
+ * once per client.  What differs is only which Core action names the client
+ * (the caller closes over that) and whether the client also carries a model
+ * list of its own, which is what ``modelList`` decides.
+ */
+function ClientBackendFields({ accessibilityPrefix, models, native, localApiActive, designatedRoute, designatedSelection, modelList, modelListHint, busy, onUseLocalApi, onUseSavedModel, translate }: {
+  /** Disambiguates two clients' identical labels inside one pane. */
+  accessibilityPrefix?: string;
+  /** The saved routes this app serves, as the designate menu lists them. */
+  models: UnknownRecord[];
+  native: NativeLeafAdapter;
+  localApiActive: boolean;
+  /** The route the client is on, empty while it points at this app's proxy. */
+  designatedRoute: string;
+  /** What the off direction returns to; absent when nothing is remembered. */
+  designatedSelection?: UnknownRecord;
+  /** Absent for a client that keeps no model list of its own. */
+  modelList?: { enabled: boolean; onToggle: (enabled: boolean) => Promise<void> };
+  modelListHint?: string;
+  busy: boolean;
+  onUseLocalApi: (selection: UnknownRecord) => Promise<void>;
+  onUseSavedModel: (selection: UnknownRecord) => Promise<void>;
+  translate: Translate;
+}): React.JSX.Element {
+  const menuGroups = useMemo(() => savedRouteMenuGroups(models, translate), [models, translate]);
+  const savedModelCount = menuGroups.reduce((total, group) => total + group.labels.length, 0);
+  const [clientActionBusy, setClientActionBusy] = useState(false);
+  const [designateBusy, setDesignateBusy] = useState(false);
+  const [listBusy, setListBusy] = useState(false);
+  // A controlled native switch only repaints on a *changed* value prop, so an
+  // action that cannot name a saved route re-mounts it onto the configured
+  // value instead of drifting from the file.
+  const [switchGeneration, setSwitchGeneration] = useState(0);
+  const designateButtonRef = useRef<HostInstance | null>(null);
+  const labelled = (key: string): string => (accessibilityPrefix ? `${accessibilityPrefix}: ${translate(key)}` : translate(key));
+  const assembleSwitch = (): void => setSwitchGeneration((current) => current + 1);
+  const designateSavedModel = (selection: UnknownRecord | undefined): void => {
+    if (!selection || designateBusy || clientActionBusy) return;
+    setDesignateBusy(true);
+    void onUseSavedModel(selection).finally(() => setDesignateBusy(false));
+  };
+  // One menu backs both controls: a provider is the menu's own level, so a
+  // long model list stays navigable.  The host answers the chosen
+  // ``{group, item}`` pair, or nothing when the menu was dismissed, which
+  // leaves the client as it was.
+  const openSavedModelMenu = (anchor: HostInstance | null): void => {
+    const showGroupedActionMenu = native.showGroupedActionMenu;
+    if (!anchor || !showGroupedActionMenu || savedModelCount === 0) return;
+    const groups = menuGroups
+      .slice(0, NATIVE_ACTION_MENU_ITEM_LIMIT)
+      .map((group) => ({ title: group.title, items: group.labels }));
+    anchor.measureInWindow((x, y, width, height) => {
+      void showGroupedActionMenu({ title: translate("settings.designateAs"), groups, anchor: { x, y, width, height } })
+        .then((choice) => { if (choice) designateSavedModel(menuGroups[choice.group]?.selections[choice.item]); });
+    });
+  };
+  // A real two-way switch: on adopts this app's proxy through the row this app
+  // owns, off puts the client back on the saved route the control names — the
+  // remembered route, so unchecking opens no menu.
+  const toggleLocalApi = (enabled: boolean): void => {
+    if (clientActionBusy || designateBusy) { assembleSwitch(); return; }
+    if (enabled) {
+      setClientActionBusy(true);
+      // The proxy serves public model names, so adopting it also states the
+      // route the client is leaving; that is what "off" returns to later.
+      void onUseLocalApi(designatedSelection ?? {}).finally(() => setClientActionBusy(false));
+      return;
+    }
+    if (!designatedSelection) { assembleSwitch(); return; }
+    designateSavedModel(designatedSelection);
+  };
+  return <View style={styles.externalSettingsFieldList}>
+    <View style={styles.externalSettingsField}>
+      <View style={styles.externalSettingsInputRow}>
+        <TooltipText numberOfLines={1} tooltip={translate("settings.useLocalApi")} style={styles.externalSettingsFieldLabel} accessibilityLabel={labelled("settings.useLocalApi")}>{translate("settings.useLocalApi")}</TooltipText>
+        <View style={styles.externalSettingsValueSlot}>
+          <NativeToggle
+            key={`use-local-api-${switchGeneration}`}
+            accessibilityLabel={labelled("settings.useLocalApi")}
+            value={localApiActive}
+            disabled={(busy && !(clientActionBusy || designateBusy)) || clientActionBusy || designateBusy}
+            onValueChange={toggleLocalApi}
+            style={styles.externalSettingsBooleanControl}
+          />
+        </View>
+      </View>
+      <View style={styles.externalSettingsHelpSlot}><Text style={styles.externalSettingsHelpText}>{translate("settings.useLocalApiHint")}</Text></View>
+    </View>
+    <View style={styles.externalSettingsField}>
+      <View style={styles.externalSettingsInputRow}>
+        <TooltipText numberOfLines={1} tooltip={translate("settings.designateAs")} style={styles.externalSettingsFieldLabel} accessibilityLabel={labelled("settings.designateAs")}>{translate("settings.designateAs")}</TooltipText>
+        <View style={styles.externalSettingsValueSlot}>
+          <NativeButton
+            ref={designateButtonRef}
+            title={designatedRoute}
+            toolTip={translate(savedModelCount > 0 ? "settings.designateAsHint" : "settings.designateAsUnavailable")}
+            accessibilityLabel={designatedRoute ? `${translate("settings.designateAs")}: ${designatedRoute}` : labelled("settings.designateAs")}
+            titleWidth="flex"
+            symbol="chevron-up-down"
+            symbolWithTitle
+            symbolTrailing
+            disabled={(busy && !designateBusy) || designateBusy || clientActionBusy || savedModelCount === 0}
+            busy={designateBusy}
+            onPress={() => {
+              if (designateBusy || clientActionBusy) return;
+              openSavedModelMenu(designateButtonRef.current);
+            }}
+          />
+        </View>
+      </View>
+    </View>
+    {modelList === undefined ? null : <View style={styles.externalSettingsField}>
+      <View style={styles.externalSettingsInputRow}>
+        <TooltipText numberOfLines={1} tooltip={translate("settings.useRouterModelList")} style={styles.externalSettingsFieldLabel} accessibilityLabel={labelled("settings.useRouterModelList")}>{translate("settings.useRouterModelList")}</TooltipText>
+        <View style={styles.externalSettingsValueSlot}>
+          <NativeToggle
+            accessibilityLabel={labelled("settings.useRouterModelList")}
+            value={modelList.enabled}
+            disabled={(busy && !listBusy) || listBusy}
+            onValueChange={(enabled) => {
+              if (listBusy) return;
+              setListBusy(true);
+              void modelList.onToggle(enabled).finally(() => setListBusy(false));
+            }}
+            style={styles.externalSettingsBooleanControl}
+          />
+        </View>
+      </View>
+      {modelListHint ? <View style={styles.externalSettingsHelpSlot}><Text style={styles.externalSettingsHelpText}>{modelListHint}</Text></View> : null}
+    </View>}
+  </View>;
+}
+
+/**
+ * One client's listed files, grouped by the app that owns them.
+ *
+ * A rail entry can cover more than one app — Claude is Claude Code and Claude
+ * Desktop — and their documents belong to different programs, so a group's
+ * own title sits above its rows.  A client whose rail entry is already one app
+ * draws its rows directly, without repeating the entry's name.
+ */
+function ClientFileRows({ files, groups, revealFileLabel, revealFile, busy, translate, onOpenFile }: {
+  files: ClientFile[];
+  /** The app titles this client's files are split into; empty for one app. */
+  groups: ReadonlyArray<{ app: NonNullable<ClientFile["app"]>; titleKey: string }>;
+  revealFileLabel: string;
+  /** Absent on a host that cannot show a file in its own file manager. */
+  revealFile?: (path: string) => void;
+  busy: boolean;
+  translate: Translate;
+  onOpenFile: (file: ClientFile) => void;
+}): React.JSX.Element {
+  const row = (file: ClientFile): React.JSX.Element => <View key={file.id} style={assistantFileSurfaceStyles.fileRow}>
+    <View style={assistantFileSurfaceStyles.fileMeta}>
+      <Text numberOfLines={1} style={assistantFileSurfaceStyles.fileLabel}>{file.name}</Text>
+      {/* The path itself is the reveal control, so a click opens the platform
+          file manager at that file (or its directory). */}
+      <NativeButton
+        link
+        plainLink
+        titleWidth="flex"
+        title={file.display_path}
+        toolTip={revealFileLabel}
+        accessibilityLabel={`${revealFileLabel}: ${file.display_path}`}
+        disabled={revealFile === undefined}
+        onPress={() => revealFile?.(file.path)}
+        style={assistantFileSurfaceStyles.filePathLink}
+      />
+    </View>
+    {file.exists ? null : <Text style={assistantFileSurfaceStyles.fileMissing}>{translate("clients.fileMissing")}</Text>}
+    <NativeButton title={translate("settings.editFile")} toolTip={file.exists ? undefined : translate("clients.fileMissing")} accessibilityLabel={`${translate("settings.editFile")}: ${file.display_path}`} disabled={busy || !file.exists} onPress={() => onOpenFile(file)} style={assistantFileSurfaceStyles.editFileButton} />
+  </View>;
+  if (groups.length === 0) return <>{files.map(row)}</>;
+  return <>{groups.map((group) => {
+    const members = files.filter((file) => file.app === group.app);
+    if (members.length === 0) return null;
+    return <View key={group.app} style={styles.externalSettingsFileGroup}>
+      <Text style={styles.externalSettingsFileGroupTitle}>{translate(group.titleKey)}</Text>
+      {members.map(row)}
+    </View>;
+  })}</>;
+}
+
+function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatalogEnabled, codexRoute, standaloneSearch, onToggleStandaloneSearch, codexFeatures, clientProvider, clientModel, localApiActive, onToggleCodexModelCatalog, onToggleCodexFeature, onUseLocalApi, onUseSavedModel, claudeClients, claudeModels, onClaudeUseLocalApi, onClaudeUseSavedModel, onToggleClaudeModelList, translate, ipc, filesToken, onOpenFile }: {
+  busy: boolean;
+  native: NativeLeafAdapter;
+  codexModels: UnknownRecord[];
+  codexModelCatalogEnabled: boolean;
+  /** The saved route Codex is on, or the one it last left for this app. */
+  codexRoute?: ClientRoute;
+  standaloneSearch: boolean;
+  onToggleStandaloneSearch: (enabled: boolean) => Promise<void>;
+  codexFeatures?: UnknownRecord;
+  clientProvider: string;
+  clientModel: string;
+  localApiActive: boolean;
+  onToggleCodexModelCatalog: (enabled: boolean) => Promise<void>;
+  onToggleCodexFeature: (feature: string, enabled: boolean) => Promise<void>;
+  onUseLocalApi: (selection: UnknownRecord) => Promise<void>;
+  onUseSavedModel: (selection: UnknownRecord) => Promise<void>;
+  /** One entry per Claude app: its own switch, route, and model list. */
+  claudeClients: Record<ClaudeClientApp, UnknownRecord>;
+  claudeModels: UnknownRecord[];
+  onClaudeUseLocalApi: (app: ClaudeClientApp, selection: UnknownRecord) => Promise<void>;
+  onClaudeUseSavedModel: (app: ClaudeClientApp, selection: UnknownRecord) => Promise<void>;
+  onToggleClaudeModelList: (app: ClaudeClientApp, enabled: boolean) => Promise<void>;
+  translate: Translate;
+  ipc: IpcClient;
+  filesToken: number;
+  onOpenFile: (file: ClientFile) => void;
+}): React.JSX.Element {
   const [files, setFiles] = useState<ClientFile[]>();
   const [error, setError] = useState<string>();
-  // The rail selects one client; its detail lists that client's files only.
+  // The rail selects one client entry; its detail lists that client's files.
   const [selectedClient, setSelectedClient] = useState<ClientFile["client"]>("codex");
   useEffect(() => {
     let active = true;
@@ -8765,20 +9054,10 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
   // Finder on macOS, Explorer on Windows: the label names the platform's own
   // file manager, and the host only ever opens it at the listed path.
   const revealFileLabel = translate(Platform.OS === "windows" ? "settings.revealInExplorer" : "settings.revealInFinder");
-  // Codex's own config names its gateway, so this client has exactly two
-  // backends: this app's proxy, or one saved provider route.  The field's
-  // switch is the real two-way switch between them and mirrors the
-  // configuration; the control beside it decides which saved route the off
-  // position means.  A controlled native checkbox only repaints on a changed
-  // value prop, so an uncheck that cannot name a saved route re-mounts the box
-  // onto the configured value instead of drifting from the file.
-  const [clientActionBusy, setClientActionBusy] = useState(false);
-  const [clientSwitchGeneration, setClientSwitchGeneration] = useState(0);
-  const settleClientSwitch = (): void => setClientSwitchGeneration((current) => current + 1);
   // Codex's own model list is one Core switch, not a document edit: checked
-  // installs this app's public model list as Codex's catalog, unchecked drops
-  // the managed pointer so the client falls back to its built-in list. Core
-  // owns the value and the switch only guards the request while it is in
+  // installs this app's public model list as Codex's own catalog, unchecked
+  // drops the managed pointer so the client falls back to its built-in list.
+  // Core owns the value and the switch only guards the request while it is in
   // flight.
   const [catalogBusy, setCatalogBusy] = useState(false);
   const toggleCatalog = (enabled: boolean): void => {
@@ -8786,173 +9065,33 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
     setCatalogBusy(true);
     void onToggleCodexModelCatalog(enabled).finally(() => setCatalogBusy(false));
   };
-  // The catalog file only stays the user's while the switch is off: with it
-  // on, Core rewrites that file from the public model list whenever the list
-  // changes, so an edit needs one explicit confirmation first.
-  const openClientFile = (file: ClientFile): void => {
-    if (file.id !== CODEX_MODEL_CATALOG_FILE_ID || !codexModelCatalogEnabled) {
-      onOpenFile(file);
-      return;
-    }
+  const claudeCode = asRecord(claudeClients.claudeCode);
+  const claudeDesktop = asRecord(claudeClients.claudeDesktop);
+  // A file this app generates only stays the user's while its own switch is
+  // off: with the switch on, Core rewrites that file whenever the list it came
+  // from changes, so an edit needs one explicit confirmation first.
+  const generatedFileOpen = (file: ClientFile, generated: boolean): void => {
+    if (!generated) { onOpenFile(file); return; }
     void native.showConfirmation({
       title: translate("codex.modelCatalogEditTitle"),
       message: translate("codex.modelCatalogEditBody"),
       confirmLabel: translate("codex.modelCatalogEditConfirm"),
     }).then((confirmed) => { if (confirmed) onOpenFile(file); });
   };
-  // The designate action puts the client straight onto one saved provider
-  // route: its own model, endpoint, and key, taken from Young Router's stored
-  // model list.
-  const [designateBusy, setDesignateBusy] = useState(false);
-  const designateButtonRef = useRef<HostInstance | null>(null);
-  const savedModelGroups = useMemo(() => {
-    const rows = codexModels.flatMap((row) => {
-      const model = stringValue(row.model).trim();
-      const provider = stringValue(row.provider).trim();
-      const deploymentId = stringValue(row.deployment_id).trim();
-      if (!model || !provider || !deploymentId) return [];
-      return [{ model, provider, deploymentId, keyName: stringValue(row.api_key_name).trim() }];
-    });
-    // One route is one menu row: a provider can serve one public name from two
-    // routes (two keys, a fallback ordering), and collapsing them by name
-    // offered only the first — the second could never be designated.  Where a
-    // name is shared, the row says which key it answers with.
-    const shared = new Map<string, number>();
-    for (const row of rows) {
-      const identity = `${row.provider}\u001f${row.model}`;
-      shared.set(identity, (shared.get(identity) ?? 0) + 1);
-    }
-    const providers = new Map<string, { labels: string[]; selections: UnknownRecord[] }>();
-    const seen = new Set<string>();
-    for (const row of rows) {
-      const identity = `${row.provider}\u001f${row.deploymentId}`;
-      if (seen.has(identity)) continue;
-      seen.add(identity);
-      const duplicated = (shared.get(`${row.provider}\u001f${row.model}`) ?? 0) > 1;
-      const entry = providers.get(row.provider) ?? { labels: [], selections: [] };
-      entry.labels.push(duplicated ? `${row.model} · ${row.keyName || translate("providers.undefinedKey")}` : row.model);
-      entry.selections.push({ model: row.model, provider: row.provider, deployment_id: row.deploymentId });
-      providers.set(row.provider, entry);
-    }
-    return [...providers].map(([provider, entry]) => ({ provider, labels: entry.labels, selections: entry.selections }));
-  }, [codexModels, translate]);
-  const savedModelCount = savedModelGroups.reduce((total, group) => total + group.labels.length, 0);
-  const designateSavedModel = (selection: UnknownRecord | undefined): void => {
-    const chosen = selection ?? undefined;
-    if (!chosen || designateBusy || clientActionBusy) return;
-    const provider = stringValue(chosen.provider).trim();
-    const model = stringValue(chosen.model).trim();
-    if (provider && model) setLastRoute({ model, provider, deployment_id: stringValue(chosen.deployment_id).trim(), label: `${provider} / ${model}` });
-    setDesignateBusy(true);
-    void onUseSavedModel(chosen).finally(() => setDesignateBusy(false));
+  const openClientFile = (file: ClientFile): void => {
+    // The two documents Core generates model lists into: Codex's own catalog
+    // file, and Claude Code's settings document, which holds its picker.
+    if (file.id === CODEX_MODEL_CATALOG_FILE_ID) { generatedFileOpen(file, codexModelCatalogEnabled); return; }
+    if (file.id === CLAUDE_CODE_SETTINGS_FILE_ID) { generatedFileOpen(file, booleanValue(claudeCode.model_list_enabled)); return; }
+    onOpenFile(file);
   };
-  // One menu backs both controls: a provider is the menu's own level, so a
-  // long model list stays navigable, and each provider keeps its models in
-  // stored order.  The host answers the chosen `{group, item}` pair, or
-  // nothing when the menu was dismissed, which leaves the client as it was.
-  const openSavedModelMenu = (anchor: HostInstance | null): void => {
-    const showGroupedActionMenu = native.showGroupedActionMenu;
-    if (!anchor || !showGroupedActionMenu || savedModelCount === 0) return;
-    const groups = savedModelGroups
-      .slice(0, NATIVE_ACTION_MENU_ITEM_LIMIT)
-      .map((group) => ({ title: group.provider, items: group.labels }));
-    anchor.measureInWindow((x, y, width, height) => {
-      void showGroupedActionMenu({ title: translate("settings.designateAs"), groups, anchor: { x, y, width, height } })
-        .then((choice) => { if (choice) designateSavedModel(savedModelGroups[choice.group]?.selections[choice.item]); });
-    });
-  };
-  // The client names the route's own provider model id, which can carry a
-  // LiteLLM adapter prefix and the provider's own decoration, while the menu
-  // beside it offers the saved route's public model.  Resolve the saved route
-  // the client points at once, so both the control's label and the switch's
-  // off direction use the spelling the menu itself offers; a target this pane
-  // cannot resolve keeps the client's own spelling and can only be left
-  // through the menu.
-  const clientRoute = useMemo(() => {
-    const tail = (value: string): string => value.slice(value.lastIndexOf("/") + 1).trim().toLowerCase();
-    const model = clientModel.trim();
-    if (!model) return undefined;
-    // The client names its route either by the provider's own model id (when
-    // it talks to the provider directly) or by the public name this app's
-    // proxy serves, so both spellings identify the same saved route — which is
-    // what lets the switch name the route it would go back to.
-    const matches = (row: UnknownRecord): boolean => {
-      const publicModel = stringValue(row.model).trim();
-      if (publicModel && publicModel === model) return true;
-      return tail(stringValue(row.upstream_model)) === tail(model);
-    };
-    // The provider ``model_provider`` names is the route's own provider on
-    // both sides of the switch, so that pairing identifies the route exactly;
-    // a model name on its own is only a fallback for a client this pane does
-    // not recognize.
-    const matching = codexModels.filter(matches);
-    const saved = codexModels.find((row) => clientProvider !== "" && stringValue(row.provider).trim() === clientProvider && matches(row))
-      // Without a provider this pane recognizes, the model name alone decides
-      // only while one saved route carries it: two providers can expose the
-      // same upstream tail, and picking the first would put the client on a
-      // route it was never on.  An unresolved target keeps the client's own
-      // spelling and can still be left through the designate menu.
-      ?? (matching.length === 1 ? matching[0] : undefined);
-    if (!saved) return undefined;
-    const savedProvider = stringValue(saved.provider).trim();
-    const mapped = stringValue(saved.model).trim();
-    const deploymentId = stringValue(saved.deployment_id).trim();
-    if (!savedProvider || !mapped || !deploymentId) return undefined;
-    return { model: mapped, provider: savedProvider, deployment_id: deploymentId, label: `${savedProvider} / ${mapped}` };
-  }, [clientModel, clientProvider, codexModels]);
-  // The route the user last put this client on.  On the proxy the client's
-  // model is only a public name, which several saved routes may share, so the
-  // remembered choice — not the first matching row — decides where "off" goes.
-  const [lastRoute, setLastRoute] = useState<ClientRoute | undefined>(undefined);
-  useEffect(() => {
-    if (clientRoute) setLastRoute(clientRoute);
-  }, [clientRoute]);
-  const offRoute = localApiActive ? lastRoute ?? clientRoute : clientRoute;
-  const clientRouteLabel = clientRoute?.label
+  // The control names the API a client uses.  On this app's proxy no specific
+  // API is selected — the client talks to the proxy — so the field stays
+  // empty there, and picking a route is what fills it and moves the switch
+  // off.  The route remembered for a later "off" is deliberately not shown: it
+  // is where the switch would go, not where the client is.
+  const codexRouteLabel = codexRoute?.label
     ?? [clientProvider, clientModel].filter((part) => part.length > 0).join(" / ");
-  // The control names the API this client uses.  On this app's proxy no
-  // specific API is selected — the client talks to the proxy — so the field
-  // stays empty there, and picking a route is what fills it and moves the
-  // switch off.  The route remembered for a later "off" is deliberately not
-  // shown: it is where the switch would go, not where the client is.
-  const designatedRoute = localApiActive ? "" : clientRouteLabel;
-  // A real two-way switch: on adopts this app's proxy through the provider row
-  // this app owns, off puts the client back on the saved route the control
-  // names — resolved from the client's own provider and model, so unchecking
-  // opens no menu.  An action that cannot name a saved route changes nothing
-  // and re-mounts the switch onto the configured value (a controlled native
-  // control only repaints on a *changed* value prop).
-  const toggleLocalApi = (enabled: boolean): void => {
-    if (clientActionBusy || designateBusy) { settleClientSwitch(); return; }
-    if (enabled) {
-      setClientActionBusy(true);
-      // The proxy serves public model names, so adopting it also names the
-      // route the client is leaving.
-      void onUseLocalApi(offRoute ?? {}).finally(() => setClientActionBusy(false));
-      return;
-    }
-    if (!offRoute) { settleClientSwitch(); return; }
-    designateSavedModel(offRoute);
-  };
-  const designateAction = selectedClient === "codex"
-    ? <NativeButton
-        ref={designateButtonRef}
-        title={designatedRoute}
-        toolTip={translate(savedModelCount > 0 ? "settings.designateAsHint" : "settings.designateAsUnavailable")}
-        accessibilityLabel={designatedRoute ? `${translate("settings.designateAs")}: ${designatedRoute}` : translate("settings.designateAs")}
-        titleWidth="flex"
-        symbol="chevron-up-down"
-        symbolWithTitle
-        symbolTrailing
-        disabled={(busy && !designateBusy) || designateBusy || clientActionBusy || savedModelCount === 0}
-        busy={designateBusy}
-        onPress={() => {
-          if (designateBusy || clientActionBusy) return;
-          openSavedModelMenu(designateButtonRef.current);
-        }}
-      />
-    : null;
-
   const featureKeys = Object.keys(codexFeatures ?? {}).filter((feature) => feature.endsWith("_use"));
   // Browser and Computer Use are Codex's own capabilities and are on by default
   // there, so a switch for them here only restated another app's setting — and
@@ -8975,49 +9114,26 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
         hint={translate(selectedGroup.hintKey)}
       />
       <PersistentScrollView style={styles.externalSettingsPane} contentContainerStyle={styles.externalSettingsPaneContent} horizontal={false} showsVerticalScrollIndicator>
-        {/* The Codex client's controls are fields of the same grid the runtime
-            pane's settings use — one left-aligned label column, one control
-            column, and the tip wrapped underneath that column — so both detail
-            panes read as one surface.  The switch moves the client between
-            this app's proxy and the saved route the control names. */}
-        {selectedClient === "codex" ? <View style={styles.externalSettingsFieldList}>
-          <View style={styles.externalSettingsField}>
-            <View style={styles.externalSettingsInputRow}>
-              <TooltipText numberOfLines={1} tooltip={translate("settings.useLocalApi")} style={styles.externalSettingsFieldLabel} accessibilityLabel={translate("settings.useLocalApi")}>{translate("settings.useLocalApi")}</TooltipText>
-              <View style={styles.externalSettingsValueSlot}>
-                <NativeToggle
-                  key={`use-local-api-${clientSwitchGeneration}`}
-                  accessibilityLabel={translate("settings.useLocalApi")}
-                  value={localApiActive}
-                  disabled={(busy && !(clientActionBusy || designateBusy)) || clientActionBusy || designateBusy}
-                  onValueChange={toggleLocalApi}
-                  style={styles.externalSettingsBooleanControl}
-                />
-              </View>
-            </View>
-            <View style={styles.externalSettingsHelpSlot}><Text style={styles.externalSettingsHelpText}>{translate("settings.useLocalApiHint")}</Text></View>
-          </View>
-          <View style={styles.externalSettingsField}>
-            <View style={styles.externalSettingsInputRow}>
-              <TooltipText numberOfLines={1} tooltip={translate("settings.designateAs")} style={styles.externalSettingsFieldLabel} accessibilityLabel={translate("settings.designateAs")}>{translate("settings.designateAs")}</TooltipText>
-              <View style={styles.externalSettingsValueSlot}>{designateAction}</View>
-            </View>
-          </View>
-          <View style={styles.externalSettingsField}>
-            <View style={styles.externalSettingsInputRow}>
-              <TooltipText numberOfLines={1} tooltip={translate("codex.modelCatalog")} style={styles.externalSettingsFieldLabel} accessibilityLabel={translate("codex.modelCatalog")}>{translate("codex.modelCatalog")}</TooltipText>
-              <View style={styles.externalSettingsValueSlot}>
-                <NativeToggle
-                  accessibilityLabel={translate("codex.modelCatalog")}
-                  value={codexModelCatalogEnabled}
-                  disabled={(busy && !catalogBusy) || catalogBusy}
-                  onValueChange={toggleCatalog}
-                  style={styles.externalSettingsBooleanControl}
-                />
-              </View>
-            </View>
-            <View style={styles.externalSettingsHelpSlot}><Text style={styles.externalSettingsHelpText}>{translate("codex.modelCatalogHint")}</Text></View>
-          </View>
+        {/* A client's controls are fields of the same grid the runtime pane's
+            settings use — one left-aligned label column, one control column,
+            and the tip wrapped underneath that column — so both detail panes
+            read as one surface.  Codex and Claude draw the same three fields
+            from one component: "use this app's API" plus the saved route it
+            returns to, and the model list Core generates for that client. */}
+        {selectedClient === "codex" ? <>
+          <ClientBackendFields
+            models={codexModels}
+            native={native}
+            localApiActive={localApiActive}
+            designatedRoute={localApiActive ? "" : codexRouteLabel}
+            designatedSelection={codexRoute}
+            modelList={{ enabled: codexModelCatalogEnabled, onToggle: async (enabled) => toggleCatalog(enabled) }}
+            modelListHint={translate("codex.modelCatalogHint")}
+            busy={busy}
+            onUseLocalApi={onUseLocalApi}
+            onUseSavedModel={onUseSavedModel}
+            translate={translate}
+          />
           <View style={styles.externalSettingsField}>
             <View style={styles.externalSettingsInputRow}>
               <TooltipText numberOfLines={1} tooltip={translate("codex.standaloneSearch")} style={styles.externalSettingsFieldLabel} accessibilityLabel={translate("codex.standaloneSearch")}>{translate("codex.standaloneSearch")}</TooltipText>
@@ -9051,31 +9167,48 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
               <View style={styles.externalSettingsHelpSlot}><Text style={styles.externalSettingsHelpText}>{translate("codex.surfaceFeatureHint")}</Text></View>
             </View>;
           })}
-        </View> : null}
+        </> : null}
+        {/* Claude is one rail entry and two apps.  Each carries its own switch,
+            its own designated route, and its own generated model list, so the
+            pane says which app a block belongs to instead of drawing one
+            client's state on the other's row. */}
+        {selectedClient === "claude" ? CLAUDE_APP_GROUPS.map(({ app, titleKey }) => {
+          const state = asRecord(app === "claudeCode" ? claudeCode : claudeDesktop);
+          const available = app === "claudeCode" || claudeDesktop.available !== false;
+          const route = asRecord(state.designated_route);
+          return <View key={app} style={styles.externalSettingsAppGroup}>
+            <View style={styles.externalSettingsAppHeader}>
+              <Text style={styles.externalSettingsAppTitle}>{translate(titleKey)}</Text>
+            </View>
+            <ClientBackendFields
+              accessibilityPrefix={translate(titleKey)}
+              models={claudeModels}
+              native={native}
+              localApiActive={booleanValue(state.uses_local_api)}
+              designatedRoute={booleanValue(state.uses_local_api) ? "" : clientRouteLabel(stringValue(route.provider), stringValue(route.model))}
+              designatedSelection={route}
+              modelList={{ enabled: booleanValue(state.model_list_enabled), onToggle: (enabled) => onToggleClaudeModelList(app, enabled) }}
+              modelListHint={translate(app === "claudeCode" ? "claude.codeModelListHint" : "claude.desktopModelListHint")}
+              busy={busy || !available}
+              onUseLocalApi={(selection) => onClaudeUseLocalApi(app, selection)}
+              onUseSavedModel={(selection) => onClaudeUseSavedModel(app, selection)}
+              translate={translate}
+            />
+          </View>;
+        }) : null}
         {error !== undefined
           ? <Text style={assistantFileSurfaceStyles.filesStatus}>{error}</Text>
           : files === undefined
             ? <Text style={assistantFileSurfaceStyles.filesStatus}>{translate("common.loading")}</Text>
-            : clientFiles(selectedClient).map((file) => <View key={file.id} style={assistantFileSurfaceStyles.fileRow}>
-              <View style={assistantFileSurfaceStyles.fileMeta}>
-                <Text numberOfLines={1} style={assistantFileSurfaceStyles.fileLabel}>{file.name}</Text>
-                {/* The path itself is the reveal control, so a click opens the
-                    platform file manager at that file (or its directory). */}
-                <NativeButton
-                  link
-                  plainLink
-                  titleWidth="flex"
-                  title={file.display_path}
-                  toolTip={revealFileLabel}
-                  accessibilityLabel={`${revealFileLabel}: ${file.display_path}`}
-                  disabled={native.revealFile === undefined}
-                  onPress={() => native.revealFile?.(file.path)}
-                  style={assistantFileSurfaceStyles.filePathLink}
-                />
-              </View>
-              {file.exists ? null : <Text style={assistantFileSurfaceStyles.fileMissing}>{translate("clients.fileMissing")}</Text>}
-              <NativeButton title={translate("settings.editFile")} toolTip={file.exists ? undefined : translate("clients.fileMissing")} accessibilityLabel={`${translate("settings.editFile")}: ${file.display_path}`} disabled={busy || !file.exists} onPress={() => openClientFile(file)} style={assistantFileSurfaceStyles.editFileButton} />
-            </View>)}
+            : <ClientFileRows
+                files={clientFiles(selectedClient)}
+                groups={selectedClient === "claude" ? CLAUDE_APP_GROUPS : []}
+                revealFileLabel={revealFileLabel}
+                revealFile={native.revealFile}
+                busy={busy}
+                translate={translate}
+                onOpenFile={openClientFile}
+              />}
       </PersistentScrollView>
     </View>
   </View>;
@@ -9607,6 +9740,10 @@ function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSec
         <Text style={styles.runtimeMultilineLabel} accessibilityLabel={label}>{label}</Text>
         {action ? <View style={styles.runtimeMultilineHeaderActions}>{action}</View> : null}
       </View>
+      {/* The wrapper carries no height of its own: the field states its
+          height, and a wrapper that restated a different one reserved less
+          room than the field drew, so the tip below was painted over the
+          editor's last line. */}
       <View style={styles.runtimeMultilineEditor}>{control}</View>
       <RuntimeFieldMeta item={item} translate={translate} multiline />
     </View>;
@@ -9731,6 +9868,10 @@ function RuntimeFieldMeta({ item, translate, multiline = false }: { item: Unknow
       : rawDefaultValue;
   const help = runtimeFieldHelp(key, stringValue(item.help), translate);
   if (multiline) {
+    // The tip under a full-width editor starts where the editor starts.  The
+    // shared help slot indents to the value column with `paddingLeft`, so the
+    // multiline variant has to cancel that padding rather than add a margin
+    // it never overrode.
     return <View style={[styles.runtimeHelpSlot, styles.runtimeMultilineHelpSlot]}>
       <Text style={styles.runtimeJsonDefaultHint}>{translate("runtime.jsonDefaultHint")}</Text>
       {help ? <Text style={styles.runtimeHelpText}>{help}</Text> : null}
@@ -12978,8 +13119,12 @@ const styles = StyleSheet.create({
   providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 12 }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerListPane: { width: 180, minWidth: 180, maxWidth: 180, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, modelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 320, minWidth: 260, maxWidth: 360, flexGrow: 0, flexShrink: 1 }, providerEditorContent: { flex: 1, minHeight: 0 }, providerEditorScrollContent: { paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }, persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }, persistentScrollHost: { position: "relative", flex: 1, minHeight: 0 }, persistentScrollFill: { flex: 1, minHeight: 0 }, persistentScrollThumb: { position: "absolute", top: 2, right: 2, width: 4, borderRadius: 2, backgroundColor: "rgba(96,96,96,0.55)" }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, // A link is also a cursor: the row shows the pointing hand over the whole
 // finding, label included, exactly like every native link in the app.
 inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspectorProbeFindingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textDecorationLine: "underline" }, inspectorEnableControl: { flexShrink: 0 }, orderEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, orderEditorField: { flex: 1, width: undefined }, orderFollowControl: { flexShrink: 0 }, modelWindowValue: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, modelWindowText: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, modelWindowLink: { flexShrink: 0 }, protocolSettings: { gap: 4 }, helpTipAnchor: { position: "relative", zIndex: 2 }, helpTipDismiss: { position: "absolute", left: -2400, right: -2400, top: -2400, bottom: -2400 }, helpTipButton: { width: 16, height: 16, minWidth: 16, minHeight: 16 }, helpTipPopupLeft: { position: "absolute", left: 0, bottom: 22, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipPopup: { position: "absolute", right: 0, bottom: 22, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
-  externalSettingsWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, externalSettingsFieldList: { ...SETTINGS_FIELD_LIST }, externalSettingsField: { ...SETTINGS_FIELD }, externalSettingsInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, externalSettingsFieldLabel: { ...SETTINGS_FIELD_LABEL }, externalSettingsValueSlot: { ...SETTINGS_FIELD_ROUTE_SLOT }, externalSettingsBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, externalSettingsHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, externalSettingsHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, externalSettingsPane: { flex: 1, minHeight: 0 }, externalSettingsPaneContent: { paddingVertical: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, gap: 14 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 },
-  runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 6 }, runtimeWorkspaceBody: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, runtimeWorkspace: { width: "100%", padding: SETTINGS_PANE_INSET, gap: 14 }, runtimeScrollSurface: { flex: 1, minWidth: 0, backgroundColor: systemColors.textBackground }, runtimeFieldList: { ...SETTINGS_FIELD_LIST }, runtimeField: { ...SETTINGS_FIELD }, runtimeInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, runtimeModifiedBar: { position: "absolute", left: 0, top: 3, bottom: 3, width: 2, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarInline: { width: 2, alignSelf: "center", height: 16, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarActive: { backgroundColor: systemColors.blue }, runtimeFieldError: { marginLeft: SETTINGS_FIELD_HELP_INDENT, color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, runtimeValueControlInvalid: { borderWidth: 1, borderColor: systemColors.red, borderRadius: 4 }, runtimeResetButton: { minWidth: 28, width: 28, height: 22, paddingHorizontal: 0 }, runtimeFieldLabel: { ...SETTINGS_FIELD_LABEL }, runtimeValueSlot: { ...SETTINGS_FIELD_VALUE_SLOT }, runtimeValueControl: { width: SETTINGS_FIELD_VALUE_WIDTH, minWidth: SETTINGS_FIELD_VALUE_WIDTH, height: 26 }, runtimeBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, runtimeUnit: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, runtimeHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, runtimeMultilineField: { minWidth: 0, flexGrow: 1, flexBasis: "100%", maxWidth: "100%" }, runtimeMultilineHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, paddingLeft: SETTINGS_FIELD_LEAD }, runtimeMultilineLabel: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeMultilineHeaderActions: { flexShrink: 0, minHeight: 26, justifyContent: "center" }, runtimeMultilineEditor: { width: "100%", minWidth: 0, height: 108, flex: 1, alignSelf: "stretch" }, runtimeMultilineHelpSlot: { marginLeft: 0, maxWidth: "100%", minWidth: 0, paddingTop: 6, gap: 3 }, runtimeJsonDefaultHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, fontWeight: "600", minWidth: 0 },
+  externalSettingsWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, externalSettingsFieldList: { ...SETTINGS_FIELD_LIST },
+  // One rail entry can carry two apps, so each app's block keeps the grid's
+  // rhythm but not the grid: a title, then that app's own fields and files.
+  externalSettingsAppGroup: { gap: 14 }, externalSettingsAppHeader: { paddingLeft: SETTINGS_FIELD_LEAD }, externalSettingsAppTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  externalSettingsFileGroup: { gap: 4 }, externalSettingsFileGroupTitle: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600", paddingLeft: SETTINGS_FIELD_LEAD }, externalSettingsField: { ...SETTINGS_FIELD }, externalSettingsInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, externalSettingsFieldLabel: { ...SETTINGS_FIELD_LABEL }, externalSettingsValueSlot: { ...SETTINGS_FIELD_ROUTE_SLOT }, externalSettingsBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, externalSettingsHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, externalSettingsHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, externalSettingsPane: { flex: 1, minHeight: 0 }, externalSettingsPaneContent: { paddingVertical: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, gap: 14 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 },
+  runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 6 }, runtimeWorkspaceBody: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, runtimeWorkspace: { width: "100%", padding: SETTINGS_PANE_INSET, gap: 14 }, runtimeScrollSurface: { flex: 1, minWidth: 0, backgroundColor: systemColors.textBackground }, runtimeFieldList: { ...SETTINGS_FIELD_LIST }, runtimeField: { ...SETTINGS_FIELD }, runtimeInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, runtimeModifiedBar: { position: "absolute", left: 0, top: 3, bottom: 3, width: 2, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarInline: { width: 2, alignSelf: "center", height: 16, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarActive: { backgroundColor: systemColors.blue }, runtimeFieldError: { marginLeft: SETTINGS_FIELD_HELP_INDENT, color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, runtimeValueControlInvalid: { borderWidth: 1, borderColor: systemColors.red, borderRadius: 4 }, runtimeResetButton: { minWidth: 28, width: 28, height: 22, paddingHorizontal: 0 }, runtimeFieldLabel: { ...SETTINGS_FIELD_LABEL }, runtimeValueSlot: { ...SETTINGS_FIELD_VALUE_SLOT }, runtimeValueControl: { width: SETTINGS_FIELD_VALUE_WIDTH, minWidth: SETTINGS_FIELD_VALUE_WIDTH, height: 26 }, runtimeBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, runtimeUnit: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, runtimeHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, runtimeMultilineField: { minWidth: 0, flexGrow: 1, flexBasis: "100%", maxWidth: "100%" }, runtimeMultilineHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, paddingLeft: SETTINGS_FIELD_LEAD }, runtimeMultilineLabel: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeMultilineHeaderActions: { flexShrink: 0, minHeight: 26, justifyContent: "center" }, runtimeMultilineEditor: { width: "100%", minWidth: 0, alignSelf: "stretch" }, runtimeMultilineHelpSlot: { paddingLeft: 0, maxWidth: "100%", minWidth: 0, paddingTop: 6, gap: 3 }, runtimeJsonDefaultHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, fontWeight: "600", minWidth: 0 },
   dataManagementWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, dataManagementPane: { flex: 1, minHeight: 0 }, dataManagementPaneScrollContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 4, gap: 10 }, dataManagementImportIntro: { width: "100%", minHeight: 72, paddingHorizontal: 12, paddingVertical: 12, justifyContent: "center" }, dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: SETTINGS_FIELD_GAP, paddingLeft: SETTINGS_FIELD_LEAD }, dataManagementImportFileLabel: { ...SETTINGS_FIELD_LABEL }, dataManagementImportFileValue: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground }, dataManagementImportFilePlaceholder: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, dataManagementSelectionBar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSelectionCount: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementToolbarButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, dataManagementSectionsField: { flex: 1, minWidth: 0, gap: 6 }, dataManagementSectionList: { gap: 4 }, dataManagementSectionItem: { minHeight: 22 }, dataManagementActionStatus: { flexShrink: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14 }, dataManagementSensitiveHint: { color: systemColors.brown, fontSize: UI_FONT_SIZE, lineHeight: 16, paddingVertical: 5, paddingHorizontal: 7, backgroundColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.08) ?? "rgba(255, 204, 0, 0.08)", default: "rgba(255, 204, 0, 0.08)" }), borderRadius: 4, borderWidth: 1, borderColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.2) ?? "rgba(255, 204, 0, 0.2)", default: "rgba(255, 204, 0, 0.2)" }) }, dataManagementSyncScopeValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementDirectionPicker: { width: SETTINGS_FIELD_VALUE_WIDTH, height: 24, flexGrow: 0, flexShrink: 0 },
   // The WebDAV tab is fields of the same grid the other panes draw, so its
   // list is the shared list rather than a form of its own.

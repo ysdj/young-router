@@ -41,11 +41,19 @@ from ..security import redact
 from ._shared import (
     DomainError,
     _action_name,
+    _app_state_root,
     _default_provider_config_path,
     _default_runtime_root,
     _default_runtime_settings_path,
     _mapping,
     _safe_problem,
+)
+from ._shared_api import (
+    one_saved_route,
+    read_route_setting,
+    saved_route_api_key,
+    saved_routes,
+    store_route_setting,
 )
 
 _CODEX_ENVIRONMENT_LOCK = threading.RLock()
@@ -77,21 +85,9 @@ def _resolve_runtime_root(
     runtime_settings_path: Path | str | None,
     runtime_config_path: Path | str | None,
 ) -> Path:
-    """Pick the app-state directory for a Codex domain.
+    """Pick the app-state directory for a Codex domain."""
 
-    Production passes the host's runtime root explicitly.  A directly
-    constructed domain falls back to the directory holding its runtime
-    documents, so tests and portable callers never touch the user's real app
-    directory.
-    """
-
-    if runtime_root is not None:
-        return Path(runtime_root).expanduser()
-    if runtime_settings_path is not None:
-        return Path(runtime_settings_path).expanduser().parent
-    if runtime_config_path is not None:
-        return Path(runtime_config_path).expanduser().parent
-    return _default_runtime_root()
+    return _app_state_root(runtime_root, runtime_settings_path, runtime_config_path)
 
 # The provider row this app owns in the Codex configuration.  Adopting the
 # local proxy through a dedicated row keeps the client's own backends intact
@@ -603,6 +599,11 @@ class CodexSettingsDomain:
         self.runtime_root = _resolve_runtime_root(
             runtime_root, runtime_settings_path, runtime_config_path
         )
+        # This app's own bookkeeping about a client -- the route it was last put
+        # on, and the model list generated for it -- lives under this root, in
+        # the one file both domains read.  It is named for what it holds so the
+        # two domains' calls read the same.
+        self.app_state_root = self.runtime_root
         self.model_catalog_path = managed_catalog_path(resolved_home)
         # App-private catalog bookkeeping stays out of the Codex directory:
         # the inheritance pin lives in the app's runtime settings file.
@@ -1225,6 +1226,42 @@ class CodexSettingsDomain:
             structured if isinstance(structured, Mapping) else {}
         )
 
+    def designated_route(self) -> dict[str, str] | None:
+        """The saved route this client is on, or the one it last left for us.
+
+        A Codex client on this app's proxy names a public model, which several
+        saved routes may share, so the remembered route is the only answer left;
+        a client pointing anywhere else answers from its own document.
+        """
+
+        remembered = read_route_setting(self.app_state_root, "codex")
+        if self.uses_local_api():
+            return remembered
+        structured = self._draft.get("structured")
+        structured = structured if isinstance(structured, Mapping) else {}
+        model = str(structured.get("model") or "").strip()
+        provider = str(structured.get("model_provider") or "").strip()
+        if not model:
+            return remembered
+        try:
+            _, rows = saved_routes(self.runtime_config_path)
+        except DomainError:
+            return remembered
+        matches = [
+            row
+            for row in rows
+            if str(row.get("model") or "").strip() == model
+            and (not provider or str(row.get("provider") or "").strip() == provider)
+        ]
+        if len(matches) != 1:
+            return remembered
+        row = matches[0]
+        return {
+            "model": str(row.get("model") or "").strip(),
+            "provider": str(row.get("provider") or "").strip(),
+            "deployment_id": str(row.get("deployment_id") or "").strip(),
+        }
+
     def _safe_snapshot(self, payload: Mapping[str, Any], revision: int) -> dict[str, Any]:
         errors = payload.get("validation_errors", [])
         warnings = payload.get("warnings", [])
@@ -1237,6 +1274,7 @@ class CodexSettingsDomain:
             "config_exists": bool(payload.get("config_exists")),
             "auth_file_exists": bool(payload.get("auth_exists")),
             "uses_local_api": self.uses_local_api(),
+            "designated_route": self.designated_route(),
             "standalone_search": self.standalone_search_enabled(),
             "image_context_mcp": self.image_context_mcp_enabled(),
             "structured": redact(payload.get("structured", {})),
@@ -1296,61 +1334,21 @@ class CodexSettingsDomain:
         API" action — and the client's own provider identity never changes.
         """
 
-        from .. import codex_config
-
-        model = str(data.get("model") or "").strip()
-        provider = str(data.get("provider") or "").strip()
-        deployment_id = str(data.get("deployment_id") or "").strip()
-        if not model or not provider:
-            raise DomainError("Select one saved Young Router model")
-        try:
-            runtime = codex_config.load_yaml(self.runtime_config_path)
-            rows = codex_config.configured_models(runtime)
-        except Exception as exc:
-            raise _safe_problem(exc, "The saved Young Router models could not be read") from None
-        candidates = [
-            row
-            for row in rows
-            if row.get("model") == model
-            and row.get("provider") == provider
-            and (not deployment_id or row.get("deployment_id") == deployment_id)
-        ]
-        if len(candidates) != 1:
-            raise DomainError("Select one current Young Router model")
-        row = candidates[0]
+        runtime, rows = saved_routes(self.runtime_config_path)
+        row = one_saved_route(rows, data)
         base_url = str(row.get("api_base") or "").strip()
         if not base_url:
             raise DomainError("The selected model has no saved provider endpoint")
         surface = str(row.get("upstream_url_surface") or "").strip().lower()
         patch = self._active_provider_patch(
             base_url=base_url,
-            key=self._saved_model_api_key(runtime, str(row.get("deployment_id") or "")),
+            key=saved_route_api_key(runtime, str(row.get("deployment_id") or "")),
             wire_api="responses" if surface.endswith("responses") else "chat",
         )
         if not patch.get("api_key"):
             patch.pop("api_key", None)
-        patch["model"] = _direct_model_id(str(row.get("upstream_model") or model))
+        patch["model"] = _direct_model_id(str(row.get("upstream_model") or row.get("model") or ""))
         return patch
-
-    @staticmethod
-    def _saved_model_api_key(runtime: object, deployment_id: str) -> str:
-        """The route's own key from the runtime model list, when it has one."""
-
-        if not deployment_id or not isinstance(runtime, Mapping):
-            return ""
-        entries = runtime.get("model_list")
-        if not isinstance(entries, list):
-            return ""
-        for entry in entries:
-            if not isinstance(entry, Mapping):
-                continue
-            info = entry.get("model_info")
-            if not isinstance(info, Mapping) or str(info.get("id") or "").strip() != deployment_id:
-                continue
-            params = entry.get("litellm_params")
-            value = params.get("api_key") if isinstance(params, Mapping) else None
-            return value.strip() if isinstance(value, str) else ""
-        return ""
 
     def dispatch(self, action: str, payload: object | None = None) -> dict[str, Any]:
         name = _action_name(action)
@@ -1389,18 +1387,22 @@ class CodexSettingsDomain:
             # names the route the client leaves behind: the proxy serves the
             # route's public model name, so keeping the client's own provider
             # model id would leave it asking for a model the proxy cannot
-            # resolve.
+            # resolve.  That route is also what the off direction returns to,
+            # and it is remembered here because the client's own document can
+            # no longer state it once it points at the proxy.
             patch = self._local_api_patch()
             patch.update(self._surface_sync_patch())
             config_text = _remove_legacy_computer_mcp(config_text)
             model = str(data.get("model") or "").strip()
             if model:
                 patch["model"] = model
+            store_route_setting(self.app_state_root, "codex", data)
             self._draft = self._sync(config_text, auth_text, patch)
         elif name in {"use_saved_model", "usesavedmodel"}:
             # Restore the client directly onto one saved provider route: the
             # chosen model, that provider's own endpoint, and the route's key.
             self._draft = self._sync(config_text, auth_text, self._saved_model_patch(data))
+            store_route_setting(self.app_state_root, "codex", data)
         elif name == "codex_feature_set":
             feature = data.get("feature")
             enabled_value = data.get("enabled")

@@ -203,15 +203,21 @@ class ClientFilesDomainTests(unittest.TestCase):
                 ],
                 [row["document"] for row in result["files"]],
             )
+            # Claude is one rail entry: both apps file under it, and ``app``
+            # is what tells Claude Code's document apart from Desktop's two.
             self.assertEqual(
                 [
                     "codex", "codex",
-                    "claudeCode", "claudeDesktop", "claudeDesktop",
+                    "claude", "claude", "claude",
                     "pi", "pi", "pi",
                     "dsh", "dsh", "opencode", "opencode",
                     "codex", "codex",
                 ],
                 [row["client"] for row in result["files"]],
+            )
+            self.assertEqual(
+                ["claudeCode", "claudeDesktop", "claudeDesktop"],
+                [row["app"] for row in result["files"] if row["client"] == "claude"],
             )
             self.assertEqual(
                 {"codex": 2, "claude": 3, "clients": 9},

@@ -2798,7 +2798,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertTrue(raw["config_exists"])
             self.assertTrue(raw["auth_file_exists"])
 
-    @mock.patch("young_router.core.codex_config._local_exposed_models", return_value=(["default-chat"], True))
+    @mock.patch("young_router.core.codex_config.local_exposed_models", return_value=(["default-chat"], True))
     def test_live_catalog_refresh_does_not_make_a_noop_editor_stage_dirty(self, _live_models) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3091,7 +3091,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
                     {"feature": "future_use", "enabled": True},
                 )
 
-    @mock.patch("young_router.core.codex_config._local_exposed_models", return_value=(['default-chat'], True))
+    @mock.patch("young_router.core.codex_config.local_exposed_models", return_value=(['default-chat'], True))
     def test_menu_catalog_toggle_preserves_staged_codex_edits_and_tracks_public_models(self, _live_models) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3134,7 +3134,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertEqual([], disabled_catalog["public_models"])
 
     @mock.patch(
-        "young_router.core.codex_config._local_exposed_models",
+        "young_router.core.codex_config.local_exposed_models",
         return_value=(['default-chat', 'second-chat', 'third-chat'], True),
     )
     def test_model_catalog_uses_every_litellm_exposed_model(self, _live_models) -> None:
@@ -3202,7 +3202,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             return endpoint["result"]
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             side_effect=exposed_models,
         ):
             root = Path(directory)
@@ -3244,7 +3244,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             return endpoint["result"]
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             side_effect=exposed_models,
         ):
             root = Path(directory)
@@ -3305,7 +3305,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
                 [model["slug"] for model in catalog["models"]],
             )
 
-    @mock.patch("young_router.core.codex_config._local_exposed_models", return_value=(["default-chat"], True))
+    @mock.patch("young_router.core.codex_config.local_exposed_models", return_value=(["default-chat"], True))
     def test_catalog_metadata_repair_keeps_the_catalog_current(self, _live_models) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3332,7 +3332,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertEqual(["default-chat"], snapshot["public_models"])
             self.assertTrue(catalog_is_current(catalog_path, ["default-chat"], registry=codex._context_registry))
 
-    @mock.patch("young_router.core.codex_config._local_exposed_models", return_value=(["default-chat"], True))
+    @mock.patch("young_router.core.codex_config.local_exposed_models", return_value=(["default-chat"], True))
     def test_missing_catalog_is_rebuilt(self, _live_models) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3358,7 +3358,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
 
     def test_catalog_priority_reorder_keeps_the_catalog_current(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             return_value=(["model-a", "model-b"], True),
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",
@@ -3422,7 +3422,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             return list(live_models["names"]), True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             side_effect=exposed_models,
         ), mock.patch(
             "young_router.core.model_catalog.load_native_catalog",

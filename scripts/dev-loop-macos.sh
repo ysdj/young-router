@@ -13,23 +13,35 @@
 # this app read their sources from the installed bundle when they start -- Core
 # and the proxy import `young_router/`, the host loads `main.jsbundle` -- so
 # writing the changed tree into that bundle and restarting is enough.  Measured
-# here: 10 to 16 s for an edit.
+# here: 10 to 16 s for an edit, of which the restart alone is ~10 s.
 #
 #   scripts/dev-loop-macos.sh            sync whatever changed, restart
 #   scripts/dev-loop-macos.sh --js       rebundle and install the UI only
 #   scripts/dev-loop-macos.sh --python   sync the Python tree only
-#   scripts/dev-loop-macos.sh --metro    set up Metro dev server for sub-second
-#                                        Fast Refresh (one-time, keeps running)
+#   scripts/dev-loop-macos.sh --metro    point the installed app at Metro, so a
+#                                        UI edit costs a reload instead of a
+#                                        bundle; keeps Metro in this terminal
+#   scripts/dev-loop-macos.sh --reload   make the running app load the bundle
+#                                        again, without restarting anything
 #   scripts/dev-loop-macos.sh --proxy    run an isolated proxy on a scratch
 #                                        port, leaving the app alone
 #   scripts/dev-loop-macos.sh --check    report which half is stale, act not
 #
-# `--metro` is the fastest JS iteration: it sets the installed app to load from
-# Metro's dev server, starts Metro, and keeps it running. JS edits land in under
-# one second with Fast Refresh and state preserved. Run it once, leave Metro
-# running, and edit. Stop Metro (Ctrl-C) or clear the override
-# (`defaults delete young.router.app MetroServerURL && restart-app.sh`) to go
-# back to the bundled JS.
+# `--metro` plus `--reload` is the JS loop.  `RCTHost` registers itself as a
+# reload listener in every configuration, and a reload re-reads the bundle URL
+# and rebuilds the JS instance in place, so a UI edit costs one bundle fetch
+# (~1 s warm) instead of a bundle build plus a restart (~20 s).  What it does
+# not do is keep React state or an open native window's contents: a reload
+# resets the React tree, which is the same thing a restart gives today, minus
+# Core and the proxy going down with it.
+#
+# Neither mode turns HMR on: the installed host is Release, so `RCT_DEV` is 0,
+# `setupHMRClientWithBundleURL` is the empty stub, and nothing opens an HMR
+# socket.  Nor is there a red box: a bundle that fails to compile reaches
+# `RCTFatal` and aborts.  That is why `--metro` fetches the bundle before it
+# points the app at it, and why `--reload` refuses while Metro is not answering
+# -- and why `AppDelegate.mm` drops the override when a bundle load fails, so a
+# broken bundle costs one launch instead of a launch loop.
 #
 # `--proxy` is the data-plane loop: it starts a second proxy from the checkout's
 # `young_router/` against a scratch runtime root and a port of its own, so a
@@ -57,6 +69,9 @@ APP="${YOUNG_ROUTER_INSTALL_APP:-/Applications/Young Router.app}"
 CORE="$APP/Contents/Resources/Core"
 RESOURCES="$APP/Contents/Resources"
 RESTART_APP="$ROOT/scripts/restart-app.sh"
+APP_PROCESSES="$ROOT/scripts/app-processes.sh"
+# `AppDelegate.mm` answers this link by reloading the JS instance in place.
+RELOAD_URL="young-router://reload"
 MODE="auto"
 
 usage() {
@@ -68,6 +83,7 @@ while (($# > 0)); do
     --js) MODE="js" ;;
     --python) MODE="python" ;;
     --metro) MODE="metro" ;;
+    --reload) MODE="reload" ;;
     --proxy) MODE="proxy" ;;
     --check) MODE="check" ;;
     -h|--help) usage; exit 0 ;;
@@ -90,38 +106,127 @@ CORE_SYNC_EXCLUDES=(
   --exclude 'dsh-vision-router' --exclude 'our-free-model'
 )
 
-# --- Metro dev server for sub-second Fast Refresh ------------------------------
+# --- Metro dev server ---------------------------------------------------------
 #
-# This mode sets the installed app to load from Metro instead of the packaged
-# bundle, starts Metro in this terminal, and keeps it running. JS edits land in
-# under one second with Fast Refresh and state preserved. Run it once, leave
-# Metro running, and edit. Stop Metro (Ctrl-C) or clear the override to go back.
+# This mode points the installed app at Metro instead of the packaged bundle,
+# then keeps Metro running in this terminal.  Two facts shape it:
+#
+#   * the installed host is Release, so `RCT_DEV` is 0 and nothing opens an HMR
+#     socket -- an edit is picked up by the next bundle load, not live;
+#   * a Release host has no red box, so a bundle that fails to compile reaches
+#     `RCTFatal` and aborts.  The bundle is therefore fetched here first, and
+#     the override is written only when Metro compiled it.
+#
+# The override lives in the app's own defaults, so a failed fetch would also
+# poison the next launch; `AppDelegate.mm` clears it when a bundle load fails.
+METRO_PID=""
 if [[ "$MODE" == "metro" ]]; then
+  [[ -d "$CORE/young_router" ]] || {
+    echo "dev-loop-macos: no installed bundle at $APP" >&2
+    echo "Run scripts/build-and-install-macos.sh once to install one, then iterate here." >&2
+    exit 1
+  }
   command -v node >/dev/null 2>&1 || {
     echo "dev-loop-macos: node is required to run Metro" >&2
     exit 3
   }
+  command -v curl >/dev/null 2>&1 || {
+    echo "dev-loop-macos: curl is required to probe Metro" >&2
+    exit 3
+  }
   METRO_PORT="${YOUNG_ROUTER_METRO_PORT:-8081}"
-  METRO_URL="http://localhost:${METRO_PORT}/index.bundle?platform=macos&dev=true&minify=false"
-
-  echo "dev-loop-macos: setting MetroServerURL to $METRO_URL"
+  # `dev=false`, not the usual `dev=true`: this bundle runs in a Release host,
+  # and `__DEV__` is what enables the renderer's view-config check that a
+  # `topLevelType` appears in both `bubblingEventTypes` and `directEventTypes`.
+  # The generated `LiteLLMAppKitPicker` and `LiteLLMAppKitSegmentedControl`
+  # configs declare `topChange` as a direct event while the platform base config
+  # declares it as bubbling, so a dev bundle aborts on first render with
+  # "Event cannot be both direct and bubbling: topChange" and the window shows
+  # nothing.  The packaged bundle is built without `__DEV__` and never runs that
+  # check, so serving the same shape keeps the loop faithful to what ships --
+  # a bug that only reproduces in dev would be a bug the loop could not show.
+  # `minify=false` still keeps the bundle readable.
+  METRO_URL="http://127.0.0.1:${METRO_PORT}/index.bundle?platform=macos&dev=false&minify=false"
+  METRO_LOG="${TMPDIR:-/tmp}/young-router-metro-${METRO_PORT}.log"
+  # `node_modules/.bin/react-native` is the CLI's shell shim, not a JS entry:
+  # running it under `node` is a syntax error, so it is executed directly.
+  (
+    cd "$RN_ROOT/apps/macos"
+    exec "$RN_ROOT/node_modules/.bin/react-native" start --port "$METRO_PORT"
+  ) >"$METRO_LOG" 2>&1 &
+  METRO_PID=$!
+  # Metro answers nothing until it has resolved the port, so wait for the status
+  # endpoint rather than sleeping a fixed guess.  `ps -p` is the liveness probe:
+  # this script must not signal anything (see the stop policy above), and a dead
+  # Metro would otherwise be waited out to the full loop.
+  metro_ready=0
+  for _ in $(seq 1 240); do
+    if curl -sf -o /dev/null --max-time 1 "http://127.0.0.1:${METRO_PORT}/status"; then
+      metro_ready=1
+      break
+    fi
+    ps -p "$METRO_PID" >/dev/null 2>&1 || break
+    sleep 0.5
+  done
+  if [[ "$metro_ready" != "1" ]]; then
+    echo "dev-loop-macos: Metro did not start; see $METRO_LOG" >&2
+    tail -20 "$METRO_LOG" >&2
+    exit 1
+  fi
+  # The preflight is the whole safety story: a bundle Metro cannot compile is
+  # one the Release host would abort on, and it would abort after the override
+  # was already written.
+  status="$(curl -s -o "$METRO_LOG.bundle" -w '%{http_code}' --max-time 300 "$METRO_URL" || echo 000)"
+  if [[ "$status" != "200" ]]; then
+    echo "dev-loop-macos: Metro could not compile the bundle (HTTP $status); the app was left alone." >&2
+    head -20 "$METRO_LOG.bundle" >&2
+    exit 1
+  fi
+  echo "dev-loop-macos: Metro compiled the bundle; pointing the app at $METRO_URL"
   defaults write young.router.app MetroServerURL "$METRO_URL"
-
-  # Restart the app so it picks up the override and connects to Metro
+  # The one restart this mode makes: it is not a sync, it is what makes the
+  # override visible to a host that already read it at launch.
   if ! "$RESTART_APP" >/dev/null 2>&1; then
     echo "dev-loop-macos: the app did not restart cleanly" >&2
     exit 1
   fi
+  echo "dev-loop-macos: app is loading from Metro; log at $METRO_LOG"
+  echo "  After an edit, from another terminal: scripts/dev-loop-macos.sh --reload"
+  echo "  Back to the packaged bundle:"
+  echo "    defaults delete young.router.app MetroServerURL && scripts/restart-app.sh"
+  # Staying attached keeps Metro alive with this shell: Ctrl-C ends both, and
+  # the next launch of the app finds a server that no longer answers.
+  wait "$METRO_PID"
+  exit 0
+fi
 
-  echo "dev-loop-macos: Metro will serve on port $METRO_PORT"
-  echo "  - JS edits land in under 1 second with Fast Refresh"
-  echo "  - Stop Metro (Ctrl-C) or clear the override to go back:"
-  echo "      defaults delete young.router.app MetroServerURL && scripts/restart-app.sh"
-  echo ""
-
-  # Start Metro and keep it in the foreground
-  cd "$RN_ROOT/apps/macos"
-  exec npx react-native start --port "$METRO_PORT"
+# --- the in-place JS reload ---------------------------------------------------
+#
+# The cheapest loop there is: the app re-reads its bundle URL and rebuilds the
+# JS instance, while Core, the proxy and every worker keep running.  It answers
+# only when the bundle it would load is known to compile, because a Release
+# host has no red box and answers a failed load with `RCTFatal`.
+if [[ "$MODE" == "reload" ]]; then
+  [[ -n "$("$APP_PROCESSES" hosts "$APP")" ]] || {
+    echo "dev-loop-macos: the app is not running; start it once with scripts/restart-app.sh" >&2
+    exit 1
+  }
+  override="$(defaults read young.router.app MetroServerURL 2>/dev/null || true)"
+  if [[ -n "$override" ]]; then
+    status="$(curl -s -o /dev/null -w '%{http_code}' --max-time 120 "$override" || echo 000)"
+    if [[ "$status" != "200" ]]; then
+      echo "dev-loop-macos: the dev server at $override answered HTTP $status, so a reload would abort the app." >&2
+      echo "  Fix the bundle, or return to the packaged one:" >&2
+      echo "    defaults delete young.router.app MetroServerURL && scripts/restart-app.sh" >&2
+      exit 1
+    fi
+  fi
+  open "$RELOAD_URL" >/dev/null 2>&1 || {
+    echo "dev-loop-macos: could not send the reload link" >&2
+    exit 1
+  }
+  echo "dev-loop-macos: reload requested${override:+ (bundle: $override)}"
+  exit 0
 fi
 
 # --- the isolated proxy loop ------------------------------------------------
@@ -286,6 +391,10 @@ case "$MODE" in
     [[ "$python_changed" == 1 ]] || { echo "dev-loop-macos: python tree is current; nothing to do"; exit 0; }
     sync_python
     ;;
+  metro)
+    # The bundle is served from Metro, so there is no bundle to write.  What
+    # this mode needs from below is the one restart that makes the app load it.
+    ;;
   auto)
     [[ "$js_changed$python_changed" != "00" ]] || { echo "dev-loop-macos: nothing changed; nothing to do"; exit 0; }
     sync_python
@@ -301,4 +410,5 @@ if ! "$RESTART_APP" >/dev/null 2>&1; then
   echo "dev-loop-macos: the app did not restart cleanly" >&2
   exit 1
 fi
+
 echo "dev-loop-macos: running with the change -- run scripts/build-and-install-macos.sh when it is settled"

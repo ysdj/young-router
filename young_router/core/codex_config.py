@@ -293,7 +293,7 @@ def local_api_key(config: dict[str, Any]) -> str:
     return value
 
 
-def _local_exposed_models(api_key: str) -> tuple[list[str], bool]:
+def local_exposed_models(api_key: str) -> tuple[list[str], bool]:
     """Read the model IDs LiteLLM currently exposes on its local API.
 
     The configured ``model_list`` is intentionally not a catalog source.  A
@@ -1112,7 +1112,7 @@ def _runtime_context(
         runtime_config = load_yaml(config_path)
         models = configured_models(runtime_config)
         key = local_api_key(runtime_config)
-        exposed_models, menu_enabled = _local_exposed_models(key)
+        exposed_models, menu_enabled = local_exposed_models(key)
     except EditorError as exc:
         # The Codex editor must remain usable to repair an existing Codex file
         # even if the LiteLLM source is temporarily invalid/unavailable.

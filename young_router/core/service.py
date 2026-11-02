@@ -1255,7 +1255,12 @@ class CoreStore:
                 # Never claim Apply succeeded against a placeholder when the
                 # user's real source is malformed.
                 adapters.append(UnavailableDomain(name))
-        claude_factory: Callable[[], DomainAdapter] = lambda: ClaudeSettingsDomain(claude_settings_path)
+        claude_factory: Callable[[], DomainAdapter] = lambda: ClaudeSettingsDomain(
+            claude_settings_path,
+            runtime_config_path=config_path,
+            runtime_settings_path=resolved_runtime_settings_path,
+            runtime_root=resolved_runtime_root,
+        )
         try:
             adapters.append(claude_factory())
         except Exception:
@@ -3842,6 +3847,7 @@ class CoreStore:
                     # The proxy's port or key may have just changed; a Codex
                     # client that already uses the proxy has to follow it.
                     self._follow_codex_local_api()
+                    self._refresh_client_model_lists()
                     # A start or restart is also where the image-context switch
                     # and the client's fetch-server entry are reconciled: the
                     # pass reads its switch from the proxy's environment, which
@@ -4162,6 +4168,7 @@ class CoreStore:
                     except Exception:
                         pass
                 self._follow_codex_local_api(codex)
+                self._refresh_client_model_lists()
                 # The image-context switch lives in the runtime settings and the
                 # fetch server in the client's document.  Reconciling here as
                 # well as on Apply is what makes the two agree after a start:
@@ -4175,6 +4182,28 @@ class CoreStore:
             # The host quit while this restart was in flight; shutdown() may
             # have stopped the previous proxy before this one started.
             self._stop_service_after_reload_shutdown()
+
+    def _refresh_client_model_lists(self) -> None:
+        """Regenerate the client model lists this app generates.
+
+        A list generated from this router's public models has to follow the
+        routes behind them for the same reason the Codex catalog does: a route
+        that was added, removed, or renamed while a pane was closed otherwise
+        leaves a client's picker offering models the router no longer serves.
+        The caller holds ``self._lock``; the write happens before the revision
+        is published, so every open window sees the new file and the new state
+        together.  A failure belongs to that one client's list, never to the
+        proxy restart that just succeeded.
+        """
+
+        claude = self._domains.get("claude")
+        refresh = getattr(claude, "refresh_model_lists", None)
+        if not callable(refresh):
+            return
+        try:
+            refresh()
+        except Exception:
+            pass
 
     def _follow_codex_local_api(self, codex: object | None = None) -> None:
         """Keep a Codex client that uses this app's proxy on its current endpoint.
@@ -4355,6 +4384,7 @@ class CoreStore:
                         # a client that points at this proxy follows a port change.
                         self._service_reload_replace_process = False
                         self._follow_codex_local_api()
+                        self._refresh_client_model_lists()
                         self._sync_codex_image_context_mcp(["codex"])
                     else:
                         self._service_supervision_attempts += 1

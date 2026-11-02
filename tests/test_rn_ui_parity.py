@@ -2783,19 +2783,30 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("def _active_provider_patch(", core)
         self.assertIn('entry["base_url"] = base_url', core)
         self.assertIn('return {"api_key": key, "direct_connection": {"provider": "openai", "base_url": base_url}}', core)
-        self.assertIn('patch["model"] = _direct_model_id(str(row.get("upstream_model") or model))', core)
+        self.assertIn('patch["model"] = _direct_model_id(str(row.get("upstream_model") or row.get("model") or ""))', core)
         self.assertNotIn('"model_provider": provider,', core)
-        self.assertIn('if (publicModel && publicModel === model) return true;', self.ui)
-        self.assertIn("codexModels.find((row) => clientProvider !== \"\" && stringValue(row.provider).trim() === clientProvider && matches(row))", self.ui)
+        # The saved-route resolution is one shared reader: the same rows answer
+        # Codex and both Claude apps, so a route resolves identically in all
+        # three and none of them can pick a route the others would not.
+        shared = (ROOT / "young_router/core/domains/_shared_api.py").read_text(encoding="utf-8")
+        self.assertIn("def one_saved_route(", shared)
+        self.assertIn("def saved_routes(", shared)
+        self.assertIn("if len(candidates) != 1:", shared)
+        self.assertIn("function clientRouteLabel(provider: string, model: string): string {", self.ui)
+        self.assertIn("function savedRouteMenuGroups(models: UnknownRecord[], translate: Translate)", self.ui)
+        self.assertIn("function ClientBackendFields({ accessibilityPrefix, models, native, localApiActive, designatedRoute, designatedSelection, modelList, modelListHint, busy, onUseLocalApi, onUseSavedModel, translate }", self.ui)
 
     def test_external_settings_list_only_registered_client_files_with_paths(self) -> None:
-        pane = self.ui.split("function AssistantSettingsWorkspace", 1)[1].split("function GeneralWorkspace", 1)[0]
+        # The client controls and the file rows are two components because one
+        # rail entry can hold two apps; the pane composes them, so a marker
+        # belongs to whichever of the three draws it.
+        pane = self.ui.split("function ClientBackendFields(")[1].split("function GeneralWorkspace", 1)[0]
         self.assertIn(
             'const CLIENT_FILE_GROUPS: ReadonlyArray<{ client: ClientFile["client"]; titleKey: string; hintKey: string }> = [',
             self.ui,
         )
         for marker in (
-            'accessibilityLabel={translate("settings.useLocalApi")}',
+            'accessibilityLabel={labelled("settings.useLocalApi")}',
             'translate("settings.editFile")',
             # The designate control points the client straight at one saved
             # provider route and names the provider and model it points at;
@@ -2803,12 +2814,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'title={designatedRoute}',
             # The control names the API the client uses and stays empty on
             # this app's proxy, where no specific API is selected.
-            'const designatedRoute = localApiActive ? "" : clientRouteLabel;',
+            'designatedRoute={localApiActive ? "" : codexRouteLabel}',
             'symbol="chevron-up-down"',
             "symbolTrailing",
-            "void onUseSavedModel(chosen).finally(() => setDesignateBusy(false));",
+            "void onUseSavedModel(selection).finally(() => setDesignateBusy(false));",
             'void showGroupedActionMenu({ title: translate("settings.designateAs"), groups, anchor: { x, y, width, height } })',
-            "{designateAction}",
+            "{designateButtonRef}",
             "void ipc.files()",
             ".then((result) => { if (active) setFiles(result.files); })",
             "{file.name}",
@@ -2857,11 +2868,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for absent in ("CodexRestartNotice", "showCodexRestartConfirmation", "restartCodex"):
             self.assertNotIn(absent, self.ui)
         for marker in (
-            'accessibilityLabel={translate("codex.modelCatalog")}',
+            'accessibilityLabel={labelled("settings.useRouterModelList")}',
             'translate("codex.modelCatalogHint")',
             "const toggleCatalog = (enabled: boolean): void => {",
             "void onToggleCodexModelCatalog(enabled).finally(() => setCatalogBusy(false));",
-            "disabled={(busy && !catalogBusy) || catalogBusy}",
+            "disabled={(busy && !listBusy) || listBusy}",
             "styles.externalSettingsFieldLabel",
             "styles.externalSettingsValueSlot",
             "styles.externalSettingsHelpSlot",
@@ -2871,12 +2882,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")}',
             'const CODEX_MODEL_CATALOG_FILE_ID = "codex_model_catalog";',
             "const openClientFile = (file: ClientFile): void => {",
-            "if (file.id !== CODEX_MODEL_CATALOG_FILE_ID || !codexModelCatalogEnabled) {",
+            "if (file.id === CODEX_MODEL_CATALOG_FILE_ID) { generatedFileOpen(file, codexModelCatalogEnabled); return; }",
+            # Claude Code keeps its picker in its own settings document, so
+            # that file is generated too and needs the same warning first.
+            'const CLAUDE_CODE_SETTINGS_FILE_ID = "claude.settings";',
+            'if (file.id === CLAUDE_CODE_SETTINGS_FILE_ID) { generatedFileOpen(file, booleanValue(claudeCode.model_list_enabled)); return; }',
             'title: translate("codex.modelCatalogEditTitle")',
             'message: translate("codex.modelCatalogEditBody")',
             'confirmLabel: translate("codex.modelCatalogEditConfirm")',
             ".then((confirmed) => { if (confirmed) onOpenFile(file); });",
-            "onPress={() => openClientFile(file)}",
+            "onPress={() => onOpenFile(file)}",
         ):
             self.assertIn(marker, self.ui if marker not in pane else pane)
         for marker in (
@@ -2884,24 +2899,24 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # never a header control beside the detail title: the switch and
             # the control that names the designated provider and model share
             # one label column and one control column.
-            '{selectedClient === "codex" ? <View style={styles.externalSettingsFieldList}>',
+            '{selectedClient === "codex" ? <>',
             "styles.externalSettingsInputRow",
             "styles.externalSettingsFieldLabel",
             "styles.externalSettingsValueSlot",
             "styles.externalSettingsHelpSlot",
             # One on/off setting is a switch, never a checkbox.
             "<NativeToggle",
-            "disabled={(busy && !catalogBusy) || catalogBusy}",
-            'void onUseLocalApi(offRoute ?? {}).finally(() => setClientActionBusy(false));',
+            "disabled={(busy && !listBusy) || listBusy}",
+            "void onUseLocalApi(designatedSelection ?? {}).finally(() => setClientActionBusy(false));",
             # On the proxy the model is only a public name, so the route the
             # user last chose decides where "off" goes instead of the first
-            # matching row.
-            "const offRoute = localApiActive ? lastRoute ?? clientRoute : clientRoute;",
-            "const [lastRoute, setLastRoute] = useState<ClientRoute | undefined>(undefined);",
-            "if (!offRoute) { settleClientSwitch(); return; }",
-            "designateSavedModel(offRoute);",
+            # matching row; Core remembers it because the client's own file no
+            # longer carries it.
+            "designatedSelection={codexRoute}",
+            "if (!designatedSelection) { assembleSwitch(); return; }",
+            "designateSavedModel(designatedSelection);",
             "value={localApiActive}",
-            'accessibilityLabel={translate("settings.useLocalApi")}',
+            'accessibilityLabel={labelled("settings.useLocalApi")}',
             'translate("settings.useLocalApiHint")',
             # The switch is a real two-way switch driven by the config: on
             # adopts this app's proxy, off returns the client to the saved
@@ -2912,23 +2927,35 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "disabled={(busy && !(clientActionBusy || designateBusy)) || clientActionBusy || designateBusy}",
             "onValueChange={toggleLocalApi}",
             "const toggleLocalApi = (enabled: boolean): void => {",
-            "const [clientSwitchGeneration, setClientSwitchGeneration] = useState(0);",
-            "const settleClientSwitch = (): void => setClientSwitchGeneration((current) => current + 1);",
-            "const clientRoute = useMemo(() => {",
-            "{designateAction}",
+            "const [switchGeneration, setSwitchGeneration] = useState(0);",
+            "const assembleSwitch = (): void => setSwitchGeneration((current) => current + 1);",
+            "const menuGroups = useMemo(() => savedRouteMenuGroups(models, translate), [models, translate]);",
+            "{designateButtonRef}",
             # The control names the saved route's public provider and model
             # (the spelling the menu itself offers) and truncates inside its
             # own column instead of widening the row.
             'titleWidth="flex"',
-            'const designatedRoute = localApiActive ? "" : clientRouteLabel;',
+            'designatedRoute={localApiActive ? "" : codexRouteLabel}',
             'clientProvider={codexClientProvider}',
             'clientModel={codexClientModel}',
             'localApiActive={codexUsesLocalApi}',
             "const codexClientProvider = stringValue(codexStructured.model_provider).trim();",
             'onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")}',
             'const codexUsesLocalApi = booleanValue(codexState.uses_local_api);',
+            # The same three fields answer for both Claude apps, each naming its
+            # own client so Core writes the right document.
+            'onClaudeUseLocalApi={(app, selection) => dispatch("use_local_api", { ...selection, client: app }, "claude")}',
+            'onClaudeUseSavedModel={(app, selection) => dispatch("use_saved_model", { ...selection, client: app }, "claude")}',
+            'onToggleClaudeModelList={(app, enabled) => dispatch("claude.models.set", { client: app, enabled }, "claude")}',
         ):
             self.assertIn(marker, self.ui if marker not in pane else pane)
+        # Core -- not the pane -- remembers the route a client leaves: once the
+        # client points at this proxy its own file names a public model that
+        # several saved routes may share, so only Core can answer where "off"
+        # goes back to.
+        for path in (ROOT / "young_router/core/domains/codex.py", ROOT / "young_router/core/domains/claude.py"):
+            domain = path.read_text(encoding="utf-8")
+            self.assertIn('read_route_setting(self.app_state_root, "codex")', domain) if "codex" in path.name else self.assertIn('read_route_setting(self.app_state_root, client)', domain)
         # The path itself is the reveal control: a native link button whose
         # long title is bounded by its own column instead of the button's
         # reserved label width.  It shows the home-shortened spelling of the
@@ -2936,7 +2963,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             'titleWidth="flex"',
             'title={file.display_path}',
-            'onPress={() => native.revealFile?.(file.path)}',
+            "onPress={() => revealFile?.(file.path)}",
             'accessibilityLabel={`${revealFileLabel}: ${file.display_path}`}',
             'const revealFileLabel = translate(Platform.OS === "windows" ? "settings.revealInExplorer" : "settings.revealInFinder");',
             'filePathLink: { alignSelf: "stretch", minWidth: 0, flexGrow: 0, flexShrink: 1 },',
@@ -3180,8 +3207,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("if (option) onSelect(option.value);", self.ui)
         self.assertIn("assistantSettingOptions(values, optionTranslator)", self.ui)
         self.assertIn('titleKey: "clients.codex"', self.ui)
-        self.assertIn('{ client: "claudeCode", titleKey: "claude.codeSection"', self.ui)
-        self.assertIn('{ client: "claudeDesktop", titleKey: "claude.desktopSection"', self.ui)
+        self.assertIn('{ client: "claude", titleKey: "clients.claude"', self.ui)
+        self.assertIn('{ app: "claudeCode", titleKey: "claude.codeSection" }', self.ui)
+        self.assertIn('{ app: "claudeDesktop", titleKey: "claude.desktopSection" }', self.ui)
         # The external settings pane lists client files instead of structured
         # Codex/Claude fields, so it localizes display metadata only.
         self.assertNotIn("localizeCodexValidationMessage(message, translate)", self.ui)
@@ -3695,7 +3723,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'type EditorLanguage = "json" | "toml" | "yaml" | "text";',
             "type ReplaceDocumentCommand = {",
             'type SetBaselineCommand = { type: "setBaseline"; baseline: string };',
-            'type HostCommand = ReplaceDocumentCommand | SetBaselineCommand | InsertTextCommand | { type: "focus" };',
+            'type HostCommand = ReplaceDocumentCommand | SetBaselineCommand | InsertTextCommand | { type: "scale"; scale: number } | { type: "focus" };',
             "type AceSession = {",
             "type AceEditor = {",
             "type AceApi = { edit: (element: HTMLElement, options?: Record<string, unknown>) => AceEditor };",
@@ -3745,6 +3773,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('fontSize: "13px"', self.code_editor_web)
         self.assertIn('const ACE_EDITOR_FONT = Platform.OS === "windows" ? "16px/1.45" : "12px/1.55";', self.code_editor_wrapper)
         self.assertIn('font: ${ACE_EDITOR_FONT} ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;', self.code_editor_wrapper)
+        self.assertIn('${Platform.OS === "windows" ? `', self.code_editor_wrapper)
+        self.assertIn("zoom: var(--editor-scale);", self.code_editor_wrapper)
+        self.assertIn("window.LiteLLMCodeEditorPlatform", self.code_editor_wrapper)
+        self.assertIn("aceEditor.setFontSize(baseFontSize * effectiveScale);", self.code_editor_web)
+        self.assertIn("applyEditorScale(message.scale);", self.code_editor_web)
+        self.assertIn("calc(184px * var(--editor-scale))", self.code_editor_wrapper)
         for marker in (
             "#code-editor-layout {",
             "body.diff-sidebar-enabled #code-editor-layout {",
@@ -3820,9 +3854,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # Claude documents are now file rows in the shared listing; the pane
         # never renders a structured Claude form or invents a saved default.
         for marker in (
-            '{ client: "claudeCode", titleKey: "claude.codeSection"',
-            '{ client: "claudeDesktop", titleKey: "claude.desktopSection"',
-            'hintKey: "clients.claudeCodeFilesHint"',
+            # One Claude entry, two apps inside it: the rail no longer offers
+            # the same product twice, and the detail lists each app's files
+            # under its own title.
+            '{ client: "claude", titleKey: "clients.claude"',
+            '{ app: "claudeCode", titleKey: "claude.codeSection" }',
+            '{ app: "claudeDesktop", titleKey: "claude.desktopSection" }',
+            'hintKey: "clients.claudeFilesHint"',
+            'groups={selectedClient === "claude" ? CLAUDE_APP_GROUPS : []}',
             "function FileEditorWorkspace",
             'language={target.language === "yaml" ? "yaml" : target.language === "toml" ? "toml" : "json"}',
         ):
@@ -3887,6 +3926,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assert_ui_has(marker)
 
         self.assertNotIn('label={`${label}${stringValue(item.unit)', self.ui)
+        # The multiline editor is a full-width block, so its tip may not keep
+        # the value-column indent the shared help slot states as padding, and
+        # the wrapper may not reserve a height the field itself overrides:
+        # either mistake draws the tip over the editor or beside its left edge.
+        self.assert_ui_has("runtimeMultilineEditor: { width: \"100%\", minWidth: 0, alignSelf: \"stretch\" }")
+        self.assert_ui_has("runtimeMultilineHelpSlot: { paddingLeft: 0,")
+        self.assert_ui_not_has("runtimeMultilineHelpSlot: { marginLeft: 0,")
         self.assertIn('runtimeOptionLabel(key, rawDefaultValue, translate)', self.ui)
         self.assertNotIn('translate("runtime.subtitle")', self.ui)
         # Restore defaults was removed entirely; per-setting reset in the
@@ -7524,8 +7570,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # is never moved onto another provider's route.
         self.assertIn(r"const identity = `${row.provider}\u001f${row.deploymentId}`;", self.ui)
         self.assertIn(r'`${row.model} · ${row.keyName || translate("providers.undefinedKey")}`', self.ui)
-        self.assertIn("?? (matching.length === 1 ? matching[0] : undefined);", self.ui)
-        self.assertIn("const matching = codexModels.filter(matches);", self.ui)
+        # An ambiguous name resolves to nothing: Core answers a client's own
+        # model back to one saved route only when exactly one route carries it,
+        # and the pane's off direction uses that same answer.
+        domain = (ROOT / "young_router/core/domains/_shared_api.py").read_text(encoding="utf-8")
+        self.assertIn("    if len(candidates) != 1:", domain)
+        self.assertIn("def _route_named(self, model: str) -> dict[str, str] | None:", (ROOT / "young_router/core/domains/claude.py").read_text(encoding="utf-8"))
         core = (ROOT / "young_router/core/codex_config.py").read_text(encoding="utf-8")
         self.assertIn('"api_key_name": str(info.get("api_key_name") or "").strip(),', core)
         self.assertIn('"order": params.get("order"),', core)

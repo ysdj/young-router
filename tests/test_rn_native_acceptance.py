@@ -498,6 +498,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "onEditorChange(std::move(event))",
             "void ScaleChildSiteLink(",
             "metrics.Frame.Width * scale, metrics.Frame.Height * scale",
+            "scale = std::max(scale, std::max(1.0f, island_.ContentIsland().RasterizationScale()));",
+            "webview_.RasterizationScale(1.0);",
+            "SendEditorScaleFromIsland();",
+            "ApplyRasterizationScale(island_content.RasterizationScale());",
+            "current->ApplyRasterizationScale(sender.RasterizationScale());",
+            "island_state_changed_token_",
             "child_layout_metrics_token_",
             "static winrt::fire_and_forget InitializeBrowserAsync(",
             "winrt::com_ptr<CodeWebViewComponentView> self",
@@ -1573,7 +1579,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('return ["group": NSNumber(value: tag / 1_000), "item": NSNumber(value: tag % 1_000)]', mac)
         self.assertIn('result["group"] = static_cast<double>(selected->first);', windows_module)
         self.assertIn('result["item"] = static_cast<double>(selected->second);', windows_module)
-        self.assertIn("designateSavedModel(savedModelGroups[choice.group]?.selections[choice.item]);", ui)
+        # The saved-route menu is built once for every client, so the chosen
+        # row is resolved against that shared grouping.
+        self.assertIn("designateSavedModel(menuGroups[choice.group]?.selections[choice.item]);", ui)
         self.assertIn("Promise<{ group: number; item: number } | undefined>", types)
         # One menu deep: the provider is a section caption and its models sit
         # underneath, never a submenu opening to the right.

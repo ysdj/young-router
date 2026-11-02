@@ -398,6 +398,18 @@ class ClaudeDesktopConfig:
         self._draft = candidate
         return self.snapshot()
 
+    def gateway_url(self) -> str:
+        """The third-party inference endpoint this profile names, if any."""
+
+        value = self._draft.get("inferenceGatewayBaseUrl")
+        return value if isinstance(value, str) else ""
+
+    def gateway_url(self) -> str:
+        """The third-party inference endpoint this profile names, if any."""
+
+        value = self._draft.get("inferenceGatewayBaseUrl")
+        return value if isinstance(value, str) else ""
+
     def secret_present(self, field: str) -> bool:
         if field != "desktop_gateway_api_key":
             raise ClaudeDesktopConfigError("The requested secret field is unavailable")

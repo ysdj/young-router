@@ -85,7 +85,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
 
     def test_retired_sidecar_pin_moves_into_runtime_settings_and_is_removed(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             return_value=EXPOSED,
         ):
             root = Path(directory)
@@ -120,7 +120,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
 
     def test_orphaned_retired_catalog_left_by_an_older_release_is_removed(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             return_value=EXPOSED,
         ):
             root = Path(directory)
@@ -141,7 +141,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
 
     def test_legacy_pointer_is_migrated_to_the_current_catalog_name(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             return_value=EXPOSED,
         ):
             root = Path(directory)
@@ -167,7 +167,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
 
     def test_rebrand_pointer_is_migrated_to_the_current_catalog_name(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             return_value=EXPOSED,
         ):
             root = Path(directory)
@@ -206,7 +206,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
         astra = profile("gpt-6-astra", 1, "Astra instructions")
         orbit = profile("gpt-7-orbit", 0, "GPT-7 instructions")
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             return_value=EXPOSED,
         ):
             root = Path(directory)
@@ -256,7 +256,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
             "model_messages": {"instructions_template": "Native client instructions"},
         }
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             return_value=EXPOSED,
         ):
             root = Path(directory)
@@ -283,7 +283,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
 
     def test_missing_managed_catalog_file_is_rebuilt_before_codex_loads(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             return_value=EXPOSED,
         ):
             root = Path(directory)
@@ -304,7 +304,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
 
     def test_dangling_pointer_is_dropped_when_the_router_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             return_value=([], False),
         ):
             root = Path(directory)
@@ -322,7 +322,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
 
     def test_foreign_catalog_pointer_is_never_touched(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             return_value=EXPOSED,
         ):
             root = Path(directory)
@@ -340,7 +340,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
 
     def test_pointer_repair_moves_a_staged_draft_pointer_too(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.codex_config._local_exposed_models",
+            "young_router.core.codex_config.local_exposed_models",
             return_value=EXPOSED,
         ):
             root = Path(directory)

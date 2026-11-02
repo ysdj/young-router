@@ -66,6 +66,28 @@ def _default_runtime_settings_path() -> Path:
     return Path(configured).expanduser() if configured else _default_runtime_root() / "runtime-settings.env"
 
 
+def _app_state_root(
+    runtime_root: Path | str | None,
+    runtime_settings_path: Path | str | None,
+    runtime_config_path: Path | str | None,
+) -> Path:
+    """The app-state directory a domain reads its own bookkeeping from.
+
+    Production passes the host's runtime root explicitly.  A directly
+    constructed domain falls back to the directory holding the runtime documents
+    it was given, so tests and portable callers never read or write the user's
+    real app directory.
+    """
+
+    if runtime_root is not None:
+        return Path(runtime_root).expanduser()
+    if runtime_settings_path is not None:
+        return Path(runtime_settings_path).expanduser().parent
+    if runtime_config_path is not None:
+        return Path(runtime_config_path).expanduser().parent
+    return _default_runtime_root()
+
+
 def _runtime_root_for_config(config_path: Path) -> Path:
     """The installation root a configuration document belongs to.
 

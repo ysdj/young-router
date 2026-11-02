@@ -105,7 +105,7 @@ class CodexConfigTests(unittest.TestCase):
             "build_opener",
             return_value=opener,
         ):
-            models, enabled = codex_config._local_exposed_models("sk-local-test")
+            models, enabled = codex_config.local_exposed_models("sk-local-test")
 
         self.assertTrue(enabled)
         self.assertEqual(["model-b", "model-a"], models)
@@ -117,7 +117,7 @@ class CodexConfigTests(unittest.TestCase):
         opener = mock.Mock()
         opener.open.side_effect = urllib.error.URLError("offline")
         with mock.patch.object(codex_config.urllib.request, "build_opener", return_value=opener):
-            models, enabled = codex_config._local_exposed_models("sk-local-test")
+            models, enabled = codex_config.local_exposed_models("sk-local-test")
 
         self.assertFalse(enabled)
         self.assertEqual([], models)

@@ -26,6 +26,25 @@ from ..claude_desktop import (
     ClaudeDesktopConfigError,
     ClaudeDeveloperSettings,
 )
+from ._shared import (
+    DomainError,
+    _action_name,
+    _app_state_root,
+    _default_provider_config_path,
+)
+from . import _shared_api
+from ._shared_api import (
+    anthropic_base_url,
+    normalise_route,
+    on_local_api,
+    one_saved_route,
+    read_generated_models,
+    read_route_setting,
+    saved_route_api_key,
+    saved_routes,
+    store_generated_models,
+    store_route_setting,
+)
 
 
 DOMAIN_NAME = "claude"
@@ -38,6 +57,11 @@ RISK_CONFIRMATION_CODES = (
     "filesystem_scope_broadened",
     "network_scope_broadened",
 )
+
+#: The two clients this domain owns.  Claude Code reads ``~/.claude/settings.json``
+#: and Claude Desktop reads its third-party inference profile; an action that
+#: changes one client's backend names which one it means.
+_CLAUDE_CLIENTS = ("claudeCode", "claudeDesktop")
 
 _SECRET_KEY_MARKERS = (
     "token",
@@ -603,6 +627,22 @@ def default_settings_path() -> pathlib.Path:
     return pathlib.Path.home() / DEFAULT_SETTINGS_DIR / SETTINGS_FILENAME
 
 
+def _claude_client(data: Mapping[str, Any]) -> str:
+    """Which Claude app one action addresses.
+
+    The two clients share this domain but not a document, and the pane draws
+    one target control too.  An action names its client; anything else is the
+    CLI, which is the surface this domain owned before Desktop joined it.
+    """
+
+    value = data.get("client")
+    if value is None:
+        return "claudeCode"
+    if value not in _CLAUDE_CLIENTS:
+        raise ClaudeSettingsError("The requested Claude client is unavailable")
+    return str(value)
+
+
 def _normalise_permissions(settings: Mapping[str, Any]) -> dict[str, Any]:
     value = settings.get("permissions", {})
     if value is None:
@@ -1121,9 +1161,32 @@ class ClaudeSettingsDomain:
         desktop_loader: Callable[[pathlib.Path], tuple[str, bool]] | None = None,
         developer_settings_path: pathlib.Path | str | None = None,
         developer_loader: Callable[[pathlib.Path], tuple[str, bool]] | None = None,
+        runtime_config_path: pathlib.Path | str | None = None,
+        runtime_settings_path: pathlib.Path | str | None = None,
+        runtime_root: pathlib.Path | str | None = None,
     ):
         self.settings_path = pathlib.Path(settings_path).expanduser() if settings_path else default_settings_path()
         self._loader = loader or _safe_read
+        # The saved-route actions ("use a specific API") read the same provider
+        # document Codex reads, and the remembered route lives in the runtime
+        # settings beside the catalog pin.  Both stay optional so a caller that
+        # passes an explicit Claude path keeps that path as its only source.
+        self.runtime_config_path = (
+            pathlib.Path(runtime_config_path).expanduser()
+            if runtime_config_path is not None
+            else _default_provider_config_path()
+        )
+        # This app's own bookkeeping about a Claude client -- the route it was
+        # last put on, and the model list generated for it -- lives in the
+        # app-state root beside the Codex catalog's, never in the client's file.
+        self.app_state_root = _app_state_root(
+            runtime_root, runtime_settings_path, runtime_config_path
+        )
+        # The app's own proxy endpoint, resolved once per document load rather
+        # than per snapshot: it reads the runtime settings and the large
+        # runtime configuration while snapshots are polled with a window open.
+        self._local_api_base_url: str | None = None
+        self.refresh_local_api_endpoint()
         # Production uses both official sources.  Tests and callers that pass
         # an explicit Claude Code path stay isolated unless they also provide
         # an explicit Desktop library.
@@ -1186,7 +1249,13 @@ class ClaudeSettingsDomain:
 
         rows: list[dict[str, Any]] = []
 
-        def describe(document: str, path: pathlib.Path, *, client: str, name: str | None = None) -> None:
+        def describe(
+            document: str,
+            path: pathlib.Path,
+            *,
+            app: str,
+            name: str | None = None,
+        ) -> None:
             try:
                 details = path.lstat()
                 exists = stat.S_ISREG(details.st_mode)
@@ -1195,7 +1264,10 @@ class ClaudeSettingsDomain:
             rows.append(
                 {
                     "id": f"claude.{document}",
-                    "client": client,
+                    # Both apps are one entry in the pane's rail, and ``app``
+                    # is what separates their file groups inside it.
+                    "client": "claude",
+                    "app": app,
                     "domain": self.name,
                     "document": document,
                     "name": name or path.name,
@@ -1205,17 +1277,22 @@ class ClaudeSettingsDomain:
                 }
             )
 
-        # Claude Code and Claude Desktop are separate clients with separate
-        # files: ``~/.claude/settings.json`` belongs to the CLI, while the
-        # Desktop app owns its third-party inference library and developer
-        # settings. The pane groups them apart so an edit never looks like it
-        # belongs to the other app.
-        describe("settings", self.settings_path, client="claudeCode")
+        # Claude Code and Claude Desktop are one product with two apps:
+        # ``~/.claude/settings.json`` belongs to the CLI, while the Desktop app
+        # owns its third-party inference library and developer settings.  The
+        # pane draws them under one Claude entry and groups the files by app,
+        # so an edit never looks like it belongs to the other one.
+        describe("settings", self.settings_path, app="claudeCode")
         if self._desktop is not None:
             active = self._desktop.desktop_config_path
-            describe("desktop", active if active is not None else self._desktop.config_library_path, client="claudeDesktop", name=None if active is not None else "configLibrary")
+            describe(
+                "desktop",
+                active if active is not None else self._desktop.config_library_path,
+                app="claudeDesktop",
+                name=None if active is not None else "configLibrary",
+            )
         if self._developer is not None:
-            describe("developer", self._developer.path, client="claudeDesktop")
+            describe("developer", self._developer.path, app="claudeDesktop")
         return rows
 
     def external_disk_state(self) -> dict[str, bool]:
@@ -1371,6 +1448,251 @@ class ClaudeSettingsDomain:
             result["cleanupPeriodDays"] = _positive_integer(settings["cleanupPeriodDays"], "cleanupPeriodDays")
         return result
 
+    # -- the clients' model lists -------------------------------------------
+
+    def _public_models(self) -> list[str] | None:
+        """The names this router currently publishes, or ``None`` when unknown.
+
+        ``None`` and an empty list are different answers: the proxy answers
+        ``/v1/models`` while it is still loading its routes, and a worker
+        reload briefly publishes no group.  Writing that observation into a
+        client's picker would erase the models the user can actually reach, so
+        only an observed non-empty list may rewrite one.
+        """
+
+        from .. import codex_config
+
+        try:
+            key = codex_config.local_api_key(codex_config.load_yaml(self.runtime_config_path))
+            names, available = codex_config.local_exposed_models(key)
+        except Exception:
+            return None
+        if not available or not names:
+            return None
+        return list(names)
+
+    def code_model_list_names(self) -> list[str]:
+        """The model IDs Claude Code's own picker currently offers."""
+
+        value = self._draft.get("modelPicker")
+        options = value.get("options") if isinstance(value, Mapping) else None
+        if not isinstance(options, list):
+            return []
+        names: list[str] = []
+        for item in options:
+            model = item.get("model") if isinstance(item, Mapping) else item
+            if isinstance(model, str) and model.strip():
+                names.append(model.strip())
+        return names
+
+    def code_model_list_enabled(self) -> bool:
+        """Whether Claude Code's picker is this app's list, not its built-in one.
+
+        The lineup alone is not the answer: a lineup that only *adds* rows
+        leaves Claude's built-in models beside this router's names, and a user
+        who came here to route Claude through this app would then be shown
+        models it cannot serve.  The switch means "this list, alone", which is
+        exactly ``replaceBuiltInOptions``.
+        """
+
+        value = self._draft.get("modelPicker")
+        return isinstance(value, Mapping) and value.get("replaceBuiltInOptions") is True
+
+    def desktop_model_list_enabled(self) -> bool:
+        """Whether Claude Desktop's picker list is the one this app generated.
+
+        Claude Desktop has a single model list, so "the switch is on" is the
+        same question as "this file still carries the list this app wrote".
+        The record of what was generated answers it: a profile copied in from
+        elsewhere holds its own models, and claiming those as this app's would
+        let a refresh overwrite a list the user brought with them.
+        """
+
+        if self._desktop is None:
+            return False
+        generated = read_generated_models(self.app_state_root, "claudeDesktop")
+        if not generated:
+            return False
+        return list(self._desktop.snapshot().get("model_names") or []) == generated
+
+    @staticmethod
+    def _code_picker(names: Sequence[str], existing: object = None) -> dict[str, Any]:
+        """A picker lineup for one public-model list.
+
+        A row this app already wrote keeps every field it carries except the
+        model ID: the lineup is this app's list, but a label or a
+        ``behavesAs`` the user added is theirs, and regenerating the file must
+        not silently drop it.
+        """
+
+        preserved: dict[str, dict[str, Any]] = {}
+        options = existing.get("options") if isinstance(existing, Mapping) else None
+        if isinstance(options, list):
+            for item in options:
+                if not isinstance(item, Mapping):
+                    continue
+                model = item.get("model")
+                if isinstance(model, str) and model.strip():
+                    preserved.setdefault(model.strip(), dict(item))
+        rows: list[dict[str, Any]] = []
+        for name in names:
+            row = dict(preserved.get(name) or {})
+            row["model"] = name
+            rows.append(row)
+        lineup: dict[str, Any] = {"replaceBuiltInOptions": True, "options": rows}
+        if isinstance(existing, Mapping):
+            for key, value in existing.items():
+                if key not in lineup:
+                    lineup[key] = copy.deepcopy(value)
+        return lineup
+
+    def _code_model_list_apply(self, enabled: bool, names: Sequence[str] | None = None) -> dict[str, Any]:
+        """Set (or drop) Claude Code's picker lineup from this app's list."""
+
+        candidate = copy.deepcopy(self._draft)
+        if not enabled:
+            candidate.pop("modelPicker", None)
+            return candidate
+        resolved = list(names) if names is not None else self._public_models()
+        if not resolved:
+            raise DomainError("Young Router is not running or exposes no models")
+        candidate["modelPicker"] = self._code_picker(resolved, candidate.get("modelPicker"))
+        return candidate
+
+    def _desktop_model_list_apply(self, enabled: bool, names: Sequence[str] | None = None) -> None:
+        if self._desktop is None:
+            raise ClaudeSettingsError("Claude Desktop configuration is unavailable")
+        if not enabled:
+            try:
+                self._desktop.set_model_names([])
+            except ClaudeDesktopConfigError as exc:
+                raise ClaudeSettingsError(str(exc)) from None
+            return
+        resolved = list(names) if names is not None else self._public_models()
+        if not resolved:
+            raise DomainError("Young Router is not running or exposes no models")
+        try:
+            self._desktop.set_model_names(resolved)
+        except ClaudeDesktopConfigError as exc:
+            raise ClaudeSettingsError(str(exc)) from None
+
+    def refresh_model_lists(self) -> bool:
+        """Regenerate an enabled client model list the public list outgrew.
+
+        The Codex catalog's equivalent, and for the same reason: a client's
+        picker was generated from this router's public models, so a route that
+        was added, removed, or renamed has to reach that picker without the
+        user reopening the pane.  Two gates keep this from fighting the user:
+        a list is touched only while its own switch is on, and only when the
+        public names it was generated from actually differ -- an observation
+        that is merely empty (the proxy still loading, a worker reload between
+        groups) is not a change, and a model a user typed into the list by hand
+        is preserved by name, not dropped with the rewrite.
+        """
+
+        names = self._public_models()
+        if not names:
+            return False
+        changed = False
+        if self.code_model_list_enabled():
+            generated = read_generated_models(self.app_state_root, "claudeCode")
+            if set(generated) != set(names) or self.code_model_list_names() != list(names):
+                candidate = self._code_model_list_apply(True, names)
+                if validate_settings(candidate):
+                    raise ClaudeSettingsError("Claude Settings contains invalid values")
+                self._draft = candidate
+                store_generated_models(self.app_state_root, "claudeCode", names)
+                changed = True
+        if self.desktop_model_list_enabled() and self._desktop is not None:
+            generated = read_generated_models(self.app_state_root, "claudeDesktop")
+            current = list(self._desktop.snapshot().get("model_names") or [])
+            if set(generated) != set(names) or current != list(names):
+                self._desktop_model_list_apply(True, names)
+                store_generated_models(self.app_state_root, "claudeDesktop", names)
+                changed = True
+        if changed:
+            self._revision += 1
+        return changed
+
+    # -- this app's proxy, and the saved route a client leaves for it -------
+
+    def refresh_local_api_endpoint(self) -> None:
+        """Resolve this app's proxy endpoint for the "use this API" action."""
+
+        try:
+            self._local_api_base_url = _shared_api.endpoint()[0]
+        except Exception:
+            self._local_api_base_url = None
+
+    def _code_env(self) -> dict[str, Any]:
+        return _mapping(self._draft.get("env", {}), "env")
+
+    def code_uses_local_api(self) -> bool:
+        """True when Claude Code's own ``env`` already names this proxy."""
+
+        if not self._local_api_base_url:
+            return False
+        return on_local_api(self._code_env().get("ANTHROPIC_BASE_URL"), versioned=False)
+
+    def desktop_uses_local_api(self) -> bool:
+        if self._desktop is None or not self._local_api_base_url:
+            return False
+        return on_local_api(self._desktop.gateway_url(), versioned=False)
+
+    def _route_named(self, model: str) -> dict[str, str] | None:
+        """Resolve a client's own model name back to one saved route.
+
+        Only a name exactly one saved route answers resolves.  Two providers
+        can expose the same public model behind two keys, and picking the first
+        would put the client's off direction on a route it was never on.
+        """
+
+        if not model:
+            return None
+        try:
+            _, rows = saved_routes(self.runtime_config_path)
+        except DomainError:
+            return None
+        matches = [row for row in rows if str(row.get("model") or "").strip() == model]
+        if len(matches) != 1:
+            return None
+        row = matches[0]
+        return normalise_route(
+            {
+                "model": row.get("model"),
+                "provider": row.get("provider"),
+                "deployment_id": row.get("deployment_id"),
+            }
+        )
+
+    def client_route(self, client: str) -> dict[str, str] | None:
+        """The saved route this client is on, or the one it last left for us.
+
+        The remembered route answers while the client points at this app's
+        proxy, because the proxy serves public model names and several saved
+        routes may share one: the client's own document has nothing left to
+        identify the route it came from.  A client that points somewhere else
+        answers from its own document instead, so a route the user configured
+        by hand is never reported as this app's choice.
+        """
+
+        remembered = read_route_setting(self.app_state_root, client)
+        if client == "claudeDesktop":
+            if self.desktop_uses_local_api():
+                return remembered
+            model_names = (
+                self._desktop.snapshot().get("model_names", []) if self._desktop is not None else []
+            )
+            model = str(model_names[0]).strip() if model_names else ""
+            return self._route_named(model) or remembered
+        if self.code_uses_local_api():
+            return remembered
+        env = self._code_env()
+        model = _string(env.get("ANTHROPIC_MODEL"), "env.ANTHROPIC_MODEL") or _string(
+            self._draft.get("model"), "model"
+        )
+        return self._route_named(model or "") or remembered
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "domain": self.name,
@@ -1378,7 +1700,42 @@ class ClaudeSettingsDomain:
             "settings": self._safe_projection(self._draft),
             "desktop": self._desktop.snapshot() if self._desktop is not None else {"available": False},
             "developer": self._developer.snapshot() if self._developer is not None else {"available": False},
+            # The two clients share one domain but not one backend: each carries
+            # its own switch, its own designated route, and its own model list,
+            # so the pane never draws one client's state on the other's row.
+            "clients": {
+                "claudeCode": {
+                    "uses_local_api": self.code_uses_local_api(),
+                    "designated_route": self.client_route("claudeCode"),
+                    "model_list_enabled": self.code_model_list_enabled(),
+                },
+                "claudeDesktop": {
+                    "uses_local_api": self.desktop_uses_local_api(),
+                    "designated_route": self.client_route("claudeDesktop"),
+                    "model_list_enabled": self.desktop_model_list_enabled(),
+                },
+            },
+            # The saved routes the designate control offers.  Only identity and
+            # the labels the menu shows: no endpoint, no key.
+            "models": self._saved_route_rows(),
         }
+
+    def _saved_route_rows(self) -> list[dict[str, Any]]:
+        try:
+            _, rows = saved_routes(self.runtime_config_path)
+        except DomainError:
+            return []
+        return [
+            {
+                "model": str(row.get("model") or ""),
+                "provider": str(row.get("provider") or ""),
+                "deployment_id": str(row.get("deployment_id") or ""),
+                "api_key_name": str(row.get("api_key_name") or ""),
+                "upstream_url_surface": str(row.get("upstream_url_surface") or ""),
+            }
+            for row in rows
+            if row.get("model") and row.get("provider") and row.get("deployment_id")
+        ]
 
     def draft_state(self) -> object:
         if self._desktop is None and self._developer is None:
@@ -1419,7 +1776,11 @@ class ClaudeSettingsDomain:
 
     def dispatch(self, action: str, payload: object | None = None) -> dict[str, Any]:
         data = _mapping(payload or {}, "payload")
-        if action in {"developer_patch", "developerPatch"}:
+        # One spelling per action: the UI names an action with dots, a direct
+        # Core caller may use underscores, and the two must reach the same
+        # branch instead of one of them landing on "unknown action".
+        name = _action_name(action)
+        if name in {"developer_patch", "developerpatch"}:
             if self._developer is None:
                 raise ClaudeSettingsError("Claude Desktop developer settings are unavailable")
             try:
@@ -1428,7 +1789,7 @@ class ClaudeSettingsDomain:
                 raise ClaudeSettingsError(str(exc)) from None
             self._revision += 1
             return self.snapshot()
-        if action in {"desktop_patch", "desktopPatch"}:
+        if name in {"desktop_patch", "desktoppatch"}:
             if self._desktop is None:
                 raise ClaudeSettingsError("Claude Desktop configuration is unavailable")
             try:
@@ -1437,23 +1798,105 @@ class ClaudeSettingsDomain:
                 raise ClaudeSettingsError(str(exc)) from None
             self._revision += 1
             return self.snapshot()
-        if action in {"use_local_api", "useLocalApi"}:
-            # Point Claude Desktop at this app's own proxy and adopt its
-            # master key. The Anthropic-compatible base URL carries no /v1.
-            if self._desktop is None:
-                raise ClaudeSettingsError("Claude Desktop configuration is unavailable")
-            from ._shared import local_proxy_endpoint
-
-            base_url, key = local_proxy_endpoint()
-            base_url = base_url.removesuffix("/v1")
-            try:
-                self._desktop.patch({"inferenceGatewayBaseUrl": base_url})
-                self._desktop.stage_secret("desktop_gateway_api_key", key)
-            except ClaudeDesktopConfigError as exc:
-                raise ClaudeSettingsError(str(exc)) from None
+        if name in {"use_local_api", "uselocalapi"}:
+            # Point one Claude client at this app's own proxy and adopt its
+            # master key.  Claude Code names its gateway in ``env``; Claude
+            # Desktop names it in its third-party inference profile.  Both
+            # store the Messages root, which carries no ``/v1``: each appends
+            # ``/v1/messages`` itself.  The route the client leaves behind is
+            # remembered, because the proxy serves public model names and the
+            # client's own document can no longer state which route it was on.
+            client = _claude_client(data)
+            base_url, key = _shared_api.endpoint()
+            base_url = anthropic_base_url(base_url)
+            store_route_setting(self.app_state_root, client, data)
+            if client == "claudeDesktop":
+                if self._desktop is None:
+                    raise ClaudeSettingsError("Claude Desktop configuration is unavailable")
+                try:
+                    self._desktop.patch(
+                        {"inferenceProvider": "gateway", "inferenceGatewayBaseUrl": base_url}
+                    )
+                    self._desktop.stage_secret("desktop_gateway_api_key", key)
+                except ClaudeDesktopConfigError as exc:
+                    raise ClaudeSettingsError(str(exc)) from None
+                self._revision += 1
+                return self.snapshot()
+            candidate = copy.deepcopy(self._draft)
+            env = _mapping(candidate.get("env", {}), "env")
+            env["ANTHROPIC_BASE_URL"] = base_url
+            # ``ANTHROPIC_AUTH_TOKEN`` is the bearer form a gateway states; an
+            # ``ANTHROPIC_API_KEY`` left beside it is the old direct route's
+            # credential and would be sent as a second identity.
+            env.pop("ANTHROPIC_API_KEY", None)
+            env["ANTHROPIC_AUTH_TOKEN"] = key
+            model = str(data.get("model") or "").strip()
+            if model:
+                env["ANTHROPIC_MODEL"] = model
+                candidate["model"] = model
+            elif isinstance(env.get("ANTHROPIC_MODEL"), str):
+                candidate["model"] = env["ANTHROPIC_MODEL"]
+            candidate["env"] = env
+            errors = validate_settings(candidate)
+            if errors:
+                raise ClaudeSettingsError(errors[0])
+            self._draft = candidate
             self._revision += 1
             return self.snapshot()
-        if action in {"desktop_models_patch", "desktopModelsPatch"}:
+        if name in {"use_saved_model", "usesavedmodel"}:
+            # The counterpart of ``use_local_api``: put one Claude client back
+            # on a saved route's own endpoint, key, and public model name,
+            # instead of going through this app's proxy.  A client on the proxy
+            # has nothing left to read -- the proxy serves public names -- so
+            # the pane names the route explicitly.
+            client = _claude_client(data)
+            runtime, rows = saved_routes(self.runtime_config_path)
+            row = one_saved_route(rows, data)
+            route_base_url = str(row.get("api_base") or "").strip()
+            if not route_base_url:
+                raise DomainError("The selected model has no saved provider endpoint")
+            route_key = saved_route_api_key(runtime, str(row.get("deployment_id") or ""))
+            route_model = str(row.get("model") or "").strip()
+            store_route_setting(self.app_state_root, client, data)
+            if client == "claudeDesktop":
+                if self._desktop is None:
+                    raise ClaudeSettingsError("Claude Desktop configuration is unavailable")
+                try:
+                    self._desktop.patch(
+                        {
+                            "inferenceProvider": "gateway",
+                            "inferenceGatewayBaseUrl": anthropic_base_url(route_base_url),
+                        }
+                    )
+                    self._desktop.stage_secret("desktop_gateway_api_key", route_key)
+                    self._desktop.set_model_names([route_model] if route_model else [])
+                except ClaudeDesktopConfigError as exc:
+                    raise ClaudeSettingsError(str(exc)) from None
+                self._revision += 1
+                return self.snapshot()
+            candidate = copy.deepcopy(self._draft)
+            env = _mapping(candidate.get("env", {}), "env")
+            env["ANTHROPIC_BASE_URL"] = anthropic_base_url(route_base_url)
+            # The saved route's own key is the credential this route answers,
+            # and it is applied only when this app stores one: a route that
+            # authenticates elsewhere must not carry a stale token forward.
+            if route_key:
+                env.pop("ANTHROPIC_API_KEY", None)
+                env["ANTHROPIC_AUTH_TOKEN"] = route_key
+            if route_model:
+                env["ANTHROPIC_MODEL"] = route_model
+                candidate["model"] = route_model
+            candidate["env"] = env
+            errors = validate_settings(candidate)
+            if errors:
+                raise ClaudeSettingsError(errors[0])
+            self._draft = candidate
+            self._revision += 1
+            return self.snapshot()
+        if name in {"desktop_models_patch", "desktopmodelspatch"}:
+            # The Desktop list as an explicit value rather than a switch.  Older
+            # callers only had this app's Desktop, so they named no client; the
+            # value is theirs to set, so it is also not recorded as generated.
             if self._desktop is None:
                 raise ClaudeSettingsError("Claude Desktop configuration is unavailable")
             if set(data) != {"model_names"}:
@@ -1464,8 +1907,36 @@ class ClaudeSettingsDomain:
                 raise ClaudeSettingsError(str(exc)) from None
             self._revision += 1
             return self.snapshot()
+        if name in {"claude_models_set", "claudemodelsset", "claude_models", "claudemodels"}:
+            # One switch per client, because the two apps keep different model
+            # lists: Claude Code reads ``modelPicker`` from its own settings,
+            # Claude Desktop reads ``inferenceModels`` from its third-party
+            # profile.  Both are generated from this router's public list.
+            client = _claude_client(data)
+            enabled = data.get("enabled", data.get("model_list_enabled"))
+            if not isinstance(enabled, bool):
+                raise DomainError("The Claude model-list switch is invalid")
+            if client == "claudeDesktop":
+                self._desktop_model_list_apply(enabled)
+                store_generated_models(
+                    self.app_state_root,
+                    "claudeDesktop",
+                    list(self._desktop.snapshot().get("model_names") or []) if enabled else [],
+                )
+                self._revision += 1
+                return self.snapshot()
+            candidate = self._code_model_list_apply(enabled)
+            errors = validate_settings(candidate)
+            if errors:
+                raise ClaudeSettingsError(errors[0])
+            self._draft = candidate
+            store_generated_models(
+                self.app_state_root, "claudeCode", self.code_model_list_names() if enabled else []
+            )
+            self._revision += 1
+            return self.snapshot()
         candidate = copy.deepcopy(self._draft)
-        if action in {"set", "patch"}:
+        if name in {"set", "patch", "claude_settings_set"}:
             _validate_structured_patch(data)
             normalized = _normalise_structured_patch(data)
             for key, value in normalized.items():
@@ -1475,7 +1946,7 @@ class ClaudeSettingsDomain:
                     candidate[key] = _deep_merge(_mapping(candidate[key], key), value)
                 else:
                     candidate[key] = copy.deepcopy(value)
-        elif action in {"set_raw", "setRaw"}:
+        elif name in {"set_raw", "setraw"}:
             document = data.get("document", "settings")
             raw_text = data.get("raw_json", data.get("rawJson", data.get("text")))
             if not isinstance(raw_text, str):
@@ -1507,11 +1978,11 @@ class ClaudeSettingsDomain:
             if not isinstance(loaded, dict):
                 raise ClaudeSettingsError("Claude Settings JSON must be an object")
             candidate = loaded
-        elif action in {"select_deployment", "selectDeployment"}:
+        elif name in {"select_deployment", "selectdeployment"}:
             candidate = apply_litellm_deployment(candidate, data.get("deployment", data))
-        elif action in {"patch_deployment", "patchDeployment"}:
+        elif name in {"patch_deployment", "patchdeployment"}:
             candidate = _patch_litellm_deployment(candidate, data.get("deployment", data))
-        elif action in {"reset", "cancel", "reload"}:
+        elif name in {"reset", "cancel", "reload"}:
             candidate = copy.deepcopy(self._raw)
             if self._desktop is not None:
                 self._desktop.reset_draft()

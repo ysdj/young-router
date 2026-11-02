@@ -84,7 +84,13 @@ export type EditorDocument =
  */
 export interface ClientFile {
   id: string;
-  client: "codex" | "claude" | "claudeCode" | "claudeDesktop" | "pi" | "dsh" | "opencode";
+  /**
+   * ``claude`` covers both Claude apps: Claude Code and Claude Desktop keep
+   * their own documents but share the pane's one Claude entry, so ``app`` is
+   * what tells the two file groups apart.
+   */
+  client: "codex" | "claude" | "pi" | "dsh" | "opencode";
+  app?: "claudeCode" | "claudeDesktop";
   domain: "codex" | "claude" | "clients";
   document:
     | "config"

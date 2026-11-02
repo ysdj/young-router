@@ -116,9 +116,10 @@ struct CodeWebViewComponentView
     try {
       island_ = winrt::Microsoft::UI::Xaml::XamlIsland{};
       webview_ = WebView2{};
-      // The XamlIsland is attached to RNW's ChildSiteLink, which supplies the
-      // monitor scale after connection. Let WebView2 track that scale itself;
-      // overriding it from GetDpiForSystem double-scales this child surface.
+      // The XamlIsland is attached to RNW's ChildSiteLink.  The island's own
+      // rasterization scale is the monitor scale the child surface adopts, and
+      // WebView2 must use that same scale for its page viewport; the Fabric
+      // PointScaleFactor is 1 inside this child host.
       auto weak = get_weak();
       navigation_completed_token_ = webview_.NavigationCompleted(
           [weak](auto const&, auto const& args) {
@@ -129,7 +130,19 @@ struct CodeWebViewComponentView
             }
           });
       island_.Content(webview_);
-      island_view.Connect(island_.ContentIsland());
+      auto island_content = island_.ContentIsland();
+      island_state_changed_token_ = island_content.StateChanged(
+          [weak](winrt::Microsoft::UI::Content::ContentIsland const& sender, auto const& args) {
+            if (!args.DidRasterizationScaleChange()) return;
+            if (auto current = weak.get(); current && !current->disposed_) {
+              current->ApplyRasterizationScale(sender.RasterizationScale());
+              if (current->editor_ready_) {
+                current->SendEditorScale(sender.RasterizationScale());
+              }
+            }
+          });
+      ApplyRasterizationScale(island_content.RasterizationScale());
+      island_view.Connect(island_content);
       ScaleChildSiteLink(island_view, island_view.LayoutMetrics());
       auto child_link_weak = get_weak();
       child_layout_metrics_token_ = island_view.LayoutMetricsChanged(
@@ -146,15 +159,35 @@ struct CodeWebViewComponentView
   }
 
   // Fabric layout is in DIPs, but RNW forwards this child-site size without
-  // applying PointScaleFactor; the linked XAML island needs the physical size.
+  // applying the monitor scale.  The child host reports PointScaleFactor 1
+  // even though its XAML island adopts the 2x display scale, so the island's
+  // own rasterization scale is the authoritative multiplier for the link.
   void ScaleChildSiteLink(
       ContentIslandComponentView const& island_view,
       winrt::Microsoft::ReactNative::LayoutMetrics const& metrics) noexcept {
     try {
       auto link = island_view.ChildSiteLink();
       if (!link) return;
-      const auto scale = std::max(1.0f, metrics.PointScaleFactor);
+      auto scale = std::max(1.0f, metrics.PointScaleFactor);
+      try {
+        scale = std::max(scale, std::max(1.0f, island_.ContentIsland().RasterizationScale()));
+      } catch (...) {
+      }
       link.ActualSize({metrics.Frame.Width * scale, metrics.Frame.Height * scale});
+      // Apply the scale again after the link has its final physical size so the
+      // control and its browser surface use the same monitor scale.
+      ApplyRasterizationScale(scale);
+    } catch (...) {
+    }
+  }
+
+  // The child site is sized in physical pixels, so the browser surface is
+  // 1:1 with the window.  The page reads the host display scale for its font
+  // and rail sizes; a 2x WebView buffer would be downscaled here and is
+  // unnecessary work during typing and scrolling.
+  void ApplyRasterizationScale(double /*scale*/) noexcept {
+    try {
+      if (webview_) webview_.RasterizationScale(1.0);
     } catch (...) {
     }
   }
@@ -182,6 +215,7 @@ struct CodeWebViewComponentView
       auto scale = 1.0;
       try {
         scale = self->island_.ContentIsland().RasterizationScale();
+        self->ScaleChildSiteLink(wait->island_view, wait->island_view.LayoutMetrics());
       } catch (...) {
         // The island is gone or not connected yet; stop waiting and start the
         // browser so the surface still initializes.
@@ -263,8 +297,7 @@ struct CodeWebViewComponentView
       co_await self->webview_.EnsureCoreWebView2Async(environment, controller_options);
       if (self->disposed_ || !self->webview_) co_return;
       self->core_ = self->webview_.CoreWebView2();
-      const auto island_scale = self->island_.ContentIsland().RasterizationScale();
-      if (island_scale > 0.0) self->webview_.RasterizationScale(island_scale);
+      self->ApplyRasterizationScale(self->island_.ContentIsland().RasterizationScale());
       auto weak = self->get_weak();
       self->web_message_token_ = self->core_.WebMessageReceived(
           [weak](auto const&, auto const& args) {
@@ -379,6 +412,28 @@ struct CodeWebViewComponentView
     }
   }
 
+  void SendEditorScaleFromIsland() noexcept {
+    double scale = 1.0;
+    try {
+      scale = island_.ContentIsland().RasterizationScale();
+    } catch (...) {
+    }
+    SendEditorScale(scale);
+  }
+
+  void SendEditorScale(double scale) noexcept {
+    if (!(scale > 0.0)) return;
+    try {
+      auto payload = winrt::Windows::Data::Json::JsonObject{};
+      payload.Insert(L"type", winrt::Windows::Data::Json::JsonValue::CreateStringValue(L"scale"));
+      payload.Insert(L"scale", winrt::Windows::Data::Json::JsonValue::CreateNumberValue(scale));
+      auto script = winrt::hstring(L"window.LiteLLMCodeEditor && window.LiteLLMCodeEditor.receive(") +
+          payload.Stringify() + L");";
+      ExecuteEditorScript(std::move(script));
+    } catch (...) {
+    }
+  }
+
   void InsertClipboardText() noexcept {
     InsertClipboardTextAsync(get_strong());
   }
@@ -439,6 +494,7 @@ struct CodeWebViewComponentView
             html_state_generation_ == editor_state_generation_;
         pending_sync_ = !initial_document_is_current;
         SynchronizeEditorIfReady();
+        SendEditorScaleFromIsland();
         return;
       }
       if (type == "error") {
@@ -490,6 +546,13 @@ struct CodeWebViewComponentView
     html_state_generation_ = 0;
     page_recovery_attempts_ = 0;
     try {
+      if (island_state_changed_token_.value != 0) {
+        island_.ContentIsland().StateChanged(island_state_changed_token_);
+      }
+    } catch (...) {
+    }
+    island_state_changed_token_ = {};
+    try {
       if (core_ && web_message_token_.value != 0) {
         core_.WebMessageReceived(web_message_token_);
       }
@@ -536,6 +599,7 @@ struct CodeWebViewComponentView
   winrt::event_token web_message_token_{};
   winrt::event_token navigation_completed_token_{};
   winrt::event_token child_layout_metrics_token_{};
+  winrt::event_token island_state_changed_token_{};
 };
 
 void RegisterCodeWebViewRecycleHandler(

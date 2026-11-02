@@ -1,6 +1,7 @@
 #import "AppDelegate.h"
 
 #import <React/RCTBundleURLProvider.h>
+#import <React/RCTReloadCommand.h>
 #if __has_include(<ReactAppDependencyProvider/RCTAppDependencyProvider.h>)
 #import <ReactAppDependencyProvider/RCTAppDependencyProvider.h>
 #endif
@@ -32,7 +33,31 @@
 #if __has_include(<ReactAppDependencyProvider/RCTAppDependencyProvider.h>)
   self.dependencyProvider = [RCTAppDependencyProvider new];
 #endif
+  [self clearMetroOverrideWhenBundleFails:defaults];
   [self installNativeStatusItem];
+}
+
+/// A Metro-served bundle that fails to compile reaches `RCTFatal`, which a
+/// Release host answers by aborting -- with no red box to explain it.  The
+/// override outlives that abort, so the next launch would fetch the same
+/// broken bundle and abort again, leaving no window to clear it from.  Dropping
+/// the override here, before the abort, returns the following launch to the
+/// packaged bundle.  Installed only while the override is in use, so a Release
+/// host that never opts into Metro keeps its stock failure path.
+- (void)clearMetroOverrideWhenBundleFails:(NSUserDefaults *)defaults
+{
+  if (defaults && [defaults stringForKey:@"MetroServerURL"] == nil) {
+    return;
+  }
+  [[NSNotificationCenter defaultCenter] addObserverForName:RCTJavaScriptDidFailToLoadNotification
+                                                    object:nil
+                                                     queue:nil
+                                                usingBlock:^(NSNotification *note) {
+    NSLog(@"Young Router: Metro bundle failed to load (%@); clearing MetroServerURL",
+          note.userInfo[@"error"]);
+    [defaults removeObjectForKey:@"MetroServerURL"];
+    [defaults synchronize];
+  }];
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification
@@ -162,6 +187,19 @@
     routeScheme = @"young-router";
   }
   for (NSURL *url in urls) {
+    // `young-router://reload` is the dev loop's trigger.  `RCTHost` registers
+    // itself as a reload listener in every configuration, so this re-reads the
+    // bundle URL and rebuilds the instance without touching Core or the proxy --
+    // which is what makes a Metro-served JS edit cost a reload instead of a
+    // restart.  It is a reload and nothing else: it carries no route, reads no
+    // configuration, and a Release host that never opts into Metro simply
+    // reloads the packaged bundle it already runs.
+    if ([[url scheme] isEqualToString:routeScheme] && [[url host] isEqualToString:@"reload"]) {
+      dispatch_async(dispatch_get_main_queue(), ^{
+        RCTTriggerReloadCommandListeners(@"young-router reload link");
+      });
+      continue;
+    }
     if (![[url scheme] isEqualToString:routeScheme] || ![[url host] isEqualToString:@"open"]) {
       continue;
     }
@@ -200,9 +238,9 @@
 #if DEBUG
   return [[RCTBundleURLProvider sharedSettings] jsBundleURLForBundleRoot:@"index"];
 #else
-  // Release builds can load from Metro when this override is set, enabling
-  // Fast Refresh without switching to a Debug configuration. Cleared or an
-  // invalid URL falls back to the packaged bundle.
+  // Release builds can load from Metro when this override is set, which lets a
+  // JS edit be picked up by a reload instead of a deploy. Cleared or an invalid
+  // URL falls back to the packaged bundle.
   NSString *metroURL = [[NSUserDefaults standardUserDefaults] stringForKey:@"MetroServerURL"];
   if (metroURL && [metroURL hasPrefix:@"http"]) {
     NSURL *url = [NSURL URLWithString:metroURL];
