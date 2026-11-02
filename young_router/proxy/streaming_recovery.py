@@ -1125,6 +1125,14 @@ async def _stream_route_recovery_poll(
     max_poll_seconds = _routing_module._recovery_max_seconds_for_request(request_data)
     if max_poll_seconds <= 0:
         return
+    if _routing_module._is_thinking_replay_contract_error(exception):
+        if _routing_module._strip_replayed_reasoning_items(request_data):
+            _trace_module._request_route_trace(
+                "route_recovery_poll_reasoning_stripped",
+                request_data,
+                stripped_item_types=["reasoning", "function_call", "function_call_output"],
+                exception=_routing_module._trace_exception(exception),
+            )
     # The request body was already refused by size on this request: another
     # attempt forwards the same bytes, so the poll cannot make progress and
     # must not hold the client open until the recovery window expires.

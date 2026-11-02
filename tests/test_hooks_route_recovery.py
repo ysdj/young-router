@@ -1030,6 +1030,120 @@ class HookRouteRecoveryTests(HookTestCase):
             )
         )
 
+    async def test_thinking_refusal_strips_the_replayed_tool_graph_once(self) -> None:
+        """A route that cannot verify the replayed thinking gets the text only.
+
+        The 183-item history from the flux-code era is refused by the official
+        DeepSeek route with the thinking-replay 400 while a 381-item history on
+        the same route answers.  The graph (reasoning, function calls, their
+        outputs) is what the route cannot verify; the messages are still the
+        user's conversation.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_POLICY_REQUEST_ERROR_ENV, None)
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "1")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        seen = []
+
+        async def sanitized_attempt(request_data, exception, **kwargs):
+            seen.append(
+                [
+                    item
+                    for item in request_data.get("input", [])
+                    if isinstance(item, dict)
+                ]
+            )
+            yield {
+                "type": "response.output_text.delta",
+                "item_id": "msg_sanitized",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "answered without the old tool graph",
+            }
+
+        request_data = {
+            "model": "balanced-chat",
+            "input": [
+                {"role": "user", "content": "continue"},
+                {"type": "reasoning", "encrypted_content": "foreign"},
+                {"type": "function_call", "name": "bash", "arguments": "{}", "call_id": "c1"},
+                {"type": "function_call_output", "call_id": "c1", "output": "old"},
+                {"role": "assistant", "content": [{"type": "output_text", "text": "done"}]},
+            ],
+            "stream": True,
+            "metadata": {"request_id": "route-recovery-strip"},
+            "model_info": {"id": "79f0dc70", "order": 1},
+        }
+        refusal = RuntimeError(
+            "litellm.BadRequestError: OpenAIException - {\"error\":{\"message\":"
+            "\"the `reasoning_text` in the thinking mode must be passed back "
+            "to the api.\"}}"
+        )
+        refusal.status_code = 400
+
+        with mock.patch.object(
+            hooks._streaming_module,
+            "_stream_route_recovery_poll_attempt",
+            sanitized_attempt,
+        ), mock.patch.object(
+            hooks._streaming_module,
+            "_stream_native_route_recovery_poll_attempt",
+            sanitized_attempt,
+        ):
+            chunks = [
+                chunk
+                async for chunk in hooks._stream_route_recovery_poll(
+                    request_data,
+                    refusal,
+                )
+            ]
+
+        self.assertTrue(seen)
+        self.assertFalse(
+            any(
+                item.get("type") in {"reasoning", "function_call", "function_call_output"}
+                for item in seen[0]
+            )
+        )
+        self.assertTrue(any(item.get("role") == "user" for item in seen[0]))
+        self.assertTrue(
+            any(
+                isinstance(chunk, dict)
+                and chunk.get("delta") == "answered without the old tool graph"
+                for chunk in chunks
+            )
+        )
+
+    def test_thinking_refusal_keeps_the_recovery_stream_despite_an_ordered_entry(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_POLICY_REQUEST_ERROR_ENV, None)
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "10")
+        refusal = RuntimeError(
+            "litellm.BadRequestError: OpenAIException - {\"error\":{\"message\":"
+            "\"the `reasoning_text` in the thinking mode must be passed back "
+            "to the api.\"}}"
+        )
+        refusal.status_code = 400
+        request_kwargs = {
+            "model": "balanced-chat",
+            "stream": True,
+            "input": [{"role": "user", "content": "continue"}],
+            "metadata": {"request_id": "ordered-entry-thinking"},
+        }
+        with mock.patch.object(
+            hooks._responses_execution_module,
+            "_ordered_deployment_fallback_entry",
+            return_value={"id": "next"},
+        ):
+            self.assertTrue(
+                hooks._should_return_route_recovery_stream(
+                    refusal,
+                    request_kwargs,
+                    object(),
+                )
+            )
+
     def test_first_event_timeout_keeps_polling_a_delivered_then_idle_stream(self) -> None:
         """Only a zero-byte wait is terminal; a delivered stream is not.
 
