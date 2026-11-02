@@ -1885,11 +1885,11 @@ def _install_managed_responses_websocket_keepalive_patch() -> None:
 
 
 def _is_pending_reasoning_item_event(event: Any) -> bool:
-    """Whether this queued iterator frame announces a reasoning item."""
+    """Whether this queued iterator frame announces or closes a reasoning item."""
 
-    if (
-        _web_search_native_module._response_item_get(event, "type")
-        != "response.output_item.added"
+    if _web_search_native_module._response_item_get(event, "type") not in (
+        "response.output_item.added",
+        "response.output_item.done",
     ):
         return False
     item = _web_search_native_module._response_item_get(event, "item")
@@ -1911,44 +1911,154 @@ def _reasoning_summary_part_added_event(item_id: Any, output_index: Any) -> Any:
     return _streaming_module._json_stream_event(event)
 
 
-def _open_reasoning_summary_items(pending: list[Any], queued_from: int) -> None:
-    """Give a queued reasoning item the summary array it is about to fill.
+def _set_item_field(item: Any, key: str, value: Any) -> None:
+    if isinstance(item, dict):
+        item[key] = value
+        return
+    setattr(item, key, value)
+
+
+def _chunk_reasoning_fragment(chunk: Any) -> str:
+    choices = _web_search_native_module._response_item_get(chunk, "choices")
+    if not isinstance(choices, (list, tuple)) or not choices:
+        return ""
+    delta = _web_search_native_module._response_item_get(choices[0], "delta")
+    fragment = _web_search_native_module._response_item_get(delta, "reasoning_content")
+    return fragment if isinstance(fragment, str) else ""
+
+
+def _pending_content_part_done_text(pending: list[Any], queued_from: int) -> Any:
+    for event in pending[queued_from:]:
+        if _web_search_native_module._response_item_get(event, "type") != "response.content_part.done":
+            continue
+        part = _web_search_native_module._response_item_get(event, "part")
+        if _web_search_native_module._response_item_get(part, "type") != "reasoning_text":
+            continue
+        text = _web_search_native_module._response_item_get(part, "text")
+        if isinstance(text, str) and text:
+            return text
+    return None
+
+
+def _reasoning_summary_text_event(item_id: Any, output_index: Any, kind: str, text: str) -> Any:
+    event: dict[str, Any] = {
+        "type": f"response.reasoning_summary_text.{kind}",
+        "item_id": item_id,
+        "output_index": output_index,
+        "summary_index": 0,
+    }
+    if kind == "delta":
+        event["delta"] = text
+    else:
+        event["text"] = text
+    return _streaming_module._json_stream_event(event)
+
+
+def _reasoning_summary_part_done_event(item_id: Any, output_index: Any, text: str) -> Any:
+    event: dict[str, Any] = {
+        "type": "response.reasoning_summary_part.done",
+        "item_id": item_id,
+        "output_index": output_index,
+        "summary_index": 0,
+        "part": {"type": "summary_text", "text": text},
+    }
+    return _streaming_module._json_stream_event(event)
+
+
+def _apply_reasoning_summary_to_response(iterator: Any, response: Any) -> None:
+    output = _web_search_native_module._response_item_get(response, "output")
+    if not isinstance(output, (list, tuple)):
+        return
+    texts = getattr(iterator, "_young_router_reasoning_summary_text", None)
+    if not isinstance(texts, dict):
+        return
+    for item in output:
+        if _web_search_native_module._response_item_get(item, "type") != "reasoning":
+            continue
+        item_id = _web_search_native_module._response_item_get(item, "id")
+        text = texts.get(item_id)
+        if isinstance(text, str) and text:
+            _set_item_field(item, "summary", [{"type": "summary_text", "text": text}])
+
+
+def _open_reasoning_summary_items(
+    iterator: Any,
+    pending: list[Any],
+    queued_from: int,
+    chunk: Any,
+) -> None:
+    """Give a reasoning item both the summary frames and the summary text.
 
     LiteLLM's Chat-to-Responses iterator builds a reasoning item from a delta
-    that carries only ``reasoning_content``, so ``_ensure_output_item_for_chunk``
-    queues an ``output_item.added`` frame stating ``id``/``type``/``status`` and
-    no ``summary`` at all, and it never queues the
-    ``response.reasoning_summary_part.added`` frame that opens summary index 0.
-
-    A client needs both before it will render a summary delta.  The Codex
-    desktop app drops a summary delta whose item announced no ``summary``
-    array, so the thinking this route streamed never reached its thinking
-    block and surfaced under the answer instead -- while this proxy's own chat
-    bridge, which states ``summary: []`` and the part frame, showed the same
-    thinking correctly.  Only a missing summary is stated and only the part
-    frame is added, so a release whose iterator already queues both keeps its
-    own frames.
+    that carries only ``reasoning_content``: it queues the item and a
+    ``reasoning_text`` content part, but no ``reasoning_summary_part`` and no
+    summary deltas.  Its item ``summary`` is now an empty array rather than
+    absent, so restating the array is not enough -- a client that renders
+    thinking from ``reasoning_summary_text`` (the Pi does) still sees nothing.
+    Emit the summary frames and mirror the text into the item's ``summary`` as
+    well, so both the live block and the completed item carry it.  The raw
+    ``reasoning_text`` content part stays where LiteLLM put it.
     """
 
+    fragment = _chunk_reasoning_fragment(chunk)
+    done_text = _pending_content_part_done_text(pending, queued_from)
     opening: list[Any] = []
-    for event in pending[queued_from:]:
+
+    texts = getattr(iterator, "_young_router_reasoning_summary_text", None)
+    if not isinstance(texts, dict):
+        texts = {}
+        setattr(iterator, "_young_router_reasoning_summary_text", texts)
+    opened = getattr(iterator, "_young_router_reasoning_summary_open", None)
+    if not isinstance(opened, set):
+        opened = set()
+        setattr(iterator, "_young_router_reasoning_summary_open", opened)
+    finished = getattr(iterator, "_young_router_reasoning_summary_done", None)
+    if not isinstance(finished, set):
+        finished = set()
+        setattr(iterator, "_young_router_reasoning_summary_done", finished)
+
+    fragment_added = False
+    for event in list(pending[queued_from:]):
         if not _is_pending_reasoning_item_event(event):
             continue
         item = _web_search_native_module._response_item_get(event, "item")
+        item_id = _web_search_native_module._response_item_get(item, "id")
+        output_index = _web_search_native_module._response_item_get(event, "output_index")
+        if item_id is None:
+            continue
+
         if _web_search_native_module._response_item_get(item, "summary") is None:
-            try:
-                setattr(item, "summary", [])
-            except Exception:
-                continue
-        opening.append(
-            _reasoning_summary_part_added_event(
-                _web_search_native_module._response_item_get(item, "id"),
-                _web_search_native_module._response_item_get(event, "output_index"),
+            _set_item_field(item, "summary", [])
+
+        text = texts.get(item_id, "")
+        if item_id not in opened:
+            opening.append(_reasoning_summary_part_added_event(item_id, output_index))
+            opened.add(item_id)
+        if fragment and not fragment_added:
+            opening.append(
+                _reasoning_summary_text_event(item_id, output_index, "delta", fragment)
             )
-        )
+            text += fragment
+            texts[item_id] = text
+            fragment_added = True
+        if done_text is not None and item_id not in finished:
+            text = done_text or text
+            opening.append(
+                _reasoning_summary_text_event(item_id, output_index, "done", text)
+            )
+            opening.append(
+                _reasoning_summary_part_done_event(item_id, output_index, text)
+            )
+            _set_item_field(item, "summary", [{"type": "summary_text", "text": text}])
+            texts[item_id] = text
+            finished.add(item_id)
+        elif _web_search_native_module._response_item_get(event, "type") == "response.output_item.done" and text:
+            _set_item_field(item, "summary", [{"type": "summary_text", "text": text}])
+
+    setattr(iterator, "_young_router_reasoning_summary_text", texts)
+    setattr(iterator, "_young_router_reasoning_summary_open", opened)
+    setattr(iterator, "_young_router_reasoning_summary_done", finished)
     if opening:
-        # Behind the item the frames describe and ahead of its first delta: the
-        # iterator drains this list one frame per read.
         pending.extend(opening)
 
 
@@ -1972,6 +2082,12 @@ def _install_responses_completion_stream_patch() -> None:
         original_init(self, *args, **kwargs)
         if not hasattr(self, "completed_response"):
             self.completed_response = None
+        if not hasattr(self, "_young_router_reasoning_summary_text"):
+            self._young_router_reasoning_summary_text = {}
+        if not hasattr(self, "_young_router_reasoning_summary_open"):
+            self._young_router_reasoning_summary_open = set()
+        if not hasattr(self, "_young_router_reasoning_summary_done"):
+            self._young_router_reasoning_summary_done = set()
 
     setattr(patched_init, _RESPONSES_COMPLETION_STREAM_PATCH_ATTR, True)
     setattr(patched_init, "_original_init", original_init)
@@ -2006,7 +2122,7 @@ def _install_responses_completion_stream_patch() -> None:
             queued_before = len(pending) if isinstance(pending, list) else 0
             result = original_ensure_output_item_for_chunk(self, chunk)
             if isinstance(pending, list):
-                _open_reasoning_summary_items(pending, queued_before)
+                _open_reasoning_summary_items(self, pending, queued_before, chunk)
             return result
 
         setattr(
@@ -2093,6 +2209,7 @@ def _install_responses_completion_stream_patch() -> None:
             )
             response = _web_search_native_module._response_item_get(response_completed_event, "response")
             if response is not None:
+                _apply_reasoning_summary_to_response(self, response)
                 _responses_output_module._strip_empty_message_items_when_structured_output_present(response)
             _normalize_response_completed_event_usage(response_completed_event)
             return response_completed_event
