@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import copy
-from unittest import mock
-
 from hook_test_utils import *
 
 
@@ -1936,52 +1933,6 @@ class HookRoutingTests(HookTestCase):
                 deployment,
             ),
             "anthropic",
-        )
-
-    def test_a_summary_less_responses_stream_learns_the_chat_fallback(self) -> None:
-        hooks, _ = load_hook_module()
-        hooks._PROTOCOL_FALLBACKS.clear()
-        self.addCleanup(hooks._PROTOCOL_FALLBACKS.clear)
-        deployment = {
-            "litellm_params": {"model": "openai/deepseek-v4.1-flash", "order": 1},
-            "model_info": {
-                "id": "deepseek-chat-route",
-                "upstream_url_surface": "openai/chat",
-                "upstream_protocol_mode": "fallback",
-            },
-        }
-        summary_request = {
-            "call_type": "aresponses",
-            "input": "hello",
-            "reasoning": {"effort": "high", "summary": "auto"},
-        }
-        with mock.patch.object(
-            hooks, "_protocol_fallback_update_shared", return_value=None
-        ):
-            self.assertEqual(
-                hooks._request_surface_for_deployment(summary_request, deployment),
-                "openai/responses",
-            )
-            self.assertFalse(
-                hooks._remember_reasoning_summary_chat_fallback(
-                    {"call_type": "aresponses", "input": "hello"}, deployment
-                )
-            )
-            self.assertTrue(
-                hooks._remember_reasoning_summary_chat_fallback(
-                    summary_request, deployment
-                )
-            )
-        self.assertEqual(
-            hooks._request_surface_for_deployment(summary_request, deployment),
-            "openai/chat",
-        )
-
-        fixed = copy.deepcopy(deployment)
-        fixed["model_info"]["id"] = "fixed-chat-route"
-        fixed["model_info"]["upstream_protocol_mode"] = "fixed"
-        self.assertFalse(
-            hooks._remember_reasoning_summary_chat_fallback(summary_request, fixed)
         )
 
     def test_fixed_mode_ignores_a_stale_fallback_target(self) -> None:

@@ -162,7 +162,7 @@ class ReasoningSummaryStreamTests(unittest.TestCase):
 
 
 
-    def test_content_part_done_is_mirrored_into_summary_frames(self) -> None:
+    def test_content_part_done_without_a_streamed_summary_sends_nothing(self) -> None:
         texts: dict[str, str] = {}
         seen: set[str] = set()
         done: set[str] = set()
@@ -180,28 +180,10 @@ class ReasoningSummaryStreamTests(unittest.TestCase):
             chunk, texts, seen, done
         )
 
-        self.assertEqual(
-            [
-                "response.reasoning_summary_part.added",
-                "response.reasoning_summary_text.delta",
-                "response.reasoning_summary_text.done",
-                "response.reasoning_summary_part.done",
-            ],
-            [event["type"] for event in events],
-        )
-        delta = next(
-            event for event in events if event["type"].endswith(".delta")
-        )
-        self.assertEqual("step one", delta["delta"])
-        self.assertEqual("step one", texts["r1"])
+        self.assertEqual([], events)
+        self.assertEqual({}, texts)
         self.assertNotIn("r1", seen)
-        self.assertIn("r1", done)
-        self.assertEqual(
-            [],
-            patches.reasoning_summary_chunks_for_delivery(
-                chunk, texts, seen, done
-            ),
-        )
+        self.assertNotIn("r1", done)
 
     def test_output_item_done_and_completed_carry_the_summary(self) -> None:
         texts = {"r1": "the whole thought"}

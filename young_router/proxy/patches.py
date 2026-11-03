@@ -2019,10 +2019,11 @@ def reasoning_summary_chunks_for_delivery(
     ``response.reasoning_summary_text.delta``.  A client that asked for a
     summary (``reasoning.summary``) renders the summary frames, so a raw delta
     is mirrored into one as it arrives, and the raw frame itself is suppressed
-    by :func:`reasoning_summary_suppresses_chunk`.  A provider that sends no
-    deltas at all still gets the whole ``content_part.done`` text at the end;
-    that path remains, and a real summary delta from the upstream wins over
-    either.  ``done`` keeps the terminal frames from repeating.
+    by :func:`reasoning_summary_suppresses_chunk`.  A real summary delta from
+    the upstream wins over the raw shape.  If the upstream sent no delta for an
+    item, no summary is synthesized from its completed text: the reader sees
+    the thinking only when the route actually streamed it.  ``done`` keeps the
+    terminal frames from repeating.
     """
 
     get = _web_search_native_module._response_item_get
@@ -2073,16 +2074,16 @@ def reasoning_summary_chunks_for_delivery(
             or item_id in finished
         ):
             return []
-        raw_streamed = item_id in texts
+        if item_id not in seen and item_id not in texts:
+            # The upstream never sent a delta for this item.  Do not invent a
+            # summary from the completed text: a client that asked to watch the
+            # thinking gets it only when the route actually streamed it.
+            return []
         texts[item_id] = text
-        events = []
-        if item_id not in seen and not raw_streamed:
-            events.append(_reasoning_summary_part_added_event(item_id, output_index))
-            events.append(
-                _reasoning_summary_text_event(item_id, output_index, "delta", text)
-            )
-        events.append(_reasoning_summary_text_event(item_id, output_index, "done", text))
-        events.append(_reasoning_summary_part_done_event(item_id, output_index, text))
+        events = [
+            _reasoning_summary_text_event(item_id, output_index, "done", text),
+            _reasoning_summary_part_done_event(item_id, output_index, text),
+        ]
         finished.add(item_id)
         return events
     if chunk_type == "response.output_item.done":
