@@ -250,7 +250,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("export function setGroupManagerOpen(open: boolean): void {", gate)
         self.assertIn("export function isGroupManagerOpen(): boolean {", gate)
         self.assert_ui_has("return isProviderWizardOpen() || isAssistantEditorOpen() || isGroupManagerOpen();")
-        self.assert_ui_has("const applyStagedQuietly = (): Promise<void> => apply({ quiet: true, keepControlsEnabled: true });")
+        self.assert_ui_has("const applyStagedQuietly = (): Promise<void> => apply({ quiet: true });")
         # A host whose sheet can only save on close stages those same edits
         # after it is gone and states that host's outcome in the pane.
         self.assertIn('onStatus?.(translate("common.saved"));', self.relay)
@@ -517,7 +517,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("lastDispatchError", self.ui)
 
     def test_shared_assistant_apply_is_not_blocked_by_the_undefined_default_domain(self) -> None:
-        apply_body = self.ui.split('const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }):', 1)[1].split(
+        apply_body = self.ui.split('const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string }):', 1)[1].split(
             "const autoAppliedKey",
             1,
         )[0]
@@ -543,7 +543,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'return dirty.length === 0 ? "" : `${dirty.join(",")}@${actionSnapshot.revision}`;',
             'if (busy || hasPendingFieldEdits()) return;',
             'setResult(translate("common.saving"));',
-            'void apply({ message: "common.saved", keepControlsEnabled: true });',
+            'void apply({ message: "common.saved" });',
             '}, IMMEDIATE_APPLY_DEBOUNCE_MS);',
             # A single text edit must re-run the effect once its dirty flag
             # clears, so the pending-field counter is part of the deps.
@@ -579,6 +579,37 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("return undefined;\n    } finally {", outcome)
         self.assertIn("activeRuns.current -= 1;", outcome.split("} finally {", 1)[1])
 
+    def test_an_apply_can_never_take_the_window_controls(self) -> None:
+        """An Apply is background work; the signature has no lock to pass.
+
+        The panes have no Apply button: the debounced auto-apply, the flush of
+        the pane being left, and a child surface's quiet apply are the only
+        callers.  Any of them holding the window-wide flag rendered the pane the
+        user was looking at entirely disabled — most visibly the pane they had
+        just navigated into — while the strip had already cleared to 就绪.  The
+        lock is therefore not an option this API offers, so a future caller
+        cannot reintroduce it by passing a flag.
+        """
+
+        signature = "const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string }):"
+        apply_body = self.ui.split(signature, 1)[1].split("const autoAppliedKey", 1)[0]
+        self.assertNotIn("keepControlsEnabled", apply_body)
+        # The third argument of `runOutcome` is the lock; an Apply always passes
+        # true (kept controls) there, and the wait text is the strip's job.
+        self.assertIn(
+            'options?.silent ? null : (options?.message ?? "common.saved"), true, true, undefined, options?.quiet === true);',
+            apply_body,
+        )
+        # Every call site states no lock either.
+        for index, line in enumerate(self.ui.splitlines()):
+            if "apply({" not in line and "apply()" not in line:
+                continue
+            self.assertNotIn(
+                "keepControlsEnabled",
+                line,
+                f"line {index + 1} lets an Apply hold the pane-wide lock: {line.strip()}",
+            )
+
     def test_provider_key_editor_uses_the_secret_native_control(self) -> None:
         editor = self.ui.split("const keysEditorView =", 1)[1].split(
             "</View>;",
@@ -611,7 +642,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('closeRoute();', close_body)
 
     def test_apply_rebases_one_live_projection_revision_conflict(self) -> None:
-        apply_body = self.ui.split('const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }):', 1)[1].split(
+        apply_body = self.ui.split('const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string }):', 1)[1].split(
             'const activateProviderAndRestart',
             1,
         )[0]
@@ -4915,7 +4946,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "apiKeyActions: relayApiKeyActions,",
         ):
             self.assert_ui_has(marker)
-        apply_body = self.ui.split("const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }):", 1)[1].split("const autoAppliedKey", 1)[0]
+        apply_body = self.ui.split("const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string }):", 1)[1].split("const autoAppliedKey", 1)[0]
         self.assertIn('settingsRoute || route === "providers-models" || route === "data-management" || domain === undefined', apply_body)
         self.assertIn("await dispatchQueue.current;", apply_body)
         self.assertIn('return { draftStaged: next.drafts.relay_accounts?.dirty === true };', self.ui)
@@ -6171,14 +6202,20 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The provided key's value is not being read: it is managed by the
         # station.  Placeholder text that claims a read is in progress is what
         # read as a stuck field in the provider inspector.
-        provided = self.ui.split("function ProviderKeysPanel", 1)[1].split("function CodexWorkspace", 1)[0]
+        provided = self.ui.split("function ProviderKeysPanel", 1)[1].split("\nfunction ", 1)[0]
+        # The key editor's own two fields are drafts of this panel's writes:
+        # they carry `formBusy`, never the window flag.
+        self.assertNotIn("disabled={busy}", provided)
+        self.assertIn("disabled={formBusy}", provided)
+        self.assertIn('busy={formBusy} domain="providers_models"', provided)
+        self.assertIn("disabled={formBusy || selectedProvided.account.autoGrouping}", provided)
         self.assertIn('hint={selectedProvided.resource.keyHint ? translate("providers.relayKeyValueHint") : translate("common.none")}', provided)
         self.assertNotIn('hint={selectedProvided.resource.keyHint ? translate("providers.apiKeySavedHint")', provided)
         # The one input auto grouping legitimately locks says why it is locked:
         # the switch that owns the name is in 分组管理, not on this pane.
         self.assertIn('{selectedProvided.account.autoGrouping ? <Text style={styles.fieldHint}>{translate("providers.keyNameAutoGroupingHint")}</Text> : null}', provided)
-        self.assertIn('"providers.keyNameAutoGroupingHint": "自动分组已开启：密钥名由中转站的分组决定。"', self.zh)
-        self.assertIn('"providers.keyNameAutoGroupingHint": "Auto grouping is on: the relay\'s group names this key."', self.en)
+        self.assertIn('"providers.keyNameAutoGroupingHint": "自动分组已开启"', self.zh)
+        self.assertIn('"providers.keyNameAutoGroupingHint": "Auto grouping is on"', self.en)
 
     def test_relay_add_login_asks_after_the_signin_succeeds(self) -> None:
         relay = self.relay
@@ -6226,7 +6263,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("await relay.commit(\"station.update\", { id: station.id, name, origin, type });", self.ui)
         self.assertIn("onStageStationUpdate=", self.ui)
         self.assertIn('translate("relay.stationUpdateStaged")', relay)
-        apply_body = self.ui.split("const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }):", 1)[1].split("const autoAppliedKey", 1)[0]
+        apply_body = self.ui.split("const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string }):", 1)[1].split("const autoAppliedKey", 1)[0]
         self.assertIn("await dispatchQueue.current;", apply_body)
         # Relay/provider drafts are committed by the shell's immediate apply;
         # the removed footer no longer renders a route-level Apply button.
@@ -6857,8 +6894,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # user just opened: it may not hold that pane's controls disabled while
         # Core spends a relay-bound Apply, with the strip already cleared to
         # 就绪 by the run itself.  Edits made meanwhile queue behind the Apply.
-        self.assertIn('await apply({ silent: true, keepControlsEnabled: true });', self.ui)
-        self.assertIn('const applyStagedQuietly = (): Promise<void> => apply({ quiet: true, keepControlsEnabled: true });', self.ui)
+        self.assertIn('await apply({ silent: true });', self.ui)
+        self.assertIn('const applyStagedQuietly = (): Promise<void> => apply({ quiet: true });', self.ui)
         self.assertIn('setResult(translate(purpose === "navigate" ? "runtime.fixInvalidBeforeLeaving" : "runtime.fixInvalidBeforeClose"));', self.ui)
         for locale in (self.zh, self.en):
             self.assertIn('"runtime.fixInvalidBeforeLeaving"', locale)

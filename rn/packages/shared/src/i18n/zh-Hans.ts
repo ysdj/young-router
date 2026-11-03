@@ -599,7 +599,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.keyListHint": "名称用于模型路由；已保存的内容留在安全存储中。",
   "providers.apiKeyInput": "新 API 密钥",
   "providers.apiKeySavedHint": "正在读取已保存的 API 密钥...",
-  "providers.keyNameAutoGroupingHint": "自动分组已开启：密钥名由中转站的分组决定。",
+  "providers.keyNameAutoGroupingHint": "自动分组已开启",
   "providers.addKey": "添加密钥",
   "providers.modelRate": "倍率",
   "providers.publicModel": "公开模型",

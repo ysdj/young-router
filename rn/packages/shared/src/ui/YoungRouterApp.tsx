@@ -2512,6 +2512,14 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       setResult(next);
     };
     activeRuns.current += 1;
+    // Invariant: only an action the user starts in this pane may count here.
+    // A run counted by this block takes every field of the window, so the
+    // automatic writers — the debounced auto-apply, the flush of a pane being
+    // left, a child surface's quiet apply, a station/model read — must pass
+    // `keepControlsEnabled` (or, for an Apply, have no way to pass false; see
+    // `applyOutcome`).  A counted run clears its result before it starts, so
+    // the strip states the wait (`common.working`) instead of 就绪; a lock
+    // that appears without that word is the bug this counter is not to have.
     if (!keepControlsEnabled) {
       busyRuns.current += 1;
       setBusy(true);
@@ -2897,7 +2905,14 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     }
     return "keep";
   }, [ipc, native, onSnapshot, translate]);
-  const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<IpcResults["apply"] | { cancelled: true } | undefined> => {
+  // Invariant: an Apply in this shell is background work and may never take
+  // the window's fields.  The shell has no Apply button — its only callers are
+  // the debounced auto-apply, the flush of the pane being left, and a child
+  // surface's quiet apply — so the option to hold the controls is deliberately
+  // absent from this signature.  Every edit made while an Apply runs queues
+  // behind it and stages on the revision it produces; taking the lock here is
+  // what left the destination pane disabled while the strip read 就绪.
+  const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string }): Promise<IpcResults["apply"] | { cancelled: true } | undefined> => {
     if ((!settingsRoute && !domain) || domain === "logs") return Promise.resolve(undefined);
     return runOutcome<IpcResults["apply"] | { cancelled: true }>(async () => {
       await flushPendingFields();
@@ -2972,9 +2987,9 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       // and a later edit is not stuck behind it.
       if (diskConflicts.length > 0) setKeptDiskGeneration({});
       return result;
-    }, options?.silent ? null : (options?.message ?? "common.saved"), options?.keepControlsEnabled === true, true, undefined, options?.quiet === true);
+    }, options?.silent ? null : (options?.message ?? "common.saved"), true, true, undefined, options?.quiet === true);
   };
-  const apply = async (options?: { silent?: boolean; quiet?: boolean; message?: string; keepControlsEnabled?: boolean }): Promise<void> => {
+  const apply = async (options?: { silent?: boolean; quiet?: boolean; message?: string }): Promise<void> => {
     await applyOutcome(options);
   };
   // A child surface applies the draft it wrote itself (分组管理's 保存并关闭):
@@ -2984,7 +2999,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   // it: the sheet is already gone when the write lands, so holding that pane
   // disabled for it is the same unexplained freeze the navigation flush used
   // to produce.
-  const applyStagedQuietly = (): Promise<void> => apply({ quiet: true, keepControlsEnabled: true });
+  const applyStagedQuietly = (): Promise<void> => apply({ quiet: true });
   // The settings shell commits as the user changes controls. Wait for the
   // route's serial dispatch queue, then apply the staged domains; the debounce
   // coalesces a burst of toggles into one Core apply. A failed apply keeps its
@@ -3027,7 +3042,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       autoAppliedKey.current = autoApplyKey;
       // Keep the pane interactive while the background apply runs; the
       // dispatch queue serializes any edit made in the meantime.
-      void apply({ message: "common.saved", keepControlsEnabled: true });
+      void apply({ message: "common.saved" });
     }, IMMEDIATE_APPLY_DEBOUNCE_MS);
     return () => clearTimeout(timer);
   }, [autoApplyKey, busy, hasPendingFieldEdits, pendingFieldRevision, shell, translate]);
@@ -3050,12 +3065,12 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     await dispatchQueue.current;
     // The commit belongs to the pane being left, but its wait must not follow
     // the user into the pane they opened: the flush runs after navigation has
-    // already rendered the destination, and a pane-wide busy flag here left
-    // every input of the new pane disabled with the strip reading 就绪 for as
-    // long as Core spent applying a relay-bound draft.  Later edits queue
-    // behind this Apply and stage on the revision it produces, exactly as they
-    // do behind the debounced auto-apply.
-    await apply({ silent: true, keepControlsEnabled: true });
+    // already rendered the destination, and holding the pane-wide flag here
+    // left every input of the new pane disabled with the strip reading 就绪
+    // for as long as Core spent applying a relay-bound draft.  `apply` is
+    // structurally background work (see `applyOutcome`), so later edits queue
+    // behind this Apply and stage on the revision it produces.
+    await apply({ silent: true });
     return true;
   };
   // Clear the close-blocked notice as soon as the invalid drafts are fixed.
@@ -6826,7 +6841,9 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
           labelVisible={false}
           label={translate("providers.keyName")}
           value={drafts?.providerKeyDisplayName(providerId, selectedCustom.id, selectedCustom.name) ?? selectedCustom.name}
-          disabled={busy}
+          // This field is a draft of this panel's own write: another surface's
+          // wait never greys it.  A rename stages through the dispatch queue.
+          disabled={formBusy}
           onDraftChange={(value) => drafts?.setProviderKeyNameDraft(providerId, selectedCustom.id, value)}
           onCommit={(name) => {
             if (!name || name === selectedCustom.name) return;
@@ -6841,7 +6858,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
           }}
         />)}
         {keysEditorField("key-value", translate("providers.keyValue"), <View style={styles.keysEditorValueRow}>
-          <View style={styles.keysEditorValueField}><NativeSecretField labelVisible={false} plainText autoCommit label={translate("providers.keyValue")} hint={booleanValue(selectedCustom.configured) ? translate("providers.apiKeySavedHint") : translate("providers.apiKeyInput")} busy={busy} domain="providers_models" field="api_key" target={`${providerId}\u001f${selectedCustom.name}`} onSecretState={onSecretState} /></View>
+          <View style={styles.keysEditorValueField}><NativeSecretField labelVisible={false} plainText autoCommit label={translate("providers.keyValue")} hint={booleanValue(selectedCustom.configured) ? translate("providers.apiKeySavedHint") : translate("providers.apiKeyInput")} busy={formBusy} domain="providers_models" field="api_key" target={`${providerId}\u001f${selectedCustom.name}`} onSecretState={onSecretState} /></View>
           <NativeButton title="" symbol="copy" compact disabled={controlsBusy || !booleanValue(selectedCustom.configured)} toolTip={translate("relay.apiKeyCopy")} accessibilityLabel={translate("relay.apiKeyCopy")} onPress={() => {
             void (async () => {
               try {
@@ -6863,7 +6880,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
             labelVisible={false}
             label={translate("providers.keyName")}
             value={selectedProvidedName}
-            disabled={controlsBusy || selectedProvided.account.autoGrouping}
+            disabled={formBusy || selectedProvided.account.autoGrouping}
             onDraftChange={(value) => setProvidedNameDrafts((current) => ({ ...current, [selectedProvided.key]: value }))}
             onCommit={(value) => {
               const name = value.trim();

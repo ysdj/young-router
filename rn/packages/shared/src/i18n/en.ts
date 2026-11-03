@@ -591,7 +591,7 @@ export const en: Record<TranslationKey, string> = {
   "providers.keyListHint": "Names route models; saved values stay in secure storage.",
   "providers.apiKeyInput": "New API key",
   "providers.apiKeySavedHint": "Loading the saved API key...",
-  "providers.keyNameAutoGroupingHint": "Auto grouping is on: the relay's group names this key.",
+  "providers.keyNameAutoGroupingHint": "Auto grouping is on",
   "providers.addKey": "Add key",
   "providers.modelRate": "Rate",
   "providers.publicModel": "Public model",
