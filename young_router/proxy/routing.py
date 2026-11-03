@@ -4746,37 +4746,72 @@ def _request_asks_for_reasoning_summary(request_kwargs: Optional[dict]) -> bool:
     return summary.strip().casefold() not in _REASONING_SUMMARY_OFF_VALUES
 
 
-def _deployment_upstream_model_name(deployment: Any) -> str:
-    params = deployment.get("litellm_params") if isinstance(deployment, dict) else None
-    model = params.get("model") if isinstance(params, dict) else None
-    if not isinstance(model, str):
-        return ""
-    return model.rsplit("/", 1)[-1].strip().casefold()
-
-
-def _request_prefers_chat_for_reasoning_summary(
+def _remember_reasoning_summary_chat_fallback(
     request_kwargs: Optional[dict],
     deployment: Any,
-    client_surface: str,
 ) -> bool:
-    """Ask a DeepSeek relay on chat when the client wants to watch it think.
+    """Learn that a fallback route's Responses wire cannot stream a summary.
 
-    DeepSeek's ``/v1/responses`` endpoint sends no summary deltas: the whole
-    reasoning arrives once in ``content_part.done`` at the end of the thinking
-    phase, so a reader can only show it in one block.  The same relay's chat
-    stream carries ``reasoning_content`` chunk by chunk, and the Responses chat
-    bridge turns each into a summary delta.  A route that declares chat already
-    names the wire that can stream the thinking, so use it for this request;
-    without a summary request the route's ordinary client-protocol choice is
-    left alone.
+    ``upstream_protocol_mode: fallback`` asks the client's protocol first and
+    uses the declared surface only after that attempt fails.  A relay whose
+    Responses endpoint answers successfully but sends the whole reasoning in a
+    single ``content_part.done`` frame is not a protocol error, yet it cannot
+    serve a request that asked to watch the thinking.  Record that as the
+    fallback the mode already describes, so the route's next request asks the
+    declared chat surface, whose ``reasoning_content`` arrives chunk by chunk.
+    The route's configured order and protocol mode are not changed.
     """
 
-    return (
-        client_surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES
-        and _deployment_surface(deployment) == _UPSTREAM_URL_SURFACE_OPENAI_CHAT
-        and _deployment_upstream_model_name(deployment).startswith("deepseek")
-        and _request_asks_for_reasoning_summary(request_kwargs)
+    if not _request_asks_for_reasoning_summary(request_kwargs):
+        return False
+    if _deployment_protocol_mode(deployment) != _UPSTREAM_PROTOCOL_MODE_FALLBACK:
+        return False
+    declared_surface = _deployment_surface(deployment)
+    if declared_surface != _UPSTREAM_URL_SURFACE_OPENAI_CHAT:
+        return False
+    client_surface = _request_client_surface(request_kwargs)
+    if client_surface != _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
+        return False
+    deployment_id = _responses_request_module._deployment_id(deployment)
+    cache_key = _protocol_fallback_cache_key(deployment_id, client_surface)
+    ttl = _protocol_fallback_ttl_seconds()
+    if not cache_key or ttl <= 0:
+        return False
+    now = time.time()
+    state = {
+        "deployment_id": deployment_id,
+        "client_surface": client_surface,
+        "from_surface": client_surface,
+        "fallback_surface": declared_surface,
+        "relax_tool_choice": False,
+        "created_at": now,
+        "expires_at": now + ttl,
+    }
+
+    def record(fallbacks: dict[str, Any], _now: float) -> None:
+        existing = fallbacks.get(cache_key)
+        if (
+            isinstance(existing, dict)
+            and existing.get("fallback_surface") == declared_surface
+        ):
+            return
+        fallbacks[cache_key] = dict(state)
+
+    if _protocol_fallback_update_shared(record) is None:
+        with _PROTOCOL_FALLBACK_LOCK:
+            _PROTOCOL_FALLBACKS[cache_key] = dict(state)
+    _trace_module._route_trace(
+        "protocol_fallback_learned",
+        request_id=_trace_request_id(request_kwargs),
+        session=_trace_session_context(request_kwargs),
+        deployment_id=deployment_id,
+        client_surface=client_surface,
+        from_surface=client_surface,
+        fallback_surface=declared_surface,
+        reason="reasoning_summary_not_streamed",
+        ttl_seconds=ttl,
     )
+    return True
 
 
 def _request_surface_for_deployment(
@@ -4796,12 +4831,6 @@ def _request_surface_for_deployment(
     ):
         return requested_surface
     client_surface = _request_client_surface(request_kwargs)
-    if _request_prefers_chat_for_reasoning_summary(
-        request_kwargs,
-        deployment,
-        client_surface,
-    ):
-        return _UPSTREAM_URL_SURFACE_OPENAI_CHAT
     cached_surface = _protocol_fallback_cached_surface(request_kwargs, deployment)
     return cached_surface or client_surface or _deployment_surface(deployment)
 

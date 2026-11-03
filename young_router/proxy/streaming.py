@@ -6486,6 +6486,28 @@ async def _yield_start_buffered_stream_with_error_fallback(
                     and not is_responses_stream
                 )
             ):
+                if (
+                    saw_visible_output
+                    and not saw_delivered_output
+                    and is_responses_stream
+                    and _routing_module._request_asks_for_reasoning_summary(
+                        request_data
+                    )
+                ):
+                    selected_deployment = _CURRENT_SELECTED_DEPLOYMENT_BOX.get()
+                    if not isinstance(selected_deployment, dict):
+                        selected_model_info = (
+                            _request_context_module._request_model_info(request_data)
+                        )
+                        if isinstance(selected_model_info, dict) and selected_model_info:
+                            selected_deployment = {
+                                "model_info": selected_model_info,
+                            }
+                    if isinstance(selected_deployment, dict):
+                        _routing_module._remember_reasoning_summary_chat_fallback(
+                            request_data,
+                            selected_deployment,
+                        )
                 # Which frame ends the start buffer decides whether a thinking
                 # block can stream at all, and "the reader saw nothing for the
                 # whole reasoning phase" is otherwise indistinguishable from a

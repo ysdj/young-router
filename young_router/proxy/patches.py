@@ -3114,6 +3114,7 @@ def _install_openai_responses_fake_stream_patch() -> None:
         _OPENAI_RESPONSES_FAKE_STREAM_PATCH_ATTR,
         True,
     )
+    setattr(patched_should_fake_stream, "_young_router_original", original)
     OpenAIResponsesAPIConfig.should_fake_stream = patched_should_fake_stream
 
 

@@ -107,6 +107,16 @@ class ReasoningCapabilityRegistrationTests(unittest.TestCase):
 
         from young_router.proxy import patches
 
+        # Another suite can reload litellm; a patch installed before that
+        # reload closes over the old module's cost map.  Unwrap and reinstall
+        # so this test exercises the current module.
+        installed = getattr(
+            OpenAIResponsesAPIConfig.should_fake_stream,
+            "_young_router_original",
+            None,
+        )
+        if installed is not None:
+            OpenAIResponsesAPIConfig.should_fake_stream = installed
         patches._install_openai_responses_fake_stream_patch()
         config = OpenAIResponsesAPIConfig()
         cost = {
