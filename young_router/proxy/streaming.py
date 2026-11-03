@@ -6372,6 +6372,13 @@ async def _yield_start_buffered_stream_with_error_fallback(
                 if completed_compat_chunk is not None:
                     chunk = completed_compat_chunk
             buffer.append(chunk)
+            if _stream_chunk_type(chunk).startswith("response.reasoning_summary_text.delta"):
+                _trace_module._request_route_trace(
+                    "responses_start_buffer_summary_delta", request_data,
+                    delta_len=len(str((_stream_chunk_dump(chunk) or {}).get("delta") or "")),
+                    delivered=_stream_chunk_is_public_reasoning_delta(chunk),
+                    chunk_class=type(chunk).__name__,
+                )
             if is_responses_stream:
                 completion_state.remember(chunk)
             saw_visible_output = saw_visible_output or (
