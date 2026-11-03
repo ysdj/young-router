@@ -110,6 +110,11 @@ class YoungRouterHook(CustomLogger):
     ) -> None:
         if _routing_module._is_codex_compaction_capability_probe(kwargs):
             return
+        # A model-list or health read is not a turn: it selects no route, so the
+        # row it would add has no model, cost, or usage.  See
+        # ``_is_local_control_plane_read``.
+        if _routing_module._is_local_control_plane_read(kwargs):
+            return
         _trace_codex_fast_tier_result(kwargs, response_obj, outcome="success")
         streaming = kwargs.get("stream") is True
         completed_stream = (
@@ -132,6 +137,14 @@ class YoungRouterHook(CustomLogger):
     ) -> None:
         if _routing_module._is_codex_compaction_capability_probe(kwargs):
             return
+        # A listing or health read that failed never became a turn.  Left
+        # logged, every ``/v1/models`` read a client or this app's own
+        # client-model loop made while a worker was still loading its key became
+        # a 本机网关拒绝密钥 row -- hundreds of them, all reading as failures of
+        # requests nobody made.  A key a client cannot use still shows on the
+        # turn it sends.
+        if _routing_module._is_local_control_plane_read(kwargs):
+            return
         _trace_codex_fast_tier_result(kwargs, response_obj, outcome="failure")
         if _routing_module._should_suppress_recent_failure_log(kwargs, response_obj):
             return
@@ -147,6 +160,8 @@ class YoungRouterHook(CustomLogger):
         end_time: Any,
     ) -> None:
         if _routing_module._is_codex_compaction_capability_probe(kwargs):
+            return
+        if _routing_module._is_local_control_plane_read(kwargs):
             return
         failed = _codex_fast_tier_module._response_indicates_failure(response_obj)
         completed = _streaming_module._responses_stream_chunk_is_completed(response_obj)

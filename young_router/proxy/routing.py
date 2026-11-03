@@ -3832,6 +3832,44 @@ def _request_log_error_summary(
     return {key: value for key, value in error.items() if value not in (None, "")}
 
 
+#: LiteLLM's own control-plane reads.  A read of one of these never selects a
+#: route, so it has no public model, upstream, cost, or usage to report.
+_LOCAL_CONTROL_PLANE_READ_PATHS = frozenset(
+    {
+        "/v1/models",
+        "/models",
+        "/health",
+        "/health/liveliness",
+        "/health/readiness",
+        "/metrics",
+    }
+)
+
+
+def _is_local_control_plane_read(request_kwargs: Optional[dict]) -> bool:
+    """Whether this callback describes a control-plane read, not a turn.
+
+    Codex, Claude Desktop, and this app's own client-model loop all read
+    ``/v1/models``, and Core's own health probe reads ``/health``.  None of
+    those requests reaches a deployment, so a request-log row for one carries no
+    model, no cost, and no usage -- and when the read lands on a worker that is
+    still loading its key, the refusal the row records is about this process's
+    own startup and tells the reader nothing they did.
+
+    Observed live 2026-11-03: 707 of 982 rows in the request log were
+    ``/v1/models`` refusals with an empty provider column, produced while the
+    proxy replaced its workers -- no client turn was made in that window at all
+    (the access log held zero ``POST`` requests).  A key a real client cannot
+    use still shows on the turns it sends, which is the row this log exists for.
+    """
+
+    call_type = (request_kwargs or {}).get("call_type")
+    if not isinstance(call_type, str):
+        return False
+    path = call_type.split("?", 1)[0].strip().lower()
+    return path in _LOCAL_CONTROL_PLANE_READ_PATHS
+
+
 def _should_suppress_recent_failure_log(
     request_kwargs: Optional[dict],
     response_obj: Any,

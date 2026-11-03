@@ -803,6 +803,81 @@ class HookTraceLoggingTests(HookTestCase):
             hooks._is_local_gateway_auth_rejection_error(provider_failure)
         )
 
+    async def test_a_control_plane_read_never_becomes_a_request_row(self) -> None:
+        """A listing or health read is not a turn, even when it was refused.
+
+        Every ``/v1/models`` read -- a client's picker, this app's own
+        client-model loop -- selects no route, so the row it produced carried no
+        model, no cost and no usage; the only thing a reader saw was
+        本机网关拒绝密钥, repeated once per read while the proxy replaced its
+        workers.  The same stale key still has to show on a real turn, and that
+        is the boundary this test pins.
+        """
+
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+
+        class ProxyException(Exception):
+            def __init__(self, message: str, type: str, code: int) -> None:
+                super().__init__(message)
+                self.type = type
+                self.code = str(code)
+
+        rejection = ProxyException("No connected db.", "no_db_connection", 400)
+        start = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+        end = start + timedelta(milliseconds=3)
+
+        self.assertTrue(hooks._is_local_control_plane_read({"call_type": "/v1/models"}))
+        self.assertTrue(hooks._is_local_control_plane_read({"call_type": "/health"}))
+        self.assertFalse(hooks._is_local_control_plane_read({"call_type": "aresponses"}))
+        self.assertFalse(hooks._is_local_control_plane_read({"call_type": "amodels"}))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+
+            await hook.async_log_failure_event(
+                {"call_type": "/v1/models", "exception": rejection}, None, start, end
+            )
+            await hook.async_log_success_event(
+                {"call_type": "/v1/models", "model": "public-chat"},
+                {"id": "list"},
+                start,
+                end,
+            )
+            await hook.async_log_failure_event(
+                {"call_type": "/health", "exception": RuntimeError("probe")},
+                None,
+                start,
+                end,
+            )
+            written = (
+                log_path.read_text(encoding="utf-8").strip()
+                if log_path.exists()
+                else ""
+            )
+            self.assertEqual("", written)
+
+            # A real turn carrying the same refused key is still reported: that
+            # row is the one that tells a reader whose key is stale.
+            await hook.async_log_failure_event(
+                {
+                    "call_type": "aresponses",
+                    "model": "public-chat",
+                    "exception": rejection,
+                },
+                None,
+                start,
+                end,
+            )
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(1, len(records))
+            self.assertEqual("gateway_auth_rejected", records[0]["routing_state"])
+
     def test_recent_request_timestamp_treats_naive_callback_time_as_local(self) -> None:
         hooks, _ = load_hook_module()
         callback_time = datetime(2026, 6, 9, 12, 0, 0)
