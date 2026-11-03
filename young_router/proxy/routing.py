@@ -4484,41 +4484,85 @@ def _ensure_attempt_lease_id(request_kwargs: Optional[dict]) -> Optional[str]:
     would leave the turn uncounted -- a cap that silently does not apply.  This
     marker is written once, before any deployment is selected, so the count
     covers every routed request and no route can be missed.
+
+    It lives in ``litellm_metadata`` rather than at the top level, and that
+    placement is what makes the marker usable at all:
+
+    * A top-level key is forwarded to the provider.  LiteLLM passes unknown
+      keyword arguments straight through to the upstream body, so a top-level
+      marker reaches the provider as a stray field of this proxy's invention.
+    * A top-level key never comes back.  The success callback sees the logging
+      layer's ``model_call_details``, which is built from a fixed set of keys;
+      anything else at the top level is dropped.  The slot that callback is
+      supposed to release would then outlive every request it counted.
+
+    ``litellm_metadata`` is LiteLLM's own internal bucket: it is not sent
+    upstream, and it does survive into the callback, so the claim and the
+    release read the same identifier.
     """
 
     if not isinstance(request_kwargs, dict):
         return None
-    existing = request_kwargs.get(_ATTEMPT_LEASE_ID_KEY)
-    if isinstance(existing, str) and existing.strip():
-        return existing.strip()
+    existing = _attempt_lease_id(request_kwargs)
+    if existing:
+        return existing
     lease_id = os.urandom(8).hex()
-    request_kwargs[_ATTEMPT_LEASE_ID_KEY] = lease_id
+    metadata = _request_context_module._request_metadata_dict(
+        request_kwargs, "litellm_metadata"
+    )
+    if metadata is None:
+        metadata = {}
+    else:
+        metadata = metadata.copy()
+    metadata[_ATTEMPT_LEASE_ID_KEY] = lease_id
+    request_kwargs["litellm_metadata"] = metadata
     return lease_id
 
 
 def _attempt_lease_id(request_kwargs: Optional[dict]) -> Optional[str]:
-    """The one key that names this turn, shared by every hop of it.
+    """The one identifier that names this turn, shared by every hop of it.
 
     The lease belongs to the *turn* and the deployment, not to the attempt: a
     fallback re-sends the same turn to a different route, and its own slot is
     the one it takes.  Keying by the turn is what keeps one turn from counting
     twice, and what lets a hop that fails in a way this proxy did not observe
     be released by the next hop's own claim.
+
+    The location the marker is found in is deliberately *not* part of the
+    identifier: a request that reaches the claim with the marker at the top
+    level and the release through a metadata copy still has to compute one key,
+    or the slot would be released under a name nothing holds.
+
+    The identifier is looked up key-first, across every container.  A request
+    that reaches this proxy plain carries ``litellm_trace_id`` at the top level,
+    while the marker it was stamped with comes back nested under
+    ``litellm_params``; searching one container at a time would return the trace
+    id on the way in and the lease on the way out, which is two different
+    identifiers for one turn and a slot that is never given back.
     """
 
     if not isinstance(request_kwargs, dict):
         return None
-    for container_name, container in (
-        ("request", request_kwargs),
-        ("litellm_metadata", _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata")),
-        ("metadata", _request_context_module._request_metadata_dict(request_kwargs, "metadata")),
-    ):
-        if not isinstance(container, dict):
-            continue
-        for key in _REQUEST_TURN_IDENTIFIER_KEYS:
+    containers = [
+        request_kwargs,
+        _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata"),
+        _request_context_module._request_metadata_dict(request_kwargs, "metadata"),
+    ]
+    litellm_params = request_kwargs.get("litellm_params")
+    if isinstance(litellm_params, dict):
+        # What a success callback hands back is the logging layer's copy of the
+        # request, and it nests the metadata under ``litellm_params``.
+        for key in ("litellm_metadata", "metadata"):
+            nested = litellm_params.get(key)
+            if isinstance(nested, dict):
+                containers.append(nested)
+    for key in _REQUEST_TURN_IDENTIFIER_KEYS:
+        for container in containers:
+            if not isinstance(container, dict):
+                continue
             value = container.get(key)
             if isinstance(value, str) and value.strip():
-                return f"{value.strip()}|{container_name}"
+                return value.strip()
     return None
 
 

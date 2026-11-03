@@ -313,6 +313,7 @@ class RuntimePaths:
     webdav_sync_state: Path
     recovery: Path
     cooldowns: Path
+    concurrency: Path
     affinity: Path
 
     @classmethod
@@ -343,6 +344,10 @@ class RuntimePaths:
             webdav_sync_state=Path(os.environ.get("LITELLM_WEBDAV_SYNC_STATE", runtime / "webdav-sync-state.json")).expanduser(),
             recovery=Path(os.environ.get("YOUNG_ROUTER_ROUTE_RECOVERY_STATE_FILE", runtime / "route-recovery-state.json")).expanduser(),
             cooldowns=Path(os.environ.get("YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_FILE", runtime / "deployment-cooldowns.json")).expanduser(),
+            # The in-flight concurrency leases every worker shares.  Its own
+            # file, because a claim writes on every request while the cooldown
+            # document also carries state that is not rewritten at that rate.
+            concurrency=Path(os.environ.get("YOUNG_ROUTER_DEPLOYMENT_CONCURRENCY_FILE", runtime / "deployment-concurrency.json")).expanduser(),
             affinity=Path(os.environ.get("YOUNG_ROUTER_SESSION_DEPLOYMENT_AFFINITY_FILE", runtime / "session-deployment-affinity.json")).expanduser(),
         )
 
@@ -908,6 +913,7 @@ class CoreServiceController:
         env["LITELLM_NATIVE_PID_FILE"] = str(self.paths.pid)
         env["YOUNG_ROUTER_ROUTE_RECOVERY_STATE_FILE"] = str(self.paths.recovery)
         env["YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_FILE"] = str(self.paths.cooldowns)
+        env["YOUNG_ROUTER_DEPLOYMENT_CONCURRENCY_FILE"] = str(self.paths.concurrency)
         env["YOUNG_ROUTER_SESSION_DEPLOYMENT_AFFINITY_FILE"] = str(self.paths.affinity)
         # Keep request summaries beside the managed configuration for both
         # Finder-launched and terminal-launched Core processes.  The native

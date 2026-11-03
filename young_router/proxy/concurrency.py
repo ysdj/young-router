@@ -280,9 +280,11 @@ def claim(lease_key: str, deployment_key: str, cap: int) -> bool:
     result = _update(take)
     if isinstance(result, tuple) and isinstance(result[0], bool):
         return result[0]
-    # No shared store means no shared count.  The cap is a claim about every
-    # worker at once, so a process that cannot see the others does not enforce a
-    # number it cannot make true; the filter reports the same fact separately.
+    # No shared store means no shared count, and a cap a process cannot make
+    # true for the other workers is a number it must not pretend to enforce.
+    # ``_with_active_model_concurrency`` reports the same fact once per process
+    # as ``model_concurrency_store_unavailable``, so the operator learns the cap
+    # is inactive instead of believing a route is capped.
     return True
 
 

@@ -407,10 +407,14 @@ class CrossProcessConcurrencyTests(unittest.TestCase):
         self.assertEqual(line, "held", f"worker did not take the slot: {line!r}")
 
     def claim_in_child(self, lease_key: str, cap: int = 1) -> str:
+        # An empty stdin is EOF: a holder exits at once instead of waiting for
+        # a line nobody will send, so a regression that takes the slot still
+        # reports it rather than hanging the suite.
         result = subprocess.run(
             [sys.executable, "-c", self.SCRIPT, lease_key, "id:route-a", str(cap)],
             cwd=str(ROOT),
             env=self._child_env(),
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=120,
@@ -428,6 +432,20 @@ class CrossProcessConcurrencyTests(unittest.TestCase):
         for index in range(3):
             self.hold_in_child(f"id:route-a|t{index}|request", cap=3)
         self.assertEqual(self.claim_in_child("id:route-a|t3|request", cap=3), "refused")
+
+    def test_a_worker_that_died_does_not_hold_the_slot(self) -> None:
+        """A killed worker releases nothing, so its lease has to stop counting."""
+
+        self.hold_in_child("id:route-a|first|request", cap=1)
+        self.assertEqual(self.claim_in_child("id:route-a|second|request", cap=1), "refused")
+
+        holder = self.holders.pop()
+        holder.kill()
+        holder.wait(timeout=120)
+
+        # Left to the lease TTL, a killed worker's slot would hold a route below
+        # its cap for the whole request budget.
+        self.assertEqual(self.claim_in_child("id:route-a|third|request", cap=1), "held")
 
 
 class PatchedSelectionConcurrencyTests(ConcurrencyStoreTestCase):
@@ -602,20 +620,66 @@ class AttemptLeaseIdentityTests(ConcurrencyStoreTestCase):
         hook = hooks.YoungRouterHook()
         request = {"model": "default-chat", "messages": [{"role": "user", "content": "hi"}]}
 
-        self.assertIsNone(request.get(hooks._ATTEMPT_LEASE_ID_KEY))
+        self.assertIsNone(hooks._attempt_lease_id(request))
         # The hook changes nothing else on this request, so it answers None and
         # the identifier it stamped rides on the request the caller already owns.
         self.assertIsNone(
             await hook.async_pre_call_hook({}, None, request, None)
         )
-        lease_id = request.get(hooks._ATTEMPT_LEASE_ID_KEY)
+        lease_id = hooks._attempt_lease_id(request)
 
         self.assertIsInstance(lease_id, str)
         self.assertTrue(lease_id)
+        # The marker rides in LiteLLM's own internal bucket, never at the top
+        # level: a top-level key is forwarded to the provider as a stray body
+        # field, and it is dropped before the success callback that has to give
+        # the slot back.
+        self.assertNotIn(hooks._ATTEMPT_LEASE_ID_KEY, request)
+        self.assertEqual(request["litellm_metadata"][hooks._ATTEMPT_LEASE_ID_KEY], lease_id)
         # A second hook pass over the same turn keeps the identifier it has, so
         # the lease does not move out from under the attempt that holds it.
         await hook.async_pre_call_hook({}, None, request, None)
-        self.assertEqual(request[hooks._ATTEMPT_LEASE_ID_KEY], lease_id)
+        self.assertEqual(hooks._attempt_lease_id(request), lease_id)
+
+    def test_the_callback_shape_names_the_same_turn(self) -> None:
+        """The claim and the release must compute one key, in either shape.
+
+        A success callback is handed the logging layer's copy of the request, so
+        the marker is nested under ``litellm_params``.  If the release looked
+        only at the top level it would find nothing and leave the slot behind,
+        which is a route that serves less than its cap for the lease window.
+        """
+
+        hooks, _ = load_hook_module()
+        claim_request = {"litellm_metadata": {hooks._ATTEMPT_LEASE_ID_KEY: "turn-x"}}
+        callback_request = {
+            "litellm_params": {"litellm_metadata": {hooks._ATTEMPT_LEASE_ID_KEY: "turn-x"}}
+        }
+
+        self.assertEqual(hooks._attempt_lease_id(claim_request), "turn-x")
+        self.assertEqual(hooks._attempt_lease_id(callback_request), "turn-x")
+        # ``litellm_trace_id`` remains a fallback for a path that fills it, and
+        # it must not acquire a container suffix the claim never writes.
+        self.assertEqual(hooks._attempt_lease_id({"litellm_trace_id": "trace-y"}), "trace-y")
+
+    def test_a_claimed_slot_is_released_from_the_callback_shape(self) -> None:
+        """A delivered answer gives back the slot when the callback reports it."""
+
+        hooks, _ = load_hook_module()
+        deployment = _deployment("route-a")
+        claim_request = _request("turn-cb")
+        claim_request["litellm_metadata"] = {hooks._ATTEMPT_LEASE_ID_KEY: "turn-cb"}
+
+        self.assertTrue(
+            hooks._claim_deployment_concurrency_slot(claim_request, deployment, 1)
+        )
+        self.assertEqual(hooks._deployment_in_flight_count("id:route-a"), 1)
+
+        hooks._record_deployment_success_for_cooldown(
+            {"litellm_params": {"litellm_metadata": dict(claim_request["litellm_metadata"])}}
+        )
+
+        self.assertEqual(hooks._deployment_in_flight_count("id:route-a"), 0)
 
 
 def test_the_proxy_and_the_config_editor_name_one_key() -> None:
@@ -631,3 +695,90 @@ def test_the_proxy_and_the_config_editor_name_one_key() -> None:
 
     assert concurrency.MODEL_CONCURRENCY_LIMIT_KEY == MODEL_CONCURRENCY_KEY
     assert concurrency.MODEL_CONCURRENCY_MAX == MODEL_CONCURRENCY_MAX
+
+
+class SharedStoreUnavailableTests(ConcurrencyStoreTestCase):
+    """A cap that cannot be shared is reported, never pretended.
+
+    The store is a file under this installation's runtime root.  When that file
+    cannot be written the count is unknown, so filtering on it would enforce a
+    number no other worker agrees with -- and silently doing nothing would let
+    the operator believe a route is capped.  Both halves are stated in the trace
+    instead.
+    """
+
+    def test_an_unwritable_store_filters_nothing_and_says_so(self) -> None:
+        hooks, _ = load_hook_module()
+        # A directory where the leases file should be: the lock cannot be taken,
+        # so every read of the shared count fails.
+        self.leases_path.mkdir(parents=True, exist_ok=True)
+        deployment = _deployment("route-a")
+        self.assertIsNone(hooks._deployment_in_flight_count("id:route-a"))
+
+        with self.assertLogs("young_router.route_trace", level="WARNING") as captured:
+            available, saturated, filtered = hooks._with_active_model_concurrency(
+                [deployment], request_kwargs=_request("turn-new")
+            )
+
+        self.assertEqual(available, [deployment])
+        self.assertEqual(saturated, [])
+        self.assertFalse(filtered)
+        self.assertTrue(
+            any(
+                "model_concurrency_store_unavailable" in line
+                for line in captured.output
+            )
+        )
+
+
+class CallbackShapeLeaseTests(ConcurrencyStoreTestCase):
+    """The turn's identifier must survive the trip through LiteLLM.
+
+    These are regression tests for a defect that only appeared on the live
+    proxy: the slot was claimed with an identifier nothing could release, so a
+    route served less than its cap until the lease expired.  Each case is one
+    half of that trip -- the marker's *location* on the way in, and the marker's
+    *container* on the way back.
+    """
+
+    def test_a_stamped_marker_is_never_sent_to_the_provider(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {"model": "default-chat", "messages": [{"role": "user", "content": "hi"}]}
+
+        hooks._ensure_attempt_lease_id(request)
+
+        self.assertNotIn(hooks._ATTEMPT_LEASE_ID_KEY, request)
+        self.assertIn(hooks._ATTEMPT_LEASE_ID_KEY, request["litellm_metadata"])
+
+    def test_an_existing_container_is_copied_rather_than_mutated(self) -> None:
+        hooks, _ = load_hook_module()
+        original = {"other": "value"}
+        request = {"litellm_metadata": original}
+
+        hooks._ensure_attempt_lease_id(request)
+
+        self.assertEqual(original, {"other": "value"})
+        self.assertEqual(request["litellm_metadata"]["other"], "value")
+        self.assertIn(hooks._ATTEMPT_LEASE_ID_KEY, request["litellm_metadata"])
+
+    def test_a_marker_wins_over_a_trace_id_whichever_container_holds_it(self) -> None:
+        """Key-first lookup: the marker is the turn's own, the trace id is not.
+
+        On the way in the request carries LiteLLM's ``litellm_trace_id`` at the
+        top level; on the way back the marker is nested under ``litellm_params``.
+        A container-first search answers two different identifiers for one turn,
+        which is what left the slot behind.
+        """
+
+        hooks, _ = load_hook_module()
+        outgoing = {
+            "litellm_trace_id": "trace-in",
+            "litellm_metadata": {hooks._ATTEMPT_LEASE_ID_KEY: "turn-1"},
+        }
+        incoming = {
+            "litellm_trace_id": "trace-out",
+            "litellm_params": {"litellm_metadata": {hooks._ATTEMPT_LEASE_ID_KEY: "turn-1"}},
+        }
+
+        self.assertEqual(hooks._attempt_lease_id(outgoing), "turn-1")
+        self.assertEqual(hooks._attempt_lease_id(incoming), "turn-1")
