@@ -1023,6 +1023,7 @@ class CoreStore:
         # thread so the committed edit and every later IPC request stay fast.
         self._service_reload_guard = threading.Lock()
         self._service_reload_thread: threading.Thread | None = None
+        self._client_model_sync: Any | None = None
         self._service_reload_pending = False
         self._service_reload_stopping = False
         # Whether the queued restart must replace the process (a runtime
@@ -2523,6 +2524,7 @@ class CoreStore:
         access_token: object = "",
         refresh_token: object = "",
         user_id: object = "",
+        quota: object = None,
     ) -> dict[str, Any]:
         """Restore or update one locally validated native relay session.
 
@@ -2534,6 +2536,11 @@ class CoreStore:
         ``user_id`` is the station's own account id, which the host carries
         beside the session because a New API fork requires it as the
         ``New-Api-User`` header on every dashboard read.
+
+        ``quota`` is the New API profile the host's own probe just read.  The
+        probe that proves the session is the same answer the account's balance
+        comes from, so carrying it here settles both in one write instead of
+        paying a second read for a number the entry already had.
         """
 
         known_secrets = tuple(
@@ -2583,6 +2590,7 @@ class CoreStore:
                         refresh_token=str(refresh_token) if isinstance(refresh_token, str) else "",
                         user_id=user_id,
                         preserve_resources=True,
+                        quota=quota,
                     )
                 elif login_status in {"signed_out", "expired"} and matching.get("remember_password") is True:
                     # A login this Core already determined inside its re-check
@@ -3027,6 +3035,79 @@ class CoreStore:
             scheduler.stop()
 
     # -- proxy supervision -------------------------------------------------
+    def client_model_sync(self) -> Any:
+        """The loop that keeps the generated client model lists current.
+
+        Created on request and started by the Core entry point, like the loops
+        above.  A window's snapshot already re-derives these lists, but that
+        only runs while somebody is looking, and the routes can change with no
+        reload owed.
+        """
+
+        if self._client_model_sync is None:
+            from . import client_model_sync as _client_model_sync
+
+            self._client_model_sync = _client_model_sync.attach(
+                self, self.client_model_documents()
+            )
+        return self._client_model_sync
+
+    def client_model_documents(self) -> tuple[Any, ...]:
+        """The documents that decide which model names the router serves.
+
+        The provider document is the source of every public name, so its own
+        timestamp is the one signal that says "the roster may have moved".  A
+        runtime document is included when a caller configured one apart from it,
+        because the router reads both.
+        """
+
+        paths: list[Any] = []
+        for name in ("providers_models", "runtime"):
+            adapter = self._domains.get(name)
+            for attribute in ("config_path", "runtime_config_path", "settings_path"):
+                value = getattr(adapter, attribute, None)
+                if isinstance(value, (str, Path)) and Path(value).expanduser() not in paths:
+                    paths.append(Path(value).expanduser())
+        return tuple(paths)
+
+    def adopt_external_route_change(self) -> None:
+        """Make a document changed by somebody else reach the running proxy.
+
+        A provider Apply reloads the proxy itself, so its own edits need
+        nothing here.  A document rewritten by another process -- a restored
+        backup, a model toggled by a tool that does not know this app -- leaves
+        the running proxy serving the previous roster, and no refresh can see a
+        difference it is never told about.  Reloading is what makes the router's
+        own ``/v1/models`` answer the new document, and the client model lists
+        follow on the reload that reload already triggers.
+        """
+
+        self._schedule_service_reload_after_apply()
+
+    def refresh_client_model_lists(self) -> None:
+        """Regenerate every client model list this app generates.
+
+        Idempotent: each generator compares the document on disk with what the
+        router serves and writes only a difference.  A pass that finds nothing
+        new therefore costs one loopback read and no file write.
+        """
+
+        with self._lock:
+            claude = self._domains.get("claude")
+            refresh = getattr(claude, "refresh_model_lists", None)
+            if callable(refresh):
+                try:
+                    refresh()
+                except Exception:
+                    pass
+            codex = self._domains.get("codex")
+            refresh_catalog = getattr(codex, "refresh_model_catalog", None)
+            if callable(refresh_catalog):
+                try:
+                    refresh_catalog()
+                except Exception:
+                    pass
+
     def service_supervisor(self) -> Any:
         """The loop that restores the proxy without a person's click.
 
@@ -3847,7 +3928,7 @@ class CoreStore:
                     # The proxy's port or key may have just changed; a Codex
                     # client that already uses the proxy has to follow it.
                     self._follow_codex_local_api()
-                    self._refresh_client_model_lists()
+                    self.refresh_client_model_lists()
                     # A start or restart is also where the image-context switch
                     # and the client's fetch-server entry are reconciled: the
                     # pass reads its switch from the proxy's environment, which
@@ -4168,7 +4249,7 @@ class CoreStore:
                     except Exception:
                         pass
                 self._follow_codex_local_api(codex)
-                self._refresh_client_model_lists()
+                self.refresh_client_model_lists()
                 # The image-context switch lives in the runtime settings and the
                 # fetch server in the client's document.  Reconciling here as
                 # well as on Apply is what makes the two agree after a start:
@@ -4182,28 +4263,6 @@ class CoreStore:
             # The host quit while this restart was in flight; shutdown() may
             # have stopped the previous proxy before this one started.
             self._stop_service_after_reload_shutdown()
-
-    def _refresh_client_model_lists(self) -> None:
-        """Regenerate the client model lists this app generates.
-
-        A list generated from this router's public models has to follow the
-        routes behind them for the same reason the Codex catalog does: a route
-        that was added, removed, or renamed while a pane was closed otherwise
-        leaves a client's picker offering models the router no longer serves.
-        The caller holds ``self._lock``; the write happens before the revision
-        is published, so every open window sees the new file and the new state
-        together.  A failure belongs to that one client's list, never to the
-        proxy restart that just succeeded.
-        """
-
-        claude = self._domains.get("claude")
-        refresh = getattr(claude, "refresh_model_lists", None)
-        if not callable(refresh):
-            return
-        try:
-            refresh()
-        except Exception:
-            pass
 
     def _follow_codex_local_api(self, codex: object | None = None) -> None:
         """Keep a Codex client that uses this app's proxy on its current endpoint.
@@ -4384,7 +4443,7 @@ class CoreStore:
                         # a client that points at this proxy follows a port change.
                         self._service_reload_replace_process = False
                         self._follow_codex_local_api()
-                        self._refresh_client_model_lists()
+                        self.refresh_client_model_lists()
                         self._sync_codex_image_context_mcp(["codex"])
                     else:
                         self._service_supervision_attempts += 1

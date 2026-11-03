@@ -361,11 +361,27 @@ class ClaudeDesktopConfig:
         self._draft = candidate
         return self.snapshot()
 
-    def set_model_names(self, value: object) -> dict[str, Any]:
+    def set_model_names(self, value: object, labels: Mapping[str, str] | None = None) -> dict[str, Any]:
+        """Replace the picker's model list, optionally labelling each entry.
+
+        ``labels`` maps a model id to the name the picker should show instead.
+        Claude Desktop renders an id it recognises itself, but an alias it does
+        not recognise is drawn verbatim -- so a route listed here as
+        ``claude-dsv41-flash`` would read exactly like that in the picker.  A
+        ``labelOverride`` is verified to replace that rendering with any string,
+        which is how a model keeps a Claude-shaped id and still reads as the
+        model it really is.
+        """
+
         if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
             raise ClaudeDesktopConfigError("Claude Desktop model names must be a list of strings")
         names = [_string(item, "Claude Desktop model name") for item in value]
         normalized = [name for name in names if name is not None]
+        resolved_labels: dict[str, str] = {}
+        for key, label in (labels or {}).items():
+            text_label = _string(label, "Claude Desktop model label", allow_empty=True)
+            if isinstance(key, str) and text_label:
+                resolved_labels[key] = text_label
 
         existing_by_name: dict[str, object] = {}
         existing = self._draft.get("inferenceModels")
@@ -379,11 +395,20 @@ class ClaudeDesktopConfig:
         for name in normalized:
             existing_entry = existing_by_name.get(name)
             if isinstance(existing_entry, Mapping):
-                next_entries.append({**copy.deepcopy(dict(existing_entry)), "name": name})
+                entry: object = {**copy.deepcopy(dict(existing_entry)), "name": name}
             elif isinstance(existing_entry, str):
-                next_entries.append(name)
+                entry = name
             else:
-                next_entries.append({"name": name})
+                entry = {"name": name}
+            label = resolved_labels.get(name, "")
+            # The label is this app's own field: applying it here, and removing
+            # it when the caller stops asking for one, keeps the file equal to
+            # what the pane says the list is.
+            if label:
+                entry = {"name": name, **{k: v for k, v in (entry.items() if isinstance(entry, Mapping) else []) if k not in {"name", "labelOverride"}}, "labelOverride": label}
+            elif isinstance(entry, Mapping) and "labelOverride" in entry:
+                entry = {k: v for k, v in entry.items() if k != "labelOverride"}
+            next_entries.append(entry)
 
         candidate = copy.deepcopy(self._draft)
         if next_entries:
@@ -397,6 +422,31 @@ class ClaudeDesktopConfig:
             self._ensure_target()
         self._draft = candidate
         return self.snapshot()
+
+    def model_entries(self) -> list[dict[str, str]]:
+        """The pending ``inferenceModels`` rows as name and label pairs.
+
+        The pane's switch compares this with the rows it derives, so a list that
+        lost its labels -- an older release wrote the bare ids, or Desktop
+        rewrote the file -- is rewritten instead of being accepted as current.
+        """
+
+        rows: list[dict[str, str]] = []
+        for item in self._draft.get("inferenceModels") or []:
+            if isinstance(item, str):
+                rows.append({"name": item})
+                continue
+            if not isinstance(item, Mapping):
+                continue
+            name = item.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            row = {"name": name.strip()}
+            label = item.get("labelOverride")
+            if isinstance(label, str) and label.strip():
+                row["labelOverride"] = label.strip()
+            rows.append(row)
+        return rows
 
     def gateway_url(self) -> str:
         """The third-party inference endpoint this profile names, if any."""

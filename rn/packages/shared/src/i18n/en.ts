@@ -307,6 +307,7 @@ export const en: Record<TranslationKey, string> = {
   "common.savedServiceStopped": "Saved; it will take effect when the service starts",
   "common.reloaded": "Reloaded",
   "common.ready": "Ready",
+  "common.working": "Working…",
   "common.notApplied": "Changes not applied",
   "common.notAppliedPartial": "Some changes not applied",
   "common.discard": "Discard changes",
@@ -351,7 +352,7 @@ export const en: Record<TranslationKey, string> = {
   "claude.desktopSection": "Claude Desktop",
   "claude.codeSection": "Claude Code",
   "claude.codeModelListHint": "Checked, Claude Code's model picker lists Young Router's public models; unchecked, it keeps its own built-in list.",
-  "claude.desktopModelListHint": "Checked, Claude Desktop's model list is replaced by Young Router's public model list; unchecked, it goes back to the models it discovers from the gateway.",
+  "claude.desktopModelListHint": "Checked, Claude Desktop's model list is replaced by Young Router's public model list; unchecked, it goes back to the models it discovers from the gateway. Claude Desktop keeps only entries named like an Anthropic model, with no competitor brand in them (claude-fast-v3 works; claude-gpt and claude-deepseek do not) and deletes the rest from its picker with a warning. Unchecking does not surface them either. To make a model appear here, give its route a public name that is the Claude model it stands in for; the picker then shows that route's real upstream model, so public name claude-dsv41-flash with upstream deepseek-v4.1-flash reads as deepseek-v4.1-flash.",
   "clients.claude": "Claude",
   "clients.claudeFilesHint": "Claude Code user settings, and Claude Desktop third-party inference and developer settings",
   "clients.codex": "Codex",
@@ -590,6 +591,7 @@ export const en: Record<TranslationKey, string> = {
   "providers.keyListHint": "Names route models; saved values stay in secure storage.",
   "providers.apiKeyInput": "New API key",
   "providers.apiKeySavedHint": "Loading the saved API key...",
+  "providers.keyNameAutoGroupingHint": "Auto grouping is on: the relay's group names this key.",
   "providers.addKey": "Add key",
   "providers.modelRate": "Rate",
   "providers.publicModel": "Public model",
@@ -617,7 +619,7 @@ export const en: Record<TranslationKey, string> = {
   "providers.deleteApiKey": "Delete API key {key}?",
   "providers.deleteApiKeyModelsMessage": "The following models will also be deleted:\n{models}",
   "providers.deleteApiKeyNoModelsMessage": "No models use this key.",
-  "providers.relayKeyValueHint": "Managed by Service Provider Management",
+  "providers.relayKeyValueHint": "Managed by the service provider",
   "providers.routeCredential": "Linked account",
   "providers.providerKey": "Key name",
   "providers.keyOrderColumn": "Key / Order",
@@ -650,6 +652,15 @@ export const en: Record<TranslationKey, string> = {
   "providers.upstreamContextWindowHelpTitle": "Upstream context",
   "providers.upstreamContextWindowHelp": "This upstream publishes this window in its own model catalog. The app only reads it; it cannot be changed here.",
   "providers.followMultiplier": "Follow multiplier",
+  // The route's own share of the concurrency cap.  An empty field is not a
+  // missing value: it is the route following the runtime's global limit, which
+  // is why the hint names that number instead of drawing an empty box.
+  "providers.routeConcurrency": "Concurrency",
+  "providers.routeConcurrencyHelpTitle": "Route concurrency",
+  // 0 is the one value the control cannot state for itself: an empty field
+  // follows the global limit, while 0 leaves this route uncapped.
+  "providers.routeConcurrencyHelp": "How many requests this route may serve at once. A request arriving while it is full is answered by the next route of the same public model, exactly as a cooled route is skipped; only when every route of the model is full is the request refused with a concurrency error. The number is this route's own, because a group is several deployments that answer at different speeds; 0 leaves this route uncapped.",
+  "providers.routeConcurrencyInherit": "Follow global ({value})",
   "providers.addWizard": "Add with wizard…",
   "providers.wizard.title": "Configure provider",
   "providers.wizard.stepProvider": "Provider",
@@ -759,7 +770,7 @@ export const en: Record<TranslationKey, string> = {
   "providers.wizard.duplicateName": "A provider with this name already exists. Enter a different name.",
   "settings.structured": "Structured settings",
   "settings.useLocalApi": "Use Young Router API",
-  "settings.useLocalApiHint": "Checked points Codex at the local Young Router API by rewriting the current provider's address, key, and model name (the port and key follow the runtime settings); unchecking returns to the model last chosen with \"Use a specific API\".",
+  "settings.useLocalApiHint": "Checked points this client at the local Young Router API by rewriting its address, key, and model name (the port and key follow the runtime settings); unchecking returns to the model last chosen with \"Use a specific API\".",
   "settings.designateAs": "Use a specific API",
   "settings.designateAsHint": "Pick one saved model and point this client straight at its provider address, key, and default model instead of this app's proxy.",
   "settings.designateAsUnavailable": "Young Router has no saved models yet; add a provider and its models first.",

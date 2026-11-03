@@ -90,7 +90,10 @@ class CoreIPCBridge {
       std::optional<std::string> const& cookie,
       std::optional<std::string> const& access_token,
       std::optional<std::string> const& refresh_token,
-      std::optional<std::string> const& user_id = std::nullopt);
+      std::optional<std::string> const& user_id = std::nullopt,
+      // The New API profile quota the host's own probe read; Core owns the
+      // display unit that turns it into money.
+      std::optional<double> const& quota = std::nullopt);
   int AddEventHandler(std::function<void(std::string const&)> handler);
   void RemoveEventHandler(int token);
   void Stop();

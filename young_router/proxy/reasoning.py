@@ -143,6 +143,11 @@ def _model_listing_efforts(public_name: str) -> list[str] | None:
     return published_reasoning_levels(capability.supported_levels, pi_spelling=True)
 
 
+#: Distinguishes "this record says nothing about the level" (leave it to the
+#: provider) from "this record states the level as unsupported" (``None``).
+_UNSTATED_LEVEL = object()
+
+
 def _canonical_reasoning_level(value: object) -> str | None:
     if not isinstance(value, str):
         return None
@@ -168,6 +173,28 @@ def _clamp_reasoning_level(
     return supported_levels[0] if supported_levels else None
 
 
+def _served_reasoning_levels(capability: ReasoningCapability) -> tuple[str, ...]:
+    """The levels this route actually maps, not the ladder it advertises.
+
+    ``supported_levels`` is the generic ladder a client may offer; a pi.dev
+    record's ``thinking_level_map`` is the per-route truth, and a level it
+    states as ``null`` is one the provider cannot take.  A client is free to ask
+    for a tier in the advertised ladder (Claude Desktop's Effort control offers
+    ``low`` through ``max`` for every model it lists), so the route's own answer
+    is what a requested tier has to be reconciled against.
+    """
+
+    mapping = capability.thinking_level_map
+    if not mapping:
+        return capability.supported_levels
+    served = tuple(
+        level
+        for level in capability.supported_levels
+        if mapping.get(level, _UNSTATED_LEVEL) is not None
+    )
+    return served or capability.supported_levels
+
+
 def _mapped_reasoning_effort(
     value: object,
     capability: ReasoningCapability,
@@ -175,7 +202,7 @@ def _mapped_reasoning_effort(
     requested = _canonical_reasoning_level(value)
     if requested is None:
         return value
-    selected = _clamp_reasoning_level(requested, capability.supported_levels)
+    selected = _clamp_reasoning_level(requested, _served_reasoning_levels(capability))
     if selected is None:
         return value
     mapping = capability.thinking_level_map
@@ -217,6 +244,19 @@ def _map_reasoning_fields(
             mapped = _mapped_reasoning_effort(item, capability)
             updated[key] = mapped
             changed = changed or mapped != item
+            continue
+        if key == "output_config" and isinstance(item, dict):
+            # Claude Desktop and Claude Code on the Messages wire state depth as
+            # ``output_config.effort`` rather than ``reasoning_effort``, so a
+            # ladder the route does not serve has to be reconciled here or the
+            # tier reaches the upstream as the client typed it.
+            mapped_config, config_changed = _map_reasoning_fields(
+                item,
+                capability,
+                in_reasoning=True,
+            )
+            updated[key] = mapped_config
+            changed = changed or config_changed
             continue
         if key in {"extra_body", "litellm_params"} and isinstance(item, dict):
             mapped, item_changed = _map_reasoning_fields(item, capability)
@@ -356,6 +396,11 @@ def _request_reasoning_level(request_kwargs: Any) -> str | None:
         level = _canonical_reasoning_level(reasoning.get("effort"))
         if level is not None:
             return level
+    output_config = request_kwargs.get("output_config")
+    if isinstance(output_config, dict):
+        level = _canonical_reasoning_level(output_config.get("effort"))
+        if level is not None:
+            return level
     for container_key in ("extra_body", "litellm_params"):
         container = request_kwargs.get(container_key)
         if not isinstance(container, dict):
@@ -366,6 +411,11 @@ def _request_reasoning_level(request_kwargs: Any) -> str | None:
         nested = container.get("reasoning")
         if isinstance(nested, dict):
             level = _canonical_reasoning_level(nested.get("effort"))
+            if level is not None:
+                return level
+        nested_config = container.get("output_config")
+        if isinstance(nested_config, dict):
+            level = _canonical_reasoning_level(nested_config.get("effort"))
             if level is not None:
                 return level
     return None

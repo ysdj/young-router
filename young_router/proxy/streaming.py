@@ -1774,6 +1774,25 @@ def _local_shutdown_completed_response_event(
     )
     return _json_stream_event(completed_event)
 
+def _unclassified_stop_message() -> str:
+    """The one sentence for a stop no branch in this module can name.
+
+    Both wire formats return it, because the same stop may reach either client
+    and the sentence, not the code, is what decides whether the turn survives.
+    Pi matches ``isRetryableAssistantError``'s phrase list against the rendered
+    ``<code>: <message>``, and "ended without" is on that list; Codex never
+    reads the sentence and retries every code it does not recognise, which is
+    why ``upstream_route_failure`` is never given a name of our own invention.
+    """
+
+    return (
+        "The turn ended before the assistant answered, and the router could "
+        "not classify the stop, so the stream ended without a terminal "
+        "response event. The route trace for this request records the upstream "
+        "status and the exception that ended it."
+    )
+
+
 def _synthesized_failed_response_event(
     request_data: dict,
     exception: Exception,
@@ -1954,6 +1973,46 @@ def _synthesized_failed_response_event(
         # deterministic refusal (body size, tool history) use the same pair.
         error_type = "invalid_request_error"
         error_code = "invalid_prompt"
+    elif _routing_module._is_terminal_prompt_or_policy_error(exception):
+        # A route refused the prompt itself under its own content policy.  The
+        # trace has named this cause for sessions (``terminal-prompt-or-policy``)
+        # and the chat-completions wire already gave it a code, but this
+        # Responses branch did not exist: the stop fell through to the
+        # unclassified sentence, so the client was told the router could not
+        # classify a refusal whose own words say what it was.  Nothing a resend
+        # changes reaches a different answer, so the wire type is the one that
+        # stops the client and the sentence says what to change.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        message = (
+            f"{model_group} refused this prompt under the route's own content "
+            "policy, and no candidate route would accept it. Change the prompt "
+            "or start a new task; the same text meets the same refusal."
+        )
+        # ``invalid_prompt`` is Codex's own name for a refusal no resend can
+        # clear, and it is deliberately not one of Pi's retry phrases.
+        error_type = "invalid_request_error"
+        error_code = "invalid_prompt"
+    elif _routing_module._is_upstream_model_not_found_error(exception):
+        # The route answered 404 for the model it was asked to serve.  That is a
+        # configuration change, not a transport hiccup, so it may not read as an
+        # unclassified stop: the reader is told which model no route serves.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        message = (
+            f"No candidate route serves {model_group} any more (the upstream "
+            "answered that the model does not exist). Disable the stale "
+            "provider route or choose another model; sending this turn again "
+            "meets the same answer."
+        )
+        error_type = "invalid_request_error"
+        error_code = "invalid_prompt"
     elif _routing_module._is_upstream_deployment_failover_error(exception):
         message = _routing_module._sanitized_upstream_route_failure_message(
             model,
@@ -2063,6 +2122,25 @@ def _synthesized_failed_response_event(
         )
         error_type = "invalid_request_error"
         error_code = "invalid_prompt"
+    elif _routing_module._is_upstream_request_shape_rejected_error(exception):
+        # The route refused the body this router (or litellm) built, and every
+        # candidate route answered the same way.  Neither sentence this stop used
+        # to reach was true: it was not an unclassified stop, and it was not the
+        # conversation the route rejected.  A resend rebuilds the identical
+        # body, so the wire type is the one that stops the client.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        message = (
+            f"{model_group} rejected the request body this router sent, on every "
+            "candidate route: the route answered a request-shape refusal rather "
+            "than anything about the conversation. Sending the same turn again "
+            "meets the same refusal; choose another route for this model."
+        )
+        error_type = "invalid_request_error"
+        error_code = "invalid_prompt"
     elif (
         _routing_module._is_route_recovery_poll_error(exception)
         # This worker's own stall watchdog already names its cause and keeps its
@@ -2129,20 +2207,43 @@ def _synthesized_failed_response_event(
                 )
             error_code = "upstream_stream_interrupted"
         error_type = "server_error"
-    else:
-        # Nothing this router knows can explain the stop, so the sentence says
-        # exactly that and no more.  The generic "the route failed before an
-        # answer was available" wording this branch used to carry is banned
-        # repo-wide (tests/test_proxy_module_integrity.py): clients render it as
-        # a retry tip and re-send a request the router already knows is dead,
-        # which is the reconnect loop a generic sentence causes.  A failure that
-        # has a cause gets its own branch above; one that does not says so
-        # plainly and stops.
-        message = (
-            "The turn ended before the assistant answered, and the router "
-            "could not classify the stop. The route trace for this request "
-            "records the upstream status and the exception that ended it."
+    elif _routing_module._stop_cause_is_named(exception):
+        # The router's own trace names this cause, but no branch above owns it.
+        # Reaching here means the recovery policy already called it terminal --
+        # that decision is what routes a transient cause to the poll branch --
+        # so the honest sentence is a refusal, and it may not claim the router
+        # could not classify a stop its trace just classified.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
         )
+        message = (
+            f"{model_group} refused this request on every candidate route, and "
+            "the route trace for this request names the refusal. No resend "
+            "changes that answer; change the route or the request before "
+            "sending it again."
+        )
+        error_type = "invalid_request_error"
+        error_code = "invalid_prompt"
+    else:
+        # Nothing here can name the stop, so the sentence says exactly that.
+        # The generic "the route failed before an answer was available" wording
+        # this branch used to carry is banned repo-wide
+        # (tests/test_proxy_module_integrity.py), and the sentence may not claim
+        # a cause it does not have.
+        #
+        # It may not end the turn either.  An unknown cause is not the same fact
+        # as a refusal no resend can clear, and only Codex reads the code: every
+        # code it does not recognise is retried there, while Pi reads the
+        # sentence, and a sentence it matches nothing in ends the turn.  So the
+        # same stop survived on one client and killed a live gpt-6.1-sol turn on
+        # the other.  The truncation clause below is the literal truth (this
+        # attempt produced no terminal response event) and puts the stop on the
+        # retry list of both clients, which is where a stop nobody can explain
+        # belongs: bounded by each client's own budget, never by a sentence that
+        # reads as final.
+        message = _unclassified_stop_message()
         error_type = "server_error"
         error_code = "upstream_route_failure"
     response = {
@@ -2233,7 +2334,11 @@ def _native_stream_error_code(exception: Exception) -> str:
         # Codex keys its retry decision on `error.code`; these are its names.
         return "context_length_exceeded"
     if _routing_module._is_terminal_prompt_or_policy_error(exception):
-        return "upstream_prompt_rejected"
+        # ``invalid_prompt`` is Codex's own name for a refusal no resend
+        # changes.  ``upstream_prompt_rejected`` was this router's own spelling,
+        # and Codex treats every code it does not recognise as retryable, so a
+        # content-policy refusal was resent until the client's budget ran out.
+        return "invalid_prompt"
     if _routing_module._is_image_generation_all_deployments_unsupported_error(
         exception
     ):
@@ -2251,6 +2356,16 @@ def _native_stream_error_code(exception: Exception) -> str:
     if _routing_module._is_upstream_request_field_rejected_error(exception):
         # ``invalid_prompt`` is the Codex code for a refusal no resend changes;
         # a code of this router's own invention would be retried there forever.
+        return "invalid_prompt"
+    if _routing_module._is_upstream_request_shape_rejected_error(exception):
+        # The same reading as the request-field branch: the body this side built
+        # is what was refused, and ``invalid_prompt`` is the Codex code that
+        # stops a client resending it.
+        return "invalid_prompt"
+    if _routing_module._is_upstream_model_not_found_error(exception):
+        # A route that 404s the model is a configuration change: ``invalid_prompt``
+        # is what stops Codex resending a turn no candidate can serve, and a code
+        # of our own would be retried there until the budget ran out.
         return "invalid_prompt"
     if _routing_module._is_upstream_deployment_failover_error(exception):
         return "insufficient_quota"
@@ -2337,6 +2452,43 @@ def _native_stream_error_message(
             or "the requested model"
         )
         return _routing_module._upstream_tool_history_rejected_message(model_group)
+    if _routing_module._is_terminal_prompt_or_policy_error(exception):
+        # The Responses branch states the same refusal for the same reason: the
+        # route judged the prompt, and a resend carries the identical prompt.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        return (
+            f"{model_group} refused this prompt under the route's own content "
+            "policy, and no candidate route would accept it. Change the prompt "
+            "or start a new task; the same text meets the same refusal."
+        )
+    if _routing_module._is_upstream_request_shape_rejected_error(exception):
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        return (
+            f"{model_group} rejected the request body this router sent, on every "
+            "candidate route: the route answered a request-shape refusal rather "
+            "than anything about the conversation. Sending the same turn again "
+            "meets the same refusal; choose another route for this model."
+        )
+    if _routing_module._is_upstream_model_not_found_error(exception):
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        return (
+            f"No candidate route serves {model_group} any more (the upstream "
+            "answered that the model does not exist). Disable the stale "
+            "provider route or choose another model; sending this turn again "
+            "meets the same answer."
+        )
     if getattr(exception, "stream_incomplete", False):
         # Keeps the phrase the chat-completions terminal test pins, and adds the
         # one the client's retry classifier needs.  This stop is transient -- the
@@ -2359,6 +2511,11 @@ def _native_stream_error_message(
             "stream ended without a terminal response event. The route has "
             "been parked; send the message again and another route will answer."
         )
+    if not _routing_module._stop_cause_is_named(exception):
+        # The same stop, in the same words as the Responses event: one nobody can
+        # name is not a refusal the client's own bytes earned, and the sentence it
+        # reads is what decides whether the turn survives.
+        return _unclassified_stop_message()
     return _routing_module._sanitized_upstream_route_failure_message(
         model,
         exception,

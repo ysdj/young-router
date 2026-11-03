@@ -293,6 +293,44 @@ def local_api_key(config: dict[str, Any]) -> str:
     return value
 
 
+#: A listing entry's own modality, as LiteLLM resolves it from the upstream
+#: model name (``create_model_info_response`` reads ``mode`` off the model
+#: metadata).  It is the one statement in the listing that says a route answers
+#: images rather than text, so it is what keeps an image generator out of a
+#: client's model picker without touching ``/v1/models`` itself -- the router
+#: keeps publishing the route, and only the pickers this app writes skip it.
+_IMAGE_LISTING_MODE_MARKER = "image"
+
+
+def _listing_entry_is_image_model(item: Any) -> bool:
+    """Whether one ``/v1/models`` entry states that it generates images."""
+
+    if not isinstance(item, dict):
+        return False
+    mode = item.get("mode")
+    return isinstance(mode, str) and _IMAGE_LISTING_MODE_MARKER in mode.strip().lower()
+
+
+def _public_catalog_is_image_model(name: str) -> bool:
+    """Whether the public catalogs say this route serves only images.
+
+    The listing's own ``mode`` is LiteLLM's inference, and it is absent for a
+    route whose upstream name no installed cost map knows.  The public catalogs
+    (pi.dev, models.dev) state the modality independently, and
+    ``model_catalog._route_is_image_model`` already reads them for the Codex
+    catalog entry, so the same answer narrows this list too.  A registry that
+    cannot be built is not evidence of a text model: the answer is ``False`` and
+    the listing's own ``mode`` remains the only filter on this path.
+    """
+
+    try:
+        from . import model_catalog as _model_catalog
+
+        return _model_catalog.route_serves_only_images(name)
+    except Exception:
+        return False
+
+
 def local_exposed_models(api_key: str) -> tuple[list[str], bool]:
     """Read the model IDs LiteLLM currently exposes on its local API.
 
@@ -301,6 +339,15 @@ def local_exposed_models(api_key: str) -> tuple[list[str], bool]:
     answers the authenticated ``/v1/models`` request.  Any transport,
     authentication, response-shape, or size failure therefore produces no
     exposed models.
+
+    An image generation route is dropped here, and only here: ``/v1/models``
+    keeps publishing it, while every picker this app writes -- the managed Codex
+    catalog and both Claude lists -- is built from what this function answers.
+    A generator cannot be selected into a conversation (it is reached through
+    the client's own image tool, not by naming it as the model), so listing it
+    offered a choice that could only fail; the request log for
+    ``gpt-image-2.5-sunburst`` showed the client sending a full coding-agent tool
+    set to a route that answers ``{\"size\":\"1024x1024\"...}`` instead.
     """
 
     if not isinstance(api_key, str) or not api_key.strip():
@@ -349,6 +396,8 @@ def local_exposed_models(api_key: str) -> tuple[list[str], bool]:
         if not name or len(name) > 256 or any(ord(char) < 32 for char in name):
             continue
         if name in seen:
+            continue
+        if _listing_entry_is_image_model(item) or _public_catalog_is_image_model(name):
             continue
         seen.add(name)
         names.append(name)

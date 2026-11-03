@@ -107,7 +107,13 @@ def store(thread_id: Any, request_kwargs: Dict[str, Any]) -> int:
     if not safe:
         return 0
     images: List[Dict[str, Any]] = []
-    for image in _image_context_module.scan(request_kwargs.get("input")):
+    # The same file map the pass scanned with, read before this write replaces
+    # it: the cache must number the pictures exactly as the request the model
+    # reads was numbered, or an id the placeholders name answers nothing.
+    previous_paths = paths(safe)
+    for image in _image_context_module.scan(
+        request_kwargs.get("input"), file_paths=previous_paths
+    ):
         if not isinstance(image.mime, str) or not image.raw:
             continue
         images.append(
@@ -129,7 +135,15 @@ def store(thread_id: Any, request_kwargs: Dict[str, Any]) -> int:
     _write_files(safe, images)
     target = _path_for(safe)
     temporary = f"{target}.tmp.{os.getpid()}"
-    payload = {"threadId": safe, "at": time.time(), "images": images}
+    # The task's own language travels with it: the fetch tool writes the line
+    # before a copy it returns, and that line has to read in the language the
+    # placeholders around it were written in.
+    payload = {
+        "threadId": safe,
+        "at": time.time(),
+        "lang": _image_context_module._language(request_kwargs),
+        "images": images,
+    }
     try:
         with open(temporary, "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
@@ -299,27 +313,87 @@ def _remove_tree(folder: str) -> None:
         pass
 
 
-def load(thread_id: Any, environ: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
-    """Every image the last stored request of one task carried."""
+def _payload(thread_id: Any, environ: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """One task's stored replay, or ``{}`` when it cannot answer.
+
+    ``{"threadId", "at", "lang", "images"}``.  ``lang`` is the language the
+    pass wrote this task's placeholders in, kept here because the fetch tool
+    writes the heading for a fetched copy and must speak the same one.
+    """
 
     safe = _safe_thread_id(thread_id)
     if not safe:
-        return []
+        return {}
     try:
         with open(_path_for(safe, environ), "r", encoding="utf-8") as handle:
             payload = json.load(handle)
     except (OSError, ValueError):
-        return []
-    images = payload.get("images") if isinstance(payload, dict) else None
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    images = payload.get("images")
     if not isinstance(images, list):
-        return []
+        return {}
     at = payload.get("at")
     if isinstance(at, (int, float)) and time.time() - at > REPLAY_CACHE_MAX_AGE_SECONDS:
         # A stale record never answers a fetch.  It is not unlinked here: a
         # worker may `os.replace` a fresh replay at this path between the read
         # and the unlink, and the sweeper owns the deletion from its own clock.
+        return {}
+    return payload
+
+
+def load(thread_id: Any, environ: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+    """Every image the last stored request of one task carried."""
+
+    images = _payload(thread_id, environ).get("images")
+    if not isinstance(images, list):
         return []
     return [image for image in images if isinstance(image, dict)]
+
+
+def _found(thread_id: Any, image_id: str, environ: Optional[Dict[str, str]]) -> Optional[tuple]:
+    """``(record, lang, mime, data_url)`` for one stored id, or ``None``.
+
+    The task is one lookup key, not a requirement: a client starts the fetch
+    tool without telling it which task the model is in (Codex passes a task id
+    to its own tools, not to an MCP server's), so an id the named task cannot
+    answer is looked for in the most recent replays.  ``IMG-004`` names one
+    image of one task, and a hit in the newest replay that carries it is the
+    task the model is asking about.
+
+    One lookup answers both halves of a fetch, so an id is never served with
+    bytes from one task under a heading read from another.
+    """
+
+    wanted = str(image_id or "").strip().upper()
+    if not wanted:
+        return None
+    answer = _lookup(_payload(thread_id, environ), wanted) if _safe_thread_id(thread_id) else None
+    if answer is not None:
+        return answer
+    for candidate in _recent_threads(environ):
+        if candidate == _safe_thread_id(thread_id):
+            continue
+        answer = _lookup(_payload(candidate, environ), wanted)
+        if answer is not None:
+            return answer
+    return None
+
+
+def fetched(
+    thread_id: Any,
+    image_id: str,
+    environ: Optional[Dict[str, str]] = None,
+) -> Optional[tuple]:
+    """``(record, lang, mime, data_url)`` for one stored id, or ``None``.
+
+    The fetch tool needs the record and not only the bytes: the line it puts
+    before an image names that image's own fields, and that line is what makes
+    the next request recognise the copy as the id it answers.
+    """
+
+    return _found(thread_id, image_id, environ)
 
 
 def image_data_url(
@@ -329,38 +403,29 @@ def image_data_url(
 ) -> Optional[tuple]:
     """``(mime, data_url)`` for one stored id, or ``None`` when it is gone.
 
-    The task is one lookup key, not a requirement: a client starts this tool
-    without telling it which task the model is in (Codex passes a task id to its
-    own tools, not to an MCP server's), so an id that the named task cannot
-    answer is looked for in the most recent replays.  ``IMG-0004`` names one
-    image of one task, and a hit in the newest replay that carries it is the
-    task the model is asking about.
+    The bytes alone, for a caller that only draws a picture; ``fetched`` is the
+    same lookup with the record and the task's language beside them.
     """
 
-    wanted = str(image_id or "").strip().upper()
-    if not wanted:
+    answer = _found(thread_id, image_id, environ)
+    return None if answer is None else (answer[2], answer[3])
+
+
+def _lookup(payload: Dict[str, Any], wanted: str) -> Optional[tuple]:
+    """``(record, lang, mime, data_url)`` for one id inside one stored replay."""
+
+    images = payload.get("images")
+    if not isinstance(images, list):
         return None
-    answer = _lookup(load(thread_id, environ), wanted)
-    if answer is not None:
-        return answer
-    for candidate in _recent_threads(environ):
-        if candidate == _safe_thread_id(thread_id):
-            continue
-        answer = _lookup(load(candidate, environ), wanted)
-        if answer is not None:
-            return answer
-    return None
-
-
-def _lookup(images: List[Dict[str, Any]], wanted: str) -> Optional[tuple]:
+    lang = "en" if payload.get("lang") == "en" else "zh"
     for image in images:
-        if str(image.get("id") or "").upper() != wanted:
+        if not isinstance(image, dict) or str(image.get("id") or "").upper() != wanted:
             continue
         mime = image.get("mime")
         encoded = image.get("base64")
         if not isinstance(mime, str) or not isinstance(encoded, str) or not encoded:
             return None
-        return mime, f"data:{mime};base64,{encoded}"
+        return image, lang, mime, f"data:{mime};base64,{encoded}"
     return None
 
 

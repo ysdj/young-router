@@ -124,6 +124,15 @@ MENU_MANUAL_ORDER_KEY = "x-young-router-manual-order"
 # already read: ``max_input_tokens``.
 PUBLIC_MODEL_CONTEXT_KEY = "max_input_tokens"
 PUBLIC_MODEL_LIMIT_KEYS = (PUBLIC_MODEL_CONTEXT_KEY,)
+#: How many requests one route may serve at once.
+#:
+#: A route's own cap, not the public model's: the proxy counts in-flight
+#: attempts per deployment, and a group is several deployments that answer at
+#: different speeds.  A route that states no value inherits the runtime's global
+#: limit, so an ordinary route writes nothing here and follows that setting when
+#: it changes.  ``0`` is an explicit "no cap for this route".
+MODEL_CONCURRENCY_KEY = "max_concurrency"
+MODEL_CONCURRENCY_MAX = 4096
 MENU_PROVIDER_SOURCE_KEY = "x-young-router-provider-source"
 MENU_PROVIDER_AUTH_KEY = "x-young-router-provider-auth"
 #: Which channel of a multi-channel integration a provider row is.
@@ -867,6 +876,27 @@ def _validate_current_schema(data: dict[str, Any], path: pathlib.Path) -> None:
                 if _positive_int(limit) is None:
                     raise ValueError(
                         f"{path.name} {section_name}[{index}] {limit_key} must be a positive integer"
+                    )
+            if MODEL_CONCURRENCY_KEY in model_info:
+                # ``0`` is meaningful here and is the one value the positive
+                # limit above cannot state: it says this route is unlimited,
+                # which is different from saying nothing (follow the runtime
+                # default).
+                concurrency = model_info.get(MODEL_CONCURRENCY_KEY)
+                try:
+                    parsed_concurrency = _menu_order(concurrency, "Route concurrency")
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{path.name} {section_name}[{index}] {exc}"
+                    ) from exc
+                if (
+                    not isinstance(parsed_concurrency, int)
+                    or parsed_concurrency < 0
+                    or parsed_concurrency > MODEL_CONCURRENCY_MAX
+                ):
+                    raise ValueError(
+                        f"{path.name} {section_name}[{index}] {MODEL_CONCURRENCY_KEY} "
+                        f"must be a whole number from 0 to {MODEL_CONCURRENCY_MAX}"
                     )
             deployment_id = _string_value(model_info.get("id")).strip()
             if deployment_id and not RANDOM_DEPLOYMENT_ID_RE.fullmatch(deployment_id):

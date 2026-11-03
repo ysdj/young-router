@@ -1097,6 +1097,10 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("YOUNG_ROUTER_WINDOWS_TREE", script)
         self.assertIn("node_modules", script)
         self.assertIn("index.windows.bundle", script)
+        self.assertIn("rn\\scripts\\build-windows.ps1", script)
+        self.assertIn("rn\\scripts\\patch-react-native-windows.mjs", script)
+        self.assertIn("Windows build helper changes", script)
+        self.assertIn("$windowsBuildChanged.Count -gt 0", script)
         self.assertIn("shell:AppsFolder", script)
         self.assertIn("native sources the host executable cannot carry", script)
         self.assertIn("pnpm run build:windows", script)
@@ -1113,6 +1117,34 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("AttachThreadInput", reader)
         self.assertIn("CopyFromScreen", reader)
         self.assertIn("GetWindowRect", reader)
+        # A synthetic wheel only reaches a composition island after a synthetic
+        # move, and these panes ignore SetScrollPercent while answering Scroll.
+        self.assertIn("0x0800", reader)
+        self.assertIn("ScrollAmount]::LargeIncrement", reader)
+
+    def test_the_prepared_windows_wheel_patch_is_guarded_and_wired_into_source_builds(self) -> None:
+        # A wheel detent has to move what the rest of Windows moves, and RNW's
+        # own mapping hands the raw delta to the tracker and eases every event.
+        # The source build is allowed only when the matching incremental RNW
+        # output is already present: a fresh tree must fail before it starts an
+        # hours-long full RNW build.
+        patch = (ROOT / "rn" / "scripts" / "patch-react-native-windows.mjs").read_text(encoding="utf-8")
+        self.assertIn("SPI_GETWHEELSCROLLLINES", patch)
+        self.assertIn("WHEEL_DELTA", patch)
+        self.assertIn("c_scrollerLineDelta", patch)
+        self.assertIn("scrollLeft(wheelDelta, false)", patch)
+        self.assertIn("scrollDown(-wheelDelta, false)", patch)
+        self.assertIn("is not the shape this script rewrites", patch)
+        self.assertIn("GetSystemWheelScrollLines", patch)
+
+        build = (ROOT / "rn" / "scripts" / "build-windows.ps1").read_text(encoding="utf-8")
+        self.assertIn("patch-react-native-windows.mjs", build)
+        self.assertIn("--root $ProjectRoot", build)
+        self.assertIn("node_modules\\react-native-windows\\target\\$WindowsArch\\Release\\Microsoft.ReactNative\\Microsoft.ReactNative.dll", build)
+        self.assertIn("RNW source-build output is missing", build)
+        self.assertIn("UseExperimentalNuget=false", build)
+        self.assertLess(build.index("RNW source-build output is missing"), build.index("pnpm run build"))
+        self.assertLess(build.index("patch-react-native-windows.mjs"), build.index("pnpm run build"))
 
     def test_the_js_loop_reloads_the_bundle_in_place_and_only_from_a_known_good_one(self) -> None:
         # A UI edit's shortest path is a reload, not a restart: `RCTHost`

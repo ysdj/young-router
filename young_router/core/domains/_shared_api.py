@@ -20,6 +20,7 @@ read from its own document which route it left.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -254,6 +255,86 @@ def saved_route_api_key(runtime: object, deployment_id: str) -> str:
     return ""
 
 
+#: Brand tokens Claude Desktop refuses inside an ``inferenceModels`` entry,
+#: even when the id starts with ``claude-``.  Verified one by one against the
+#: app: ids carrying any of these are silently dropped from the picker, while
+#: the same id with a neutral word in their place is kept.  It is the app's own
+#: competitor list, so this is a denylist of what this router can be pointed
+#: at -- an id it does not mention is assumed acceptable, which is the safe
+#: direction: a name that is kept but unrecognised still shows in the picker.
+CLAUDE_DESKTOP_REFUSED_TOKENS = frozenset(
+    {
+        "openai",
+        "gpt",
+        "chatgpt",
+        "deepseek",
+        "gemini",
+        "bard",
+        "kimi",
+        "moonshot",
+        "glm",
+        "zhipu",
+        "qwen",
+        "dashscope",
+        "grok",
+        "xai",
+        "llama",
+        "mistral",
+        "doubao",
+        "bytedance",
+        "yi",
+        "minimax",
+        "ernie",
+        "baidu",
+    }
+)
+
+
+def desktop_accepts_model_name(name: object) -> bool:
+    """Whether Claude Desktop keeps this id in its third-party model list.
+
+    Two conditions, both observed on the app itself: the id has to read as an
+    Anthropic model (a bare ``grok-4.7`` is removed with a warning), and it may
+    not carry a competitor's brand even behind the ``claude-`` prefix
+    (``claude-gpt-test`` was removed while ``claude-fast-v3`` was kept).
+
+    Verified additions that survive: ``claude-fast-v3``, ``claude-think-max``,
+    ``claude-3-5-sonnet``, ``anthropic/claude-x``.  Verified removals:
+    ``claude-gpt-test``, ``claude-deepseek-test``, ``claude-gemini-test``,
+    ``claude-kimi-x``, ``claude-glm-5``, ``claude-openai-x``,
+    ``claude-qwen-x``, ``claude-grok-x``, ``claude-llama-x``,
+    ``claude-mistral-x``, ``claude-doubao-x``, ``claude-yi-x``.
+    """
+
+    if not names_a_claude_model(name):
+        return False
+    assert isinstance(name, str)
+    tokens = {token for token in re.split(r"[^a-z0-9]+", name.strip().lower()) if token}
+    return not (tokens & CLAUDE_DESKTOP_REFUSED_TOKENS)
+
+
+def names_a_claude_model(name: object) -> bool:
+    """Whether Claude Desktop keeps this model ID in its third-party picker.
+
+    Claude Desktop on 3P builds its picker from the models it can map onto an
+    Anthropic model, and it *deletes* every other ID from the configuration on
+    launch -- with a warning that names the removal.  A gateway this app fronts
+    serves whatever public names the user configured, so writing all of them
+    into ``inferenceModels`` left Desktop with a stripped list and the user with
+    a "removed from the list" warning per route.
+
+    The rule is the one this proxy already uses to decide a route speaks the
+    Messages wire, so both sides agree on what "names a Claude model" means;
+    the caller only writes the names this accepts.
+    """
+
+    from ...config.schema import infer_upstream_fallback_surface
+
+    if not isinstance(name, str) or not name.strip():
+        return False
+    return infer_upstream_fallback_surface(name) == "anthropic"
+
+
 def anthropic_base_url(base_url: str) -> str:
     """The Messages root for a client that appends ``/v1/messages`` itself."""
 
@@ -261,10 +342,12 @@ def anthropic_base_url(base_url: str) -> str:
 
 
 __all__ = [
+    "CLAUDE_DESKTOP_REFUSED_TOKENS",
     "CLIENT_ROUTE_CLIENTS",
     "CLIENT_ROUTE_STATE_FILE_NAME",
     "anthropic_base_url",
     "endpoint",
+    "names_a_claude_model",
     "normalise_route",
     "on_local_api",
     "one_saved_route",

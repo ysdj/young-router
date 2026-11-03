@@ -34,7 +34,7 @@ _INSTRUCTIONS_ZH = (
 )
 _INSTRUCTIONS_EN = (
     "Fetch the original of an omitted image by its id. The id is the one in the "
-    "placeholder (\"Image IMG-0004\"). A fetched image is provided for this call "
+    "placeholder (\"Image IMG-004\"). A fetched image is provided for this call "
     "only; ask again when you need it again."
 )
 
@@ -46,7 +46,7 @@ def _tool_spec() -> Dict[str, Any]:
         "description": (
             "Return the original bytes of images the user's image-context manager "
             "left out of the current turn, addressed by the id in their "
-            "placeholder (for example IMG-0004). Use it when the placeholder's "
+            "placeholder (for example IMG-004). Use it when the placeholder's "
             "description is not enough to answer. An image fetched here is "
             "provided for this call only."
         ),
@@ -56,13 +56,27 @@ def _tool_spec() -> Dict[str, Any]:
                 "ids": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Image ids from the placeholders, e.g. [\"IMG-0004\"].",
+                    "description": "Image ids from the placeholders, e.g. [\"IMG-004\"].",
                 }
             },
             "required": ["ids"],
         },
         "annotations": {"readOnlyHint": True},
     }
+
+
+def _fetched_line(record: Dict[str, Any], image_id: str, lang: str) -> str:
+    """The heading this copy carries, built by the pass's own builder."""
+
+    return _image_context_module.fetched_label(
+        str(record.get("id") or image_id),
+        lang=lang,
+        name=record.get("name"),
+        kind=record.get("kind") or "tool",
+        turn=record.get("turn"),
+        width=record.get("width"),
+        height=record.get("height"),
+    )
 
 
 def _thread_id(params: Dict[str, Any]) -> Optional[str]:
@@ -112,7 +126,7 @@ def fetch(params: Dict[str, Any]) -> Dict[str, Any]:
                     "type": "text",
                     "text": (
                         "No image ids were given. Pass the ids from the "
-                        "placeholders, for example {\"ids\": [\"IMG-0004\"]}."
+                        "placeholders, for example {\"ids\": [\"IMG-004\"]}."
                     ),
                 }
             ],
@@ -121,12 +135,16 @@ def fetch(params: Dict[str, Any]) -> Dict[str, Any]:
     blocks: List[Dict[str, Any]] = []
     missing: List[str] = []
     for image_id in wanted:
-        answer = _store_module.image_data_url(thread_id, image_id)
+        answer = _store_module.fetched(thread_id, image_id)
         if answer is None:
             missing.append(image_id)
             continue
-        mime, data_url = answer
-        blocks.append({"type": "text", "text": f"[Image {image_id} | provided this turn]"})
+        record, lang, mime, data_url = answer
+        # The line this copy carries is the pass's own heading for a fetched
+        # image, in the task's language.  The pass reads it back on the next
+        # request and keeps the id it names, so the picture the model just
+        # asked for stays the id it asked for instead of taking a new number.
+        blocks.append({"type": "text", "text": _fetched_line(record, image_id, lang)})
         blocks.append({"type": "image", "data": data_url.split(",", 1)[1], "mimeType": mime})
     if missing:
         blocks.append(

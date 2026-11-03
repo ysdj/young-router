@@ -12,6 +12,7 @@ from young_router.core.model_catalog import (
     catalog_model_names,
     catalog_names_from_editor,
     catalog_payload,
+    route_serves_only_images,
     select_inherited_profile,
     selected_model_names,
     write_catalog,
@@ -1718,6 +1719,124 @@ class SharedContextCacheTests(unittest.TestCase):
             ["low", "high"],
             [item["effort"] for item in text_model["supported_reasoning_levels"]],
         )
+
+    def test_the_picker_filter_keeps_a_generator_out_of_the_client_lists(self) -> None:
+        """The catalog's own answer is what both clients' pickers consult.
+
+        ``/v1/models`` keeps serving every route, so a filter placed on the
+        listing would hide the generator from Pi too.  The pickers are built
+        from ``codex_config.local_exposed_models``, which asks this, so the
+        answer is the one the catalog already resolves per route: only a route
+        that serves images and states no thinking step above ``off``.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "contexts.json"
+            cache.write_text(
+                json.dumps(
+                    self._cache(
+                        {
+                            "openai/gpt-image-public": {
+                                **self._profile(272_000),
+                                "image_model_metadata": {
+                                    "type": "image",
+                                    "input_modalities": ["text", "image"],
+                                    "output_modalities": ["image"],
+                                },
+                            },
+                            # A group that also serves a reasoning text model keeps
+                            # its place in the picker: that route is a conversation.
+                            "openai/omni-route": {
+                                **self._profile(272_000),
+                                "reasoning": True,
+                                "supported_reasoning_levels": ["low", "high"],
+                                "default_reasoning_level": "high",
+                                "image_model_metadata": {
+                                    "type": "image",
+                                    "input_modalities": ["text", "image"],
+                                    "output_modalities": ["image", "text"],
+                                },
+                            },
+                            "openai/text-route": {
+                                **self._profile(272_000),
+                                "reasoning": True,
+                                "supported_reasoning_levels": ["low", "high"],
+                                "default_reasoning_level": "high",
+                            },
+                        }
+                    )
+                ),
+                encoding="utf-8",
+            )
+            registry = ModelContextRegistry(cache_path=cache, refresh_enabled=False)
+
+            self.assertTrue(
+                route_serves_only_images("openai/gpt-image-public", registry=registry)
+            )
+            self.assertFalse(
+                route_serves_only_images("openai/omni-route", registry=registry)
+            )
+            self.assertFalse(
+                route_serves_only_images("openai/text-route", registry=registry)
+            )
+            self.assertFalse(route_serves_only_images("", registry=registry))
+            self.assertFalse(route_serves_only_images(None, registry=registry))  # type: ignore[arg-type]
+
+    def test_an_unreadable_catalog_does_not_hide_every_route(self) -> None:
+        """An exception in the filter must answer "chat", never "image"."""
+
+        with mock.patch(
+            "young_router.core.model_catalog._image_filter_registry",
+            side_effect=RuntimeError("cache unreadable"),
+        ):
+            self.assertFalse(route_serves_only_images("some-chat-model"))
+
+    def test_the_picker_filter_builds_its_registry_from_this_installation(self) -> None:
+        """The lazy registry must really resolve, not silently answer "chat".
+
+        ``route_serves_only_images`` fails open, so a builder that raised would
+        still return ``False`` for every route and the filter would become a
+        no-op -- image models back in both pickers, with nothing failing.  This
+        drives the real builder over a real cache under a temporary runtime
+        root, which is the only shape that distinguishes "this is a chat model"
+        from "the lookup never ran".
+        """
+
+        import young_router.core.model_catalog as catalog_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root / "model-contexts.json"
+            cache.write_text(
+                json.dumps(
+                    self._cache(
+                        {
+                            "openai/gpt-image-public": {
+                                **self._profile(272_000),
+                                "image_model_metadata": {
+                                    "type": "image",
+                                    "input_modalities": ["text", "image"],
+                                    "output_modalities": ["image"],
+                                },
+                            },
+                            "openai/text-route": {
+                                **self._profile(272_000),
+                                "reasoning": True,
+                                "supported_reasoning_levels": ["low", "high"],
+                                "default_reasoning_level": "high",
+                            },
+                        }
+                    )
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                catalog_module, "_IMAGE_FILTER_REGISTRY", None
+            ), mock.patch(
+                "young_router.config_paths.runtime_root", return_value=root
+            ):
+                self.assertTrue(route_serves_only_images("openai/gpt-image-public"))
+                self.assertFalse(route_serves_only_images("openai/text-route"))
 
     def test_a_cache_that_disappears_keeps_the_records_already_in_hand(self) -> None:
         """Losing the file is not evidence a resolved window became unknown."""

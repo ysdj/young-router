@@ -320,12 +320,19 @@ _WORDS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# An id numbers one occurrence, in the order the replay presents it -- the same
-# rule, and the same ``IMG-000`` shape, the attachment manager uses for its
-# panel, so a selection the user made in that panel names the images this pass
-# sees.  It is not a content digest: two byte-identical images are two ids.
+# An id numbers one occurrence, in the order the replay presents it.  It is not a
+# content digest: two byte-identical images are two ids.
+#
+# The shape is the attachment manager's own, and it is the *lowest* one that
+# maintained: it numbers ``IMG-%03d``, the panel and the notes reader accept
+# ``IMG-\d{3,}``, and this pass used four digits.  Four was the one width that
+# could never agree with it -- a panel selection made on ``IMG-001`` named an id
+# this pass never wrote, and a placeholder it offered could not be parsed by a
+# reader that only knows the panel's ids -- so the digits are the maintained
+# three, and an old placeholder still parses because the readers here accept
+# three or more.
 _ID_PREFIX = "IMG-"
-_ID_DIGITS = 4
+_ID_DIGITS = 3
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -615,7 +622,7 @@ def _decode_data_url(value: Any) -> Optional[Tuple[str, bytes]]:
 
 _IMAGE_PART_TYPES = ("input_image", "image_url")
 # The line the fetch tool writes before an image it returns, in either language:
-# ``[图片 IMG-0004 取回的原图｜…]`` / ``[Image IMG-0004 fetched original | …]``.
+# ``[图片 IMG-004 取回的原图｜…]`` / ``[Image IMG-004 fetched original | …]``.
 # An image behind it is a *copy* of an existing occurrence, not a new one, so it
 # must not take a new id -- the model and the panel both address that image by
 # the id it copies.
@@ -623,6 +630,58 @@ _FETCHED_LINE = re.compile(
     r"^\[(?:图片|Image) (IMG-\d{3,}) (?:取回的原图|fetched original)(?:｜| \||])"
 )
 _OPEN_TAG = re.compile(r'^<image name=(\[Image #\d+\]) path="(.*)">$', re.S)
+
+
+def _same_path(value: object) -> str:
+    """One file path in the form two callers can compare.
+
+    A path arrives here as the client echoed it, so it is cleaned the same way
+    on both sides of the comparison instead of trusted as text.
+    """
+
+    text = str(value or "").strip().strip('"')
+    return os.path.normpath(os.path.expanduser(text)) if text else ""
+
+
+# The client's own image viewer: one call per file, and its result is only the
+# picture.  Both spellings exist in this client's replay (``function_call`` for
+# the Responses wire, ``custom_tool_call`` for a freeform tool).
+_VIEW_TOOL_NAME = "view_image"
+_VIEW_CALL_ITEMS = frozenset({"function_call", "custom_tool_call"})
+
+
+def _viewed_file_id(item: Mapping[str, Any], known_files: Mapping[str, str]) -> Optional[str]:
+    """The stored image one ``view_image`` call opened, if it opened ours."""
+
+    if str(item.get("type") or "") not in _VIEW_CALL_ITEMS:
+        return None
+    if str(item.get("name") or "") != _VIEW_TOOL_NAME:
+        return None
+    arguments = item.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            return None
+    if not isinstance(arguments, Mapping):
+        return None
+    path = arguments.get("path")
+    if not isinstance(path, str) or not path:
+        return None
+    return known_files.get(_same_path(path))
+
+
+def _file_path_ids(file_paths: Optional[Mapping[str, str]]) -> Dict[str, str]:
+    """``{path: id}`` for the files one task's last replay wrote."""
+
+    if not file_paths:
+        return {}
+    result: Dict[str, str] = {}
+    for image_id, path in file_paths.items():
+        cleaned = _same_path(path)
+        if cleaned and isinstance(image_id, str) and image_id:
+            result[cleaned] = image_id
+    return result
 _CLOSE_TAG = re.compile(r"^</image>$")
 
 
@@ -732,16 +791,28 @@ def scan(
     input_items: Any,
     *,
     turn_of_item: Optional[Dict[int, int]] = None,
+    file_paths: Optional[Mapping[str, str]] = None,
 ) -> List[_Found]:
     """Every image a replay carries, in wire order, with its identity.
 
     The turn of an image is the number of user messages that precede it, which
     is what a placeholder names ("第 3 轮").  It is derived here rather than read
     from the transcript so this pass stays a pure function of the request.
+
+    ``file_paths`` is this task's ``{id: path}`` map from the replay the pass
+    wrote before this one.  A picture the model opened with the client's own
+    viewer comes back as a bare image: the result has no tag and no id, and the
+    only thing that says which picture it is, is the ``view_image`` call beside
+    it, whose arguments name the file this pass wrote.  That id is therefore
+    read off the call -- exactly as the fetch tool's line is read off its own
+    result -- and both readers exist for one rule: an id the model was given
+    keeps meaning the one image it named, however the copy came back.
     """
 
     if not isinstance(input_items, list):
         return []
+    known_files = _file_path_ids(file_paths)
+    viewed_by_call: Dict[str, str] = {}
     found: List[_Found] = []
     # A picture is *unseen* when it sits after the last item the assistant
     # produced.  The assistant has not answered since, so no earlier request of
@@ -787,6 +858,10 @@ def scan(
                 )
             )
             continue
+        if known_files:
+            opened = _viewed_file_id(item, known_files)
+            if opened is not None:
+                viewed_by_call[str(item.get("call_id") or "")] = opened
         field = "content" if item.get("type") == "message" else "output"
         parts = item.get(field)
         if not isinstance(parts, list):
@@ -823,6 +898,12 @@ def scan(
                 if line is not None:
                     copy_of = line.group(1)
                     break
+            if copy_of is None:
+                # The client's own viewer, opened on a file this pass wrote.
+                # Its result carries the image and nothing else -- no tag, no
+                # id -- so the id comes from the call that asked for it, which
+                # names the path.
+                copy_of = viewed_by_call.get(str(item.get("call_id") or ""))
             if copy_of is not None:
                 found.append(
                     _found_image(
@@ -923,13 +1004,47 @@ def _heading(image: _Found, state: str, lang: str) -> str:
     turn, size -- and its own label when Codex wrote one around the upload.
     """
 
+    return _heading_text(
+        image.image_id,
+        state,
+        lang,
+        name=image.name,
+        kind=image.kind,
+        turn=image.turn,
+        width=image.width,
+        height=image.height,
+        label=None,
+    )
+
+
+def _heading_text(
+    image_id: str,
+    state: str,
+    lang: str,
+    *,
+    name: object = None,
+    kind: object = "tool",
+    turn: object = 0,
+    width: object = None,
+    height: object = None,
+    label: object = None,
+) -> str:
+    """One heading from plain values, for the callers that hold no ``_Found``.
+
+    The fetch tool is a separate process (an MCP server the client starts), and
+    it has the stored record of an image rather than this pass's scan result.
+    It still has to write the heading this pass writes -- same fields, same
+    order, same separators -- so the line is built here once and both sides
+    name an image the same way.
+    """
+
     words = _WORDS[lang]
-    fields: List[str] = [str(image.name or words["unnamed"])]
-    fields.append(str(words["kind"].get(str(image.kind), words["kind"]["tool"])))
-    fields.append(str(words["turn"](image.turn)))
-    if image.width and image.height:
-        fields.append(str(words["size"](image.width, image.height)))
-    return str(words["heading"](image.image_id, None, state, fields))
+    fields: List[str] = [str(name or words["unnamed"])]
+    fields.append(str(words["kind"].get(str(kind), words["kind"]["tool"])))
+    fields.append(str(words["turn"](int(turn or 0))))
+    if width and height:
+        fields.append(str(words["size"](int(width), int(height))))
+    return str(words["heading"](image_id, label, state, fields))
 
 
 def _placeholder(image: _Found, lang: str, *, state: Optional[str] = None) -> str:
@@ -980,10 +1095,42 @@ def _included_label(image: _Found, lang: str) -> str:
     return _heading(image, str(_WORDS[lang]["included"]), lang)
 
 
-def _fetched_label(image: _Found, lang: str) -> str:
-    """The line the fetch tool puts before an image it returns."""
+def fetched_label(
+    image_id: str,
+    *,
+    lang: str = _LANG_ZH,
+    name: object = None,
+    kind: object = "tool",
+    turn: object = 0,
+    width: object = None,
+    height: object = None,
+) -> str:
+    """The line the fetch tool puts before an image it returns.
 
-    return _heading(image, str(_WORDS[lang]["fetched"]), lang)
+    This is the half of "fetch by id" that keeps an id meaning one picture.  The
+    pass decides what is a *copy* by reading this line back
+    (``_FETCHED_LINE``): an image behind it is the one its id already names, so
+    it keeps that id instead of taking the next number.  A tool that answered a
+    fetch with a line of its own -- one this reader does not match -- therefore
+    renumbered the picture the model had just asked for, and the same image
+    answered two ids for the rest of the task.
+
+    It is deliberately callable with plain values: the fetch tool is an MCP
+    server the client starts, so it holds a stored record rather than this
+    pass's scan result.
+    """
+
+    return _heading_text(
+        image_id,
+        str(_WORDS[lang]["fetched"]),
+        lang,
+        name=name,
+        kind=kind,
+        turn=turn,
+        width=width,
+        height=height,
+        label=None,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1207,7 +1354,11 @@ def _rewrite(
     # narrower -- the signed items themselves are never touched, because this
     # pass only ever replaces image parts, and no signed item carries one.
     mutable_from = 0
-    images = scan(input_items)
+    # The task is read here because the scan needs it: a picture the model
+    # opened with the client's own viewer is named by the file the *previous*
+    # request wrote for it, and that map is this task's own.
+    thread_id = _thread_id(request_kwargs)
+    images = scan(input_items, file_paths=_stored_file_paths(thread_id))
     if not images:
         _declined(request_kwargs, "no_images")
         return None
@@ -1313,7 +1464,6 @@ def _rewrite(
         if forced and images and keep_picture_item is None
         else None
     )
-    thread_id = _thread_id(request_kwargs)
     selection = read_selection(thread_id)
     auto = selection.get("auto")
     automatic = True if forced else (auto if isinstance(auto, bool) else mode() == "auto")
@@ -1556,6 +1706,24 @@ def _rewrite(
     result["input"] = rewritten
     _trace(request_kwargs, omitted, automatic, len(images))
     return result
+
+
+def _stored_file_paths(thread_id: Optional[str]) -> Dict[str, str]:
+    """This task's ``{id: path}`` map from the replay it already has.
+
+    Read before this request's own replay is written, so it is the map the
+    previous request published -- which is the one the pictures in this replay
+    were opened from.
+    """
+
+    if not thread_id:
+        return {}
+    from . import image_context_store as _store_module
+
+    try:
+        return dict(_store_module.paths(thread_id))
+    except Exception:
+        return {}
 
 
 def _store_replay(thread_id: Optional[str], request_kwargs: Mapping[str, Any]) -> None:

@@ -17,9 +17,10 @@
 #   * a copy on the VM's local disk owns `node_modules` and the build outputs
 #     (`Tree`: `YOUNG_ROUTER_WINDOWS_TREE`, default `%USERPROFILE%\yr-win`).
 #
-# This script syncs the JavaScript surface from the first into the second,
-# bundles it into the registered package's own Bundle directory, and restarts
-# the app.  Measured: 35 to 45 s, almost all of it Metro.
+# This script syncs the JavaScript surface and the Windows build helpers from
+# the first into the second, bundles it into the registered package's own Bundle
+# directory, and restarts the app.  Measured: 35 to 45 s, almost all of it
+# Metro.
 #
 # What it refuses, and why:
 #
@@ -91,6 +92,7 @@ $DependencyFiles = @(
 )
 $JsRoots = @('rn\packages\shared\src')
 $JsFiles = @('rn\apps\windows\index.js', 'rn\apps\windows\babel.config.js', 'rn\apps\windows\metro.config.js')
+$WindowsBuildFiles = @('rn\scripts\build-windows.ps1', 'rn\scripts\patch-react-native-windows.mjs')
 
 function Get-ChangedFiles {
   param([string]$Left, [string]$Right, [string[]]$ExcludeDirectories = @())
@@ -193,11 +195,22 @@ foreach ($file in $JsFiles) {
   if ((Get-FileHash -LiteralPath $left -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $right -Algorithm SHA256).Hash) { $jsChanged.Add($file) }
 }
 
+$windowsBuildChanged = New-Object System.Collections.Generic.List[string]
+foreach ($file in $WindowsBuildFiles) {
+  $left = Join-Path $Source $file
+  $right = Join-Path $Tree $file
+  if (-not (Test-Path -LiteralPath $left)) { continue }
+  if (-not (Test-Path -LiteralPath $right)) { $windowsBuildChanged.Add($file); continue }
+  if ((Get-FileHash -LiteralPath $left -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $right -Algorithm SHA256).Hash) { $windowsBuildChanged.Add($file) }
+}
+
 "source: $Source"
 "tree:   $Tree"
 "host:   $hostExe ($($builtAt.ToLocalTime()))"
 "js changes: $($jsChanged.Count)"
 foreach ($file in $jsChanged) { "  $file" }
+"Windows build helper changes: $($windowsBuildChanged.Count)"
+foreach ($file in $windowsBuildChanged) { "  $file" }
 
 if ($dependencyChanges.Count -gt 0) {
   "dependency changes: $($dependencyChanges.Count)"
@@ -220,7 +233,7 @@ if ($nativeGaps.Count -gt 0) {
 $blocked = if ($nativeGaps.Count -gt 0 -and -not $AllowStaleNative) { $true } elseif ($dependencyChanges.Count -gt 0) { $true } else { $false }
 
 if ($Check) {
-  $stale = $jsChanged.Count -gt 0 -or $nativeGaps.Count -gt 0 -or $dependencyChanges.Count -gt 0
+  $stale = $jsChanged.Count -gt 0 -or $windowsBuildChanged.Count -gt 0 -or $nativeGaps.Count -gt 0 -or $dependencyChanges.Count -gt 0
   $newest = Get-ChildItem -LiteralPath (Join-Path $Tree 'rn\packages\shared\src') -Recurse -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
   if ($newest -and (Test-Path -LiteralPath $bundle)) {
     if ((Get-Item -LiteralPath $bundle).LastWriteTimeUtc -lt $newest.LastWriteTimeUtc) {
@@ -244,7 +257,7 @@ this script with -AllowStaleNative and report the native gap.)
 "@
 }
 
-if ($Source -ne $Tree -and $jsChanged.Count -gt 0) {
+if ($Source -ne $Tree -and ($jsChanged.Count -gt 0 -or $windowsBuildChanged.Count -gt 0)) {
   foreach ($root in $JsRoots) {
     $from = Join-Path $Source $root
     $to = Join-Path $Tree $root
@@ -257,7 +270,12 @@ if ($Source -ne $Tree -and $jsChanged.Count -gt 0) {
     if (-not (Test-Path -LiteralPath $from)) { continue }
     Copy-Item -LiteralPath $from -Destination (Join-Path $Tree $file) -Force
   }
-  "synced $($jsChanged.Count) file(s) into the tree"
+  foreach ($file in $WindowsBuildFiles) {
+    $from = Join-Path $Source $file
+    if (-not (Test-Path -LiteralPath $from)) { continue }
+    Copy-Item -LiteralPath $from -Destination (Join-Path $Tree $file) -Force
+  }
+  "synced $($jsChanged.Count) JavaScript file(s) and $($windowsBuildChanged.Count) Windows build helper file(s) into the tree"
 }
 
 $pnpm = Get-Command pnpm -ErrorAction SilentlyContinue

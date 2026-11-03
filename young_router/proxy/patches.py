@@ -913,6 +913,23 @@ def _install_selected_deployment_marker_patch() -> None:
             **upstream_kwargs: Any,
         ) -> None:
             _responses_execution_module._remember_request_model_group_before_deployment_update(kwargs)
+            # The route is about to be called, which is the moment its
+            # concurrency cap applies: the candidate filter already skipped a
+            # full route when a peer was free, so reaching here with a full cap
+            # means every candidate of the group is full.  A turn that is turned
+            # away here is refused by this proxy with a reason of its own -- it
+            # is never retried against the same full pool by a caller that reads
+            # the refusal as an upstream rate limit.
+            concurrency_cap = _routing_module._model_concurrency_cap(deployment)
+            if concurrency_cap > 0 and not _routing_module._claim_deployment_concurrency_slot(
+                kwargs,
+                deployment,
+                concurrency_cap,
+            ):
+                raise _routing_module._model_concurrency_rejection_exception(
+                    kwargs,
+                    deployment,
+                )
             surface = _routing_module._request_surface_for_deployment(kwargs, deployment)
             # Read the client's replay before the surface adapter rewrites it:
             # ``input`` becomes ``messages`` for a Chat-shaped route, and the
@@ -1301,6 +1318,11 @@ def _install_order_peer_failover_patch() -> None:
             e,
             kwargs,
         ):
+            # The attempt that held this route's slot is over.  A concurrency
+            # refusal never took one, so releasing is a no-op for it; a real
+            # failure frees the slot now instead of waiting for the lease to age
+            # out, so the peer this attempt advances to starts from a true count.
+            _routing_module._release_request_concurrency_slots(kwargs)
             _routing_module._mark_same_deployment_retry_exhausted(e)
             _routing_module._mark_exception_for_deployment_failover(e, kwargs)
         _routing_module._sync_failed_deployment_exclusions(kwargs, e)

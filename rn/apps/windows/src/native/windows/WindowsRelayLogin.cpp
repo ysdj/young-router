@@ -625,7 +625,32 @@ struct EndpointProbeResult {
   // The account id the station itself reported for this session, which is what
   // a New API fork compares its ``New-Api-User`` header against.
   std::string user_id;
+  // The New API ``quota`` the same profile read stated.  Core's balance is this
+  // number divided by the site's display unit, so carrying it over is what makes
+  // the session probe answer the balance question too -- and the entry then
+  // costs one authenticated read instead of two.
+  std::optional<double> quota;
 };
+
+// One number from an answer, for a value the app compares rather than shows.  A
+// station's JSON binding may serialize a quota as a string, and a value that is
+// not finite is not a number this app can state.
+std::optional<double> FirstJsonNumber(json::IJsonValue const& root, std::vector<std::vector<std::wstring>> const& paths) {
+  for (auto const& path : paths) {
+    try {
+      json::IJsonValue current = root;
+      for (auto const& key : path) current = current.GetObject().GetNamedValue(key);
+      double value = 0;
+      try {
+        value = current.GetNumber();
+      } catch (...) {
+        value = std::stod(Trim(WideToUtf8(current.GetString().c_str())));
+      }
+      if (std::isfinite(value)) return value;
+    } catch (...) {}
+  }
+  return std::nullopt;
+}
 
 std::optional<std::string> FirstJsonString(json::IJsonValue const& root, std::vector<std::vector<std::wstring>> const& paths) {
   for (auto const& path : paths) {
@@ -826,9 +851,15 @@ std::optional<EndpointProbeResult> ProbeEndpoint(
         saw_non_authentication_failure = true;
         continue;
       }
+      // A braced initializer fills members in declaration order, so the family
+      // the probe answered as comes before the station's own account id.  Reading
+      // this list as "id then family" stored the id as the session's account type,
+      // which ReadSession then rejected against its own account -- so every mount
+      // re-probed with no session and the pane read 未登录 after a restart.
       return EndpointProbeResult{std::move(username), std::move(accepted_cookie), std::move(access),
-                                 std::move(refresh), std::move(detected_user_id),
-                                 std::string(step.family)};
+                                 std::move(refresh), std::string(step.family),
+                                 std::move(detected_user_id),
+                                 FirstJsonNumber(root, {{L"data", L"quota"}, {L"quota"}})};
     } catch (...) {
       saw_non_authentication_failure = true;
     }
@@ -1663,7 +1694,8 @@ std::optional<WindowsRelaySessionRestoreResult> RestoreWindowsRelaySession(
       "signed_in", verified->username,
       verified->cookie.empty() ? std::nullopt : std::optional<std::string>(verified->cookie),
       verified->access_token, verified->refresh_token,
-      verified->user_id.empty() ? std::nullopt : std::optional<std::string>(verified->user_id));
+      verified->user_id.empty() ? std::nullopt : std::optional<std::string>(verified->user_id),
+      verified->quota);
   if (!accepted) return std::nullopt;
   return WindowsRelaySessionRestoreResult{
       accepted->revision, accepted->login_status, accepted->username};

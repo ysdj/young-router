@@ -870,6 +870,16 @@ _ROUTE_TRACE_PREVIEW_DEFAULT_CHARS = 2000
 _ROUTE_TRACE_PREVIEW_MAX_CHARS = 2000
 _ROUTE_TRACE_LIST_SCAN_ITEMS = 40
 _RECENT_REQUESTS_LOG_ENV = "LITELLM_RECENT_REQUESTS_LOG"
+# The one identifier that is stable for every attempt of one client turn: this
+# proxy's own attempt marker, or the trace id LiteLLM stamps on the request.
+# The attempt lease is keyed by the turn and the deployment, so the fallbacks
+# of one turn take one slot rather than one slot per hop.
+_ATTEMPT_LEASE_ID_KEY = "_young_router_attempt_lease_id"
+_REQUEST_TURN_IDENTIFIER_KEYS = (
+    "_young_router_attempt_lease_id",
+    "litellm_trace_id",
+    "litellm_call_id",
+)
 _DSH_VISION_ROUTER_CONFIG_ENV = "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"
 _INTERNAL_CONTEXT_PREFIXES = (
     "another language model started to solve this problem",
@@ -1346,16 +1356,75 @@ _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES = {
 # stop: ``recovery_policy`` stayed ``error``, the route was never cooled down,
 # and the next request selected the same upstream that had just cut a turn.
 #
-# Only these markers are matched, never a read-error class on its own: a read
-# error whose text names no framing failure is an ordinary disconnect, which is
-# a network outage the caller should wait out, not a route to quarantine.
+# A body that ends without the length its own headers promised is one family,
+# however the transport words it.  The last two sentences are what HTTP/2 and
+# HTTP/1.1 chunked transfers say, and neither was matched here: the stop arrived
+# as the unclassified one, whose sentence Pi's retry classifier matches nothing
+# in, so a turn the next attempt could have served ended instead of resending.
 _UPSTREAM_TRUNCATED_STREAM_MARKERS = (
     "response payload is not completed",
     "not enough data to satisfy transfer length",
     "not enough data to satisfy content length",
     "transferencodingerror",
     "contentlengtherror",
+    "incomplete chunked read",
+    "peer closed connection without sending complete message body",
 )
+
+# The same failure with no sentence at all.  ``httpx.ReadError`` and
+# ``asyncio.IncompleteReadError`` carry an empty message whenever the transport
+# gave no detail, and both mean the one thing their names say: the request was
+# accepted and reading its body failed.  That is never a verdict on the bytes
+# (nothing validated them) and it is never a network outage the caller should
+# wait out -- the router's poll has no deadline on that branch, so a route that
+# cuts every long answer would hold the client's stream open forever.  It is a
+# transport fault of that route, which is what a cooldown parks.
+_UPSTREAM_BODY_READ_FAILURE_CLASS_NAMES = {
+    "readerror",
+    "remoteprotocolerror",
+    "incompletereaderror",
+    "incompleteread",
+    "endofstream",
+    "serverdisconnectederror",
+    "clientpayloaderror",
+}
+_UPSTREAM_BODY_READ_FAILURE_MARKERS = (
+    "peer closed connection",
+    "incomplete read",
+    "chunked encoding error",
+)
+
+
+def _is_upstream_body_read_failure(exception: Exception) -> bool:
+    """Whether reading an accepted response's body failed at the transport.
+
+    Narrower than the connectivity check on purpose: a connect failure reached
+    no route at all and is waited out, while this one reached a route that then
+    stopped writing.  ``__context__`` is not followed, for the reason
+    :func:`_is_upstream_truncated_stream_error` states -- it holds an unrelated
+    error that happened to be in flight.
+    """
+
+    pending = [exception]
+    seen: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        candidate_id = id(candidate)
+        if candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        if type(candidate).__name__.lower() in _UPSTREAM_BODY_READ_FAILURE_CLASS_NAMES:
+            return True
+        text = _exception_text(candidate)
+        if text:
+            lowered = text.lower()
+            if any(marker in lowered for marker in _UPSTREAM_BODY_READ_FAILURE_MARKERS):
+                return True
+        for attr in ("__cause__", "original_exception"):
+            nested = getattr(candidate, attr, None)
+            if isinstance(nested, Exception) and id(nested) not in seen:
+                pending.append(nested)
+    return False
 
 
 def _is_upstream_truncated_stream_error(exception: Exception) -> bool:

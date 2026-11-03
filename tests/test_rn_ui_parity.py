@@ -145,11 +145,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # mid-action.  A child window keeps no strip of its own.
         # The strip keeps its permanent strip and, since the usage pager lives
         # at its right end, it may also carry that route's own controls.
-        self.assert_ui_has('{shell ? <View style={[styles.routeStatusBar, Platform.OS === "windows" && styles.routeStatusBarWindows]}><Text numberOfLines={2} style={[styles.routeStatusText, Platform.OS === "windows" && styles.routeStatusTextWindows]}>{routeStatus ?? translate("common.ready")}</Text>{statusBarControls}</View> : null}')
+        self.assert_ui_has('{shell ? <View style={[styles.routeStatusBar, Platform.OS === "windows" && styles.routeStatusBarWindows]}><View style={styles.routeStatusLead}>{busy ? <NativeBusySpinner label={translate("common.working")} /> : null}<Text numberOfLines={2} style={[styles.routeStatusText, Platform.OS === "windows" && styles.routeStatusTextWindows]}>{routeStatus ?? translate("common.ready")}</Text></View>{statusBarControls}</View> : null}')
         # The strip reads from the same Windows palette as the pane above it.
         self.assert_ui_has('routeStatusBarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderTopColor: WINDOWS_CONTROL.strokeSubtle }')
         self.assertNotIn("{shell && routeStatus ? <View style={styles.routeStatusBar}>", self.ui)
         self.assertIn('"common.ready": "Ready"', self.en)
+        # A counted run clears its result before it starts, so the strip has to
+        # state the wait itself or a held window reads 就绪 while it answers
+        # nothing.
+        self.assert_ui_has('const routeStatus = result ?? (busy ? translate("common.working") : undefined);')
+        self.assertIn('"common.working": "Working…"', self.en)
+        self.assertIn('"common.working": "处理中…"', self.zh)
+        self.assert_ui_has('{busy ? <NativeBusySpinner label={translate("common.working")} /> : null}')
         self.assertIn('"common.ready": "就绪"', self.zh)
         translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
         self.assertIn('| "common.ready"', translation_keys)
@@ -243,7 +250,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("export function setGroupManagerOpen(open: boolean): void {", gate)
         self.assertIn("export function isGroupManagerOpen(): boolean {", gate)
         self.assert_ui_has("return isProviderWizardOpen() || isAssistantEditorOpen() || isGroupManagerOpen();")
-        self.assert_ui_has("const applyStagedQuietly = (): Promise<void> => apply({ quiet: true });")
+        self.assert_ui_has("const applyStagedQuietly = (): Promise<void> => apply({ quiet: true, keepControlsEnabled: true });")
         # A host whose sheet can only save on close stages those same edits
         # after it is gone and states that host's outcome in the pane.
         self.assertIn('onStatus?.(translate("common.saved"));', self.relay)
@@ -1421,11 +1428,22 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # control column with those two, so splitting it onto a row of its own —
         # which left the number unlabelled under the label and pushed the two
         # controls to the pane's far edge — is the regression this guards.
-        window_row = model_detail.split('{publicModelName ? ', 1)[1].split('<PickerField label={translate("providers.provider")}', 1)[0]
+        window_row = model_detail.split('{publicModelName ? ', 1)[1].split('{routeRate ? ', 1)[0]
         self.assertEqual(1, window_row.count('styles.formRow'))
         self.assertIn('<Text numberOfLines={1} style={styles.modelInspectorLabel}>{translate("providers.contextWindow")}</Text>', window_row)
         self.assertIn('<View style={styles.modelWindowValue}>', window_row)
         self.assertLess(window_row.index('modelInspectorLabel'), window_row.index('modelWindowValue'))
+        # 倍率 follows the public window, before the route's own fields: it is
+        # the number the list's 倍率 column prices this row with and the one
+        # 跟随倍率 sorts by, so it is stated through that column's own reader
+        # rather than through a second reading of the catalog.  A rate no read
+        # has produced keeps no row — the label alone would read as a rate of
+        # nothing.
+        rate_row = model_detail.split('{routeRate ? ', 1)[1].split('<PickerField label={translate("providers.provider")}', 1)[0]
+        self.assertEqual(1, rate_row.count('styles.formRow'))
+        self.assertIn('<Text numberOfLines={1} style={styles.modelInspectorLabel}>{translate("providers.modelRate")}</Text>', rate_row)
+        self.assertIn('{routeRate}</Text>', rate_row)
+        self.assertIn('const routeRate = modelRateText(service, upstreamModelID, relayMultiplier);', model_detail)
         for absent in ("modelWindowHeader", "modelWindowHeaderActions"):
             self.assertNotIn(absent, self.ui)
         # No commit and no input: the window is one number for the whole group.
@@ -1676,7 +1694,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'statuses={dataManagementStatuses}',
             'const actionRow = (controls: React.ReactNode, result?: string, hint?: string): React.JSX.Element => <View style={SETTINGS_FIELD}>',
             '<Text numberOfLines={2} style={styles.dataManagementActionStatus}>{result ?? ""}</Text>',
-            'const routeStatus = result;',
+            'const routeStatus = result ?? (busy ? translate("common.working") : undefined);',
             '{routeStatus ?? translate("common.ready")}',
             'const dispatchDataManagement: Dispatch = (type, payload = {}, targetDomain = "webdav")',
         ):
@@ -3861,7 +3879,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '{ app: "claudeCode", titleKey: "claude.codeSection" }',
             '{ app: "claudeDesktop", titleKey: "claude.desktopSection" }',
             'hintKey: "clients.claudeFilesHint"',
-            'groups={selectedClient === "claude" ? CLAUDE_APP_GROUPS : []}',
+            # Each app's files sit under that app's own controls, so one
+            # heading covers a block instead of a word repeated above it.
+            'const listed = clientFiles("claude").filter((file) => file.app === app);',
             "function FileEditorWorkspace",
             'language={target.language === "yaml" ? "yaml" : target.language === "toml" ? "toml" : "json"}',
         ):
@@ -4459,7 +4479,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # blank, not 无: the upstream having published no rate and this
             # pane not having read one are different facts.
             'providerAuthStatusLabel: { width: 88, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }',
-            '{serviceRate.trim()}</Text>',
+            '{routeRate}</Text>',
             # One association block is labelled by the provider's service, its
             # right-hand control follows the sign-in state, and an account-backed
             # provider keeps its key slot and fetch path.
@@ -4798,8 +4818,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # having published no number and this pane not having read one are
         # different facts, and only the first is a statement about the upstream.
         self.assert_ui_has('return rate === undefined ? "" : rateNumber(rate) !== undefined ? rate : "";')
-        self.assert_ui_has('{serviceRate.trim()}</Text>')
-        self.assertNotIn('serviceRate.trim() || translate("common.none")', self.ui)
+        self.assert_ui_has('{routeRate}</Text>')
+        self.assertNotIn('routeRate || translate("common.none")', self.ui)
         self.assertNotIn('rate === undefined ? "" : serviceRateNumber(rate) !== undefined ? rate : translate("common.none")', self.ui)
 
     def test_unified_provider_workspace_lists_every_provider_kind(self) -> None:
@@ -6130,6 +6150,36 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("function RelayAccountManager(", relay)
         self.assertNotIn("relayNavigationItems", relay)
 
+    def test_a_background_wait_never_locks_an_editable_field(self) -> None:
+        """A wait started elsewhere does not disable the pane the user is editing.
+
+        The provider detail used to carry one window-wide busy flag into every
+        control, while the strip cleared to 就绪 at the start of each counted
+        run.  Leaving a pane therefore disabled the pane the user opened (its
+        Apply was still running), and the window said it was ready.
+        """
+
+        identity = self.ui.split("function ProviderIdentityFields(", 1)[1].split("function ProviderEditor(", 1)[0]
+        # Identity fields are drafts staged on the shared queue, not commands:
+        # an in-flight action never freezes the name, the address, or 启用.
+        self.assertNotIn("disabled={busy}", identity)
+        self.assertNotIn("busy: boolean;", identity)
+        # A station account panel holds its rows for its own writes only; the
+        # window flag describes work another surface started.
+        self.assertIn("const controlsBusy = formBusy || stationBusy;", self.relay)
+        self.assertNotIn("const controlsBusy = busy || formBusy || stationBusy;", self.relay)
+        # The provided key's value is not being read: it is managed by the
+        # station.  Placeholder text that claims a read is in progress is what
+        # read as a stuck field in the provider inspector.
+        provided = self.ui.split("function ProviderKeysPanel", 1)[1].split("function CodexWorkspace", 1)[0]
+        self.assertIn('hint={selectedProvided.resource.keyHint ? translate("providers.relayKeyValueHint") : translate("common.none")}', provided)
+        self.assertNotIn('hint={selectedProvided.resource.keyHint ? translate("providers.apiKeySavedHint")', provided)
+        # The one input auto grouping legitimately locks says why it is locked:
+        # the switch that owns the name is in 分组管理, not on this pane.
+        self.assertIn('{selectedProvided.account.autoGrouping ? <Text style={styles.fieldHint}>{translate("providers.keyNameAutoGroupingHint")}</Text> : null}', provided)
+        self.assertIn('"providers.keyNameAutoGroupingHint": "自动分组已开启：密钥名由中转站的分组决定。"', self.zh)
+        self.assertIn('"providers.keyNameAutoGroupingHint": "Auto grouping is on: the relay\'s group names this key."', self.en)
+
     def test_relay_add_login_asks_after_the_signin_succeeds(self) -> None:
         relay = self.relay
         ui = self.ui
@@ -6803,6 +6853,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # closing the window does.
         shell = self.ui.split("function SettingsShell(", 1)[1].split("function SettingsRail(", 1)[0]
         self.assertIn('void flushActivePane.current?.("navigate").catch(() => undefined);', shell)
+        # The commit of the pane being left is background work for the pane the
+        # user just opened: it may not hold that pane's controls disabled while
+        # Core spends a relay-bound Apply, with the strip already cleared to
+        # 就绪 by the run itself.  Edits made meanwhile queue behind the Apply.
+        self.assertIn('await apply({ silent: true, keepControlsEnabled: true });', self.ui)
+        self.assertIn('const applyStagedQuietly = (): Promise<void> => apply({ quiet: true, keepControlsEnabled: true });', self.ui)
         self.assertIn('setResult(translate(purpose === "navigate" ? "runtime.fixInvalidBeforeLeaving" : "runtime.fixInvalidBeforeClose"));', self.ui)
         for locale in (self.zh, self.en):
             self.assertIn('"runtime.fixInvalidBeforeLeaving"', locale)

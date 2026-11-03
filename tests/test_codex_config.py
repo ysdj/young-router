@@ -122,6 +122,66 @@ class CodexConfigTests(unittest.TestCase):
         self.assertFalse(enabled)
         self.assertEqual([], models)
 
+    def test_local_exposed_models_drops_an_image_route_the_listing_states(self) -> None:
+        """A generator is not a conversation, so no picker offers it.
+
+        The listing keeps publishing the route -- ``/v1/models`` is untouched --
+        and every picker this app writes skips it, because naming a generator as
+        the model of a turn is a choice that can only fail.  The recorded turn
+        for ``gpt-image-2.5-sunburst`` sent ``exec_command``/``apply_patch`` to a
+        route that answers its own request body instead of a message.
+        """
+
+        opener = mock.Mock()
+        opener.open.return_value = self._Response(
+            {
+                "data": [
+                    {"id": "chat-model", "mode": "chat"},
+                    {"id": "gpt-image-2.5-sunburst", "mode": "image_generation"},
+                    {"id": "gpt-image-1", "mode": "image"},
+                    # A route the public catalogs resolve and LiteLLM's own cost
+                    # map does not still leaves the picker.
+                    {"id": "vendor-image-xl"},
+                    {"id": "no-mode-chat-model"},
+                ]
+            }
+        )
+
+        with mock.patch.object(
+            codex_config, "local_base_url", return_value="http://127.0.0.1:4999/v1"
+        ), mock.patch.object(
+            codex_config.urllib.request, "build_opener", return_value=opener
+        ), mock.patch.object(
+            codex_config,
+            "_public_catalog_is_image_model",
+            side_effect=lambda name: name == "vendor-image-xl",
+        ):
+            models, enabled = codex_config.local_exposed_models("sk-local-test")
+
+        self.assertTrue(enabled)
+        self.assertEqual(["chat-model", "no-mode-chat-model"], models)
+
+    def test_an_unreadable_public_catalog_does_not_hide_a_chat_route(self) -> None:
+        """A registry that cannot be built is not evidence of an image model."""
+
+        opener = mock.Mock()
+        opener.open.return_value = self._Response(
+            {"data": [{"id": "chat-model"}, {"id": "other-chat"}]}
+        )
+
+        with mock.patch.object(
+            codex_config, "local_base_url", return_value="http://127.0.0.1:4999/v1"
+        ), mock.patch.object(
+            codex_config.urllib.request, "build_opener", return_value=opener
+        ), mock.patch(
+            "young_router.core.model_catalog.route_serves_only_images",
+            side_effect=RuntimeError("cache unreadable"),
+        ):
+            models, enabled = codex_config.local_exposed_models("sk-local-test")
+
+        self.assertTrue(enabled)
+        self.assertEqual(["chat-model", "other-chat"], models)
+
     def test_litellm_model_selection_uses_local_checkpoint_provider(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runtime_config = Path(directory) / "config.yaml"

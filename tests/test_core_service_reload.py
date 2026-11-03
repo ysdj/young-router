@@ -78,6 +78,84 @@ class CoreServiceReloadTests(unittest.TestCase):
             self.assertEqual(["reload"], reload_calls)
             self.assertIn("model: openai/new-chat", config_path.read_text(encoding="utf-8"))
 
+    def test_provider_apply_regenerates_the_claude_model_lists(self) -> None:
+        """A route change reaches Claude Desktop the same way it reaches Codex.
+
+        Adding or renaming a model is an Apply, and an Apply reloads the proxy.
+        Every reload regenerates the client model lists this app generates --
+        the Codex catalog and the Claude picker -- so a route the operator just
+        changed is in the client without anybody reopening the pane.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.yaml"
+            config_path.write_text(
+                "providers:\n"
+                "  primary:\n"
+                "    api_base: https://example.test/v1\n"
+                "    api_keys:\n"
+                "      - name: default\n"
+                "        value: replace-me\n"
+                "model_list:\n"
+                "  - model_name: public-chat\n"
+                "    litellm_params:\n"
+                "      model: openai/old-chat\n"
+                "      api_base: https://example.test/v1\n"
+                "      api_key: replace-me\n"
+                "    model_info:\n"
+                "      id: deadbeef\n"
+                "      provider: primary\n"
+                "      upstream_url_surface: openai/responses\n",
+                encoding="utf-8",
+            )
+
+            refreshed: list[int] = []
+
+            class ClaudeProbe:
+                name = "claude"
+
+                def refresh_model_lists(self) -> bool:
+                    refreshed.append(1)
+                    return True
+
+                def snapshot(self) -> dict[str, object]:
+                    return {"domain": "claude"}
+
+                def dispatch(self, action: str, payload: object | None = None) -> dict[str, object]:
+                    return self.snapshot()
+
+                def draft_state(self) -> object:
+                    return {}
+
+                def validate(self, payload: object | None = None) -> dict[str, object]:
+                    return {"valid": True, "errors": []}
+
+            core = CoreStore(
+                domains=[ProvidersModelsDomain(config_path), ClaudeProbe()],
+                service_handlers={
+                    "status": lambda _operation: {"state": "running"},
+                    "reload": lambda _operation: {"state": "running"},
+                },
+            )
+            core.snapshot()
+            staged = core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "model.patch",
+                    "payload": {
+                        "provider_id": "primary",
+                        "model_id": "deadbeef",
+                        "changes": {"upstream_model": "openai/new-chat"},
+                    },
+                },
+                expected_revision=core.revision,
+            )
+            result = core.apply("providers_models", revision=staged["revision"])
+
+            self.assertTrue(result["applied"])
+            self.assertTrue(core.wait_for_service_reload(5.0))
+            self.assertTrue(refreshed, "a reload must regenerate the Claude model lists")
+
     def test_provider_apply_does_not_start_a_stopped_service(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.yaml"

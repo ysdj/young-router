@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping, Sequence
+import os
 from pathlib import Path
+import threading
 from typing import Any
 
 from .model_contexts import ModelContextRegistry
@@ -12,6 +14,7 @@ from .model_contexts import (
     SEARCH_TOOL_CAPABILITY_BRIDGE,
     SEARCH_TOOL_CAPABILITY_UNSUPPORTED,
     ReasoningCapability,
+    default_context_cache_path,
     published_reasoning_levels,
 )
 from .native_codex_catalog import load_native_catalog
@@ -349,6 +352,93 @@ def _route_is_image_model(registry: ModelContextRegistry, name: str) -> bool:
     )
 
 
+#: One registry for the picker filter below.  It is a read of the public
+#: catalogs' cache, keyed by the cache file it read, exactly as
+#: ``proxy.reasoning`` keeps its own: resolving a route's modality per name
+#: would otherwise re-parse the runtime document once per listed model.
+_IMAGE_FILTER_REGISTRY_LOCK = threading.RLock()
+_IMAGE_FILTER_REGISTRY: tuple[str, ModelContextRegistry] | None = None
+
+
+def _image_filter_registry() -> ModelContextRegistry:
+    """The registry the client-picker filter reads, built from this install.
+
+    Resolved exactly as ``proxy.reasoning`` resolves its own: the same runtime
+    document, the same settings file, the same cache and the same retired
+    copies.  The picker filter and the catalog entry must answer from one set of
+    records, or a route could read as an image model in one and a chat model in
+    the other.  Refresh stays off: this is a read of whatever the pane already
+    fetched, not a second fetcher racing it.
+    """
+
+    global _IMAGE_FILTER_REGISTRY
+
+    from .. import config_paths as _config_paths
+    from .model_contexts import legacy_context_cache_paths
+
+    root = _config_paths.runtime_root()
+    cache = default_context_cache_path(root)
+    key = str(cache)
+    with _IMAGE_FILTER_REGISTRY_LOCK:
+        if _IMAGE_FILTER_REGISTRY is not None and _IMAGE_FILTER_REGISTRY[0] == key:
+            return _IMAGE_FILTER_REGISTRY[1]
+        configured_settings = os.environ.get(
+            "YOUNG_ROUTER_RUNTIME_SETTINGS_FILE", ""
+        ).strip()
+        configured_home = os.environ.get("CODEX_HOME", "").strip()
+        codex_home = (
+            Path(configured_home).expanduser()
+            if configured_home
+            else Path.home() / ".codex"
+        )
+        registry = ModelContextRegistry(
+            runtime_config_path=_config_paths.provider_config_path(root),
+            runtime_settings_path=(
+                Path(configured_settings).expanduser()
+                if configured_settings
+                else root / "runtime-settings.env"
+            ),
+            cache_path=cache,
+            legacy_cache_paths=legacy_context_cache_paths(codex_home),
+            refresh_enabled=False,
+        )
+        _IMAGE_FILTER_REGISTRY = (key, registry)
+        return registry
+
+
+def route_serves_only_images(
+    name: str,
+    *,
+    registry: ModelContextRegistry | None = None,
+) -> bool:
+    """Whether this public route serves image generation and nothing else.
+
+    A client's model picker is a list of conversations to have, and a generator
+    is not one: the client reaches its own image tool, never by naming the route
+    as the model of a turn.  Listing one therefore offered a choice that could
+    only fail, and the recorded turn for ``gpt-image-2.5-sunburst`` showed what
+    failing looked like -- Codex sent ``exec_command`` and ``apply_patch`` to a
+    route that answers its own request body.
+
+    ``/v1/models`` is deliberately not this question.  The router keeps
+    publishing every route it serves, because Pi and anything else speaking the
+    raw OpenAI shape may legitimately call the generator; only the Codex catalog
+    and the Claude pickers this app writes consult this answer.
+
+    A registry that cannot be built answers ``False``: an unreadable cache is
+    not evidence that a route is an image model, and the listing's own ``mode``
+    remains the only filter on that path.
+    """
+
+    if not isinstance(name, str) or not name.strip():
+        return False
+    try:
+        resolved = registry or _image_filter_registry()
+        return _route_is_image_model(resolved, name.strip())
+    except Exception:
+        return False
+
+
 def _apply_reasoning_capability(model: dict[str, Any], capability: ReasoningCapability | None) -> None:
     """Publish one route's provider-wire ladder on a catalog entry.
 
@@ -672,6 +762,7 @@ __all__ = [
     "managed_catalog_path",
     "previous_managed_catalog_path",
     "profile_has_instructions",
+    "route_serves_only_images",
     "select_inherited_profile",
     "selected_model_names",
     "write_catalog",

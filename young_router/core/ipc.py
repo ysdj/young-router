@@ -383,9 +383,16 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                     )
                     self._send(200, {"protocol_version": PROTOCOL_VERSION, **result})
                 elif route.endswith("/relay/restore"):
-                    allowed = {"account_id", "type", "label", "origin", "login_status", "username", "cookie", "access_token", "refresh_token", "user_id"}
+                    allowed = {"account_id", "type", "label", "origin", "login_status", "username", "cookie", "access_token", "refresh_token", "user_id", "quota"}
                     required = {"account_id", "type", "label", "origin", "login_status"}
                     if not required.issubset(data) or set(data).difference(allowed):
+                        raise CoreError("relay_restore_failed", "Relay login result is invalid")
+                    # The profile quota the host's probe read.  It is optional -- a
+                    # host that did not read one leaves the balance to Core's own
+                    # refresh -- but a value that is not a number is refused rather
+                    # than dropped, so a broken bridge is not read as "no balance".
+                    quota = data.get("quota")
+                    if quota is not None and (isinstance(quota, bool) or not isinstance(quota, (int, float))):
                         raise CoreError("relay_restore_failed", "Relay login result is invalid")
                     result = self._owner.core.restore_relay_session(
                         account_id=data.get("account_id"),
@@ -398,6 +405,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                         access_token=data.get("access_token", ""),
                         refresh_token=data.get("refresh_token", ""),
                         user_id=data.get("user_id", ""),
+                        quota=quota,
                     )
                     self._send(200, {"protocol_version": PROTOCOL_VERSION, **result})
                 elif route.endswith("/relay/import"):

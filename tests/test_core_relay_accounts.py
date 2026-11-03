@@ -2177,6 +2177,168 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertEqual([], [path for method, path in station.calls if path == "/api/user/login"])
             self.assertEqual("signed_in", domain.snapshot()["accounts"][0]["login_status"])
 
+    def test_one_session_probe_states_the_login_and_the_balance(self) -> None:
+        """The read that proves a session is the read the balance comes from.
+
+        A New API session probe and its account balance are one answer, and the
+        entry used to pay for it twice: once to learn 已登录, then again behind a
+        key-list refresh that had to finish before the pane could show a number
+        it already had.  Both are settled in the single write the probe makes,
+        and the refresh behind it asks only what the probe did not.
+        """
+
+        fake = FakeRelayHTTPClient(
+            {
+                "/api/user/self": {"data": {"username": "sample-user", "id": 80, "quota": 1_500_000}},
+                "/api/status": {"data": {"quota_per_unit": 500_000}},
+                "/api/user/models": {"data": ["model-a"]},
+                "/api/token/?p=1&size=100": {
+                    "data": {"items": [{"id": 7, "name": "known-key", "status": 1, "key": "replace-key"}]}
+                },
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test", "remember_password": True},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="sample-user",
+                cookie="session=replace-cookie",
+                remember_password=True,
+            )
+            fake.requests.clear()
+
+            restored = domain.restore_saved_session(account_id)
+
+            self.assertEqual("signed_in", restored["login_status"])
+            self.assertEqual(3.0, restored["balance"])
+            # One authenticated read, plus the site's own display unit.
+            self.assertEqual(["/api/user/self", "/api/status"], [path for _, path, _ in fake.requests])
+
+            fake.requests.clear()
+            domain.refresh_resources(account_id)
+
+            paths = [path for _, path, _ in fake.requests]
+            self.assertNotIn("/api/user/self", paths)
+            self.assertNotIn("/api/status", paths)
+            self.assertIn("/api/token/?p=1&size=100", paths)
+            self.assertEqual(3.0, domain.snapshot()["accounts"][0]["balance"])
+
+    def test_a_hosts_verified_probe_states_the_balance_with_the_login_result(self) -> None:
+        """A host that proved the session already read the account's profile.
+
+        The macOS and Windows hosts verify a remembered session themselves and
+        hand Core the result, so Core never saw the payload the balance is in --
+        and read it again behind the login.  The quota travels with the result
+        instead, which is what lets the row read 已登录 and $3.00 in the same
+        repaint rather than a moment of one and a key list later the other.
+        """
+
+        fake = FakeRelayHTTPClient(
+            {
+                "/api/status": {"data": {"quota_per_unit": 500_000}},
+                "/api/user/models": {"data": ["model-a"]},
+                "/api/token/?p=1&size=100": {
+                    "data": {"items": [{"id": 7, "name": "known-key", "status": 1, "key": "replace-key"}]}
+                },
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test", "remember_password": True},
+            )["accounts"][0]["id"]
+
+            accepted = domain.accept_login_result(
+                account_id,
+                username="sample-user",
+                cookie="session=replace-cookie",
+                remember_password=True,
+                quota=1_500_000,
+            )
+
+            self.assertEqual("signed_in", accepted["login_status"])
+            self.assertEqual(3.0, accepted["balance"])
+            # The two facts belong to one observation: the row never states 已登录
+            # with a balance from an earlier session beside it.
+            self.assertIsNotNone(accepted["login_observed_seconds_ago"])
+            self.assertLess(accepted["login_observed_seconds_ago"], 5.0)
+            # The quota is the profile; only the display unit had to be asked.
+            self.assertEqual(["/api/status"], [path for _, path, _ in fake.requests])
+
+            fake.requests.clear()
+            domain.refresh_resources(account_id)
+            self.assertNotIn("/api/user/self", [path for _, path, _ in fake.requests])
+            # The unit is site configuration, so the second balance did not ask
+            # for it again either.
+            self.assertNotIn("/api/status", [path for _, path, _ in fake.requests])
+
+    def test_an_authenticated_balance_read_is_also_the_login_observation(self) -> None:
+        """A station that answered an authenticated read has accepted the session.
+
+        Core holds the session, so the balance read is a login check that was
+        already being paid for.  Recording it is what stops the entry from
+        probing first and reading afterwards; a read the station dropped or
+        refused states nothing and leaves the observation where it was.
+        """
+
+        class AnsweringStation(FakeRelayHTTPClient):
+            def __init__(self, responses: dict[str, object], **kwargs: object) -> None:
+                super().__init__(responses, **kwargs)
+                self.balance_answers = True
+
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                if path == "/api/user/self" and not self.balance_answers:
+                    self.requests.append((origin, path, dict(headers)))
+                    raise RelayAccountsError("Relay account balance is unavailable")
+                return super().json(origin, path, headers=headers)
+
+        responses = {
+            "/api/user/self": {"data": {"username": "sample-user", "id": 80, "quota": 1_500_000}},
+            "/api/status": {"data": {"quota_per_unit": 500_000}},
+            "/api/user/models": {"data": ["model-a"]},
+            "/api/token/?p=1&size=100": {
+                "data": {"items": [{"id": 7, "name": "known-key", "status": 1, "key": "replace-key"}]}
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            station = AnsweringStation(responses)
+            domain = RelayAccountsDomain(directory, http_client=station)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test", "remember_password": True},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="sample-user",
+                cookie="session=replace-cookie",
+                remember_password=True,
+            )
+            domain.set_login_status(account_id, "expired")
+
+            domain.refresh_resources(account_id)
+
+            account = domain.snapshot()["accounts"][0]
+            self.assertEqual("signed_in", account["login_status"])
+            self.assertIsNotNone(account["login_observed_seconds_ago"])
+            self.assertLess(account["login_observed_seconds_ago"], 5.0)
+            self.assertEqual(3.0, account["balance"])
+
+            # A read that did not answer is not a login observation: the note
+            # the last real answer left behind stands, and so does the balance.
+            domain.set_login_status(account_id, "expired")
+            station.balance_answers = False
+            domain._balance_observations.clear()
+            domain.refresh_resources(account_id)
+
+            account = domain.snapshot()["accounts"][0]
+            self.assertEqual("expired", account["login_status"])
+            self.assertEqual(3.0, account["balance"])
+
     def test_a_refused_sign_in_starts_a_wait_instead_of_repeating(self) -> None:
         """A capped account is asked once, then left alone for the wait.
 

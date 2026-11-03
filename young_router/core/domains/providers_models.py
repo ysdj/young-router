@@ -30,6 +30,8 @@ from ...config.schema import (
     MENU_PROVIDER_SOURCE_KEY,
     MENU_RELAY_KEYS_KEY,
     MENU_RELAY_KEYS_VERSION,
+    MODEL_CONCURRENCY_KEY,
+    MODEL_CONCURRENCY_MAX,
     MODEL_ORDER_MODES,
     PUBLIC_MODEL_CONTEXT_KEY,
     RESPONSES_COMPACTION_CAPABILITY_ALIASES,
@@ -54,6 +56,7 @@ from ...adapters import workbuddy as workbuddy_module
 from ... import adapters as managed_adapters
 from ...browser_identity import browser_request_headers
 from ...values import explicit_bool
+from ...values import int_or_none as _int_or_none
 from ...api_base import isolated_http_opener, service_root
 from ..persistence import atomic_write_text
 from ..security import (
@@ -99,6 +102,21 @@ def _public_name_for_lane_id(model_id: str) -> str:
     return model_id
 
 
+def _positive_or_zero(value: object) -> int | None:
+    """A route's stated cap, where ``0`` is a value and absent is ``None``.
+
+    ``None`` is what the pane needs to draw "follows the runtime default"; a
+    route that states ``0`` is unlimited and must not read as unset.
+    """
+
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    parsed = _int_or_none(value)
+    return parsed if parsed is not None and parsed >= 0 else None
+
+
 def _largest(value: object) -> int | None:
     """The largest positive number in a stated set, or ``None`` when it states none.
 
@@ -125,6 +143,11 @@ def _largest(value: object) -> int | None:
 # residue of a credential the user cannot revoke.  ``_relay_absent_source`` is
 # the one reader of that meaning.
 _RELAY_ABSENT_RESOURCE_CODES = frozenset({"resource_removed"})
+
+#: The Runtime Settings key a route with no cap of its own follows.  Stated once
+#: so the proxy's default, the schema entry, and the number the model detail
+#: explains are the same setting rather than three spellings of it.
+MODEL_CONCURRENCY_SETTING_KEY = "YOUNG_ROUTER_MODEL_CONCURRENCY_LIMIT"
 
 
 def _relay_absent_source(value: object) -> tuple[str, str] | None:
@@ -966,6 +989,13 @@ class ProvidersModelsDomain:
                         "deployment_id": str(model.get("deployment_id", "")),
                         "upstream_url_surface": str(model.get("upstream_url_surface", "")),
                         "upstream_protocol_mode": str(model.get("upstream_protocol_mode", "fallback")),
+                        # How many requests this route may serve at once, when it
+                        # states a cap of its own.  ``None`` is not a missing
+                        # value: it says the route follows the runtime's global
+                        # limit, which is what the pane draws as the inherited
+                        # default rather than as an empty box.  ``0`` is the
+                        # route's own "no cap".
+                        "max_concurrency": _positive_or_zero(model.get(MODEL_CONCURRENCY_KEY)),
                         # The surfaces this route can be measured on.  The pane
                         # offers a protocol choice on a route that has one; a
                         # route served by a worker this deployment runs answers
@@ -1065,6 +1095,11 @@ class ProvidersModelsDomain:
             "providers": safe,
             "provider_count": len(safe),
             "model_contexts": self._model_context_projection(),
+            # The concurrency cap a route that states none follows.  Sent with the
+            # same snapshot the routes arrive in, so the model detail states the
+            # number the proxy will actually use instead of a copy of the schema
+            # default the pane would otherwise have to keep in step.
+            "model_concurrency_default": self._model_concurrency_default(),
             "binding_issues": [dict(item) for item in self._binding_issues],
             # The window one service account read answers later reads for.  The
             # provider pane reads it (with each provider's own observation age
@@ -1074,6 +1109,15 @@ class ProvidersModelsDomain:
             "service_account_recheck_seconds": self._workbuddy_recheck_seconds(),
             "raw_editor_available": True,
         }
+
+    def _model_concurrency_default(self) -> int:
+        """The runtime's global concurrency limit, as a route inherits it."""
+
+        from ._shared import runtime_setting_text
+
+        value = runtime_setting_text(MODEL_CONCURRENCY_SETTING_KEY)
+        parsed = _int_or_none(value)
+        return parsed if parsed is not None and 0 <= parsed <= MODEL_CONCURRENCY_MAX else 8
 
     def _context_registry(self):
         """The read-only registry that resolves public-model metadata.
@@ -7681,6 +7725,18 @@ class ProvidersModelsDomain:
                 merged_extra = dict(model.get("litellm_extra", {})) if isinstance(model.get("litellm_extra"), Mapping) else {}
                 merged_extra.update(changes["litellm_extra"])
                 changes["litellm_extra"] = merged_extra
+            if MODEL_CONCURRENCY_KEY in changes:
+                # A route's own cap, not the public model's: the proxy counts
+                # in-flight attempts per deployment.  An empty value clears the
+                # declaration so the route follows the runtime's global limit
+                # again, which is the only way to "inherit" once a number was
+                # written.
+                changes[MODEL_CONCURRENCY_KEY] = self._route_concurrency_limit(
+                    changes[MODEL_CONCURRENCY_KEY]
+                )
+                if changes[MODEL_CONCURRENCY_KEY] is None:
+                    model.pop(MODEL_CONCURRENCY_KEY, None)
+                    changes.pop(MODEL_CONCURRENCY_KEY, None)
             # A route declares no Codex window of its own.  The number is the
             # public model's, written once for the whole group by
             # ``public.model_patch``, so a per-route write is refused instead of
@@ -7858,6 +7914,28 @@ class ProvidersModelsDomain:
             models[model_index] = model
         for provider_index, provider in changed_providers.items():
             self._draft["providers"][provider_index] = provider
+
+    @staticmethod
+    def _route_concurrency_limit(value: object) -> int | None:
+        """One route's concurrency cap, with ``None`` meaning "inherit".
+
+        ``0`` is deliberately a value: it states that this route is not capped,
+        which is a different choice from following a global default the user may
+        later set.  The upper bound exists so a typo cannot write a number no
+        pool could ever reach.
+        """
+
+        if value is None or isinstance(value, bool):
+            return None
+        text = str(value).strip()
+        if text in {"", "inherit"}:
+            return None
+        parsed = _int_or_none(text)
+        if parsed is None or parsed < 0 or parsed > MODEL_CONCURRENCY_MAX:
+            raise DomainError(
+                f"Route concurrency must be a whole number from 0 to {MODEL_CONCURRENCY_MAX}"
+            )
+        return parsed
 
     @staticmethod
     def _public_model_limit(value: object, *, label: str) -> int | None:

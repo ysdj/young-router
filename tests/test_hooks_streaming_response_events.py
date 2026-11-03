@@ -3223,6 +3223,28 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
                 ),
                 {},
             ),
+            # A response body that stops arriving is a transport fault of that
+            # route, never a verdict on the request: the router validated
+            # nothing before it happened.  These two shapes reached the
+            # unclassified sentence, whose "could not classify" wording matches
+            # no Pi retry phrase, so a live turn on a long history ended there
+            # instead of resending onto a sibling route.
+            "body cut mid-chunk": (
+                error(
+                    "RemoteProtocolError",
+                    "peer closed connection without sending complete message "
+                    "body (incomplete chunked read)",
+                ),
+                {},
+            ),
+            # The same failure with an empty message: the class is the only
+            # evidence there is, and reading it as a deterministic refusal is
+            # what ended the turn.
+            "body read failed, no text": (error("ReadError", ""), {}),
+            "chunked body incomplete": (
+                error("IncompleteReadError", "8 bytes read on a total of 64"),
+                {},
+            ),
         }
 
         # Refusals no resend can fix, split by whether the client's own error
@@ -3243,6 +3265,38 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
             "route balance exhausted": error(
                 "BadRequestError", "insufficient balance", 402
             ),
+            # The route judged the prompt under its own content policy.  The
+            # trace named this cause and the chat wire already gave it a code,
+            # but this side reported "could not classify the stop" -- a sentence
+            # Pi matches no retry phrase in, so a refusal the user can act on
+            # ended the turn with no explanation.
+            "prompt refused by content policy": error(
+                "BadRequestError",
+                "Your request was rejected by the safety system: content_policy",
+                400,
+            ),
+            # Azure words the same refusal as "content management policy", which
+            # matched no marker here and so arrived as an unclassified stop.
+            "prompt filtered by azure policy": error(
+                "BadRequestError",
+                "The response was filtered due to the Azure OpenAI content "
+                "management policy",
+                400,
+            ),
+            # A route that no longer serves the model answers 404 for it.  That
+            # is a configuration change, and the reader has to be told which
+            # model nothing serves.
+            "model no longer served": error(
+                "NotFoundError", "model deepseek-v4.1-flash not found", 404
+            ),
+            # The route refused the body this side built, and so did every
+            # sibling: resending rebuilds the identical body.
+            "request shape refused": error(
+                "BadRequestError",
+                "litellm.BadRequestError: OpenAIException - invalid_request_error: "
+                "unknown field 'reasoning_effort'",
+                400,
+            ),
         }
         # No Codex error code means this.  Mapping one anyway would tell the user
         # the wrong thing, so these stay unrecognised and the client's own retry
@@ -3251,6 +3305,14 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
             "account restricted": error(
                 "BadRequestError", "账号存在异常行为，已被限制使用", 400
             ),
+        }
+        # A stop nothing in this module can name is not the same fact as a
+        # refusal the request earned: the router has validated nothing and
+        # diagnosed nothing.  Both clients must therefore bound it with their own
+        # retry budget rather than read the sentence as final -- a live turn on
+        # gpt-6.1-sol died on the unclassified sentence, while Codex retried the
+        # identical one, because Codex reads the code and Pi reads the sentence.
+        unknown_stops = {
             "unexplainable stop": TypeError(
                 "patched_update_kwargs_with_deployment() got an unexpected "
                 "keyword argument 'splits_stream_timeout'"
@@ -3347,6 +3409,10 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
                         self._codex_retries(code_of(exception, wire=wire)),
                         f"Codex would loop over {name} on {wire}: {text}",
                     )
+                    # A refusal this router classified may never be reported as
+                    # one it could not: the branch for an unclassified stop is
+                    # for a cause nothing here owns.
+                    self.assertNotIn("could not classify the stop", text)
 
         for name, exception in user_must_act_unmapped.items():
             for wire in ("responses", "chat"):
@@ -3360,6 +3426,26 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
                         retry_phrases.search(text),
                         f"{name} would be retried pointlessly by Pi on {wire}: {text}",
                     )
+
+        for name, exception in unknown_stops.items():
+            for wire in ("responses", "chat"):
+                with self.subTest(name=name, wire=wire):
+                    text = rendered(
+                        exception,
+                        wire=wire,
+                        after_visible_output=True,
+                    )
+                    # Pi keeps the turn alive, and its own budget ends it if the
+                    # cause repeats.
+                    self.assertTrue(
+                        retry_phrases.search(text),
+                        f"{name} would end a live Pi turn on {wire}: {text}",
+                    )
+                    # The sentence still says the truth about what it knows, and
+                    # it borrows no Codex code, so Codex bounds it with its own
+                    # budget exactly as before.
+                    self.assertIn("could not classify the stop", text)
+                    self.assertTrue(self._codex_retries(code_of(exception, wire=wire)))
 
         # A restart is the other stop a client must resend through, and it is
         # asserted through the message builders: the terminal path for a local

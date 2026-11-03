@@ -15,11 +15,13 @@ import math
 import os
 import pathlib
 import stat
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlsplit
 
+from ... import claude_aliases
 from ...atomic_io import atomic_write_text
 from ..claude_desktop import (
     ClaudeDesktopConfig,
@@ -35,6 +37,7 @@ from ._shared import (
 from . import _shared_api
 from ._shared_api import (
     anthropic_base_url,
+    desktop_accepts_model_name,
     normalise_route,
     on_local_api,
     one_saved_route,
@@ -627,6 +630,34 @@ def default_settings_path() -> pathlib.Path:
     return pathlib.Path.home() / DEFAULT_SETTINGS_DIR / SETTINGS_FILENAME
 
 
+#: The families Claude Desktop can identify on its own.
+_ANTHROPIC_MODEL_FAMILIES = ("opus", "sonnet", "haiku")
+
+
+def _names_an_anthropic_family(name: str) -> bool:
+    """Whether Claude Desktop renders this id itself, with its own controls."""
+
+    text = name.strip().lower().rsplit("/", 1)[-1]
+    if not text.startswith("claude-"):
+        return False
+    tail = text.removeprefix("claude-")
+    # Both spellings are real Anthropic models: the current ``claude-opus-5-5``
+    # and the older ``claude-3-5-sonnet``, which the app also renders itself.
+    if tail[:1].isdigit():
+        return True
+    return any(tail.startswith(family) or tail.startswith(f"{family}-") for family in _ANTHROPIC_MODEL_FAMILIES)
+
+
+def _strip_adapter_prefix(value: str) -> str:
+    """The model id a person recognises, without this app's adapter prefix."""
+
+    text = value.strip()
+    for adapter in ("openai/", "anthropic/", "azure/", "vertex_ai/", "gemini/"):
+        if text.startswith(adapter):
+            return text[len(adapter):]
+    return text
+
+
 def _claude_client(data: Mapping[str, Any]) -> str:
     """Which Claude app one action addresses.
 
@@ -1186,6 +1217,7 @@ class ClaudeSettingsDomain:
         # than per snapshot: it reads the runtime settings and the large
         # runtime configuration while snapshots are polled with a window open.
         self._local_api_base_url: str | None = None
+        self._model_list_refreshed_at = 0.0
         self.refresh_local_api_endpoint()
         # Production uses both official sources.  Tests and callers that pass
         # an explicit Claude Code path stay isolated unless they also provide
@@ -1506,14 +1538,103 @@ class ClaudeSettingsDomain:
         The record of what was generated answers it: a profile copied in from
         elsewhere holds its own models, and claiming those as this app's would
         let a refresh overwrite a list the user brought with them.
+
+        The test is containment, not equality, and it holds in both
+        directions.  Desktop deletes every entry it cannot map onto an Anthropic
+        model, so a list this app wrote can come back *shorter* than the record;
+        and a write that failed after the record was stored leaves the file
+        *longer* than it.  Equality would read either state as "off" and no
+        refresh would ever repair the file -- which is exactly where a user is
+        left holding a warning this app cannot clear for them.
         """
 
         if self._desktop is None:
             return False
-        generated = read_generated_models(self.app_state_root, "claudeDesktop")
+        generated = set(read_generated_models(self.app_state_root, "claudeDesktop"))
         if not generated:
             return False
-        return list(self._desktop.snapshot().get("model_names") or []) == generated
+        current = set(self._desktop.snapshot().get("model_names") or [])
+        return current.issubset(generated) or generated.issubset(current)
+
+    def _desktop_labels(self) -> dict[str, str]:
+        """The name Claude Desktop's picker should show for each public model.
+
+        An id Desktop can map onto an Anthropic model renders itself -- with
+        the model's own display name and Effort control -- so labelling it
+        would replace better text with worse.  An alias it cannot map is drawn
+        verbatim, and that is the case worth labelling: the route's own upstream
+        model is what the person reading the picker recognises, so
+        ``claude-dsv41-flash`` reads as ``deepseek-v4.1-flash``.
+        """
+
+        try:
+            _, rows = saved_routes(self.runtime_config_path)
+        except DomainError:
+            return {}
+        labels: dict[str, str] = {}
+        for row in rows:
+            public_name = str(row.get("model") or "").strip()
+            upstream = str(row.get("upstream_model") or "").strip()
+            if not public_name or not upstream or public_name in labels:
+                continue
+            if _names_an_anthropic_family(public_name):
+                continue
+            labels[public_name] = _strip_adapter_prefix(upstream)
+        return labels
+
+    def desktop_model_names(self) -> list[str]:
+        """The public names Claude Desktop will actually keep in its picker.
+
+        Verified against the app rather than read off its documentation: given
+        ``claude-opus-5-5``, ``anthropic/claude-sonnet-4-5``, ``grok-4.7``,
+        ``gpt-6.1-sol`` and ``gemini-3.8-flash``, the picker offered the first
+        two and deleted the rest -- and a ``behavesAs`` mapping on the deleted
+        ones did not save them.  Desktop builds its picker from models it can
+        map onto an Anthropic model, and this gateway serves whatever public
+        names the user configured, so a route is visible there only when its
+        public name is the Claude model it stands in for.
+
+        Leaving the list unset is not an escape hatch: with nothing to go on,
+        Desktop discovers ``/v1/models`` from this gateway and applies the same
+        rule, then falls back to its own built-in lineup -- so the models it
+        cannot name stay invisible either way, and only the warning disappears.
+        """
+
+        return [
+            name for name in (self._public_models() or [])
+            if desktop_accepts_model_name(name)
+        ]
+
+    def desktop_model_entries(self) -> list[dict[str, str]]:
+        """The ``inferenceModels`` rows for this router's public models.
+
+        Derived, never configured: a public name Claude Desktop keeps is
+        written as itself, so the picker renders the model's own display name
+        and Effort control; every other public name gets the alias
+        ``claude_aliases`` derives for it, with the public name as
+        ``labelOverride`` and the proxy resolving that alias back.  A route
+        added later is covered without anybody editing a list.
+        """
+
+        names = self._public_models() or []
+        aliases = claude_aliases.alias_index(names)
+        rows: list[dict[str, str]] = []
+        for name in names:
+            if claude_aliases.desktop_keeps_model_id(name):
+                rows.append({"name": name})
+                continue
+            alias = claude_aliases.claude_desktop_alias(name)
+            if aliases.get(alias) != name:
+                continue
+            rows.append({"name": alias, "labelOverride": name})
+        # The picker is read top-down and selected by number, so it is ordered by
+        # the name a person actually reads -- the label, or the id when Desktop
+        # renders the row itself.  Two routes of one public name stay adjacent in
+        # the router's own order, because the sort is stable.
+        rows.sort(
+            key=lambda row: str(row.get("labelOverride") or row["name"]).casefold()
+        )
+        return rows
 
     @staticmethod
     def _code_picker(names: Sequence[str], existing: object = None) -> dict[str, Any]:
@@ -1560,6 +1681,14 @@ class ClaudeSettingsDomain:
         return candidate
 
     def _desktop_model_list_apply(self, enabled: bool, names: Sequence[str] | None = None) -> None:
+        """Write the picker's list, always with the labels its rows read as.
+
+        ``names`` narrows the write to a caller's list; it never replaces the
+        derivation.  Building ``{"name": ...}`` from those ids directly is how a
+        background refresh silently dropped every ``labelOverride`` and left the
+        picker showing the derived ids instead of the models they stand for.
+        """
+
         if self._desktop is None:
             raise ClaudeSettingsError("Claude Desktop configuration is unavailable")
         if not enabled:
@@ -1568,11 +1697,25 @@ class ClaudeSettingsDomain:
             except ClaudeDesktopConfigError as exc:
                 raise ClaudeSettingsError(str(exc)) from None
             return
-        resolved = list(names) if names is not None else self._public_models()
-        if not resolved:
-            raise DomainError("Young Router is not running or exposes no models")
+        derived = self.desktop_model_entries()
+        if names is None:
+            entries = derived
+        else:
+            wanted = list(names)
+            entries = [row for row in derived if row["name"] in wanted]
+        # Only ids Desktop keeps are written.  Handing it the rest makes it
+        # delete them on the next launch -- with a warning the user cannot act
+        # on from inside this app -- and leaves the switch claiming a list the
+        # file no longer holds.  An alias it derives always qualifies, so this
+        # refuses only a router that publishes nothing at all.
+        accepted = [row["name"] for row in entries if desktop_accepts_model_name(row["name"])]
+        if not accepted:
+            raise DomainError(
+                "Young Router is not running or exposes no models"
+            )
+        labels = {row["name"]: row["labelOverride"] for row in entries if row.get("labelOverride")}
         try:
-            self._desktop.set_model_names(resolved)
+            self._desktop.set_model_names(accepted, labels=labels)
         except ClaudeDesktopConfigError as exc:
             raise ClaudeSettingsError(str(exc)) from None
 
@@ -1582,37 +1725,112 @@ class ClaudeSettingsDomain:
         The Codex catalog's equivalent, and for the same reason: a client's
         picker was generated from this router's public models, so a route that
         was added, removed, or renamed has to reach that picker without the
-        user reopening the pane.  Two gates keep this from fighting the user:
-        a list is touched only while its own switch is on, and only when the
-        public names it was generated from actually differ -- an observation
-        that is merely empty (the proxy still loading, a worker reload between
-        groups) is not a change, and a model a user typed into the list by hand
-        is preserved by name, not dropped with the rewrite.
+        user reopening the pane.
+
+        Three gates keep this from fighting the user.  A list is touched only
+        while its own switch is on; an observation that is merely empty (the
+        proxy still loading, a worker reload between groups) is not a change;
+        and a client whose document holds an edit the user has not applied is
+        left alone, because writing the list would commit that edit too.  The
+        write is its own step -- ``_persist_generated_lists`` -- rather than the
+        ordinary Apply: Apply asks for confirmation of the *document's* risk
+        settings, and a user who has already applied ``bypassPermissions`` must
+        not have every background refresh refused by a prompt nobody sees.
         """
 
         names = self._public_models()
         if not names:
             return False
-        changed = False
-        if self.code_model_list_enabled():
-            generated = read_generated_models(self.app_state_root, "claudeCode")
-            if set(generated) != set(names) or self.code_model_list_names() != list(names):
+        # A draft the user is still editing belongs to them.  The next pass,
+        # after they apply it, finds the file clean and does the work then.
+        code_free = self._draft == self._raw
+        desktop_free = self._desktop is not None and not self._desktop.is_dirty()
+        saved_code = copy.deepcopy(self._draft)
+        generated: dict[str, list[str]] = {}
+
+        if code_free and self.code_model_list_enabled():
+            recorded = read_generated_models(self.app_state_root, "claudeCode")
+            if set(recorded) != set(names) or self.code_model_list_names() != list(names):
                 candidate = self._code_model_list_apply(True, names)
                 if validate_settings(candidate):
                     raise ClaudeSettingsError("Claude Settings contains invalid values")
                 self._draft = candidate
-                store_generated_models(self.app_state_root, "claudeCode", names)
-                changed = True
-        if self.desktop_model_list_enabled() and self._desktop is not None:
-            generated = read_generated_models(self.app_state_root, "claudeDesktop")
+                generated["claudeCode"] = list(names)
+
+        if desktop_free and self.desktop_model_list_enabled():
+            # Desktop's list is judged against the ids it will keep, which are
+            # the derived rows rather than the router's public names: comparing
+            # raw names would rewrite the file on every pass and never settle.
+            derived_entries = [
+                row for row in self.desktop_model_entries()
+                if desktop_accepts_model_name(row["name"])
+            ]
+            desktop_names = [row["name"] for row in derived_entries]
+            recorded = read_generated_models(self.app_state_root, "claudeDesktop")
             current = list(self._desktop.snapshot().get("model_names") or [])
-            if set(generated) != set(names) or current != list(names):
-                self._desktop_model_list_apply(True, names)
-                store_generated_models(self.app_state_root, "claudeDesktop", names)
-                changed = True
-        if changed:
-            self._revision += 1
-        return changed
+            if not desktop_names:
+                # Nothing on this router can appear in Desktop's picker any
+                # more, so the honest state is "no list of ours": clear it and
+                # let the app go back to discovering what it can.
+                if recorded or current:
+                    self._desktop.set_model_names([])
+                    generated["claudeDesktop"] = []
+            elif (
+                set(recorded) != set(desktop_names)
+                or current != desktop_names
+                # A row's label is part of the list this app wrote: when the
+                # stored rows disagree about it, the file is stale even though
+                # every id still matches.
+                or self._desktop.model_entries() != derived_entries
+            ):
+                self._desktop_model_list_apply(True, desktop_names)
+                generated["claudeDesktop"] = list(desktop_names)
+
+        if not generated:
+            return False
+        try:
+            wrote = self._persist_generated_lists()
+        except Exception:
+            # The refresh is background work.  A file that changed underneath it
+            # or cannot be written leaves the user's own state exactly as it was,
+            # and the next pass tries again.
+            self._draft = saved_code
+            if self._desktop is not None:
+                self._desktop.reset_draft()
+            return False
+        if not wrote:
+            return False
+        for client, models in generated.items():
+            store_generated_models(self.app_state_root, client, models)
+        self._revision += 1
+        return True
+
+    def _persist_generated_lists(self) -> bool:
+        """Write only the generated model lists to their clients' documents.
+
+        The ordinary ``apply`` is the wrong writer here: it commits every staged
+        field and gates on the document's risk confirmations, and a background
+        refresh owns neither.  Both documents are written from the draft this
+        call just built, and each is written only when it actually changed.
+        """
+
+        wrote = False
+        if self._desktop is not None and self._desktop.is_dirty():
+            self._desktop.apply()
+            wrote = True
+        if self._draft != self._raw:
+            if _current_bytes(self.settings_path) != self._baseline_bytes:
+                raise ClaudeSettingsError("Claude Settings changed on disk; reload and try again")
+            try:
+                text = json.dumps(self._draft, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+            except (TypeError, ValueError):
+                raise ClaudeSettingsError("Claude Settings contains invalid values") from None
+            _atomic_write(self.settings_path, text)
+            self._raw = copy.deepcopy(self._draft)
+            self._exists = True
+            self._baseline_bytes = text.encode("utf-8")
+            wrote = True
+        return wrote
 
     # -- this app's proxy, and the saved route a client leaves for it -------
 
@@ -1693,7 +1911,34 @@ class ClaudeSettingsDomain:
         )
         return self._route_named(model or "") or remembered
 
+    #: A window snapshot is polled while a window is open, so the list is
+    #: re-derived at most this often.  Codex's catalog is kept current the same
+    #: way -- by the snapshot that would draw it -- and the throttle is what
+    #: keeps a poll from becoming a ``/v1/models`` request per tick.
+    _MODEL_LIST_REFRESH_SECONDS = 2.0
+
+    def _refresh_model_lists_if_due(self) -> None:
+        """Let an open window repair a list the router outgrew.
+
+        A proxy reload already regenerates an enabled list, which covers a
+        provider Apply that changed the routes.  This covers the other order:
+        the routes changed while no reload was owed -- a model renamed in
+        another window, a route disabled and re-enabled -- and the list on disk
+        is now behind.  A snapshot may never fail because of it, so every error
+        is dropped here and the next pass tries again.
+        """
+
+        now = time.monotonic()
+        if now - self._model_list_refreshed_at < self._MODEL_LIST_REFRESH_SECONDS:
+            return
+        self._model_list_refreshed_at = now
+        try:
+            self.refresh_model_lists()
+        except Exception:
+            pass
+
     def snapshot(self) -> dict[str, Any]:
+        self._refresh_model_lists_if_due()
         return {
             "domain": self.name,
             "revision": self._revision,
@@ -1869,7 +2114,12 @@ class ClaudeSettingsDomain:
                         }
                     )
                     self._desktop.stage_secret("desktop_gateway_api_key", route_key)
-                    self._desktop.set_model_names([route_model] if route_model else [])
+                    # Desktop deletes a name it cannot map onto an Anthropic
+                    # model, so writing one here would only produce a warning
+                    # on the next launch and an empty picker either way.
+                    self._desktop.set_model_names(
+                        [route_model] if desktop_accepts_model_name(route_model) else []
+                    )
                 except ClaudeDesktopConfigError as exc:
                     raise ClaudeSettingsError(str(exc)) from None
                 self._revision += 1

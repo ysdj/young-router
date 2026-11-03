@@ -343,6 +343,13 @@ export interface ProviderModelSummary {
   max_input_tokens?: number | null;
   /** The window this route's own upstream publishes for it, when its catalog states one. Read-only: the number is the upstream's, not this app's. */
   upstream_context_window?: number | null;
+  /**
+   * How many requests this route may serve at once, when it states a cap of
+   * its own.  `null`/absent is not a missing value: it is this route following
+   * the runtime's global limit (`model_concurrency_default` below), while `0`
+   * states that the route is deliberately uncapped.
+   */
+  max_concurrency?: number | null;
   binding_health?: ModelBindingHealth;
   upstream_protocol_mode?: "fallback" | "fixed";
   upstream_url_surface?: ProbeSurfaceName;
@@ -373,6 +380,8 @@ export interface ProvidersModelsSummary {
   providers: ProviderSummary[];
   /** Registry defaults per public model, shown when the user sets no limit. */
   model_contexts?: Record<string, PublicModelContext>;
+  /** The concurrency cap a route that states none of its own follows. */
+  model_concurrency_default?: number;
   revision: number;
 }
 

@@ -105,6 +105,16 @@ OPTIONAL_READ_PATHS = frozenset(
 RESOURCE_REFRESH_MAX_WORKERS = 8
 DETECTION_RESPONSE_BYTES = 64 * 1024
 DETECTION_TIMEOUT_SECONDS = 3.0
+# How long one balance observation answers for.  A pane entry probes the session
+# and then refreshes the key list, and both ask the same profile: the second ask
+# cannot learn anything the first did not state a second earlier.  The window is
+# deliberately short -- a person pressing 刷新 a moment later is asking the
+# station again, and that answer may not come from this one.
+BALANCE_REUSE_SECONDS = 10.0
+# The station's display unit (``/api/status`` -> ``quota_per_unit``) is site
+# configuration rather than account state, so it is read once per origin and
+# re-read after this long instead of beside every balance.
+QUOTA_UNIT_REUSE_SECONDS = 300.0
 _SECRET_FIELDS = frozenset(
     {
         "access_token",
@@ -1282,6 +1292,12 @@ class RelayAccountsDomain:
         # The active copy stays process-local. An explicitly remembered login
         # also has a durable private copy beside the plaintext password.
         self._session_secrets: dict[str, dict[str, str]] = {}
+        # The last balance a station stated, per account, and the moment it stops
+        # answering; see ``BALANCE_REUSE_SECONDS``.
+        self._balance_observations: dict[str, tuple[float, float]] = {}
+        # The display unit the station reports, per origin; see
+        # ``_quota_per_unit``.
+        self._quota_units: dict[str, tuple[float, float]] = {}
         # Raw API keys remain process-local. They are populated from an
         # authenticated refresh/read and never enter snapshots or storage.
         self._resource_secret_cache: dict[str, str] = {}
@@ -3603,6 +3619,7 @@ class RelayAccountsDomain:
         user_id: object = "",
         remember_password: bool | None = None,
         preserve_resources: bool = False,
+        quota: object = None,
     ) -> dict[str, Any]:
         """Trusted native/browser boundary for one completed login.
 
@@ -3617,6 +3634,11 @@ class RelayAccountsDomain:
         it is a plain decimal id: a fork that reports something else must not
         have a guessed value sent at it.  An absent id keeps whatever this
         account already held, so a routine re-login never erases it.
+
+        ``quota`` is the New API profile the host's probe just read.  That probe
+        and this account's balance are the same answer, so taking it here is
+        what states 已登录 and the money beside it together, instead of leaving a
+        second copy of the read to the key-list refresh behind it.
         """
 
         index = self._index(account_id)
@@ -3643,6 +3665,19 @@ class RelayAccountsDomain:
         if captured_user_id:
             account["user_id"] = captured_user_id
         observed_at = _utc_now_iso()
+        # New API's profile read is the same answer its balance comes from; a
+        # sub2api probe reads a different page, so there is no quota to take and
+        # its balance stays with the refresh below.  A station whose display
+        # unit cannot be read still signs in: the balance is a summary of the
+        # account, never the login itself.
+        if quota is not None and account["type"] == "newapi":
+            try:
+                balance = self._balance_from_quota(account, quota)
+            except RelayAccountsError:
+                balance = None
+            if balance is not None:
+                account["balance"] = balance
+                self._remember_balance(account_id, balance)
         account.update(
             {
                 "username": username_value,
@@ -3783,7 +3818,8 @@ class RelayAccountsDomain:
             # The station answered and refused this session.  That is a real
             # answer, and ``None`` is how it is stated.
             return None
-        if not isinstance(_json_data(payload), Mapping):
+        profile = _json_data(payload)
+        if not isinstance(profile, Mapping):
             return None
         self._session_secrets[account_id] = secrets
         account["login_status"] = "signed_in"
@@ -3791,6 +3827,19 @@ class RelayAccountsDomain:
         account["last_updated_at"] = account["login_observed_at"]
         account["resource_status"] = "idle"
         account["resource_error"] = "none"
+        # The profile this probe just read *is* the balance read.  Settling both
+        # in one write is what lets the pane state 已登录 and the money beside it
+        # at the same moment; the refresh that follows is then a key list rather
+        # than a second copy of the question it already answered.  A station
+        # whose display unit cannot be read still signs in -- the balance is a
+        # summary of the account, never the login itself.
+        try:
+            balance = self._balance_from_profile(account, profile)
+        except RelayAccountsError:
+            pass
+        else:
+            account["balance"] = balance
+            self._remember_balance(account_id, balance)
         self._accounts[index] = _private_account(account)
         self._persist()
         self.revision += 1
@@ -4015,9 +4064,10 @@ class RelayAccountsDomain:
 
         The observation is the account's own ``login_observed_at``, which is
         stamped by exactly the outcomes that are a statement about the login: a
-        sign-in, a restored session, and a determined 未登录.  A resource read
-        records its own time elsewhere, so a failed one cannot make an old probe
-        look fresh.
+        sign-in, a restored session, a determined 未登录, and an authenticated
+        dashboard read the station answered (the balance among them).  A read
+        that failed states nothing and stamps nothing, so it cannot make an old
+        probe look fresh.
         """
 
         return self.recent_login_check_answer(account_id) is not None
@@ -4580,32 +4630,93 @@ class RelayAccountsDomain:
         Both paths are documentary (``OPTIONAL_READ_PATHS``): the balance is an
         independent summary, so neither read retries and neither can hold the
         refresh it rides along with.
+
+        A balance the station stated a moment ago is not a question: the entry's
+        session probe and the refresh behind it read the same profile, so the
+        observation answers here and the second read is not sent
+        (``BALANCE_REUSE_SECONDS``).
         """
 
+        account_id = str(account.get("id", ""))
+        observed = self._recent_balance(account_id)
+        if observed is not None:
+            return observed
         headers = self._headers(account)
+        path = "/api/v1/user/profile" if account["type"] == "sub2api" else "/api/user/self"
+        profile = _json_data(self._http.json(account["origin"], path, headers=headers))
+        balance = self._balance_from_profile(account, profile)
+        self._remember_balance(account_id, balance)
+        return balance
+
+    def _balance_from_profile(self, account: Mapping[str, Any], profile: object) -> float:
+        """The money one profile answer states, or this app's own refusal.
+
+        One conversion for both families, because the login probe and the
+        refresh each hold a profile payload: a balance that came from one reader
+        and a different number from the other is two answers to one question.
+        """
+
+        if not isinstance(profile, Mapping):
+            raise RelayAccountsError("Relay account balance is unavailable")
         if account["type"] == "sub2api":
-            profile = _json_data(
-                self._http.json(account["origin"], "/api/v1/user/profile", headers=headers)
-            )
-            if not isinstance(profile, Mapping):
-                raise RelayAccountsError("Relay account balance is unavailable")
             balance = _balance(profile.get("balance"))
             if balance is None:
                 raise RelayAccountsError("Relay account balance is unavailable")
             return balance
-        profile = _json_data(
-            self._http.json(account["origin"], "/api/user/self", headers=headers)
-        )
-        status = _json_data(
-            self._http.json(account["origin"], "/api/status", headers={})
-        )
-        if not isinstance(profile, Mapping) or not isinstance(status, Mapping):
+        return self._balance_from_quota(account, profile.get("quota"))
+
+    def _balance_from_quota(self, account: Mapping[str, Any], quota: object) -> float:
+        """Turn one New API ``quota`` into money with the site's own unit."""
+
+        amount = _balance(quota)
+        if amount is None:
             raise RelayAccountsError("Relay account balance is unavailable")
-        quota = _balance(profile.get("quota"))
-        quota_per_unit = _balance(status.get("quota_per_unit"))
-        if quota is None or quota_per_unit is None or quota_per_unit <= 0:
+        unit = self._quota_per_unit(str(account["origin"]))
+        if unit is None:
             raise RelayAccountsError("Relay account balance is unavailable")
-        return quota / quota_per_unit
+        return amount / unit
+
+    def _quota_per_unit(self, origin: str) -> float | None:
+        """The station's display unit, read once per origin per process.
+
+        ``/api/status`` is public site configuration, not something about this
+        account: reading it beside every balance spent a round trip on a number
+        that does not change.  A station this process could not read answers
+        ``None`` and is asked again next time, so a momentary failure costs one
+        balance rather than five minutes of them.
+        """
+
+        now = time.monotonic()
+        cached = self._quota_units.get(origin)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+        unit: float | None = None
+        try:
+            status = _json_data(self._http.json(origin, "/api/status", headers={}))
+            if isinstance(status, Mapping):
+                unit = _balance(status.get("quota_per_unit"))
+        except Exception:
+            unit = None
+        if unit is None or unit <= 0:
+            return None
+        self._quota_units[origin] = (now + QUOTA_UNIT_REUSE_SECONDS, unit)
+        return unit
+
+    def _recent_balance(self, account_id: str) -> float | None:
+        """The balance this account's own last answer still covers, if any."""
+
+        observed = self._balance_observations.get(account_id)
+        if observed is None:
+            return None
+        if observed[0] <= time.monotonic():
+            self._balance_observations.pop(account_id, None)
+            return None
+        return observed[1]
+
+    def _remember_balance(self, account_id: str, balance: float) -> None:
+        """Record one balance a station just stated for later in the same entry."""
+
+        self._balance_observations[account_id] = (time.monotonic() + BALANCE_REUSE_SECONDS, balance)
 
     # After one refused sign-in, this app waits before asking the station
     # again.  A refusal is the station's answer about *this* moment, and asking
@@ -4886,6 +4997,16 @@ class RelayAccountsDomain:
                         # leaves the last known balance in place instead of
                         # blanking it for every other round trip.
                         account["balance"] = previous_balance
+                    else:
+                        # An authenticated dashboard read that *answered* is this
+                        # account's login observation: the station accepted the
+                        # session Core holds, which is what 已登录 states.  A read
+                        # that failed is not, and is left to the key read below
+                        # to classify.  Stamping it here is what lets one read
+                        # settle both questions, so the entry stops paying a
+                        # probe first and a balance afterwards.
+                        account["login_status"] = "signed_in"
+                        account["login_observed_at"] = _utc_now_iso()
                     try:
                         groups = groups_future.result()
                     except RelayAccountsError:

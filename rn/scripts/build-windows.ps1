@@ -107,6 +107,24 @@ try {
     throw "React Native Windows host project is missing at rn/apps/windows/windows."
   }
 
+  # The wheel fix changes RNW source, so the matching incremental source-build
+  # output must already exist.  Without this guard, a fresh checkout silently
+  # falls back to compiling all of RNW, which is not an acceptable artifact
+  # build on the ARM64 development machine.
+  $ReactNativeWheelPatch = Join-Path $RnRoot "scripts\patch-react-native-windows.mjs"
+  $ReactNativeTargetDll = Join-Path $RnRoot "node_modules\react-native-windows\target\$WindowsArch\Release\Microsoft.ReactNative\Microsoft.ReactNative.dll"
+  if (-not (Test-Path -LiteralPath $ReactNativeTargetDll -PathType Leaf)) {
+    throw "RNW source-build output is missing: $ReactNativeTargetDll. Prebuild Microsoft.ReactNative.dll or restore the RNW build cache before building Windows."
+  }
+  if (-not (Test-Path -LiteralPath $ReactNativeWheelPatch -PathType Leaf)) {
+    throw "The prepared RNW wheel patch is missing: $ReactNativeWheelPatch."
+  }
+  if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+    throw "node is required to patch the React Native Windows source tree."
+  }
+  & node $ReactNativeWheelPatch --root $ProjectRoot
+  if ($LASTEXITCODE -ne 0) { throw "Could not apply the prepared React Native Windows wheel patch." }
+
   pnpm run build
 
   Remove-Item -LiteralPath $Core -Recurse -Force -ErrorAction SilentlyContinue
@@ -355,7 +373,7 @@ print('young-router-veridrop-import-ok')
     "--dir", $AppRoot, "exec", "react-native", "run-windows",
     "--no-launch", "--no-deploy", "--no-packager", "--release", "--arch", $WindowsArch,
     "--sln", "windows\YoungRouter.sln", "--proj", "windows\YoungRouter\YoungRouter.vcxproj",
-    "--msbuildprops", "YoungRouterCoreStagingDir=$CoreRoot,RunCodegenWindows=false,WindowsTargetPlatformVersion=$($InstalledSdk.Name),RestoreIgnoreFailedSources=true,RestoreForce=false"
+    "--msbuildprops", "YoungRouterCoreStagingDir=$CoreRoot,RunCodegenWindows=false,WindowsTargetPlatformVersion=$($InstalledSdk.Name),RestoreIgnoreFailedSources=true,RestoreForce=false,UseExperimentalNuget=false"
   )
   $LowResourceBuild = $WindowsArch -eq "ARM64" -and $env:YOUNG_ROUTER_LOW_RESOURCE_BUILD -notin @("0", "false", "no")
   if ($LowResourceBuild) {

@@ -296,7 +296,8 @@ import Foundation
         cookie: String? = nil,
         accessToken: String? = nil,
         refreshToken: String? = nil,
-        userID: String? = nil
+        userID: String? = nil,
+        quota: Double? = nil
     ) throws -> RelaySessionRestoreResult {
         guard ["signed_in", "signed_out", "expired"].contains(loginStatus),
               accountID.utf8.count <= 96,
@@ -309,6 +310,7 @@ import Foundation
               (refreshToken?.utf8.count ?? 0) <= 32_768,
               (userID?.utf8.count ?? 0) <= 32,
               userID?.allSatisfy({ $0.isNumber }) ?? true,
+              quota?.isFinite ?? true,
               loginStatus != "signed_in" || (!(username?.isEmpty ?? true) && (!(cookie?.isEmpty ?? true) || !(accessToken?.isEmpty ?? true))),
               loginStatus == "signed_in" || ((cookie?.isEmpty ?? true) && (accessToken?.isEmpty ?? true) && (refreshToken?.isEmpty ?? true)) else {
             throw BridgeError.invalidResponse
@@ -325,6 +327,9 @@ import Foundation
         if let accessToken, !accessToken.isEmpty { payload["access_token"] = accessToken }
         if let refreshToken, !refreshToken.isEmpty { payload["refresh_token"] = refreshToken }
         if let userID, !userID.isEmpty { payload["user_id"] = userID }
+        // The profile quota the probe read, as the station reported it: Core owns
+        // the display unit that turns it into money, so nothing here has to be.
+        if let quota, quota.isFinite { payload["quota"] = quota }
         guard let body = try? JSONSerialization.data(withJSONObject: payload, options: []),
               body.count <= 96 * 1024 else { throw BridgeError.invalidResponse }
         let (data, response, _, restarted) = try performCoreRequest(

@@ -24,6 +24,7 @@ from .schema import (
     MENU_RELAY_SOURCE_MODEL_KEY,
     MENU_ROUTE_KEY,
     MENU_PROVIDER_SOURCE_KEY,
+    MODEL_CONCURRENCY_KEY,
     PUBLIC_MODEL_CONTEXT_KEY,
     PUBLIC_MODEL_LIMIT_KEYS,
     UPSTREAM_PROTOCOL_MODE_KEY,
@@ -54,6 +55,23 @@ from .schema import (
 CONFIG_DOCUMENT_CONFIG_KEY = "config"
 CONFIG_DOCUMENT_DISABLED_KEY = "disabled"
 CONFIG_DOCUMENT_KEYS = {CONFIG_DOCUMENT_CONFIG_KEY, CONFIG_DOCUMENT_DISABLED_KEY}
+
+def _route_concurrency(value: Any) -> int | None:
+    """One route's own concurrency cap, as the pane states it.
+
+    ``None`` means the route states nothing and follows the runtime default;
+    ``0`` means the route is explicitly unlimited.  Reading the two apart is the
+    whole point: folding an absent key into ``0`` would make every saved route
+    permanently ignore a default the user changes later.
+    """
+
+    if value is None:
+        return None
+    parsed = _menu_order(value, "Route concurrency")
+    if not isinstance(parsed, int) or parsed < 0:
+        raise ValueError("Route concurrency must be a whole number from 0 to 4096")
+    return parsed
+
 
 def _is_unbound_entry(model_info: dict[str, Any]) -> bool:
     """Whether one entry records that the route names no key of its own."""
@@ -335,6 +353,7 @@ def _model_to_editor(
             "supported_upstream_url_surfaces",
             "x-young-router-upstream-url-surface-order",
             MENU_MODEL_ENABLED_KEY,
+            MODEL_CONCURRENCY_KEY,
             *PUBLIC_MODEL_LIMIT_KEYS,
         }
     }
@@ -396,6 +415,11 @@ def _model_to_editor(
         "supports_responses_image_generation_tool_present": supports_responses_image_tool_present,
         "upstream_url_surface": upstream_url_surface,
         "upstream_protocol_mode": upstream_protocol_mode,
+        # The route's own concurrency cap, when it states one.  ``None`` is
+        # "inherit the runtime default" and is not the same as ``0`` (this route
+        # is unlimited), so the value is kept as stated instead of being folded
+        # into a number the pane could not tell apart from an absent setting.
+        "max_concurrency": _route_concurrency(model_info.get(MODEL_CONCURRENCY_KEY)),
         "entry_extra": entry_extra,
         "litellm_extra": litellm_extra,
         "model_info_extra": model_info_extra,

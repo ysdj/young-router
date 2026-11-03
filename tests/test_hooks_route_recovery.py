@@ -3742,9 +3742,10 @@ class HookRouteRecoveryTests(HookTestCase):
         """The truncated-body reading never widens into every read error.
 
         ``ReadError`` is also what an ordinary dropped connection produces, and
-        that is an outage to wait out rather than a route to quarantine.  Only a
-        body that stopped mid-framing is route evidence; the class name alone is
-        not.
+        that is an outage to wait out rather than a route to quarantine.  What
+        decides is the text: a chain that names connectivity is an outage, and a
+        body that stopped mid-framing is route evidence.  A read error with no
+        text at all is neither -- see the test below.
         """
 
         hooks, _proxy_server = load_hook_module()
@@ -3762,6 +3763,43 @@ class HookRouteRecoveryTests(HookTestCase):
         )
         self.assertEqual(
             hooks._trace_exception(exc)["reason"], "upstream-network-connectivity"
+        )
+
+    def test_a_read_that_failed_with_no_text_parks_the_route(self) -> None:
+        """A bare read failure is a route's transport fault, not the request's.
+
+        ``httpx.ReadError`` carries an empty message whenever the transport gave
+        no detail, and the class name was the only evidence there was.  Both
+        readings this module had missed it: the connectivity markers need text,
+        and the truncated-body markers need a sentence, so the stop fell to the
+        ``error`` default -- which is the branch for a deterministic refusal.
+        The client was told a route it had just been cut on had judged its
+        bytes, and ended the turn, because that sentence names no cause Pi
+        retries.  It is not an outage to wait out either: that policy polls with
+        no deadline, so a route that cuts every long answer would hold the
+        client's stream open for as long as it kept failing.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class ReadError(Exception):
+            pass
+
+        exc = ReadError("")
+        exc.failed_deployment_id = "c52c205f"
+        exc.failed_deployment_order = 0
+
+        self.assertTrue(hooks._is_upstream_body_read_failure(exc))
+        self.assertFalse(hooks._is_upstream_truncated_stream_error(exc))
+        self.assertFalse(hooks._is_network_recovery_exception(exc))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exc),
+            hooks._RECOVERY_POLICY_COOLDOWN,
+        )
+        # A trace that said ``other`` could not be told apart from a request
+        # this router had never classified.
+        self.assertEqual(
+            hooks._trace_exception(exc)["reason"], "upstream-body-read-failed"
         )
 
     def test_an_unrelated_earlier_error_does_not_make_a_stop_look_truncated(self) -> None:

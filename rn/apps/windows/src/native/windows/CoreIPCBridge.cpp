@@ -733,6 +733,9 @@ std::optional<CoreIPCBridge::RelaySessionRestoreResult> CoreIPCBridge::RestoreRe
     if (user_id && !user_id->empty()) {
       payload.SetNamedValue(L"user_id", winrt::Windows::Data::Json::JsonValue::CreateStringValue(Utf8ToWide(*user_id)));
     }
+    if (quota && std::isfinite(*quota)) {
+      payload.SetNamedValue(L"quota", winrt::Windows::Data::Json::JsonValue::CreateNumberValue(*quota));
+    }
     auto body = WideToUtf8(payload.Stringify().c_str());
     if (body.size() > 96 * 1024) return std::nullopt;
     auto result = HostRequest(L"host/relay/restore", body, false);

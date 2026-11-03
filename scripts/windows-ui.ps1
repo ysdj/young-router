@@ -28,10 +28,13 @@
 #   windows-ui.ps1 move -X <x> -Y <y> -Width <w> -Height <h>
 #   windows-ui.ps1 shot -Path <file.png>       photograph the app window only
 #
-# `move` is the reliable way to bring a lower pane into view: the settings
-# panes are custom ScrollViewers whose UIA ScrollPattern reports itself
-# scrollable but ignores SetScrollPercent, and a synthetic wheel event does not
-# reach them either -- so a taller window beats a scroll.
+# `scrollto` walks a pane with ScrollPattern increments; `SetScrollPercent` is
+# accepted and ignored by the settings panes, and a synthetic wheel only reaches
+# the composition island after a synthetic mouse *move* -- wheel alone is
+# dropped -- so `wheel` sends both.
+#
+# `move` is the other way to bring a lower block into view, and the only one
+# that needs no pane cooperation: a taller window shows the whole pane.
 param(
   [Parameter(Mandatory = $true, Position = 0)][string]$Command,
   [string]$Filter = '',
@@ -177,11 +180,25 @@ switch ($Command) {
   'wheel' {
     Focus-App
     $delta = if ($Ticks -lt 0) { -120 } else { 120 }
+    $handle = Get-AppWindow
+    # The shell owns a full-screen XAML island of its own, so a window that is
+    # merely foreground is not necessarily the one the cursor hits: hop to
+    # topmost for the gesture and drop back afterwards.  The move matters too --
+    # a composition island drops an injected wheel that no move preceded.
+    [YoungRouterWindow]::SetWindowPos($handle, [IntPtr](-1), 0, 0, 0, 0, 0x0043) | Out-Null
+    Start-Sleep -Milliseconds 200
     [YoungRouterWindow]::SetCursorPos($X, $Y) | Out-Null
+    Start-Sleep -Milliseconds 120
+    [YoungRouterWindow]::mouse_event(0x0001, 1, 1, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 60
+    [YoungRouterWindow]::mouse_event(0x0001, -1, -1, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 120
     for ($i = 0; $i -lt [math]::Abs($Ticks); $i++) {
       [YoungRouterWindow]::mouse_event(0x0800, 0, 0, $delta, [UIntPtr]::Zero)
       Start-Sleep -Milliseconds 40
     }
+    Start-Sleep -Milliseconds 250
+    [YoungRouterWindow]::SetWindowPos($handle, [IntPtr](-2), 0, 0, 0, 0, 0x0043) | Out-Null
     "wheeled $Ticks at $X,$Y"
   }
   'wait' {
@@ -213,14 +230,27 @@ switch ($Command) {
       $area = $rect.Width * $rect.Height
       if ($panes[$i][1].Current.VerticalViewSize -lt 99.9 -and $area -gt $largest) { $chosen = $i; $largest = $area }
     }
-    $panes[$chosen][1].SetScrollPercent([System.Windows.Automation.ScrollPattern]::NoScrollValue, $Percent)
-    Start-Sleep -Milliseconds 400
-    $after = [math]::Round($panes[$chosen][1].Current.VerticalScrollPercent, 1)
-    if ([math]::Abs($after - $Percent) -gt 1) {
-      "pane $chosen stayed at $after%: this pane's ScrollPattern accepts the call and does not move.  Use -Command move with a taller -Height instead."
+    # `SetScrollPercent` is answered and ignored by these panes; the increment
+    # call is the one that moves them, so the target is reached in steps.
+    $pattern = $panes[$chosen][1]
+    $noAmount = [System.Windows.Automation.ScrollAmount]::NoAmount
+    $step = [System.Windows.Automation.ScrollAmount]::LargeIncrement
+    $current = $pattern.Current.VerticalScrollPercent
+    $start = $current
+    if ($current -gt $Percent) { $step = [System.Windows.Automation.ScrollAmount]::LargeDecrement }
+    for ($i = 0; $i -lt 40; $i++) {
+      $current = $pattern.Current.VerticalScrollPercent
+      if ([math]::Abs($current - $Percent) -le 3) { break }
+      $pattern.Scroll($noAmount, $step)
+      Start-Sleep -Milliseconds 120
+      if (([math]::Abs($pattern.Current.VerticalScrollPercent - $current)) -lt 0.5) { break }
+    }
+    $after = [math]::Round($pattern.Current.VerticalScrollPercent, 1)
+    if ([math]::Abs($after - $start) -lt 0.5) {
+      "pane $chosen did not move from $start%: fall back to -Command move with a taller -Height."
       exit 1
     }
-    "scrolled pane $chosen to $after%"
+    "scrolled pane $chosen from $start% to $after% (asked for $Percent%; the pane reports no movement past that)"
   }
   'move' {
     $handle = Get-AppWindow

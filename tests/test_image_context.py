@@ -161,7 +161,7 @@ class ImageContextScanTests(_ImageContextCase):
 
         found = image_context_module.scan(items)
 
-        self.assertEqual([image.image_id for image in found], ["IMG-0001", "IMG-0002"])
+        self.assertEqual([image.image_id for image in found], ["IMG-001", "IMG-002"])
         self.assertEqual([image.turn for image in found], [1, 2])
         self.assertEqual((found[0].width, found[0].height), (9, 7))
         self.assertEqual(found[0].kind, "upload")
@@ -195,7 +195,7 @@ class ImageContextRewriteTests(_ImageContextCase):
         labels = [
             part["text"]
             for part in newest["content"]
-            if part.get("type") == "input_text" and "IMG-0002" in part.get("text", "")
+            if part.get("type") == "input_text" and "IMG-002" in part.get("text", "")
         ]
         self.assertEqual(len(labels), 1)
         self.assertIn("provided", labels[0])
@@ -217,7 +217,7 @@ class ImageContextRewriteTests(_ImageContextCase):
         )
         self.assertEqual(replacement[0], items[0]["content"][0])
         text = replacement[1]["text"]
-        self.assertIn("图片 IMG-0001 已省略", text)
+        self.assertIn("图片 IMG-001 已省略", text)
         self.assertIn("第 1 轮", text)
         self.assertIn("120×90", text)
         self.assertIn("[Image #1]", text)
@@ -239,7 +239,7 @@ class ImageContextRewriteTests(_ImageContextCase):
         result = self.rewritten(items)
 
         self.assertEqual(result["input"][2], signed)
-        self.assertIn("IMG-0001", result["input"][1]["content"][1]["text"])
+        self.assertIn("IMG-001", result["input"][1]["content"][1]["text"])
         # The placeholder is what the note introduced; the note itself sits just
         # before the turn it explains.
         self.assertIn("上下文管理说明", json.dumps(result["input"], ensure_ascii=False))
@@ -289,10 +289,10 @@ class ImageContextRewriteTests(_ImageContextCase):
         # is exactly the prefix the upstream would then re-read.
         opening = result["input"][0]["content"]
         self.assertTrue(any(part.get("type") == "input_image" for part in opening))
-        self.assertTrue(any("IMG-0001" in part.get("text", "") for part in opening))
+        self.assertTrue(any("IMG-001" in part.get("text", "") for part in opening))
         duplicate = result["input"][2]["content"][1]["text"]
-        self.assertIn("图片 IMG-0002 未重复提供", duplicate)
-        self.assertIn("IMG-0001", duplicate)
+        self.assertIn("图片 IMG-002 未重复提供", duplicate)
+        self.assertIn("IMG-001", duplicate)
 
     def test_the_switch_off_means_the_request_is_untouched(self) -> None:
         items = [
@@ -366,7 +366,7 @@ class ImageContextRewriteTests(_ImageContextCase):
             {
                 "threadId": thread,
                 "auto": False,
-                "unchecked": {"IMG-0001": {"id": "IMG-0001"}},
+                "unchecked": {"IMG-001": {"id": "IMG-001"}},
             },
         )
         items = [_user_turn("第一轮", _upload_parts(_png(4, 4))), _user_turn("第二轮")]
@@ -378,7 +378,7 @@ class ImageContextRewriteTests(_ImageContextCase):
             for item in result["input"]
             if item.get("role") == "user" and len(item.get("content") or []) == 2
         ][0]
-        self.assertIn("IMG-0001", replaced["content"][1]["text"])
+        self.assertIn("IMG-001", replaced["content"][1]["text"])
 
     def test_the_task_id_is_read_from_the_clients_turn_metadata(self) -> None:
         # Codex carries the task id only inside this JSON header; without it the
@@ -403,7 +403,7 @@ class ImageContextRewriteTests(_ImageContextCase):
         thread = "11111111-2222-3333-4444-777777777777"
         self.selection(
             thread,
-            {"threadId": thread, "auto": True, "pinned": {"IMG-0001": {"id": "IMG-0001"}}},
+            {"threadId": thread, "auto": True, "pinned": {"IMG-001": {"id": "IMG-001"}}},
         )
         items = [
             _user_turn("first", _upload_parts(_png(120, 90, noisy=True))),
@@ -428,7 +428,7 @@ class ImageContextCopyTests(_ImageContextCase):
                 "type": "function_call_output",
                 "call_id": "c9",
                 "output": [
-                    {"type": "input_text", "text": "[图片 IMG-0001 取回的原图｜第 1 轮]"},
+                    {"type": "input_text", "text": "[图片 IMG-001 取回的原图｜第 1 轮]"},
                     {"type": "input_image", "image_url": _data_url(raw)},
                 ],
             },
@@ -442,10 +442,10 @@ class ImageContextCopyTests(_ImageContextCase):
         self.assertEqual(
             [(image.image_id, image.copy_of) for image in found],
             [
-                ("IMG-0001", None),
-                ("IMG-0002", None),
-                ("IMG-0001", "IMG-0001"),
-                ("IMG-0003", None),
+                ("IMG-001", None),
+                ("IMG-002", None),
+                ("IMG-001", "IMG-001"),
+                ("IMG-003", None),
             ],
         )
 
@@ -458,7 +458,7 @@ class ImageContextCopyTests(_ImageContextCase):
                 "type": "function_call_output",
                 "call_id": "c9",
                 "output": [
-                    {"type": "input_text", "text": "[图片 IMG-0001 取回的原图｜第 1 轮]"},
+                    {"type": "input_text", "text": "[图片 IMG-001 取回的原图｜第 1 轮]"},
                     {"type": "input_image", "image_url": _data_url(raw)},
                 ],
             },
@@ -517,7 +517,7 @@ class ImageContextFileFetchTests(_ImageContextCase):
         self.assertIn("view_image", text)
         self.assertNotIn("view_image_by_id", text)
         path = text.split("“")[1].split("”")[0]
-        self.assertTrue(path.endswith("IMG-0001.png"), path)
+        self.assertTrue(path.endswith("IMG-001.png"), path)
         self.assertTrue(os.path.isfile(path), path)
         with open(path, "rb") as handle:
             self.assertEqual(handle.read()[:8], b"\x89PNG\r\n\x1a\n")
@@ -550,7 +550,7 @@ class ImageContextFileFetchTests(_ImageContextCase):
 
     def test_forgetting_a_task_removes_its_files_too(self) -> None:
         self.rewrite_in_path_mode()
-        folder = os.path.dirname(store_module.paths(self.thread)["IMG-0001"])
+        folder = os.path.dirname(store_module.paths(self.thread)["IMG-001"])
         self.assertTrue(os.path.isdir(folder))
 
         self.assertTrue(store_module.forget(self.thread))
@@ -610,7 +610,7 @@ class ImageContextStoreRetentionTests(_ImageContextCase):
     def test_file_copies_without_a_replay_are_dropped(self) -> None:
         orphan = os.path.join(store_module.files_dir(), "orphan-thread")
         os.makedirs(orphan)
-        with open(os.path.join(orphan, "IMG-0001.png"), "wb") as handle:
+        with open(os.path.join(orphan, "IMG-001.png"), "wb") as handle:
             handle.write(b"png")
 
         store_module.sweep(now=time.time())
@@ -644,7 +644,7 @@ class ImageContextFetchTests(_ImageContextCase):
 
         self.rewritten(items, metadata={"thread_id": thread})
 
-        answer = store_module.image_data_url(thread, "IMG-0001")
+        answer = store_module.image_data_url(thread, "IMG-001")
         self.assertIsNotNone(answer)
         assert answer is not None
         mime, data_url = answer
@@ -681,7 +681,7 @@ class ImageContextFetchTests(_ImageContextCase):
                     "method": "tools/call",
                     "params": {
                         "name": mcp_module.TOOL_NAME,
-                        "arguments": {"ids": ["IMG-0001"]},
+                        "arguments": {"ids": ["IMG-001"]},
                     },
                 }
             )
@@ -689,6 +689,172 @@ class ImageContextFetchTests(_ImageContextCase):
         blocks = answer["result"]["content"]  # type: ignore[index]
         self.assertEqual([block["type"] for block in blocks], ["text", "image"])
         self.assertEqual(blocks[1]["mimeType"], "image/png")
+
+    def test_a_fetched_copy_keeps_the_id_its_line_names(self) -> None:
+        """The fetch tool's own line is what makes an id mean one picture.
+
+        The pass recognises a copy by reading the line in front of it.  This
+        tool used to answer with a line of its own (``[Image IMG-001 | provided
+        this turn]``), which that reader does not match: the picture the model
+        had just asked for came back as a new occurrence, took the next number,
+        and the same image answered two ids for the rest of the task -- so a
+        panel selection made on the id the model was told could no longer name
+        it.  The line is now the pass's own heading for a fetched image.
+        """
+
+        thread = "eeeeeeee-1111-2222-3333-444444444444"
+        uploads = _png(120, 90, noisy=True, seed=7)
+        first = [
+            _user_turn("first", _upload_parts(uploads)),
+            _user_turn("second"),
+        ]
+        image_context_module._with_codex_image_context(
+            _request(first, metadata={"thread_id": thread})
+        )
+        with mock.patch.dict(os.environ, {mcp_module.THREAD_ENV: thread}):
+            answer = mcp_module.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": mcp_module.TOOL_NAME,
+                        "arguments": {"ids": ["IMG-001"]},
+                    },
+                }
+            )
+        line = answer["result"]["content"][0]["text"]  # type: ignore[index]
+        self.assertRegex(line, r"^\[(?:图片|Image) IMG-001 (?:取回的原图|fetched original)")
+        self.assertIsNotNone(image_context_module._FETCHED_LINE.match(line))
+
+        # Codex carries that call's result into the next replay, exactly as the
+        # tool returned it.
+        answered = {
+            "type": "function_call_output",
+            "call_id": "fetch-1",
+            "output": [
+                {"type": "input_text", "text": line},
+                {
+                    "type": "input_image",
+                    "image_url": answer["result"]["content"][1]["data"],  # type: ignore[index]
+                },
+            ],
+        }
+        answered["output"][1]["image_url"] = _data_url(
+            base64.b64decode(answered["output"][1]["image_url"])
+        )
+        replay = first + [answered]
+        carried = image_context_module.scan(replay)
+
+        self.assertEqual([image.image_id for image in carried], ["IMG-001", "IMG-001"])
+        self.assertEqual(carried[-1].copy_of, "IMG-001")
+
+    def test_a_picture_the_client_viewer_reopened_keeps_its_id(self) -> None:
+        """The other way a copy comes back: the client's own viewer, on our file.
+
+        Path mode hands the model a file this pass wrote, and the client's own
+        ``view_image`` result carries the image and nothing else -- no tag, no
+        id (checked against every such pair in this machine's rollouts).  Read
+        as a new occurrence, the picture the model just reopened took the next
+        number: one image answered two ids, and the same bytes were cached twice
+        under two names.  The id lives on the call, which names the path.
+        """
+
+        thread = "abcdefab-1111-2222-3333-444444444444"
+        raw = _png(120, 90, noisy=True, seed=5)
+        first = [_user_turn("first", _upload_parts(raw)), _user_turn("second")]
+        with mock.patch.dict(
+            os.environ, {image_context_module.IMAGE_CONTEXT_FETCH_ENV: "path"}
+        ):
+            self.rewritten(first, metadata={"thread_id": thread})
+            stored = store_module.paths(thread)["IMG-001"]
+            reopened = [
+                {
+                    "type": "function_call",
+                    "name": "view_image",
+                    "namespace": "functions",
+                    "call_id": "call_view_1",
+                    "arguments": json.dumps({"path": stored, "detail": "original"}),
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_view_1",
+                    "output": [{"type": "input_image", "image_url": _data_url(raw)}],
+                },
+            ]
+            replay = first + [_assistant("ok"), _user_turn("third")] + reopened
+
+            found = image_context_module.scan(replay, file_paths=store_module.paths(thread))
+            self.assertEqual([image.image_id for image in found], ["IMG-001", "IMG-001"])
+            self.assertEqual(found[-1].copy_of, "IMG-001")
+
+            result = self.rewritten(replay, metadata={"thread_id": thread})
+            wire = json.dumps(result["input"], ensure_ascii=False)
+            self.assertIn("IMG-001", wire)
+            self.assertNotIn("IMG-002", wire)
+            self.assertEqual(
+                [os.path.basename(path) for path in store_module.paths(thread).values()],
+                ["IMG-001.png"],
+            )
+
+    def test_a_viewer_call_for_a_file_this_pass_did_not_write_is_a_new_picture(self) -> None:
+        """Only our own files carry an id; anything else is its own picture."""
+
+        stored = "/Users/somebody/.young-router/image-context/replays/files/t/IMG-001.png"
+        replay = [
+            _user_turn("first", _upload_parts(_png(4, 4))),
+            {
+                "type": "function_call",
+                "name": "view_image",
+                "call_id": "call_view_2",
+                "arguments": json.dumps({"path": "/tmp/somebody-else.png"}),
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_view_2",
+                "output": [{"type": "input_image", "image_url": _data_url(_png(120, 90, noisy=True, seed=9))}],
+            },
+        ]
+
+        found = image_context_module.scan(replay, file_paths={"IMG-001": stored})
+
+        self.assertEqual([image.image_id for image in found], ["IMG-001", "IMG-002"])
+        self.assertEqual(found[-1].copy_of, None)
+
+    def test_the_fetched_line_speaks_the_tasks_own_language(self) -> None:
+        """The copy's heading reads in the language its placeholders were in.
+
+        The fetch tool is a separate process, so it reads the task's language
+        from the stored replay instead of guessing one.
+        """
+
+        thread = "ffffffff-1111-2222-3333-444444444444"
+        image_context_module._with_codex_image_context(
+            _request(
+                [
+                    _user_turn("第一轮", _upload_parts(_png(120, 90, noisy=True))),
+                    _user_turn("第二轮"),
+                ],
+                metadata={"thread_id": thread},
+            )
+        )
+
+        record, lang, _mime, _data = store_module.fetched(thread, "IMG-001")
+
+        self.assertEqual(lang, "zh")
+        self.assertEqual(record["id"], "IMG-001")
+        self.assertIn(
+            "取回的原图",
+            image_context_module.fetched_label(
+                "IMG-001",
+                lang=lang,
+                name=record.get("name"),
+                kind=record.get("kind"),
+                turn=record.get("turn"),
+                width=record.get("width"),
+                height=record.get("height"),
+            ),
+        )
 
     def test_an_id_is_found_even_when_the_client_names_no_task(self) -> None:
         # Codex starts an MCP server without telling it which task the model is
@@ -701,8 +867,8 @@ class ImageContextFetchTests(_ImageContextCase):
             )
         )
 
-        self.assertIsNotNone(store_module.image_data_url(None, "IMG-0001"))
-        self.assertIsNotNone(store_module.image_data_url("another-task", "IMG-0001"))
+        self.assertIsNotNone(store_module.image_data_url(None, "IMG-001"))
+        self.assertIsNotNone(store_module.image_data_url("another-task", "IMG-001"))
         self.assertIsNone(store_module.image_data_url(None, "IMG-0404"))
 
     def test_the_initializer_names_the_server_and_its_instructions(self) -> None:
@@ -773,7 +939,7 @@ class ImageContextDeploymentTests(_ImageContextCase):
         ][0]
         self.assertNotIn("view_image_by_id", note)
         self.assertIn("需要 IMG-", note)
-        self.assertIn("需要 IMG-0001", json.dumps(result["input"], ensure_ascii=False))
+        self.assertIn("需要 IMG-001", json.dumps(result["input"], ensure_ascii=False))
 
     def test_the_endpoint_answers_only_with_the_installations_token(self) -> None:
         environment = {"LITELLM_MASTER_KEY": "sk-test"}
@@ -809,7 +975,7 @@ class ImageContextStorageTests(_ImageContextCase):
         with open(path, encoding="utf-8") as handle:
             written = handle.read()
         self.assertNotIn("secret sentence", written)
-        self.assertIn("IMG-0001", written)
+        self.assertIn("IMG-001", written)
 
 
 class ImageContextDeclineTests(_ImageContextCase):
@@ -973,9 +1139,9 @@ class ImageContextSizeModeTests(_ImageContextCase):
         # The oldest picture stays as well: it is the anchor every later request
         # shares a prefix with, so retiring it would rewrite the whole request.
         wire = json.dumps(result["input"], ensure_ascii=False)
-        self.assertIn("IMG-0001 provided", wire)
-        self.assertIn("IMG-0015 provided", wire)
-        self.assertIn("IMG-0002 omitted", wire)
+        self.assertIn("IMG-001 provided", wire)
+        self.assertIn("IMG-015 provided", wire)
+        self.assertIn("IMG-002 omitted", wire)
 
     def test_a_batch_of_views_reaches_the_model_whole(self) -> None:
         # Real thread ``01a195f0``: a step that asked for several pages at once
@@ -1017,9 +1183,9 @@ class ImageContextSizeModeTests(_ImageContextCase):
         self.assertEqual(len(carried), 2)
         self.assertEqual(carried[-1].raw, image_context_module.scan(items)[-1].raw)
         wire = json.dumps(result["input"], ensure_ascii=False)
-        for named in ("IMG-0002", "IMG-0003", "IMG-0004"):
+        for named in ("IMG-002", "IMG-003", "IMG-004"):
             self.assertIn(f"{named} omitted", wire)
-        self.assertIn("IMG-0005 provided", wire)
+        self.assertIn("IMG-005 provided", wire)
 
     def test_size_mode_omits_pictures_older_than_the_newest_result(self) -> None:
         items = self.one_turn_task(4)
@@ -1034,7 +1200,7 @@ class ImageContextSizeModeTests(_ImageContextCase):
         # The newest result's picture is the one the model just asked to see.
         self.assertEqual(after, cw._inline_image_bytes([items[-2]]))
         # Every omitted picture is still named, so it can be fetched back.
-        self.assertIn("IMG-0001", json.dumps(result["input"], ensure_ascii=False))
+        self.assertIn("IMG-001", json.dumps(result["input"], ensure_ascii=False))
 
     def test_the_setting_reaches_the_turn_being_answered(self) -> None:
         # The task that produced this pass's own bug report is one user message
@@ -1050,7 +1216,7 @@ class ImageContextSizeModeTests(_ImageContextCase):
         self.assertLess(after, before / 2)
         # The newest result's picture is the one the model just asked to see.
         self.assertEqual(after, cw._inline_image_bytes([items[-2]]))
-        self.assertIn("IMG-0001", json.dumps(result["input"], ensure_ascii=False))
+        self.assertIn("IMG-001", json.dumps(result["input"], ensure_ascii=False))
 
     def test_the_turns_own_upload_is_never_touched(self) -> None:
         # The picture the user attached is what the task is about, and the note
@@ -1089,10 +1255,10 @@ class ImageContextSizeModeTests(_ImageContextCase):
         # Its own id label is inserted before it, so a placeholder elsewhere can
         # be matched to the picture in front of the model.
         self.assertTrue(
-            any("IMG-0001" in part.get("text", "") for part in opening["content"])
+            any("IMG-001" in part.get("text", "") for part in opening["content"])
         )
         # The older tool results are what was left out.
-        self.assertIn("IMG-0002", json.dumps(result["input"], ensure_ascii=False))
+        self.assertIn("IMG-002", json.dumps(result["input"], ensure_ascii=False))
 
     def test_a_lone_tool_picture_is_kept_because_nothing_is_newer(self) -> None:
         items = self.one_turn_task(1)

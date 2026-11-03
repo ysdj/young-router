@@ -2100,6 +2100,18 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # commit is in flight, so the wizard can never stay busy behind a
         # stale embedded browser.
         self.assertIn("panelClosedDuringCommit = true", mac_leaf)
+        # A window the user closes mid-commit keeps that commit alive with no
+        # window on screen.  The child-panel lock over the workspace must still
+        # be released on every terminal branch, or the whole settings window
+        # answers no click or key while it looks perfectly live.
+        self.assertIn("private func releaseChildPresentation() {", mac_leaf)
+        release_helper = mac_leaf.split("private func releaseChildPresentation() {", 1)[1].split("private func dismissPresentation()", 1)[0]
+        self.assertIn("AppKitNativeLeaf.shared.endChildPanel(panel)", release_helper)
+        commit_close = mac_leaf.split("func cancelFromReact() {", 1)[1].split("func windowShouldClose", 1)[0]
+        self.assertIn("panelClosedDuringCommit = true", commit_close)
+        self.assertIn("releaseChildPresentation()", commit_close)
+        closed_failure = mac_leaf.split("if panelClosedDuringCommit {", 1)[1].split("signInButton.isEnabled = true", 1)[0]
+        self.assertIn("releaseChildPresentation()", closed_failure)
         self.assertNotIn("dismissWhileCommitting()", mac_leaf)
         self.assertIn("self.finish(accepted, session: session, attempt: attempt)", mac_leaf)
         self.assertIn("func windowShouldClose(_ sender: NSWindow) -> Bool", mac_leaf)
@@ -2311,6 +2323,27 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("RestoreWindowsRelaySession(", windows_relay)
         self.assertIn('HostRequest(L"host/relay/restore"', windows_core)
         self.assertIn('"/v1/host/relay/restore"', core_ipc)
+        # The probe that proves a remembered session already read the account's
+        # profile, and Core's balance is that profile divided by the site's own
+        # display unit.  Both hosts therefore carry the quota they saw into the
+        # restore, which is what turns one authenticated read into both answers
+        # instead of two; a host that omits it still works, one read later.
+        self.assertIn("quota: probe.quota", mac_leaf)
+        self.assertIn('payload["quota"] = quota', mac_core)
+        self.assertIn('FirstJsonNumber(root, {{L"data", L"quota"}, {L"quota"}})', windows_relay)
+        self.assertIn("verified->quota", windows_relay)
+        self.assertIn('payload.SetNamedValue(L"quota"', windows_core)
+        self.assertIn('"refresh_token", "user_id", "quota"', core_ipc)
+        self.assertIn("quota=quota,", core_ipc)
+        # A braced initializer fills members in declaration order, so the family
+        # a probe answered as comes before the station's own account id.  Read as
+        # "id, then family" the session was stored under the id, which ReadSession
+        # rejected against its own account type.
+        probe_result = windows_relay.split("return EndpointProbeResult{", 1)[1].split("}", 1)[0]
+        self.assertLess(
+            probe_result.index("std::string(step.family)"),
+            probe_result.index("std::move(detected_user_id)"),
+        )
 
     def test_relay_credentials_are_cleared_per_account_through_a_native_only_bridge(self) -> None:
         types = (SHARED / "types.ts").read_text(encoding="utf-8")
@@ -2772,6 +2805,13 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("frame.origin.x = NSMaxX(bounds) - strip;", controls)
         self.assertIn("frame.size.width = strip;", controls)
         self.assertIn("const NSRect clipFrame = NSMakeRect(NSMinX(bounds), NSMinY(bounds), NSWidth(bounds), NSHeight(bounds));", controls)
+        # The track ends at the viewport's bottom edge, measured from where AppKit
+        # started it.  A table's vertical scroller is tiled below the header it
+        # floats over the rows, so deriving the height from the bounds alone ran
+        # the track one header past the frame, and the knob's travel ends at the
+        # track's end: at the bottom of the content its last rows were clipped by
+        # the frame and the bar looked cut off.
+        self.assertIn("const CGFloat trackHeight = MAX(0, NSMaxY(bounds) - NSMinY(frame));", controls)
         self.assertIn("FloatPersistentScrollerOverContent(scrollView);", controls)
         # The capsule itself measures zero, so the gutter AppKit reserves for a
         # legacy scroller is zero: the table, its columns, its header, and the

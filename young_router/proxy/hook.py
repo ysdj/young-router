@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .. import claude_aliases as _claude_aliases_module
 from . import image_generation as _image_generation_module
 from . import image_context as _image_context_module
 from . import image_inputs as _image_inputs_module
@@ -52,6 +53,18 @@ class YoungRouterHook(CustomLogger):
 
         if not isinstance(data, dict):
             return None
+        # Claude Desktop's picker can only offer ids that read as an Anthropic
+        # model, so this app hands it a derived alias and keeps the real public
+        # name behind it (``claude_aliases``).  This hook is the only place that
+        # runs before deployment selection, so the alias has to become the
+        # public name here or the router refuses it as an unknown model.
+        _claude_aliases_module.rewrite_request_model(data)
+        # This hook runs once per client turn, before any deployment is chosen,
+        # so it is where the turn gets the identifier its hops share.  A model's
+        # concurrency cap is counted per turn: the hop that advances to a peer
+        # takes the peer's slot and gives the first route's back, never holding
+        # two for one request.
+        _routing_module._ensure_attempt_lease_id(data)
         if not _responses_request_module._request_is_responses_api(data):
             return None
         # Record this before any bridge or surface adapter rewrites the input:
@@ -252,6 +265,28 @@ class YoungRouterHook(CustomLogger):
             web_search_filtered = False
             web_search_unsupported_bridge = False
             responses_image_input_filtered = False
+            # A route at its concurrency cap can serve nothing, so it leaves the
+            # candidate pool exactly as a cooled route does.  The cap is per
+            # route, and the group is only narrowed while a free route remains:
+            # a group whose every route is full keeps its pool, because a single
+            # route's model group has nowhere else to go -- that attempt is told
+            # its limit was reached after the request is routed, and another hop
+            # is never invented for it.
+            concurrency_saturated: list[dict[str, Any]] = []
+            concurrency_filtered = False
+            if candidate_deployments:
+                (
+                    concurrency_available,
+                    concurrency_saturated,
+                    concurrency_filtered,
+                ) = _routing_module._with_active_model_concurrency(
+                    candidate_deployments,
+                    request_kwargs=request_kwargs,
+                )
+                if concurrency_available:
+                    candidate_deployments = concurrency_available
+                else:
+                    concurrency_filtered = False
 
             has_image_generation_tool = _tools_module._request_has_image_generation_tool(request_kwargs)
             image_tool_unsupported_deployments: list[dict[str, Any]] = []
@@ -317,6 +352,11 @@ class YoungRouterHook(CustomLogger):
                 responses_image_input_filtered=responses_image_input_filtered,
                 session_affinity_deployment_id=session_affinity_deployment_id,
                 session_affinity_applied=session_affinity_applied,
+                concurrency_filtered=concurrency_filtered,
+                concurrency_all_candidates=bool(
+                    concurrency_saturated and not concurrency_filtered
+                ),
+                concurrency_saturated=concurrency_saturated,
                 request_preview=_trace_module._trace_request_preview(request_kwargs, messages=messages),
                 request=_trace_module._trace_request_summary(request_kwargs, messages=messages),
                 healthy=_routing_module._trace_deployments(original_deployments),

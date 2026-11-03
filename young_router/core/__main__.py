@@ -144,6 +144,13 @@ def run(argv: list[str] | None = None) -> int:
     # The interval loop lives beside the IPC server: it reads the saved switch
     # and interval, so a machine nobody is looking at still syncs.
     webdav_scheduler = core.webdav_scheduler()
+    # The generated client model lists follow the router with no window open:
+    # a provider Apply regenerates them through the proxy reload, and this loop
+    # is the path for a change that owed no reload.
+    # Optional: a store that predates this loop (or a test double) simply runs
+    # without it, because the lists are bookkeeping rather than a service.
+    client_model_sync = getattr(core, "client_model_sync", None)
+    client_model_sync = client_model_sync() if callable(client_model_sync) else None
     # The image-context cache is swept after every write; this loop is the
     # path that still runs when the pass is off and no write arrives.
     image_context_sweeper = core.image_context_sweeper()
@@ -165,6 +172,8 @@ def run(argv: list[str] | None = None) -> int:
             return 0
         server.start()
         webdav_scheduler.start()
+        if client_model_sync is not None:
+            client_model_sync.start()
         image_context_sweeper.start()
         if service_supervisor is not None:
             service_supervisor.start()

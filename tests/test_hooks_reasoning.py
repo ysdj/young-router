@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 
 from hook_test_utils import HookTestCase, load_hook_module
@@ -195,6 +196,59 @@ class HookReasoningMappingTests(HookTestCase):
         self.assertIsNotNone(mapped)
         assert mapped is not None
         self.assertEqual("high", mapped["reasoning_effort"])
+
+    def test_messages_effort_is_clamped_up_to_the_nearest_level_a_route_serves(self) -> None:
+        """Claude clients state depth as ``output_config.effort``, not ``reasoning_effort``.
+
+        Claude Desktop's Effort control offers its own ladder (``low`` through
+        ``max``) for every model it lists, while a route only serves the levels
+        its provider maps.  A tier the route does not serve therefore has to be
+        reconciled here, and the rule is Pi's: take the nearest *higher* level,
+        and only fall back downwards when nothing above is served -- asking for
+        more thinking must never silently buy less.
+        """
+
+        hooks, _ = load_hook_module()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        self._configure_pi_cache(
+            root,
+            {
+                "custom/through-high": self._record(
+                    {
+                        "off": "none",
+                        "minimal": None,
+                        "low": "low",
+                        "medium": None,
+                        "high": "high",
+                        "xhigh": None,
+                        "max": None,
+                    }
+                ),
+            },
+        )
+        litellm_params = {"model": "through-high", "custom_llm_provider": "custom"}
+
+        def effort(sent: str) -> str:
+            request = {
+                "model": "through-high",
+                "litellm_params": dict(litellm_params),
+                "output_config": {"effort": sent},
+            }
+            mapped = hooks._with_model_reasoning_mapping(request)
+            # ``None`` is "nothing to reconcile": the route serves the level the
+            # client stated, and the request goes out exactly as it came in.
+            return request["output_config"]["effort"] if mapped is None else mapped["output_config"]["effort"]
+
+        # Upwards to the nearest served level.
+        self.assertEqual("high", effort("medium"))
+        self.assertEqual("high", effort("xhigh"))
+        self.assertEqual("high", effort("max"))
+        self.assertEqual("high", effort("ultra"))
+        # A level the route serves is left exactly as the client stated it.
+        self.assertEqual("low", effort("low"))
+        self.assertEqual("none", effort("none"))
 
     async def test_pre_call_hook_applies_pi_mapping_after_deployment_selection(self) -> None:
         hooks, _ = load_hook_module()

@@ -672,7 +672,13 @@ export function StationAccountsPanel({
   // opens the pane on load.
   const selected = stationAccounts.find((account) => account.id === selectedID)
     ?? (selectedID === undefined ? stationAccounts[0] : undefined);
-  const controlsBusy = busy || formBusy || stationBusy;
+  // The window's own busy flag describes work another surface started — an
+  // Apply of the pane the user just left, an official sign-in, a data-management
+  // read.  Every control here acts on this station account and stages through
+  // its own guarded lane, so only this panel's writes hold them: gating on the
+  // window flag made 去登录 read as disabled with nothing on screen to explain
+  // why.
+  const controlsBusy = formBusy || stationBusy;
   const publish = (message: string): void => {
     onStatus?.(message);
   };

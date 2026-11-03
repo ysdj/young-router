@@ -233,6 +233,14 @@ async def _stream_streaming_error_fallback(
             return
         except Exception as exc:
             buffered_chunks.clear()
+            # The attempt whose stream just ended is no longer in flight, so its
+            # concurrency slot goes back before the next hop is selected
+            # against the count.  Only an attempt that was cut before it
+            # delivered visible output may advance; one that already rewrote
+            # the client's stream keeps its slot until the lease ages out,
+            # because the turn really did hold the route for that long.
+            if not started_delivery:
+                _routing_module._release_request_concurrency_slots(request_data)
             if started_delivery:
                 _routing_module._mark_same_deployment_retry_exhausted(exc)
                 _routing_module._sync_failed_deployment_exclusions(request_data, exc)
@@ -1474,13 +1482,14 @@ async def _stream_route_recovery_poll(
                         exception=_routing_module._trace_exception(last_exception),
                     )
                     break
-                last_exception = poll_exception
-                _trace_module._request_route_trace(
-                    "route_recovery_poll_attempt_failed", request_data,
-                    poll_attempt=attempt,
-                    elapsed_seconds=round(time.monotonic() - started_at_monotonic, 3),
-                    exception=_routing_module._trace_exception(last_exception),
-                )
+                else:
+                    last_exception = poll_exception
+                    _trace_module._request_route_trace(
+                        "route_recovery_poll_attempt_failed", request_data,
+                        poll_attempt=attempt,
+                        elapsed_seconds=round(time.monotonic() - started_at_monotonic, 3),
+                        exception=_routing_module._trace_exception(last_exception),
+                    )
 
             now = time.monotonic()
             if max_poll_seconds <= 0 or (

@@ -1321,10 +1321,17 @@ void FloatPersistentScrollerOverContent(NSScrollView *scrollView)
     // last tiled: a resize (the provider wizard grows a row, a pane swaps its
     // content) left the capsule at the old viewport height, so its knob sat
     // where the previous layout had put it and the track ended short of the
-    // bottom edge.  Re-derive the track from the bounds this pass measured and
-    // let AppKit recompute the knob inside it.
-    const CGFloat trackHeight = NSHeight(bounds);
-    if (fabs(NSHeight(frame) - trackHeight) > 0.5) {
+    // bottom edge.  Re-derive the track from the edges this pass measured and
+    // let AppKit recompute the knob inside it — measured from where AppKit
+    // started the track, never from the bounds' top.  Outside a table the two
+    // agree, but AppKit tiles a table's vertical scroller *below* the header it
+    // floats over the rows (the scroll view's `contentInsets`), so one full
+    // bounds height from that origin ran the track one header past the bottom
+    // edge.  The knob's travel ends at the track's end, so at the end of the
+    // content its bottom was drawn outside the frame and clipped by it: the bar
+    // looked cut off exactly where the user had scrolled to.
+    const CGFloat trackHeight = MAX(0, NSMaxY(bounds) - NSMinY(frame));
+    if (trackHeight > 0 && fabs(NSHeight(frame) - trackHeight) > 0.5) {
       frame.size.height = trackHeight;
     }
     scrollView.verticalScroller.frame = frame;

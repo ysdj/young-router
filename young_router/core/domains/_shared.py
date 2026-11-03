@@ -66,6 +66,25 @@ def _default_runtime_settings_path() -> Path:
     return Path(configured).expanduser() if configured else _default_runtime_root() / "runtime-settings.env"
 
 
+def runtime_setting_text(key: str) -> str:
+    """One effective Runtime Settings value, or ``""`` when it cannot be read.
+
+    Read through the same schema the proxy is handed, so a pane that states an
+    inherited number states the number the next worker will actually use -- not
+    a copy of the default kept somewhere in the UI, which is how a pane starts
+    explaining a limit the proxy no longer has.
+    """
+
+    try:
+        from ..runtime_settings_io import load_specs, read_settings_file
+
+        values = read_settings_file(_default_runtime_settings_path(), load_specs())
+    except Exception:
+        return ""
+    value = values.get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
 def _app_state_root(
     runtime_root: Path | str | None,
     runtime_settings_path: Path | str | None,

@@ -27,6 +27,7 @@ HOOK_MODULE_NAMES = (
     "proxy.codex_fast_tier",
     "proxy.trace",
     "log_rotation",
+    "proxy.concurrency",
     "proxy.state",
     "proxy.routing",
     "proxy.responses_tools",

@@ -25,8 +25,11 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import update_context_attachment_manager as gate  # noqa: E402
 
 
-_REWRITE = """
-// The image sits in the history, so the model concludes it never saw it.
+# Upstream split the old ``plugin/src/rewrite.ts`` in two: the placeholder
+# wording became its own module and each protocol got its own rewriter.  The
+# fixtures follow that layout so a release that moves a mirrored sentence one
+# level further still fails the gate.
+_WORDS = """
 const WORDS = {
   zh: {
     heading: (id, label, state, fields) => `[图片 ${id}${label ? `（${label}）` : ""} ${state}｜${fields.join("｜")}]`,
@@ -36,6 +39,10 @@ const WORDS = {
     autoNote: ["上下文管理说明（来自用户安装的上下文素材管理工具）：这个任务开着“自动选图”。"],
   },
 };
+"""
+
+_REWRITE = """
+// The image sits in the history, so the model concludes it never saw it.
 export function rewriteItems(items, describe, unchecked, pixelHash, options = "zh") {
   return { items, report: {} };
 }
@@ -47,17 +54,26 @@ export function readSelection(threadId: string, dir: string): Selection { return
 """
 
 _THREAD_INDEX = """
+# The id width the panel, the notes reader and the placeholder regex all
+# accept is ``IMG-\\d{3,}``; three is what upstream writes.
 const entry = { id: `IMG-${String(images.length + 1).padStart(3, "0")}`, turn };
 """
 
 
-def _release_archive(version: str = "0.9.1", *, rewrite: str = _REWRITE) -> bytes:
+def _release_archive(
+    version: str = "0.9.1",
+    *,
+    rewrite: str = _REWRITE,
+    words: str = _WORDS,
+    index: str | None = None,
+) -> bytes:
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as bundle:
         for name, text in (
-            ("plugin/src/rewrite.ts", rewrite),
-            ("plugin/src/selection.ts", _SELECTION),
-            ("plugin/src/thread-index.ts", _THREAD_INDEX),
+            ("plugin/src/core/words.ts", words),
+            ("plugin/src/adapters/protocols/openai-responses/rewrite.ts", rewrite),
+            ("plugin/src/core/selection.ts", _SELECTION),
+            ("plugin/src/core/request-index.ts", _THREAD_INDEX if index is None else index),
         ):
             payload = text.encode("utf-8")
             info = tarfile.TarInfo(f"context-attachment-manager-{version}/{name}")
@@ -97,17 +113,35 @@ class ContextAttachmentManagerGateTests(unittest.TestCase):
         recorded = json.loads((output / "release.json").read_text(encoding="utf-8"))
         self.assertEqual(recorded["version"], "0.9.1")
         self.assertEqual(recorded["repository"], gate.REPOSITORY)
-        self.assertIn("plugin/src/rewrite.ts", recorded["verified"])
+        self.assertIn("plugin/src/core/words.ts", recorded["verified"])
+        self.assertIn(
+            "plugin/src/adapters/protocols/openai-responses/rewrite.ts",
+            recorded["verified"],
+        )
 
     def test_a_release_that_reworded_the_manual_placeholder_fails_the_build(self) -> None:
-        reworded = _REWRITE.replace("需要重看时，在回复里写", "需要看这张图时，回复")
+        reworded = _WORDS.replace("需要重看时，在回复里写", "需要看这张图时，回复")
 
         with self.assertRaises(gate.UpdateError) as raised:
-            self.stage(archive=_release_archive(rewrite=reworded))
+            self.stage(archive=_release_archive(words=reworded))
 
         message = str(raised.exception)
-        self.assertIn("plugin/src/rewrite.ts", message)
+        self.assertIn("plugin/src/core/words.ts", message)
         self.assertIn("manual placeholder sentence", message)
+
+    def test_a_release_that_widened_the_image_id_fails_the_build(self) -> None:
+        # The panel writes selections by the id it shows, and this pass writes
+        # the placeholders the model reads; a release that numbered images four
+        # digits wide would leave a selection the user made naming an id nothing
+        # here ever writes, and a placeholder no reader of its own accepts.
+        widened = _THREAD_INDEX.replace('padStart(3, "0")', 'padStart(4, "0")')
+
+        with self.assertRaises(gate.UpdateError) as raised:
+            self.stage(archive=_release_archive(index=widened))
+
+        message = str(raised.exception)
+        self.assertIn("plugin/src/core/request-index.ts", message)
+        self.assertIn("numbering", message)
 
     def test_a_release_that_dropped_the_pinned_selection_key_fails_the_build(self) -> None:
         without_pinned = _SELECTION.replace("pinned?: Record<string, Mark>", "")
@@ -117,9 +151,10 @@ class ContextAttachmentManagerGateTests(unittest.TestCase):
             buffer = io.BytesIO()
             with tarfile.open(fileobj=buffer, mode="w:gz") as bundle:
                 for name, text in (
-                    ("plugin/src/rewrite.ts", _REWRITE),
-                    ("plugin/src/selection.ts", without_pinned),
-                    ("plugin/src/thread-index.ts", _THREAD_INDEX),
+                    ("plugin/src/core/words.ts", _WORDS),
+                    ("plugin/src/adapters/protocols/openai-responses/rewrite.ts", _REWRITE),
+                    ("plugin/src/core/selection.ts", without_pinned),
+                    ("plugin/src/core/request-index.ts", _THREAD_INDEX),
                 ):
                     payload = text.encode("utf-8")
                     info = tarfile.TarInfo(f"context-attachment-manager-0.9.1/{name}")
@@ -139,7 +174,7 @@ class ContextAttachmentManagerGateTests(unittest.TestCase):
             with self.assertRaises(gate.UpdateError) as raised:
                 gate.stage(Path(directory.name) / "staged")
 
-        self.assertIn("plugin/src/selection.ts", str(raised.exception))
+        self.assertIn("plugin/src/core/selection.ts", str(raised.exception))
 
     def test_a_second_build_reuses_the_verified_release(self) -> None:
         output = self.stage()
@@ -187,8 +222,11 @@ class ContextAttachmentManagerGateTests(unittest.TestCase):
 
     def test_the_pinned_release_is_the_one_the_scripts_describe(self) -> None:
         # The pin is what a reviewer reads to know which upstream behaviour the
-        # mirrored wording came from.
-        self.assertRegex(gate.PINNED_RELEASE, r"^\d+\.\d+\.\d+$")
+        # mirrored wording came from, and it is the last release whose layout
+        # this gate was re-checked against: 0.11.0 is the one that split
+        # ``rewrite.ts`` into ``core/words.ts`` plus a per-protocol rewriter and
+        # moved the index to ``core/request-index.ts``.
+        self.assertEqual(gate.PINNED_RELEASE, "0.11.0")
 
 
 if __name__ == "__main__":  # pragma: no cover

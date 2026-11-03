@@ -43,6 +43,8 @@ from .schema import (
     MENU_RELAY_KEYS_VERSION,
     MENU_RELAY_SOURCE_MODEL_KEY,
     MENU_ROUTE_KEY,
+    MODEL_CONCURRENCY_KEY,
+    MODEL_CONCURRENCY_MAX,
     MODEL_ORDER_MODES,
     PUBLIC_MODEL_CONTEXT_KEY,
     RANDOM_DEPLOYMENT_ID_RE,
@@ -89,6 +91,30 @@ def _numeric_order(value: Any) -> int | float:
         raise ValueError(f"Invalid route order: {text}")
     if isinstance(parsed, float) and not math.isfinite(parsed):
         raise ValueError(f"Invalid route order: {text}")
+    return parsed
+
+
+def _route_concurrency(value: Any) -> int | None:
+    """One route's own concurrency cap, or ``None`` when it states none.
+
+    Kept apart from its neighbours because ``0`` is a stated value here — the
+    route is unlimited — while an absent key is the route following the
+    runtime's default.  Writing one as the other would make a saved route stop
+    tracking a setting the user changes later, or start capping a route the user
+    deliberately left uncapped.
+    """
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    parsed = _parse_scalar(str(value).strip())
+    if isinstance(parsed, bool) or not isinstance(parsed, (int, float)):
+        raise ValueError(f"Invalid route concurrency: {value}")
+    if isinstance(parsed, float):
+        if not math.isfinite(parsed) or not parsed.is_integer():
+            raise ValueError(f"Invalid route concurrency: {value}")
+        parsed = int(parsed)
+    if parsed < 0 or parsed > MODEL_CONCURRENCY_MAX:
+        raise ValueError(f"Invalid route concurrency: {value}")
     return parsed
 
 
@@ -618,6 +644,14 @@ def _entry_from_editor(
         model_info.pop(PUBLIC_MODEL_CONTEXT_KEY, None)
     else:
         model_info[PUBLIC_MODEL_CONTEXT_KEY] = limit
+    # This route's own concurrency cap.  A route that states nothing writes
+    # nothing, so it keeps following the runtime's global limit; a stated ``0``
+    # is written as ``0`` because "unlimited" is a choice, not an absent one.
+    route_concurrency = _route_concurrency(model.get(MODEL_CONCURRENCY_KEY))
+    if route_concurrency is None:
+        model_info.pop(MODEL_CONCURRENCY_KEY, None)
+    else:
+        model_info[MODEL_CONCURRENCY_KEY] = route_concurrency
 
     if params:
         entry["litellm_params"] = params

@@ -15,7 +15,9 @@ the part this app mirrors has moved:
 * the ``IMG-xxx`` numbering its index assigns,
 * the placeholder sentences and the heading both modes write,
 * the developer note that explains the placeholders,
-* the ``unchecked`` / ``pinned`` / ``auto`` shape of its selection state.
+* the ``unchecked`` / ``pinned`` / ``auto`` shape of its selection state,
+* the ``IMG-%03d`` shape of an image id (this pass numbers with it too, so a
+  selection made in that panel names the images this pass wrote).
 
 The release is resolved over the git protocol and its source archive is fetched
 from codeload, not from the GitHub REST API: an anonymous API call is rate
@@ -62,25 +64,35 @@ ARCHIVE_URL = os.environ.get(
     "CONTEXT_ATTACHMENT_MANAGER_ARCHIVE_URL",
     f"https://codeload.github.com/{REPOSITORY}/tar.gz/refs/tags",
 )
-# The release this checkout's placeholder wording and selection reader were
-# written against.  A newer release is accepted only if every mirrored detail
-# below still matches, which is what makes an upgrade safe to take.
-PINNED_RELEASE = "0.9.1"
+# The release this checkout's placeholder wording, id shape and selection reader
+# were last re-checked against.  A newer release is accepted only if every
+# mirrored detail below still matches, which is what makes an upgrade safe to
+# take.
+PINNED_RELEASE = "0.11.0"
 DEFAULT_TIMEOUT_SECONDS = 60
 USER_AGENT = "Young-Router/context-attachment-manager-build"
 
 # Files this app mirrors.  They are read from the release's own source archive;
 # nothing is copied into the bundle.
-REWRITE_SOURCE = "plugin/src/rewrite.ts"
-SELECTION_SOURCE = "plugin/src/selection.ts"
-THREAD_INDEX_SOURCE = "plugin/src/thread-index.ts"
+# Upstream split one ``plugin/src/rewrite.ts`` into a wording module and a
+# per-protocol rewriter, so the things this app mirrors now live apart: the
+# placeholder sentences and the heading are in ``core/words.ts``, the item
+# rewriter this pass mirrors is the Responses one, and the index that numbers a
+# placeholder is ``core/request-index.ts``.  The sentences and the selection
+# fields are the same text as before; what the split did add is the id width,
+# which the numbering marker now states -- a release that widened it would write
+# placeholders whose ids no selection of that panel could ever name.
+REWRITE_SOURCE = "plugin/src/adapters/protocols/openai-responses/rewrite.ts"
+WORDS_SOURCE = "plugin/src/core/words.ts"
+SELECTION_SOURCE = "plugin/src/core/selection.ts"
+THREAD_INDEX_SOURCE = "plugin/src/core/request-index.ts"
 
 # What the mirrored behaviour depends on.  Each entry is (file, pattern, why).
 REQUIRED_MARKERS: tuple[tuple[str, str, str], ...] = (
     (
         THREAD_INDEX_SOURCE,
-        r"IMG-\$\{String\(",
-        "the IMG-xxx numbering a placeholder names changed",
+        r"IMG-\$\{String\([^}]*\)[^`]*padStart\(3\b",
+        "the IMG-001 numbering a placeholder names changed, or an image id widened past IMG-%03d",
     ),
     (
         REWRITE_SOURCE,
@@ -88,27 +100,27 @@ REQUIRED_MARKERS: tuple[tuple[str, str, str], ...] = (
         "the placeholder writer this pass mirrors is gone or renamed",
     ),
     (
-        REWRITE_SOURCE,
+        WORDS_SOURCE,
         r"需要重看时，在回复里写",
         "the manual placeholder sentence changed",
     ),
     (
-        REWRITE_SOURCE,
+        WORDS_SOURCE,
         r"需要原图时调用",
         "the automatic placeholder sentence changed",
     ),
     (
-        REWRITE_SOURCE,
+        WORDS_SOURCE,
         r"已省略",
         "the placeholder heading state changed",
     ),
     (
-        REWRITE_SOURCE,
+        WORDS_SOURCE,
         r"heading: \(id, label, state, fields\)",
         "the placeholder heading shape changed",
     ),
     (
-        REWRITE_SOURCE,
+        WORDS_SOURCE,
         r"上下文管理说明",
         "the developer note this pass mirrors changed",
     ),

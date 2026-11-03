@@ -303,6 +303,13 @@ def run(argv: list[str] | None = None) -> int:
     # request row an earlier process left unfinished can never receive its
     # terminal callback.  Close those rows before the workers start serving.
     settle_stale_recent_requests()
+    # The same reading applies to the concurrency leases: every lease in the
+    # shared file belongs to a worker this start replaced.  Left alone, each one
+    # would hold a slot on its route until its lease aged out, and the routes
+    # would serve less than their cap for hours.
+    from .concurrency import reset_leases
+
+    reset_leases()
 
     # The one handover that can lose the whole start: see the guard.
     _install_worker_handover_guard()

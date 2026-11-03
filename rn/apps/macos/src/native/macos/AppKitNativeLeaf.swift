@@ -2139,7 +2139,8 @@ private enum NativeRelayOriginPolicy {
                 cookie: probe.cookie,
                 accessToken: probe.accessToken,
                 refreshToken: probe.refreshToken,
-                userID: probe.userID
+                userID: probe.userID,
+                quota: probe.quota
             )
         case .expired:
             return try? CoreIPCBridge.shared.restoreRelaySession(
@@ -7645,6 +7646,13 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     func windowWillClose(_ notification: Notification) {
         if activeCheck?.isCommitting() == true {
             panelClosedDuringCommit = true
+            // The window is already gone, and the commit deliberately keeps
+            // running without it.  Nothing else releases the child-panel lock
+            // in that state: the workspace kept swallowing every click and key
+            // press with no window on screen to explain it.  Release the
+            // presentation here; the commit's own outcome still reports to
+            // the React side when it lands.
+            releaseChildPresentation()
             return
         }
         cancel(nil)
@@ -7663,6 +7671,11 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         if panelClosedDuringCommit {
             finished = true
             clearCapturedCredentials()
+            // Same boundary as the close above: a commit that failed after its
+            // window went away settles the flow, so the lock over the
+            // workspace goes with it.  ``endChildPanel`` is idempotent, so
+            // releasing here as well as in ``windowWillClose`` is safe.
+            releaseChildPresentation()
             let callback = completion
             completion = nil
             session.finishTasksAndInvalidate()
@@ -7803,6 +7816,16 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         capturedRefreshToken = nil
         capturedUserID = nil
         capturedPassword = nil
+    }
+
+    /// Release the lock this window holds over the workspace it was opened
+    /// from.  The mid-commit close path keeps the flow alive after its window
+    /// is already gone, so every terminal branch of that flow has to release
+    /// the presentation itself.  Ending a panel that is no longer registered
+    /// is a harmless no-op, which is what lets both paths call this.
+    private func releaseChildPresentation() {
+        guard let panel else { return }
+        AppKitNativeLeaf.shared.endChildPanel(panel)
     }
 
     private func dismissPresentation() {
@@ -8226,6 +8249,11 @@ private struct NativeRelaySessionProbeResult {
     let accessToken: String
     let refreshToken: String
     let userID: String
+    // The New API ``quota`` the same profile read stated.  Core's balance is
+    // this number divided by the site's display unit, so carrying it over is
+    // what makes the probe answer the balance question too -- and the entry
+    // then costs one authenticated read instead of two.
+    let quota: Double?
 }
 
 private enum NativeRelaySessionProbeOutcome {
@@ -8331,7 +8359,10 @@ private enum NativeRelaySessionProbe {
             // the session that just proved itself, so a session whose account
             // changed cannot keep sending the previous account's id.
             let userID = stationUserID(object) ?? session.userID
-            return .verified(NativeRelaySessionProbeResult(username: username, cookie: cookie, accessToken: accessToken, refreshToken: refreshToken, userID: userID))
+            // The profile this probe accepted is also the account's balance, so
+            // the number travels with the session it was read beside.
+            let quota = firstNumber(object, paths: ["data", "quota"], ["quota"])
+            return .verified(NativeRelaySessionProbeResult(username: username, cookie: cookie, accessToken: accessToken, refreshToken: refreshToken, userID: userID, quota: quota))
         }
         return sawAuthenticationRejection && !sawNonAuthenticationFailure ? .expired : .unavailable
     }
@@ -8377,6 +8408,28 @@ private enum NativeRelaySessionProbe {
                 continue
             }
             if !text.isEmpty, text.count <= 32, text.allSatisfy({ $0.isNumber }) { return text }
+        }
+        return nil
+    }
+
+    private static func firstNumber(_ value: Any, paths: [String]...) -> Double? {
+        for path in paths {
+            var current: Any = value
+            var valid = true
+            for key in path {
+                guard let map = current as? [String: Any], let next = map[key] else { valid = false; break }
+                current = next
+            }
+            guard valid else { continue }
+            let number: Double?
+            if let value = current as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID() {
+                number = value.doubleValue
+            } else if let text = current as? String {
+                number = Double(text.trimmingCharacters(in: .whitespacesAndNewlines))
+            } else {
+                number = nil
+            }
+            if let number, number.isFinite { return number }
         }
         return nil
     }

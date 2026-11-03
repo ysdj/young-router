@@ -2455,6 +2455,11 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
         try {
           const summary = await ipc.validate(name, revision.current);
           validatedMessage ??= validationSummaryMessage(summary, translate);
+          // One precise message is the whole point of this pass.  Asking every
+          // remaining domain after it kept a failed window's controls disabled
+          // for another request budget each, which the user read as a frozen
+          // window rather than as a validation result.
+          if (validatedMessage) break;
         } catch {
           // A domain that is not part of this transaction must not hide the
           // validation detail from the domain that is.
@@ -2975,7 +2980,11 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   // A child surface applies the draft it wrote itself (分组管理's 保存并关闭):
   // the pane it was opened from must stay silent about work it did not start,
   // and the child reports the outcome in its own status bar.
-  const applyStagedQuietly = (): Promise<void> => apply({ quiet: true });
+  // A child surface's own commit is background work for the pane underneath
+  // it: the sheet is already gone when the write lands, so holding that pane
+  // disabled for it is the same unexplained freeze the navigation flush used
+  // to produce.
+  const applyStagedQuietly = (): Promise<void> => apply({ quiet: true, keepControlsEnabled: true });
   // The settings shell commits as the user changes controls. Wait for the
   // route's serial dispatch queue, then apply the staged domains; the debounce
   // coalesces a burst of toggles into one Core apply. A failed apply keeps its
@@ -3039,7 +3048,14 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       return false;
     }
     await dispatchQueue.current;
-    await apply({ silent: true });
+    // The commit belongs to the pane being left, but its wait must not follow
+    // the user into the pane they opened: the flush runs after navigation has
+    // already rendered the destination, and a pane-wide busy flag here left
+    // every input of the new pane disabled with the strip reading 就绪 for as
+    // long as Core spent applying a relay-bound draft.  Later edits queue
+    // behind this Apply and stage on the revision it produces, exactly as they
+    // do behind the debounced auto-apply.
+    await apply({ silent: true, keepControlsEnabled: true });
     return true;
   };
   // Clear the close-blocked notice as soon as the invalid drafts are fixed.
@@ -3477,7 +3493,11 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   const claudeModelRows = asRecords(claudeState.models);
   // One strip per window. Backup & sync reports per tab, so the strip shows the
   // active tab's own result; every other route reports its own work here.
-  const routeStatus = result;
+  // A wait is never Ready.  A counted run clears its result before it starts,
+  // so a window whose controls are held by an in-flight action would otherwise
+  // read 就绪 while nothing answered it — the one word that must not describe a
+  // window that is still waiting.
+  const routeStatus = result ?? (busy ? translate("common.working") : undefined);
   // A route may put controls in this strip instead of drawing a bar of its own:
   // the usage pager belongs beside the status it changes, not in a second row
   // above an empty strip.
@@ -3511,7 +3531,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
         mid-action and the pane below it keeps a stable height.  A child window
         keeps no strip of its own: it states its result beside its own footer
         buttons instead. */}
-    {shell ? <View style={[styles.routeStatusBar, Platform.OS === "windows" && styles.routeStatusBarWindows]}><Text numberOfLines={2} style={[styles.routeStatusText, Platform.OS === "windows" && styles.routeStatusTextWindows]}>{routeStatus ?? translate("common.ready")}</Text>{statusBarControls}</View> : null}
+    {shell ? <View style={[styles.routeStatusBar, Platform.OS === "windows" && styles.routeStatusBarWindows]}><View style={styles.routeStatusLead}>{busy ? <NativeBusySpinner label={translate("common.working")} /> : null}<Text numberOfLines={2} style={[styles.routeStatusText, Platform.OS === "windows" && styles.routeStatusTextWindows]}>{routeStatus ?? translate("common.ready")}</Text></View>{statusBarControls}</View> : null}
   </View></PendingFieldContext.Provider></TranslationContext.Provider>;
 }
 
@@ -5903,6 +5923,10 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     return Array.from(groups, ([name, entries]) => ({ name, entries }));
   }, [routes]);
   const modelContexts = asRecord(state.model_contexts);
+  // The concurrency cap a route that states none of its own follows, read from the
+  // same snapshot the routes arrive in: the model detail explains this number,
+  // so it must be the one the proxy will actually use.
+  const globalConcurrencyLimit = numberValue(state.model_concurrency_default, 8);
   // Why the last relay-bound Apply refused: Core hands back the rows it named,
   // so the pane marks the key or route instead of only stating the outcome.
   const bindingIssues = asRecords(state.binding_issues);
@@ -6442,10 +6466,10 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         </View>
       </View>}
     </View>
-    {showProviderInspector ? <View style={styles.providerInspector}>{viewMode === "routes" ? (activePublicGroup ? <PublicModelInspector key={`public:${activePublicGroup.name}`} group={activePublicGroup} modelContexts={modelContexts} backLabel={publicModelReturn?.label} onBackToModel={returnToPublicModelOrigin} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} onRenamed={(next) => { setSelectedPublicModel(next); setSelectedRoute(""); }} /> : activeRoute ? (providerSourceModel ? <ProviderEditor key={`provider:${editorIdentifier(activeRoute.provider)}`} provider={activeRoute.provider} relaySources={relaySources} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(editorIdentifier(activeRoute.provider), value)} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} station={stationForProvider(activeRoute.provider)} stationAccounts={stationAccountsFor(activeRoute.provider)} relay={relay} addOfficialAccount={addOfficialAccount} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <ModelInspector key={`model:${editorIdentifier(activeRoute.provider)}:${editorIdentifier(activeRoute.model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(activeRoute.model)} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), probeInputFingerprint(providerBaseURL(activeRoute.provider), modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model), activeRoute.model))} onNameDraftChange={(value) => setModelNameDraft(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), value)} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onOpenPublicModel={() => { // The pane is keyed by the name the routes table groups under, which is
+    {showProviderInspector ? <View style={styles.providerInspector}>{viewMode === "routes" ? (activePublicGroup ? <PublicModelInspector key={`public:${activePublicGroup.name}`} group={activePublicGroup} modelContexts={modelContexts} backLabel={publicModelReturn?.label} onBackToModel={returnToPublicModelOrigin} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} onRenamed={(next) => { setSelectedPublicModel(next); setSelectedRoute(""); }} /> : activeRoute ? (providerSourceModel ? <ProviderEditor key={`provider:${editorIdentifier(activeRoute.provider)}`} provider={activeRoute.provider} relaySources={relaySources} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(editorIdentifier(activeRoute.provider), value)} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} station={stationForProvider(activeRoute.provider)} stationAccounts={stationAccountsFor(activeRoute.provider)} relay={relay} addOfficialAccount={addOfficialAccount} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <ModelInspector key={`model:${editorIdentifier(activeRoute.provider)}:${editorIdentifier(activeRoute.model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(activeRoute.model)} globalConcurrencyLimit={globalConcurrencyLimit} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), probeInputFingerprint(providerBaseURL(activeRoute.provider), modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model), activeRoute.model))} onNameDraftChange={(value) => setModelNameDraft(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), value)} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onOpenPublicModel={() => { // The pane is keyed by the name the routes table groups under, which is
                   // the display name the drafts already project, so 设置 opens that
                   // group's settings even while the name field holds a draft.
-                  const publicModel = activeRoute.publicModel.trim(); if (!publicModel) return; selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: activeRoute.key, label: modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: editorIdentifier(activeRoute.provider), model_id: editorIdentifier(activeRoute.model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(activeRoute.model)); setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`); setProviderSourceModel(undefined); })} />) : <EmptyState translate={translate} />) : provider && model ? <ModelInspector key={`model:${providerId}:${editorIdentifier(model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={provider} providerId={providerId} model={model} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(model)} {...modelProbeProps(providerId, editorIdentifier(model), probeInputFingerprint(providerBaseURL(provider), modelUpstreamDisplay(providerId, model), model))} onNameDraftChange={(value) => setModelNameDraft(providerId, editorIdentifier(model), value)} onProviderClick={() => { setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onOpenPublicModel={() => { const publicModel = modelDisplayName(providerId, model).trim(); if (!publicModel) return; const originRouteKey = `${providerId}:${stringValue(model.editor_id, stringValue(model.deployment_id, identifier(model))).trim()}`; setViewMode("routes"); selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: originRouteKey, label: modelUpstreamDisplay(providerId, model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: providerId, model_id: editorIdentifier(model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(model)); setProviderSourceModel(undefined); })} /> : provider ? <ProviderEditor key={`provider:${providerId}`} provider={provider} relaySources={relaySources} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(providerId, value)} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} station={selectedStation} stationAccounts={selectedStationAccounts} relay={relay} addOfficialAccount={addOfficialAccount} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <EmptyState translate={translate} />}</View>
+                  const publicModel = activeRoute.publicModel.trim(); if (!publicModel) return; selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: activeRoute.key, label: modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: editorIdentifier(activeRoute.provider), model_id: editorIdentifier(activeRoute.model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(activeRoute.model)); setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`); setProviderSourceModel(undefined); })} />) : <EmptyState translate={translate} />) : provider && model ? <ModelInspector key={`model:${providerId}:${editorIdentifier(model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={provider} providerId={providerId} model={model} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(model)} globalConcurrencyLimit={globalConcurrencyLimit} {...modelProbeProps(providerId, editorIdentifier(model), probeInputFingerprint(providerBaseURL(provider), modelUpstreamDisplay(providerId, model), model))} onNameDraftChange={(value) => setModelNameDraft(providerId, editorIdentifier(model), value)} onProviderClick={() => { setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onOpenPublicModel={() => { const publicModel = modelDisplayName(providerId, model).trim(); if (!publicModel) return; const originRouteKey = `${providerId}:${stringValue(model.editor_id, stringValue(model.deployment_id, identifier(model))).trim()}`; setViewMode("routes"); selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: originRouteKey, label: modelUpstreamDisplay(providerId, model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: providerId, model_id: editorIdentifier(model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(model)); setProviderSourceModel(undefined); })} /> : provider ? <ProviderEditor key={`provider:${providerId}`} provider={provider} relaySources={relaySources} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(providerId, value)} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} station={selectedStation} stationAccounts={selectedStationAccounts} relay={relay} addOfficialAccount={addOfficialAccount} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <EmptyState translate={translate} />}</View>
     : null}
     <RelayDialogHost />
   </View></ProviderWorkspaceDraftContext.Provider>;
@@ -6833,26 +6857,33 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
         </View>)}
       </> : selectedProvided ? <>
         {/* Relay keys match the custom key editor: name + value only. */}
-        {keysEditorField("key-name", translate("providers.keyName"), <TextField
-          key={`provided-key-name:${selectedProvided.key}`}
-          labelVisible={false}
-          label={translate("providers.keyName")}
-          value={selectedProvidedName}
-          disabled={controlsBusy || selectedProvided.account.autoGrouping}
-          onDraftChange={(value) => setProvidedNameDrafts((current) => ({ ...current, [selectedProvided.key]: value }))}
-          onCommit={(value) => {
-            const name = value.trim();
-            if (!name || name === selectedProvided.resource.name || selectedProvided.account.autoGrouping) return;
-            void runProvidedAction(() => relay.apiKeyActions.update?.(selectedProvided.account.id, selectedProvided.resource.id, name) ?? Promise.resolve(), "relay.apiKeyUpdateStaged");
-          }}
-        />)}
+        {keysEditorField("key-name", translate("providers.keyName"), <>
+          <TextField
+            key={`provided-key-name:${selectedProvided.key}`}
+            labelVisible={false}
+            label={translate("providers.keyName")}
+            value={selectedProvidedName}
+            disabled={controlsBusy || selectedProvided.account.autoGrouping}
+            onDraftChange={(value) => setProvidedNameDrafts((current) => ({ ...current, [selectedProvided.key]: value }))}
+            onCommit={(value) => {
+              const name = value.trim();
+              if (!name || name === selectedProvided.resource.name || selectedProvided.account.autoGrouping) return;
+              void runProvidedAction(() => relay.apiKeyActions.update?.(selectedProvided.account.id, selectedProvided.resource.id, name) ?? Promise.resolve(), "relay.apiKeyUpdateStaged");
+            }}
+          />
+          {/* The field states why it is locked: auto grouping is the station's
+              layout owning the name, and nothing else on this pane draws that
+              switch.  A greyed name with no line beside it read as an input the
+              app had disabled for no reason. */}
+          {selectedProvided.account.autoGrouping ? <Text style={styles.fieldHint}>{translate("providers.keyNameAutoGroupingHint")}</Text> : null}
+        </>)}
         {keysEditorField("key-value", translate("providers.keyValue"), <NativeSecretField
           labelVisible={false}
           plainText
           autoCommit
           disabled
           label={translate("providers.keyValue")}
-          hint={selectedProvided.resource.keyHint ? translate("providers.apiKeySavedHint") : translate("common.none")}
+          hint={selectedProvided.resource.keyHint ? translate("providers.relayKeyValueHint") : translate("common.none")}
           busy={controlsBusy}
           domain="relay_accounts"
           field="api_key"
@@ -6882,7 +6913,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
           onCommit={() => undefined}
         />)}
         {keysEditorField("orphan-key-value", translate("providers.keyValue"), <View style={styles.keysEditorValueRow}>
-          <View style={styles.keysEditorValueField}><NativeSecretField labelVisible={false} plainText autoCommit disabled label={translate("providers.keyValue")} hint={booleanValue(selectedOrphan.configured) ? translate("providers.apiKeySavedHint") : translate("common.none")} busy={controlsBusy} domain="providers_models" field="api_key" target={`${providerId}\u001f${selectedOrphan.name}`} onSecretState={onSecretState} /></View>
+          <View style={styles.keysEditorValueField}><NativeSecretField labelVisible={false} plainText autoCommit disabled label={translate("providers.keyValue")} hint={booleanValue(selectedOrphan.configured) ? translate("common.saved") : translate("common.none")} busy={controlsBusy} domain="providers_models" field="api_key" target={`${providerId}\u001f${selectedOrphan.name}`} onSecretState={onSecretState} /></View>
           <NativeButton title="" symbol="copy" compact disabled={controlsBusy || !booleanValue(selectedOrphan.configured)} toolTip={translate("relay.apiKeyCopy")} accessibilityLabel={translate("relay.apiKeyCopy")} onPress={() => {
             void (async () => {
               try {
@@ -7114,7 +7145,7 @@ function PublicModelInspector({ group, modelContexts, backLabel, busy, translate
   </View>;
 }
 
-function ModelInspector({ providers, providerLabels, provider, providerId, model, relaySources, native, busy, translate, dispatch, probe, probing, probeResult, modelContexts, bindingIssue, onNameDraftChange, onProviderClick, onProviderChange, onOpenPublicModel, dispatchSnapshot }: { providers: UnknownRecord[]; providerLabels: string[]; provider: UnknownRecord; providerId: string; model: UnknownRecord; relaySources: RelaySourceOption[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; probe: () => void; probing: boolean; probeResult?: IpcResults["probe"] | null; modelContexts?: UnknownRecord; bindingIssue?: UnknownRecord; onNameDraftChange?: (name: string) => void; onProviderClick: () => void; onProviderChange: (providerId: string) => void; onOpenPublicModel?: () => void; dispatchSnapshot: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined> }): React.JSX.Element {
+function ModelInspector({ providers, providerLabels, provider, providerId, model, relaySources, native, busy, translate, dispatch, probe, probing, probeResult, modelContexts, globalConcurrencyLimit, bindingIssue, onNameDraftChange, onProviderClick, onProviderChange, onOpenPublicModel, dispatchSnapshot }: { providers: UnknownRecord[]; providerLabels: string[]; provider: UnknownRecord; providerId: string; model: UnknownRecord; relaySources: RelaySourceOption[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; probe: () => void; probing: boolean; probeResult?: IpcResults["probe"] | null; modelContexts?: UnknownRecord; globalConcurrencyLimit?: number; bindingIssue?: UnknownRecord; onNameDraftChange?: (name: string) => void; onProviderClick: () => void; onProviderChange: (providerId: string) => void; onOpenPublicModel?: () => void; dispatchSnapshot: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined> }): React.JSX.Element {
   const id = editorIdentifier(model);
   // A service's own catalog states each model's credit rate; the rate is shown
   // beside the route it belongs to, so the picker's `x0.79` stays visible here.
@@ -7200,11 +7231,21 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   const relayMultiplier = relaySourceForKey(selectedProviderKey, relaySources)?.multiplier;
   // A route can follow a rate two ways: a relay key, whose station states the
   // group's multiplier, or an account whose own catalog states what each model
-  // bills at (the 倍率 row above).  Both are the same relation — the order
-  // follows a number this app does not decide — so the switch asks whether a
-  // rate is known, not which kind of provider the route happens to use.
+  // bills at (the 倍率 row under 公开上下文).  Both are the same relation — the
+  // order follows a number this app does not decide — so the switch asks
+  // whether a rate is known, not which kind of provider the route happens to
+  // use.
   const followsServiceRate = usesRelayKey || providerService(provider) !== undefined;
   const followedRate = usesRelayKey ? relayMultiplier : rateNumber(serviceRate);
+  // The row's own reading of the rate, asked through the one helper the list
+  // column also asks: a relay key's group multiplier first, then the rate an
+  // account-backed service publishes for this upstream model.  Going through
+  // that helper instead of repeating its rule is what keeps the row and the
+  // column from pricing one route two ways, and a rate nobody has read yet is
+  // the empty string — the row is then absent rather than stating a blank,
+  // because a label with nothing beside it reads as a value the pane could not
+  // answer instead of one the upstream withheld.
+  const routeRate = modelRateText(service, upstreamModelID, relayMultiplier);
   const canFollowMultiplier = followsServiceRate && followedRate !== undefined;
   const manualOrder = numberValue(model.manual_order, modelEffectiveOrder(model));
   const followsMultiplier = canFollowMultiplier && modelOrderMode(model) === "relay_multiplier";
@@ -7365,6 +7406,19 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
           <ContextWindowHelp recommended={recommendedWindow} translate={translate} />
         </View>
       </View> : null}
+      {routeRate ? <View style={styles.formRow}>
+        {/* The rate this route is billed at, stated directly under the public
+            window it is served with: the pair answers what the reader came to
+            this pane for — what the model is, and what it costs — before the
+            route's own fields.  It is read through `modelRateText`, the helper
+            the model list's 倍率 column prints from, and it is the number
+            跟随倍率 sorts by, so no two surfaces can price one route two ways.
+            A route whose rate is not known keeps no row at all: a blank beside
+            a label is a value the pane could not answer rather than one the
+            upstream withheld, so the row follows the number, not the service. */}
+        <Text numberOfLines={1} style={styles.modelInspectorLabel}>{translate("providers.modelRate")}</Text>
+        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{routeRate}</Text>
+      </View> : null}
       <PickerField label={translate("providers.provider")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} allowShrink value={providerLabel} values={providerLabels} disabled={busy || providers.length <= 1} onSelect={(label) => { const next = providers[providerLabels.indexOf(label)]; if (next) onProviderChange(editorIdentifier(next)); }} />
       {isDraftModel(model, translate) ? <Text style={styles.fieldHint}>{translate(selectedProviderKey || routeCredential ? "providers.draftModelHint" : "providers.draftModelKeylessHint")}</Text> : null}
       {/* An account-backed route states the one credential it answers with,
@@ -7377,15 +7431,6 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
       {credentialChoices.length > 1 ? <PickerField label={translate("providers.routeCredential")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} allowShrink value={routeCredential?.id ?? ""} values={credentialChoices.map((credential) => ({ value: credential.id, label: credential.label }))} disabled={busy} onSelect={selectRouteCredential} /> : null}
       {providerKeyOptions.length > 0 ? <PickerField label={translate("providers.providerKey")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} allowShrink value={selectedProviderKey?.id ?? ""} values={[{ value: "", label: translate("providers.undefinedKey") }, ...providerKeyOptions]} disabled={busy} onSelect={selectProviderKey} /> : null}
       {bindingIssueText ? <Text style={styles.fieldHint}>{bindingIssueText}</Text> : null}
-      {serviceRate.trim() ? <View style={styles.formRow}>
-        <Text numberOfLines={1} style={styles.modelInspectorLabel}>{translate("providers.modelRate")}</Text>
-        {/* A rate the catalog states is printed as it states it.  A catalog
-            that states no rate draws no row at all: the label on its own would
-            read as a rate of nothing, and a blank beside a label is a value
-            the pane could not answer rather than one the upstream withheld.
-            The row therefore follows the number, not the service. */}
-        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{serviceRate.trim()}</Text>
-      </View> : null}
       <TextField label={translate("providers.upstream")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} value={upstreamFieldValue} onDraftChange={(value) => drafts?.setModelUpstreamDraft(providerId, id, value)} onCommit={(upstream_model) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_model } })} />
       {/* The window the route's own upstream publishes, stated directly under
           the model it belongs to.  It is a reading, not a field: the number is
@@ -7432,6 +7477,7 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
           },
         })} style={styles.orderFollowControl} /> : null}
       </View>
+      <RouteConcurrencyField providerId={providerId} model={model} busy={busy} globalLimit={globalConcurrencyLimit} translate={translate} dispatch={dispatch} />
       <ProtocolPicker providerId={providerId} model={model} busy={busy} translate={translate} dispatch={dispatch} />
     </View>
   </View>;
@@ -7472,6 +7518,53 @@ function ContextWindowHelp({ recommended, translate }: { recommended: number | n
   const [open, setOpen] = useState(false);
   const text = `${translate("providers.contextWindowRecommendedLine", { value: publicModelTokensText(recommended, translate) })}\n${translate("providers.contextWindowRowHelp")}`;
   return <HelpTip open={open} text={text} title={translate("providers.contextWindowRowHelpTitle")} onToggle={() => setOpen((current) => !current)} />;
+}
+
+/**
+ * One route's share of the concurrency cap.
+ *
+ * The number is the route's own because a public model is a group of
+ * deployments that answer at different speeds, and the proxy counts in-flight
+ * attempts per deployment.  An empty field is a real state — the route follows
+ * the runtime's global limit — so it is stated in the row's own hint with the
+ * number it will actually use; `0` is the other stated value, meaning this
+ * route is not capped at all.  Both are why the field cannot fall back to `0`
+ * for an empty draft: that would silently cap or uncap a route the user never
+ * touched.
+ */
+function RouteConcurrencyField({ providerId, model, busy, globalLimit, translate, dispatch }: { providerId: string; model: UnknownRecord; busy: boolean; globalLimit?: number; translate: Translate; dispatch: Dispatch }): React.JSX.Element {
+  const inheritedLimit = globalLimit ?? 8;
+  const id = editorIdentifier(model);
+  const stated = model.max_concurrency;
+  const inherited = stated === undefined || stated === null;
+  const [tipOpen, setTipOpen] = useState(false);
+  return <TextField
+    label={translate("providers.routeConcurrency")}
+    labelWidth={MODEL_INSPECTOR_LABEL_WIDTH}
+    controlWidth={96}
+    keyboardType="numeric"
+    disabled={busy}
+    value={inherited ? "" : String(stated)}
+    // The empty field states the default it inherits, so no help line repeats
+    // it: this pane's fields carry one only for what the control cannot show,
+    // and a wrapped sentence in a 96 pt column would reflow every row below it.
+    placeholder={translate("providers.routeConcurrencyInherit", { value: String(inheritedLimit) })}
+    accessory={<HelpTip open={tipOpen} text={translate("providers.routeConcurrencyHelp")} title={translate("providers.routeConcurrencyHelpTitle")} onToggle={() => setTipOpen((current) => !current)} />}
+    validate={(next) => {
+      const trimmed = next.trim();
+      if (!trimmed) return undefined;
+      if (!Number.isFinite(Number(trimmed)) || !Number.isInteger(Number(trimmed))) return translate("runtime.invalidNumber");
+      const parsed = Number(trimmed);
+      return parsed >= 0 && parsed <= 4096 ? undefined : translate("runtime.invalidNumber");
+    }}
+    onCommit={(next) => {
+      const trimmed = next.trim();
+      // An empty draft is the inherit choice, which Core clears the route's own
+      // declaration for; it is never written as 0, because 0 means "uncapped".
+      const changes = trimmed === "" ? { max_concurrency: null } : { max_concurrency: Number(trimmed) };
+      return dispatch("model.patch", { provider_id: providerId, model_id: id, changes });
+    }}
+  />;
 }
 
 function ProtocolPicker({ providerId, model, busy, translate, dispatch }: { providerId: string; model: UnknownRecord; busy: boolean; translate: Translate; dispatch: Dispatch }): React.JSX.Element {
@@ -7792,7 +7885,7 @@ function uniqueProviderName(providers: UnknownRecord[], name: string, excludeID 
  * read back here afterwards; the pane shows the fact rather than a control that
  * would have to rewire a provider, its address, and its routes in place.
  */
-function ProviderIdentityFields({ provider, providerID, relayStations, station, stationDraft, onStationDraftChange, onStageStationUpdate, busy, translate, dispatch, onStatus, onBaseUrlDraftChange, onNameDraftChange }: {
+function ProviderIdentityFields({ provider, providerID, relayStations, station, stationDraft, onStationDraftChange, onStageStationUpdate, translate, dispatch, onStatus, onBaseUrlDraftChange, onNameDraftChange }: {
   provider: UnknownRecord;
   providerID: string;
   relayStations: RelayStationOption[];
@@ -7800,7 +7893,6 @@ function ProviderIdentityFields({ provider, providerID, relayStations, station, 
   stationDraft?: StationDraft;
   onStationDraftChange?: (draft: StationDraft) => void;
   onStageStationUpdate?: (overrides: StationDraft) => Promise<void>;
-  busy: boolean;
   translate: Translate;
   dispatch: Dispatch;
   onStatus?: (status?: string) => void;
@@ -7891,8 +7983,14 @@ function ProviderIdentityFields({ provider, providerID, relayStations, station, 
       ? dispatch("service_provider.patch", { provider_id: providerID, provider: { name: next } })
       : dispatch("provider.patch", { provider_id: providerID, changes: kind === "relay" ? { provider_type: "custom", name: next } : { name: next } });
   };
+  // Identity is a draft, not a command: the name, the address, and the enable
+  // switch all stage through the shared dispatch queue and are applied by the
+  // shell as the user edits.  They therefore never carry the window-wide busy
+  // flag; doing so made any in-flight action in the pane — a key write, an
+  // account check, an Apply of the pane the user just left — read as a provider
+  // whose identity had been locked for no visible reason.
   return <View style={styles.providerSourceFields}>
-    <View style={styles.providerEnabledRow}><NativeCheckbox label={translate("common.enable")} value={booleanValue(provider.enabled, true)} disabled={busy} onValueChange={(enabled) => dispatch(isLogin ? "service_provider.patch" : "provider.patch", isLogin ? { provider_id: providerID, provider: { enabled } } : { provider_id: providerID, changes: { enabled } })} /></View>
+    <View style={styles.providerEnabledRow}><NativeCheckbox label={translate("common.enable")} value={booleanValue(provider.enabled, true)} onValueChange={(enabled) => dispatch(isLogin ? "service_provider.patch" : "provider.patch", isLogin ? { provider_id: providerID, provider: { enabled } } : { provider_id: providerID, changes: { enabled } })} /></View>
     {/* The name, always in this row, and the one identity underneath it: the
         name this provider is listed under, the type it is, and the address
         that type is bound to.  The type is stated, never offered: a provider's
@@ -7906,7 +8004,6 @@ function ProviderIdentityFields({ provider, providerID, relayStations, station, 
         label={translate("providers.providerName")}
         labelWidth={88}
         value={providerName}
-        disabled={busy}
         onDraftChange={onNameDraftChange}
         onCommit={commitName}
       />
@@ -7928,7 +8025,6 @@ function ProviderIdentityFields({ provider, providerID, relayStations, station, 
         label={translate("providers.providerName")}
         labelWidth={88}
         value={stationDraft?.name ?? stationDisplayName(station, translate)}
-        disabled={busy}
         onDraftChange={(value) => setStationDraftValue({ name: value })}
         onCommit={() => { void stageStationUpdate(); }}
       />
@@ -7941,7 +8037,6 @@ function ProviderIdentityFields({ provider, providerID, relayStations, station, 
         label={translate("providers.baseUrl")}
         labelWidth={88}
         value={stationDraft?.origin ?? station.origin}
-        disabled={busy}
         onDraftChange={(value) => setStationDraftValue({ origin: value })}
         onCommit={() => { void stageStationUpdate(); }}
       />
@@ -7951,7 +8046,6 @@ function ProviderIdentityFields({ provider, providerID, relayStations, station, 
         label={translate("providers.providerName")}
         labelWidth={88}
         value={providerName}
-        disabled={busy}
         onDraftChange={onNameDraftChange}
         onCommit={commitName}
       />
@@ -7968,7 +8062,6 @@ function ProviderIdentityFields({ provider, providerID, relayStations, station, 
         label={translate("providers.baseUrl")}
         labelWidth={88}
         value={providerBaseURL}
-        disabled={busy}
         onDraftChange={onBaseUrlDraftChange}
         onCommit={commitBaseURL}
       />
@@ -8327,7 +8420,6 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
       stationDraft={stationDraft}
       onStationDraftChange={setStationDraftValue}
       onStageStationUpdate={stageStationUpdate}
-      busy={busy}
       translate={translate}
       dispatch={dispatch}
       onStatus={onStatus}
@@ -8952,10 +9044,8 @@ function ClientBackendFields({ accessibilityPrefix, models, native, localApiActi
  * own title sits above its rows.  A client whose rail entry is already one app
  * draws its rows directly, without repeating the entry's name.
  */
-function ClientFileRows({ files, groups, revealFileLabel, revealFile, busy, translate, onOpenFile }: {
+function ClientFileRows({ files, revealFileLabel, revealFile, busy, translate, onOpenFile }: {
   files: ClientFile[];
-  /** The app titles this client's files are split into; empty for one app. */
-  groups: ReadonlyArray<{ app: NonNullable<ClientFile["app"]>; titleKey: string }>;
   revealFileLabel: string;
   /** Absent on a host that cannot show a file in its own file manager. */
   revealFile?: (path: string) => void;
@@ -8983,15 +9073,7 @@ function ClientFileRows({ files, groups, revealFileLabel, revealFile, busy, tran
     {file.exists ? null : <Text style={assistantFileSurfaceStyles.fileMissing}>{translate("clients.fileMissing")}</Text>}
     <NativeButton title={translate("settings.editFile")} toolTip={file.exists ? undefined : translate("clients.fileMissing")} accessibilityLabel={`${translate("settings.editFile")}: ${file.display_path}`} disabled={busy || !file.exists} onPress={() => onOpenFile(file)} style={assistantFileSurfaceStyles.editFileButton} />
   </View>;
-  if (groups.length === 0) return <>{files.map(row)}</>;
-  return <>{groups.map((group) => {
-    const members = files.filter((file) => file.app === group.app);
-    if (members.length === 0) return null;
-    return <View key={group.app} style={styles.externalSettingsFileGroup}>
-      <Text style={styles.externalSettingsFileGroupTitle}>{translate(group.titleKey)}</Text>
-      {members.map(row)}
-    </View>;
-  })}</>;
+  return <>{files.map(row)}</>;
 }
 
 function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatalogEnabled, codexRoute, standaloneSearch, onToggleStandaloneSearch, codexFeatures, clientProvider, clientModel, localApiActive, onToggleCodexModelCatalog, onToggleCodexFeature, onUseLocalApi, onUseSavedModel, claudeClients, claudeModels, onClaudeUseLocalApi, onClaudeUseSavedModel, onToggleClaudeModelList, translate, ipc, filesToken, onOpenFile }: {
@@ -9172,10 +9254,17 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
             its own designated route, and its own generated model list, so the
             pane says which app a block belongs to instead of drawing one
             client's state on the other's row. */}
-        {selectedClient === "claude" ? CLAUDE_APP_GROUPS.map(({ app, titleKey }) => {
+        {selectedClient === "claude" && error !== undefined
+          ? <Text style={assistantFileSurfaceStyles.filesStatus}>{error}</Text>
+          : null}
+        {selectedClient === "claude" && error === undefined && files === undefined
+          ? <Text style={assistantFileSurfaceStyles.filesStatus}>{translate("common.loading")}</Text>
+          : null}
+        {selectedClient === "claude" && files !== undefined ? CLAUDE_APP_GROUPS.map(({ app, titleKey }) => {
           const state = asRecord(app === "claudeCode" ? claudeCode : claudeDesktop);
           const available = app === "claudeCode" || claudeDesktop.available !== false;
           const route = asRecord(state.designated_route);
+          const listed = clientFiles("claude").filter((file) => file.app === app);
           return <View key={app} style={styles.externalSettingsAppGroup}>
             <View style={styles.externalSettingsAppHeader}>
               <Text style={styles.externalSettingsAppTitle}>{translate(titleKey)}</Text>
@@ -9194,21 +9283,32 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
               onUseSavedModel={(selection) => onClaudeUseSavedModel(app, selection)}
               translate={translate}
             />
+            {/* The app's own files sit under the app's own controls: one
+                heading above three fields and again above two file rows said
+                the same word twice and left the reader to work out which
+                block a file belonged to. */}
+            <ClientFileRows
+              files={listed}
+              revealFileLabel={revealFileLabel}
+              revealFile={native.revealFile}
+              busy={busy}
+              translate={translate}
+              onOpenFile={openClientFile}
+            />
           </View>;
         }) : null}
-        {error !== undefined
+        {selectedClient === "claude" ? null : (error !== undefined
           ? <Text style={assistantFileSurfaceStyles.filesStatus}>{error}</Text>
           : files === undefined
             ? <Text style={assistantFileSurfaceStyles.filesStatus}>{translate("common.loading")}</Text>
             : <ClientFileRows
                 files={clientFiles(selectedClient)}
-                groups={selectedClient === "claude" ? CLAUDE_APP_GROUPS : []}
                 revealFileLabel={revealFileLabel}
                 revealFile={native.revealFile}
                 busy={busy}
                 translate={translate}
                 onOpenFile={openClientFile}
-              />}
+              />)}
       </PersistentScrollView>
     </View>
   </View>;
@@ -13053,7 +13153,7 @@ const styles = StyleSheet.create({
   windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowSurfaceShellWindows: { backgroundColor: WINDOWS_CONTROL.fill }, windowsChildModalSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, providerWizardRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, logsContent: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   // Settings window: a native source-list sidebar next to the active pane.
   settingsShellFrame: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, settingsShellHeader: { flexShrink: 0, flexDirection: "row", minWidth: 0, backgroundColor: systemColors.window, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, minWidth: 0, flexShrink: 0, minHeight: 0 }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderIntegrated: { width: 200, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsSidebarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderRightWidth: 1, borderRightColor: WINDOWS_CONTROL.strokeSubtle }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { height: 8, flexShrink: 0 }, settingsSidebarList: { flex: 1, minWidth: 0, minHeight: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneHeaderIntegrated: { flex: 1, minWidth: 0, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailIntegrated: { paddingTop: 0 }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: systemColors.window }, settingsRailDetailHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
-  routeStatusBar: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, justifyContent: "space-between", paddingHorizontal: 16, paddingVertical: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusBarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderTopColor: WINDOWS_CONTROL.strokeSubtle }, routeStatusTextWindows: { color: WINDOWS_CONTROL.textSecondary },
+  routeStatusBar: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, justifyContent: "space-between", paddingHorizontal: 16, paddingVertical: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusBarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderTopColor: WINDOWS_CONTROL.strokeSubtle }, routeStatusTextWindows: { color: WINDOWS_CONTROL.textSecondary }, routeStatusLead: { minWidth: 0, flex: 1, flexDirection: "row", alignItems: "center", gap: 6 },
   // The usage pager is the window's status bar on this tab: the row count stays
   // on the left where every other route states its status, and the page controls
   // sit on the right of that same row rather than in a strip above the table.
@@ -13122,8 +13222,7 @@ inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspec
   externalSettingsWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, externalSettingsFieldList: { ...SETTINGS_FIELD_LIST },
   // One rail entry can carry two apps, so each app's block keeps the grid's
   // rhythm but not the grid: a title, then that app's own fields and files.
-  externalSettingsAppGroup: { gap: 14 }, externalSettingsAppHeader: { paddingLeft: SETTINGS_FIELD_LEAD }, externalSettingsAppTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
-  externalSettingsFileGroup: { gap: 4 }, externalSettingsFileGroupTitle: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600", paddingLeft: SETTINGS_FIELD_LEAD }, externalSettingsField: { ...SETTINGS_FIELD }, externalSettingsInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, externalSettingsFieldLabel: { ...SETTINGS_FIELD_LABEL }, externalSettingsValueSlot: { ...SETTINGS_FIELD_ROUTE_SLOT }, externalSettingsBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, externalSettingsHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, externalSettingsHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, externalSettingsPane: { flex: 1, minHeight: 0 }, externalSettingsPaneContent: { paddingVertical: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, gap: 14 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 },
+  externalSettingsAppGroup: { gap: 14 }, externalSettingsAppHeader: { paddingLeft: SETTINGS_FIELD_LEAD }, externalSettingsAppTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, externalSettingsField: { ...SETTINGS_FIELD }, externalSettingsInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, externalSettingsFieldLabel: { ...SETTINGS_FIELD_LABEL }, externalSettingsValueSlot: { ...SETTINGS_FIELD_ROUTE_SLOT }, externalSettingsBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, externalSettingsHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, externalSettingsHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, externalSettingsPane: { flex: 1, minHeight: 0 }, externalSettingsPaneContent: { paddingVertical: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, gap: 14 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 },
   runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 6 }, runtimeWorkspaceBody: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, runtimeWorkspace: { width: "100%", padding: SETTINGS_PANE_INSET, gap: 14 }, runtimeScrollSurface: { flex: 1, minWidth: 0, backgroundColor: systemColors.textBackground }, runtimeFieldList: { ...SETTINGS_FIELD_LIST }, runtimeField: { ...SETTINGS_FIELD }, runtimeInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, runtimeModifiedBar: { position: "absolute", left: 0, top: 3, bottom: 3, width: 2, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarInline: { width: 2, alignSelf: "center", height: 16, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarActive: { backgroundColor: systemColors.blue }, runtimeFieldError: { marginLeft: SETTINGS_FIELD_HELP_INDENT, color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, runtimeValueControlInvalid: { borderWidth: 1, borderColor: systemColors.red, borderRadius: 4 }, runtimeResetButton: { minWidth: 28, width: 28, height: 22, paddingHorizontal: 0 }, runtimeFieldLabel: { ...SETTINGS_FIELD_LABEL }, runtimeValueSlot: { ...SETTINGS_FIELD_VALUE_SLOT }, runtimeValueControl: { width: SETTINGS_FIELD_VALUE_WIDTH, minWidth: SETTINGS_FIELD_VALUE_WIDTH, height: 26 }, runtimeBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, runtimeUnit: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, runtimeHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, runtimeMultilineField: { minWidth: 0, flexGrow: 1, flexBasis: "100%", maxWidth: "100%" }, runtimeMultilineHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, paddingLeft: SETTINGS_FIELD_LEAD }, runtimeMultilineLabel: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeMultilineHeaderActions: { flexShrink: 0, minHeight: 26, justifyContent: "center" }, runtimeMultilineEditor: { width: "100%", minWidth: 0, alignSelf: "stretch" }, runtimeMultilineHelpSlot: { paddingLeft: 0, maxWidth: "100%", minWidth: 0, paddingTop: 6, gap: 3 }, runtimeJsonDefaultHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, fontWeight: "600", minWidth: 0 },
   dataManagementWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, dataManagementPane: { flex: 1, minHeight: 0 }, dataManagementPaneScrollContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 4, gap: 10 }, dataManagementImportIntro: { width: "100%", minHeight: 72, paddingHorizontal: 12, paddingVertical: 12, justifyContent: "center" }, dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: SETTINGS_FIELD_GAP, paddingLeft: SETTINGS_FIELD_LEAD }, dataManagementImportFileLabel: { ...SETTINGS_FIELD_LABEL }, dataManagementImportFileValue: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground }, dataManagementImportFilePlaceholder: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, dataManagementSelectionBar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSelectionCount: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementToolbarButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, dataManagementSectionsField: { flex: 1, minWidth: 0, gap: 6 }, dataManagementSectionList: { gap: 4 }, dataManagementSectionItem: { minHeight: 22 }, dataManagementActionStatus: { flexShrink: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14 }, dataManagementSensitiveHint: { color: systemColors.brown, fontSize: UI_FONT_SIZE, lineHeight: 16, paddingVertical: 5, paddingHorizontal: 7, backgroundColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.08) ?? "rgba(255, 204, 0, 0.08)", default: "rgba(255, 204, 0, 0.08)" }), borderRadius: 4, borderWidth: 1, borderColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.2) ?? "rgba(255, 204, 0, 0.2)", default: "rgba(255, 204, 0, 0.2)" }) }, dataManagementSyncScopeValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementDirectionPicker: { width: SETTINGS_FIELD_VALUE_WIDTH, height: 24, flexGrow: 0, flexShrink: 0 },
   // The WebDAV tab is fields of the same grid the other panes draw, so its

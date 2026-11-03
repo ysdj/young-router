@@ -5,11 +5,13 @@ from . import image_inputs as _image_inputs_module
 from . import responses_request as _responses_request_module
 from . import request_context as _request_context_module
 from .. import api_base as _api_base_module
+from ..values import int_or_none as _int_or_none
 from . import responses_execution as _responses_execution_module
 from . import responses_surfaces as _responses_surfaces_module
 from . import state as _state_module
 from . import streaming as _streaming_module
 from . import tools as _tools_module
+from . import concurrency as _concurrency_module
 from . import trace as _trace_module
 
 
@@ -17,6 +19,7 @@ from .base import (
     Any,
     AsyncIterator,
     List,
+    _ATTEMPT_LEASE_ID_KEY,
     Optional,
     _CHAT_TOOL_NAME_PATTERN,
     _ATTEMPTED_UPSTREAM_URL_SURFACES_KEY,
@@ -35,6 +38,7 @@ from .base import (
     _CURRENT_SELECTED_DEPLOYMENT,
     _CURRENT_SELECTED_DEPLOYMENT_BOX,
     _DEPLOYMENT_COOLDOWNS,
+    _REQUEST_TURN_IDENTIFIER_KEYS,
     _DEPLOYMENT_COOLDOWN_COMPACTION_DEFAULT_ENABLED,
     _DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED_ENV,
     _DEPLOYMENT_COOLDOWN_DEFAULT_FAILURES,
@@ -155,6 +159,7 @@ from .base import (
     _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES,
     _UPSTREAM_TEMPORARY_ERROR_MARKERS,
     _is_upstream_truncated_stream_error,
+    _is_upstream_body_read_failure,
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
     _UPSTREAM_URL_SURFACE_DEPLOYMENT_ID_KEY,
     _UPSTREAM_URL_SURFACE_KEY,
@@ -193,6 +198,16 @@ _FIRST_STREAM_OUTPUT_TIMES_TTL_SECONDS = 600.0
 # early without emitting any function call.  See the trace event
 # ``responses_completed_text_only_after_buffered_stream``.
 _TEXT_ONLY_COMPLETION_MIN_DURATION_MS = 4000
+# What this process holds for each turn, so a turn's slots are given back by
+# their exact keys instead of by scanning the shared file for them.  Another
+# worker's leases are never this process's to release.
+_HELD_CONCURRENCY_LEASES: dict[str, set[str]] = {}
+_HELD_CONCURRENCY_LEASES_LOCK = threading.Lock()
+_CONCURRENCY_STORE_UNAVAILABLE_TRACED = False
+# Set on an exception this proxy raised because a route was already serving its
+# whole concurrency cap.  It is not an upstream answer, so every classifier that
+# reads status or wording must recognise it before them.
+_MODEL_CONCURRENCY_REJECTION_ATTR = "_young_router_model_concurrency_rejection"
 # Set by the deployment pre-call hook on the selected-deployment marker so the
 # wrapper that carries that attempt's stream can refresh its request-log row.
 _PENDING_REQUEST_LOG_ID_KEY = "_young_router_pending_request_log_id"
@@ -921,6 +936,13 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
     """
     if _is_image_generation_all_deployments_unsupported_error(exception):
         return _RECOVERY_POLICY_ERROR
+    if _is_model_concurrency_rejection_error(exception):
+        # A route at its cap is not broken and nothing upstream refused: it is
+        # busy for as long as its requests run.  The attempt still advances (a
+        # peer may have a free slot) and, with no peer, waits out the recovery
+        # window rather than parking the route -- a cooldown here would remove
+        # the only route of a single-route group from its own next request.
+        return _RECOVERY_POLICY_RECOVERY
     preserved = getattr(exception, _SANITIZED_UPSTREAM_ROUTE_FAILURE_POLICY_ATTR, None)
     if preserved in _RECOVERY_POLICY_VALUES:
         return preserved
@@ -1097,6 +1119,22 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
         # failed, and it will fail the same way on the next request.  A cooldown
         # is what makes the next attempt pick a different deployment instead of
         # the upstream that just cut a turn mid-answer.
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_SERVER_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
+        )
+
+    if _is_upstream_body_read_failure(exception):
+        # The same fault as the branch above with the diagnosis missing: a read
+        # of an already-accepted response failed and the transport said nothing
+        # about framing.  Reading that as ``error`` -- the default for every
+        # exception nothing else claims -- told the client a route it had just
+        # been cut on was a refusal its own bytes had earned, and the client
+        # ended the turn because the sentence named no cause it retries.  It is
+        # not a connectivity outage either: that branch waits without a
+        # deadline, so a route that cuts every long answer would hold the
+        # client's stream open for as long as it kept failing.  The route is
+        # parked instead, and the attempt ends as the transient stop it is.
         return _recovery_policy_setting(
             _RECOVERY_POLICY_SERVER_ENV,
             _RECOVERY_POLICY_COOLDOWN,
@@ -4414,6 +4452,266 @@ def _deployment_protocol_mode(deployment: Any) -> str:
     return value if value in {_UPSTREAM_PROTOCOL_MODE_FALLBACK, _UPSTREAM_PROTOCOL_MODE_FIXED} else _UPSTREAM_PROTOCOL_MODE_FALLBACK
 
 
+def _model_concurrency_limit() -> int:
+    """How many requests one route may serve at once when it states no cap."""
+
+    return _concurrency_module.model_concurrency_limit()
+
+
+def _model_concurrency_cap(deployment: Any) -> int:
+    """The cap one deployment serves under: its own, else the global default.
+
+    The number is read from the route's ``model_info``, so it travels with the
+    deployment the Router already holds.  ``None`` on the route is the only
+    value that inherits, so a route that states ``0`` stays explicitly
+    unlimited even when the default is set.
+
+    The *count* it is compared against is the one every worker shares
+    (``proxy.concurrency``): LiteLLM's own per-deployment
+    ``max_parallel_requests`` semaphore is per process — ``local_only`` in its
+    client cache — so sixteen workers each counting their own requests let a
+    route capped at 8 serve 128 at once.
+    """
+
+    return _concurrency_module.model_concurrency_cap(deployment)
+
+
+def _ensure_attempt_lease_id(request_kwargs: Optional[dict]) -> Optional[str]:
+    """Stamp the one identifier every hop of this turn shares.
+
+    ``litellm_trace_id`` already serves, but it is LiteLLM's own and a path that
+    does not fill it (a ``specific_deployment`` call, an adapter entry point)
+    would leave the turn uncounted -- a cap that silently does not apply.  This
+    marker is written once, before any deployment is selected, so the count
+    covers every routed request and no route can be missed.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return None
+    existing = request_kwargs.get(_ATTEMPT_LEASE_ID_KEY)
+    if isinstance(existing, str) and existing.strip():
+        return existing.strip()
+    lease_id = os.urandom(8).hex()
+    request_kwargs[_ATTEMPT_LEASE_ID_KEY] = lease_id
+    return lease_id
+
+
+def _attempt_lease_id(request_kwargs: Optional[dict]) -> Optional[str]:
+    """The one key that names this turn, shared by every hop of it.
+
+    The lease belongs to the *turn* and the deployment, not to the attempt: a
+    fallback re-sends the same turn to a different route, and its own slot is
+    the one it takes.  Keying by the turn is what keeps one turn from counting
+    twice, and what lets a hop that fails in a way this proxy did not observe
+    be released by the next hop's own claim.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return None
+    for container_name, container in (
+        ("request", request_kwargs),
+        ("litellm_metadata", _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata")),
+        ("metadata", _request_context_module._request_metadata_dict(request_kwargs, "metadata")),
+    ):
+        if not isinstance(container, dict):
+            continue
+        for key in _REQUEST_TURN_IDENTIFIER_KEYS:
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                return f"{value.strip()}|{container_name}"
+    return None
+
+
+def _attempt_lease_key(request_kwargs: Optional[dict], deployment: Any) -> Optional[str]:
+    """The lease naming one turn's hold on one deployment, or ``None``."""
+
+    lease_id = _attempt_lease_id(request_kwargs)
+    deployment_key = _deployment_cooldown_key_from_deployment(deployment)
+    if not lease_id or not deployment_key:
+        return None
+    return f"{deployment_key}|{lease_id}"
+
+
+def _deployment_in_flight_count(deployment_key: str) -> Optional[int]:
+    """How many live attempts hold a slot on one deployment, across workers."""
+
+    return _concurrency_module.count_for(deployment_key)
+
+
+def _claim_deployment_concurrency_slot(
+    request_kwargs: Optional[dict],
+    deployment: Any,
+    cap: int,
+) -> bool:
+    """Take this turn's slot on *deployment*, or answer that it is full.
+
+    The claim is idempotent for the same turn: a hop that re-enters with an
+    identifier it already holds refreshes its own lease instead of taking a
+    second slot, which is what makes a protocol-fallback retry on one
+    deployment cost one slot and not two.
+    """
+
+    lease_key = _attempt_lease_key(request_kwargs, deployment)
+    if not lease_key or cap <= 0:
+        return True
+    deployment_key = lease_key.split("|", 1)[0]
+    if not _concurrency_module.claim(lease_key, deployment_key, cap):
+        return False
+    # Remember what this process holds, so the turn can give exactly its own
+    # slots back instead of scanning the shared file for them.
+    lease_id = _attempt_lease_id(request_kwargs)
+    if lease_id:
+        with _HELD_CONCURRENCY_LEASES_LOCK:
+            _HELD_CONCURRENCY_LEASES.setdefault(lease_id, set()).add(lease_key)
+    return True
+
+
+def _release_deployment_concurrency_slot(request_kwargs: Optional[dict], deployment: Any) -> None:
+    """Give back this turn's slot on one deployment, if it still holds it."""
+
+    lease_key = _attempt_lease_key(request_kwargs, deployment)
+    if not lease_key:
+        return
+    _release_concurrency_lease_keys([lease_key])
+
+
+def _release_concurrency_lease_keys(lease_keys: list[str]) -> None:
+    if not lease_keys:
+        return
+    _concurrency_module.release(lease_keys)
+    _forget_held_concurrency_leases(lease_keys)
+
+
+def _forget_held_concurrency_leases(lease_keys: list[str]) -> None:
+    if not lease_keys:
+        return
+    dropped = set(lease_keys)
+    with _HELD_CONCURRENCY_LEASES_LOCK:
+        for lease_id, held in list(_HELD_CONCURRENCY_LEASES.items()):
+            held.difference_update(dropped)
+            if not held:
+                _HELD_CONCURRENCY_LEASES.pop(lease_id, None)
+
+
+def _release_request_concurrency_slots(request_kwargs: Optional[dict]) -> None:
+    """Release every slot this turn still holds.
+
+    A turn that ends on a route, or ends at all, must not leave a slot behind:
+    the lease would eventually be pruned, but until then the cap would count a
+    request nobody is serving.
+    """
+
+    lease_id = _attempt_lease_id(request_kwargs)
+    if not lease_id:
+        return
+    with _HELD_CONCURRENCY_LEASES_LOCK:
+        held = _HELD_CONCURRENCY_LEASES.pop(lease_id, None)
+    if held:
+        _concurrency_module.release(sorted(held))
+
+
+def _with_active_model_concurrency(
+    deployments: List[dict],
+    *,
+    request_kwargs: Optional[dict] = None,
+) -> tuple[List[dict], list[dict[str, Any]], bool]:
+    """Drop the routes whose concurrency cap is already full.
+
+    Returns the eligible routes, the routes held back (for the trace), and
+    whether anything was filtered.  An empty first list is returned as an empty
+    list: the caller decides what a pool with no free slot means, because a
+    group that has only one route still has to be served by it.
+    """
+
+    if not deployments or not isinstance(deployments, list):
+        return deployments, [], False
+    counts = _concurrency_module.counts()
+    if counts is None:
+        # No shared count means the cap cannot be made true across workers, so
+        # this filter would be enforcing a number it cannot honour.  Say so once
+        # per process instead of behaving as if the pool were empty.
+        _trace_concurrency_store_unavailable(request_kwargs)
+        return deployments, [], False
+    eligible: list[dict] = []
+    saturated: list[dict[str, Any]] = []
+    for deployment in deployments:
+        cap = _model_concurrency_cap(deployment)
+        if cap <= 0:
+            eligible.append(deployment)
+            continue
+        deployment_key = _deployment_cooldown_key_from_deployment(deployment)
+        in_flight = counts.get(deployment_key, 0) if deployment_key else 0
+        if in_flight >= cap:
+            entry = _trace_deployment(deployment)
+            entry["concurrency_limit"] = cap
+            entry["concurrency_in_flight"] = in_flight
+            saturated.append(entry)
+            continue
+        eligible.append(deployment)
+    if saturated:
+        return eligible, saturated, True
+    return deployments, [], False
+
+
+def _trace_concurrency_store_unavailable(request_kwargs: Optional[dict]) -> None:
+    global _CONCURRENCY_STORE_UNAVAILABLE_TRACED
+    if _CONCURRENCY_STORE_UNAVAILABLE_TRACED:
+        return
+    _CONCURRENCY_STORE_UNAVAILABLE_TRACED = True
+    _trace_module._route_trace(
+        "model_concurrency_store_unavailable",
+        request_id=_trace_request_id(request_kwargs),
+        model_group=_responses_execution_module._request_model_group(request_kwargs),
+        limit=_model_concurrency_limit(),
+    )
+
+
+def _is_model_concurrency_rejection_error(exception: Exception) -> bool:
+    """Whether *exception* is this proxy's own "that route is full" answer."""
+
+    return bool(getattr(exception, _MODEL_CONCURRENCY_REJECTION_ATTR, False))
+
+
+def _model_concurrency_rejection_exception(
+    request_kwargs: Optional[dict],
+    deployment: Any,
+) -> Exception:
+    """The refusal a full pool raises when it has no other route to offer.
+
+    It is deliberately not a 429: the upstream said nothing, nothing is
+    rate-limited, and a client that reads it as an upstream limit would back
+    off the model instead of the one busy route.  The message names the number
+    and the route so the reader knows what to change, and the recovery policy
+    treats it as an attempt that may advance.
+    """
+
+    cap = _model_concurrency_cap(deployment)
+    deployment_key = _deployment_cooldown_key_from_deployment(deployment) or "route"
+    exception = RuntimeError(
+        f"model concurrency limit reached: {deployment_key} is already serving "
+        f"{cap} request(s) at once; retry when a request finishes"
+    )
+    try:
+        setattr(exception, _MODEL_CONCURRENCY_REJECTION_ATTR, True)
+    except Exception:
+        pass
+    try:
+        setattr(exception, "failed_deployment_id", _responses_request_module._deployment_id(deployment))
+    except Exception:
+        pass
+    _trace_module._route_trace(
+        "model_concurrency_limit_reached",
+        request_id=_trace_request_id(request_kwargs),
+        session=_trace_session_context(request_kwargs),
+        model_group=_responses_execution_module._request_model_group(request_kwargs),
+        deployment=_trace_deployment(deployment),
+        concurrency_limit=cap,
+        concurrency_in_flight=_deployment_in_flight_count(deployment_key),
+        exception=_trace_exception(exception),
+    )
+    return exception
+
+
 def _active_cooldown_state_for_key(
     cooldowns: dict[str, Any],
     cooldown_key: str,
@@ -4936,10 +5234,23 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         reason = "codex-compaction-unsupported"
     elif _is_no_deployments_available_error(exception):
         reason = "no-available-deployment"
+    elif _is_model_concurrency_rejection_error(exception):
+        # This proxy answered, not the upstream: the group's every route was
+        # already serving its cap.  ``other`` reads as an upstream defect and
+        # sends the reader to the providers for a limit this installation set.
+        reason = "model-concurrency-limit"
     elif type(exception).__name__ == "ProxyModelNotFoundError":
         reason = "model-not-configured"
     elif _is_terminal_prompt_or_policy_error(exception):
         reason = "terminal-prompt-or-policy"
+    elif _is_upstream_relay_capacity_error(exception):
+        # A relay whose channel pool is empty answers like nothing else here, and
+        # ``other`` hid it: the stop it produces is transient, so a trace that
+        # could not name it is how the same pool kept being read as a request
+        # error.
+        reason = "upstream-relay-capacity"
+    elif _is_upstream_session_rejected_error(exception):
+        reason = "upstream-session-rejected"
     elif _is_upstream_account_restricted_error(exception):
         reason = "upstream-account-restricted"
     elif _is_upstream_client_version_rejected_error(exception):
@@ -4970,6 +5281,10 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         reason = "responses-schema-unsupported"
     elif _is_image_parameter_or_capability_bad_request_error(exception):
         reason = "image-parameter-or-capability-bad-request"
+    elif _is_upstream_model_not_found_error(exception):
+        # 404 for the model itself.  A trace that said ``other`` could not be
+        # told apart from a request this router had never classified.
+        reason = "upstream-model-not-found"
     elif _is_deployment_compatible_bad_request_error(exception):
         reason = "upstream-compatible-bad-request"
     elif getattr(exception, "stream_incomplete", False) and status_code is None:
@@ -4985,6 +5300,11 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         reason = _exception_body_reason(exception)
     elif _exception_indicates_network_connectivity_error(exception):
         reason = "upstream-network-connectivity"
+    elif _is_upstream_body_read_failure(exception):
+        # "other" is how a read that failed with no sentence of its own read in
+        # the trace, and that is why a client could be told the router could not
+        # classify a stop the transport had described by its own class name.
+        reason = "upstream-body-read-failed"
     elif status_code in (408, 429) or (status_code is not None and status_code >= 500):
         reason = f"upstream-status-{status_code}"
     elif type(exception).__name__ in _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES:
@@ -5010,6 +5330,19 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         ),
         "recovery_policy": _recovery_policy_for_exception(exception),
     }
+
+
+def _stop_cause_is_named(exception: Exception) -> bool:
+    """Whether this module can say *why* the turn stopped.
+
+    The one authority on that is :func:`_trace_exception`, which already walks
+    every classifier this package has and answers ``other`` only when none of
+    them owns the stop.  Two reader-facing sentences depend on it: a stop with
+    a cause may not be described as one the router could not classify, and a
+    stop without one may not be described as a refusal the client earned.
+    """
+
+    return _trace_exception(exception).get("reason") != "other"
 
 
 def _recovery_diagnostic(exception: Exception) -> dict[str, Any]:
@@ -5740,6 +6073,14 @@ def _is_terminal_prompt_or_policy_error(exception: Exception) -> bool:
             "content policy",
             "content-policy",
             "contentpolicy",
+            # Azure OpenAI words the same refusal as "filtered due to the Azure
+            # OpenAI content management policy", which matched none of the
+            # spellings above: the stop reached the client as one nothing here
+            # had classified, so the turn was retried against the identical
+            # prompt instead of naming the refusal.
+            "content management policy",
+            "content filtering",
+            "content filter",
             "policy_violation",
             "policy violation",
             "safety policy",
@@ -6537,6 +6878,12 @@ def _sync_failed_deployment_exclusions(
 
 
 def _is_priority_deployment_failover_error(exception: Exception) -> bool:
+    if _is_model_concurrency_rejection_error(exception):
+        # The route is busy, not broken: this attempt belongs to some other
+        # deployment of the group, and another hop would have taken it if the
+        # pool had reported it as unavailable in the first place.  It never
+        # reaches a provider, so it is checked before every textual classifier.
+        return True
     if _is_codex_compaction_capability_unsupported_error(exception):
         # The probed deployment cannot satisfy the encrypted remote-compaction
         # contract. That is this deployment's capability failure: advance to
@@ -6560,6 +6907,10 @@ def _is_priority_deployment_failover_error(exception: Exception) -> bool:
     if _is_image_generation_all_deployments_unsupported_error(exception):
         return False
     if _is_image_generation_tool_runtime_fallback_error(exception):
+        return True
+    if _is_model_concurrency_rejection_error(exception):
+        # A sibling deployment holds a different cap, so this attempt advances
+        # instead of ending the turn on the route that happened to be full.
         return True
     if _is_upstream_surface_failover_error(exception):
         return True
@@ -6861,6 +7212,13 @@ def _record_deployment_success_for_cooldown(request_kwargs: Optional[dict]) -> N
     # the next request for the same session/model group reuses the upstream's
     # warm prompt cache. Every success path (non-streaming completion, stream
     # completion, guarded stream success) funnels through here.
+    #
+    # This is also where a busy route becomes free again: an answer delivered
+    # is the one fact every protocol's success path reports, and the attempt's
+    # slot must be given back before the next request is filtered against the
+    # count.  A stream that ends through the failure path releases in the
+    # fallback wrapper instead; the lease TTL covers the paths neither sees.
+    _release_request_concurrency_slots(request_kwargs)
     _record_session_deployment_affinity(request_kwargs)
     _trace_deployment_success(request_kwargs)
     cooldown_keys = _deployment_cooldown_keys_from_request(request_kwargs)
@@ -7463,6 +7821,38 @@ def _sanitized_upstream_route_failure_message(
         # itself: a field layout this installation built is refused the same
         # way on every replay.
         return _upstream_request_field_rejected_message(model_group)
+    if _is_terminal_prompt_or_policy_error(exception):
+        # The same reading: the route judged the prompt, so a replay carries the
+        # identical prompt to the identical verdict.  This sentence is the only
+        # thing the Anthropic wire shape delivers, and the "temporary upstream
+        # route failure" wording below would have sent the reader looking for a
+        # transport fault that never existed.
+        return (
+            f"{model_group} refused this prompt under the route's own content "
+            "policy, and no candidate route would accept it. Change the prompt "
+            "or start a new task; the same text meets the same refusal."
+        )
+    if _is_model_concurrency_rejection_error(exception):
+        # Nothing upstream was asked: this installation's own cap refused the
+        # turn.  The generic tail would name an upstream route failure and a
+        # stream that ended, neither of which happened, and it would send the
+        # reader to inspect providers for a number they set themselves.  The
+        # stop is one a resend clears -- a slot frees the moment a running
+        # request finishes -- so it carries a phrase the client's retry
+        # classifier knows.
+        return (
+            f"{model_group} is already serving as many requests at once as its "
+            "concurrency limit allows, so this turn was not sent upstream. "
+            "Nothing has to be reconfigured; please retry your request once one "
+            "of the requests already running finishes."
+        )
+    if _is_upstream_model_not_found_error(exception):
+        return (
+            f"No candidate route serves {model_group} any more (the upstream "
+            "answered that the model does not exist). Disable the stale "
+            "provider route or choose another model; sending this turn again "
+            "meets the same answer."
+        )
     status_code = _exception_status_code(exception)
     relay_message = _upstream_relay_capacity_message(exception)
     if _is_upstream_relay_capacity_error(exception):
@@ -8024,6 +8414,24 @@ def _is_deployment_compatible_bad_request_error(exception: Exception) -> bool:
     ):
         return False
     return True
+
+
+def _is_upstream_request_shape_rejected_error(exception: Exception) -> bool:
+    """Whether a route refused the *request body* this side built.
+
+    Three classifiers describe one answer -- the Responses schema being
+    unsupported, the deployment refusing parameters its validator does not
+    know, and a gateway answering with its own HTML 400 -- and all three are a
+    verdict on the shape of what was sent, never on the conversation.  Grouped
+    so the terminal event can say which of the two it is instead of telling the
+    reader the router could not classify a refusal it had just named.
+    """
+
+    return (
+        _is_responses_schema_unsupported_error(exception)
+        or _is_deployment_compatible_bad_request_error(exception)
+        or _is_upstream_gateway_bad_request_error(exception)
+    )
 
 
 def _is_thinking_replay_contract_error(exception: Exception) -> bool:
