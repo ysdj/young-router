@@ -126,6 +126,7 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "Could not apply the prepared React Native Windows wheel patch." }
 
   pnpm run build
+  if ($LASTEXITCODE -ne 0) { throw "React Native Windows JavaScript build checks failed." }
 
   Remove-Item -LiteralPath $Core -Recurse -Force -ErrorAction SilentlyContinue
   New-Item -ItemType Directory -Path $Core | Out-Null
@@ -373,7 +374,7 @@ print('young-router-veridrop-import-ok')
     "--dir", $AppRoot, "exec", "react-native", "run-windows",
     "--no-launch", "--no-deploy", "--no-packager", "--release", "--arch", $WindowsArch,
     "--sln", "windows\YoungRouter.sln", "--proj", "windows\YoungRouter\YoungRouter.vcxproj",
-    "--msbuildprops", "YoungRouterCoreStagingDir=$CoreRoot,RunCodegenWindows=false,WindowsTargetPlatformVersion=$($InstalledSdk.Name),RestoreIgnoreFailedSources=true,RestoreForce=false,UseExperimentalNuget=false"
+    "--msbuildprops", "YoungRouterCoreStagingDir=$CoreRoot,RunCodegenWindows=false,WindowsTargetPlatformVersion=$($InstalledSdk.Name),RestoreIgnoreFailedSources=true,RestoreForce=false,UseExperimentalNuget=false,_WindowsAppSDKFoundationPlatform=$WindowsArch"
   )
   $LowResourceBuild = $WindowsArch -eq "ARM64" -and $env:YOUNG_ROUTER_LOW_RESOURCE_BUILD -notin @("0", "false", "no")
   if ($LowResourceBuild) {
@@ -381,6 +382,7 @@ print('young-router-veridrop-import-ok')
     $RunWindowsArgs[$RunWindowsArgs.IndexOf("--msbuildprops") + 1] += ",MultiProcessorCompilation=false,MultiProcCL=false"
   }
   & pnpm @RunWindowsArgs
+  if ($LASTEXITCODE -ne 0) { throw "React Native Windows host build failed." }
 
   $WindowsRelease = Join-Path $AppRoot "windows\$WindowsArch\Release"
   $PackagePayload = Join-Path $AppRoot "windows\YoungRouter.Package\bin\$WindowsArch\Release\YoungRouter"

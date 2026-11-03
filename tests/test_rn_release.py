@@ -1143,8 +1143,10 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("node_modules\\react-native-windows\\target\\$WindowsArch\\Release\\Microsoft.ReactNative\\Microsoft.ReactNative.dll", build)
         self.assertIn("RNW source-build output is missing", build)
         self.assertIn("UseExperimentalNuget=false", build)
+        self.assertIn("_WindowsAppSDKFoundationPlatform=$WindowsArch", build)
         self.assertLess(build.index("RNW source-build output is missing"), build.index("pnpm run build"))
         self.assertLess(build.index("patch-react-native-windows.mjs"), build.index("pnpm run build"))
+        self.assertIn('if ($LASTEXITCODE -ne 0) { throw "React Native Windows host build failed." }', build)
 
     def test_the_js_loop_reloads_the_bundle_in_place_and_only_from_a_known_good_one(self) -> None:
         # A UI edit's shortest path is a reload, not a restart: `RCTHost`
