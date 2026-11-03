@@ -4728,6 +4728,50 @@ def _active_cooldown_state_for_key(
     return None
 
 
+_REASONING_SUMMARY_OFF_VALUES = frozenset({"", "none", "off", "null", "false"})
+
+
+def _request_asks_for_reasoning_summary(request_kwargs: Optional[dict]) -> bool:
+    """Whether the client asked to see the model's thinking."""
+
+    if not isinstance(request_kwargs, dict):
+        return False
+    reasoning = request_kwargs.get("reasoning")
+    if isinstance(reasoning, dict):
+        summary = reasoning.get("summary")
+    else:
+        summary = request_kwargs.get("model_reasoning_summary")
+    if not isinstance(summary, str):
+        return False
+    return summary.strip().casefold() not in _REASONING_SUMMARY_OFF_VALUES
+
+
+def _request_prefers_declared_chat_for_reasoning_summary(
+    request_kwargs: Optional[dict],
+    deployment: Any,
+    client_surface: str,
+) -> bool:
+    """Use a fallback route's declared chat wire when the client wants to see thinking.
+
+    A route that declares ``openai/chat`` is also its own protocol fallback.
+    The Responses wire of such a relay can answer without exposing the streamed
+    reasoning text (DeepSeek returns an encrypted reasoning item with an empty
+    summary), while the declared chat stream carries ``reasoning_content``
+    chunk by chunk and the Responses chat bridge turns each chunk into a
+    summary delta.  Only a client that asked for a summary needs that wire;
+    ``fixed`` mode and a route that declares another surface keep their own
+    protocol choice.
+    """
+
+    if _deployment_protocol_mode(deployment) != _UPSTREAM_PROTOCOL_MODE_FALLBACK:
+        return False
+    if _deployment_surface(deployment) != _UPSTREAM_URL_SURFACE_OPENAI_CHAT:
+        return False
+    if client_surface != _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
+        return False
+    return _request_asks_for_reasoning_summary(request_kwargs)
+
+
 def _request_surface_for_deployment(
     request_kwargs: Optional[dict],
     deployment: Any,
@@ -4745,6 +4789,12 @@ def _request_surface_for_deployment(
     ):
         return requested_surface
     client_surface = _request_client_surface(request_kwargs)
+    if _request_prefers_declared_chat_for_reasoning_summary(
+        request_kwargs,
+        deployment,
+        client_surface,
+    ):
+        return _UPSTREAM_URL_SURFACE_OPENAI_CHAT
     cached_surface = _protocol_fallback_cached_surface(request_kwargs, deployment)
     return cached_surface or client_surface or _deployment_surface(deployment)
 

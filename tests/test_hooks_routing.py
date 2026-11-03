@@ -1935,6 +1935,98 @@ class HookRoutingTests(HookTestCase):
             "anthropic",
         )
 
+    def test_fallback_chat_route_uses_chat_when_the_client_wants_a_summary(self) -> None:
+        hooks, _ = load_hook_module()
+        deployment = {
+            "litellm_params": {"model": "openai/deepseek-flash", "order": 1},
+            "model_info": {
+                "id": "chat-route",
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+
+        self.assertEqual(
+            hooks._request_surface_for_deployment(
+                {
+                    "call_type": "aresponses",
+                    "input": "hello",
+                    "reasoning": {"effort": "max", "summary": "auto"},
+                },
+                deployment,
+            ),
+            "openai/chat",
+        )
+
+    def test_fallback_chat_route_keeps_the_client_protocol_without_a_summary(self) -> None:
+        hooks, _ = load_hook_module()
+        deployment = {
+            "litellm_params": {"model": "openai/deepseek-flash", "order": 1},
+            "model_info": {
+                "id": "chat-route",
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+
+        self.assertEqual(
+            hooks._request_surface_for_deployment(
+                {
+                    "call_type": "aresponses",
+                    "input": "hello",
+                    "reasoning": {"effort": "max", "summary": "none"},
+                },
+                deployment,
+            ),
+            "openai/responses",
+        )
+
+    def test_fixed_responses_route_keeps_its_surface_with_a_summary(self) -> None:
+        hooks, _ = load_hook_module()
+        deployment = {
+            "litellm_params": {"model": "openai/vendor-model", "order": 1},
+            "model_info": {
+                "id": "fixed-responses-route",
+                "upstream_url_surface": "openai/responses",
+                "upstream_protocol_mode": "fixed",
+            },
+        }
+
+        self.assertEqual(
+            hooks._request_surface_for_deployment(
+                {
+                    "call_type": "aresponses",
+                    "input": "hello",
+                    "reasoning": {"effort": "max", "summary": "auto"},
+                },
+                deployment,
+            ),
+            "openai/responses",
+        )
+
+    def test_fallback_responses_route_keeps_its_surface_with_a_summary(self) -> None:
+        hooks, _ = load_hook_module()
+        deployment = {
+            "litellm_params": {"model": "openai/vendor-model", "order": 1},
+            "model_info": {
+                "id": "responses-route",
+                "upstream_url_surface": "openai/responses",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+
+        self.assertEqual(
+            hooks._request_surface_for_deployment(
+                {
+                    "call_type": "aresponses",
+                    "input": "hello",
+                    "reasoning": {"effort": "max", "summary": "auto"},
+                },
+                deployment,
+            ),
+            "openai/responses",
+        )
+
     def test_excluded_deployments_survive_the_litellm_metadata_rebuild(self) -> None:
         hooks, _ = load_hook_module()
 

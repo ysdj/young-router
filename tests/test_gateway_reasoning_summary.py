@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from young_router.proxy import patches
+from young_router.proxy import patches, responses_execution
 
 
 def _event(payload: dict) -> object:
@@ -333,3 +333,61 @@ class ReasoningSummaryStreamTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChatBridgeReasoningSummaryTests(unittest.IsolatedAsyncioTestCase):
+    """The Responses chat bridge streams a thinking route's reasoning_content."""
+
+    async def test_reasoning_content_becomes_summary_frames_before_the_answer(self) -> None:
+        class ChatStream:
+            def __init__(self) -> None:
+                self.chunks = [
+                    {"choices": [{"delta": {"reasoning_content": "step one "}}]},
+                    {"choices": [{"delta": {"reasoning_content": "step two"}}]},
+                    {"choices": [{"delta": {"content": "answer"}}]},
+                ]
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self.chunks:
+                    raise StopAsyncIteration
+                return self.chunks.pop(0)
+
+        events = [
+            event
+            async for event in responses_execution._responses_chat_bridge_text_stream_from_chat_stream(
+                ChatStream(),
+                {
+                    "model": "deepseek-v4.1-flash",
+                    "reasoning": {"effort": "max", "summary": "auto"},
+                },
+            )
+        ]
+        types = [event["type"] for event in events]
+        self.assertIn("response.reasoning_summary_part.added", types)
+        deltas = [
+            event["delta"]
+            for event in events
+            if event["type"] == "response.reasoning_summary_text.delta"
+        ]
+        self.assertEqual(["step one ", "step two"], deltas)
+        reasoning_done = next(
+            event
+            for event in events
+            if event["type"] == "response.output_item.done"
+            and event["item"].get("type") == "reasoning"
+        )
+        self.assertEqual(
+            [{"type": "summary_text", "text": "step one step two"}],
+            reasoning_done["item"]["summary"],
+        )
+        answer = next(
+            event for event in events if event["type"] == "response.output_text.delta"
+        )
+        self.assertLess(
+            types.index("response.reasoning_summary_text.delta"),
+            types.index("response.output_text.delta"),
+        )
+        self.assertEqual("answer", answer["delta"])
