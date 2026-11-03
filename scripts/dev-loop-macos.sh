@@ -59,8 +59,10 @@
 # JS/Python half that no window could show.  `tests/test_rn_release.py` pins
 # that refusal and the other boundaries stated here.
 #
-# Neither mode replaces the deploy: run `build-and-install-macos.sh` once the
-# change is settled, and read its own output for what it shipped.
+# Neither mode is the deploy: `build-and-install-macos.sh` re-checks the
+# upstream releases, re-signs, and installs, so it runs when a deploy is asked
+# for (or when this loop refused a native source).  A change the loop carried
+# is already live in the installed app, and that is where an edit ends.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -411,4 +413,4 @@ if ! "$RESTART_APP" >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "dev-loop-macos: running with the change -- run scripts/build-and-install-macos.sh when it is settled"
+echo "dev-loop-macos: running with the change"
