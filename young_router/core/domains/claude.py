@@ -1627,13 +1627,11 @@ class ClaudeSettingsDomain:
             if aliases.get(alias) != name:
                 continue
             rows.append({"name": alias, "labelOverride": name})
-        # The picker is read top-down and selected by number, so it is ordered by
-        # the name a person actually reads -- the label, or the id when Desktop
-        # renders the row itself.  Two routes of one public name stay adjacent in
-        # the router's own order, because the sort is stable.
-        rows.sort(
-            key=lambda row: str(row.get("labelOverride") or row["name"]).casefold()
-        )
+        # Rows keep the order of the public names they were derived from, and
+        # that order is already the picker's: ``codex_config.local_exposed_models``
+        # answers every name this app writes alphabetically, case-insensitively,
+        # and a row's ``labelOverride`` is that same public name -- so the label a
+        # person reads is what the list is ordered by, without a sort here.
         return rows
 
     @staticmethod

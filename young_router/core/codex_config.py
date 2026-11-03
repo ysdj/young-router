@@ -348,6 +348,12 @@ def local_exposed_models(api_key: str) -> tuple[list[str], bool]:
     offered a choice that could only fail; the request log for
     ``gpt-image-2.5-sunburst`` showed the client sending a full coding-agent tool
     set to a route that answers ``{\"size\":\"1024x1024\"...}`` instead.
+
+    The answer is ordered by public name, case-insensitively, and that is the
+    only order in it: every picker this app writes -- the managed Codex catalog
+    and both Claude lists -- is built from these names, so a route sits in the
+    same place in all of them and no client re-sorts its copy.  ``/v1/models``
+    itself is untouched and keeps the order its ``model_list`` declares.
     """
 
     if not isinstance(api_key, str) or not api_key.strip():
@@ -401,6 +407,7 @@ def local_exposed_models(api_key: str) -> tuple[list[str], bool]:
             continue
         seen.add(name)
         names.append(name)
+    names.sort(key=str.casefold)
     return names, True
 
 

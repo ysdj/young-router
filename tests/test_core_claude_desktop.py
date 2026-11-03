@@ -479,10 +479,12 @@ general_settings:
             self.assertEqual(len(set(names)), len(names), "aliases must be unique")
             self.assertTrue(snapshot["clients"]["claudeDesktop"]["model_list_enabled"])
 
-    def test_the_list_is_ordered_by_the_name_the_picker_shows(self) -> None:
+    def test_the_list_keeps_the_order_the_public_names_arrive_in(self) -> None:
         # The picker is read top-down and picked by number, so its order is the
-        # reader's, not the router's: the label a row displays is what sorts it,
-        # and a row Desktop renders itself sorts by its own id.
+        # reader's.  That order is settled once, where the public names are read
+        # (``codex_config.local_exposed_models``), and this derivation must not
+        # re-rank it: a row written as itself and a row written under an alias
+        # sit in the list exactly where their public name does.
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             desktop_root = root / "configLibrary"
@@ -493,16 +495,11 @@ general_settings:
                 runtime_config_path=root / "config.yaml",
                 runtime_root=root,
             )
-            public = ["grok-4.7", "kimi-k3.1-pro", "claude-opus-5-5", "deepseek-v4.1-flash"]
+            public = ["claude-opus-5-5", "deepseek-v4.1-flash", "grok-4.7", "kimi-k3.1-pro"]
             with mock.patch.object(domain, "_public_models", return_value=public):
                 entries = domain.desktop_model_entries()
 
-            shown = [row.get("labelOverride") or row["name"] for row in entries]
-            self.assertEqual(sorted(shown, key=str.casefold), shown)
-            self.assertEqual(
-                ["claude-opus-5-5", "deepseek-v4.1-flash", "grok-4.7", "kimi-k3.1-pro"],
-                shown,
-            )
+            self.assertEqual(public, [row.get("labelOverride") or row["name"] for row in entries])
 
     def test_a_snapshot_repairs_a_list_the_router_outgrew(self) -> None:
         # A proxy reload regenerates the list, which covers a provider Apply.

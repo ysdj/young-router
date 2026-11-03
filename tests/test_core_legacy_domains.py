@@ -3356,7 +3356,10 @@ class CodexSettingsDomainTests(unittest.TestCase):
 
             self.assertTrue(catalog_is_current(catalog_path, ["default-chat"], registry=codex._context_registry))
 
-    def test_catalog_priority_reorder_keeps_the_catalog_current(self) -> None:
+    def test_the_catalog_is_alphabetical_whatever_model_is_active(self) -> None:
+        # The picker lists the catalog by ``priority`` ascending, so that number
+        # is the row's place in an alphabetical list -- switching the active
+        # model re-orders nothing, because no model holds a special place.
         with tempfile.TemporaryDirectory() as directory, mock.patch(
             "young_router.core.codex_config.local_exposed_models",
             return_value=(["model-a", "model-b"], True),
@@ -3412,8 +3415,8 @@ class CodexSettingsDomainTests(unittest.TestCase):
             snapshot = core.snapshot()["domains"]["codex"]["model_catalog"]
             catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
 
-            self.assertEqual(["model-b", "model-a"], snapshot["public_models"])
-            self.assertEqual(["model-b", "model-a"], [model["slug"] for model in catalog["models"]])
+            self.assertEqual(["model-a", "model-b"], snapshot["public_models"])
+            self.assertEqual(["model-a", "model-b"], [model["slug"] for model in catalog["models"]])
 
     def test_provider_apply_updates_enabled_catalog(self) -> None:
         live_models = {"names": ["default-chat"]}

@@ -14,7 +14,6 @@ from young_router.core.model_catalog import (
     catalog_payload,
     route_serves_only_images,
     select_inherited_profile,
-    selected_model_names,
     write_catalog,
 )
 from young_router.core.model_contexts import (
@@ -212,19 +211,11 @@ class ModelCatalogTests(unittest.TestCase):
             defaults_by_key["YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MIN_BYTES"],
         )
 
-    def test_selected_names_keep_explicit_models_in_order_and_dedupe(self) -> None:
-        config = {
-            "model": "deepseek-v4-flash",
-            "review_model": "deepseek-v4-flash",
-        }
-        self.assertEqual(["deepseek-v4-flash"], selected_model_names(config))
-        self.assertEqual(
-            ["deepseek-v4-flash", "review-only"],
-            selected_model_names({"model": " deepseek-v4-flash ", "review_model": "review-only"}),
-        )
-        self.assertEqual([], selected_model_names({"model": "", "review_model": None}))
-
-    def test_catalog_names_include_exposed_configured_models_after_selected_models(self) -> None:
+    def test_catalog_names_are_the_exposed_list_following_the_pickers_order(self) -> None:
+        # Every picker this app writes is read top-down and picked by number, so
+        # they share one order, and the one probe both clients read owns it.
+        # This step filters that order; it never re-ranks it, and a selected model
+        # holds no special place.
         payload = {
             "structured": {
                 "model": "active-model",
@@ -238,27 +229,44 @@ class ModelCatalogTests(unittest.TestCase):
                 {"model": "anthropic-model"},
             ],
             "exposed_models": [
+                "active-model",
+                "anthropic-model",
+                "image-model",
                 "other-model",
                 "active-model",
-                "other-model",
-                "image-model",
-                "anthropic-model",
             ],
         }
 
         # The configured model list is an allowlist over the live exposure:
-        # selected names keep their position, unconfigured routes are never
-        # catalog entries, and configured-but-unexposed names are not
-        # fallbacks.
+        # unconfigured routes are never catalog entries, and
+        # configured-but-unexposed names are not fallbacks.
         self.assertEqual(
             [
                 "active-model",
-                "other-model",
-                "image-model",
                 "anthropic-model",
+                "image-model",
+                "other-model",
             ],
             catalog_names_from_editor(payload),
         )
+
+    def test_the_catalog_numbers_priorities_in_the_order_it_is_given(self) -> None:
+        """Codex sorts its picker by ``priority`` and discards the array order.
+
+        Verified against the client's models-manager: the catalog's own ``models``
+        array is not what the list renders.  The priority is therefore the row's
+        place in the picker, and it is numbered from the order the names arrive
+        in -- the one order the probe every client reads already provides.
+        """
+
+        with mock.patch(
+            "young_router.core.model_catalog.load_native_catalog",
+            return_value=[],
+        ):
+            models = catalog_payload(["alpha", "mike", "zulu"])["models"]
+
+        self.assertEqual(["alpha", "mike", "zulu"], [model["slug"] for model in models])
+        self.assertEqual([1, 2, 3], [model["priority"] for model in models])
 
     def test_catalog_names_include_every_exposed_configured_route(self) -> None:
         self.assertEqual(

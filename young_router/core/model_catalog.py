@@ -79,24 +79,6 @@ def legacy_managed_catalog_path(codex_home: Path | str) -> Path:
     return Path(codex_home).expanduser() / LEGACY_CATALOG_FILE_NAME
 
 
-def selected_model_names(config: object) -> list[str]:
-    """Return the explicitly configured Codex and review models, in order."""
-
-    if not isinstance(config, Mapping):
-        return []
-    names: list[str] = []
-    seen: set[str] = set()
-    for key in ("model", "review_model"):
-        value = config.get(key)
-        if not isinstance(value, str):
-            continue
-        name = value.strip()
-        if name and name not in seen:
-            seen.add(name)
-            names.append(name)
-    return names
-
-
 def catalog_names_from_editor(payload: object) -> list[str]:
     """Return public model names available to the Codex model catalog.
 
@@ -111,8 +93,10 @@ def catalog_names_from_editor(payload: object) -> list[str]:
     currently unavailable drops out of the catalog, and an unavailable Menu
     still yields an empty catalog.
 
-    The active and review models are kept first *only when LiteLLM exposes
-    them*; every other eligible ID follows in endpoint order.
+    The order is the exposure's own, which is already alphabetical by public
+    name: ``codex_config.local_exposed_models`` owns that one order for every
+    picker this app writes, so this filters and never re-ranks.  The active and
+    review models hold no special place -- a picker is one alphabetical list.
     """
 
     if not isinstance(payload, Mapping):
@@ -130,38 +114,19 @@ def catalog_names_from_editor(payload: object) -> list[str]:
             if isinstance(name, str) and name.strip():
                 configured.add(name.strip())
 
-    names: list[str] = []
-    seen: set[str] = set()
-
-    def add(value: object) -> None:
-        if not isinstance(value, str):
-            return
-        name = value.strip()
-        if name and name in configured and name not in seen:
-            seen.add(name)
-            names.append(name)
-
     exposed = payload.get("exposed_models")
     if not isinstance(exposed, Sequence) or isinstance(exposed, (str, bytes, bytearray)):
         return []
 
-    exposed_names: list[str] = []
-    exposed_seen: set[str] = set()
+    names: list[str] = []
+    seen: set[str] = set()
     for value in exposed:
         if not isinstance(value, str):
             continue
         name = value.strip()
-        if not name or name in exposed_seen:
-            continue
-        exposed_seen.add(name)
-        exposed_names.append(name)
-
-    exposed_set = set(exposed_names)
-    for name in selected_model_names(payload.get("structured")):
-        if name in exposed_set:
-            add(name)
-    for name in exposed_names:
-        add(name)
+        if name and name in configured and name not in seen:
+            seen.add(name)
+            names.append(name)
     return names
 
 
@@ -582,6 +547,11 @@ def catalog_payload(
 ) -> dict[str, Any]:
     context_registry = registry or ModelContextRegistry()
     resolved_native = load_native_catalog() if native_models is None else native_models
+    # Codex's models-manager discards this array's order and sorts the picker by
+    # ``priority`` ascending, so the number is the row's position in the list a
+    # person reads.  ``names`` arrives in the one order every generated picker
+    # uses -- ``catalog_names_from_editor`` answers it -- so the catalog
+    # reproduces that order rather than inventing a second one.
     return {
         "models": [
             _catalog_model(name, index + 1, context_registry, resolved_native, base_slug)
@@ -764,6 +734,5 @@ __all__ = [
     "profile_has_instructions",
     "route_serves_only_images",
     "select_inherited_profile",
-    "selected_model_names",
     "write_catalog",
 ]

@@ -92,6 +92,7 @@ class CodexConfigTests(unittest.TestCase):
             {
                 "data": [
                     {"id": "model-b"},
+                    {"id": "Alpha-model"},
                     {"id": "model-a"},
                     {"id": "model-b"},
                     {"id": ""},
@@ -108,7 +109,13 @@ class CodexConfigTests(unittest.TestCase):
             models, enabled = codex_config.local_exposed_models("sk-local-test")
 
         self.assertTrue(enabled)
-        self.assertEqual(["model-b", "model-a"], models)
+        # Every picker this app writes is read top-down and picked by number, so
+        # the probe answers the one order they all share: alphabetical by public
+        # name, case-insensitively.  It is settled here, in the only function the
+        # Codex catalog and both Claude lists are built from, so no client re-sorts
+        # its own copy into a different list.  ``/v1/models`` itself keeps
+        # publishing in the order its ``model_list`` declares.
+        self.assertEqual(["Alpha-model", "model-a", "model-b"], models)
         request = opener.open.call_args.args[0]
         self.assertEqual("http://127.0.0.1:4999/v1/models", request.full_url)
         self.assertEqual("Bearer sk-local-test", request.get_header("Authorization"))
