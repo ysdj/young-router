@@ -6089,6 +6089,11 @@ async def _yield_streaming_error_fallback_or_raise(
         async for chunk in _stream_streaming_error_fallback(request_data, exception):
             if is_responses_stream and not fallback_started_delivery:
                 chunk_has_visible_output = _stream_chunk_has_visible_output(chunk)
+                # Thinking is shown the moment it arrives, exactly as in the
+                # ordinary start buffer.  A fallback that held summary deltas
+                # until the answer handed the reader the whole reasoning block
+                # at once; it is delivered output, so it ends this window.
+                chunk_has_public_reasoning = _stream_chunk_is_public_reasoning_delta(chunk)
                 chunk_is_completed = _responses_completed_chunk_has_usable_output(
                     chunk,
                     request_data,
@@ -6096,6 +6101,7 @@ async def _yield_streaming_error_fallback_or_raise(
                 chunk_is_incomplete_terminal = _responses_stream_chunk_is_incomplete_terminal(chunk)
                 if not (
                     chunk_has_visible_output
+                    or chunk_has_public_reasoning
                     or chunk_is_completed
                     or chunk_is_incomplete_terminal
                 ):
@@ -6108,6 +6114,7 @@ async def _yield_streaming_error_fallback_or_raise(
                 fallback_start_buffer.clear()
                 fallback_delivered_terminal_or_visible = (
                     chunk_has_visible_output
+                    or chunk_has_public_reasoning
                     or chunk_is_completed
                     or chunk_is_incomplete_terminal
                 )
@@ -6115,6 +6122,7 @@ async def _yield_streaming_error_fallback_or_raise(
                 fallback_delivered_terminal_or_visible = (
                     fallback_delivered_terminal_or_visible
                     or _stream_chunk_has_visible_output(chunk)
+                    or _stream_chunk_is_public_reasoning_delta(chunk)
                     or _responses_completed_chunk_has_usable_output(chunk, request_data)
                     or _responses_stream_chunk_is_incomplete_terminal(chunk)
                 )
@@ -6372,13 +6380,6 @@ async def _yield_start_buffered_stream_with_error_fallback(
                 if completed_compat_chunk is not None:
                     chunk = completed_compat_chunk
             buffer.append(chunk)
-            if _stream_chunk_type(chunk).startswith("response.reasoning_summary_text.delta"):
-                _trace_module._request_route_trace(
-                    "responses_start_buffer_summary_delta", request_data,
-                    delta_len=len(str((_stream_chunk_dump(chunk) or {}).get("delta") or "")),
-                    delivered=_stream_chunk_is_public_reasoning_delta(chunk),
-                    chunk_class=type(chunk).__name__,
-                )
             if is_responses_stream:
                 completion_state.remember(chunk)
             saw_visible_output = saw_visible_output or (

@@ -1,11 +1,62 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 
 from hook_test_utils import *
 
 
 class HookStreamingFailoverTests(HookTestCase):
+    async def test_fallback_start_buffer_delivers_a_reasoning_summary_delta(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = sys.modules["young_router.proxy.streaming"]
+        original_fallback = streaming_module._stream_streaming_error_fallback
+        self.addCleanup(
+            setattr,
+            streaming_module,
+            "_stream_streaming_error_fallback",
+            original_fallback,
+        )
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0")
+        gate = asyncio.Event()
+
+        async def holding_fallback(_request_data, _exception):
+            yield {
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "reasoning-fallback",
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": "one step",
+            }
+            await gate.wait()
+            yield {
+                "type": "response.output_text.delta",
+                "item_id": "answer-fallback",
+                "output_index": 1,
+                "content_index": 0,
+                "delta": "the answer",
+            }
+
+        streaming_module._stream_streaming_error_fallback = holding_fallback
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+        }
+        stream = hooks._yield_streaming_error_fallback_or_raise(
+            request_data,
+            RuntimeError("upstream failed"),
+        )
+
+        first = await asyncio.wait_for(stream.__anext__(), timeout=1.0)
+        self.assertEqual(
+            "response.reasoning_summary_text.delta",
+            jsonable_stream_chunk(first)["type"],
+        )
+        gate.set()
+        await stream.aclose()
+
     async def test_terminal_failed_stream_wrapper_is_delivered_once(self) -> None:
         hooks, _proxy_server = load_hook_module()
         streaming_module = sys.modules["young_router.proxy.streaming"]

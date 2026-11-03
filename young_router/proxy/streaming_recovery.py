@@ -543,19 +543,6 @@ async def _stream_route_recovery_poll_attempt(
 
             buffered_chunks.append(chunk)
             completion_state.remember(chunk)
-            buffered_type = _streaming_module._stream_chunk_type(chunk)
-            if buffered_type.startswith("response.reasoning_summary"):
-                _trace_module._request_route_trace(
-                    "route_recovery_poll_summary_chunk", request_data,
-                    event_type=buffered_type,
-                    delta_len=len(str((_streaming_module._stream_chunk_dump(chunk) or {}).get("delta") or "")),
-                    deliverable=bool(
-                        _streaming_module._stream_chunk_has_deliverable_route_recovery_output(
-                            chunk,
-                            request_data,
-                        )
-                    ),
-                )
             terminal_exception = _streaming_module._route_recovery_terminal_chunk_exception(
                 chunk,
                 request_data,
