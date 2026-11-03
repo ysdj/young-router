@@ -1,4 +1,4 @@
-"""Tell LiteLLM which routes of ours can reason, before any turn runs.
+"""Tell LiteLLM which routes of ours can reason and stream, before any turn runs.
 
 LiteLLM ships a static cost map of the models it knows.  A relay's own model id
 is absent from it, and an absent entry means "this model has no reasoning": the
@@ -30,7 +30,11 @@ def runtime_config_path() -> str:
             value = None
         if isinstance(value, str) and value.strip():
             return value.strip()
-    return os.environ.get("LITELLM_RUNTIME_CONFIG", "").strip()
+    for name in ("LITELLM_RUNTIME_CONFIG", "LITELLM_CONFIG_FILE"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
 
 
 def register(config_path: str | None = None) -> int:
@@ -70,11 +74,27 @@ def register(config_path: str | None = None) -> int:
         # LiteLLM keys the map by the bare model id; a provider prefix is the
         # route's own spelling and never appears in the table.
         name = model.split("/", 1)[-1] if "/" in model else model
+        adapter = model.split("/", 1)[0] if "/" in model else "openai"
+        # An images route never takes the Responses streaming path, so leave its
+        # entry's routing fields untouched.
+        is_image = "image" in name.casefold()
         entry = cost.get(name)
         if isinstance(entry, Mapping) and entry.get("supports_reasoning") is True:
-            continue
+            if is_image or entry.get("litellm_provider") in (None, adapter):
+                continue
         target: dict[str, Any] = dict(entry) if isinstance(entry, Mapping) else {}
         target["supports_reasoning"] = True
+        if not is_image:
+            # LiteLLM's OpenAI Responses adapter fakes a stream for a model it
+            # cannot find in this map.  A faked stream calls the provider
+            # without ``stream`` and only then slices the completed body into
+            # events: the reader waits through the whole thinking phase and
+            # receives every summary delta at once.  These routes are
+            # OpenAI-compatible relays this proxy calls with the adapter's
+            # provider, so state both facts here and the provider's own SSE
+            # stays the wire.
+            target["supports_native_streaming"] = True
+            target["litellm_provider"] = adapter
         cost[name] = target
         registered += 1
     return registered
