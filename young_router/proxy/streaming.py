@@ -506,6 +506,17 @@ def _responses_stream_chunk_for_delivery(
                 request_data
             )
         ):
+            _trace_module._request_route_trace(
+                "responses_summary_frame_dropped",
+                request_data,
+                event_type=_stream_chunk_type(chunk),
+                reasoning=request_data.get("reasoning")
+                if isinstance(request_data, dict)
+                else None,
+                model_reasoning_summary=request_data.get("model_reasoning_summary")
+                if isinstance(request_data, dict)
+                else None,
+            )
             return None
         return chunk
     if isinstance(chunk, (str, bytes)):
@@ -566,6 +577,17 @@ def _responses_stream_chunk_for_delivery(
                 request_data
             )
         ):
+            _trace_module._request_route_trace(
+                "responses_summary_frame_dropped",
+                request_data,
+                event_type=_stream_chunk_type(json_chunk),
+                reasoning=request_data.get("reasoning")
+                if isinstance(request_data, dict)
+                else None,
+                model_reasoning_summary=request_data.get("model_reasoning_summary")
+                if isinstance(request_data, dict)
+                else None,
+            )
             return None
         return _json_stream_event(json_chunk)
     return chunk
