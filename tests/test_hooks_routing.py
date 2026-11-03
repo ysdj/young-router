@@ -1935,6 +1935,28 @@ class HookRoutingTests(HookTestCase):
             "anthropic",
         )
 
+    def test_excluded_deployments_survive_the_litellm_metadata_rebuild(self) -> None:
+        hooks, _ = load_hook_module()
+
+        class Refusal(Exception):
+            def __init__(self) -> None:
+                super().__init__("refused")
+                self.failed_deployment_id = "route-a"
+
+        request = {"litellm_metadata": {}}
+        hooks._sync_failed_deployment_exclusions(request, Refusal())
+
+        self.assertEqual(["route-a"], request["_excluded_deployment_ids"])
+        self.assertEqual(
+            ["route-a"],
+            request["litellm_metadata"]["excluded_deployment_ids"],
+        )
+        rebuilt = {"litellm_metadata": {"excluded_deployment_ids": ["route-a"]}}
+        self.assertEqual(
+            {"route-a"},
+            hooks._request_excluded_deployment_ids(rebuilt),
+        )
+
     def test_fixed_mode_ignores_a_stale_fallback_target(self) -> None:
         hooks, _ = load_hook_module()
         deployment = {

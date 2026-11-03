@@ -589,6 +589,14 @@ def _request_excluded_deployment_ids(request_kwargs: Optional[dict]) -> set[str]
     request_kwargs = request_kwargs or {}
     excluded = request_kwargs.get("_excluded_deployment_ids")
     if not isinstance(excluded, list):
+        # LiteLLM rebuilds the router kwargs from the deployment parameters
+        # between the fallback call and deployment selection, which drops the
+        # underscore key.  ``litellm_metadata`` survives that rebuild, so the
+        # exclusion written there is the one the router can still see.
+        metadata = request_kwargs.get("litellm_metadata")
+        if isinstance(metadata, dict):
+            excluded = metadata.get("excluded_deployment_ids")
+    if not isinstance(excluded, list):
         return set()
     return {item for item in excluded if isinstance(item, str)}
 

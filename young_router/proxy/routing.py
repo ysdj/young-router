@@ -6869,7 +6869,13 @@ def _sync_failed_deployment_exclusions(
         excluded_ids.add(failed_id)
     if excluded_ids:
         if isinstance(request_kwargs, dict):
-            request_kwargs["_excluded_deployment_ids"] = sorted(excluded_ids)
+            serialized = sorted(excluded_ids)
+            request_kwargs["_excluded_deployment_ids"] = serialized
+            metadata = request_kwargs.get("litellm_metadata")
+            if isinstance(metadata, dict):
+                metadata = metadata.copy()
+                metadata["excluded_deployment_ids"] = serialized
+                request_kwargs["litellm_metadata"] = metadata
         _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(excluded_ids)
         try:
             exception.excluded_deployment_ids = sorted(excluded_ids)  # type: ignore[attr-defined]

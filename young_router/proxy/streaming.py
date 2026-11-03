@@ -3826,6 +3826,12 @@ def _apply_streaming_error_fallback_constraints(
         serialized_excluded_ids = sorted(excluded_ids)
         request_data["_excluded_deployment_ids"] = serialized_excluded_ids
         payload["_excluded_deployment_ids"] = serialized_excluded_ids
+        for container in (request_data, payload):
+            metadata = container.get("litellm_metadata")
+            if isinstance(metadata, dict):
+                metadata = metadata.copy()
+                metadata["excluded_deployment_ids"] = serialized_excluded_ids
+                container["litellm_metadata"] = metadata
         _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(excluded_ids)
         return excluded_ids
 
