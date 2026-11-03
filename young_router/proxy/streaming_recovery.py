@@ -1347,6 +1347,14 @@ async def _stream_route_recovery_poll(
             )
             if forced_target_order is not None:
                 request_data[_streaming_module._ROUTE_RECOVERY_FORCED_TARGET_ORDER_KEY] = forced_target_order
+            # Captured after the reset above: the reopen clears this request's
+            # exclusions, so an earlier snapshot would hide the refusal this
+            # attempt is about to record.
+            excluded_before_attempt = (
+                _responses_request_module._request_excluded_deployment_ids(
+                    request_data
+                )
+            )
 
             target_order = forced_target_order
             if target_order is None:
@@ -1491,6 +1499,39 @@ async def _stream_route_recovery_poll(
                         exception=_routing_module._trace_exception(last_exception),
                     )
 
+            # A single-deployment group cannot refresh to another route: the
+            # reopen below recomputes the same order and selects the same
+            # deployment again. Once that route has actually refused this round,
+            # every later attempt replays the same bytes at it, and holding the
+            # client for the rest of the window is silence -- the client's own
+            # retry is the attempt that can end up anywhere else. A round that
+            # never reached an upstream (a preserved exclusion, a shared
+            # cooldown) adds nothing new to the excluded set and is not this
+            # case; multi-route groups keep their refresh, which is what selects
+            # a different route.
+            configured_deployment_ids = _route_recovery_poll_configured_deployment_ids(
+                request_data
+            )
+            excluded_after_attempt = (
+                _responses_request_module._request_excluded_deployment_ids(
+                    request_data
+                )
+            )
+            if (
+                len(configured_deployment_ids) == 1
+                and configured_deployment_ids <= excluded_after_attempt
+                and excluded_after_attempt - excluded_before_attempt
+                and _routing_module._is_no_deployments_available_error(last_exception)
+            ):
+                _trace_module._request_route_trace(
+                    "route_recovery_poll_single_route_exhausted", request_data,
+                    poll_attempt=attempt,
+                    configured_deployment_ids=sorted(configured_deployment_ids),
+                    elapsed_seconds=round(time.monotonic() - started_at_monotonic, 3),
+                    exception=_routing_module._trace_exception(last_exception),
+                )
+                break
+
             now = time.monotonic()
             if max_poll_seconds <= 0 or (
                 deadline is not None and now >= deadline
@@ -1622,6 +1663,27 @@ def _route_recovery_poll_cooldown_wait(
         "cooldown_until": min(cooldown_until_values),
         "cooldown_deployments": cooled,
     }
+
+def _route_recovery_poll_configured_deployment_ids(request_data: dict) -> set[str]:
+    """The whole group, never the request's current exclusions.
+
+    ``_configured_deployment_ids`` reads the pool through
+    ``_router_configured_deployments``, which releases this request's exclusion
+    block for the call; that is exactly the number the poll compares its own
+    exhausted set against.
+    """
+
+    try:
+        from litellm.proxy.proxy_server import llm_router
+    except Exception:
+        return set()
+    if llm_router is None:
+        return set()
+    try:
+        return _configured_deployment_ids(llm_router, request_data)
+    except Exception:
+        return set()
+
 
 def _route_recovery_poll_has_no_available_deployments(request_data: dict) -> bool:
     """Compatibility predicate for callers that only need the cooling state."""

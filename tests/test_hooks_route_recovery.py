@@ -1199,6 +1199,153 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertIn({"type": "response.completed", "response": {"id": "resp-recovered"}}, chunks)
         self.assertFalse(any(isinstance(chunk, str) for chunk in chunks))
 
+    async def test_single_route_refusal_ends_the_poll_instead_of_holding_the_client(self) -> None:
+        """A group with one deployment cannot fail over to anything.
+
+        Live 2026-11-03: ``glm-5.3-flash`` held one reachable deployment and
+        that relay answered 503 ``no available channels``. The fallback excluded
+        it, and the poll reopened the same one-route pool every ~17 s for its
+        four-hour window: the client rendered a spinner and read keepalives
+        only, and nothing inside the window could ever select another route.
+        The turn has to end so the client's own retry is what asks again.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        attempts = []
+
+        class RouterRateLimitError(Exception):
+            pass
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [
+                    {
+                        "litellm_params": {"order": 0.2},
+                        "model_info": {"id": "only-route"},
+                    }
+                ]
+
+        async def refused_attempt(request_data, exception, **kwargs):
+            attempts.append(dict(request_data))
+            request_data["_excluded_deployment_ids"] = ["only-route"]
+            raise RouterRateLimitError(
+                "No deployments available for selected model"
+            )
+            if False:
+                yield None
+
+        proxy_server.llm_router = FakeRouter()
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "3600")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        request_data = {
+            "model": "glm-5.3-flash",
+            "input": [{"role": "user", "content": "9.11和9.9比哪个大"}],
+            "stream": True,
+            "metadata": {"request_id": "single-route-refusal"},
+        }
+        first_exception = RouterRateLimitError(
+            "No deployments available for selected model"
+        )
+
+        with mock.patch.object(
+            hooks._streaming_module,
+            "_stream_route_recovery_poll_attempt",
+            refused_attempt,
+        ), mock.patch.object(
+            hooks._streaming_module,
+            "_stream_native_route_recovery_poll_attempt",
+            refused_attempt,
+        ):
+            started = time.monotonic()
+            chunks = [
+                chunk
+                async for chunk in hooks._stream_route_recovery_poll(
+                    request_data,
+                    first_exception,
+                )
+            ]
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(len(attempts), 1)
+        self.assertLess(elapsed, 1.0)
+        assert_upstream_route_failed_terminal(self, chunks)
+
+    async def test_single_route_poll_still_spends_its_reopen_when_no_upstream_was_reached(self) -> None:
+        """A round that only met our own exclusion is not the route refusing again.
+
+        The first fallback round leaves the one route excluded, and the poll's
+        first attempt inherits that exclusion instead of reaching the upstream.
+        Nothing new was refused, so the reopen has to happen: only once that
+        attempt really reaches the route may the poll call the group exhausted.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        attempts = []
+
+        class RouterRateLimitError(Exception):
+            pass
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [
+                    {"litellm_params": {"order": 0.2}, "model_info": {"id": "only-route"}},
+                ]
+
+        async def attempt(request_data, exception, **kwargs):
+            attempts.append(dict(request_data))
+            if len(attempts) == 1:
+                raise RouterRateLimitError(
+                    "No deployments available for selected model"
+                )
+            yield {
+                "type": "response.output_text.delta",
+                "item_id": "msg_recovered",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "recovered after the reopen",
+            }
+
+        proxy_server.llm_router = FakeRouter()
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "3600")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        request_data = {
+            "model": "glm-5.3-flash",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "metadata": {"request_id": "single-route-reopen"},
+            "_excluded_deployment_ids": ["only-route"],
+        }
+        first_exception = RouterRateLimitError(
+            "No deployments available for selected model"
+        )
+
+        with mock.patch.object(
+            hooks._streaming_module,
+            "_stream_route_recovery_poll_attempt",
+            attempt,
+        ), mock.patch.object(
+            hooks._streaming_module,
+            "_stream_native_route_recovery_poll_attempt",
+            attempt,
+        ):
+            chunks = [
+                chunk
+                async for chunk in hooks._stream_route_recovery_poll(
+                    request_data,
+                    first_exception,
+                )
+            ]
+
+        self.assertEqual(len(attempts), 2)
+        self.assertNotIn("only-route", attempts[1].get("_excluded_deployment_ids") or [])
+        self.assertTrue(
+            any(
+                isinstance(chunk, dict)
+                and chunk.get("delta") == "recovered after the reopen"
+                for chunk in chunks
+            )
+        )
+
     async def test_route_recovery_round_streams_non_streaming_success(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []
