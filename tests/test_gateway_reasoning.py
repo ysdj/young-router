@@ -114,13 +114,14 @@ class ReasoningCapabilityRegistrationTests(unittest.TestCase):
             "non-streaming-model": {"supports_native_streaming": False},
         }
         with mock.patch("litellm.model_cost", cost):
-            self.assertFalse(
-                config.should_fake_stream(
-                    model="deepseek-v4.1-flash",
-                    stream=True,
-                    custom_llm_provider=None,
+            for provider in (None, "deepseek", "openai"):
+                self.assertFalse(
+                    config.should_fake_stream(
+                        model="deepseek-v4.1-flash",
+                        stream=True,
+                        custom_llm_provider=provider,
+                    )
                 )
-            )
             self.assertTrue(
                 config.should_fake_stream(
                     model="non-streaming-model",

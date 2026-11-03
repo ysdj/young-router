@@ -3077,20 +3077,37 @@ def _install_openai_responses_fake_stream_patch() -> None:
         stream: Any = None,
         custom_llm_provider: Any = None,
     ) -> Any:
-        if stream is True and not custom_llm_provider and isinstance(model, str):
+        if stream is True and isinstance(model, str):
             name = model.rsplit("/", 1)[-1]
             entry = getattr(litellm, "model_cost", {}).get(name)
             if (
                 isinstance(entry, dict)
                 and entry.get("supports_native_streaming") is True
             ):
+                _trace_module._request_route_trace(
+                    "openai_responses_fake_stream",
+                    {},
+                    model=model,
+                    provider=custom_llm_provider,
+                    fake=False,
+                    source="registered-native-streaming",
+                )
                 return False
-        return original(
+        fake = original(
             self,
             model=model,
             stream=stream,
             custom_llm_provider=custom_llm_provider,
         )
+        _trace_module._request_route_trace(
+            "openai_responses_fake_stream",
+            {},
+            model=model,
+            provider=custom_llm_provider,
+            fake=bool(fake),
+            source="litellm",
+        )
+        return fake
 
     setattr(
         patched_should_fake_stream,
