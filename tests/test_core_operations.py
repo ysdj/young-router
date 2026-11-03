@@ -1189,6 +1189,35 @@ class CoreOperationsTests(unittest.TestCase):
                 (root / ".litellm-runtime" / "config.yaml").read_bytes(),
             )
 
+    def test_a_restage_with_nothing_to_change_leaves_the_document_alone(self) -> None:
+        """An unchanged restage must not move the timestamp an edit is read from.
+
+        The staged document and the provider editor's document are the same
+        file, and the client-model watcher reloads the proxy when that file's
+        timestamp moves.  A restage that rewrote identical bytes therefore read
+        as an edit by somebody else, queued a reload, and that reload's own
+        restage moved it again -- back-to-back worker replacements while every
+        window stayed on 启动中.  The write is skipped when there is nothing to
+        write, so the watcher is not told about a change nobody made.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / ".litellm-runtime"
+            runtime.mkdir(parents=True)
+            document = runtime / "config.yaml"
+            document.write_text("model_list: []\n", encoding="utf-8")
+            before = document.read_bytes()
+            # A timestamp far enough in the past that a replacement cannot be
+            # mistaken for the same value on a coarse filesystem clock.
+            os.utime(document, (1_600_000_000, 1_600_000_000))
+            stamped = document.stat().st_mtime_ns
+
+            CoreServiceController(root)._stage_runtime_config()
+
+            self.assertEqual(before, document.read_bytes())
+            self.assertEqual(stamped, document.stat().st_mtime_ns)
+
     def test_a_restage_stages_the_document_the_provider_editor_writes(self) -> None:
         """Staging reads the editor's document, never a stale sibling beside it.
 

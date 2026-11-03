@@ -68,8 +68,10 @@ class ClientModelSyncScheduler:
         poll_seconds: float = POLL_SECONDS,
         settle_seconds: Iterable[float] = SETTLE_SECONDS,
         fallback_seconds: float = FALLBACK_SECONDS,
+        on_change: Callable[[], None] | None = None,
     ):
         self._refresh = refresh
+        self._on_change = on_change
         self._paths = tuple(pathlib.Path(path).expanduser() for path in watch_paths)
         self._poll = max(0.05, float(poll_seconds))
         self._settle = tuple(float(value) for value in settle_seconds)
@@ -96,7 +98,9 @@ class ClientModelSyncScheduler:
 
     def _run(self) -> None:
         # One pass at start: an installation whose document never moves still
-        # reconciles a list an older release left behind.
+        # reconciles a list an older release left behind, and a document that
+        # moved while this process was not watching is adopted once.
+        self._change_quietly()
         self._refresh_quietly()
         self._last_signature = self._observe()
         next_fallback = time.monotonic() + self._fallback
@@ -106,6 +110,12 @@ class ClientModelSyncScheduler:
                 observed = self._observe()
                 if observed != self._last_signature:
                     self._last_signature = observed
+                    # A document that moved is reloaded once, on the pass that
+                    # noticed it.  The settle ladder and the fallback below are
+                    # waiting for the router to catch up with a reload already
+                    # queued; asking for another on each of them replaced its
+                    # workers again for a change they were already serving.
+                    self._change_quietly()
                     now = time.monotonic()
                     pending = [now + offset for offset in self._settle]
             now = time.monotonic()
@@ -127,6 +137,17 @@ class ClientModelSyncScheduler:
             # on it.
             return
 
+    def _change_quietly(self) -> None:
+        if self._on_change is None:
+            return
+        try:
+            self._on_change()
+        except Exception:
+            # An adoption is a request to reload, and the document is still on
+            # disk if this pass could not make it: a later observed change or
+            # the next launch adopts it again.
+            return
+
 
 def attach(core: Any, watch_paths: Iterable[Any] = ()) -> ClientModelSyncScheduler:
     """Wire the loop to one Core store and the documents its routes live in."""
@@ -134,6 +155,9 @@ def attach(core: Any, watch_paths: Iterable[Any] = ()) -> ClientModelSyncSchedul
     adopt = getattr(core, "adopt_external_route_change", None)
 
     def refresh() -> None:
+        core.refresh_client_model_lists()
+
+    def change() -> None:
         # A change this process did not make is also invisible to the running
         # proxy: reloading is what makes ``/v1/models`` answer the new document,
         # and that reload regenerates the client lists by itself.  A change made
@@ -141,9 +165,8 @@ def attach(core: Any, watch_paths: Iterable[Any] = ()) -> ClientModelSyncSchedul
         # into the reload already queued.
         if callable(adopt):
             adopt()
-        core.refresh_client_model_lists()
 
-    return ClientModelSyncScheduler(refresh=refresh, watch_paths=watch_paths)
+    return ClientModelSyncScheduler(refresh=refresh, on_change=change, watch_paths=watch_paths)
 
 
 __all__ = [

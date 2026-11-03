@@ -52,6 +52,47 @@ class ClientModelSyncSchedulerTests(unittest.TestCase):
             "an edited document must be picked up without waiting out a clock",
         )
 
+    def test_only_an_observed_change_asks_for_an_adoption(self) -> None:
+        # A reload restages the router's own document, and the staged document
+        # is often the file watched here.  If every refresh asked for a reload,
+        # that reload's restage would read as the next change: the proxy would
+        # replace its workers forever.  Adoption therefore belongs to the pass
+        # that noticed the document move; the settle retries and the fallback
+        # only re-derive the client lists.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        document = pathlib.Path(directory.name) / "config.yaml"
+        document.write_text("one\n", encoding="utf-8")
+
+        changes: list[int] = []
+        refreshes: list[int] = []
+        scheduler = ClientModelSyncScheduler(
+            refresh=lambda: refreshes.append(1),
+            on_change=lambda: changes.append(1),
+            watch_paths=[document],
+            poll_seconds=0.02,
+            settle_seconds=(0.0, 0.05, 0.1),
+            fallback_seconds=0.15,
+        )
+        scheduler.start()
+        self.addCleanup(scheduler.stop)
+        self.assertTrue(_wait_for(lambda: changes), "the launch pass adopts once")
+        adopted = len(changes)
+        refreshed = len(refreshes)
+
+        document.write_text("two\n", encoding="utf-8")
+        self.assertTrue(
+            _wait_for(lambda: len(refreshes) >= refreshed + 3),
+            "the settle ladder still re-derives the lists",
+        )
+        self.assertEqual(adopted + 1, len(changes), "one adoption for one observed change")
+
+        self.assertTrue(
+            _wait_for(lambda: len(refreshes) >= refreshed + 4),
+            "the fallback keeps re-deriving the lists",
+        )
+        self.assertEqual(adopted + 1, len(changes), "a fallback pass reloads nothing")
+
     def test_a_change_is_followed_by_retries_until_the_router_catches_up(self) -> None:
         # The router serves /v1/models from its running process and reloads its
         # workers on its own schedule, so the first read after a write can still

@@ -1215,24 +1215,39 @@ class CoreServiceController:
             if retired is not None:
                 staged = retired
             if staged is None:
-                atomic_write_bytes(self.paths.runtime_config, source.read_bytes())
+                payload = source.read_bytes()
             else:
                 import yaml
 
-                atomic_write_text(
-                    self.paths.runtime_config,
-                    yaml.safe_dump(
-                        staged,
-                        allow_unicode=True,
-                        default_flow_style=False,
-                        sort_keys=False,
-                        width=1000,
-                    ),
-                )
+                payload = yaml.safe_dump(
+                    staged,
+                    allow_unicode=True,
+                    default_flow_style=False,
+                    sort_keys=False,
+                    width=1000,
+                ).encode("utf-8")
+            # The staged document is also the document the provider editor
+            # writes, so an unchanged restage used to replace it with the same
+            # bytes and move its timestamp.  The client-model watcher reads that
+            # timestamp as "somebody else edited the roster", queues a reload,
+            # and that reload's own restage moved it again: the proxy replaced
+            # its workers back to back while every window stayed on 启动中.  A
+            # restage that would write what is already there is a no-op.
+            if self._runtime_document_holds(payload):
+                return
+            atomic_write_bytes(self.paths.runtime_config, payload)
         except PersistenceError:
             raise
         except Exception:
             raise RuntimeError("Provider/model configuration is invalid") from None
+
+    def _runtime_document_holds(self, payload: bytes) -> bool:
+        """Whether the staged document already has exactly these bytes."""
+
+        try:
+            return self.paths.runtime_config.read_bytes() == payload
+        except OSError:
+            return False
 
     def _missing_configuration_problem(self) -> str:
         """Why staging had nothing to read, named so the old copy is findable.
