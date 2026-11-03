@@ -67,18 +67,15 @@ def _reset_route_exhaustion_retry_state(
     if preserve_failed_deployment and failed_id:
         excluded_ids = existing_excluded_ids
         excluded_ids.add(failed_id)
-        request_data["_excluded_deployment_ids"] = sorted(excluded_ids)
-        _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(excluded_ids)
+        _write_request_excluded_deployment_ids(request_data, excluded_ids)
         try:
             exception.excluded_deployment_ids = sorted(excluded_ids)  # type: ignore[attr-defined]
         except Exception:
             pass
     elif preserve_existing_exclusions and existing_excluded_ids:
-        request_data["_excluded_deployment_ids"] = sorted(existing_excluded_ids)
-        _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(existing_excluded_ids)
+        _write_request_excluded_deployment_ids(request_data, existing_excluded_ids)
     else:
-        request_data.pop("_excluded_deployment_ids", None)
-        _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(set())
+        _write_request_excluded_deployment_ids(request_data, set())
         try:
             delattr(exception, "excluded_deployment_ids")
         except AttributeError:
@@ -96,6 +93,41 @@ def _reset_route_exhaustion_retry_state(
         request_data["_target_order"] = target_order
     else:
         request_data.pop("_target_order", None)
+
+
+def _write_request_excluded_deployment_ids(
+    request_data: dict,
+    excluded_ids: set[str],
+) -> None:
+    """Write one exclusion set to every place LiteLLM reads it from.
+
+    ``_sync_failed_deployment_exclusions`` records a refusal twice: the
+    underscore key and ``litellm_metadata.excluded_deployment_ids``, because
+    LiteLLM rebuilds the router kwargs between the fallback call and deployment
+    selection and only the metadata survives that rebuild. Clearing one copy is
+    what made the recovery poll's pool reopen a no-op: every later attempt was
+    refused before it reached an upstream, so the poll could never select the
+    route it had just refreshed, and a single-route group looped for the whole
+    window while the client showed a spinner.
+    """
+
+    serialized = sorted(excluded_ids)
+    if serialized:
+        request_data["_excluded_deployment_ids"] = serialized
+    else:
+        request_data.pop("_excluded_deployment_ids", None)
+    metadata = request_data.get("litellm_metadata")
+    if isinstance(metadata, dict) and (
+        "excluded_deployment_ids" in metadata or serialized
+    ):
+        metadata = metadata.copy()
+        if serialized:
+            metadata["excluded_deployment_ids"] = serialized
+        else:
+            metadata.pop("excluded_deployment_ids", None)
+        request_data["litellm_metadata"] = metadata
+    _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(set(serialized))
+
 
 def _configured_deployment_orders(router: Any, request_data: dict) -> list[_RouteOrder]:
     model_group = _responses_execution_module._request_model_group(request_data)

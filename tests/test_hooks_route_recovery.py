@@ -1346,6 +1346,36 @@ class HookRouteRecoveryTests(HookTestCase):
             )
         )
 
+    def test_pool_reopen_clears_the_metadata_exclusion_copy(self) -> None:
+        """The exclusion LiteLLM can still see is the metadata one.
+
+        Live 2026-11-03: ``kimi-k3.1-pro`` held one deployment and the poll
+        reopened the pool every five seconds, but the exclusion survived in
+        ``litellm_metadata`` — the copy LiteLLM's router rebuild keeps — so
+        every attempt was refused before it reached an upstream and the turn
+        looped for the whole four-hour window. The reopen has to clear both.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        deployment_id = "93763ae7"
+        request_data = {
+            "model": "kimi-k3.1-pro",
+            "input": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "_excluded_deployment_ids": [deployment_id],
+            "litellm_metadata": {"excluded_deployment_ids": [deployment_id]},
+        }
+        exception = RuntimeError("No deployments available for selected model")
+
+        hooks._reset_route_exhaustion_retry_state(request_data, exception)
+
+        self.assertNotIn("_excluded_deployment_ids", request_data)
+        self.assertNotIn(
+            "excluded_deployment_ids",
+            request_data["litellm_metadata"],
+        )
+        self.assertFalse(hooks._CURRENT_EXCLUDED_DEPLOYMENT_IDS.get())
+
     async def test_route_recovery_round_streams_non_streaming_success(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []
