@@ -664,6 +664,40 @@ class HookStreamingFailoverTests(HookTestCase):
             )
         )
 
+    def test_route_recovery_delivers_reasoning_summary_as_it_streams(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "reasoning": {"effort": "high", "summary": "auto"},
+        }
+        delta = {
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": "reasoning-stream",
+            "output_index": 0,
+            "summary_index": 0,
+            "delta": "one step",
+        }
+        part_added = {
+            "type": "response.reasoning_summary_part.added",
+            "item_id": "reasoning-stream",
+            "output_index": 0,
+            "summary_index": 0,
+            "part": {"type": "summary_text", "text": ""},
+        }
+
+        self.assertTrue(
+            hooks._stream_chunk_has_deliverable_route_recovery_output(
+                delta, request_data
+            )
+        )
+        self.assertFalse(
+            hooks._stream_chunk_has_deliverable_route_recovery_output(
+                part_added, request_data
+            )
+        )
+
     async def test_reasoning_only_clean_eof_fails_over_instead_of_completing(self) -> None:
         hooks, proxy_server = load_hook_module()
         hooks._DEPLOYMENT_COOLDOWNS.clear()

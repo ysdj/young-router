@@ -2904,6 +2904,13 @@ def _stream_chunk_has_deliverable_route_recovery_output(
         return False
     if _responses_completed_chunk_is_web_search_only(dumped):
         return False
+    if _stream_chunk_is_public_reasoning_delta(dumped):
+        # Thinking is shown the moment it arrives, so it ends the poll's
+        # buffer window exactly as it ends the ordinary start buffer's.  While
+        # this predicate omitted it, a recovery poll held every summary delta
+        # until the first answer token and then released the whole reasoning
+        # block at once.
+        return True
     if _stream_chunk_has_visible_output(chunk):
         return True
     if _responses_completed_chunk_has_route_recovery_output(dumped, request_data):
