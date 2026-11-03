@@ -2703,7 +2703,10 @@ def _stream_chunk_has_visible_output(chunk: Any) -> bool:
             return True
     return False
 
-def _stream_chunk_is_public_reasoning_delta(chunk: Any) -> bool:
+def _stream_chunk_is_public_reasoning_delta(
+    chunk: Any,
+    request_data: Optional[dict] = None,
+) -> bool:
     """Whether this frame is thinking the client can already read.
 
     A reasoning summary delta is user-visible output even though it is not the
@@ -2725,6 +2728,21 @@ def _stream_chunk_is_public_reasoning_delta(chunk: Any) -> bool:
             if isinstance(delta, str) and delta.strip():
                 return True
             if isinstance(delta, dict) and str(delta.get("thinking") or "").strip():
+                return True
+            continue
+        if chunk_type == "response.reasoning_text.delta":
+            # A Responses upstream may stream the thinking raw; the delivery
+            # loop mirrors it into summary frames for a client that asked for
+            # a summary.  That conversion happens downstream of the start
+            # buffer, so the raw frame itself must open the window or the
+            # whole block is held until the answer.
+            if (
+                isinstance(delta, str)
+                and delta.strip()
+                and _web_search_native_module._public_reasoning_is_allowed(
+                    request_data
+                )
+            ):
                 return True
             continue
         # Anthropic reports thinking as a ``content_block_delta`` whose own
@@ -2800,7 +2818,10 @@ def _stream_chunk_delivered_text_delta(chunk: Any) -> bool:
     return False
 
 
-def _stream_chunk_has_delivered_output(chunk: Any) -> bool:
+def _stream_chunk_has_delivered_output(
+    chunk: Any,
+    request_data: Optional[dict] = None,
+) -> bool:
     """Whether the client has now been shown something it cannot un-see.
 
     Once a frame has reached the reader, neither a replay nor a silent failover
@@ -2812,7 +2833,9 @@ def _stream_chunk_has_delivered_output(chunk: Any) -> bool:
 
     return _stream_chunk_delivered_text_delta(
         chunk
-    ) or _stream_chunk_has_visible_output(chunk) or _stream_chunk_is_public_reasoning_delta(chunk)
+    ) or _stream_chunk_has_visible_output(chunk) or _stream_chunk_is_public_reasoning_delta(
+        chunk, request_data
+    )
 
 def _response_item_is_web_search_call(item: Any) -> bool:
     json_item = _jsonable(item)
@@ -2926,7 +2949,7 @@ def _stream_chunk_has_deliverable_route_recovery_output(
         return False
     if _responses_completed_chunk_is_web_search_only(dumped):
         return False
-    if _stream_chunk_is_public_reasoning_delta(dumped):
+    if _stream_chunk_is_public_reasoning_delta(dumped, request_data):
         # Thinking is shown the moment it arrives, so it ends the poll's
         # buffer window exactly as it ends the ordinary start buffer's.  While
         # this predicate omitted it, a recovery poll held every summary delta
@@ -5610,7 +5633,9 @@ async def _yield_guarded_original_stream(
         if chunk is None:
             continue
         remember(chunk)
-        visible_output_seen = visible_output_seen or _stream_chunk_has_delivered_output(chunk)
+        visible_output_seen = visible_output_seen or _stream_chunk_has_delivered_output(
+            chunk, request_data
+        )
         answer_output_seen = answer_output_seen or _stream_chunk_has_visible_output(chunk)
         completed_compat_chunk = _responses_output_limit_incomplete_as_completed_chunk(
             chunk,
@@ -5784,7 +5809,9 @@ async def _yield_guarded_original_stream(
                     return
                 raise chunk_exception
             remember(chunk)
-            visible_output_seen = visible_output_seen or _stream_chunk_has_delivered_output(chunk)
+            visible_output_seen = visible_output_seen or _stream_chunk_has_delivered_output(
+                chunk, request_data
+            )
             answer_output_seen = answer_output_seen or _stream_chunk_has_visible_output(chunk)
             completed_compat_chunk = _responses_output_limit_incomplete_as_completed_chunk(
                 chunk,
@@ -6115,7 +6142,9 @@ async def _yield_streaming_error_fallback_or_raise(
                 # ordinary start buffer.  A fallback that held summary deltas
                 # until the answer handed the reader the whole reasoning block
                 # at once; it is delivered output, so it ends this window.
-                chunk_has_public_reasoning = _stream_chunk_is_public_reasoning_delta(chunk)
+                chunk_has_public_reasoning = _stream_chunk_is_public_reasoning_delta(
+                    chunk, request_data
+                )
                 chunk_is_completed = _responses_completed_chunk_has_usable_output(
                     chunk,
                     request_data,
@@ -6144,7 +6173,7 @@ async def _yield_streaming_error_fallback_or_raise(
                 fallback_delivered_terminal_or_visible = (
                     fallback_delivered_terminal_or_visible
                     or _stream_chunk_has_visible_output(chunk)
-                    or _stream_chunk_is_public_reasoning_delta(chunk)
+                    or _stream_chunk_is_public_reasoning_delta(chunk, request_data)
                     or _responses_completed_chunk_has_usable_output(chunk, request_data)
                     or _responses_stream_chunk_is_incomplete_terminal(chunk)
                 )
@@ -6413,7 +6442,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
             # answer token made a whole reasoning block arrive at once, after the
             # model had already finished thinking.
             saw_delivered_output = saw_delivered_output or (
-                _stream_chunk_is_public_reasoning_delta(chunk)
+                _stream_chunk_is_public_reasoning_delta(chunk, request_data)
             )
             if is_responses_stream:
                 if _responses_stream_chunk_is_completed(chunk):

@@ -2009,20 +2009,46 @@ def reasoning_summary_chunks_for_delivery(
     chunk: Any,
     texts: dict[str, str],
     seen: set[str],
+    done: Optional[set[str]] = None,
+    request_data: Optional[dict] = None,
 ) -> list[Any]:
-    """Render the raw reasoning a Chat upstream streams as summary frames.
+    """Render streamed reasoning as the summary frames a Responses client reads.
 
-    The Chat-to-Responses iterator emits the real reasoning text only inside a
-    ``content_part.done`` whose part is ``reasoning_text``; it never emits
-    ``reasoning_summary_*`` frames, and its pending-event list is not the queue
-    this proxy's delivery loop reads.  The Pi renders thinking from the summary
-    frames (and from the item's ``summary``), so mirror the done text there as
-    the chunk passes through the one delivery path every chunk takes.  ``seen``
-    lets a real summary delta from the iterator win instead of duplicating it.
+    A Responses upstream may stream its thinking as raw
+    ``response.reasoning_text.delta`` events rather than
+    ``response.reasoning_summary_text.delta``.  A client that asked for a
+    summary (``reasoning.summary``) renders the summary frames, so a raw delta
+    is mirrored into one as it arrives, and the raw frame itself is suppressed
+    by :func:`reasoning_summary_suppresses_chunk`.  A provider that sends no
+    deltas at all still gets the whole ``content_part.done`` text at the end;
+    that path remains, and a real summary delta from the upstream wins over
+    either.  ``done`` keeps the terminal frames from repeating.
     """
 
     get = _web_search_native_module._response_item_get
     chunk_type = get(chunk, "type")
+    finished = done if isinstance(done, set) else set()
+    if chunk_type == "response.reasoning_text.delta":
+        if not _web_search_native_module._public_reasoning_is_allowed(request_data):
+            return []
+        text = get(chunk, "delta")
+        item_id = get(chunk, "item_id")
+        output_index = get(chunk, "output_index")
+        if (
+            not isinstance(text, str)
+            or not text
+            or item_id is None
+            or item_id in seen
+            or item_id in finished
+        ):
+            return []
+        first = item_id not in texts
+        texts[item_id] = (texts.get(item_id) or "") + text
+        events = []
+        if first:
+            events.append(_reasoning_summary_part_added_event(item_id, output_index))
+        events.append(_reasoning_summary_text_event(item_id, output_index, "delta", text))
+        return events
     if chunk_type == "response.reasoning_summary_text.delta":
         item_id = get(chunk, "item_id")
         if item_id is not None:
@@ -2044,17 +2070,21 @@ def reasoning_summary_chunks_for_delivery(
             not isinstance(text, str)
             or not text
             or item_id is None
-            or item_id in seen
+            or item_id in finished
         ):
             return []
+        raw_streamed = item_id in texts
         texts[item_id] = text
-        seen.add(item_id)
-        return [
-            _reasoning_summary_part_added_event(item_id, output_index),
-            _reasoning_summary_text_event(item_id, output_index, "delta", text),
-            _reasoning_summary_text_event(item_id, output_index, "done", text),
-            _reasoning_summary_part_done_event(item_id, output_index, text),
-        ]
+        events = []
+        if item_id not in seen and not raw_streamed:
+            events.append(_reasoning_summary_part_added_event(item_id, output_index))
+            events.append(
+                _reasoning_summary_text_event(item_id, output_index, "delta", text)
+            )
+        events.append(_reasoning_summary_text_event(item_id, output_index, "done", text))
+        events.append(_reasoning_summary_part_done_event(item_id, output_index, text))
+        finished.add(item_id)
+        return events
     if chunk_type == "response.output_item.done":
         item = get(chunk, "item")
         if get(item, "type") == "reasoning":
@@ -2067,6 +2097,22 @@ def reasoning_summary_chunks_for_delivery(
         _apply_reasoning_summary_to_output(get(response, "output"), texts)
         return []
     return []
+
+
+def reasoning_summary_suppresses_chunk(
+    chunk: Any,
+    request_data: Optional[dict] = None,
+) -> bool:
+    """Whether a raw reasoning frame was replaced by a summary frame.
+
+    The reader asked to see the thinking and the delivery loop converted this
+    delta into a public summary delta; sending the raw frame too would show the
+    same text twice in a client that renders both.
+    """
+
+    if _web_search_native_module._response_item_get(chunk, "type") != "response.reasoning_text.delta":
+        return False
+    return _web_search_native_module._public_reasoning_is_allowed(request_data)
 
 
 def _open_reasoning_summary_items(

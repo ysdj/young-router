@@ -7,6 +7,28 @@ from hook_test_utils import *
 
 
 class HookStreamingFailoverTests(HookTestCase):
+    def test_a_raw_reasoning_delta_opens_the_public_thinking_window(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        raw = {
+            "type": "response.reasoning_text.delta",
+            "item_id": "reasoning-raw",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "one step",
+        }
+
+        self.assertTrue(
+            hooks._stream_chunk_is_public_reasoning_delta(
+                raw, {"reasoning": {"effort": "high", "summary": "auto"}}
+            )
+        )
+        self.assertFalse(hooks._stream_chunk_is_public_reasoning_delta(raw, {}))
+        self.assertTrue(
+            hooks._stream_chunk_has_delivered_output(
+                raw, {"reasoning": {"effort": "high", "summary": "auto"}}
+            )
+        )
+
     async def test_fallback_start_buffer_delivers_a_reasoning_summary_delta(self) -> None:
         hooks, _proxy_server = load_hook_module()
         streaming_module = sys.modules["young_router.proxy.streaming"]

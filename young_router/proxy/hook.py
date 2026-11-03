@@ -533,15 +533,26 @@ class YoungRouterHook(CustomLogger):
 
         reasoning_summary_texts: dict[str, str] = {}
         reasoning_summary_seen: set[str] = set()
+        reasoning_summary_done: set[str] = set()
 
         async def deliver_stream(stream: AsyncIterator[Any]) -> AsyncIterator[Any]:
             async for stream_chunk in stream:
+                suppress_reasoning_text = (
+                    _patches_module.reasoning_summary_suppresses_chunk(
+                        stream_chunk,
+                        request_data,
+                    )
+                )
                 for summary_chunk in _patches_module.reasoning_summary_chunks_for_delivery(
                     stream_chunk,
                     reasoning_summary_texts,
                     reasoning_summary_seen,
+                    reasoning_summary_done,
+                    request_data,
                 ):
                     yield deliver_chunk(summary_chunk)
+                if suppress_reasoning_text:
+                    continue
                 for image_chunk in image_generation_chunks_for_delivery(stream_chunk):
                     yield deliver_chunk(image_chunk)
 

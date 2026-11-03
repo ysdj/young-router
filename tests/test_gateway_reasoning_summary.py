@@ -165,6 +165,7 @@ class ReasoningSummaryStreamTests(unittest.TestCase):
     def test_content_part_done_is_mirrored_into_summary_frames(self) -> None:
         texts: dict[str, str] = {}
         seen: set[str] = set()
+        done: set[str] = set()
         chunk = _event(
             {
                 "type": "response.content_part.done",
@@ -175,7 +176,9 @@ class ReasoningSummaryStreamTests(unittest.TestCase):
             }
         )
 
-        events = patches.reasoning_summary_chunks_for_delivery(chunk, texts, seen)
+        events = patches.reasoning_summary_chunks_for_delivery(
+            chunk, texts, seen, done
+        )
 
         self.assertEqual(
             [
@@ -191,8 +194,14 @@ class ReasoningSummaryStreamTests(unittest.TestCase):
         )
         self.assertEqual("step one", delta["delta"])
         self.assertEqual("step one", texts["r1"])
-        self.assertIn("r1", seen)
-        self.assertEqual([], patches.reasoning_summary_chunks_for_delivery(chunk, texts, seen))
+        self.assertNotIn("r1", seen)
+        self.assertIn("r1", done)
+        self.assertEqual(
+            [],
+            patches.reasoning_summary_chunks_for_delivery(
+                chunk, texts, seen, done
+            ),
+        )
 
     def test_output_item_done_and_completed_carry_the_summary(self) -> None:
         texts = {"r1": "the whole thought"}
@@ -216,6 +225,106 @@ class ReasoningSummaryStreamTests(unittest.TestCase):
         self.assertEqual(
             [{"type": "summary_text", "text": "the whole thought"}],
             response["output"][0]["summary"],
+        )
+
+
+    def test_raw_reasoning_deltas_stream_as_summary_text(self) -> None:
+        texts: dict[str, str] = {}
+        seen: set[str] = set()
+        done: set[str] = set()
+        request_data = {"reasoning": {"effort": "high", "summary": "auto"}}
+        first = _event(
+            {
+                "type": "response.reasoning_text.delta",
+                "item_id": "r1",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "We",
+            }
+        )
+        second = _event(
+            {
+                "type": "response.reasoning_text.delta",
+                "item_id": "r1",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": " need",
+            }
+        )
+
+        first_events = patches.reasoning_summary_chunks_for_delivery(
+            first, texts, seen, done, request_data
+        )
+        self.assertEqual(
+            [
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+            ],
+            [event["type"] for event in first_events],
+        )
+        self.assertEqual("We", first_events[-1]["delta"])
+        self.assertTrue(
+            patches.reasoning_summary_suppresses_chunk(first, request_data)
+        )
+
+        second_events = patches.reasoning_summary_chunks_for_delivery(
+            second, texts, seen, done, request_data
+        )
+        self.assertEqual(
+            ["response.reasoning_summary_text.delta"],
+            [event["type"] for event in second_events],
+        )
+        self.assertEqual("We need", texts["r1"])
+
+        final = _event(
+            {
+                "type": "response.content_part.done",
+                "item_id": "r1",
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "reasoning_text", "text": "We need"},
+            }
+        )
+        final_events = patches.reasoning_summary_chunks_for_delivery(
+            final, texts, seen, done, request_data
+        )
+        self.assertEqual(
+            [
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+            ],
+            [event["type"] for event in final_events],
+        )
+
+        self.assertEqual(
+            [],
+            patches.reasoning_summary_chunks_for_delivery(
+                first, {}, set(), set(), {}
+            ),
+        )
+        self.assertFalse(patches.reasoning_summary_suppresses_chunk(first, {}))
+
+    def test_a_real_summary_delta_wins_over_a_raw_reasoning_delta(self) -> None:
+        raw = _event(
+            {
+                "type": "response.reasoning_text.delta",
+                "item_id": "r1",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "raw",
+            }
+        )
+        texts: dict[str, str] = {}
+        seen = {"r1"}
+        self.assertEqual(
+            [],
+            patches.reasoning_summary_chunks_for_delivery(
+                raw,
+                texts,
+                seen,
+                set(),
+                {"reasoning": {"effort": "high", "summary": "auto"}},
+            ),
         )
 
 if __name__ == "__main__":
