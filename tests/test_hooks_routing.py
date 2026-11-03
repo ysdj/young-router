@@ -1935,6 +1935,46 @@ class HookRoutingTests(HookTestCase):
             "anthropic",
         )
 
+    def test_a_deepseek_summary_request_uses_the_declared_chat_surface(self) -> None:
+        hooks, _ = load_hook_module()
+        deployment = {
+            "litellm_params": {"model": "openai/deepseek-v4.1-flash", "order": 1},
+            "model_info": {
+                "id": "deepseek-chat-route",
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+        summary_request = {
+            "call_type": "aresponses",
+            "input": "hello",
+            "reasoning": {"effort": "high", "summary": "auto"},
+        }
+
+        self.assertEqual(
+            hooks._request_surface_for_deployment(summary_request, deployment),
+            "openai/chat",
+        )
+        self.assertEqual(
+            hooks._request_surface_for_deployment(
+                {"call_type": "aresponses", "input": "hello"}, deployment
+            ),
+            "openai/responses",
+        )
+
+        other_relay = {
+            "litellm_params": {"model": "openai/kimi-k3", "order": 1},
+            "model_info": {
+                "id": "kimi-chat-route",
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+        self.assertEqual(
+            hooks._request_surface_for_deployment(summary_request, other_relay),
+            "openai/responses",
+        )
+
     def test_fixed_mode_ignores_a_stale_fallback_target(self) -> None:
         hooks, _ = load_hook_module()
         deployment = {

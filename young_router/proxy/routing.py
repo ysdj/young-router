@@ -4728,6 +4728,57 @@ def _active_cooldown_state_for_key(
     return None
 
 
+_REASONING_SUMMARY_OFF_VALUES = frozenset({"", "none", "off", "null", "false"})
+
+
+def _request_asks_for_reasoning_summary(request_kwargs: Optional[dict]) -> bool:
+    """Whether the client asked to see the model's thinking."""
+
+    if not isinstance(request_kwargs, dict):
+        return False
+    reasoning = request_kwargs.get("reasoning")
+    if isinstance(reasoning, dict):
+        summary = reasoning.get("summary")
+    else:
+        summary = request_kwargs.get("model_reasoning_summary")
+    if not isinstance(summary, str):
+        return False
+    return summary.strip().casefold() not in _REASONING_SUMMARY_OFF_VALUES
+
+
+def _deployment_upstream_model_name(deployment: Any) -> str:
+    params = deployment.get("litellm_params") if isinstance(deployment, dict) else None
+    model = params.get("model") if isinstance(params, dict) else None
+    if not isinstance(model, str):
+        return ""
+    return model.rsplit("/", 1)[-1].strip().casefold()
+
+
+def _request_prefers_chat_for_reasoning_summary(
+    request_kwargs: Optional[dict],
+    deployment: Any,
+    client_surface: str,
+) -> bool:
+    """Ask a DeepSeek relay on chat when the client wants to watch it think.
+
+    DeepSeek's ``/v1/responses`` endpoint sends no summary deltas: the whole
+    reasoning arrives once in ``content_part.done`` at the end of the thinking
+    phase, so a reader can only show it in one block.  The same relay's chat
+    stream carries ``reasoning_content`` chunk by chunk, and the Responses chat
+    bridge turns each into a summary delta.  A route that declares chat already
+    names the wire that can stream the thinking, so use it for this request;
+    without a summary request the route's ordinary client-protocol choice is
+    left alone.
+    """
+
+    return (
+        client_surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES
+        and _deployment_surface(deployment) == _UPSTREAM_URL_SURFACE_OPENAI_CHAT
+        and _deployment_upstream_model_name(deployment).startswith("deepseek")
+        and _request_asks_for_reasoning_summary(request_kwargs)
+    )
+
+
 def _request_surface_for_deployment(
     request_kwargs: Optional[dict],
     deployment: Any,
@@ -4745,6 +4796,12 @@ def _request_surface_for_deployment(
     ):
         return requested_surface
     client_surface = _request_client_surface(request_kwargs)
+    if _request_prefers_chat_for_reasoning_summary(
+        request_kwargs,
+        deployment,
+        client_surface,
+    ):
+        return _UPSTREAM_URL_SURFACE_OPENAI_CHAT
     cached_surface = _protocol_fallback_cached_surface(request_kwargs, deployment)
     return cached_surface or client_surface or _deployment_surface(deployment)
 
