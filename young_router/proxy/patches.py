@@ -2074,10 +2074,11 @@ def reasoning_summary_chunks_for_delivery(
             or item_id in finished
         ):
             return []
-        if item_id not in seen and item_id not in texts:
-            # The upstream never sent a delta for this item.  Do not invent a
-            # summary from the completed text: a client that asked to watch the
-            # thinking gets it only when the route actually streamed it.
+        if item_id not in texts:
+            # Either the upstream sent no delta (do not invent a summary from
+            # the completed text) or its own summary frames own the terminal
+            # pair; only a raw-delta stream mirrored here needs this hook to
+            # close it.
             return []
         texts[item_id] = text
         events = [

@@ -309,5 +309,27 @@ class ReasoningSummaryStreamTests(unittest.TestCase):
             ),
         )
 
+
+    def test_a_streamed_summary_owns_its_terminal_frames(self) -> None:
+        texts: dict[str, str] = {}
+        seen = {"r1"}
+        done: set[str] = set()
+        final = _event(
+            {
+                "type": "response.content_part.done",
+                "item_id": "r1",
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "reasoning_text", "text": "the upstream summary"},
+            }
+        )
+        self.assertEqual(
+            [],
+            patches.reasoning_summary_chunks_for_delivery(
+                final, texts, seen, done
+            ),
+        )
+        self.assertEqual({}, texts)
+
 if __name__ == "__main__":
     unittest.main()
