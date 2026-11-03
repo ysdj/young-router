@@ -4,6 +4,42 @@ from hook_test_utils import *
 
 
 class HookResponsesWebSearchBridgeTests(HookTestCase):
+    async def test_raw_reasoning_delta_is_forwarded_when_a_summary_was_requested(self) -> None:
+        hooks, _ = load_hook_module()
+
+        async def upstream():
+            yield {
+                "type": "response.reasoning_text.delta",
+                "item_id": "rs-visible",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "one step",
+            }
+
+        requested = [
+            hooks._jsonable(chunk)
+            async for chunk in hooks._adapt_provider_hidden_web_search_stream(
+                upstream(),
+                {
+                    "tools": [{"type": "web_search"}],
+                    "reasoning": {"effort": "high", "summary": "auto"},
+                },
+            )
+        ]
+        self.assertEqual(
+            ["response.reasoning_text.delta"],
+            [chunk["type"] for chunk in requested],
+        )
+
+        private = [
+            hooks._jsonable(chunk)
+            async for chunk in hooks._adapt_provider_hidden_web_search_stream(
+                upstream(),
+                {"tools": [{"type": "web_search"}]},
+            )
+        ]
+        self.assertEqual([], private)
+
     def test_hidden_search_adapter_preserves_terminal_responses_failure(self) -> None:
         hooks, _ = load_hook_module()
         request = {

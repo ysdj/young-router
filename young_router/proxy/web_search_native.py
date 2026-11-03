@@ -1087,10 +1087,22 @@ class _ProviderHiddenWebSearchStreamAdapter:
                 return events
             events.append(self._forward_event(chunk))
             return events
+        if chunk_type == "response.reasoning_text.delta":
+            # Raw reasoning stays private unless the client asked to see the
+            # thinking.  When it did, forward the delta: the delivery loop
+            # mirrors each one into a public summary frame, and the hidden
+            # search item's own reasoning is still consumed below.
+            if _provider_hidden_web_search_reasoning_item_id(
+                dumped.get("item_id")
+            ):
+                return events
+            if _public_reasoning_is_allowed(self.request_kwargs):
+                events.append(self._forward_event(chunk))
+            return events
         if chunk_type.startswith("response.reasoning"):
-            # Raw reasoning remains private. Public summary events are handled
-            # above, while the stable hidden-search item id is consumed only
-            # to expose the standard web-search lifecycle.
+            # Public summary events are handled above; the stable hidden-search
+            # item id is consumed only to expose the standard web-search
+            # lifecycle.
             return events
         if self._message_output_begins(chunk_type, dumped):
             events.extend(self._completed_events())
