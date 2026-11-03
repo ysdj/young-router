@@ -3934,6 +3934,11 @@ async def _streaming_error_fallback_response(
             request_data,
         )
         or _routing_module._is_no_deployments_available_error(exception)
+        # A route that refuses the replayed thinking is not a group-wide
+        # failure: the same history is answerable on a sibling.  Without this
+        # the poll excluded the refusing route but the next round returned an
+        # empty stream before selecting anything, so it excluded it forever.
+        or _routing_module._is_thinking_replay_contract_error(exception)
     ):
         return None
 
