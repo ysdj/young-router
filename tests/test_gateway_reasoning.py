@@ -98,3 +98,40 @@ class ReasoningCapabilityRegistrationTests(unittest.TestCase):
         self.assertEqual(1, registered)
         self.assertEqual("openai", cost["deepseek-flash"]["litellm_provider"])
         self.assertIs(True, cost["deepseek-flash"]["supports_native_streaming"])
+
+    def test_a_registered_relay_is_not_faked_without_a_provider(self) -> None:
+        import litellm
+        from litellm.llms.openai.responses.transformation import (
+            OpenAIResponsesAPIConfig,
+        )
+
+        from young_router.proxy import patches
+
+        patches._install_openai_responses_fake_stream_patch()
+        config = OpenAIResponsesAPIConfig()
+        cost = {
+            "deepseek-v4.1-flash": {"supports_native_streaming": True},
+            "non-streaming-model": {"supports_native_streaming": False},
+        }
+        with mock.patch("litellm.model_cost", cost):
+            self.assertFalse(
+                config.should_fake_stream(
+                    model="deepseek-v4.1-flash",
+                    stream=True,
+                    custom_llm_provider=None,
+                )
+            )
+            self.assertTrue(
+                config.should_fake_stream(
+                    model="non-streaming-model",
+                    stream=True,
+                    custom_llm_provider=None,
+                )
+            )
+            self.assertTrue(
+                config.should_fake_stream(
+                    model="not-registered",
+                    stream=True,
+                    custom_llm_provider=None,
+                )
+            )

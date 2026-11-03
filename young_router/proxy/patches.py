@@ -3037,6 +3037,69 @@ def _install_chatgpt_account_credential_patch() -> None:
     setattr(ChatGPTConfig, "_young_router_account_credentials", True)
 
 
+_OPENAI_RESPONSES_FAKE_STREAM_PATCH_ATTR = (
+    "_young_router_openai_responses_fake_stream_patch"
+)
+
+
+def _install_openai_responses_fake_stream_patch() -> None:
+    """Keep a registered relay's own SSE instead of LiteLLM's fake stream.
+
+    ``OpenAIResponsesAPIConfig.should_fake_stream`` asks
+    ``supports_native_streaming``, which calls ``get_llm_provider`` and raises
+    for a relay model whose bare id carries no provider.  The adapter passes no
+    provider for such a call, so an unknown custom model is declared
+    non-streaming and LiteLLM runs the request without ``stream`` and slices the
+    completed body into events: the reader waits through the whole thinking
+    phase and receives every summary delta at once.  A model this app already
+    registered with ``supports_native_streaming`` is answered from that entry
+    here, before the provider-inference failure can fake the stream.
+    """
+
+    try:
+        import litellm
+
+        from litellm.llms.openai.responses.transformation import (
+            OpenAIResponsesAPIConfig,
+        )
+    except Exception:
+        return
+
+    original = getattr(OpenAIResponsesAPIConfig, "should_fake_stream", None)
+    if not callable(original) or getattr(
+        original, _OPENAI_RESPONSES_FAKE_STREAM_PATCH_ATTR, False
+    ):
+        return
+
+    def patched_should_fake_stream(
+        self: Any,
+        model: Any = None,
+        stream: Any = None,
+        custom_llm_provider: Any = None,
+    ) -> Any:
+        if stream is True and not custom_llm_provider and isinstance(model, str):
+            name = model.rsplit("/", 1)[-1]
+            entry = getattr(litellm, "model_cost", {}).get(name)
+            if (
+                isinstance(entry, dict)
+                and entry.get("supports_native_streaming") is True
+            ):
+                return False
+        return original(
+            self,
+            model=model,
+            stream=stream,
+            custom_llm_provider=custom_llm_provider,
+        )
+
+    setattr(
+        patched_should_fake_stream,
+        _OPENAI_RESPONSES_FAKE_STREAM_PATCH_ATTR,
+        True,
+    )
+    OpenAIResponsesAPIConfig.should_fake_stream = patched_should_fake_stream
+
+
 def install_all() -> None:
     _install_latin1_response_headers_patch()
     _install_anthropic_unversioned_endpoint_patch()
@@ -3057,6 +3120,7 @@ def install_all() -> None:
     _install_uvicorn_shutdown_marker_patch()
     _install_managed_responses_websocket_keepalive_patch()
     _install_responses_completion_stream_patch()
+    _install_openai_responses_fake_stream_patch()
     _install_responses_tool_search_bridge_patch()
     # The bridged replay is repaired here, before a thinking upstream judges it:
     # the client's reasoning item does not survive the Responses-to-Chat
