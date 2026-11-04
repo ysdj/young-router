@@ -165,10 +165,15 @@ def route_label(route: Mapping[str, str] | None) -> str:
     return f"{route.get('provider', '')} / {route.get('model', '')}".strip(" /")
 
 
-def endpoint() -> tuple[str, str]:
-    """This app's proxy base URL (with ``/v1``) and its master key."""
+def endpoint(config_path: Path | None = None) -> tuple[str, str]:
+    """This app's proxy base URL (with ``/v1``) and its master key.
 
-    return local_proxy_endpoint()
+    ``config_path`` is the runtime document the calling domain manages, which is
+    where this installation's master key is; a caller with none names nothing
+    and the default locations answer.
+    """
+
+    return local_proxy_endpoint(config_path)
 
 
 def on_local_api(configured: object, *, versioned: bool = True) -> bool:

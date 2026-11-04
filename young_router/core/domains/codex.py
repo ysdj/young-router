@@ -1809,7 +1809,7 @@ class CodexSettingsDomain:
 
         from ._shared import local_proxy_endpoint
 
-        base_url, key = local_proxy_endpoint()
+        base_url, key = local_proxy_endpoint(self.runtime_config_path)
         self._local_api_base_url = base_url
         structured = self._draft.get("structured")
         structured = structured if isinstance(structured, Mapping) else {}

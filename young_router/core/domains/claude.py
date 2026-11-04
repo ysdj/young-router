@@ -1836,7 +1836,9 @@ class ClaudeSettingsDomain:
         """Resolve this app's proxy endpoint for the "use this API" action."""
 
         try:
-            self._local_api_base_url = _shared_api.endpoint()[0]
+            self._local_api_base_url = _shared_api.endpoint(
+                self.runtime_config_path
+            )[0]
         except Exception:
             self._local_api_base_url = None
 
@@ -2050,7 +2052,12 @@ class ClaudeSettingsDomain:
             # remembered, because the proxy serves public model names and the
             # client's own document can no longer state which route it was on.
             client = _claude_client(data)
-            base_url, key = _shared_api.endpoint()
+            base_url, key = _shared_api.endpoint(self.runtime_config_path)
+            # The endpoint just adopted *is* this app's proxy, whatever this
+            # domain resolved at construction: a checkout with no installed
+            # config resolved nothing, and both `uses_local_api` answers would
+            # then contradict the document that was just written.
+            self._local_api_base_url = base_url
             base_url = anthropic_base_url(base_url)
             store_route_setting(self.app_state_root, client, data)
             if client == "claudeDesktop":

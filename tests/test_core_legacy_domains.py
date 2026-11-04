@@ -2494,7 +2494,10 @@ class CodexSettingsDomainTests(unittest.TestCase):
             domain.dispatch("use_local_api", {"model": "default-chat"})
             domain.apply()
 
-            base_url, key = local_proxy_endpoint()
+            # The document this test wrote answers for its own key; asking
+            # the default locations made the expectation depend on
+            # whatever config the machine running the suite happens to have.
+            base_url, key = local_proxy_endpoint(runtime)
             self.assertRegex(base_url, r"^http://127\.0\.0\.1:\d+/v1$")
             structured = domain.snapshot()["structured"]
             # The client keeps the provider ``model_provider`` names; only that
@@ -2539,7 +2542,10 @@ class CodexSettingsDomainTests(unittest.TestCase):
             domain.dispatch("use_local_api", {"model": "default-chat"})
             domain.apply()
 
-            base_url, key = local_proxy_endpoint()
+            # The document this test wrote answers for its own key; asking
+            # the default locations made the expectation depend on
+            # whatever config the machine running the suite happens to have.
+            base_url, key = local_proxy_endpoint(runtime)
             structured = domain.snapshot()["structured"]
             self.assertEqual("openai", structured["model_provider"])
             self.assertEqual(base_url, structured["openai_base_url"])

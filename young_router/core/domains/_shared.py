@@ -188,12 +188,22 @@ def local_proxy_endpoint(
     # 12390 while this installation served 12391).
     port = codex_config.local_port(config_path)
     key = ""
-    candidates = (
+    # The document this caller is editing answers first: a domain is handed the
+    # runtime config it manages, so its master key is in *that* file, and only a
+    # caller with none (a bare status read) falls back to where an installation
+    # keeps it.  Reading the default path first made every one of these actions
+    # depend on ambient machine state -- a checkout with no installed config
+    # could not adopt the local API at all, which is what the CI run reported as
+    # "the local proxy's master key could not be read".
+    candidates: tuple[Path | None, ...] = (
+        config_path,
         codex_config.default_config_path(),
         _default_runtime_root() / ".litellm_runtime" / "config.yaml",
         _default_runtime_root() / ".litellm-runtime" / "config.yaml",
     )
     for candidate in candidates:
+        if candidate is None:
+            continue
         try:
             key = codex_config.local_api_key(codex_config.load_yaml(candidate))
             break
