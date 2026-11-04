@@ -4593,6 +4593,15 @@ def _ensure_attempt_lease_id(request_kwargs: Optional[dict]) -> Optional[str]:
         metadata = metadata.copy()
     metadata[_ATTEMPT_LEASE_ID_KEY] = lease_id
     request_kwargs["litellm_metadata"] = metadata
+    # The success callback hands back the logging layer's copy, which nests the
+    # metadata under ``litellm_params``; a marker that only exists at the top
+    # level never comes back, so the slot it names is never released.
+    litellm_params = request_kwargs.get("litellm_params")
+    if isinstance(litellm_params, dict):
+        nested = litellm_params.get("litellm_metadata")
+        nested = dict(nested) if isinstance(nested, dict) else {}
+        nested[_ATTEMPT_LEASE_ID_KEY] = lease_id
+        litellm_params["litellm_metadata"] = nested
     return lease_id
 
 
@@ -4727,8 +4736,21 @@ def _release_request_concurrency_slots(request_kwargs: Optional[dict]) -> None:
         return
     with _HELD_CONCURRENCY_LEASES_LOCK:
         held = _HELD_CONCURRENCY_LEASES.pop(lease_id, None)
-    if held:
-        _concurrency_module.release(sorted(held))
+    if not held:
+        # Nothing to give back is the ordinary shape (a turn that never claimed,
+        # a listing).  It stays silent: a trace per request would drown the ones
+        # that matter.
+        return
+    _concurrency_module.release(sorted(held))
+    _trace_module._route_trace(
+        "concurrency_slot_release",
+        request_id=_trace_request_id(request_kwargs),
+        model_group=_responses_execution_module._request_model_group(request_kwargs),
+        deployment_id=_deployment_id_from_request(request_kwargs),
+        lease_id=lease_id,
+        released=len(held),
+        held_after=len(_HELD_CONCURRENCY_LEASES),
+    )
 
 
 def _with_active_model_concurrency(
