@@ -70,8 +70,12 @@ IMAGE_CONTEXT_MIN_BYTES_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MIN_BYTES"
 # of the bytes, so "the model can still see what it worked on" does not depend on
 # a tool being installed.
 IMAGE_CONTEXT_PREVIEW_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_PREVIEW"
-IMAGE_CONTEXT_PREVIEW_VALUES = ("auto", "on", "off")
-IMAGE_CONTEXT_PREVIEW_DEFAULT = "auto"
+IMAGE_CONTEXT_PREVIEW_VALUES = ("id", "auto", "on", "off")
+# ``id`` delivery is the default: the model asks for a picture by the id its
+# placeholder carries and the next request brings the original.  ``auto`` sends
+# thumbnails on a gateway instead, which costs bytes on every turn; ``off`` is a
+# bare placeholder.
+IMAGE_CONTEXT_PREVIEW_DEFAULT = "id"
 IMAGE_CONTEXT_PREVIEW_EDGE_ENV = (
     "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_PREVIEW_MAX_EDGE"
 )
@@ -300,7 +304,8 @@ _WORDS: Dict[str, Dict[str, Any]] = {
             "visible now, and do not take them back or apologise for them.\n"
             "When an answer needs an omitted image and what you already said is "
             "not enough, write \"need IMG-xxx\" on its own line (several ids if you "
-            "need several): that is how the user knows which one to send again. "
+            "need several): the next request carries that original, so neither the "
+            "user nor a tool is needed. "
             "Do not guess or add detail you cannot see now; do not ask the user to "
             "upload it again, and do not read image files with another tool."
         ),
@@ -409,7 +414,14 @@ def inside_turn(environ: Optional[Mapping[str, str]] = None) -> str:
 
 
 def preview_mode(environ: Optional[Mapping[str, str]] = None) -> str:
-    """Whether an omitted image is replaced by a thumbnail, nothing, or always.
+    """Whether an omitted image travels as a thumbnail, or only as its id.
+
+    ``id`` (default) sends the placeholder and nothing else: the model asks for a
+    picture by its id and the next request carries the original, which is the
+    delivery that needs no client configuration and no bytes on the turns the
+    picture is not needed.  ``auto``/``on`` additionally attach a bounded
+    thumbnail -- useful where a whole page must be recognisable at a glance and
+    the extra bytes are worth it.
 
     ``auto`` sends thumbnails exactly when the reader may have no fetch tool --
     a gateway, whose client configuration this proxy cannot edit.  A desktop
@@ -575,14 +587,16 @@ def fetch_kind(
         return "tool"
     # ``auto``: a host that owns the client's configuration *and* received this
     # request directly can hand it a file path and change nothing.  Everything
-    # else is a gateway answering somebody else's client over its own endpoint.
+    # else is a gateway answering somebody else's client.
     if _client_config_present(env) and not _request_is_remote_client(request_kwargs):
         return "file"
-    from . import image_context_endpoint as _endpoint_module
-
-    if _endpoint_module.enabled(env) or endpoint_served(env):
-        return "tool"
-    return "ask"
+    # The tool kind is a promise that ``view_image_by_id`` is reachable from the
+    # client, and the only evidence of that is a client having called it.  Until
+    # then the honest kind is the ask -- and this proxy answers that ask itself
+    # now: the next request carries every original the model named.  That is also
+    # what keeps the mirrored wording untouched, because ``ask`` is the wording
+    # the upstream already ships for a host with no tool at all.
+    return "tool" if endpoint_served(env) else "ask"
 
 
 def fetch_available(
@@ -1272,14 +1286,16 @@ def _previews_for(
     """Whether this pass sends thumbnails rather than bare placeholders."""
 
     mode = preview_mode(environ)
-    if mode == "off":
+    if mode in {"off", "id"}:
+        # ``id``: the model can ask for any original by name, so a thumbnail is
+        # bytes on every turn for a picture it may never need again.
         return False
     if mode == "on":
         return True
-    # ``auto``: only where the placeholder cannot promise a tool.  A desktop
-    # install names a path its own client opens, so a thumbnail there would be
-    # a second copy of the same picture.
-    return kind == "tool"
+    # ``auto``: wherever the reader cannot open a local path -- a gateway, whose
+    # client is somewhere else.  A desktop install names a path its own client
+    # opens, so a thumbnail there would be a second copy of the same picture.
+    return kind != "file"
 
 
 def _preview_caption(image: Any, lang: str) -> str:
@@ -1336,6 +1352,77 @@ def _duplicate_placeholder(
         f"{_heading(image, str(words['not_repeated']), lang)}\n"
         f"{words['duplicate'](twin.image_id, where)}"
     )
+
+
+# The model's own request for an original, in the wording this pass hands it.
+# The gateway reads it back out of the *newest* assistant message, so an ask is
+# honoured for exactly the next request: the turn after that has a newer message
+# and the picture is a placeholder again.
+_ASK_PATTERNS = (
+    re.compile(r"需要\s*(IMG-\d{3}(?:[、,，\s]+IMG-\d{3})*)"),
+    re.compile(r"need(?:s|ed)?\s+(IMG-\d{3}(?:[\s,，、]+IMG-\d{3})*)"),
+)
+_ASK_ID = re.compile(r"IMG-\d{3}")
+# How many originals one ask may bring back.  A model that asks for everything
+# has not understood the point, and honouring it would cost the turn the bytes
+# the pass exists to save.
+_ASK_LIMIT = 4
+
+
+def _requested_ids(input_items: Any) -> List[str]:
+    """The image ids the model asked for in its own newest message.
+
+    This is the fetch that needs no tool: the placeholder tells the model to write
+    "需要 IMG-004", and the next request carries that original.  Reading it back
+    here is what makes a bare id enough -- no MCP server, no client change, and no
+    thumbnail standing in for a picture the model could have asked for by name.
+    """
+
+    if not isinstance(input_items, list):
+        return []
+    newest: Optional[str] = None
+    for item in input_items:
+        if not isinstance(item, dict) or item.get("role") != "assistant":
+            continue
+        text = _text_of_message(item)
+        if text:
+            newest = text
+    if not newest:
+        return []
+    found: List[str] = []
+    for pattern in _ASK_PATTERNS:
+        for group in pattern.findall(newest):
+            for image_id in _ASK_ID.findall(str(group)):
+                if image_id not in found:
+                    found.append(image_id)
+    return found[:_ASK_LIMIT]
+
+
+def _text_of_message(item: Any) -> str:
+    """The plain text one message carries, whatever shape its parts have."""
+
+    if not isinstance(item, dict):
+        return ""
+    parts = item.get("content")
+    if isinstance(parts, str):
+        return parts
+    if not isinstance(parts, list):
+        return ""
+    texts = [
+        str(part.get("text") or "")
+        for part in parts
+        if isinstance(part, dict) and part.get("type") in (None, "input_text", "output_text", "text")
+    ]
+    return "\n".join(text for text in texts if text)
+
+
+def _asked_ids_by_image(images: List[_Found], input_items: Any) -> set:
+    """Which of *images* the model asked for, by the id it can see."""
+
+    wanted = set(_requested_ids(input_items))
+    if not wanted:
+        return set()
+    return {image.key for image in images if (image.image_id or "") in wanted}
 
 
 def _included_label(image: _Found, lang: str) -> str:
@@ -1719,6 +1806,10 @@ def _rewrite(
         if forced and images and keep_picture_item is None
         else None
     )
+    # What the model asked for by id in its own newest message.  Honoured here,
+    # before any retirement: the picture comes back at full size for this one
+    # request, then becomes a placeholder again.
+    asked = _asked_ids_by_image(images, input_items)
     selection = read_selection(thread_id)
     auto = selection.get("auto")
     automatic = True if forced else (auto if isinstance(auto, bool) else mode() == "auto")
@@ -1781,6 +1872,11 @@ def _rewrite(
                 omitted.append(image)
             else:
                 sent_content[image.content_id or ""] = image
+            continue
+        if image.key in asked:
+            # An id the model asked for is not a candidate for retirement, and it
+            # needs no thumbnail: the original is the answer to its question.
+            sent_content[image.content_id or ""] = image
             continue
         drop = image_id in unchecked or (automatic and aged and big)
         if drop and not in_mutable:

@@ -534,7 +534,7 @@ class ImageContextFileFetchTests(_ImageContextCase):
         self.assertNotIn("view_image_by_id", note)
         self.assertNotIn("需要 IMG-", note)
 
-    def test_a_gateway_names_the_tool_its_own_endpoint_serves(self) -> None:
+    def test_a_gateway_asks_for_the_original_until_a_client_fetches(self) -> None:
         # A gateway has no client document to edit, so the only fetch tool it
         # can offer is its own endpoint -- and the endpoint is served from the
         # first request, because a placeholder that waits for a client to have
@@ -546,6 +546,11 @@ class ImageContextFileFetchTests(_ImageContextCase):
                 image_context_module.IMAGE_CONTEXT_FETCH_ENV: "auto",
             },
         ):
+            # No client has ever called the endpoint, so no tool may be named:
+            # the ask is the kind, and this proxy answers that ask itself.
+            self.assertEqual("ask", image_context_module.fetch_kind())
+
+            image_context_module.mark_endpoint_served()
             self.assertEqual("tool", image_context_module.fetch_kind())
 
     def test_a_leftover_client_folder_on_a_gateway_is_not_a_client(self) -> None:
@@ -568,7 +573,7 @@ class ImageContextFileFetchTests(_ImageContextCase):
             },
         ):
             self.assertEqual(
-                "tool", image_context_module.fetch_kind(request_kwargs=forwarded)
+                "ask", image_context_module.fetch_kind(request_kwargs=forwarded)
             )
 
     def test_a_client_document_on_this_host_keeps_the_file_path(self) -> None:
@@ -1008,7 +1013,9 @@ class ImageContextDeploymentTests(_ImageContextCase):
         # names it: a gateway that waited for a client to call a tool it had
         # never named never got a single fetch.
         self.assertTrue(image_context_endpoint.enabled(environment))
-        self.assertTrue(image_context_module.fetch_available(environment))
+        # ``ask`` is a kind this proxy answers itself, so a fetch is available
+        # even though no tool can be named yet.
+        self.assertEqual("ask", image_context_module.fetch_kind(environment))
 
     def test_auto_registers_a_stdio_client_where_one_exists(self) -> None:
         home = Path(self.directory.name) / "desktop-home"
@@ -1415,7 +1422,7 @@ class ImageContextPreviewTests(_ImageContextCase):
         # After the base env is applied: its own update would otherwise win.
         os.environ["HOME"] = self.gateway_home
         os.environ[image_context_module.IMAGE_CONTEXT_FETCH_ENV] = "auto"
-        os.environ[image_context_module.IMAGE_CONTEXT_PREVIEW_ENV] = "auto"
+        os.environ[image_context_module.IMAGE_CONTEXT_PREVIEW_ENV] = "auto"  # opt in: the default is id
 
     def aged_replay(self) -> list:
         return [
@@ -1455,7 +1462,9 @@ class ImageContextPreviewTests(_ImageContextCase):
         joined = "\n".join(texts)
         self.assertIn("IMG-001", joined)
         self.assertIn("此处为缩略图", joined)
-        self.assertIn("view_image_by_id", joined)
+        # The caption names the ask, not a tool: this reader has none.
+        self.assertIn("需要 IMG-001", joined)
+        self.assertNotIn("view_image_by_id", joined)
 
     def test_the_note_says_the_thumbnails_are_there(self) -> None:
         result = self.rewritten(self.aged_replay())
@@ -1515,3 +1524,126 @@ class ImageContextPreviewTests(_ImageContextCase):
 
         # Everything that travelled before still travels, with the same bytes.
         self.assertEqual(first_urls[: len(second_urls)], second_urls[: len(first_urls)])
+
+
+class ImageContextIdFetchTests(_ImageContextCase):
+    """The fetch that needs no tool: the model writes the id, the next turn has it.
+
+    A gateway cannot edit the client's MCP configuration, and a thumbnail costs
+    bytes on every turn. A placeholder's id is enough if this proxy reads the
+    model's own "需要 IMG-004" back out of its newest message and puts that
+    original in the next request -- one turn later, at full size, and only when
+    it was actually asked for.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.environment.stop()
+        self.gateway_home = os.path.join(self.directory.name, "gateway-home")
+        os.makedirs(self.gateway_home, exist_ok=True)
+        self.environment.start()
+        os.environ["HOME"] = self.gateway_home
+        os.environ[image_context_module.IMAGE_CONTEXT_FETCH_ENV] = "auto"
+        os.environ[image_context_module.IMAGE_CONTEXT_PREVIEW_ENV] = "id"
+
+    def payloads(self, result: dict) -> dict:
+        """``id -> (mime, bytes)`` for every image the request carries."""
+
+        found = {}
+        for item in result["input"]:
+            for part in item.get("content") or item.get("output") or []:
+                if isinstance(part, dict) and part.get("type") == "input_image":
+                    url = part.get("image_url") or ""
+                    header, _, data = url.partition(",")
+                    found.setdefault(header, []).append(len(data) * 3 // 4)
+        return found
+
+    def image_bytes(self, result: dict) -> list:
+        sizes = []
+        for item in result["input"]:
+            for part in item.get("content") or item.get("output") or []:
+                if isinstance(part, dict) and part.get("type") == "input_image":
+                    sizes.append(len(part.get("image_url") or ""))
+        return sizes
+
+    def replay(self, ask: str | None) -> list:
+        items = [
+            _user_turn("第一轮", _upload_parts(_png(900, 700, noisy=True))),
+            _assistant("看过这页了"),
+            _tool_image(_png(1000, 800, noisy=True, seed=5)),
+        ]
+        if ask is not None:
+            items.append(_assistant(ask))
+        items.append(_user_turn("继续"))
+        return items
+
+    def test_an_id_the_model_asked_for_comes_back_at_full_size(self) -> None:
+        quiet = self.rewritten(self.replay(None))
+        self.assertEqual([], self.image_bytes(quiet), "nothing should travel yet")
+
+        asked = self.rewritten(self.replay("我还想再看一遍。\n需要 IMG-002"))
+        sizes = self.image_bytes(asked)
+        self.assertEqual(1, len(sizes), sizes)
+        # Full size, not a thumbnail: the original is the answer to the question.
+        self.assertGreater(sizes[0], 200_000)
+
+    def test_the_picture_carries_its_id_so_the_model_knows_which_it_got(self) -> None:
+        asked = self.rewritten(self.replay("需要 IMG-002"))
+
+        labels = [
+            part.get("text") or ""
+            for item in asked["input"]
+            for part in (item.get("content") or item.get("output") or [])
+            if isinstance(part, dict) and part.get("type") == "input_text"
+        ]
+        self.assertTrue(any("IMG-002" in label and "已提供" in label for label in labels), labels)
+
+    def test_an_older_ask_is_not_honoured_again(self) -> None:
+        # The ask lives in the assistant message; a later answer of the model's
+        # own is newer, so the original is not re-sent for ever.
+        items = [
+            _user_turn("第一轮", _upload_parts(_png(900, 700, noisy=True))),
+            _assistant("需要 IMG-001"),
+            _user_turn("第二轮"),
+            _assistant("这是我的结论"),
+            _user_turn("继续"),
+        ]
+
+        result = self.rewritten(items)
+
+        self.assertEqual([], self.image_bytes(result))
+
+    def test_only_the_ids_asked_for_travel_and_only_a_few(self) -> None:
+        items = [_user_turn("第一轮", _upload_parts(_png(900, 700, noisy=True)))]
+        for seed in range(3, 10):
+            items.extend([_assistant("ok"), _tool_image(_png(1000, 800, noisy=True, seed=seed))])
+        items.pop()
+        items.append(_assistant("需要 IMG-001、IMG-002、IMG-003、IMG-004、IMG-005、IMG-006"))
+        items.append(_user_turn("继续"))
+
+        result = self.rewritten(items)
+
+        self.assertEqual(4, len(self.image_bytes(result)))
+
+    def test_the_prompt_is_the_mirrored_one_and_no_tool_is_named(self) -> None:
+        """The fetch works without a word of new prompt.
+
+        ``ask`` is the wording the upstream already ships for a host with no
+        tool: it tells the model to write "需要 IMG-xxx".  This proxy answers
+        that ask itself, so nothing about the sentence has to change -- and it
+        must not start naming a tool the client cannot call.
+        """
+
+        result = self.rewritten(self.replay(None))
+
+        notes = [
+            item["content"][0]["text"]
+            for item in result["input"]
+            if item.get("role") == "developer"
+        ]
+        self.assertEqual(
+            [image_context_module._WORDS[image_context_module._LANG_ZH]["auto_ask_note"]],
+            notes,
+        )
+        self.assertNotIn("view_image_by_id", notes[0])
+        self.assertIn("“需要 IMG-xxx”", notes[0])
