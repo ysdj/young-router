@@ -34,6 +34,25 @@ class HookStubIsolationTests(unittest.TestCase):
             self.assertEqual({}, litellm.model_cost)
         self.assertIsInstance(litellm.model_cost, dict)
 
+    def test_the_stub_answers_for_the_installed_packages_resources(self) -> None:
+        """LiteLLM loads its tokenizers through ``importlib.resources``.
+
+        That call reads the module's own ``__spec__`` rather than an attribute,
+        so a stub that only delegated ``__getattr__`` raised ``AttributeError:
+        'NoneType' object has no attribute 'name'`` for any later test that
+        counted tokens -- a stream ending with reasoning usage does -- and only
+        when a hook test had loaded first.
+        """
+
+        _hooks, _proxy_server = load_hook_module()
+        import importlib.resources
+
+        import litellm
+
+        package = importlib.resources.files(litellm)
+        self.assertTrue((package / "litellm_core_utils" / "tokenizers").is_dir())
+        self.assertEqual(sys.modules["litellm"].__spec__.name, "litellm")
+
 
 if __name__ == "__main__":
     unittest.main()

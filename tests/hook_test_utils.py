@@ -167,6 +167,23 @@ def load_hook_module():
             return getattr(root, name)
 
         litellm.__getattr__ = delegate_to_installed_litellm
+        # ``__getattr__`` answers attribute reads, not the module's own search
+        # identity: ``importlib.resources.files(litellm)`` reads ``__spec__``,
+        # and a bare ``ModuleType`` has none.  LiteLLM's token counter loads its
+        # tokenizers through that call, so while the stub was installed a stream
+        # that ended carrying reasoning usage raised ``AttributeError: 'NoneType'
+        # object has no attribute 'name'`` from inside ``stream_chunk_builder`` --
+        # and only when another module had loaded the hook first, which made an
+        # unrelated test look broken.  The stub carries the installed package's
+        # identity for the same reason it delegates: everything the rest of the
+        # suite reads from ``litellm`` has to keep answering.
+        for attribute in ("__spec__", "__file__", "__loader__", "__package__"):
+            value = getattr(root, attribute, None)
+            if value is not None:
+                setattr(litellm, attribute, value)
+        package_path = getattr(root, "__path__", None)
+        if package_path is not None:
+            litellm.__path__ = list(package_path)
 
     sys.modules["litellm"] = litellm
     sys.modules["litellm.integrations"] = integrations
