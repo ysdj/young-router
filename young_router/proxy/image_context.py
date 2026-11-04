@@ -304,8 +304,7 @@ _WORDS: Dict[str, Dict[str, Any]] = {
             "visible now, and do not take them back or apologise for them.\n"
             "When an answer needs an omitted image and what you already said is "
             "not enough, write \"need IMG-xxx\" on its own line (several ids if you "
-            "need several): the next request carries that original, so neither the "
-            "user nor a tool is needed. "
+            "need several): that is how the user knows which one to send again. "
             "Do not guess or add detail you cannot see now; do not ask the user to "
             "upload it again, and do not read image files with another tool."
         ),

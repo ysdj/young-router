@@ -1625,6 +1625,33 @@ class ImageContextIdFetchTests(_ImageContextCase):
 
         self.assertEqual(4, len(self.image_bytes(result)))
 
+    def test_every_mirrored_sentence_is_still_the_upstream_one(self) -> None:
+        """The fetch must not cost a word of prompt.
+
+        These sentences are copied verbatim from Context Attachment Manager
+        because the model was tuned against them.  New delivery (an id the router
+        answers itself) must not edit one, and must not name a tool the client
+        does not have.
+        """
+
+        words = image_context_module._WORDS
+        zh, en = words[image_context_module._LANG_ZH], words[image_context_module._LANG_EN]
+
+        self.assertEqual("已省略", zh["omitted"])
+        self.assertEqual("已提供", zh["included"])
+        self.assertEqual("未重复提供", zh["not_repeated"])
+        self.assertEqual("omitted", en["omitted"])
+        self.assertEqual("provided", en["included"])
+        self.assertEqual("not repeated", en["not_repeated"])
+        self.assertTrue(zh["plain"]("IMG-007").startswith("需要重看时，在回复里写“需要 IMG-007”"))
+        self.assertIn("需要原图时调用 view_image_by_id", zh["auto_plain"]("IMG-007"))
+        self.assertIn("需要原图时调用 view_image", zh["file_plain"]("p.png"))
+        self.assertTrue(en["plain"]("IMG-007").startswith('To look again, reply "need IMG-007"'))
+        self.assertIn('call view_image_by_id with "IMG-007"', en["auto_plain"]("IMG-007"))
+        self.assertIn("上下文管理说明", zh["auto_ask_note"])
+        self.assertIn("需要 IMG-xxx", zh["auto_ask_note"])
+        self.assertIn("that is how the user knows which one to send again", en["auto_ask_note"])
+
     def test_the_prompt_is_the_mirrored_one_and_no_tool_is_named(self) -> None:
         """The fetch works without a word of new prompt.
 
