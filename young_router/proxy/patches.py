@@ -358,6 +358,33 @@ def _install_anthropic_unversioned_endpoint_patch() -> None:
     litellm_main._complete_anthropic = patched_complete
 
 
+def _enable_anthropic_prompt_caching() -> None:
+    """Let LiteLLM mark the stable Claude prefix when the client cannot.
+
+    Anthropic caches nothing unless the request carries ``cache_control``
+    breakpoints, and only the native Messages surface can state them: a Codex
+    ``/v1/responses`` turn carries no such field, so every turn of a thread
+    reached a Claude route as fresh input.  Measured 2026-11-05 against this
+    network's ``claude-opus-5-5`` route: the same ~7.4k-token prompt written
+    through ``/v1/messages`` created a 7,360-token cache and read it back on
+    the next turn, while three identical ``/v1/responses`` turns reported
+    ``cache_write_tokens: 0`` and ``cached_tokens: 0`` each -- and the relay's
+    own usage log billed all 42,658 input tokens of a Codex turn at full price.
+
+    LiteLLM's switch adds the two breakpoints it documents (the system prompt
+    and the trailing turn) to Claude models on an explicit-cache transport,
+    and stands down when the request already carries client breakpoints, so a
+    client that marks its own -- Pi's ``/v1/messages`` caching -- keeps its TTL
+    and its four-block budget untouched.
+    """
+
+    try:
+        import litellm
+    except Exception:
+        return
+    litellm.enable_anthropic_prompt_caching = True
+
+
 def _browser_compatible_headers_retry_kwargs(
     request_kwargs: dict,
 ) -> Optional[dict]:
@@ -3324,6 +3351,9 @@ def _install_openai_responses_fake_stream_patch() -> None:
 def install_all() -> None:
     _install_latin1_response_headers_patch()
     _install_anthropic_unversioned_endpoint_patch()
+    # Anthropic caches only what the request marks, and a Responses turn has no
+    # place to mark it: without this every Codex thread pays full input price.
+    _enable_anthropic_prompt_caching()
     _install_model_listing_efforts_patch()
     _install_chatgpt_account_credential_patch()
     _install_pre_call_token_count_patch()
