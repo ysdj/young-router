@@ -1013,6 +1013,71 @@ def _responses_stream_chunk_is_incomplete_terminal(chunk: Any) -> bool:
         _stream_chunk_response_status(chunk).lower() in _RESPONSES_STREAM_INCOMPLETE_STATUSES
     )
 
+def _responses_stream_requires_terminal_delivery(
+    request_data: Optional[dict],
+) -> bool:
+    """Whether this pipeline owes the reader a frame that states the outcome.
+
+    A Responses reader has no end-of-body signal of its own: the shape it parses
+    ends a turn only at ``response.completed``/``incomplete``/``failed``.  A body
+    that closes without one leaves the client waiting on a turn nobody will ever
+    finish -- observed live 2026-11-03, a deepseek route answered for seventeen
+    minutes and then ended the stream with no terminal event, and the reader's
+    own error was "stream ended before a terminal response event".
+    """
+
+    return _request_is_responses_stream(request_data)
+
+
+def _stream_failure_ended_without_terminal(exception: Exception) -> bool:
+    """Whether this exception is the stream *ending*, not a refusal of the turn.
+
+    Only the shapes that cut a stream this proxy was already delivering owe the
+    reader a terminal frame here: a body that stopped short of its terminal
+    event, a read of an accepted response that failed, or a route that closed
+    mid-answer.  A refusal that names the request itself (a malformed local
+    chunk, an oversized prompt) already has a cause the reader must act on, and
+    the layers above own it -- synthesizing there would replace a tested
+    classified stop with a generic one.
+    """
+
+    from . import routing as _routing_module
+
+    if _routing_module._is_context_size_error(exception):
+        # A prompt the route refused for its size has a cause the reader must
+        # fix, and the truncation retry above owns it: naming it here would
+        # replace that answer with a generic stop.
+        return False
+    ended_without_terminal = bool(
+        getattr(exception, "responses_stream_incomplete", False)
+        or getattr(exception, "stream_incomplete", False)
+        or _routing_module._is_route_cut_stream_error(exception)
+        or _routing_module._is_upstream_body_read_failure(exception)
+    )
+    if not ended_without_terminal:
+        return False
+    # A policy of ``error`` says no replay can change this answer; those stops
+    # already have a classified sentence and are the caller's to surface.
+    return (
+        _routing_module._recovery_policy_for_exception(exception)
+        != _routing_module._RECOVERY_POLICY_ERROR
+    )
+
+
+def _responses_stream_chunk_state_terminal(chunk: Any) -> bool:
+    """Whether this frame already states how the turn ended."""
+
+    dumps = _stream_chunk_dumps(chunk)
+    for candidate in dumps if dumps else [chunk]:
+        if _responses_stream_chunk_is_completed(candidate):
+            return True
+        if _responses_stream_chunk_is_incomplete_terminal(candidate):
+            return True
+        if _is_young_router_terminal_failure_event(candidate):
+            return True
+    return False
+
+
 def _is_young_router_terminal_failure_event(chunk: Any) -> bool:
     if bool(getattr(chunk, "_young_router_terminal_failure", False)):
         return True

@@ -3886,3 +3886,64 @@ class WebSearchAfterReasoningOrderingTests(unittest.TestCase):
             ],
             [event["type"] for event in iterator._pending_response_events],
         )
+
+
+class StreamWithoutTerminalEventTests(HookTestCase):
+    """A body that ends after output and before its terminal event.
+
+    A Responses reader has no end-of-body signal: it ends a turn at
+    ``response.completed``/``incomplete``/``failed``.  Observed live 2026-11-03,
+    a deepseek route answered for seventeen minutes, ended the stream with no
+    terminal event, and the reader sat there until a person pressed stop -- its
+    own error was "OpenAI Responses stream ended before a terminal response
+    event".  The wire boundary owes that reader a stop it can retry.
+    """
+
+    async def test_a_stream_that_ends_without_a_terminal_event_is_closed(self) -> None:
+        hooks, proxy_server = load_hook_module()
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return []
+
+            async def aresponses(self, **payload):
+                raise AssertionError("no sibling may be tried after output")
+
+        proxy_server.llm_router = FakeRouter()
+
+        async def original_stream():
+            yield {"type": "response.created", "response": {"id": "resp-partial"}}
+            yield {"type": "response.output_text.delta", "delta": "半句"}
+            # The route ends the body here, with no response.completed.
+
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "继续"}],
+            "stream": True,
+            "model_info": {"id": "order1-a", "order": 1},
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=original_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual(
+            [chunk.get("type") for chunk in chunks],
+            [
+                "response.created",
+                "response.output_text.delta",
+                "response.failed",
+            ],
+        )
+        response = chunks[-1]["response"]
+        self.assertEqual(response["status"], "failed")
+        # A stop that cut a turn the route had accepted must be one the client
+        # retries by itself: the code is the transient one, and the sentence
+        # tells the reader to send the message again.
+        self.assertEqual(response["error"]["code"], "upstream_stream_interrupted")
+        self.assertIn("again", response["error"]["message"])

@@ -485,31 +485,71 @@ class YoungRouterHook(CustomLogger):
         response: Any,
         request_data: dict,
     ) -> AsyncIterator[Any]:
+        needs_terminal_delivery = (
+            _streaming_module._responses_stream_requires_terminal_delivery(
+                request_data
+            )
+        )
+        terminal_delivered = False
         # The keepalive heartbeat wraps the complete delivery pipeline (start
         # buffering, guarded delivery, fallback and recovery rounds), so the
         # downstream client keeps receiving bytes while any internal wait is
         # in progress. Keepalive chunks intentionally bypass deliver_chunk():
         # they are already in final wire form and carry no output to adapt.
-        async for chunk in _streaming_module._yield_downstream_keepalive_stream(
-            self._post_call_streaming_iterator_pipeline(
-                user_api_key_dict,
-                response,
+        try:
+            async for chunk in _streaming_module._yield_downstream_keepalive_stream(
+                self._post_call_streaming_iterator_pipeline(
+                    user_api_key_dict,
+                    response,
+                    request_data,
+                ),
                 request_data,
-            ),
-            request_data,
-        ):
-            # A dropped chunk is not a frame.  ``deliver_chunk`` answers
-            # ``None`` for an event this client must not see (a reasoning
-            # summary it never asked for), and a ``None`` that reaches
-            # LiteLLM's serializer is written as the literal ``data: None`` --
-            # a body every Responses client rejects as malformed JSON, which is
-            # how a turn being recovered was cut by the frames meant to keep it
-            # alive.  Every delivery path below funnels through here, so the
-            # drop is applied once, at the wire boundary that would otherwise
-            # invent a payload for it.
-            if chunk is None:
-                continue
-            yield chunk
+            ):
+                # A dropped chunk is not a frame.  ``deliver_chunk`` answers
+                # ``None`` for an event this client must not see (a reasoning
+                # summary it never asked for), and a ``None`` that reaches
+                # LiteLLM's serializer is written as the literal ``data: None`` --
+                # a body every Responses client rejects as malformed JSON, which is
+                # how a turn being recovered was cut by the frames meant to keep it
+                # alive.  Every delivery path below funnels through here, so the
+                # drop is applied once, at the wire boundary that would otherwise
+                # invent a payload for it.
+                if chunk is None:
+                    continue
+                if needs_terminal_delivery and (
+                    _streaming_module._responses_stream_chunk_state_terminal(chunk)
+                ):
+                    terminal_delivered = True
+                yield chunk
+        except Exception as exc:
+            # The reader has nothing to read the end of this body from: this
+            # shape ends a turn at its terminal event, so a body that closes
+            # without one is a turn left open -- the client waits until a person
+            # presses stop, and the answer that never came is reported as a
+            # stream that "ended before a terminal response event".  Every
+            # internal path already tries to deliver a classified stop; this is
+            # the wire boundary that guarantees it when one of them ends by
+            # raising instead.
+            if (
+                not needs_terminal_delivery
+                or terminal_delivered
+                or _routing_module._is_local_shutdown_exception(exc)
+                or not _streaming_module._stream_failure_ended_without_terminal(exc)
+            ):
+                raise
+            terminal_delivered = True
+            terminal_event = _streaming_module._synthesized_failed_response_event(
+                request_data,
+                exc,
+            )
+            _trace_module._request_route_trace(
+                "responses_stream_terminal_event_synthesized",
+                request_data,
+                reason="pipeline_exception",
+                exception=_routing_module._trace_exception(exc),
+                request=_trace_module._trace_request_summary(request_data),
+            )
+            yield terminal_event
 
     async def _post_call_streaming_iterator_pipeline(
         self,
