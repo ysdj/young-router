@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -388,6 +390,44 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertGreaterEqual(workflow.count("node-version: 22"), 3)
         self.assertNotIn("mac_menu/build.sh", workflow)
         self.assertNotRegex(workflow, r"(?m)^\s*(?:run:\s*)?(?:npm|npx)\b")
+
+    def test_no_workflow_starts_on_its_own(self) -> None:
+        """A run exists only because a person asked for one.
+
+        Nothing in this repository may trigger a workflow automatically: a
+        commit is not a request to spend twenty minutes of macOS and Windows
+        runners, and a badge nobody asked for is not a review.  Every trigger
+        an event could add again -- `push`, `pull_request`, `schedule`,
+        `workflow_run`, `release`, `create` -- is refused by name rather than by
+        checking for one spelling, because the next edit brings its own.
+        """
+
+        for path in sorted((ROOT / ".github" / "workflows").glob("*.y*ml")):
+            with self.subTest(workflow=path.name):
+                text = path.read_text(encoding="utf-8")
+                declared = yaml.safe_load(text)
+                triggers = declared.get("on", declared.get(True))
+                if isinstance(triggers, str):
+                    triggers = [triggers]
+                if isinstance(triggers, list):
+                    names = triggers
+                else:
+                    names = list(triggers or {})
+                self.assertEqual(
+                    ["workflow_dispatch"],
+                    sorted(names),
+                    f"{path.name} must be dispatchable and nothing else",
+                )
+                for automatic in (
+                    "push:",
+                    "pull_request:",
+                    "pull_request_target:",
+                    "schedule:",
+                    "workflow_run:",
+                    "release:",
+                    "create:",
+                ):
+                    self.assertNotRegex(text, rf"(?m)^\s*{automatic}")
 
     def test_the_macos_job_cannot_run_below_the_xcode_react_native_requires(self) -> None:
         # React Native 0.85's ``use_react_native!`` raises "Please upgrade XCode"

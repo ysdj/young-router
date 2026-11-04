@@ -1,11 +1,9 @@
 name: LiteLLM version policy
 
 on:
-  pull_request:
-  push:
-    branches: [main]
-  schedule:
-    - cron: "17 2 * * *"
+  # Manual only, like every workflow here: the pin moves when a person moves it.
+  # The check is `./scripts/update-litellm.sh --check`, which a local run answers
+  # in a second without a runner.
   workflow_dispatch:
 
 jobs:

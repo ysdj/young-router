@@ -1,9 +1,10 @@
 name: CI
 
 on:
-  pull_request:
-  push:
-    branches: [main]
+  # A run happens only when one is asked for, never on a push or a pull
+  # request.  Nothing in this repository may start a workflow on its own: a
+  # commit is not a request to spend twenty minutes of macOS and Windows
+  # runners, and a red badge nobody asked for is not a review.
   workflow_dispatch:
 
 permissions:
