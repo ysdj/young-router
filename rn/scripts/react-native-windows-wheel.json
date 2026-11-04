@@ -1,0 +1,11 @@
+{
+  "comment": "The wheel-patched Microsoft.ReactNative.dll this repository ships. Copy it to a machine that has no React Native Windows source build with: node rn/scripts/react-native-windows-wheel.mjs install --from <dir|url>. Regenerate with `export` on the machine that built it, and commit the new digest with the change that made it necessary.",
+  "artifacts": {
+    "ARM64": {
+      "reactNativeWindows": "0.85.0-preview.2",
+      "architecture": "ARM64",
+      "sha256": "8f65ddab9caf12a20bc370cb0300080ca93bd448d77677276aeb51936eec3031",
+      "bytes": 8203264
+    }
+  }
+}

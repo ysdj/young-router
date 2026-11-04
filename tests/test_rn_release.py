@@ -920,7 +920,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
 
         # The runtime this tree staged last time seeds the next build, which is
         # what keeps the LiteLLM install off a repeat build.
-        self.assertIn('$PreviousRuntime = Join-Path $AppRoot "windows\\$WindowsArch\\Release\\Core\\runtime"', script)
+        self.assertIn('$PreviousRuntime = Join-Path $AppRoot "windows\\$WindowsArchName\\Release\\Core\\runtime"', script)
         # A packaged run holds its own executable, and the payload copy used to
         # die halfway through on it; the build replaces that instance.
         self.assertIn('Stopping the running packaged app (pid $($instance.Id))', script)
@@ -1237,6 +1237,12 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("[switch]$InitTree", script)
         self.assertIn("[switch]$Install", script)
         self.assertIn("/XD node_modules .staging-cache .venv __pycache__ .pytest_cache Pods", script)
+
+        # The loop is reachable the way every other task is, and its switches
+        # travel through pnpm's argument separator.
+        scripts = json.loads((ROOT / "rn" / "package.json").read_text(encoding="utf-8"))["scripts"]
+        self.assertEqual(scripts["dev:windows"], "pwsh ../scripts/dev-loop-windows.ps1")
+        self.assertEqual(scripts["dev:macos"], "../scripts/dev-loop-macos.sh")
         self.assertIn("[switch]$StopMetro", script)
         # The server appends how to fetch its own source map.  A file bundle that
         # carries those two lines is not what ``react-native bundle`` writes, and
@@ -1282,7 +1288,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
         build = (ROOT / "rn" / "scripts" / "build-windows.ps1").read_text(encoding="utf-8")
         self.assertIn("patch-react-native-windows.mjs", build)
         self.assertIn("--root $ProjectRoot", build)
-        self.assertIn("node_modules\\react-native-windows\\target\\$WindowsArch\\Release\\Microsoft.ReactNative\\Microsoft.ReactNative.dll", build)
+        self.assertIn("node_modules\\react-native-windows\\target\\$WindowsArchName\\Release\\Microsoft.ReactNative\\Microsoft.ReactNative.dll", build)
         self.assertIn("RNW source-build output is missing", build)
         self.assertIn("UseExperimentalNuget=true", build)
         self.assertNotIn("UseExperimentalNuget=false", build)
@@ -1298,6 +1304,15 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("[switch]$AllowUpstreamWheel", build)
         self.assertIn("YOUNG_ROUTER_ALLOW_UPSTREAM_WHEEL", build)
         self.assertIn("Building with upstream React Native Windows", build)
+        # The other answer to the same gap is to carry the prepared build over.
+        # It is installed before the gate reads it, and only after the artifact's
+        # digest and the tree's RNW release both agree.
+        self.assertIn("[string]$FetchPrebuilt", build)
+        self.assertIn("$WheelInstaller install --root $ProjectRoot --arch $WindowsArchName", build)
+        self.assertLess(
+            build.index("$WheelInstaller install"),
+            build.index("RNW source-build output is missing"),
+        )
         self.assertIn("Copy-Item -LiteralPath $ReactNativeTargetDll -Destination $PackagedReactNativeDll -Force", build)
         # The raw-output convenience exe and the host share one path, and the
         # launcher is compiled there after the payload copy: the next build then
@@ -1310,6 +1325,61 @@ class ReactNativeReleaseTests(unittest.TestCase):
             build.index("$RawHostIsLauncher = (Get-Content -Raw -LiteralPath $LauncherMarker)"),
             build.index("Copy-Item -LiteralPath $_.FullName -Destination $PackagePayload"),
         )
+
+    def test_the_prepared_wheel_build_can_be_carried_to_another_machine(self) -> None:
+        # Only one machine can produce the wheel-patched RNW binary (a source
+        # build of it is half an hour and yields no PRI), so the others copy it.
+        # A hand copy is how a tree ends up linking a DLL from a different RNW
+        # release: the host calls it by ABI, so the mistake shows up as a wrong
+        # scroll distance or a crash, never as a build error.  The tool therefore
+        # carries a digest and the release it was built from, and refuses both
+        # kinds of mismatch.
+        tool = (ROOT / "rn" / "scripts" / "react-native-windows-wheel.mjs").read_text(encoding="utf-8")
+
+        self.assertIn("createHash(\"sha256\")", tool)
+        self.assertIn("is not the recorded one", tool)
+        self.assertIn("was built from React Native Windows", tool)
+        self.assertIn("this tree stages", tool)
+        # An interrupted copy must not leave a half-written DLL for the build.
+        self.assertIn("`${target}.incoming`", tool)
+        self.assertLess(tool.index("verify(bytes, manifest)"), tool.index("renameSync(temporary, target)"))
+
+        manifest = json.loads((ROOT / "rn" / "scripts" / "react-native-windows-wheel.json").read_text(encoding="utf-8"))
+        recorded = manifest["artifacts"]["ARM64"]
+        self.assertEqual(recorded["reactNativeWindows"], "0.85.0-preview.2")
+        self.assertEqual(len(recorded["sha256"]), 64)
+        self.assertGreater(recorded["bytes"], 1024 * 1024)
+
+    def test_every_windows_path_uses_the_platform_spelling_a_build_creates(self) -> None:
+        # React Native Windows puts its output under
+        # ``target\$(Platform)\$(Configuration)`` and MSBuild uses the solution
+        # configuration's platform verbatim, so the directory is ``x64`` -- not
+        # the ``X64`` an uppercased comparison value produces.  Comparing on the
+        # uppercased form is fine; naming a path after it points the build at a
+        # tree no build creates, which only shows up when someone builds x64.
+        build = (ROOT / "rn/scripts/build-windows.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('$WindowsArchName = if ($WindowsArch -eq "ARM64") { "ARM64" } else { "x64" }', build)
+        for path in (
+            'node_modules\\react-native-windows\\target\\$WindowsArchName\\Release',
+            'windows\\$WindowsArchName\\Release',
+            'bin\\$WindowsArchName\\Release\\YoungRouter',
+        ):
+            self.assertIn(path, build)
+            self.assertNotIn(path.replace("$WindowsArchName", "$WindowsArch"), build)
+        # The CLI and the wheel installer are given the same spelling as the
+        # directories, because both of them name one.
+        self.assertIn('"--arch", $WindowsArchName', build)
+        self.assertIn("--arch $WindowsArchName --from $FetchPrebuilt", build)
+
+        loop = (ROOT / "scripts" / "dev-loop-windows.ps1").read_text(encoding="utf-8")
+        self.assertIn("$arch = if ($env:YOUNG_ROUTER_WINDOWS_ARCH -eq 'ARM64') { 'ARM64' } else { 'x64' }", loop)
+        self.assertNotIn("ToUpperInvariant()", loop)
+
+        tool = (ROOT / "rn" / "scripts" / "react-native-windows-wheel.mjs").read_text(encoding="utf-8")
+        self.assertIn('/^arm64$/i.test(requestedArch)', tool)
+        self.assertIn('/^x64$/i.test(requestedArch)', tool)
+        self.assertNotIn(".toUpperCase()", tool)
 
     def test_the_js_loop_reloads_the_bundle_in_place_and_only_from_a_known_good_one(self) -> None:
         # A UI edit's shortest path is a reload, not a restart: `RCTHost`

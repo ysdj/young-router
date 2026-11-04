@@ -59,7 +59,18 @@ pnpm run bootstrap:rnmacos && pnpm install --frozen-lockfile
 YOUNG_ROUTER_MACOS_OUTPUT="$PWD/../artifacts/Young Router.app" pnpm run build:macos
 ```
 
-Windows (Developer PowerShell, needs Windows App SDK + VS C++ desktop workload): `pnpm install --frozen-lockfile && pnpm run build:windows`.
+Windows (Developer PowerShell, needs Windows App SDK + VS C++ desktop workload): `cd rn; pnpm install --frozen-lockfile; pnpm run build:windows`.
+
+A machine that has never built React Native Windows has no prepared `Microsoft.ReactNative.dll` to swap in, and building that one from RNW sources is half an hour with an unusable PRI. Carry the prepared one over instead:
+
+```
+node rn/scripts/react-native-windows-wheel.mjs export --out <dir>      # on the machine that built it
+pnpm run build:windows -- -FetchPrebuilt <dir|url>                     # on the new machine
+```
+
+The copy is verified against the digest in `rn/scripts/react-native-windows-wheel.json` and against the RNW release the tree stages, so a binary from a different release is refused rather than linked. `node rn/scripts/react-native-windows-wheel.mjs status` reports which build a tree currently carries. Without the artifact, such a machine can still build with the upstream wheel mapping, explicitly: `-AllowUpstreamWheel` (or `YOUNG_ROUTER_ALLOW_UPSTREAM_WHEEL=1`); the run says so, and nothing about the wheel distance is claimed.
+
+For UI work there is no build at all: `pnpm run dev:windows` (or `scripts\dev-loop-windows.ps1` directly, which takes `-Check`, `-NoRestart`, `-StopMetro`) syncs the JavaScript, fetches the bundle from a Metro server it keeps running, and restarts the app — 13–17 s per edit. On a machine whose checkout is on its own disk it debugs that checkout in place; a checkout reached through a shared folder needs `-InitTree` once, because `node_modules` cannot live there.
 
 Source builds also need Xcode, CocoaPods, Node.js 22+, pnpm 11, and [uv](https://docs.astral.sh/uv/).
 

@@ -22,7 +22,9 @@
     "check:macos": "pnpm run test && pnpm run contract-check && pnpm run typecheck",
     "build": "pnpm run test && pnpm run contract-check && pnpm run typecheck && pnpm run codegen:windows:check",
     "build:macos": "../scripts/build-and-install-macos.sh",
-    "build:windows": "pwsh ./scripts/build-windows.ps1"
+    "build:windows": "pwsh ./scripts/build-windows.ps1",
+    "dev:windows": "pwsh ../scripts/dev-loop-windows.ps1",
+    "dev:macos": "../scripts/dev-loop-macos.sh"
   },
   "dependencies": {
     "@babel/runtime": "7.29.7",

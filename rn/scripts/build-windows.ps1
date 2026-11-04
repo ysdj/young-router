@@ -4,7 +4,12 @@ param(
   # hour with no valid PRI.  This lets that machine produce a working artifact
   # with the upstream wheel mapping instead of refusing to build at all; the
   # run says so, loudly, and nothing about the mapping is claimed.
-  [switch]$AllowUpstreamWheel
+  [switch]$AllowUpstreamWheel,
+  # The other way to answer the same gap: install the prepared build of that DLL
+  # from a directory an export wrote (or an HTTP URL carrying the same files).
+  # The digest and the RNW release are checked before it is used, so a copy from
+  # a different release is refused instead of linked.
+  [string]$FetchPrebuilt = $env:YOUNG_ROUTER_RNW_PREBUILT
 )
 $ErrorActionPreference = "Stop"
 
@@ -19,6 +24,13 @@ $WindowsArch = if ([string]::IsNullOrWhiteSpace($env:YOUNG_ROUTER_WINDOWS_ARCH))
 if ($WindowsArch -notin @("X64", "ARM64")) {
   throw "YOUNG_ROUTER_WINDOWS_ARCH must be x64 or ARM64."
 }
+# ``$WindowsArch`` is only for comparisons.  Every path, every MSBuild platform
+# and the RNW CLI use the way the architecture is actually spelled: React Native
+# Windows puts its own output under ``target\$(Platform)\$(Configuration)``
+# (Directory.Build.props), MSBuild uses the solution configuration's platform
+# verbatim, and that spelling is ``x64`` -- so an uppercased ``X64`` looked for
+# ``windows\X64\Release`` and ``target\X64``, which a build never creates.
+$WindowsArchName = if ($WindowsArch -eq "ARM64") { "ARM64" } else { "x64" }
 $PythonTarget = if ($WindowsArch -eq "ARM64") {
   "cpython-3.12-windows-arm64-none"
 } else {
@@ -123,13 +135,24 @@ try {
   # build, and a checkout without it would otherwise ship the upstream wheel
   # with nothing in the build output to say so.
   $ReactNativeWheelPatch = Join-Path $RnRoot "scripts\patch-react-native-windows.mjs"
-  $ReactNativeTargetDll = Join-Path $RnRoot "node_modules\react-native-windows\target\$WindowsArch\Release\Microsoft.ReactNative\Microsoft.ReactNative.dll"
+  $ReactNativeTargetDll = Join-Path $RnRoot "node_modules\react-native-windows\target\$WindowsArchName\Release\Microsoft.ReactNative\Microsoft.ReactNative.dll"
   $UseUpstreamWheel = [bool]($AllowUpstreamWheel -or $env:YOUNG_ROUTER_ALLOW_UPSTREAM_WHEEL -notin @($null, "", "0", "false", "no"))
   if ($UseUpstreamWheel) {
     Write-Warning "Building with upstream React Native Windows: its wheel mapping eases every event and does not follow the system lines-per-notch setting. Pass no override on a machine that has the prepared build."
   } else {
+    if ($FetchPrebuilt) {
+      if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+        throw "node is required to install the prepared React Native Windows build."
+      }
+      $WheelInstaller = Join-Path $RnRoot "scripts\react-native-windows-wheel.mjs"
+      if (-not (Test-Path -LiteralPath $WheelInstaller -PathType Leaf)) {
+        throw "The prepared React Native Windows installer is missing: $WheelInstaller."
+      }
+      & node $WheelInstaller install --root $ProjectRoot --arch $WindowsArchName --from $FetchPrebuilt
+      if ($LASTEXITCODE -ne 0) { throw "Could not install the prepared React Native Windows build from $FetchPrebuilt." }
+    }
     if (-not (Test-Path -LiteralPath $ReactNativeTargetDll -PathType Leaf)) {
-      throw "RNW source-build output is missing: $ReactNativeTargetDll. Copy the prepared Microsoft.ReactNative.dll there, or build this machine with -AllowUpstreamWheel (or YOUNG_ROUTER_ALLOW_UPSTREAM_WHEEL=1) to ship the upstream wheel mapping instead."
+      throw "RNW source-build output is missing: $ReactNativeTargetDll. Copy the prepared Microsoft.ReactNative.dll there (or pass -FetchPrebuilt <dir|url>, or YOUNG_ROUTER_RNW_PREBUILT), or build this machine with -AllowUpstreamWheel to ship the upstream wheel mapping instead."
     }
     if (-not (Test-Path -LiteralPath $ReactNativeWheelPatch -PathType Leaf)) {
       throw "The prepared RNW wheel patch is missing: $ReactNativeWheelPatch."
@@ -165,7 +188,7 @@ try {
     # has to be installed: re-resolving the whole proxy into a fresh temporary
     # runtime on every build is minutes of work for a release that has not
     # moved.  A runtime without an interpreter is ignored by the same check.
-    $PreviousRuntime = Join-Path $AppRoot "windows\$WindowsArch\Release\Core\runtime"
+    $PreviousRuntime = Join-Path $AppRoot "windows\$WindowsArchName\Release\Core\runtime"
     if (Test-Path (Join-Path $PreviousRuntime "bin\python.exe")) {
       $RuntimeSeed = $PreviousRuntime
     }
@@ -434,7 +457,7 @@ print('young-router-veridrop-import-ok')
   # parses as zero properties and is dropped without a word.
   $RunWindowsArgs = @(
     "--dir", $AppRoot, "exec", "react-native", "run-windows",
-    "--no-launch", "--no-deploy", "--no-packager", "--release", "--arch", $WindowsArch,
+    "--no-launch", "--no-deploy", "--no-packager", "--release", "--arch", $WindowsArchName,
     "--sln", "windows\YoungRouter.sln", "--proj", "windows\YoungRouter\YoungRouter.vcxproj",
     "--msbuildprops", "YoungRouterCoreStagingDir=$CoreRoot,RunCodegenWindows=false,WindowsTargetPlatformVersion=$($InstalledSdk.Name),RestoreIgnoreFailedSources=true,RestoreForce=false,UseExperimentalNuget=true"
   )
@@ -446,8 +469,8 @@ print('young-router-veridrop-import-ok')
   & pnpm @RunWindowsArgs
   if ($LASTEXITCODE -ne 0) { throw "React Native Windows host build failed." }
 
-  $WindowsRelease = Join-Path $AppRoot "windows\$WindowsArch\Release"
-  $PackagePayload = Join-Path $AppRoot "windows\YoungRouter.Package\bin\$WindowsArch\Release\YoungRouter"
+  $WindowsRelease = Join-Path $AppRoot "windows\$WindowsArchName\Release"
+  $PackagePayload = Join-Path $AppRoot "windows\YoungRouter.Package\bin\$WindowsArchName\Release\YoungRouter"
   New-Item -ItemType Directory -Force -Path $PackagePayload | Out-Null
   # Replacing the payload cannot overwrite an executable the running app holds:
   # a packaged run outlives the build, and the copy then fails halfway through
@@ -543,7 +566,7 @@ print('young-router-veridrop-import-ok')
   }
   $VcVarsArch = if ($WindowsArch -eq "ARM64") { "arm64" } else { "x64" }
   $VcVars = Join-Path $VsInstallPath "VC\Auxiliary\Build\vcvarsall.bat"
-  $LauncherObject = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-launcher-" + $WindowsArch + ".obj")
+  $LauncherObject = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-launcher-" + $WindowsArchName + ".obj")
   $LauncherCommand = "call `"$VcVars`" $VcVarsArch && cl.exe /nologo /O2 /MT /DUNICODE /D_UNICODE /EHsc /Fo:`"$LauncherObject`" /Fe:`"$LauncherOutput`" `"$LauncherSource`" /link /SUBSYSTEM:WINDOWS shell32.lib user32.lib"
   & cmd.exe /d /s /c $LauncherCommand
   if ($LASTEXITCODE -ne 0 -or -not (Test-Path $LauncherOutput)) {

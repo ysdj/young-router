@@ -209,7 +209,10 @@ $hostExe = Join-Path $installDirectory 'YoungRouter\YoungRouter.exe'
 $bundleDirectory = if (Test-Path -LiteralPath (Join-Path $installDirectory 'YoungRouter\Bundle')) {
   Join-Path $installDirectory 'YoungRouter\Bundle'
 } else {
-  $arch = if ($env:YOUNG_ROUTER_WINDOWS_ARCH) { $env:YOUNG_ROUTER_WINDOWS_ARCH.Trim().ToUpperInvariant() } else { 'X64' }
+  # The package payload directory carries the platform as MSBuild spells it:
+  # ``x64``
+  # and ``ARM64``, never an uppercased ``X64``.
+  $arch = if ($env:YOUNG_ROUTER_WINDOWS_ARCH -eq 'ARM64') { 'ARM64' } else { 'x64' }
   Join-Path $AppRoot "windows\YoungRouter.Package\bin\$arch\Release\YoungRouter\Bundle"
 }
 if (-not (Test-Path -LiteralPath $bundleDirectory)) { throw "No installed bundle directory at $bundleDirectory" }
