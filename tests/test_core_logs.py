@@ -790,6 +790,50 @@ model_list:
             self.assertEqual("credential-a", record["api_key_name"])
             self.assertEqual("public-chat", record["public_model"])
 
+    def test_request_log_projects_the_two_protocols_a_turn_used(self) -> None:
+        """The Log tab's protocol columns read the row's own wires.
+
+        Core records the wire the client called in on and the wire the attempt
+        actually left on.  A row written before those fields existed carries
+        neither, and the pane leaves that cell empty rather than guessing.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "recent-requests.jsonl").write_text(
+                "\n".join(
+                    json.dumps(record)
+                    for record in (
+                        {
+                            "ts": "2026-08-01T04:10:11Z",
+                            "request_id": "bridged",
+                            "status": "success",
+                            "public_model": "public-chat",
+                            "client_surface": "messages",
+                            "upstream_surface": "chat",
+                        },
+                        {
+                            "ts": "2026-08-01T04:10:12Z",
+                            "request_id": "legacy",
+                            "status": "success",
+                            "public_model": "public-chat",
+                        },
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            records = {
+                record["request_id"]: record
+                for record in LogsDomain(root).view("requests")["log"]["records"]
+            }
+
+            self.assertEqual("messages", records["bridged"]["client_surface"])
+            self.assertEqual("chat", records["bridged"]["upstream_surface"])
+            self.assertNotIn("client_surface", records["legacy"])
+            self.assertNotIn("upstream_surface", records["legacy"])
+
     def test_request_log_derives_legacy_public_model_from_route_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -479,33 +479,16 @@ def _public_catalog_is_image_model(name: str) -> bool:
         return False
 
 
-def local_exposed_models(api_key: str) -> tuple[list[str], bool]:
-    """Read the model IDs LiteLLM currently exposes on its local API.
+def _local_model_listing(api_key: str) -> list[Any] | None:
+    """The ``data`` list from this machine's authenticated ``/models`` answer.
 
-    The configured ``model_list`` is intentionally not a catalog source.  A
-    model becomes selectable in Codex only after the running Young Router
-    answers the authenticated ``/v1/models`` request.  Any transport,
-    authentication, response-shape, or size failure therefore produces no
-    exposed models.
-
-    An image generation route is dropped here, and only here: ``/v1/models``
-    keeps publishing it, while every picker this app writes -- the managed Codex
-    catalog and both Claude lists -- is built from what this function answers.
-    A generator cannot be selected into a conversation (it is reached through
-    the client's own image tool, not by naming it as the model), so listing it
-    offered a choice that could only fail; the request log for
-    ``gpt-image-2.5-sunburst`` showed the client sending a full coding-agent tool
-    set to a route that answers ``{\"size\":\"1024x1024\"...}`` instead.
-
-    The answer is ordered by public name, case-insensitively, and that is the
-    only order in it: every picker this app writes -- the managed Codex catalog
-    and both Claude lists -- is built from these names, so a route sits in the
-    same place in all of them and no client re-sorts its copy.  ``/v1/models``
-    itself is untouched and keeps the order its ``model_list`` declares.
+    A transport, authentication, response-shape, or size failure answers
+    ``None``; the callers turn that into "no observation" rather than an empty
+    model list, because an empty list is a real answer a picker may write.
     """
 
     if not isinstance(api_key, str) or not api_key.strip():
-        return [], False
+        return None
     request = urllib.request.Request(
         f"{local_base_url().rstrip('/')}/models",
         headers={
@@ -525,38 +508,113 @@ def local_exposed_models(api_key: str) -> tuple[list[str], bool]:
                 status = response.getcode()
             body = response.read(LOCAL_MODEL_LIST_MAX_BYTES + 1)
     except (OSError, urllib.error.URLError, urllib.error.HTTPError):
-        return [], False
+        return None
     except Exception:
-        return [], False
+        return None
 
     if not isinstance(status, int) or status < 200 or status >= 300:
-        return [], False
+        return None
     if len(body) > LOCAL_MODEL_LIST_MAX_BYTES:
-        return [], False
+        return None
     try:
         payload = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return [], False
+        return None
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return None
+    return payload["data"]
+
+
+def _usable_listing_name(item: object) -> str | None:
+    """One listing row's public name, or ``None`` for a row a picker must skip.
+
+    Image generators are dropped here, and only here: ``/v1/models`` keeps
+    publishing them, while every picker this app writes is built from what these
+    functions answer.  A generator cannot be selected into a conversation (it is
+    reached through the client's own image tool, not by naming it as the model),
+    so listing it offered a choice that could only fail; the request log for
+    ``gpt-image-2.5-sunburst`` showed the client sending a full coding-agent tool
+    set to a route that answers ``{"size":"1024x1024"...}`` instead.
+    """
+
+    value = item.get("id") if isinstance(item, dict) else item
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    if not name or len(name) > 256 or any(ord(char) < 32 for char in name):
+        return None
+    if _listing_entry_is_image_model(item) or _public_catalog_is_image_model(name):
+        return None
+    return name
+
+
+def local_exposed_models(api_key: str) -> tuple[list[str], bool]:
+    """Read the model IDs LiteLLM currently exposes on its local API.
+
+    The configured ``model_list`` is intentionally not a catalog source.  A
+    model becomes selectable in Codex only after the running Young Router
+    answers the authenticated ``/v1/models`` request.  Any transport,
+    authentication, response-shape, or size failure therefore produces no
+    exposed models.
+
+    An image generation route is dropped here, and only here: ``/v1/models``
+    keeps publishing it, while every picker this app writes -- the managed Codex
+    catalog and both Claude lists -- is built from what this function answers.
+    A generator cannot be selected into a conversation (it is reached through
+    the client's own image tool, not by naming it as the model), so listing it
+    offered a choice that could only fail; the request log for
+    ``gpt-image-2.5-sunburst`` showed the client sending a full coding-agent tool
+    set to a route that answers ``{"size":"1024x1024"...}`` instead.
+
+    The answer is ordered by public name, case-insensitively, and that is the
+    only order in it: every picker this app writes -- the managed Codex catalog
+    and both Claude lists -- is built from these names, so a route sits in the
+    same place in all of them and no client re-sorts its copy.  ``/v1/models``
+    itself is untouched and keeps the order its ``model_list`` declares.
+    """
+
+    data = _local_model_listing(api_key)
+    if data is None:
         return [], False
 
     names: list[str] = []
     seen: set[str] = set()
-    for item in payload["data"]:
-        value = item.get("id") if isinstance(item, dict) else item
-        if not isinstance(value, str):
-            continue
-        name = value.strip()
-        if not name or len(name) > 256 or any(ord(char) < 32 for char in name):
-            continue
-        if name in seen:
-            continue
-        if _listing_entry_is_image_model(item) or _public_catalog_is_image_model(name):
+    for item in data:
+        name = _usable_listing_name(item)
+        if name is None or name in seen:
             continue
         seen.add(name)
         names.append(name)
     names.sort(key=str.casefold)
     return names, True
+
+
+def local_exposed_model_rows(api_key: str) -> tuple[list[dict[str, object]], bool]:
+    """The same listing, with each route's own context hint.
+
+    Claude Code's ``modelPicker`` names a row by its public id and learns a
+    context window only through ``behavesAs``; the hint is the route's
+    ``max_input_tokens``.  Omitting it would make every non-Claude id look like
+    a 200k model to the client, which is the wrong number for a 1M route.
+    """
+
+    data = _local_model_listing(api_key)
+    if data is None:
+        return [], False
+
+    rows: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for item in data:
+        name = _usable_listing_name(item)
+        if name is None or name in seen:
+            continue
+        seen.add(name)
+        max_input = item.get("max_input_tokens") if isinstance(item, dict) else None
+        if not isinstance(max_input, int) or isinstance(max_input, bool) or max_input <= 0:
+            max_input = None
+        rows.append({"id": name, "max_input_tokens": max_input})
+    rows.sort(key=lambda row: str(row["id"]).casefold())
+    return rows, True
 
 
 def _safe_file_state(path: pathlib.Path, label: str) -> tuple[bool, int]:

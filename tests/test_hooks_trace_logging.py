@@ -740,6 +740,79 @@ class HookTraceLoggingTests(HookTestCase):
         self.assertTrue(record["route_key"].startswith("model=public-chat /"))
         self.assertEqual("selected", record["routing_state"])
 
+    def test_request_log_states_the_inbound_and_outbound_wire(self) -> None:
+        """The two protocol columns read the wires, never the declaration.
+
+        A ``fallback`` route answers the client's own /v1/responses request
+        while declaring a chat backup, so the row has to name the wire the
+        attempt actually left on.  An inbound protocol is the client's own
+        door, which is why a Messages client bridged onto a chat route reads
+        ``Messages`` in one column and ``Chat`` in the other: those two facts
+        are what tell a reader where a bridged turn was adapted.
+        """
+
+        hooks, _ = load_hook_module()
+        routing = sys.modules["young_router.proxy.routing"]
+        self.addCleanup(routing._ADAPTED_SURFACE_REQUESTS.clear)
+
+        responses = hooks._request_log_record(
+            "success",
+            {
+                "model": "public-chat",
+                "request_id": "req-wire-log-1",
+                "input": [{"role": "user", "content": "hello"}],
+                "proxy_server_request": {
+                    "url": "http://127.0.0.1:4000/v1/responses",
+                },
+                "model_info": {
+                    "id": "deployment-1",
+                    # The route declares its backup protocol; the surface below
+                    # is the one this attempt was dispatched on.
+                    "upstream_url_surface": "openai/chat",
+                },
+                "_young_router_upstream_url_surface": "openai/responses",
+            },
+        )
+        self.assertEqual("responses", responses["client_surface"])
+        self.assertEqual("responses", responses["upstream_surface"])
+
+        # A Messages turn adapted onto a chat route: the terminal callback's
+        # kwargs carry no surface of their own, so the request id's memory of
+        # the adapted wire is what has to answer.
+        routing._remember_request_adapted_surface(
+            {"request_id": "req-wire-log-2"}, "openai/chat"
+        )
+        bridged = hooks._request_log_record(
+            "success",
+            {
+                "call_type": "anthropic_messages",
+                "request_id": "req-wire-log-2",
+                "model_info": {"id": "deployment-2"},
+            },
+        )
+        self.assertEqual("messages", bridged["client_surface"])
+        self.assertEqual("chat", bridged["upstream_surface"])
+
+    def test_request_log_leaves_an_unknown_protocol_empty(self) -> None:
+        """A row that cannot name a wire states none instead of ``unknown``.
+
+        The column answers "which wire carried this turn"; drawn with the word
+        ``unknown`` it would report a protocol no client ever called in on.
+        """
+
+        hooks, _ = load_hook_module()
+
+        record = hooks._request_log_record(
+            "failure",
+            {
+                "call_type": "/v1/models",
+                "exception": RuntimeError("no deployment"),
+            },
+        )
+
+        self.assertNotIn("client_surface", record)
+        self.assertNotIn("upstream_surface", record)
+
     def test_request_log_classifies_pre_route_failures_and_trace_reasons(self) -> None:
         hooks, _ = load_hook_module()
 

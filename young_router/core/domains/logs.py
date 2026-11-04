@@ -1110,6 +1110,12 @@ def _safe_request_record(
         "provider",
         "api_key_name",
         "upstream_model",
+        # The wire the client called in on and the wire the request left on.
+        # Both are the proxy's own vocabulary (``responses`` / ``chat`` /
+        # ``messages`` / ``image_generation``) and the pane names the protocol;
+        # a row recorded before these fields existed simply carries none.
+        "client_surface",
+        "upstream_surface",
         "duration_ms",
         "route_key",
         "routing_state",

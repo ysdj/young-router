@@ -2746,15 +2746,16 @@ private enum NativeRelayOriginPolicy {
             // height includes the transparent title strip.
             // The provider workspace is three fixed columns and a model
             // list whose own three carry floors: the upstream id read in full,
-            // a public name that may be ellipsized, and 倍率.  A 140 pt list
-            // (its names are short) and a 320 pt inspector beside it leave the
-            // middle pane those floors at 980, so the default spends only the
-            // little a wider window adds on the two name columns, and the
-            // minimum is the narrowest the window goes before they scale down
-            // together.
+            // a public name that may be ellipsized, and 倍率.  A 120 pt list
+            // (its own title row is all it holds — 供应商, or the wider
+            // Providers beside two 22 pt buttons — and its names are short)
+            // and a 320 pt inspector beside it leave the middle pane those
+            // floors at 960, so the default spends only the little a wider
+            // window adds on the two name columns, and the minimum is the
+            // narrowest the window goes before they scale down together.
             return RouteWindowLayout(
-                contentSize: NSSize(width: 1010, height: 660),
-                minSize: NSSize(width: 980, height: 560),
+                contentSize: NSSize(width: 990, height: 660),
+                minSize: NSSize(width: 960, height: 560),
                 maxSize: nil
             )
         }

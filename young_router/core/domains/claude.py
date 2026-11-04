@@ -647,6 +647,63 @@ def _names_an_anthropic_family(name: str) -> bool:
     return any(tail.startswith(family) or tail.startswith(f"{family}-") for family in _ANTHROPIC_MODEL_FAMILIES)
 
 
+#: Claude Code's compiled catalog entries this app names through
+#: ``modelPicker[].behavesAs``.  A public gateway id is not in that catalog, so
+#: without a substitute Claude Code assumes 200k and offers no Effort ladder;
+#: ``behavesAs`` lends the row a known model's client-side handling without
+#: changing the id it sends.  The 1M entry also carries the full
+#: low..max ladder (``xhigh_effort`` and ``max_effort``).
+_CODE_BEHAVES_AS_1M = "claude-opus-5-5"
+_CODE_BEHAVES_AS_DEFAULT = "claude-sonnet-4-6"
+
+#: Claude Code's per-model ``modelSettings.<model>.autoCompactWindow`` range.
+#: The setting is the effective context window; the client caps it at the
+#: behavior model's own maximum, so a 500k route needs a 1M ``behavesAs``.
+_CODE_AUTO_COMPACT_MIN = 100_000
+_CODE_AUTO_COMPACT_MAX = 1_000_000
+
+#: Claude Code always renders a subtitle for a curated picker row: omitting
+#: ``description`` produces ``Custom model (<id>)``.  A zero-width space is the
+#: one value that survives the app's ``trim() || undefined`` fallback and draws
+#: no text, which is what keeps a row reading as just its model name.
+_CLAUDE_CODE_BLANK_DESCRIPTION = "\u200b"
+
+
+def _code_behaves_as(name: str, max_input_tokens: object) -> str | None:
+    """The known Claude Code model an unknown public id should behave as.
+
+    A real Claude id is already in the client's catalog, so it needs no
+    substitute.  A route that states 500k or more gets the 1M entry: the
+    catalog has no 500k model, and ``modelSettings.<model>.autoCompactWindow``
+    is what narrows the effective window back to the route's own number.  A
+    smaller route gets a 200k entry, which also caps any accidental larger
+    setting at its real maximum.
+    """
+
+    if claude_aliases.desktop_keeps_model_id(name):
+        return None
+    if (
+        isinstance(max_input_tokens, int)
+        and not isinstance(max_input_tokens, bool)
+        and max_input_tokens >= 500_000
+    ):
+        return _CODE_BEHAVES_AS_1M
+    return _CODE_BEHAVES_AS_DEFAULT
+
+
+def _code_auto_compact_window(max_input_tokens: object) -> int | str:
+    """The per-model auto-compact window Claude Code should use.
+
+    ``modelSettings.<model>.autoCompactWindow`` accepts 100k..1M or ``auto``.
+    An unknown route width stays ``auto`` so the client's own model choice
+    decides; a known one is clamped into the accepted range.
+    """
+
+    if not isinstance(max_input_tokens, int) or isinstance(max_input_tokens, bool):
+        return "auto"
+    return max(_CODE_AUTO_COMPACT_MIN, min(max_input_tokens, _CODE_AUTO_COMPACT_MAX))
+
+
 def _strip_adapter_prefix(value: str) -> str:
     """The model id a person recognises, without this app's adapter prefix."""
 
@@ -1482,6 +1539,26 @@ class ClaudeSettingsDomain:
 
     # -- the clients' model lists -------------------------------------------
 
+    def _public_model_rows(self) -> list[dict[str, object]]:
+        """The local listing's rows, including each route's context hint.
+
+        ``_public_models`` answers names for every picker; Claude Code also needs
+        the 1M statement so ``behavesAs`` can keep a route from falling back to
+        the client's 200k default.  A proxy that is not running is no
+        observation, not an empty list.
+        """
+
+        from .. import codex_config
+
+        try:
+            key = codex_config.local_api_key(codex_config.load_yaml(self.runtime_config_path))
+            rows, available = codex_config.local_exposed_model_rows(key)
+        except Exception:
+            return []
+        if not available:
+            return []
+        return [dict(row) for row in rows if isinstance(row, Mapping)]
+
     def _public_models(self) -> list[str] | None:
         """The names this router currently publishes, or ``None`` when unknown.
 
@@ -1634,14 +1711,19 @@ class ClaudeSettingsDomain:
         # person reads is what the list is ordered by, without a sort here.
         return rows
 
-    @staticmethod
-    def _code_picker(names: Sequence[str], existing: object = None) -> dict[str, Any]:
+    def _code_picker(self, names: Sequence[str], existing: object = None) -> dict[str, Any]:
         """A picker lineup for one public-model list.
 
         A row this app already wrote keeps every field it carries except the
         model ID: the lineup is this app's list, but a label or a
         ``behavesAs`` the user added is theirs, and regenerating the file must
         not silently drop it.
+
+        The row names the public route directly -- no Claude Desktop-style
+        alias.  ``behavesAs`` is what gives the client the route's context
+        window and Effort ladder; ``description`` blank keeps the row from
+        showing the ``Custom model (...)`` subtitle the client would otherwise
+        add.
         """
 
         preserved: dict[str, dict[str, Any]] = {}
@@ -1653,17 +1735,120 @@ class ClaudeSettingsDomain:
                 model = item.get("model")
                 if isinstance(model, str) and model.strip():
                     preserved.setdefault(model.strip(), dict(item))
+        known = {str(row.get("id")): row for row in self._public_model_rows()}
         rows: list[dict[str, Any]] = []
         for name in names:
             row = dict(preserved.get(name) or {})
             row["model"] = name
+            route = known.get(name)
+            if route is not None:
+                row.setdefault("description", _CLAUDE_CODE_BLANK_DESCRIPTION)
+                if not claude_aliases.desktop_keeps_model_id(name):
+                    row.setdefault("label", name)
+                behaves_as = _code_behaves_as(name, route.get("max_input_tokens"))
+                if behaves_as is not None:
+                    current = row.get("behavesAs")
+                    # Correct the app's earlier 200k substitution when a route
+                    # turns out to state 500k or more.  A user's own target
+                    # (not one of the two this app writes) is left alone.
+                    if current is None or current == "" or (
+                        behaves_as == _CODE_BEHAVES_AS_1M
+                        and current == _CODE_BEHAVES_AS_DEFAULT
+                    ):
+                        row["behavesAs"] = behaves_as
             rows.append(row)
+        # Claude Desktop's Code/Cowork tab launches the bundled Claude Code
+        # with the Desktop alias (`claude-mythos-<digest>`), not the public
+        # name.  A 500k route has no `[1m]` suffix, so that alias would fall
+        # back to the client's 200k default even though the public row says
+        # 500k.  A bridge row gives the alias the same behavior target; the
+        # user's public row remains the no-alias choice for the CLI.
+        rows.extend(self._desktop_code_bridge_rows(known, rows, preserved))
         lineup: dict[str, Any] = {"replaceBuiltInOptions": True, "options": rows}
         if isinstance(existing, Mapping):
             for key, value in existing.items():
                 if key not in lineup:
                     lineup[key] = copy.deepcopy(value)
         return lineup
+
+    @staticmethod
+    def _desktop_code_bridge_rows(
+        known: Mapping[str, Mapping[str, object]],
+        rows: Sequence[Mapping[str, Any]],
+        preserved: Mapping[str, Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Rows that give Desktop Code's 500k aliases a 1M behavior target.
+
+        The Desktop Code tab uses the alias id; without a bridge, the CLI sees
+        an unknown alias, assumes 200k, and caps the per-model auto window at
+        200k.  Only the 500k..1M band needs the bridge: 1M routes already carry
+        Desktop's ``[1m]`` suffix, and 200k routes are right by default.
+        """
+
+        present = {str(row.get("model") or "") for row in rows}
+        bridges: list[dict[str, Any]] = []
+        for name, route in known.items():
+            max_input = route.get("max_input_tokens")
+            if (
+                not isinstance(max_input, int)
+                or isinstance(max_input, bool)
+                or not (500_000 <= max_input < 1_000_000)
+            ):
+                continue
+            alias = claude_aliases.claude_desktop_alias(name)
+            if not alias or alias in present:
+                continue
+            row = dict(preserved.get(alias) or {})
+            row["model"] = alias
+            row.setdefault("label", f"{name} (Desktop)")
+            row.setdefault("description", _CLAUDE_CODE_BLANK_DESCRIPTION)
+            if row.get("behavesAs") in (None, "", _CODE_BEHAVES_AS_DEFAULT):
+                row["behavesAs"] = _CODE_BEHAVES_AS_1M
+            bridges.append(row)
+        return bridges
+
+    def _code_model_settings(self, names: Sequence[str], existing: object = None) -> dict[str, Any]:
+        """Per-model settings Claude Code needs for the same public rows.
+
+        ``modelPicker`` carries the public id and the behavior model; the
+        context number itself lives in ``modelSettings.<model>``.
+        ``autoCompactWindow`` is the only per-model context field in Claude
+        Code, and without it a 500k route that behaves as a 1M model would show
+        1M.  Existing entries and every other field (a user's own effort or
+        window) are preserved.
+        """
+
+        settings: dict[str, Any] = {}
+        if isinstance(existing, Mapping):
+            for model, value in existing.items():
+                if isinstance(model, str) and isinstance(value, Mapping):
+                    settings[model] = dict(value)
+        known = {str(row.get("id")): row for row in self._public_model_rows()}
+        for name in names:
+            route = known.get(name)
+            if route is None:
+                continue
+            entry = dict(settings.get(name) or {})
+            entry.setdefault("autoCompactWindow", _code_auto_compact_window(route.get("max_input_tokens")))
+            settings[name] = entry
+        # The Desktop Code bridge alias needs the same per-model window as the
+        # public row; the CLI looks the window up by the model id it was
+        # launched with (the alias).
+        for name, route in known.items():
+            max_input = route.get("max_input_tokens")
+            if (
+                not isinstance(max_input, int)
+                or isinstance(max_input, bool)
+                or not (500_000 <= max_input < 1_000_000)
+            ):
+                continue
+            alias = claude_aliases.claude_desktop_alias(name)
+            if not alias:
+                continue
+            entry = dict(settings.get(alias) or {})
+            entry.setdefault("autoCompactWindow", _code_auto_compact_window(max_input))
+            settings[alias] = entry
+        return settings
 
     def _code_model_list_apply(self, enabled: bool, names: Sequence[str] | None = None) -> dict[str, Any]:
         """Set (or drop) Claude Code's picker lineup from this app's list."""
@@ -1676,6 +1861,11 @@ class ClaudeSettingsDomain:
         if not resolved:
             raise DomainError("Young Router is not running or exposes no models")
         candidate["modelPicker"] = self._code_picker(resolved, candidate.get("modelPicker"))
+        settings = self._code_model_settings(resolved, candidate.get("modelSettings"))
+        if settings:
+            candidate["modelSettings"] = settings
+        else:
+            candidate.pop("modelSettings", None)
         return candidate
 
     def _desktop_model_list_apply(self, enabled: bool, names: Sequence[str] | None = None) -> None:

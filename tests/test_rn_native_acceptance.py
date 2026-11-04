@@ -153,8 +153,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # detail pane, which is the provider detail at 535 pt of content
         # beneath 112 pt of chrome.  The width is the provider workspace's own:
         # three columns whose model list keeps the model ids readable.
-        self.assertIn("contentSize: NSSize(width: 1010, height: 660)", leaf)
-        self.assertIn("minSize: NSSize(width: 980, height: 560)", leaf)
+        self.assertIn("contentSize: NSSize(width: 990, height: 660)", leaf)
+        self.assertIn("minSize: NSSize(width: 960, height: 560)", leaf)
         self.assertNotIn("applySettingsPaneLayout", leaf)
         # The General pane joins the shared settings window on both hosts.
         self.assertIn('"general-settings", "providers-models", "runtime-settings"', leaf)
@@ -1222,7 +1222,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # The material belongs to the window; a per-table backdrop would stack
         # a second vibrancy layer over only the table's own rows.
         self.assertNotIn("NSVisualEffectMaterialSidebar", controls)
-        self.assertIn("contentSize: NSSize(width: 1010, height: 660)", leaf)
+        self.assertIn("contentSize: NSSize(width: 990, height: 660)", leaf)
 
     def test_macos_reopen_shows_the_primary_configuration_window(self) -> None:
         app_delegate = (MAC_PROJECT / "YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")

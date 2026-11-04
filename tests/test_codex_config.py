@@ -120,6 +120,39 @@ class CodexConfigTests(unittest.TestCase):
         self.assertEqual("http://127.0.0.1:4999/v1/models", request.full_url)
         self.assertEqual("Bearer sk-local-test", request.get_header("Authorization"))
 
+    def test_local_exposed_model_rows_keeps_each_routes_context_hint(self) -> None:
+        opener = mock.Mock()
+        opener.open.return_value = self._Response(
+            {
+                "data": [
+                    {"id": "one-million", "max_input_tokens": 1_048_576},
+                    {"id": "unknown-window"},
+                    {"id": "zero", "max_input_tokens": 0},
+                    {"id": "flag", "max_input_tokens": True},
+                    {"id": "image-only", "mode": "image_generation"},
+                ]
+            }
+        )
+        with mock.patch.object(
+            codex_config, "local_base_url", return_value="http://127.0.0.1:4999/v1"
+        ), mock.patch.object(
+            codex_config.urllib.request, "build_opener", return_value=opener
+        ), mock.patch.object(
+            codex_config, "_public_catalog_is_image_model", return_value=False
+        ):
+            rows, enabled = codex_config.local_exposed_model_rows("sk-local-test")
+
+        self.assertTrue(enabled)
+        self.assertEqual(
+            [
+                {"id": "flag", "max_input_tokens": None},
+                {"id": "one-million", "max_input_tokens": 1_048_576},
+                {"id": "unknown-window", "max_input_tokens": None},
+                {"id": "zero", "max_input_tokens": None},
+            ],
+            rows,
+        )
+
     def test_local_exposed_models_returns_none_when_menu_is_unavailable(self) -> None:
         opener = mock.Mock()
         opener.open.side_effect = urllib.error.URLError("offline")

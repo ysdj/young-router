@@ -594,17 +594,27 @@ def _trace_client_surface(request_kwargs: Optional[dict]) -> str:
     return "unknown"
 
 
+def _trace_surface_name(surface: Any) -> str:
+    """The wire a configured surface names, in the log's own vocabulary."""
+
+    if surface == _UPSTREAM_URL_SURFACE_ANTHROPIC:
+        return "messages"
+    if surface == _UPSTREAM_URL_SURFACE_OPENAI_CHAT:
+        return "chat"
+    if surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
+        return "responses"
+    return ""
+
+
 def _trace_effective_upstream_surface(request_kwargs: Optional[dict]) -> str:
     request_kwargs = request_kwargs or {}
     if _trace_client_surface(request_kwargs) == "image_generation":
         return "image_generation"
-    current_surface = _routing_module._request_current_upstream_surface(request_kwargs)
-    if current_surface == _UPSTREAM_URL_SURFACE_ANTHROPIC:
-        return "messages"
-    if current_surface == _UPSTREAM_URL_SURFACE_OPENAI_CHAT:
-        return "chat"
-    if current_surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
-        return "responses"
+    name = _trace_surface_name(
+        _routing_module._request_current_upstream_surface(request_kwargs)
+    )
+    if name:
+        return name
     if request_kwargs.get("use_chat_completions_api") is True:
         return "chat"
     metadata = _request_context_module._request_metadata_dict(request_kwargs, "litellm_metadata") or {}
@@ -612,15 +622,38 @@ def _trace_effective_upstream_surface(request_kwargs: Optional[dict]) -> str:
         return "chat"
     if _responses_surfaces_module._request_uses_responses_endpoint(request_kwargs):
         return "responses"
-    model_info = _request_context_module._request_model_info(request_kwargs)
-    surface = model_info.get(_UPSTREAM_URL_SURFACE_KEY)
-    if surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
-        return "responses"
-    if surface == _UPSTREAM_URL_SURFACE_ANTHROPIC:
-        return "messages"
-    if surface == _UPSTREAM_URL_SURFACE_OPENAI_CHAT:
-        return "chat"
+    name = _trace_surface_name(
+        _request_context_module._request_model_info(request_kwargs).get(
+            _UPSTREAM_URL_SURFACE_KEY
+        )
+    )
+    if name:
+        return name
     return _trace_client_surface(request_kwargs)
+
+
+def _trace_outbound_surface(request_kwargs: Optional[dict]) -> str:
+    """The wire a request actually left on, for the request log's own row.
+
+    A terminal callback receives its kwargs by value, so the surface routing
+    wrote onto the deployment call may not be in them; the request id's own
+    memory of the adapted surface (``_request_adapted_surface``) is what still
+    names it then.  Only after both attempts have answered with nothing does
+    the route's declaration decide, which is what the interface summary does
+    for a request that has not left yet.
+    """
+
+    request_kwargs = request_kwargs or {}
+    if _trace_client_surface(request_kwargs) == "image_generation":
+        return "image_generation"
+    name = _trace_surface_name(
+        _routing_module._request_current_upstream_surface(request_kwargs)
+    ) or _trace_surface_name(
+        _routing_module._request_adapted_surface(request_kwargs)
+    )
+    if name:
+        return name
+    return _trace_effective_upstream_surface(request_kwargs)
 
 
 def _trace_interface_summary(

@@ -10612,6 +10612,10 @@ type RenderedLogRecord = {
   status: string;
   model: string;
   upstreamModel: string;
+  /** The wire the client called in on (Responses / Chat / Messages). */
+  inboundProtocol: string;
+  /** The wire the request actually left on, never the route's declaration. */
+  outboundProtocol: string;
   provider: string;
   apiKeyName: string;
   event: string;
@@ -10651,6 +10655,15 @@ type LogColumn = {
   value: (row: RenderedLogRecord) => string;
 };
 
+function logClockText(parsed: Date): string {
+  // The table's time column states a local stamp without its year: every row
+  // of a bounded log tail is from the same era, and the four digits it saves
+  // are what pays for the row's two protocol columns.  The full stamp is still
+  // in the record itself, which is what a row's own detail shows.
+  const pad = (part: number): string => String(part).padStart(2, "0");
+  return `${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}:${pad(parsed.getSeconds())}`;
+}
+
 function shortLogTimestamp(value: unknown): string {
   const raw = stringValue(value);
   if (!raw) return "";
@@ -10663,8 +10676,7 @@ function shortLogTimestamp(value: unknown): string {
       parsed.getUTCDate() === 1 && parsed.getUTCHours() < 3) {
     return "";
   }
-  const pad = (part: number): string => String(part).padStart(2, "0");
-  return `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}:${pad(parsed.getSeconds())}`;
+  return logClockText(parsed);
 }
 
 function compactLogValue(value: unknown): string {
@@ -10791,8 +10803,19 @@ function routeTraceProtocolLabel(value: string, translate: Translate): string {
   if (normalized.includes("responses")) return "Responses";
   if (normalized.includes("chat")) return "Chat";
   if (normalized.includes("messages") || normalized.includes("anthropic")) return "Messages";
+  // An image generation call has its own wire, and the fallback below would
+  // name it "other image_generation".
+  if (normalized.includes("image")) return translate("logs.routeTrace.protocolImages");
   const fallback = value.trim();
   return fallback ? `${translate("logs.routeTrace.protocolOther")} ${fallback}` : translate("logs.routeTrace.protocolOther");
+}
+
+/** The wire name a request row's protocol column shows. */
+function logProtocolLabel(value: unknown, translate: Translate): string {
+  // Absent evidence is an empty cell, never a guessed wire: a row recorded
+  // before these fields existed says nothing about the protocol it used.
+  const surface = compactLogValue(value);
+  return surface ? routeTraceProtocolLabel(surface, translate) : "";
 }
 
 const ROUTE_REASON_KEYS: Record<string, Parameters<Translate>[0]> = {
@@ -11129,8 +11152,7 @@ function parseTextLogRecord(record: string, tab: LogTab, _index: number, transla
       if (!time && /^\d{1,10}(?:\.\d+)?$/.test(match[1])) {
         const epochDate = new Date(Number(match[1]) * 1000);
         if (epochDate.getUTCFullYear() >= 2020) {
-          const pad = (part: number): string => String(part).padStart(2, "0");
-          time = `${epochDate.getFullYear()}-${pad(epochDate.getMonth() + 1)}-${pad(epochDate.getDate())} ${pad(epochDate.getHours())}:${pad(epochDate.getMinutes())}:${pad(epochDate.getSeconds())}`;
+          time = logClockText(epochDate);
         }
       }
     }
@@ -11196,6 +11218,8 @@ function parseTextLogRecord(record: string, tab: LogTab, _index: number, transla
     status,
     model,
     upstreamModel: "",
+    inboundProtocol: "",
+    outboundProtocol: "",
     provider: "",
     apiKeyName: "",
     event: "",
@@ -11300,6 +11324,8 @@ function renderOnlineUsageRecord(record: unknown, value: UnknownRecord, translat
     status,
     model,
     upstreamModel: "",
+    inboundProtocol: "",
+    outboundProtocol: "",
     provider: "",
     family,
     account,
@@ -11344,6 +11370,12 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
   const apiKeyName = compactLogValue(value.api_key_name);
   const publicModel = compactLogValue(value.public_model ?? value.model_group ?? value.model);
   const upstreamModel = compactLogValue(value.upstream_model);
+  // The two protocol columns state the wire each side used.  Core records the
+  // names, the pane phrases them the way the route trace already does, and a
+  // row written before the record carried them leaves both cells empty rather
+  // than guessing a wire from the model's shape.
+  const inboundProtocol = tab === "requests" ? logProtocolLabel(value.client_surface, translate) : "";
+  const outboundProtocol = tab === "requests" ? logProtocolLabel(value.upstream_surface, translate) : "";
   const model = publicModel || upstreamModel;
   const source = tab === "service"
     ? translate("logs.service")
@@ -11376,7 +11408,7 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
       ? routeTraceDetailLabel(directDetail, translate)
       : tab === "recovery" ? recoveryDetailLabel(directDetail, translate) : directDetail,
   );
-  const used = new Set(["ts", "timestamp", "time", "created_at", "updated_at", "checked_at", "started_at", "heartbeat_at", "source", "provider", "api_key_name", "model_group", "public_model", "route_key", "routing_state", "status", "result", "detail", "message", "event", "action", "error", "aborted", "heartbeat", "upstream_model", "model", "duration_ms", "usage", "total_tokens", "request_id", "requestId", "session", "session_id", "deployment_id", "deployment_order", "target_order", "route", "failed_route", "failed_route_key", "failed_deployment_id", "candidate_routes", "candidates", "after_constraints", "selected_candidates", "cooldown_deployments"]);
+  const used = new Set(["ts", "timestamp", "time", "created_at", "updated_at", "checked_at", "started_at", "heartbeat_at", "source", "provider", "api_key_name", "model_group", "public_model", "route_key", "routing_state", "status", "result", "detail", "message", "event", "action", "error", "aborted", "heartbeat", "upstream_model", "model", "client_surface", "upstream_surface", "duration_ms", "usage", "total_tokens", "request_id", "requestId", "session", "session_id", "deployment_id", "deployment_order", "target_order", "route", "failed_route", "failed_route_key", "failed_deployment_id", "candidate_routes", "candidates", "after_constraints", "selected_candidates", "cooldown_deployments"]);
   for (const [key, item] of Object.entries(value)) {
     if (used.has(key)) continue;
     const display = compactLogValue(item);
@@ -11430,6 +11462,8 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
     status,
     model: model || recoveryFallback,
     upstreamModel: compactUpstreamLogModel(upstreamModel) || recoveryFallback,
+    inboundProtocol,
+    outboundProtocol,
     provider: provider || recoveryFallback,
     apiKeyName: apiKeyName || recoveryFallback,
     event,
@@ -11449,6 +11483,17 @@ function logTimestampNumber(value: string): number | undefined {
   const numeric = Number(value);
   if (Number.isFinite(numeric) && /^[-+]?\d+(?:\.\d+)?$/.test(value.trim())) {
     return Math.abs(numeric) < 100_000_000_000 ? numeric * 1000 : numeric;
+  }
+  // The table states a clock without its year, so a row's own string is not a
+  // parseable date any more.  The year is this window's, which is the only one
+  // a bounded log tail can mean: the ordering it restores is exact for every
+  // row of the tail except a row recorded before last New Year, which sorts
+  // with the New Year's own date until the tail turns over.
+  const clock = value.trim().match(/^(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
+  if (clock) {
+    return Date.parse(
+      `${new Date().getFullYear()}-${clock[1]}-${clock[2]}T${clock[3]}:${clock[4]}:${clock[5]}`,
+    );
   }
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : undefined;
@@ -11547,12 +11592,17 @@ function routeTraceOutcomeLabel(outcome: RouteTraceRequest["outcome"], translate
 }
 
 const LOG_DETAIL_COLUMN_FLOOR = 240;
-// Every log record renders its stamp as `YYYY-MM-DD HH:MM:SS` in the table's
-// 13 pt face. Measured against the widest possible digit run
-// ("2026-09-30 22:58:58" -> 136 pt) plus the 8 pt cell padding on each side,
-// 168 keeps the seconds visible for every row: the requests tab used to ask for
-// 148, which clipped the tail of the widest digit runs into an ellipsis.
-const LOG_TIME_COLUMN_WIDTH = 168;
+// Every log record renders its stamp as `MM-DD HH:MM:SS` in the table's 13 pt
+// face: 14 characters measure about 101 pt, plus the 8 pt cell padding on each
+// side, so 120 shows the seconds of every row.  The year is deliberately not in
+// the stamp -- a bounded tail of one log is from one era, and the four digits
+// it costs are two protocol columns' worth of a narrow window.
+const LOG_TIME_COLUMN_WIDTH = 120;
+// A protocol column holds a wire name, never prose: `Responses` (9 characters)
+// and `Messages` measure about 65 pt in the table's 13 pt face, so 82 is the
+// header plus the cell's 8 pt padding on each side.  It is not flexible: a wire
+// name that stretched across a wide window would push the model columns apart.
+const LOG_PROTOCOL_COLUMN_WIDTH = 82;
 
 /**
  * Whether this page actually needs a column to tell its rows apart.
@@ -11581,8 +11631,15 @@ function logColumns(
   const detail = { label: translate("logs.detail"), width: 260, flex: true, detailFlex: true, value: (row: RenderedLogRecord) => row.detail };
   if (tab === "requests") return [
     time,
-    { label: translate("providers.publicModel"), width: 106, value: (row) => row.model },
-    { label: translate("providers.upstream"), width: 106, value: (row) => row.upstreamModel },
+    // One inbound pair, then one outbound pair: the wire the client called in
+    // on and the model it named, then the wire the request left on and the
+    // model that answered it.  The model headers say 入站/出站 rather than
+    // 公开/上游 because this table is about the direction a turn travelled,
+    // not about how a route is configured.
+    { label: translate("logs.inboundProtocol"), width: LOG_PROTOCOL_COLUMN_WIDTH, value: (row) => row.inboundProtocol },
+    { label: translate("logs.inboundModel"), width: 106, value: (row) => row.model },
+    { label: translate("logs.outboundProtocol"), width: LOG_PROTOCOL_COLUMN_WIDTH, value: (row) => row.outboundProtocol },
+    { label: translate("logs.outboundModel"), width: 106, value: (row) => row.upstreamModel },
     { label: translate("common.provider"), width: 78, value: (row) => row.provider },
     { label: translate("logs.apiKeyName"), width: 64, value: (row) => row.apiKeyName },
     { ...status, width: 68 },
@@ -11597,8 +11654,10 @@ function logColumns(
   ];
   if (tab === "recovery") return [
     time,
-    { label: translate("providers.publicModel"), width: 142, value: (row) => row.model },
-    { label: translate("providers.upstream"), width: 142, value: (row) => row.upstreamModel },
+    // The same pair the request rows read: this window names a turn's
+    // direction once, so a route's two model names keep those words.
+    { label: translate("logs.inboundModel"), width: 142, value: (row) => row.model },
+    { label: translate("logs.outboundModel"), width: 142, value: (row) => row.upstreamModel },
     { label: translate("common.provider"), width: 104, value: (row) => row.provider },
     { label: translate("logs.apiKeyName"), width: 120, value: (row) => row.apiKeyName },
     { ...status, width: 68 },

@@ -352,6 +352,155 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 self.assertFalse(disabled["clients"]["claudeCode"]["model_list_enabled"])
                 self.assertNotIn("modelPicker", json.loads(domain.raw_text(include_sensitive=True)))
 
+    def test_claude_code_picker_keeps_public_ids_and_learns_context(self) -> None:
+        # Claude Code's modelPicker accepts the public gateway id directly, so
+        # this path needs none of Claude Desktop's aliases.  behavesAs lends
+        # the row a known model's context/effort; without it every route falls
+        # back to the client's 200k default.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(desktop_root, {})
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            public = ["claude-opus-5-5", "gemini-3.8-flash", "gpt-6.1-sol"]
+            rows = [
+                {"id": "claude-opus-5-5", "max_input_tokens": 1_000_000},
+                {"id": "gemini-3.8-flash", "max_input_tokens": 1_048_576},
+                {"id": "gpt-6.1-sol", "max_input_tokens": 500_000},
+            ]
+            with (
+                mock.patch.object(domain, "_public_models", return_value=public),
+                mock.patch.object(domain, "_public_model_rows", return_value=rows),
+            ):
+                domain.dispatch("claude.models.set", {"client": "claudeCode", "enabled": True})
+                domain.apply()
+
+            picker = json.loads(domain.raw_text(include_sensitive=True))["modelPicker"]
+            self.assertTrue(picker["replaceBuiltInOptions"])
+            # The public rows are the CLI's no-alias list; the extra bridge
+            # row is what the Desktop Code tab's alias launches with.
+            self.assertEqual(public + ["claude-mythos-dedfef"], [row["model"] for row in picker["options"]])
+            by_name = {row["model"]: row for row in picker["options"]}
+            self.assertEqual(
+                {
+                    "model": "claude-mythos-dedfef",
+                    "label": "gpt-6.1-sol (Desktop)",
+                    "description": "\u200b",
+                    "behavesAs": "claude-opus-5-5",
+                },
+                by_name["claude-mythos-dedfef"],
+            )
+            self.assertEqual(
+                {
+                    "model": "gemini-3.8-flash",
+                    "description": "\u200b",
+                    "label": "gemini-3.8-flash",
+                    "behavesAs": "claude-opus-5-5",
+                },
+                by_name["gemini-3.8-flash"],
+            )
+            # A 500k route gets the 1M behavior model; the exact 500k comes
+            # from its per-model autoCompactWindow below.
+            self.assertEqual("claude-opus-5-5", by_name["gpt-6.1-sol"]["behavesAs"])
+            # A real Claude id is already in the client's catalog and needs no
+            # substitute; the client keeps its own friendly label for it.
+            self.assertEqual({"model": "claude-opus-5-5", "description": "\u200b"}, by_name["claude-opus-5-5"])
+            settings = json.loads(domain.raw_text(include_sensitive=True))["modelSettings"]
+            self.assertEqual(1_000_000, settings["claude-opus-5-5"]["autoCompactWindow"])
+            # 1,048,576 is clamped to the setting's accepted maximum of 1M.
+            self.assertEqual(1_000_000, settings["gemini-3.8-flash"]["autoCompactWindow"])
+            self.assertEqual(500_000, settings["gpt-6.1-sol"]["autoCompactWindow"])
+            self.assertEqual(500_000, settings["claude-mythos-dedfef"]["autoCompactWindow"])
+
+    def test_claude_code_picker_keeps_a_users_own_row_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(desktop_root, {})
+            settings = {
+                "modelPicker": {
+                    "replaceBuiltInOptions": True,
+                    "options": [
+                        {
+                            "model": "gemini-3.8-flash",
+                            "label": "Gemini",
+                            "description": "My label",
+                            "behavesAs": "claude-opus-4-8",
+                        }
+                    ],
+                }
+            }
+            (root / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with (
+                mock.patch.object(domain, "_public_models", return_value=["gemini-3.8-flash"]),
+                mock.patch.object(
+                    domain,
+                    "_public_model_rows",
+                    return_value=[{"id": "gemini-3.8-flash", "max_input_tokens": 1_048_576}],
+                ),
+            ):
+                domain.dispatch("claude.models.set", {"client": "claudeCode", "enabled": True})
+                domain.apply()
+
+            row = json.loads(domain.raw_text(include_sensitive=True))["modelPicker"]["options"][0]
+            self.assertEqual("Gemini", row["label"])
+            self.assertEqual("My label", row["description"])
+            self.assertEqual("claude-opus-4-8", row["behavesAs"])
+
+    def test_claude_code_per_model_windows_preserve_a_users_own_value(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(desktop_root, {})
+            settings = {
+                "modelSettings": {
+                    "gemini-3.8-flash": {"autoCompactWindow": 500_000, "effortLevel": "high"},
+                    "someone-elses-model": {"autoCompactWindow": "auto"},
+                }
+            }
+            (root / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with (
+                mock.patch.object(
+                    domain, "_public_models", return_value=["gemini-3.8-flash", "gpt-6.1-sol"]
+                ),
+                mock.patch.object(
+                    domain,
+                    "_public_model_rows",
+                    return_value=[
+                        {"id": "gemini-3.8-flash", "max_input_tokens": 1_048_576},
+                        {"id": "gpt-6.1-sol", "max_input_tokens": 500_000},
+                    ],
+                ),
+            ):
+                domain.dispatch("claude.models.set", {"client": "claudeCode", "enabled": True})
+                domain.apply()
+
+            settings = json.loads(domain.raw_text(include_sensitive=True))["modelSettings"]
+            # A user's lower window and effort choice survive a regeneration;
+            # the new route gets the derived 500k.
+            self.assertEqual(500_000, settings["gemini-3.8-flash"]["autoCompactWindow"])
+            self.assertEqual("high", settings["gemini-3.8-flash"]["effortLevel"])
+            self.assertEqual(500_000, settings["gpt-6.1-sol"]["autoCompactWindow"])
+            self.assertEqual(500_000, settings["claude-mythos-dedfef"]["autoCompactWindow"])
+            self.assertEqual("auto", settings["someone-elses-model"]["autoCompactWindow"])
+
     def test_desktop_model_list_replaces_its_own_list_and_clears_to_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

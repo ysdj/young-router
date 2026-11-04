@@ -1287,8 +1287,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('inspectorContent: { paddingLeft: 0, paddingRight: 6')
         self.assertNotIn("inspectorContent: { paddingTop", self.ui)
         self.assert_ui_has("providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }")
-        self.assert_ui_has("providerListPane: { width: 140, minWidth: 140, maxWidth: 140")
-        self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 132 }]}')
+        self.assert_ui_has("providerListPane: { width: 120, minWidth: 120, maxWidth: 120")
+        self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 112 }]}')
         # The model list is the upstream model, the public model, and the rate
         # the route follows.  The settings window's default width leaves that
         # pane about 296 pt, and each column's floor is what its own content
@@ -2456,7 +2456,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('dispatch("logs.refresh", { tab: selected }, "logs")', self.ui)
         self.assert_ui_has('translate("logs.apiKeyName")')
         self.assert_ui_has('value.api_key_name')
-        self.assert_ui_has('`${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())}')
+        # The stamp states a local clock without its year: the four digits it
+        # saves are what pays for the row's two protocol columns, and the
+        # newest-first sort reads the stamp back through the window's own year
+        # so the order does not depend on a year that is no longer drawn.
+        self.assert_ui_has('function logClockText(parsed: Date): string {')
+        self.assert_ui_has('return `${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}:${pad(parsed.getSeconds())}`;')
+        self.assert_ui_has('time = logClockText(epochDate);')
+        self.assert_ui_has('const clock = value.trim().match(/^(\\d{2})-(\\d{2}) (\\d{2}):(\\d{2}):(\\d{2})$/);')
 
     def test_a_local_refusal_is_not_rendered_as_an_upstream_answer(self) -> None:
         """The Log tab has to say who refused the turn.
@@ -5387,6 +5394,60 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertIn(marker, self.ui)
 
+    def test_request_log_states_a_protocol_on_each_side_of_its_models(self) -> None:
+        """Each model column is preceded by the wire that carried it.
+
+        A request row reads as one inbound pair and one outbound pair: the wire
+        the client called in on and the model it named, then the wire the
+        attempt was adapted onto and the model that answered it.  The two
+        protocol columns answer different questions -- an inbound Responses turn
+        served by a chat-only relay reads ``Responses | deepseek | Chat |
+        deepseek`` -- so neither one may be drawn beside the other's model.
+        """
+
+        self.assert_ui_has('if (tab === "requests") return [')
+        requests = self.ui.split('if (tab === "requests") return [', 1)[1].split(
+            'if (tab === "actions")', 1
+        )[0]
+        inbound = requests.index('translate("logs.inboundProtocol")')
+        inbound_model = requests.index('translate("logs.inboundModel")')
+        outbound = requests.index('translate("logs.outboundProtocol")')
+        outbound_model = requests.index('translate("logs.outboundModel")')
+        self.assertLess(inbound, inbound_model)
+        self.assertLess(inbound_model, outbound)
+        self.assertLess(outbound, outbound_model)
+        # In the Log window a turn's direction is named once, in these words:
+        # the request rows and the recovery rows both read 入站模型 / 出站模型,
+        # because this window reports where a turn travelled.  The providers
+        # pane keeps 公开模型 / 上游模型 -- that vocabulary is about how a
+        # route is configured.
+        self.assert_ui_has('{ label: translate("logs.inboundModel"), width: 142, value: (row) => row.model },')
+        self.assert_ui_has('{ label: translate("logs.outboundModel"), width: 142, value: (row) => row.upstreamModel },')
+        # A protocol is a wire name, never prose; the images wire has a name of
+        # its own instead of the generic fallback.
+        self.assert_ui_has('if (normalized.includes("image")) return translate("logs.routeTrace.protocolImages");')
+        self.assertIn('"logs.inboundProtocol": "INBOUND"', self.en)
+        self.assertIn('"logs.outboundProtocol": "OUTBOUND"', self.en)
+        self.assertIn('"logs.inboundModel": "Inbound model"', self.en)
+        self.assertIn('"logs.outboundModel": "Outbound model"', self.en)
+        self.assertIn('"logs.inboundProtocol": "入站协议"', self.zh)
+        self.assertIn('"logs.outboundProtocol": "出站协议"', self.zh)
+        self.assertIn('"logs.inboundModel": "入站模型"', self.zh)
+        self.assertIn('"logs.outboundModel": "出站模型"', self.zh)
+        translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
+        for key in (
+            "logs.inboundProtocol",
+            "logs.outboundProtocol",
+            "logs.inboundModel",
+            "logs.outboundModel",
+            "logs.routeTrace.protocolImages",
+        ):
+            self.assertIn(f'| "{key}"', translation_keys)
+        # Core records the two names; the pane only phrases them, and a row that
+        # carries neither leaves both cells empty.
+        self.assert_ui_has('tab === "requests" ? logProtocolLabel(value.client_surface, translate) : "";')
+        self.assert_ui_has('tab === "requests" ? logProtocolLabel(value.upstream_surface, translate) : "";')
+
     def test_logs_keep_the_legacy_dense_toolbar_and_table_frame(self) -> None:
         for marker in (
             "function LogsWorkspace(",
@@ -5399,8 +5460,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'routingState === "unselected"',
             'translate("logs.notRouted")',
             "function logColumns(",
-            "const LOG_TIME_COLUMN_WIDTH = 168",
+            "const LOG_TIME_COLUMN_WIDTH = 120",
             "const time = { label: translate(\"logs.localTime\"), width: LOG_TIME_COLUMN_WIDTH,",
+            "const LOG_PROTOCOL_COLUMN_WIDTH = 82",
+            '{ label: translate("logs.inboundProtocol"), width: LOG_PROTOCOL_COLUMN_WIDTH, value: (row) => row.inboundProtocol }',
+            '{ label: translate("logs.outboundProtocol"), width: LOG_PROTOCOL_COLUMN_WIDTH, value: (row) => row.outboundProtocol }',
             '<NativeTable columns={nativeTableColumns} rows={nativeTableRows}',
             "translate(\"logs.failed\")",
             "function requestStatusLabel(",
@@ -5512,12 +5576,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assert_ui_has(marker)
 
-    def test_logs_always_show_public_and_upstream_model_columns(self) -> None:
+    def test_logs_always_show_inbound_and_outbound_model_columns(self) -> None:
+        # The two model columns are never dropped when a page happens to hold
+        # one model: they are the row's identity.  In this window they are
+        # named for the direction a turn travelled -- 入站模型 / 出站模型 -- so
+        # a reader never has to translate the providers pane's configuration
+        # vocabulary (公开模型 / 上游模型) into a request's two ends.
         for marker in (
             "const publicModel = compactLogValue(value.public_model ?? value.model_group ?? value.model);",
             "upstreamModel: compactUpstreamLogModel(upstreamModel)",
-            '{ label: translate("providers.publicModel"), width: 142, value: (row) => row.model }',
-            '{ label: translate("providers.upstream"), width: 142, value: (row) => row.upstreamModel }',
+            '{ label: translate("logs.inboundModel"), width: 142, value: (row) => row.model }',
+            '{ label: translate("logs.outboundModel"), width: 142, value: (row) => row.upstreamModel }',
         ):
             self.assert_ui_has(marker)
         self.assertNotIn("function conditionalUpstreamLogModel(", self.ui)
@@ -7129,11 +7198,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"providers.keyName": "密钥名"', self.zh)
         self.assertIn('"providers.keyValue": "密钥值"', self.zh)
         # The list is a column of provider names, and its widest row is
-        # ``youyangai``: a 140 pt pane holds that beside the row's padding and
+        # ``youyangai``: a 120 pt pane holds that beside the row's padding and
         # leaves the models their width.  The pane is fixed, so a long name
-        # ellipsizes instead of pushing the two panes beside it.
-        self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 132 }]}')
-        self.assert_ui_has('providerListPane: { width: 140, minWidth: 140, maxWidth: 140')
+        # ellipsizes instead of pushing the two panes beside it.  Its own title
+        # row is the floor: ``Providers`` measures 60 pt, and the ＋/− buttons
+        # beside it are 50 more.
+        self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 112 }]}')
+        self.assert_ui_has('providerListPane: { width: 120, minWidth: 120, maxWidth: 120')
         # The providers side's model list is the upstream model, its public
         # model, and the rate the route follows: it carries no 顺序 column,
         # because that number orders one public model's routes while these rows
