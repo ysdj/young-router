@@ -64,25 +64,6 @@ IMAGE_CONTEXT_MIN_BYTES_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MIN_BYTES"
 # this app already configures; ``http`` is a gateway, where the client lives
 # somewhere else and only a URL can reach the tool; ``off`` promises no tool at
 # all; ``auto`` picks per host.
-# A thumbnail instead of nothing: a reader whose client has no fetch tool cannot
-# open a placeholder, and this proxy cannot edit that client's MCP configuration.
-# Bounded downscaled copies keep the picture *visible* to the model at a fraction
-# of the bytes, so "the model can still see what it worked on" does not depend on
-# a tool being installed.
-IMAGE_CONTEXT_PREVIEW_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_PREVIEW"
-IMAGE_CONTEXT_PREVIEW_VALUES = ("id", "auto", "on", "off")
-# ``id`` delivery is the default: the model asks for a picture by the id its
-# placeholder carries and the next request brings the original.  ``auto`` sends
-# thumbnails on a gateway instead, which costs bytes on every turn; ``off`` is a
-# bare placeholder.
-IMAGE_CONTEXT_PREVIEW_DEFAULT = "id"
-IMAGE_CONTEXT_PREVIEW_EDGE_ENV = (
-    "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_PREVIEW_MAX_EDGE"
-)
-IMAGE_CONTEXT_PREVIEW_EDGE_DEFAULT = 512
-IMAGE_CONTEXT_PREVIEW_TOKENS_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_PREVIEW_TOKENS"
-IMAGE_CONTEXT_PREVIEW_TOKENS_DEFAULT = 12_000
-IMAGE_CONTEXT_PREVIEW_QUALITY = 55
 IMAGE_CONTEXT_FETCH_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_FETCH"
 IMAGE_CONTEXT_FETCH_DEFAULT = "auto"
 IMAGE_CONTEXT_FETCH_VALUES = ("auto", "path", "stdio", "http", "off")
@@ -139,7 +120,6 @@ _WORDS: Dict[str, Dict[str, Any]] = {
             )
         ),
         "omitted": "已省略",
-        "previewed": "已省略，此处为缩略图",
         "included": "已提供",
         "not_repeated": "未重复提供",
         "plain": lambda image_id: f"需要重看时，在回复里写“需要 {image_id}”。",
@@ -171,10 +151,6 @@ _WORDS: Dict[str, Dict[str, Any]] = {
             "之前说过的内容够用时，不要调用。现在看不到的画面细节，不要猜测或补充；"
             "不要让用户重新上传图片，也不要用其他工具去读取图片文件。\n"
             "取回的图片只在本轮提供，下一轮又会换回占位文字；之后还需要时，再调用一次。"
-        ),
-        "preview_note": (
-            "其中较新的几张这次另外附了缩略图（标题行写着“此处为缩略图”），"
-            "看得出大概就够用；需要看清细节时，再按编号取回原图。"
         ),
         "auto_ask_note": (
             "上下文管理说明（来自用户安装的上下文素材管理工具）：这个任务开着“自动选图”。"
@@ -243,7 +219,6 @@ _WORDS: Dict[str, Dict[str, Any]] = {
             )
         ),
         "omitted": "omitted",
-        "previewed": "omitted, thumbnail attached",
         "included": "provided",
         "not_repeated": "not repeated",
         "plain": lambda image_id: f'To look again, reply "need {image_id}".',
@@ -282,11 +257,6 @@ _WORDS: Dict[str, Dict[str, Any]] = {
             "again, and do not read image files with another tool.\n"
             "A fetched image is provided for this turn only and becomes a "
             "placeholder again afterwards; call again when you need it again."
-        ),
-        "preview_note": (
-            "The newest of them travel as thumbnails as well (their heading says "
-            "\"thumbnail attached\"); read them at that size, and fetch the "
-            "original by id when the detail matters."
         ),
         "auto_ask_note": (
             "Context management note (from the context attachment tool the user "
@@ -409,45 +379,6 @@ def inside_turn(environ: Optional[Mapping[str, str]] = None) -> str:
         value
         if value in IMAGE_CONTEXT_INSIDE_TURN_VALUES
         else IMAGE_CONTEXT_INSIDE_TURN_DEFAULT
-    )
-
-
-def preview_mode(environ: Optional[Mapping[str, str]] = None) -> str:
-    """Whether an omitted image travels as a thumbnail, or only as its id.
-
-    ``id`` (default) sends the placeholder and nothing else: the model asks for a
-    picture by its id and the next request carries the original, which is the
-    delivery that needs no client configuration and no bytes on the turns the
-    picture is not needed.  ``auto``/``on`` additionally attach a bounded
-    thumbnail -- useful where a whole page must be recognisable at a glance and
-    the extra bytes are worth it.
-
-    ``auto`` sends thumbnails exactly when the reader may have no fetch tool --
-    a gateway, whose client configuration this proxy cannot edit.  A desktop
-    install hands out a path the client can open, and keeps it.
-    """
-
-    env = os.environ if environ is None else environ
-    value = str(env.get(IMAGE_CONTEXT_PREVIEW_ENV) or "").strip().lower()
-    return (
-        value if value in IMAGE_CONTEXT_PREVIEW_VALUES else IMAGE_CONTEXT_PREVIEW_DEFAULT
-    )
-
-
-def preview_edge(environ: Optional[Mapping[str, str]] = None) -> int:
-    env = os.environ if environ is None else environ
-    return _as_int(
-        env.get(IMAGE_CONTEXT_PREVIEW_EDGE_ENV),
-        IMAGE_CONTEXT_PREVIEW_EDGE_DEFAULT,
-        64,
-    )
-
-
-def preview_tokens(environ: Optional[Mapping[str, str]] = None) -> int:
-    env = os.environ if environ is None else environ
-    return _as_int(
-        env.get(IMAGE_CONTEXT_PREVIEW_TOKENS_ENV),
-        IMAGE_CONTEXT_PREVIEW_TOKENS_DEFAULT,
     )
 
 
@@ -1191,132 +1122,6 @@ def _heading_text(
     return str(words["heading"](image_id, label, state, fields))
 
 
-def _preview_cache_path(
-    thread_id: Optional[str],
-    image: Any,
-    edge: int,
-) -> Optional[str]:
-    """Where one thumbnail is cached, beside the replay it belongs to."""
-
-    image_id = getattr(image, "image_id", None)
-    if not thread_id or not image_id:
-        return None
-    from . import image_context_store as _store_module
-
-    try:
-        root = _store_module.previews_dir()
-    except Exception:
-        return None
-    safe_thread = _safe_thread_file_name(thread_id) or thread_id
-    return os.path.join(root, safe_thread, f"{image_id}-{edge}.jpg")
-
-
-def _preview_data_url(
-    image: Any,
-    thread_id: Optional[str],
-    edge: int,
-) -> Optional[str]:
-    """One bounded JPEG of *image*, cached on disk, or ``None`` if it cannot be made.
-
-    The bytes are written once per task and size, so later requests read the same
-    file: the thumbnail a replay carries must not change between turns, or the
-    upstream re-reads every byte after it.
-    """
-
-    path = _preview_cache_path(thread_id, image, edge)
-    if path and os.path.isfile(path):
-        try:
-            with open(path, "rb") as handle:
-                return "data:image/jpeg;base64," + base64.b64encode(
-                    handle.read()
-                ).decode()
-        except OSError:
-            path = None
-    raw = getattr(image, "raw", None)
-    if not isinstance(raw, (bytes, bytearray)) or not raw:
-        return None
-    try:
-        import io
-
-        from PIL import Image
-
-        with Image.open(io.BytesIO(bytes(raw))) as opened:
-            picture = opened.convert("RGB") if opened.mode not in ("RGB", "L") else opened.copy()
-        picture.thumbnail((edge, edge))
-        buffer = io.BytesIO()
-        picture.save(buffer, format="JPEG", quality=IMAGE_CONTEXT_PREVIEW_QUALITY, optimize=True)
-        data = buffer.getvalue()
-    except Exception:
-        # No Pillow, a format this build cannot decode, a truncated upload: the
-        # picture keeps its placeholder.  A turn must not fail for a thumbnail.
-        return None
-    if path:
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            temporary = f"{path}.{os.getpid()}.tmp"
-            with open(temporary, "wb") as handle:
-                handle.write(data)
-            os.replace(temporary, path)
-        except OSError:
-            pass
-    return "data:image/jpeg;base64," + base64.b64encode(data).decode()
-
-
-def _preview_tokens_of(image: Any, edge: int) -> int:
-    """What one thumbnail is expected to cost, from its own scaled size."""
-
-    width = getattr(image, "width", None)
-    height = getattr(image, "height", None)
-    if not isinstance(width, int) or not isinstance(height, int) or width <= 0 or height <= 0:
-        return edge * edge // _PICTURE_PIXELS_PER_TOKEN + _PICTURE_TILE_OVERHEAD_TOKENS
-    scale = min(edge / width, edge / height, 1.0)
-    scaled_width = max(1, int(width * scale))
-    scaled_height = max(1, int(height * scale))
-    return (
-        scaled_width * scaled_height // _PICTURE_PIXELS_PER_TOKEN
-        + _PICTURE_TILE_OVERHEAD_TOKENS
-    )
-
-
-def _previews_for(
-    kind: str,
-    environ: Optional[Mapping[str, str]] = None,
-) -> bool:
-    """Whether this pass sends thumbnails rather than bare placeholders."""
-
-    mode = preview_mode(environ)
-    if mode in {"off", "id"}:
-        # ``id``: the model can ask for any original by name, so a thumbnail is
-        # bytes on every turn for a picture it may never need again.
-        return False
-    if mode == "on":
-        return True
-    # ``auto``: wherever the reader cannot open a local path -- a gateway, whose
-    # client is somewhere else.  A desktop install names a path its own client
-    # opens, so a thumbnail there would be a second copy of the same picture.
-    return kind != "file"
-
-
-def _preview_caption(image: Any, lang: str) -> str:
-    """The line that travels with a thumbnail, so the model knows what it sees.
-
-    Same heading and same final line as a bare placeholder -- only the state word
-    says a thumbnail is attached -- so an id keeps naming one picture whether the
-    reader is looking at the preview or asking for the original.
-    """
-
-    words = _WORDS[lang]
-    kind = _PLACEHOLDER_KIND[lang]
-    if kind == "file":
-        path = _FILE_PATHS.get(image.image_id)
-        body = words["file_plain"](path) if path else words["plain"](image.image_id)
-    elif kind == "tool":
-        body = words["auto_plain"](image.image_id)
-    else:
-        body = words["plain"](image.image_id)
-    return f"{_heading(image, str(words['previewed']), lang)}\n{body}"
-
-
 def _placeholder(image: _Found, lang: str, *, state: Optional[str] = None) -> str:
     words = _WORDS[lang]
     if state is None:
@@ -1374,7 +1179,7 @@ def _requested_ids(input_items: Any) -> List[str]:
     This is the fetch that needs no tool: the placeholder tells the model to write
     "需要 IMG-004", and the next request carries that original.  Reading it back
     here is what makes a bare id enough -- no MCP server, no client change, and no
-    thumbnail standing in for a picture the model could have asked for by name.
+    extra bytes standing in for a picture the model could have asked for by name.
     """
 
     if not isinstance(input_items, list):
@@ -1873,8 +1678,8 @@ def _rewrite(
                 sent_content[image.content_id or ""] = image
             continue
         if image.key in asked:
-            # An id the model asked for is not a candidate for retirement, and it
-            # needs no thumbnail: the original is the answer to its question.
+            # An id the model asked for is not a candidate for retirement: the
+            # original is the answer to its question.
             sent_content[image.content_id or ""] = image
             continue
         drop = image_id in unchecked or (automatic and aged and big)
@@ -1960,31 +1765,9 @@ def _rewrite(
         # path to offer, so there it keeps saying "ask the user".
         kind = "file"
     _PLACEHOLDER_KIND[lang] = kind
-    # Which omitted pictures travel as thumbnails, allocated oldest first inside
-    # one token budget.  Oldest first for two reasons: the newest pictures are the
-    # ones the visible window already keeps at full size, and a decision that
-    # depends only on what precedes a picture means a picture that travelled once
-    # keeps travelling -- a set that moved as the replay grew would rewrite items
-    # already on the wire, and the upstream re-reads everything after them.
-    previews: Dict[str, str] = {}
-    # Text parts inserted *before* a part of their item: the caption that keeps a
-    # thumbnail's id readable, and (below) the label of an included image.
+    # Text parts inserted *before* a part of their item: the label of an image
+    # that is still sent.
     labels: Dict[int, Dict[int, str]] = {}
-    if _previews_for(kind):
-        budget = preview_tokens()
-        edge = preview_edge()
-        spent = 0
-        for candidate in sorted(omitted, key=lambda entry: entry.item):
-            if candidate.copy_of is not None or candidate.part is None:
-                continue
-            cost = _preview_tokens_of(candidate, edge)
-            if budget <= 0 or spent + cost > budget:
-                break
-            data_url = _preview_data_url(candidate, thread_id, edge)
-            if data_url is None:
-                continue
-            previews[candidate.key] = data_url
-            spent += cost
     for image in omitted:
         if image.copy_of is not None:
             replacements.setdefault(image.item, {})[image.part or 0] = str(
@@ -2004,18 +1787,6 @@ def _rewrite(
         first = image.open_tag if image.open_tag is not None else image.part
         last = image.close_tag if image.close_tag is not None else image.part
         bucket = replacements.setdefault(image.item, {})
-        preview = previews.get(image.key)
-        if preview is not None:
-            # A thumbnail *and* its placeholder: the picture stays visible at a
-            # fraction of the bytes, and the id still names the original for a
-            # reader that can fetch it.
-            caption = _preview_caption(image, lang)
-            labels.setdefault(image.item, {}).setdefault(image.part, caption)
-            bucket[image.part] = {"type": "input_image", "image_url": preview}
-            for position in range(first, last + 1):
-                if position != image.part:
-                    bucket[position] = ""
-            continue
         bucket[first] = text
         for position in range(first + 1, last + 1):
             bucket[position] = ""
@@ -2054,13 +1825,10 @@ def _rewrite(
             if position not in (bucket or {}):
                 next_parts.append(part)
                 continue
-            replacement = (bucket or {})[position]
-            if not replacement:
+            text = (bucket or {})[position]
+            if not text:
                 continue
-            if isinstance(replacement, dict):
-                next_parts.append(replacement)
-                continue
-            next_parts.append({"type": "input_text", "text": str(replacement)})
+            next_parts.append({"type": "input_text", "text": text})
         updated = item.copy()
         updated[field] = next_parts
         rewritten.append(updated)
@@ -2087,8 +1855,6 @@ def _rewrite(
         note = words["auto_ask_note"]
     else:
         note = words["manual_note"]
-    if previews:
-        note = f"{note}\n{words['preview_note']}"
     rewritten.insert(
         note_at,
         {
@@ -2100,14 +1866,7 @@ def _rewrite(
 
     result = dict(request_kwargs)
     result["input"] = rewritten
-    _trace(
-        request_kwargs,
-        omitted,
-        automatic,
-        len(images),
-        previews=len(previews),
-        preview_bytes=sum(len(url) * 3 // 4 for url in previews.values()),
-    )
+    _trace(request_kwargs, omitted, automatic, len(images))
     return result
 
 
@@ -2150,8 +1909,6 @@ def _trace(
     omitted: List[_Found],
     automatic: bool,
     total: int,
-    previews: int = 0,
-    preview_bytes: int = 0,
 ) -> None:
     from . import routing as _routing_module
     from . import trace as _trace_module
@@ -2165,8 +1922,6 @@ def _trace(
             images=total,
             omitted=len(omitted),
             omitted_bytes=sum(len(image.raw) for image in omitted),
-            previews=previews,
-            preview_bytes=preview_bytes,
             ids=[image.image_id for image in omitted][:16],
         )
     except Exception:

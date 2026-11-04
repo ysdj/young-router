@@ -634,37 +634,6 @@ class ImageContextFileFetchTests(_ImageContextCase):
         self.assertFalse(os.path.isdir(folder))
         self.assertEqual({}, store_module.paths(self.thread))
 
-    def test_forgetting_a_task_removes_its_thumbnails_too(self) -> None:
-        """A thumbnail is cached per task, so it goes with the task.
-
-        One live task carried 183 of them and the cache keeps 32 tasks: leaving
-        them behind is a directory that only ever grows.
-        """
-
-        items = [
-            _user_turn("first", _upload_parts(_png(1200, 900, noisy=True))),
-            _user_turn("second"),
-        ]
-        gateway_home = os.path.join(self.directory.name, "gateway-home")
-        os.makedirs(gateway_home, exist_ok=True)
-        with mock.patch.dict(
-            os.environ,
-            {
-                "HOME": gateway_home,
-                image_context_module.IMAGE_CONTEXT_FETCH_ENV: "auto",
-                image_context_module.IMAGE_CONTEXT_PREVIEW_ENV: "auto",
-            },
-        ):
-            self.rewritten(items, metadata={"thread_id": self.thread})
-
-        folder = os.path.join(store_module.previews_dir(), self.thread)
-        self.assertTrue(os.path.isdir(folder), folder)
-        self.assertTrue(os.listdir(folder))
-
-        self.assertTrue(store_module.forget(self.thread))
-
-        self.assertFalse(os.path.isdir(folder))
-
 
 class ImageContextStoreRetentionTests(_ImageContextCase):
     """The store's own day: pictures do not outlive the replay they answer from."""
@@ -1401,136 +1370,11 @@ if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 
 
-class ImageContextPreviewTests(_ImageContextCase):
-    """What a reader sees when its client has no fetch tool at all.
-
-    A gateway cannot edit the client's MCP configuration, so a placeholder there
-    named a tool the model could not call: three hours of one live task omitted
-    73 images per request and fetched none.  A bounded thumbnail keeps the picture
-    visible at a fraction of the bytes, which is the only path that needs no
-    client change.
-    """
-
-    def setUp(self) -> None:
-        super().setUp()
-        self.environment.stop()
-        # A gateway: no client documents on this host, so the fetch kind is the
-        # endpoint nobody has configured a client to call.
-        self.gateway_home = os.path.join(self.directory.name, "gateway-home")
-        os.makedirs(self.gateway_home, exist_ok=True)
-        self.environment.start()
-        # After the base env is applied: its own update would otherwise win.
-        os.environ["HOME"] = self.gateway_home
-        os.environ[image_context_module.IMAGE_CONTEXT_FETCH_ENV] = "auto"
-        os.environ[image_context_module.IMAGE_CONTEXT_PREVIEW_ENV] = "auto"  # opt in: the default is id
-
-    def aged_replay(self) -> list:
-        return [
-            _user_turn("第一轮", _upload_parts(_png(1200, 900, noisy=True))),
-            _assistant("看过了"),
-            _tool_image(_png(1000, 800, noisy=True, seed=7)),
-            _user_turn("第二轮"),
-        ]
-
-    def images_in(self, result: dict) -> list:
-        found = []
-        for item in result["input"]:
-            for part in item.get("content") or item.get("output") or []:
-                if isinstance(part, dict) and part.get("type") == "input_image":
-                    found.append(part)
-        return found
-
-    def test_a_gateway_sends_a_thumbnail_instead_of_nothing(self) -> None:
-        result = self.rewritten(self.aged_replay())
-
-        images = self.images_in(result)
-        self.assertTrue(images, "no thumbnail was attached")
-        url = images[0]["image_url"]
-        self.assertTrue(url.startswith("data:image/jpeg;base64,"), url[:32])
-        # A thumbnail, not the original: well under the uploaded bytes.
-        self.assertLess(len(url), len(base64.b64encode(_png(1200, 900, noisy=True))))
-
-    def test_the_caption_still_names_the_id_and_says_it_is_a_thumbnail(self) -> None:
-        result = self.rewritten(self.aged_replay())
-
-        texts = [
-            part.get("text") or ""
-            for item in result["input"]
-            for part in (item.get("content") or [])
-            if isinstance(part, dict) and part.get("type") == "input_text"
-        ]
-        joined = "\n".join(texts)
-        self.assertIn("IMG-001", joined)
-        self.assertIn("此处为缩略图", joined)
-        # The caption names the ask, not a tool: this reader has none.
-        self.assertIn("需要 IMG-001", joined)
-        self.assertNotIn("view_image_by_id", joined)
-
-    def test_the_note_says_the_thumbnails_are_there(self) -> None:
-        result = self.rewritten(self.aged_replay())
-
-        notes = [
-            item["content"][0]["text"]
-            for item in result["input"]
-            if item.get("role") == "developer"
-        ]
-        self.assertTrue(any("缩略图" in note for note in notes), notes)
-
-    def test_a_desktop_client_keeps_the_path_and_no_thumbnail(self) -> None:
-        # The client here can open a path itself, so a second copy of the same
-        # picture would only cost bytes.
-        home = Path(self.directory.name) / "desktop-home"
-        (home / ".codex").mkdir(parents=True)
-        (home / ".codex" / "config.toml").write_text("", encoding="utf-8")
-        os.environ["HOME"] = str(home)
-        os.environ[image_context_module.IMAGE_CONTEXT_FETCH_ENV] = "auto"
-        result = self.rewritten(self.aged_replay())
-
-        self.assertEqual([], self.images_in(result))
-
-    def test_off_keeps_the_bare_placeholder(self) -> None:
-        os.environ[image_context_module.IMAGE_CONTEXT_PREVIEW_ENV] = "off"
-
-        result = self.rewritten(self.aged_replay())
-
-        self.assertEqual([], self.images_in(result))
-
-    def test_the_budget_bounds_how_many_travel(self) -> None:
-        os.environ[image_context_module.IMAGE_CONTEXT_PREVIEW_TOKENS_ENV] = "500"
-
-        result = self.rewritten(self.aged_replay())
-
-        # One 512px thumbnail is ~400 tokens, so a 500-token budget allows one.
-        self.assertLessEqual(len(self.images_in(result)), 1)
-
-    def test_a_picture_that_travelled_once_keeps_travelling(self) -> None:
-        """The set must not move as the replay grows.
-
-        A thumbnail that appears or disappears between turns rewrites an item the
-        upstream has already read, and every step re-reads the bytes after it.
-        """
-
-        first = self.rewritten(self.aged_replay())
-        first_urls = [image["image_url"] for image in self.images_in(first)]
-        self.assertTrue(first_urls)
-
-        grown = self.aged_replay() + [
-            _assistant("又一个结果"),
-            _tool_image(_png(1000, 800, noisy=True, seed=11)),
-            _user_turn("第三轮"),
-        ]
-        second = self.rewritten(grown)
-        second_urls = [image["image_url"] for image in self.images_in(second)]
-
-        # Everything that travelled before still travels, with the same bytes.
-        self.assertEqual(first_urls[: len(second_urls)], second_urls[: len(first_urls)])
-
-
 class ImageContextIdFetchTests(_ImageContextCase):
     """The fetch that needs no tool: the model writes the id, the next turn has it.
 
-    A gateway cannot edit the client's MCP configuration, and a thumbnail costs
-    bytes on every turn. A placeholder's id is enough if this proxy reads the
+    A gateway cannot edit the client's MCP configuration, and the mirrored wording
+    for that host names no tool. A placeholder's id is enough if this proxy reads the
     model's own "需要 IMG-004" back out of its newest message and puts that
     original in the next request -- one turn later, at full size, and only when
     it was actually asked for.
@@ -1544,7 +1388,6 @@ class ImageContextIdFetchTests(_ImageContextCase):
         self.environment.start()
         os.environ["HOME"] = self.gateway_home
         os.environ[image_context_module.IMAGE_CONTEXT_FETCH_ENV] = "auto"
-        os.environ[image_context_module.IMAGE_CONTEXT_PREVIEW_ENV] = "id"
 
     def payloads(self, result: dict) -> dict:
         """``id -> (mime, bytes)`` for every image the request carries."""
@@ -1584,7 +1427,8 @@ class ImageContextIdFetchTests(_ImageContextCase):
         asked = self.rewritten(self.replay("我还想再看一遍。\n需要 IMG-002"))
         sizes = self.image_bytes(asked)
         self.assertEqual(1, len(sizes), sizes)
-        # Full size, not a thumbnail: the original is the answer to the question.
+        # Full size: the original is the answer to the question, and the upstream
+        # pass never puts a scaled copy in a model request.
         self.assertGreater(sizes[0], 200_000)
 
     def test_the_picture_carries_its_id_so_the_model_knows_which_it_got(self) -> None:
@@ -1674,3 +1518,32 @@ class ImageContextIdFetchTests(_ImageContextCase):
         )
         self.assertNotIn("view_image_by_id", notes[0])
         self.assertIn("“需要 IMG-xxx”", notes[0])
+
+    def test_no_picture_is_ever_sent_as_a_scaled_copy(self) -> None:
+        """Context Attachment Manager sends placeholders, never thumbnails.
+
+        Its thumbnails exist for its own panel (`core/thumbnail.ts`: "scaled-down
+        PNGs for the panel"), and its rewriter states the model-side contract --
+        "a placeholder takes the place of the image ... Nothing else changes".
+        This pass mirrors that: an omitted picture is text, and a picture that
+        travels travels at the size it was sent.
+        """
+
+        items = [_user_turn("第一轮", _upload_parts(_png(1200, 900, noisy=True)))]
+        for seed in range(3, 8):
+            items.extend([_assistant("ok"), _tool_image(_png(1000, 800, noisy=True, seed=seed))])
+        items.pop()
+        items.append(_assistant("需要 IMG-002"))
+        items.append(_user_turn("继续"))
+
+        result = self.rewritten(items)
+
+        carried = []
+        for item in result["input"]:
+            for part in item.get("content") or item.get("output") or []:
+                if isinstance(part, dict) and part.get("type") == "input_image":
+                    carried.append(len(part.get("image_url") or ""))
+        # One picture came back, at the bytes it went in with; nothing is scaled.
+        self.assertEqual(1, len(carried))
+        original = len(base64.b64encode(_png(1000, 800, noisy=True, seed=2)))
+        self.assertGreater(carried[0], original // 2)
