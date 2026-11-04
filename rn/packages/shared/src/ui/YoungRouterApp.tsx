@@ -7471,7 +7471,7 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
         <Text numberOfLines={1} style={styles.modelInspectorLabel}>{translate("providers.laneSource")}</Text>
         <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{translate(laneSource === LANE_ROUTE_REGION ? "providers.laneRoute.region" : "providers.laneRoute.main")}</Text>
       </View> : null}
-      <View style={styles.orderEditorRow}>
+      <View style={styles.routeEditorRow}>
         <TextField label={translate("providers.order")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} controlWidth={64} value={String(displayedOrder)} keyboardType="numeric" disabled={busy || followsMultiplier} onDraftChange={(value) => drafts?.setModelOrderDraft(providerId, id, value)} validate={(nextOrder) => {
           // The order is a number the user typed (decimals included).  A draft
           // that is not one stays in the field with its own message instead of
@@ -7483,7 +7483,7 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
           const parsed = Number(nextOrder.trim());
           const order = Number.isFinite(parsed) ? parsed : 0;
           return dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { manual_order: order, order } });
-        }} style={styles.orderEditorField} />
+        }} style={styles.routeEditorField} />
         {canFollowMultiplier ? <NativeCheckbox label={translate("providers.followMultiplier")} value={followsMultiplier} disabled={busy} onValueChange={(follow) => dispatch("model.patch", {
           provider_id: providerId,
           model_id: id,
@@ -7492,7 +7492,7 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
             manual_order: manualOrder,
             ...(follow ? {} : { order: manualOrder }),
           },
-        })} style={styles.orderFollowControl} /> : null}
+        })} style={styles.routeFollowControl} /> : null}
       </View>
       <RouteConcurrencyField providerId={providerId} model={model} busy={busy} globalLimit={globalConcurrencyLimit} translate={translate} dispatch={dispatch} />
       <ProtocolPicker providerId={providerId} model={model} busy={busy} translate={translate} dispatch={dispatch} />
@@ -7540,48 +7540,69 @@ function ContextWindowHelp({ recommended, translate }: { recommended: number | n
 /**
  * One route's share of the concurrency cap.
  *
- * The number is the route's own because a public model is a group of
- * deployments that answer at different speeds, and the proxy counts in-flight
- * attempts per deployment.  An empty field is a real state — the route follows
- * the runtime's global limit — so it is stated in the row's own hint with the
- * number it will actually use; `0` is the other stated value, meaning this
- * route is not capped at all.  Both are why the field cannot fall back to `0`
- * for an empty draft: that would silently cap or uncap a route the user never
- * touched.
+ * The row has the same two parts as 顺序 above it, because the two answer the
+ * same question — a number, and where that number comes from: the field states
+ * the cap, and the switch beside it decides whether the cap is this route's
+ * own or the runtime's global one.  A route that states no cap of its own is
+ * the switch's default (checked) state, and the field prints the global limit
+ * it is following while it is disabled; turning the switch off writes the
+ * number in force as this route's own, and the field becomes the place to
+ * change it.  `0` is the other stated value, meaning this route is not capped
+ * at all, which is why an emptied custom field is not `0`: it goes back to the
+ * global limit — the state the switch states — instead of silently uncapping a
+ * route the user never touched.
  */
 function RouteConcurrencyField({ providerId, model, busy, globalLimit, translate, dispatch }: { providerId: string; model: UnknownRecord; busy: boolean; globalLimit?: number; translate: Translate; dispatch: Dispatch }): React.JSX.Element {
   const inheritedLimit = globalLimit ?? 8;
   const id = editorIdentifier(model);
   const stated = model.max_concurrency;
-  const inherited = stated === undefined || stated === null;
+  const followsGlobal = stated === undefined || stated === null;
   const [tipOpen, setTipOpen] = useState(false);
-  return <TextField
-    label={translate("providers.routeConcurrency")}
-    labelWidth={MODEL_INSPECTOR_LABEL_WIDTH}
-    controlWidth={96}
-    keyboardType="numeric"
-    disabled={busy}
-    value={inherited ? "" : String(stated)}
-    // The empty field states the default it inherits, so no help line repeats
-    // it: this pane's fields carry one only for what the control cannot show,
-    // and a wrapped sentence in a 96 pt column would reflow every row below it.
-    placeholder={translate("providers.routeConcurrencyInherit", { value: String(inheritedLimit) })}
-    accessory={<HelpTip open={tipOpen} text={translate("providers.routeConcurrencyHelp")} title={translate("providers.routeConcurrencyHelpTitle")} onToggle={() => setTipOpen((current) => !current)} />}
-    validate={(next) => {
-      const trimmed = next.trim();
-      if (!trimmed) return undefined;
-      if (!Number.isFinite(Number(trimmed)) || !Number.isInteger(Number(trimmed))) return translate("runtime.invalidNumber");
-      const parsed = Number(trimmed);
-      return parsed >= 0 && parsed <= 4096 ? undefined : translate("runtime.invalidNumber");
-    }}
-    onCommit={(next) => {
-      const trimmed = next.trim();
-      // An empty draft is the inherit choice, which Core clears the route's own
-      // declaration for; it is never written as 0, because 0 means "uncapped".
-      const changes = trimmed === "" ? { max_concurrency: null } : { max_concurrency: Number(trimmed) };
-      return dispatch("model.patch", { provider_id: providerId, model_id: id, changes });
-    }}
-  />;
+  return <View style={styles.routeEditorRow}>
+    <TextField
+      label={translate("providers.routeConcurrency")}
+      labelWidth={MODEL_INSPECTOR_LABEL_WIDTH}
+      controlWidth={64}
+      keyboardType="numeric"
+      // A following route's cap is not editable here: the switch beside it is
+      // the control that decides where the number comes from, exactly as 跟随倍率
+      // does for 顺序.
+      disabled={busy || followsGlobal}
+      value={String(followsGlobal ? inheritedLimit : stated)}
+      validate={(next) => {
+        const trimmed = next.trim();
+        if (!trimmed) return undefined;
+        if (!Number.isFinite(Number(trimmed)) || !Number.isInteger(Number(trimmed))) return translate("runtime.invalidNumber");
+        const parsed = Number(trimmed);
+        return parsed >= 0 && parsed <= 4096 ? undefined : translate("runtime.invalidNumber");
+      }}
+      onCommit={(next) => {
+        const trimmed = next.trim();
+        // An empty draft returns the route to the global limit, which Core reads
+        // as no declaration of its own; it is never written as 0, because 0
+        // means "uncapped".
+        const changes = trimmed === "" ? { max_concurrency: null } : { max_concurrency: Number(trimmed) };
+        return dispatch("model.patch", { provider_id: providerId, model_id: id, changes });
+      }}
+      style={styles.routeEditorField}
+    />
+    <NativeCheckbox
+      label={translate("providers.routeConcurrencyInherit")}
+      value={followsGlobal}
+      disabled={busy}
+      // Turning the switch off keeps the number the route was already serving on
+      // screen, so the custom field starts from what the user was looking at
+      // rather than from an empty box whose meaning would be its own question.
+      onValueChange={(follow) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { max_concurrency: follow ? null : (stated ?? inheritedLimit) } })}
+      style={styles.routeFollowControl}
+    />
+    {/* The mark explains the number the switch states, so it reads as the last
+        word of 跟随全局 rather than as a second control in the row: it sits right
+        beside the label instead of at its own tab stop's distance. */}
+    <View style={styles.routeFollowHelp}>
+      <HelpTip open={tipOpen} text={translate("providers.routeConcurrencyHelp")} title={translate("providers.routeConcurrencyHelpTitle")} onToggle={() => setTipOpen((current) => !current)} />
+    </View>
+  </View>;
 }
 
 function ProtocolPicker({ providerId, model, busy, translate, dispatch }: { providerId: string; model: UnknownRecord; busy: boolean; translate: Translate; dispatch: Dispatch }): React.JSX.Element {
@@ -10383,6 +10404,8 @@ function routeTraceEventLabel(value: string, translate: Translate): string {
     next_order_fallback_available: "logs.routeEvent.nextOrder",
     final_order_fallback_retry_start: "logs.routeEvent.finalOrder",
     deployment_cooldown_started: "logs.routeEvent.cooldownStarted",
+    model_concurrency_queue_start: "logs.routeEvent.concurrencyQueueStart",
+    model_concurrency_queue_end: "logs.routeEvent.concurrencyQueueEnd",
     stream_start_timeout: "logs.routeEvent.streamStartTimeout",
     codex_fast_default_service_tier_injected: "logs.routeEvent.serviceTier",
     responses_request_gzip_enabled: "logs.routeEvent.compression",
@@ -10476,6 +10499,10 @@ const ROUTE_REASON_KEYS: Record<string, Parameters<Translate>[0]> = {
   "no-available-deployment": "logs.noAvailableRoute",
   "model-not-configured": "logs.modelNotConfigured",
   "local-gateway-auth-rejected": "logs.routeTrace.reasonGatewayAuth",
+  // A refusal this installation made, not an upstream answer: the Log tab must
+  // never render it as 上游异常/上游临时不可用, which sends the reader to the
+  // providers for a number the router itself enforced.
+  "model-concurrency-limit": "logs.routeTrace.reasonLocalConcurrency",
   other: "logs.routeTrace.reasonUnknown",
 };
 
@@ -10627,6 +10654,13 @@ function routeTraceDetailPartLabel(value: string, translate: Translate): string 
   if (order?.[1]) return translate("logs.routeTrace.order", { value: order[1] });
   const cooldown = value.match(/^cooldown=(.+)s$/);
   if (cooldown?.[1]) return translate("logs.routeTrace.cooldown", { value: cooldown[1] });
+  const waited = value.match(/^waited=(.+)s$/);
+  if (waited?.[1]) return translate("logs.routeTrace.concurrencyWaited", { value: waited[1] });
+  // ``served`` says whether a queued turn actually got a slot: the same pair a
+  // stream records with ``saw_chunk``, and the one thing that tells a wait that
+  // helped from one that spent the whole window in line.
+  if (value === "served=true") return translate("logs.routeTrace.queueServed");
+  if (value === "served=false") return translate("logs.routeTrace.queueWaiting");
   const round = value.match(/^round=(.+)$/);
   if (round?.[1]) return translate("logs.routeTrace.round", { value: round[1] });
   const reason = value.match(/^reason=(.+)$/);
@@ -10664,6 +10698,8 @@ function recoveryDetailLabel(value: string, translate: Translate): string {
     network: "logs.recoveryReason.network",
     rate_limit: "logs.recoveryReason.rateLimit",
     request_size: "logs.recoveryReason.requestSize",
+    local_capacity: "logs.recoveryReason.localCapacity",
+    local_gateway_auth: "logs.recoveryReason.localGatewayAuth",
     timeout: "logs.recoveryReason.timeout",
     unknown: "logs.recoveryReason.unknown",
   };
@@ -10700,9 +10736,19 @@ function logErrorDetail(value: unknown, translate: Translate): string {
   const error = asRecord(value);
   if (Object.keys(error).length === 0) return compactLogValue(value);
   const reason = compactLogValue(error.reason);
+  // ``local`` is the one fact a reader sorts on first: this proxy refused the
+  // turn, so no upstream answered.  Rendered as ``HTTP 503 | ServiceUnavailable``
+  // (which is how the sanitized stop reaches the client so it resends) a full
+  // concurrency pool was indistinguishable from a provider outage on the same
+  // model, and the 恢复/冷却 tab called the local cap an upstream rate limit.
+  const local = error.local === true;
   const parts = [
-    error.status_code === undefined ? "" : `HTTP ${compactLogValue(error.status_code)}`,
-    compactLogValue(error.type),
+    local
+      ? translate("logs.localRefusal")
+      : error.status_code === undefined
+        ? ""
+        : `HTTP ${compactLogValue(error.status_code)}`,
+    local ? "" : compactLogValue(error.type),
     compactLogValue(error.code),
     reason ? requestErrorReasonLabel(reason, translate) : "",
     error.failed_deployment_order === undefined ? "" : `order=${compactLogValue(error.failed_deployment_order)}`,
@@ -13235,7 +13281,7 @@ const styles = StyleSheet.create({
   // points below it, and the sections under it keep the left column's row pitch.
   providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 12 }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerListPane: { width: 180, minWidth: 180, maxWidth: 180, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22, alignItems: "center", justifyContent: "center" }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, modelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 320, minWidth: 260, maxWidth: 360, flexGrow: 0, flexShrink: 1 }, providerEditorContent: { flex: 1, minHeight: 0 }, providerEditorScrollContent: { paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }, persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }, persistentScrollHost: { position: "relative", flex: 1, minHeight: 0 }, persistentScrollFill: { flex: 1, minHeight: 0 }, persistentScrollThumb: { position: "absolute", top: 2, right: 2, width: 4, borderRadius: 2, backgroundColor: "rgba(96,96,96,0.55)" }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, // A link is also a cursor: the row shows the pointing hand over the whole
 // finding, label included, exactly like every native link in the app.
-inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspectorProbeFindingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textDecorationLine: "underline" }, inspectorEnableControl: { flexShrink: 0 }, orderEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, orderEditorField: { flex: 1, width: undefined }, orderFollowControl: { flexShrink: 0 }, modelWindowValue: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, modelWindowText: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, modelWindowLink: { flexShrink: 0 }, protocolSettings: { gap: 4 }, helpTipAnchor: { position: "relative", zIndex: 2 }, helpTipDismiss: { position: "absolute", left: -2400, right: -2400, top: -2400, bottom: -2400 }, helpTipButton: { width: 16, height: 16, minWidth: 16, minHeight: 16 }, helpTipPopupLeft: { position: "absolute", left: 0, bottom: 22, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipPopup: { position: "absolute", right: 0, bottom: 22, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspectorProbeFindingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textDecorationLine: "underline" }, inspectorEnableControl: { flexShrink: 0 }, routeEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, routeEditorField: { flexGrow: 0, width: undefined }, routeFollowControl: { flexShrink: 0 }, routeFollowHelp: { marginLeft: -8, flexShrink: 0 }, modelWindowValue: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, modelWindowText: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, modelWindowLink: { flexShrink: 0 }, protocolSettings: { gap: 4 }, helpTipAnchor: { position: "relative", zIndex: 2 }, helpTipDismiss: { position: "absolute", left: -2400, right: -2400, top: -2400, bottom: -2400 }, helpTipButton: { width: 16, height: 16, minWidth: 16, minHeight: 16 }, helpTipPopupLeft: { position: "absolute", left: 0, bottom: 22, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipPopup: { position: "absolute", right: 0, bottom: 22, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
   externalSettingsWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, externalSettingsFieldList: { ...SETTINGS_FIELD_LIST },
   // One rail entry can carry two apps, so each app's block keeps the grid's
   // rhythm but not the grid: a title, then that app's own fields and files.

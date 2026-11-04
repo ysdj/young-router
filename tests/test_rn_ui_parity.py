@@ -2377,6 +2377,59 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('value.api_key_name')
         self.assert_ui_has('`${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())}')
 
+    def test_a_local_refusal_is_not_rendered_as_an_upstream_answer(self) -> None:
+        """The Log tab has to say who refused the turn.
+
+        Live 2026-11-04: a full concurrency pool and a dead relay answered the
+        same public model in the same minute, and both rows read ``HTTP 503 |
+        ServiceUnavailable``: the local cap refusal reaches the client as a
+        sanitized 503 so the client resends, and the detail column copied it.
+        The record now carries ``local`` plus its own reason, and the detail is
+        rendered from that, never from a status this proxy invented for the
+        wire.
+        """
+
+        self.assert_ui_has('const local = error.local === true;')
+        self.assert_ui_has('translate("logs.localRefusal")')
+        self.assert_ui_has('"model-concurrency-limit": "logs.routeTrace.reasonLocalConcurrency",')
+        self.assert_ui_has('local_capacity: "logs.recoveryReason.localCapacity",')
+        for source in (self.zh, self.en):
+            for key in (
+                "logs.localRefusal",
+                "logs.routeTrace.reasonLocalConcurrency",
+                "logs.recoveryReason.localCapacity",
+                "logs.recoveryReason.localGatewayAuth",
+            ):
+                self.assertIn(f'"{key}":', source, key)
+
+    def test_the_queue_and_its_wait_read_as_router_events(self) -> None:
+        """A wait for a slot is this router's own event, worded as one.
+
+        The queue happens inside the recovery round, so its rows sit among
+        route-trace events and must not read as upstream traffic.  Each one
+        carries how long the turn waited and whether a slot came of it, and the
+        detail parts are the ones the Core already writes: ``waited`` and
+        ``served``, never a raw boolean.
+        """
+
+        for event, label in (
+            ("model_concurrency_queue_start", "logs.routeEvent.concurrencyQueueStart"),
+            ("model_concurrency_queue_end", "logs.routeEvent.concurrencyQueueEnd"),
+        ):
+            self.assert_ui_has(f'{event}: "{label}",')
+        self.assert_ui_has('const waited = value.match(/^waited=(.+)s$/);')
+        self.assert_ui_has('if (value === "served=true") return translate("logs.routeTrace.queueServed");')
+        self.assert_ui_has('if (value === "served=false") return translate("logs.routeTrace.queueWaiting");')
+        for source in (self.zh, self.en):
+            for key in (
+                "logs.routeEvent.concurrencyQueueStart",
+                "logs.routeEvent.concurrencyQueueEnd",
+                "logs.routeTrace.concurrencyWaited",
+                "logs.routeTrace.queueServed",
+                "logs.routeTrace.queueWaiting",
+            ):
+                self.assertIn(f'"{key}":', source, key)
+
     def test_service_health_is_manual_and_has_no_background_poll(self) -> None:
         self.assert_ui_has('case "service-health": return "health";')
         self.assertNotIn("SERVICE_HEALTH_POLL_MS", self.ui)

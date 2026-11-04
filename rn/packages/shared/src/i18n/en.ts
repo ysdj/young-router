@@ -88,6 +88,11 @@ export const en: Record<TranslationKey, string> = {
   "logs.routeEvent.nextOrder": "Select next order",
   "logs.routeEvent.finalOrder": "Start ordered fallback",
   "logs.routeEvent.cooldownStarted": "Start route cooldown",
+  "logs.routeEvent.concurrencyQueueStart": "Local concurrency full, queueing",
+  "logs.routeEvent.concurrencyQueueEnd": "Queueing finished",
+  "logs.routeTrace.concurrencyWaited": "Queued {value}s",
+  "logs.routeTrace.queueServed": "Slot taken",
+  "logs.routeTrace.queueWaiting": "Still queued",
   "logs.routeEvent.streamStartTimeout": "First chunk timed out",
   "logs.routeEvent.chatBridge": "Switch to Chat protocol",
   "logs.routeEvent.webSearchToolStart": "Start search tool request",
@@ -177,7 +182,9 @@ export const en: Record<TranslationKey, string> = {
   "logs.routeTrace.reasonCompactionUnsupported": "Upstream does not support Codex compaction",
   "logs.routeTrace.reasonImageFallback": "Image tool runtime fallback",
   "logs.routeTrace.reasonGatewayAuth": "The local gateway rejected the caller key",
+  "logs.routeTrace.reasonLocalConcurrency": "This router's concurrency limit is full",
   "logs.routeTrace.reasonUnknown": "Upstream error",
+  "logs.localRefusal": "Refused locally",
   "logs.routeTrace.serviceTier": "Tier {value}",
   "logs.routeTrace.serviceTierPriority": "Priority",
   "logs.routeTrace.serviceTierFlex": "Flexible",
@@ -220,6 +227,8 @@ export const en: Record<TranslationKey, string> = {
   "logs.recoveryReason.rateLimit": "Rate limited",
   "logs.recoveryReason.timeout": "Upstream timed out",
   "logs.recoveryReason.requestSize": "Request body too large",
+  "logs.recoveryReason.localCapacity": "Local concurrency limit reached",
+  "logs.recoveryReason.localGatewayAuth": "This router rejected the key",
   "logs.recoveryReason.unknown": "Recovery is retrying",
   "logs.action": "ACTION",
   "logs.type": "TYPE",
@@ -652,15 +661,15 @@ export const en: Record<TranslationKey, string> = {
   "providers.upstreamContextWindowHelpTitle": "Upstream context",
   "providers.upstreamContextWindowHelp": "This upstream publishes this window in its own model catalog. The app only reads it; it cannot be changed here.",
   "providers.followMultiplier": "Follow multiplier",
-  // The route's own share of the concurrency cap.  An empty field is not a
-  // missing value: it is the route following the runtime's global limit, which
-  // is why the hint names that number instead of drawing an empty box.
+  // The route's own share of the concurrency cap.
   "providers.routeConcurrency": "Concurrency",
   "providers.routeConcurrencyHelpTitle": "Route concurrency",
-  // 0 is the one value the control cannot state for itself: an empty field
-  // follows the global limit, while 0 leaves this route uncapped.
+  // 0 is the one value the control cannot state for itself: the switch follows
+  // the global limit, while 0 leaves this route uncapped.
   "providers.routeConcurrencyHelp": "How many requests this route may serve at once. A request arriving while it is full is answered by the next route of the same public model, exactly as a cooled route is skipped; only when every route of the model is full is the request refused with a concurrency error. The number is this route's own, because a group is several deployments that answer at different speeds; 0 leaves this route uncapped.",
-  "providers.routeConcurrencyInherit": "Follow global ({value})",
+  // The same control in the same place as 顺序's follow multiplier: checked,
+  // the route keeps no cap of its own.
+  "providers.routeConcurrencyInherit": "Follow global",
   "providers.addWizard": "Add with wizard…",
   "providers.wizard.title": "Configure provider",
   "providers.wizard.stepProvider": "Provider",
