@@ -629,6 +629,37 @@ class ImageContextFileFetchTests(_ImageContextCase):
         self.assertFalse(os.path.isdir(folder))
         self.assertEqual({}, store_module.paths(self.thread))
 
+    def test_forgetting_a_task_removes_its_thumbnails_too(self) -> None:
+        """A thumbnail is cached per task, so it goes with the task.
+
+        One live task carried 183 of them and the cache keeps 32 tasks: leaving
+        them behind is a directory that only ever grows.
+        """
+
+        items = [
+            _user_turn("first", _upload_parts(_png(1200, 900, noisy=True))),
+            _user_turn("second"),
+        ]
+        gateway_home = os.path.join(self.directory.name, "gateway-home")
+        os.makedirs(gateway_home, exist_ok=True)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HOME": gateway_home,
+                image_context_module.IMAGE_CONTEXT_FETCH_ENV: "auto",
+                image_context_module.IMAGE_CONTEXT_PREVIEW_ENV: "auto",
+            },
+        ):
+            self.rewritten(items, metadata={"thread_id": self.thread})
+
+        folder = os.path.join(store_module.previews_dir(), self.thread)
+        self.assertTrue(os.path.isdir(folder), folder)
+        self.assertTrue(os.listdir(folder))
+
+        self.assertTrue(store_module.forget(self.thread))
+
+        self.assertFalse(os.path.isdir(folder))
+
 
 class ImageContextStoreRetentionTests(_ImageContextCase):
     """The store's own day: pictures do not outlive the replay they answer from."""

@@ -62,6 +62,12 @@ def cache_dir(environ: Optional[Dict[str, str]] = None) -> str:
     return os.path.join(base, "image-context", "replays")
 
 
+def previews_dir(environ: Optional[Dict[str, str]] = None) -> str:
+    """Where the thumbnails of a task's omitted images are cached."""
+
+    return os.path.join(cache_dir(environ), "previews")
+
+
 def files_dir(environ: Optional[Dict[str, str]] = None) -> str:
     """Where the same images are also written as files.
 
@@ -209,17 +215,18 @@ def forget(thread_id: Any, environ: Optional[Dict[str, str]] = None) -> bool:
         removed = True
     except OSError:
         pass
-    folder = os.path.join(files_dir(environ), safe)
-    try:
-        for name in os.listdir(folder):
-            try:
-                os.unlink(os.path.join(folder, name))
-            except OSError:
-                pass
-        os.rmdir(folder)
-        removed = True
-    except OSError:
-        pass
+    for root in (files_dir(environ), previews_dir(environ)):
+        folder = os.path.join(root, safe)
+        try:
+            for name in os.listdir(folder):
+                try:
+                    os.unlink(os.path.join(folder, name))
+                except OSError:
+                    pass
+            os.rmdir(folder)
+            removed = True
+        except OSError:
+            pass
     return removed
 
 
@@ -275,6 +282,10 @@ def sweep(environ: Optional[Dict[str, str]] = None, *, now: Optional[float] = No
             # replay that is still there, so leave both alone.
             kept.add(thread_id)
     _sweep_files(files_dir(env), kept, cutoff)
+    # The thumbnails an omitted image travels as live beside the replay too, and
+    # would otherwise outlive the task that owns them: one task carried 183 of
+    # them, and the cache keeps 32 tasks.
+    _sweep_files(previews_dir(env), kept, cutoff)
     return removed
 
 

@@ -1191,11 +1191,11 @@ def _preview_cache_path(
     from . import image_context_store as _store_module
 
     try:
-        root = _store_module.cache_dir()
+        root = _store_module.previews_dir()
     except Exception:
         return None
     safe_thread = _safe_thread_file_name(thread_id) or thread_id
-    return os.path.join(root, "previews", safe_thread, f"{image_id}-{edge}.jpg")
+    return os.path.join(root, safe_thread, f"{image_id}-{edge}.jpg")
 
 
 def _preview_data_url(
