@@ -132,6 +132,8 @@ from .base import (
     _SESSION_DEPLOYMENT_AFFINITY_TTL_SECONDS,
     _STREAM_KEEPALIVE_DEFAULT_INTERVAL_SECONDS,
     _STREAM_KEEPALIVE_INTERVAL_SECONDS_ENV,
+    _STREAM_NO_PROGRESS_DEFAULT_SECONDS,
+    _STREAM_NO_PROGRESS_SECONDS_ENV,
     _STREAM_START_TIMEOUT_DEFAULT_SECONDS,
     _STREAM_START_TIMEOUT_SECONDS_ENV,
     _HEAVY_REPLAY_STREAM_START_TIMEOUT_DEFAULT_SECONDS,
@@ -681,6 +683,32 @@ def _stall_timeout_seconds() -> float:
         parsed = float(value)
     except ValueError:
         return _STALL_TIMEOUT_DEFAULT_SECONDS
+    return max(0.0, parsed)
+
+
+def _stream_no_progress_seconds_for_request(
+    request_data: Optional[dict],
+) -> float:
+    """How long the reader may see nothing renderable before this proxy stops.
+
+    Resolution order: request metadata override (``stream_no_progress_seconds``),
+    then ``YOUNG_ROUTER_STREAM_NO_PROGRESS_SECONDS`` (``0`` disables the
+    watchdog), then the default. Invalid values fall back to the default.
+    """
+
+    override = _request_metadata_positive_float(
+        request_data,
+        "stream_no_progress_seconds",
+    )
+    if override is not None:
+        return override
+    value = os.getenv(_STREAM_NO_PROGRESS_SECONDS_ENV, "").strip()
+    if not value:
+        return _STREAM_NO_PROGRESS_DEFAULT_SECONDS
+    try:
+        parsed = float(value)
+    except ValueError:
+        return _STREAM_NO_PROGRESS_DEFAULT_SECONDS
     return max(0.0, parsed)
 
 

@@ -1053,6 +1053,11 @@ def _stream_failure_ended_without_terminal(exception: Exception) -> bool:
         or getattr(exception, "stream_incomplete", False)
         or _routing_module._is_route_cut_stream_error(exception)
         or _routing_module._is_upstream_body_read_failure(exception)
+        # This proxy's own watchdogs: their budgets expired with the body still
+        # open, which is the same obligation -- the reader must be told, not
+        # left waiting on a stream nobody will finish.
+        or _routing_module._is_local_stream_timeout_error(exception)
+        or _routing_module._is_local_stream_start_timeout_error(exception)
     )
     if not ended_without_terminal:
         return False

@@ -3947,3 +3947,134 @@ class StreamWithoutTerminalEventTests(HookTestCase):
         # tells the reader to send the message again.
         self.assertEqual(response["error"]["code"], "upstream_stream_interrupted")
         self.assertIn("again", response["error"]["message"])
+
+
+class StreamNoProgressWatchdogTests(HookTestCase):
+    """A turn whose chain stalls while the heartbeat holds the body open.
+
+    Observed live 2026-11-03: a Codex turn's chain recorded its route as
+    successful and then delivered nothing for seventeen minutes; the heartbeat
+    kept the SSE body alive, so nothing at the wire expired, and the reader sat
+    on "waiting for the model" until a person pressed stop.
+    """
+
+    async def test_silence_that_outlasts_the_budget_ends_the_turn(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        from young_router.proxy import streaming_recovery
+
+        emitted = []
+
+        async def stalled_delivery():
+            yield {"type": "response.created", "response": {"id": "resp-stalled"}}
+            emitted.append("opened")
+            await asyncio.sleep(3600)
+
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "继续"}],
+            "stream": True,
+            "model_info": {"id": "order1-a", "order": 1},
+            "litellm_metadata": {
+                "stream_keepalive_interval_seconds": 0.01,
+                "stream_no_progress_seconds": 0.05,
+            },
+        }
+
+        observed = []
+        with self.assertRaises(Exception) as raised:
+            async for chunk in streaming_recovery._yield_downstream_keepalive_stream(
+                stalled_delivery(),
+                request_data,
+            ):
+                observed.append(chunk)
+
+        self.assertTrue(emitted)
+        self.assertTrue(hooks._is_local_stream_timeout_error(raised.exception))
+        self.assertTrue(
+            any(
+                streaming_recovery._is_stream_keepalive_chunk(chunk)
+                for chunk in observed
+            ),
+            observed,
+        )
+
+    async def test_visible_frames_reset_the_budget(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        from young_router.proxy import streaming_recovery
+
+        async def slow_but_alive():
+            for index in range(4):
+                await asyncio.sleep(0.03)
+                yield {
+                    "type": "response.reasoning_summary_text.delta",
+                    "delta": "thinking %d" % index,
+                }
+
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "继续"}],
+            "stream": True,
+            "model_info": {"id": "order1-a", "order": 1},
+            "litellm_metadata": {
+                "stream_keepalive_interval_seconds": 0.01,
+                "stream_no_progress_seconds": 0.05,
+            },
+        }
+
+        observed = [
+            chunk
+            async for chunk in streaming_recovery._yield_downstream_keepalive_stream(
+                slow_but_alive(),
+                request_data,
+            )
+        ]
+
+        deltas = [
+            chunk
+            for chunk in observed
+            if chunk.get("type") == "response.reasoning_summary_text.delta"
+        ]
+        self.assertEqual(4, len(deltas))
+
+    async def test_the_stalled_turn_reaches_the_reader_as_a_retryable_stop(self) -> None:
+        """End to end: the watchdog's stop is delivered, not swallowed."""
+
+        hooks, proxy_server = load_hook_module()
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return []
+
+            async def aresponses(self, **payload):
+                raise AssertionError("no sibling may be tried: nothing is owed")
+
+        proxy_server.llm_router = FakeRouter()
+
+        async def stalled_stream():
+            yield {"type": "response.created", "response": {"id": "resp-stalled"}}
+            await asyncio.sleep(3600)
+
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "继续"}],
+            "stream": True,
+            "model_info": {"id": "order1-a", "order": 1},
+            "litellm_metadata": {
+                "stream_keepalive_interval_seconds": 0.01,
+                "stream_no_progress_seconds": 0.05,
+            },
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=stalled_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        self.assertEqual("response.failed", chunks[-1].get("type"), chunks)
+        response = chunks[-1]["response"]
+        self.assertEqual("failed", response["status"])
+        self.assertEqual("upstream_stream_idle_timeout", response["error"]["code"])

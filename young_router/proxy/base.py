@@ -78,6 +78,16 @@ _STREAM_KEEPALIVE_INTERVAL_SECONDS_ENV = (
     "YOUNG_ROUTER_STREAM_KEEPALIVE_INTERVAL_SECONDS"
 )
 _STREAM_KEEPALIVE_DEFAULT_INTERVAL_SECONDS = 15.0
+# How long the *reader* may see nothing it can render before this proxy ends the
+# turn itself.  Every inner budget (stream start, upstream idle) times one read
+# of one iterator; observed live 2026-11-03, a turn whose chain had already
+# recorded its route as successful delivered no frame for seventeen minutes
+# while the keepalive heartbeat held the body open, and the reader sat on
+# "waiting for the model" until a person pressed stop.  A turn that is actually
+# thinking still produces visible summary frames on every client this gateway
+# serves, so silence this long is a stalled chain, not a long answer.
+_STREAM_NO_PROGRESS_SECONDS_ENV = "YOUNG_ROUTER_STREAM_NO_PROGRESS_SECONDS"
+_STREAM_NO_PROGRESS_DEFAULT_SECONDS = 900.0
 _SESSION_DEPLOYMENT_AFFINITY_ENV = "YOUNG_ROUTER_SESSION_DEPLOYMENT_AFFINITY"
 _SESSION_DEPLOYMENT_AFFINITY_FILE_ENV = (
     "YOUNG_ROUTER_SESSION_DEPLOYMENT_AFFINITY_FILE"

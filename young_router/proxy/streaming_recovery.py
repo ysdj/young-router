@@ -1058,9 +1058,15 @@ async def _yield_downstream_keepalive_stream(
     While the wrapped delivery generator has nothing to yield -- the buffered
     start phase, a silent upstream reasoning window, or route-recovery polls --
     emit one keepalive chunk per interval so client-side byte-idle timers do
-    not fire before the proxy's own budgets do. The heartbeat adds no timeout
-    of its own: every internal wait is already bounded by its existing
-    start/idle/recovery deadline, and this wrapper only fills the silence.
+    not fire before the proxy's own budgets do.
+
+    The heartbeat also *bounds* that silence, because it is the only layer that
+    knows what the reader actually received: every inner budget times one read
+    of one iterator, and a chain whose middle believes it is finished (observed
+    live 2026-11-03: the route was recorded successful while the reader got
+    nothing) holds the turn open with nothing behind it. One keepalive per
+    interval is the clock; this wrapper counts the intervals that carried no
+    renderable frame and ends the turn when the no-progress budget is spent.
     """
 
     interval = _routing_module._stream_keepalive_interval_seconds_for_request(
@@ -1102,18 +1108,33 @@ async def _yield_downstream_keepalive_stream(
 
     reader = asyncio.create_task(read_delivery())
     sequence = 0
+    no_progress_seconds = _routing_module._stream_no_progress_seconds_for_request(
+        request_data
+    )
+    last_progress_at = time.monotonic()
     try:
         while True:
             try:
                 kind, payload = await asyncio.wait_for(outcomes.get(), timeout=interval)
             except asyncio.TimeoutError:
                 sequence += 1
+                if (
+                    no_progress_seconds > 0
+                    and time.monotonic() - last_progress_at >= no_progress_seconds
+                ):
+                    raise _streaming_module._stream_idle_timeout_exception(
+                        request_data,
+                        idle_seconds=no_progress_seconds,
+                        saw_chunk=True,
+                    ) from None
                 yield _streaming_module._stream_keepalive_chunk(request_data, sequence)
                 continue
             if kind == "end":
                 return
             if kind == "error":
                 raise payload
+            if not _is_stream_keepalive_chunk(payload) and not _streaming_module._is_route_recovery_sse_keepalive(payload):
+                last_progress_at = time.monotonic()
             yield payload
     finally:
         if not reader.done():
