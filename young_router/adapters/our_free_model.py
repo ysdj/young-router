@@ -866,3 +866,9 @@ __all__ = [
     "validated_provider",
     "worker_path",
 ]
+
+
+def managed_runtime(runtime_root: Path | str | None = None) -> OurFreeModelRuntime:
+    """The runtime a Core-less host starts for a config naming this worker."""
+
+    return OurFreeModelRuntime(runtime_root)

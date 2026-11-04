@@ -208,3 +208,15 @@ def _declared_auth_kinds(attribute: str) -> frozenset[str]:
                 if isinstance(kind, str) and kind.strip():
                     kinds.add(kind.strip())
     return frozenset(kinds)
+
+
+def managed_worker_modules() -> list[Any]:
+    """Every registered worker adapter this process could import.
+
+    The public face of the registry above: a deployment that starts these
+    workers without a Core (``young_router.adapters.managed``) asks here rather
+    than naming a product, so a worker that adds itself is started by that path
+    too.
+    """
+
+    return _managed_modules()

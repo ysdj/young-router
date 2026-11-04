@@ -771,3 +771,14 @@ def unsupported_status() -> dict[str, Any]:
 
 def script_available() -> bool:
     return available() and worker_path().is_file()
+
+
+def managed_runtime(runtime_root: Path | str | None = None) -> WorkBuddyRuntime:
+    """The runtime a Core-less host starts for a config naming this worker.
+
+    ``young_router.adapters.managed`` starts a worker through the factory its
+    adapter publishes, so the contract that builds one stays in the file that
+    owns it rather than in the deployment that happens to run it.
+    """
+
+    return WorkBuddyRuntime(runtime_root)
