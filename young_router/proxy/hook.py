@@ -110,6 +110,13 @@ class YoungRouterHook(CustomLogger):
     ) -> None:
         if _routing_module._is_codex_compaction_capability_probe(kwargs):
             return
+        # Every turn ends here, whichever shape carried it -- a streaming body
+        # that finished, a non-streaming answer, a Responses call LiteLLM serves
+        # as a fake stream.  The slot this turn claimed is not in flight any
+        # more; without this it stayed counted until the lease aged out (two
+        # hours), and enough of them parked the whole route.  Releasing is a
+        # no-op for a turn that holds nothing (a listing, a health read).
+        _routing_module._release_request_concurrency_slots(kwargs)
         # A model-list or health read is not a turn: it selects no route, so the
         # row it would add has no model, cost, or usage.  See
         # ``_is_local_control_plane_read``.
