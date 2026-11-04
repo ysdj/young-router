@@ -125,6 +125,26 @@ def _write(target: Path, payload: bytes, *, executable: bool) -> None:
     temporary.replace(target)
 
 
+def _staged_version(target: Path, marker: Path) -> str | None:
+    """The release already staged beside ``marker``, when it is a whole one.
+
+    A binary without its licence is a staging run that stopped after the
+    download; reusing it would ship a runtime whose notice is missing, so that
+    state is treated as nothing staged and the download runs again.
+    """
+
+    licence = marker.with_name("BUN_LICENSE")
+    if not target.is_file() or target.stat().st_size < MINIMUM_BYTES:
+        return None
+    if not marker.is_file() or not licence.is_file():
+        return None
+    try:
+        version = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return version or None
+
+
 def update(output: Path, *, license_path: Path | None = None) -> str:
     """Stage the current Bun release for this host into ``output``.
 
@@ -136,18 +156,28 @@ def update(output: Path, *, license_path: Path | None = None) -> str:
 
     output = output.expanduser().resolve()
     package, executable = _platform_package()
-    version, tarball, _payload = package_metadata(
-        _registry_url(package),
-        package_name=package,
-        timeout=DEFAULT_TIMEOUT_SECONDS,
-        user_agent=USER_AGENT,
-    )
     target = output / executable
     marker = output / "BUN_VERSION"
+    try:
+        version, tarball, _payload = package_metadata(
+            _registry_url(package),
+            package_name=package,
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+            user_agent=USER_AGENT,
+        )
+    except UpdateError:
+        # The registry read is only here to learn which release to stage.  A
+        # staged binary already records the one that was resolved last time,
+        # and it is the same answer whenever the release has not moved.
+        staged = _staged_version(target, marker)
+        if staged is None:
+            raise
+        return f"{staged} (cached)"
     if (
         target.is_file()
         and marker.is_file()
         and marker.read_text(encoding="utf-8").strip() == version
+        and (output / "BUN_LICENSE").is_file()
     ):
         return version
     archive = download_bytes(

@@ -22,6 +22,14 @@
 # directory, and restarts the app.  Measured: 35 to 45 s, almost all of it
 # Metro.
 #
+# The bundle itself is served by a Metro instance kept running between runs: a
+# one-shot `react-native bundle` rebuilds the whole graph per edit (and its
+# `--reset-cache` threw the transform cache away first), while a server answers
+# the same bundle in 0-1 s and 3 s after an edit.  The first run after a Metro
+# restart still pays the cold build once.
+#
+#   scripts\dev-loop-windows.ps1 -StopMetro      shut the server down again
+#
 # What it refuses, and why:
 #
 #   * a native source newer than the installed host executable -- the exe
@@ -47,26 +55,98 @@ param(
   [switch]$Check,
   [switch]$NoRestart,
   [switch]$AllowStaleNative,
+  [switch]$StopMetro,
+  [switch]$InitTree,
+  [switch]$Install,
   [string]$Source = '',
   [string]$Tree = ''
 )
 $ErrorActionPreference = 'Stop'
 
 if ($env:OS -ne 'Windows_NT') { throw 'dev-loop-windows runs on a Windows host.' }
+$TreeWasGiven = [bool]$Tree -or [bool]$env:YOUNG_ROUTER_WINDOWS_TREE
 if (-not $Tree) {
   $Tree = if ($env:YOUNG_ROUTER_WINDOWS_TREE) { $env:YOUNG_ROUTER_WINDOWS_TREE }
     else { Join-Path $env:USERPROFILE 'yr-win' }
 }
 if (-not $Source) { $Source = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path }
 $Source = (Resolve-Path -LiteralPath $Source).Path
-if (-not (Test-Path -LiteralPath $Tree)) { throw "The Windows working copy is missing: $Tree" }
+
+# A shared folder is a reparse point (Parallels mounts one as a symlink to
+# ``UNC\psf\Home``), and a checkout reached through one cannot hold node_modules:
+# every ancestor is checked rather than the drive letter, because the share is
+# mounted on a fixed drive that reports ``Fixed``.
+function Test-SharedPath {
+  param([string]$Path)
+  if ($Path -match '^\\\\') { return $true }
+  $current = $Path
+  while ($current) {
+    $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+    if ($item -and ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return $true }
+    $parent = Split-Path -Parent $current
+    if (-not $parent -or $parent -eq $current) { break }
+    $current = $parent
+  }
+  return $false
+}
+
+# The second tree exists for one reason: the checkout lives on a Parallels share,
+# and pnpm cannot reliably build there.  A machine that has never built has no
+# such copy, so ``-InitTree`` creates it from the checkout -- the same copy the
+# share case always needed, made a command instead of a paragraph.  Guessing it
+# from the path is not possible: a Parallels share is mounted on a fixed drive
+# and reports ``Fixed``, so a wrong guess would build in place on a share that
+# cannot hold it.
+if (-not (Test-Path -LiteralPath $Tree)) {
+  if ($InitTree) {
+    if ($Source -eq $Tree) { throw "-InitTree needs a checkout and a tree that differ; both are $Source." }
+    "creating the Windows working copy at $Tree from $Source"
+    New-Item -ItemType Directory -Force -Path $Tree | Out-Null
+    # Everything the build reads, and none of what it writes: node_modules is
+    # installed in the tree (that is the point of the copy), the staging cache and
+    # the build outputs belong to the machine rather than to the checkout, and the
+    # macOS halves -- CocoaPods alone is 1.8 GB here -- are 2 GB a Windows build
+    # would copy and never read.
+    & robocopy $Source $Tree /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NP `
+      /XD node_modules .staging-cache .venv __pycache__ .pytest_cache Pods Bundle ARM64 x64 obj 'Generated Files' codegen AppPackages bin .git `
+      /XF .DS_Store | Out-Null
+    if ($LASTEXITCODE -gt 7) { throw "Could not copy the checkout into $Tree (robocopy exit $LASTEXITCODE)." }
+    "created the tree; its dependencies are installed by -Install"
+  } elseif (-not $TreeWasGiven -and -not (Test-SharedPath $Source)) {
+    # A checkout on this machine's own disk needs no second copy: it is where the
+    # tree would have been made.  This is the whole of a new machine's setup.
+    "no copy at $Tree; debugging the checkout in place ($Source)"
+    $Tree = $Source
+  } else {
+    throw @"
+The Windows working copy is missing: $Tree
+
+Create it from this checkout (it cannot live on the Mac share):
+  scripts\dev-loop-windows.ps1 -InitTree        create the tree here
+  scripts\dev-loop-windows.ps1 -Install         install its dependencies
+Or pass -Tree to use a copy that already exists.
+"@
+  }
+}
 $Tree = (Resolve-Path -LiteralPath $Tree).Path
 
 $TreeRn = Join-Path $Tree 'rn'
 $AppRoot = Join-Path $TreeRn 'apps\windows'
 if (-not (Test-Path -LiteralPath (Join-Path $TreeRn 'node_modules'))) {
-  throw "The Windows working copy has no node_modules: $TreeRn. Run pnpm install --frozen-lockfile --node-linker=hoisted there first; it cannot live on the Mac share."
+  if ($Install) {
+    "installing the tree's dependencies (pnpm install --frozen-lockfile --node-linker=hoisted)"
+    Push-Location $TreeRn
+    try {
+      & pnpm install --frozen-lockfile --node-linker=hoisted
+      if ($LASTEXITCODE -ne 0) { throw "pnpm install failed in $TreeRn (exit $LASTEXITCODE)." }
+    } finally {
+      Pop-Location
+    }
+  }
 }
+  if (-not (Test-Path -LiteralPath (Join-Path $TreeRn 'node_modules'))) {
+    throw "The Windows working copy has no node_modules: $TreeRn. Rerun with -Install, or run pnpm install --frozen-lockfile --node-linker=hoisted there first; it cannot live on the Mac share."
+  }
 if (-not (Test-Path -LiteralPath (Join-Path $AppRoot 'windows'))) {
   throw "The React Native Windows host project is missing: $AppRoot\windows"
 }
@@ -280,15 +360,136 @@ if ($Source -ne $Tree -and ($jsChanged.Count -gt 0 -or $windowsBuildChanged.Coun
 
 $pnpm = Get-Command pnpm -ErrorAction SilentlyContinue
 if (-not $pnpm) { throw 'pnpm is not on PATH.' }
-Push-Location $AppRoot
-try {
-  & pnpm exec react-native bundle --platform windows --entry-file index.js --bundle-output $bundle --assets-dest $bundleDirectory --dev false --reset-cache --minify false
-  if ($LASTEXITCODE -ne 0) { throw "Metro failed to build the bundle (exit $LASTEXITCODE)." }
-} finally {
-  Pop-Location
+
+# --- the bundle --------------------------------------------------------------
+# ``react-native bundle`` starts Metro, builds everything, and exits -- so each
+# edit pays for the whole graph, and ``--reset-cache`` threw the transform cache
+# away before it started (measured 109 s here).  A Metro server left running
+# answers the same bundle in 0-1 s, and 3 s after an edit, because only the
+# changed module is transformed.  The server is started on demand and reused by
+# every later run; ``-StopMetro`` shuts it down.
+$MetroPort = if ($env:YOUNG_ROUTER_METRO_PORT) { [int]$env:YOUNG_ROUTER_METRO_PORT } else { 8081 }
+$MetroBase = "http://127.0.0.1:$MetroPort"
+$MetroLog = Join-Path ([System.IO.Path]::GetTempPath()) "young-router-metro-$MetroPort.log"
+
+function Test-MetroServer {
+  try {
+    $response = Invoke-WebRequest -Uri "$MetroBase/status" -UseBasicParsing -TimeoutSec 5
+    return $response.StatusCode -eq 200
+  } catch {
+    return $false
+  }
+}
+
+function Get-MetroServerProcesses {
+  Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue |
+    Where-Object {
+      $_.CommandLine -and
+      $_.CommandLine -match 'react-native[\\/]cli\.js' -and
+      $_.CommandLine -match 'start' -and
+      $_.CommandLine -match "--port\s+$MetroPort(\s|$)"
+    }
+}
+
+function Stop-MetroServer {
+  # Two Metros sharing one cache directory wedge each other, and a server that
+  # stopped answering is worse than none: the next run would wait out its
+  # timeout and bundle twice.  One instance per port, always.
+  $servers = @(Get-MetroServerProcesses)
+  foreach ($server in $servers) { Stop-Process -Id $server.ProcessId -Force -ErrorAction SilentlyContinue }
+  if ($servers.Count -gt 0) {
+    $servers | ForEach-Object {
+      Get-CimInstance Win32_Process -Filter "ParentProcessId = $($_.ProcessId)" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -eq 'node.exe' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    }
+    Start-Sleep -Milliseconds 800
+  }
+  return $servers.Count
+}
+
+function Start-MetroServer {
+  $cli = Join-Path $AppRoot 'node_modules\react-native\cli.js'
+  if (-not (Test-Path -LiteralPath $cli)) { throw "The React Native CLI is missing at $cli." }
+  "starting Metro on port $MetroPort (log: $MetroLog)"
+  # Started straight from node with its output redirected: routed through a
+  # shell that exits, the server loses the stream it writes progress to.
+  Start-Process -FilePath (Get-Command node).Source -WorkingDirectory $AppRoot -WindowStyle Hidden `
+    -ArgumentList @($cli, 'start', '--port', "$MetroPort") `
+    -RedirectStandardOutput $MetroLog -RedirectStandardError "$MetroLog.err" | Out-Null
+}
+
+if ($StopMetro) {
+  $stopped = Stop-MetroServer
+  "stopped $stopped Metro server(s)"
+  exit 0
+}
+
+$bundleSource = 'metro-server'
+if (-not (Test-MetroServer)) {
+  # A listening port that does not answer is the wedged case: replace it.
+  Stop-MetroServer | Out-Null
+  Start-MetroServer
+  $deadline = (Get-Date).AddSeconds(90)
+  while (-not (Test-MetroServer) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+}
+
+if (Test-MetroServer) {
+  $bundleUrl = "$MetroBase/index.bundle?platform=windows&dev=false&minify=false"
+  try {
+    Invoke-WebRequest -Uri $bundleUrl -OutFile $bundle -UseBasicParsing -TimeoutSec 300
+  } catch {
+    throw "Metro did not answer the bundle request: $($_.Exception.Message)"
+  }
+  # The server appends how to find its own source map; the file host reads a
+  # bundle, not a session, and the two trailing lines make the artifact it was
+  # handed differ from the one ``react-native bundle`` writes -- which is what
+  # the Release host aborts on, since it has no red box to show.  They point at
+  # this server anyway, so the bundle is left exactly as the packager wrote it.
+  $fetched = [System.IO.File]::ReadAllText($bundle)
+  $trimmed = ($fetched -split "`n" | Where-Object { $_ -notmatch '^//# sourceMappingURL=' -and $_ -notmatch '^//# sourceURL=' }) -join "`n"
+  if ($trimmed.Length -ne $fetched.Length) {
+    [System.IO.File]::WriteAllText($bundle, $trimmed)
+  }
+  # ``--assets-dest`` is the one thing the HTTP response does not do: a file
+  # bundle resolves an image from the Bundle directory, so an asset that changed
+  # has to be copied beside it.  The packager mirrors ``rn\packages\...`` as
+  # ``assets\__packages\...``, and a UI edit usually touches none of them -- the
+  # copy compares content first and writes only what differs.  Only the two
+  # source roots are walked: recursing ``rn\apps`` reads every file in
+  # ``node_modules`` on each run, which cost more than the bundle it was
+  # refreshing.
+  $packagerRoot = Join-Path $Tree 'rn'
+  $assetRoots = @((Join-Path $packagerRoot 'packages\shared\src'), (Join-Path $packagerRoot 'apps\windows\src'))
+  foreach ($root in $assetRoots) {
+    if (-not (Test-Path -LiteralPath $root)) { continue }
+    foreach ($asset in Get-ChildItem -LiteralPath $root -Recurse -File -Include *.png, *.jpg, *.jpeg, *.gif, *.webp, *.ttf, *.otf -ErrorAction SilentlyContinue) {
+      $relative = $asset.FullName.Substring($packagerRoot.Length).TrimStart('\')
+      $target = Join-Path $bundleDirectory ("assets\__" + $relative)
+      if ((Test-Path -LiteralPath $target) -and
+          (Get-Item -LiteralPath $target).Length -eq $asset.Length) {
+        if ((Get-FileHash -LiteralPath $target).Hash -eq (Get-FileHash -LiteralPath $asset.FullName).Hash) { continue }
+      }
+      New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+      Copy-Item -LiteralPath $asset.FullName -Destination $target -Force
+    }
+  }
+} else {
+  # No server and none could be started: the one-shot packager is still correct,
+  # it just costs the whole graph.  Any half-started server is stopped first, so
+  # the two never share a transform cache.
+  Stop-MetroServer | Out-Null
+  $bundleSource = 'react-native bundle'
+  Push-Location $AppRoot
+  try {
+    & pnpm exec react-native bundle --platform windows --entry-file index.js --bundle-output $bundle --assets-dest $bundleDirectory --dev false --minify false
+    if ($LASTEXITCODE -ne 0) { throw "Metro failed to build the bundle (exit $LASTEXITCODE)." }
+  } finally {
+    Pop-Location
+  }
 }
 $bundleInfo = Get-Item -LiteralPath $bundle
-"bundled $($bundleInfo.Length) bytes into $bundle"
+"bundled $($bundleInfo.Length) bytes into $bundle ($bundleSource)"
 
 if ($NoRestart) { 'left the running app alone (-NoRestart)'; exit 0 }
 if (-not $package) { throw 'YoungRouter is not registered, so there is no app to restart.' }
@@ -301,7 +502,14 @@ foreach ($name in 'python', 'node') {
 }
 Start-Sleep -Seconds 2
 $started = Get-Date
-Start-Process ("shell:AppsFolder\{0}!App" -f $package.PackageFamilyName)
+# ``shell:AppsFolder`` needs the shell to resolve it: Windows PowerShell does
+# that, PowerShell 7 does not unless it is told to.
+$packageTarget = "shell:AppsFolder\{0}!App" -f $package.PackageFamilyName
+try {
+  Start-Process -FilePath $packageTarget -ErrorAction Stop
+} catch {
+  Start-Process -FilePath 'explorer.exe' -ArgumentList $packageTarget
+}
 $app = $null
 while (((Get-Date) - $started).TotalSeconds -lt 60) {
   Start-Sleep -Milliseconds 300

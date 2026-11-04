@@ -109,10 +109,30 @@ def prune_python_runtime(runtime: Path) -> None:
                 (parent / name).unlink(missing_ok=True)
 
 
+def prune_vendored_repository_data(adapters: Path) -> None:
+    """Drop the git metadata a staged upstream may still be carrying.
+
+    The stagers clone a release tag and delete ``.git`` from the payload they
+    publish, but a staging cache staged before that rule keeps the checkout it
+    wrote: ``reused_staged_release`` matches the recorded version and files, not
+    the absence of a repository.  Sixty-five megabytes of packfile rode into the
+    MSIX that way, and the same bytes are packed again on every build.
+    """
+
+    if not adapters.is_dir():
+        return
+    for directory, names, _files in os.walk(adapters, topdown=True, followlinks=False):
+        for name in list(names):
+            if name == ".git":
+                _remove(Path(directory) / name)
+                names.remove(name)
+
+
 def prune_core(core: Path) -> None:
     adapters = core / "young_router" / "adapters"
     for package in ("connect-workbuddy", "dsh-vision-router", "our-free-model"):
         prune_node_tree(adapters / package)
+    prune_vendored_repository_data(adapters)
     prune_python_runtime(core / "runtime" / "bin")
 
 

@@ -154,8 +154,22 @@ def _install_node(node_output: Path, *, source: str | None, index_url: str, arch
             return "copied"
         version = "copied"
     else:
-        version, filename, executable = _node_release(index_url)
+        marker = node_output / "NODE_VERSION"
+        try:
+            version, filename, executable = _node_release(index_url)
+        except UpdateError:
+            # The index is a network read; the binary it led to last time is
+            # already on disk, and its version is exactly what the lookup would
+            # have to confirm.  Reusing it is the difference between a build
+            # that stages its runtime and one that stops on a TLS handshake.
+            staged = _staged_node_version(node_output, executable)
+            if staged is None:
+                raise
+            return f"{staged} (cached)"
         target = node_output / executable
+        staged = _staged_node_version(node_output, executable)
+        if staged == version:
+            return version
         if archive_url:
             url = archive_url
         else:
@@ -171,7 +185,29 @@ def _install_node(node_output: Path, *, source: str | None, index_url: str, arch
     if target.exists():
         target.unlink()
     temporary.replace(target)
+    if version != "copied":
+        # What the next build compares against before it downloads anything.
+        (node_output / "NODE_VERSION").write_text(f"{version}\n", encoding="utf-8")
     return version
+
+
+def _staged_node_version(node_output: Path, executable: str) -> str | None:
+    """The version already staged in ``node_output``, when it is a usable one.
+
+    A binary without its marker is not reusable: the marker is what says which
+    release it is, and a file of the right size with the wrong version would
+    pin the build to a runtime nobody resolved.
+    """
+
+    target = node_output / executable
+    marker = node_output / "NODE_VERSION"
+    if not target.is_file() or target.stat().st_size < 1024 * 1024 or not marker.is_file():
+        return None
+    try:
+        version = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return version if NODE_VERSION_PATTERN.match(version) else None
 
 
 

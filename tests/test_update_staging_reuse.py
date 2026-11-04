@@ -512,6 +512,89 @@ class NodeRuntimeStagingTests(unittest.TestCase):
         self.assertTrue(mode & 0o111, "the staged Node must stay executable")
 
 
+class NodeRuntimeCacheTests(unittest.TestCase):
+    """A downloaded Node runtime is reused by the version it recorded.
+
+    The runtime stager used to land in a fresh GUID directory every build, so
+    the marker it never wrote was never needed: each build resolved the index
+    and downloaded the archive again.  Staged into the shared cache, the marker
+    is what lets a build skip both -- and what decides, when the index is
+    reachable, that a newer 22.x still replaces it.
+    """
+
+    def setUp(self) -> None:
+        self.directory = Path(tempfile.mkdtemp(prefix="young-router-node-cache-test-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.directory, ignore_errors=True))
+        self.output = self.directory / "node-runtime"
+        self.binary = b"\x4d\x5a" + b"n" * (1024 * 1024 + 8)
+        self.downloads: list[str] = []
+
+    def install(self, version: str = "v22.23.4", *, index: Exception | None = None) -> str:
+        executable = node_runtime._node_target()[2]
+
+        def release(*_arguments: object, **_keywords: object) -> tuple[str, str, str]:
+            if index is not None:
+                raise index
+            return (version, "node.zip", executable)
+
+        def download(url: str, **_keywords: object) -> bytes:
+            self.downloads.append(url)
+            return b"archive"
+
+        with mock.patch.object(node_runtime, "_node_release", side_effect=release), mock.patch.object(
+            node_runtime, "_request_bytes", side_effect=download
+        ), mock.patch.object(node_runtime, "_extract_node_bytes", return_value=self.binary):
+            return node_runtime._install_node(
+                self.output,
+                source=None,
+                index_url="https://node.invalid/index.json",
+                archive_url=None,
+            )
+
+    def test_the_first_install_downloads_and_records_the_version(self) -> None:
+        executable = node_runtime._node_target()[2]
+        self.assertEqual(self.install(), "v22.23.4")
+        self.assertEqual((self.output / executable).read_bytes(), self.binary)
+        self.assertEqual((self.output / "NODE_VERSION").read_text().strip(), "v22.23.4")
+        self.assertEqual(len(self.downloads), 1)
+
+    def test_a_repeat_install_of_the_same_version_downloads_nothing(self) -> None:
+        executable = node_runtime._node_target()[2]
+        self.install()
+        before = (self.output / executable).stat().st_mtime_ns
+        self.assertEqual(self.install(), "v22.23.4")
+        self.assertEqual(len(self.downloads), 1, self.downloads)
+        self.assertEqual((self.output / executable).stat().st_mtime_ns, before)
+
+    def test_a_resolved_newer_version_replaces_the_staged_binary(self) -> None:
+        self.install()
+        self.assertEqual(self.install(version="v22.24.0"), "v22.24.0")
+        self.assertEqual(len(self.downloads), 2)
+        self.assertEqual((self.output / "NODE_VERSION").read_text().strip(), "v22.24.0")
+
+    def test_an_unreachable_index_reuses_the_recorded_version(self) -> None:
+        # The index only names the release; the runtime it led to last time is
+        # already staged and its marker answers the same question.
+        self.install()
+        self.assertEqual(
+            self.install(index=update_common.UpdateError("offline")), "v22.23.4 (cached)"
+        )
+        self.assertEqual(len(self.downloads), 1)
+
+    def test_a_binary_without_its_version_marker_is_not_reused(self) -> None:
+        self.install()
+        (self.output / "NODE_VERSION").unlink()
+        with self.assertRaises(update_common.UpdateError):
+            self.install(index=update_common.UpdateError("offline"))
+
+    def test_a_truncated_staged_binary_is_not_reused(self) -> None:
+        executable = node_runtime._node_target()[2]
+        self.install()
+        (self.output / executable).write_bytes(b"\x4d\x5a")
+        with self.assertRaises(update_common.UpdateError):
+            self.install(index=update_common.UpdateError("offline"))
+
+
 class BunRuntimeStagingTests(unittest.TestCase):
     """The Bun runtime the free lane needs is resolved, extracted, and kept.
 
@@ -601,6 +684,34 @@ class BunRuntimeStagingTests(unittest.TestCase):
         with self.assertRaises(update_common.UpdateError):
             self.stage()
         self.assertFalse((self.output / "bun").exists())
+
+    def test_an_unreachable_registry_reuses_the_staged_release(self) -> None:
+        # Resolution exists to name the release; the staged binary and its
+        # marker are the same answer whenever the release has not moved.
+        with mock.patch.object(
+            bun_runtime, "_platform_package", return_value=("@oven/bun-darwin-arm64", "bun")
+        ):
+            self.stage()
+            before = (self.output / "bun").stat().st_mtime_ns
+            with mock.patch.object(
+                bun_runtime, "package_metadata", side_effect=update_common.UpdateError("offline")
+            ):
+                self.assertEqual(
+                    bun_runtime.update(self.output, license_path=self.license), "1.4.4 (cached)"
+                )
+            self.assertEqual((self.output / "bun").stat().st_mtime_ns, before)
+
+    def test_a_staged_binary_without_its_licence_is_not_reused(self) -> None:
+        with mock.patch.object(
+            bun_runtime, "_platform_package", return_value=("@oven/bun-darwin-arm64", "bun")
+        ):
+            self.stage()
+            (self.output / "BUN_LICENSE").unlink()
+            with mock.patch.object(
+                bun_runtime, "package_metadata", side_effect=update_common.UpdateError("offline")
+            ):
+                with self.assertRaises(update_common.UpdateError):
+                    bun_runtime.update(self.output, license_path=self.license)
 
 
 class OurFreeModelStagingTests(unittest.TestCase):
