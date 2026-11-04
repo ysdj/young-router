@@ -8635,9 +8635,13 @@ class ProvidersModelsDomain:
             if "changed on disk" in message:
                 raise DomainError("Provider/model configuration changed on disk; reload and try again") from None
             raise _safe_problem(exc, "Provider/model configuration could not be saved") from None
-        self.reload()
+        self._reload_document()
         self._model_edit_existing_key_ids.clear()
-        return {"applied": True, **self.snapshot()}
+        # The answer is deliberately ``applied`` alone.  ``CoreStore.apply``
+        # projects every domain once, for the window's own read, after this
+        # commit -- so returning this domain's projection here built it a second
+        # time for an answer nothing read.
+        return {"applied": True}
 
     def _current_disk_revision(self) -> object:
         from ...config.schema import _config_revision
@@ -8678,6 +8682,18 @@ class ProvidersModelsDomain:
         return self.snapshot()
 
     def reload(self) -> dict[str, Any]:
+        self._reload_document()
+        return self.snapshot()
+
+    def _reload_document(self) -> None:
+        """Re-read the document into this domain's draft, without projecting it.
+
+        ``reload`` answers a caller with the projection; a commit does not need
+        it, because ``CoreStore.apply`` builds the window's projection once
+        after every domain has committed.  Composing the projection here as well
+        made one click build it three times.
+        """
+
         provider_bindings, model_bindings = self._editor_id_bindings()
         loaded = self._load()
         self._normalize_provider_model_bindings(loaded["providers"])
@@ -8693,7 +8709,6 @@ class ProvidersModelsDomain:
         # the document this reload just read has no such write behind it.
         self._binding_issues = []
         self.revision += 1
-        return self.snapshot()
 
     def export(self, *, include_sensitive: bool = False) -> dict[str, Any]:
         if include_sensitive:

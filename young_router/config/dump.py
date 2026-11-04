@@ -69,10 +69,35 @@ from .schema import (
     infer_upstream_fallback_surface,
 )
 
+_DECIMAL_TEXT = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)\Z")
+
+
 def _parse_scalar(text: str) -> Any:
+    """One editor scalar, without paying a YAML scan for a plain number.
+
+    Every route states an order and many state a concurrency cap, so this ran
+    once per route per document render -- and a document render happens inside
+    every Apply, every save, and every validation.  A bare decimal is the case
+    that dominates and it is exactly the case YAML resolves without any of its
+    machinery, so it is answered directly.  Everything else still goes through
+    the loader, which is what keeps ``true``, ``1e3``, ``~``, and quoted text
+    meaning what the file says.
+    """
+
     stripped = text.strip()
     if not stripped:
         return None
+    if _DECIMAL_TEXT.match(stripped) is not None:
+        if "." in stripped:
+            try:
+                value = float(stripped)
+            except ValueError:
+                return stripped
+            return value if math.isfinite(value) else stripped
+        try:
+            return int(stripped)
+        except ValueError:
+            return stripped
     try:
         return yaml.load(stripped, Loader=_YAML_LOADER)
     except Exception:

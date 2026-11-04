@@ -73,6 +73,18 @@ CORE_PID_ENV = "YOUNG_ROUTER_CORE_PID"
 OWNER_TOKEN_BYTES = 32
 MACOS_DEFAULT_WORKERS = "16"
 SERVICE_STATUS_CACHE_SECONDS = 10.0
+#: How long one liveness probe may hold a caller.  A probe crosses a loopback
+#: socket to a process that may be mid-import, so an unanswered one used to cost
+#: the full 0.5 s wait -- and *every* window's snapshot paid it, once per read,
+#: because a negative answer is deliberately not cached.  A proxy that answers
+#: does so in about a millisecond, so this bound is two orders of magnitude above
+#: the healthy case while keeping one stalled probe inside a window's budget.
+SERVICE_HEALTH_PROBE_TIMEOUT_SECONDS = 0.15
+#: A hung probe is not evidence about the proxy, so it is remembered for a
+#: moment instead of being re-paid at once: a boot that holds the port before it
+#: can answer would otherwise cost every window a probe per poll.  A *positive*
+#: answer keeps its own, much longer memo (``SERVICE_STATUS_CACHE_SECONDS``).
+SERVICE_HEALTH_MISS_CACHE_SECONDS = 1.0
 # Upper bound for the configurable start/restart health wait. The Runtime
 # Settings schema documents the same 1..600 second range; a larger host
 # environment value must not hold a failed start open indefinitely.
@@ -1152,16 +1164,29 @@ class CoreServiceController:
         connection refusal that costs a full TCP setup per window per poll.
         A *positive* answer is reused for a moment because a proxy that just
         answered cannot have stopped without this process knowing -- an
-        operation here, or the death its own next liveness check reports.  A
-        negative one is never reused: that probe is what notices a proxy which
-        started while no window was waiting on the start itself.
+        operation here, or the death its own next liveness check reports.
+
+        A negative answer is what notices a proxy which started while no window
+        was waiting on the start itself, so it cannot be reused for long.  It is
+        still reused for ``SERVICE_HEALTH_MISS_CACHE_SECONDS``: a probe against a
+        port a booting master has bound but cannot yet answer is a *timeout*, and
+        charging that to every open window's poll made the whole settings shell
+        unresponsive for as long as the boot lasted.  The probe itself is bounded
+        by ``SERVICE_HEALTH_PROBE_TIMEOUT_SECONDS`` for the same reason.
         """
 
         target_port = self._effective_port() if port is None else port
         memo = self._health_cache
         now = time.monotonic()
-        if memo is not None and memo[0] == target_port and memo[2] and now - memo[1] < SERVICE_STATUS_CACHE_SECONDS:
-            return True
+        if memo is not None and memo[0] == target_port:
+            if memo[2] and now - memo[1] < SERVICE_STATUS_CACHE_SECONDS:
+                return True
+            # A refusal or a timeout is not a settled answer about a proxy that
+            # is still booting.  It is still reused for one short moment, so a
+            # port held by a master that has not finished importing is not
+            # charged to every open window's poll at once.
+            if not memo[2] and now - memo[1] < SERVICE_HEALTH_MISS_CACHE_SECONDS:
+                return False
         request = urllib.request.Request(
             f"http://127.0.0.1:{target_port}/health/liveliness",
             headers=browser_request_headers(),
@@ -1169,7 +1194,7 @@ class CoreServiceController:
         )
         try:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open(request, timeout=0.5) as response:
+            with opener.open(request, timeout=SERVICE_HEALTH_PROBE_TIMEOUT_SECONDS) as response:
                 status = getattr(response, "status", None)
                 if status is None:
                     status = response.getcode()

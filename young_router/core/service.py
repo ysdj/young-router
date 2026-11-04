@@ -1557,13 +1557,27 @@ class CoreStore:
         instead of asking for the same projection twice: Apply already answers
         its caller with one, and rebuilding it under this lock only to serialize
         it for the fan-out was half of a commit's cost.
+
+        Nothing is projected when no window is listening.  A background launch,
+        a closed settings window, and the gap while a window reloads all publish
+        to nobody, and building a projection those callers would each discard is
+        the same waste a second parse would be: the work is only worth doing for
+        a reader that exists.
+
+        The live service row is refreshed either way.  That read is a side effect
+        of the projection rather than of publishing -- the commit's own restart
+        decision asks whether the proxy is running, and it is this refresh that
+        keeps that answer current -- so it is kept explicit here instead of
+        riding along on work nobody consumes.  It is a memoized read, cheap
+        enough to pay on every commit.
         """
 
-        projected = self.snapshot() if snapshot is None else snapshot
-        event = make_event("snapshot", projected["revision"], projected)
         callbacks = tuple(self._subscribers.values())
         if not callbacks:
+            self._service_row_is_live()
             return
+        projected = self.snapshot() if snapshot is None else snapshot
+        event = make_event("snapshot", projected["revision"], projected)
         # One serialization, then each subscriber gets its own parse of the
         # same bytes: a window that mutates its copy must not reach another's,
         # and a deepcopy of the whole projection was slower than the JSON the
@@ -1618,11 +1632,46 @@ class CoreStore:
             # already described the reload, so a window saw the file's new
             # generation beside the values that file replaced.
             self._refresh_external_disk_state()
+            # A domain that reads the outside world on this path takes that read
+            # here, for the same reason: the memo is a function of the shared
+            # revision, and an observation of a proxy that changed on its own is
+            # not.  Bumping the revision is what invalidates the memo below.
+            self._refresh_live_domain_state()
             cached = self._snapshot_cache
             if cached is None or cached[0] != self._revision:
                 cached = (self._revision, self._project_domains())
                 self._snapshot_cache = cached
             return self._assemble_snapshot(cached[1])
+
+    def _refresh_live_domain_state(self) -> None:
+        """Let each domain take the outside read its projection represents.
+
+        A projection is memoized on the shared revision, so anything a domain
+        reads from *outside* this process must run before the memo is consulted
+        or it runs once per revision instead of once per window read.  The
+        managed Codex catalog is the case that matters: its repair needs two
+        consecutive endpoint observations, and a memoized observation is a
+        single one forever.  The caller holds ``self._lock``.
+        """
+
+        for name, adapter in self._domains.items():
+            observe = getattr(adapter, "refresh_live_state", None)
+            if not callable(observe):
+                continue
+            try:
+                changed = bool(observe())
+            except Exception:
+                # A live read is a projection input, never a reason to fail the
+                # snapshot a window is waiting on.  The domain answers with
+                # whatever its last observation established.
+                continue
+            if changed:
+                self._revision += 1
+                self._snapshot_cache = None
+                try:
+                    self._persist_metadata()
+                except PersistenceError:
+                    pass
 
     def _service_row_is_live(self) -> None:
         """Project the controller's live answer into this read.

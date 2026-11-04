@@ -2074,6 +2074,88 @@ class ServiceStatusProjectionTests(unittest.TestCase):
 
             self.assertEqual(1, health.call_count)
 
+    def test_a_liveness_probe_cannot_hold_a_window_for_half_a_second(self) -> None:
+        """A booting proxy holds its port long before it can answer on it.
+
+        The probe crossed a loopback socket with a 0.5 s wait, and a *negative*
+        answer is deliberately not cached long, so every open window's snapshot
+        paid that wait once per poll for as long as the boot lasted.  The proxy
+        answers a healthy probe in about a millisecond, so the bound is far
+        above the healthy case and well inside one window's budget.
+        """
+
+        from young_router.core import operations as operations_module
+
+        self.assertLessEqual(
+            operations_module.SERVICE_HEALTH_PROBE_TIMEOUT_SECONDS, 0.2
+        )
+        self.assertGreaterEqual(
+            operations_module.SERVICE_HEALTH_PROBE_TIMEOUT_SECONDS, 0.05
+        )
+
+    def test_a_timed_out_probe_is_not_repaid_by_every_poll(self) -> None:
+        """A silent port must not cost one full timeout per snapshot."""
+
+        import socket
+        import threading
+
+        from young_router.core.operations import CoreServiceController
+
+        # A listener that accepts and never answers: a master still importing
+        # its runtime looks exactly like this from the outside.
+        server = socket.socket()
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(64)
+        held: list[socket.socket] = []
+
+        def accept() -> None:
+            while True:
+                try:
+                    held.append(server.accept()[0])
+                except OSError:
+                    return
+
+        threading.Thread(target=accept, daemon=True).start()
+
+        def cleanup() -> None:
+            server.close()
+            for item in held:
+                try:
+                    item.close()
+                except OSError:
+                    pass
+
+        self.addCleanup(cleanup)
+        port = server.getsockname()[1]
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(Path(directory))
+            with mock.patch.object(controller, "_pid", return_value=os.getpid()), \
+                    mock.patch.object(controller, "_effective_port", return_value=port), \
+                    mock.patch.object(
+                        controller, "_recorded_proxy_within_startup_grace", return_value=True
+                    ):
+                started = time.perf_counter()
+                first = controller.status(force=False)
+                first_ms = (time.perf_counter() - started) * 1000.0
+                started = time.perf_counter()
+                second = controller.status(force=False)
+                second_ms = (time.perf_counter() - started) * 1000.0
+
+        self.assertEqual("starting", first["state"])
+        self.assertEqual("starting", second["state"])
+        self.assertLess(
+            first_ms,
+            250.0,
+            "one probe may not hold a window for more than its own budget",
+        )
+        self.assertLess(
+            second_ms,
+            50.0,
+            "an unanswered probe was paid again by the next read",
+        )
+
 
 if __name__ == "__main__":
 
