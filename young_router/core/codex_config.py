@@ -9,6 +9,7 @@ and JSON on the right always round-trip.  ``sync`` never writes to CODEX_HOME;
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -244,27 +245,174 @@ def _remove_legacy_forced_token_budget(
     return config_text
 
 
-def local_port() -> str:
+MANAGED_OWNER_FILENAME = "litellm.owner"
+MANAGED_PORT_FILENAME = "litellm.port"
+
+
+def _pid_is_running(pid: int) -> bool:
+    """Whether a recorded pid still exists.
+
+    The answer decides which address a client document is written with, so an
+    unknown pid reads as "gone": a stale record may not outvote the preference.
+    """
+
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        # The Core already owns the one portable Windows probe.
+        try:
+            from .operations import CoreServiceController
+
+            return CoreServiceController._process_alive(pid)
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _recorded_service_port(config_path: pathlib.Path | None = None) -> str | None:
+    """The port the managed proxy actually bound, while that proxy runs.
+
+    ``LITELLM_PORT`` is a *preference*: a port something else already holds
+    makes the managed service step forward, and the port it bound is recorded
+    beside the owner record (``RuntimePaths.port``).  Writing a client document
+    from the preference then names an address nothing listens on, and the
+    client waits out a turn that never reaches the proxy -- observed live
+    2026-11-04, a leftover benchmark proxy held 12390 while this installation's
+    proxy ran on 12391, so Codex streamed no thinking and no answer at all.
+    The recorded port wins only while the pid that recorded it is alive, so a
+    crashed service cannot pin the next start to its port.
+    """
+
+    if config_path is None and not (
+        os.environ.get("LITELLM_RUNTIME_ROOT", "").strip()
+        or os.environ.get("YOUNG_ROUTER_HOME", "").strip()
+    ):
+        # Nothing names the installation this process belongs to, so a record
+        # under the default root is somebody else's (a test's fixture root, a
+        # second install): the preference is the only local answer here.
+        return None
+    try:
+        from ..config_paths import RUNTIME_DIRECTORY, runtime_root
+
+        # The records sit beside the staged document the proxy loads, so a
+        # caller that names its own document reads its own installation's
+        # records rather than the ones under the default root.
+        runtime = (
+            pathlib.Path(config_path).expanduser().resolve().parent
+            if config_path is not None
+            else runtime_root() / RUNTIME_DIRECTORY
+        )
+        owner = json.loads(
+            (runtime / MANAGED_OWNER_FILENAME).read_text(encoding="utf-8")
+        )
+        port = (runtime / MANAGED_PORT_FILENAME).read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+    pid = owner.get("pid") if isinstance(owner, dict) else None
+    if not isinstance(pid, int) or not _pid_is_running(pid):
+        return None
+    return port if port.isdigit() and 0 < int(port) < 65536 else None
+
+
+def local_port(config_path: pathlib.Path | None = None) -> str:
+    recorded = _recorded_service_port(config_path)
+    if recorded is not None:
+        return recorded
     value = os.environ.get("LITELLM_PORT", DEFAULT_PORT).strip()
     return value if value.isdigit() and 0 < int(value) < 65536 else DEFAULT_PORT
 
 
-def local_base_url() -> str:
-    return f"http://127.0.0.1:{local_port()}/v1"
+def local_base_url(config_path: pathlib.Path | None = None) -> str:
+    return f"http://127.0.0.1:{local_port(config_path)}/v1"
 
 
 def load_yaml(path: pathlib.Path) -> dict[str, Any]:
+    """Parse one provider document, reusing the parse of unchanged bytes.
+
+    The answer is the caller's own copy.  The cached document is shared by
+    every reader in this process, and the provider editor's own path hands the
+    parse to writers; one that mutated a shared tree would silently change what
+    the next reader believes the file says.  A deep copy of a parse that has
+    already happened costs ~0.3 ms, against ~25 ms for the parse itself.
+    """
+
+    return copy.deepcopy(_load_yaml_text(_read_yaml_text(path)))
+
+
+#: A document larger than this is parsed on every read rather than retained, so
+#: a pathological file cannot pin memory for the process lifetime.  The parse
+#: itself is shared through ``config.schema``'s cache, which is the one every
+#: reader of this document already goes through.
+_YAML_CACHE_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _read_yaml_text(path: pathlib.Path) -> tuple[str, None]:
+    """Read one document and report its text beside the cache key it has none of.
+
+    The key is deliberately unused: ``config.schema`` keys its parse cache on the
+    text itself, so this module does not need a second identity for the same
+    bytes.  The pair is kept because a caller that already holds the text (a
+    staged draft, a document being rewritten) hands it on unchanged.
+    """
+
     try:
-        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
     except OSError:
         raise EditorError("Could not read the LiteLLM config") from None
-    except yaml.YAMLError:
-        # PyYAML exceptions often include the offending source line.  That
-        # source can contain a key, so never send the parser's text onward.
+    return text, None
+
+
+def _load_yaml_text(read: tuple[str, str | None]) -> dict[str, Any]:
+    """Parse one provider document, reusing the last parse of the same bytes.
+
+    The parse is ``config.schema``'s: it caches by the document's own text and
+    already answers the settings editor, the dumper, and the loader.  This module
+    used to keep a second cache beside it, keyed on the same bytes, so a commit
+    that validated the candidate and then read the key it wrote parsed one
+    document twice -- once per cache.  One cache means one parse for every reader
+    in the process.
+    """
+
+    text, _key = read
+    from ..config.schema import safe_load_yaml_text
+
+    try:
+        loaded = safe_load_yaml_text(text, "LiteLLM config")
+    except ValueError as exc:
+        # ``safe_load_yaml_text`` reports the reason without the source line;
+        # pass its own sentence on rather than the parser's, which can carry a
+        # credential from the document it refused.
+        message = str(exc)
+        if "must be a YAML mapping" in message:
+            raise EditorError("LiteLLM config must be a YAML mapping") from None
         raise EditorError("LiteLLM config is not valid YAML") from None
     if not isinstance(loaded, dict):
         raise EditorError("LiteLLM config must be a YAML mapping")
     return loaded
+
+
+def master_key_document(text: str) -> dict[str, Any] | None:
+    """One already-parsed document for ``text``, or None when it cannot be.
+
+    The runtime domain reads the master key straight out of ``config.yaml``,
+    which is the same document the Codex editor parses moments earlier in the
+    same request.  This answers that shared parse; a caller whose text is not a
+    mapping (a malformed document, a staging failure) gets None and keeps its
+    own fallback.
+    """
+
+    try:
+        return _load_yaml_text((text, None))
+    except Exception:
+        return None
 
 
 def local_api_key(config: dict[str, Any]) -> str:

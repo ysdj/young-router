@@ -1165,7 +1165,7 @@ class CodexSettingsDomain:
         try:
             from ._shared import local_proxy_endpoint
 
-            self._local_api_base_url = local_proxy_endpoint()[0]
+            self._local_api_base_url = local_proxy_endpoint(self.runtime_config_path)[0]
         except Exception:
             self._local_api_base_url = None
 
@@ -1291,6 +1291,27 @@ class CodexSettingsDomain:
     def snapshot(self) -> dict[str, Any]:
         self._ensure_model_catalog_current(require_stable_repair=True)
         return self._safe_snapshot(self._draft, self.revision)
+
+    def refresh_live_state(self) -> bool:
+        """Take the endpoint observation a snapshot represents, without projecting.
+
+        ``CoreStore.snapshot`` memoizes every domain projection on the shared
+        revision, which is right: a projection is a function of the domains'
+        state.  A *read of the outside world* is not, and this one used to live
+        inside ``snapshot()``, so it ran once per revision instead of once per
+        read.  The stability gate that keeps a worker reload from rewriting the
+        client's model list needs two *consecutive observations*, and the second
+        one never happened while nothing else moved the revision -- so an enabled
+        catalog quietly stopped following the proxy's model set.
+
+        ``snapshot`` keeps its own call: a caller that holds a domain directly
+        still observes.  It is idempotent within the probe's own rate limit, so
+        the two calls made for one Core read count once.
+        """
+
+        before = self.revision
+        self._ensure_model_catalog_current(require_stable_repair=True)
+        return self.revision != before
 
     def draft_state(self) -> object:
         # Live model-catalog metadata is refreshed from LiteLLM while the
@@ -1914,7 +1935,10 @@ class CodexSettingsDomain:
         from ._shared import local_proxy_endpoint
 
         previous_base_url = self._local_api_base_url
-        base_url, key = local_proxy_endpoint()
+        # Resolved against this installation's own records, so a start that had
+        # to step past an occupied port rewrites the client onto the port it
+        # actually bound instead of the preference the document already names.
+        base_url, key = local_proxy_endpoint(self.runtime_config_path)
         self._local_api_base_url = base_url
         structured = self._draft.get("structured")
         structured = structured if isinstance(structured, Mapping) else {}

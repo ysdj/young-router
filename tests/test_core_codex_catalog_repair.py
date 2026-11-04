@@ -25,7 +25,16 @@ CONFIG = ("providers:\n"
           "      api_base: https://example.test/v1\n"
           "      api_key: synthetic-key\n"
           "litellm_settings:\n"
-          "  public_model_groups: [public-a]\n")
+          "  public_model_groups: [public-a]\n"
+          # The catalog source is the proxy's authenticated ``/v1/models``, so
+          # reading it needs the key a client would present.  A document whose
+          # ``master_key`` cannot be read is refused on purpose -- returning a
+          # placeholder would make the client's own request fail with a
+          # database error -- and that refusal is what made every test in this
+          # module report "Young Router is not running or exposes no models"
+          # no matter what the endpoint stub answered.
+          "general_settings:\n"
+          "  master_key: sk-synthetic-master\n")
 
 
 class CodexCatalogRepairTests(unittest.TestCase):
@@ -80,6 +89,11 @@ class CodexCatalogRepairTests(unittest.TestCase):
             "        value: synthetic-key\n"
             f"model_list:\n{entries}"
             f"litellm_settings:\n  public_model_groups: [{groups}]\n"
+            # See CONFIG: the catalog source is the proxy's authenticated
+            # ``/v1/models``, and a document without a readable master key is
+            # refused before the endpoint stub is ever consulted.
+            "general_settings:\n"
+            "  master_key: sk-synthetic-master\n"
         )
 
     def test_catalog_switch_answers_without_a_restart_field(self) -> None:
@@ -323,6 +337,9 @@ class CodexCatalogRepairTests(unittest.TestCase):
             for names in (stable_models[:-1], stable_models, stable_models[:-1], stable_models):
                 endpoint["models"] = list(names)
                 self._force_catalog_observation(domain)
+                # The config document is what allowlists the exposure, so the
+                # test has to write the same set it claims the endpoint serves.
+                config.write_text(self._config_with_models(list(names)), encoding="utf-8")
                 domain.snapshot()
 
             self.assertEqual(stable_models, catalog_model_names(catalog_path))

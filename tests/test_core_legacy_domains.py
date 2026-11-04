@@ -54,6 +54,14 @@ litellm_settings:
   public_model_groups: [default-chat]
 future_top_level:
   keep: true
+# The Codex catalog source is the proxy's authenticated ``/v1/models``, so it
+# needs the key a client would present.  ``local_api_key`` deliberately refuses
+# a document whose key it cannot read -- answering with the built-in placeholder
+# makes the request fail as a database error instead -- and that refusal made the
+# catalog tests report "Young Router is not running or exposes no models"
+# whatever their endpoint stub answered.
+general_settings:
+  master_key: sk-synthetic-master
 """
 
 
@@ -1772,16 +1780,29 @@ class ProvidersModelsDomainTests(unittest.TestCase):
         """A read timeout is the verdict; only a dropped connection is retried."""
         attempts: list[str] = []
 
+        # The probe floors its own budget at one second however small a value
+        # the environment names, so the surface has to be slower than *that*
+        # floor, not slower than the value below.  A handler that slept exactly
+        # one second raced the floor and reported a late answer as ``ok``
+        # whenever the machine was idle enough to deliver it, which made this
+        # test pass on a loaded host and fail on a quiet one.
+        slow_seconds = 3.0
+
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self) -> None:  # noqa: N802 - stdlib handler hook
                 attempts.append(self.path)
-                time.sleep(1.0)
+                time.sleep(slow_seconds)
                 body = b'{"id": "late", "output": []}'
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except OSError:
+                    # The probe hung up on schedule; the handler's own write is
+                    # not what this test is about.
+                    pass
 
             def log_message(self, _format: str, *_args: object) -> None:
                 return
@@ -3391,6 +3412,8 @@ class CodexSettingsDomainTests(unittest.TestCase):
                           api_key: "replace-me-secret"
                     litellm_settings:
                       public_model_groups: [model-a, model-b]
+                    general_settings:
+                      master_key: sk-synthetic-master
                     """
                 ).lstrip(),
                 encoding="utf-8",

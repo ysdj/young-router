@@ -1349,5 +1349,161 @@ class LocalApiKeyTests(unittest.TestCase):
             )
 
 
+class ProviderDocumentParseCacheTests(unittest.TestCase):
+    """One request reads the provider document many times; parse it once.
+
+    The Codex editor's runtime context, its saved-route list, the local proxy
+    endpoint, the runtime domain's master key, and the service port each read
+    ``config.yaml`` while one settings commit runs.  Every one of those used to
+    pay a full PyYAML parse of the same bytes, which is what put a
+    quarter-second parse behind a single click.
+
+    The parse is shared through ``config.schema``'s cache, the one this app's
+    editor, dumper, and loader already use, so a document validated by the
+    settings editor and then read by the Codex pane costs one parse in total.
+    """
+
+    def setUp(self) -> None:
+        from young_router.config import schema as config_schema
+
+        # A cache carried over from another test would make this pass without
+        # the read it is measuring ever happening.
+        self._schema = config_schema
+        self._saved = dict(config_schema._yaml_text_parsed)
+        config_schema._yaml_text_parsed.clear()
+        self.addCleanup(self._restore)
+
+    def _restore(self) -> None:
+        self._schema._yaml_text_parsed.clear()
+        self._schema._yaml_text_parsed.update(self._saved)
+
+    def test_unchanged_bytes_are_parsed_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text("model_list:\n  - model_name: one\n", encoding="utf-8")
+            with mock.patch.object(
+                self._schema, "_yaml_load", wraps=self._schema._yaml_load
+            ) as parse:
+                first = codex_config.load_yaml(path)
+                second = codex_config.load_yaml(path)
+            self.assertEqual(1, parse.call_count)
+            self.assertEqual(first, second)
+
+    def test_each_caller_owns_the_mapping_it_receives(self) -> None:
+        """The cached tree is shared; a caller's mutation must stay its own."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text("model_list:\n  - model_name: one\n", encoding="utf-8")
+            first = codex_config.load_yaml(path)
+            first["model_list"].append({"model_name": "injected"})
+            first["extra"] = True
+
+            second = codex_config.load_yaml(path)
+
+            self.assertEqual([{"model_name": "one"}], second["model_list"])
+            self.assertNotIn("extra", second)
+
+    def test_a_rewritten_document_is_parsed_again(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text("model_list:\n  - model_name: one\n", encoding="utf-8")
+            self.assertEqual("one", codex_config.load_yaml(path)["model_list"][0]["model_name"])
+
+            path.write_text("model_list:\n  - model_name: two\n", encoding="utf-8")
+
+            self.assertEqual("two", codex_config.load_yaml(path)["model_list"][0]["model_name"])
+
+    def test_an_invalid_document_is_still_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text("model_list: [\n", encoding="utf-8")
+            with self.assertRaises(codex_config.EditorError):
+                codex_config.load_yaml(path)
+            path.write_text("- not a mapping\n", encoding="utf-8")
+            with self.assertRaises(codex_config.EditorError):
+                codex_config.load_yaml(path)
+
+    def test_the_master_key_reuses_the_codex_editors_parse(self) -> None:
+        """The runtime domain reads the key out of the document Codex parsed."""
+
+        from young_router.core.domains.runtime import master_key_from_document
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(
+                "general_settings:\n  master_key: sk-replace-cache\n",
+                encoding="utf-8",
+            )
+            text = path.read_text(encoding="utf-8")
+            codex_config.load_yaml(path)
+            with mock.patch.object(
+                self._schema, "_yaml_load", side_effect=AssertionError("re-parsed")
+            ):
+                self.assertEqual("sk-replace-cache", master_key_from_document(text))
+
+    def test_a_document_this_process_never_read_still_parses(self) -> None:
+        from young_router.core.domains.runtime import master_key_from_document
+
+        self.assertEqual(
+            "sk-replace-unseen",
+            master_key_from_document(
+                "general_settings:\n  master_key: sk-replace-unseen\n"
+            ),
+        )
+        self.assertEqual(
+            "sk-young-router", master_key_from_document("general_settings: {}\n")
+        )
+        self.assertEqual("sk-young-router", master_key_from_document(""))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class LocalPortTests(unittest.TestCase):
+    """The client document must name the port the proxy is listening on.
+
+    ``LITELLM_PORT`` is the preference, and an occupied port makes the managed
+    service step forward.  Writing the client's ``base_url`` from the
+    preference then hands the client a dead address, which reads as a silent
+    turn: no thinking, no answer, nothing in the request log (observed live
+    2026-11-04, a leftover benchmark proxy on 12390 while the install ran on
+    12391).
+    """
+
+    def setUp(self) -> None:
+        self._directory = tempfile.TemporaryDirectory()
+        self.root = Path(self._directory.name)
+        self.runtime = self.root / ".litellm-runtime"
+        self.runtime.mkdir(parents=True)
+        self._env = mock.patch.dict(
+            os.environ,
+            {"LITELLM_RUNTIME_ROOT": str(self.root), "LITELLM_PORT": "12390"},
+            clear=False,
+        )
+        self._env.start()
+
+    def tearDown(self) -> None:
+        self._env.stop()
+        self._directory.cleanup()
+
+    def _record(self, pid: int, port: int) -> None:
+        (self.runtime / codex_config.MANAGED_OWNER_FILENAME).write_text(
+            json.dumps({"pid": pid, "token": "t"}), encoding="utf-8"
+        )
+        (self.runtime / codex_config.MANAGED_PORT_FILENAME).write_text(
+            str(port), encoding="utf-8"
+        )
+
+    def test_a_running_service_moves_the_client_onto_its_bound_port(self) -> None:
+        self._record(os.getpid(), 12391)
+        self.assertEqual("12391", codex_config.local_port())
+        self.assertEqual("http://127.0.0.1:12391/v1", codex_config.local_base_url())
+
+    def test_a_dead_service_does_not_pin_the_preference(self) -> None:
+        self._record(999_999_999, 12391)
+        self.assertEqual("12390", codex_config.local_port())
+
+    def test_no_records_means_the_preference(self) -> None:
+        self.assertEqual("12390", codex_config.local_port())

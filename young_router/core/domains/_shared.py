@@ -169,26 +169,24 @@ def _direction_destination(source: int, length: int, data: Mapping[str, Any]) ->
         return min(length - 1, source + 1)
     raise DomainError("A move destination is required")
 
-def local_proxy_endpoint() -> tuple[str, str]:
+def local_proxy_endpoint(
+    config_path: Path | None = None,
+) -> tuple[str, str]:
     """The managed local proxy URL (with ``/v1``) and its master key.
 
     Shared by the Codex and Claude "use local API" actions so both adopt the
-    exact port the runtime settings select (falling back to the default port)
-    and the configured LiteLLM master key (falling back to the built-in one).
+    exact port the proxy is listening on and the configured LiteLLM master key
+    (falling back to the built-in one).
     """
 
     from .. import codex_config
 
-    port = codex_config.DEFAULT_PORT
-    try:
-        from ..runtime_settings_io import load_specs, read_settings_file
-
-        values = read_settings_file(_default_runtime_settings_path(), load_specs())
-        candidate = str(values.get("LITELLM_PORT", "")).strip()
-        if candidate.isdigit() and 0 < int(candidate) < 65536:
-            port = candidate
-    except Exception:
-        pass
+    # The port the proxy is *bound* to, which is the preference only while that
+    # port was free: a stepped start records the port it took, and a client
+    # written from the preference instead would be handed a closed address and
+    # wait out every turn (live 2026-11-04: a leftover benchmark proxy held
+    # 12390 while this installation served 12391).
+    port = codex_config.local_port(config_path)
     key = ""
     candidates = (
         codex_config.default_config_path(),

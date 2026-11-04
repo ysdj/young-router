@@ -152,12 +152,21 @@ def master_key_from_document(text: str) -> str:
     reference this process cannot resolve, both read as the default: the field
     then states the key a client actually has to present, and a restore writes
     that same value back instead of leaving an unresolvable reference in place.
+
+    The parse is shared with every other reader of this document: one window
+    refresh read this key out of the same ``config.yaml`` the Codex editor had
+    just parsed, so a second 25 ms parse of those bytes was paid to answer a
+    question the first parse had already answered.  A caller that holds text no
+    file on disk contains (a staged draft, a document being rewritten) still
+    parses it through the same cache, keyed on that text.
     """
 
     try:
-        document = yaml.safe_load(text)
+        from .. import codex_config
+
+        document = codex_config.master_key_document(text)
     except Exception:
-        return DEFAULT_MASTER_KEY
+        document = None
     settings = document.get("general_settings") if isinstance(document, Mapping) else None
     value = settings.get("master_key") if isinstance(settings, Mapping) else None
     if isinstance(value, str) and value.startswith("os.environ/"):

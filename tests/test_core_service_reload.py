@@ -237,6 +237,8 @@ class CoreServiceReloadTests(unittest.TestCase):
                           upstream_url_surface: openai/responses
                     litellm_settings:
                       public_model_groups: [public-a]
+                    general_settings:
+                      master_key: sk-synthetic-master
                     """
                 ).lstrip(),
                 encoding="utf-8",

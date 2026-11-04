@@ -46,6 +46,11 @@ CONFIG = textwrap.dedent(
           upstream_url_surface: openai/responses
     litellm_settings:
       public_model_groups: [default-chat]
+    general_settings:
+      # The catalog source is the proxy's authenticated ``/v1/models``: an
+      # unreadable master key is refused before any endpoint stub is asked, and
+      # that refusal was what these tests saw as "no models".
+      master_key: sk-synthetic-master
     """
 ).lstrip()
 
