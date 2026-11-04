@@ -6360,12 +6360,17 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         rows.push({
           key: entry.key,
           // The upstream model leads the row: it is what tells the routes of
-          // one public model apart, before the provider that serves it.
-          // The credential column names what this route answers with: an
-          // account of its row, a relay key's `账号/分组`, or a key slot.  An
-          // account is not a key, so the row's own credential list decides
-          // the label instead of a key lookup that would print 未定义密钥.
-          cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model) || translate("common.notAvailable")}`, providerDisplayName(entry.provider), modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources, providerCredentials(entry.provider, translate)), order],
+          // one public model apart, before the provider that serves it.  The
+          // order follows its provider, ahead of the credential: a table that
+          // cannot show every requested width takes the room off its trailing
+          // column, and an order is a header and a short number, so the widest
+          // and most ellipsizable column — the credential — has to be the one
+          // that yields.  The credential column names what this route answers
+          // with: an account of its row, a relay key's `账号/分组`, or a key
+          // slot.  An account is not a key, so the row's own credential list
+          // decides the label instead of a key lookup that would print
+          // 未定义密钥.
+          cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model) || translate("common.notAvailable")}`, providerDisplayName(entry.provider), order, modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources, providerCredentials(entry.provider, translate))],
         });
       }
     }
@@ -6489,7 +6494,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       </View>
       {viewMode === "routes" ? <View style={styles.routeWorkspace}>
         <TablePane wide style={styles.routeTablePane} title={translate("providers.routes")} actions={<><IconButton label="+" title={translate("providers.newRoute")} disabled={busy || providers.length === 0} onPress={addRoute} />{activeRoute || selectedPublicModel !== undefined ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteRoute} /> : null}<IconButton label="↑" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveUp")} disabled={busy || !canMoveRouteUp} onPress={() => moveRoute("up")} /><IconButton label="↓" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveDown")} disabled={busy || !canMoveRouteDown} onPress={() => moveRoute("down")} /></>}>
-          <NativeTable columns={[{ label: translate("providers.upstream"), width: 160 }, { label: translate("providers.provider"), width: 84 }, { label: translate("providers.providerKey"), width: 150 }, { label: translate("common.order"), width: 48 }, ROUTE_TABLE_SPACER_COLUMN]} rows={routeRows} disabledRowKeys={disabledRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => selectRouteTableRow(key)} style={styles.nativeRouteTable} />
+          <NativeTable columns={[{ label: translate("providers.upstream"), width: 160 }, { label: translate("providers.provider"), width: 84 }, { label: translate("common.order"), width: 48 }, { label: translate("providers.providerKey"), width: 150 }, ROUTE_TABLE_SPACER_COLUMN]} rows={routeRows} disabledRowKeys={disabledRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => selectRouteTableRow(key)} style={styles.nativeRouteTable} />
         </TablePane>
       </View> : providers.length === 0 ? <View style={styles.providerEmptyState}>
         <View style={styles.providerEmptyGlyph}><Text style={styles.providerEmptyGlyphText}>+</Text></View>
