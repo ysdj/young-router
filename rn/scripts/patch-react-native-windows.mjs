@@ -10,9 +10,11 @@
 // stopped.  Measured on a 200% host: ~29 DIP per detent before, 48 after.
 //
 // The applied change maps the delta through `SPI_GETWHEELSCROLLLINES` and
-// applies it immediately.  It is a source change, so the host must be built
-// against the RNW sources rather than its NuGet binary -- `build-windows.ps1`
-// passes `UseExperimentalNuget=false` for exactly this reason.
+// applies it immediately.  It is a source change, so the binary that ships has
+// to be the patched source build: `build-windows.ps1` still builds against the
+// NuGet package (a source build costs half an hour and has no valid PRI), then
+// replaces the packaged `Microsoft.ReactNative.dll` with the prepared one after
+// checking both report the same file version.
 //
 // Idempotent: a tree that already carries the mapping is left alone.  Fails
 // loudly when the upstream text it rewrites is not found, so an RNW upgrade

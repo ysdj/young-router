@@ -114,7 +114,14 @@ class BrowserIdentityLiteralTests(unittest.TestCase):
             self.assertEqual(2, macOS.count(probe_headers))
         self.assertIn("core.Settings().UserAgent(kRelayBrowserUserAgent);", windows)
         self.assertIn("kRelayBrowserUserAgent, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY", windows)
-        self.assertIn("std::wstring(kRelayBrowserAcceptLanguage)", windows)
+        # The request carries the same Accept-Language the browser identity
+        # advertises.  This asserts the shared constant reaches the header, not
+        # the shape of the expression that appends it: a later rewrite split the
+        # one-line concatenation into separate ``+=`` statements and dropped the
+        # now-redundant ``std::wstring(...)`` wrapper, which changed nothing the
+        # header sends but failed the literal match here for months.
+        self.assertIn("headers += kRelayBrowserAcceptLanguage;", windows)
+        self.assertIn('L"Accept-Language: "', windows)
         self.assertNotIn("L\"User-Agent: \"", windows)
 
     def test_shipped_request_code_has_no_self_naming_user_agent(self) -> None:

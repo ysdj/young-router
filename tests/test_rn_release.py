@@ -52,6 +52,31 @@ class ReactNativeReleaseTests(unittest.TestCase):
             self.assertTrue((site_packages / "mcp-2.3.0.dist-info").is_dir())
             self.assertTrue((site_packages / "mcp-types-2.3.0.dist-info").is_dir())
 
+    def test_the_windows_core_pruner_drops_a_staged_checkouts_git_data(self) -> None:
+        # A staging cache written before the stagers learned to publish a
+        # payload without ``.git`` is still reused -- the reuse rule matches the
+        # recorded version and files, not the absence of a repository.  A
+        # 65 MB packfile rode into the MSIX that way and was re-packed on every
+        # build, so the pruner is what keeps it out of the shipped Core.
+        prune_module = runpy.run_path(str(ROOT / "scripts" / "prune-windows-core.py"))
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            core = Path(temporary_directory) / "Core"
+            adapters = core / "young_router" / "adapters"
+            repository = adapters / "our-free-model" / ".git" / "objects" / "pack"
+            repository.mkdir(parents=True)
+            (repository / "pack-abc.pack").write_bytes(b"p" * 32)
+            (adapters / "our-free-model" / "package.json").write_text("{}", encoding="utf-8")
+            nested = adapters / "dsh-vision-router" / "vendor" / "dep" / ".git"
+            nested.mkdir(parents=True)
+            (nested / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+
+            prune_module["prune_core"](core)
+
+            self.assertFalse((adapters / "our-free-model" / ".git").exists())
+            self.assertFalse((adapters / "dsh-vision-router" / "vendor" / "dep" / ".git").exists())
+            self.assertTrue((adapters / "our-free-model" / "package.json").is_file())
+            self.assertTrue((adapters / "dsh-vision-router" / "vendor" / "dep").is_dir())
+
     def test_local_test_gate_never_installs_and_explicit_install_restarts_live_app(self) -> None:
         test_script = (ROOT / "scripts" / "test.sh").read_text(encoding="utf-8")
         installer = (ROOT / "scripts" / "build-and-install-macos.sh").read_text(
@@ -669,7 +694,7 @@ class ReactNativeReleaseTests(unittest.TestCase):
 
         script = (ROOT / "rn/scripts/build-windows.ps1").read_text(encoding="utf-8")
         payload = script.index(
-            'Copy-Item -Path (Join-Path $WindowsRelease "*") -Destination $PackagePayload -Recurse -Force'
+            'Copy-Item -LiteralPath $_.FullName -Destination $PackagePayload'
         )
         refresh = script.index("Copy-CoreSource $CoreRoot $ReleaseCore")
         self.assertLess(payload, refresh)
@@ -871,6 +896,83 @@ class ReactNativeReleaseTests(unittest.TestCase):
         install = script[script.index("uv pip install"):]
         install = install[:install.index("\n\n")] if "\n\n" in install else install
         self.assertIn("--target", install)
+
+    def test_every_staging_step_reuses_its_cache_by_version(self) -> None:
+        # A build stages the same Node, Bun and LiteLLM releases over and over.
+        # Staging them into a fresh GUID directory each run made their own
+        # "already staged" checks useless: the directory was always empty, the
+        # download always ran, and a flaky TLS handshake decided the build.
+        script = (ROOT / "rn/scripts/build-windows.ps1").read_text(encoding="utf-8")
+
+        self.assertIn('$NodeRuntime = Join-Path $StagingCache "node-runtime"', script)
+        self.assertNotIn('young-router-node-runtime-" + [guid]', script)
+        # Nothing in the build may delete the cache it just filled.
+        self.assertNotIn("Remove-Item -LiteralPath $NodeRuntime", script)
+
+        node = (ROOT / "scripts/update_node_runtime.py").read_text(encoding="utf-8")
+        self.assertIn('node_output / "NODE_VERSION"', node)
+        self.assertIn("def _staged_node_version", node)
+        self.assertIn("if staged == version:", node)
+
+        bun = (ROOT / "scripts/update_bun_runtime.py").read_text(encoding="utf-8")
+        self.assertIn("def _staged_version", bun)
+        self.assertIn('return f"{staged} (cached)"', bun)
+
+        # The runtime this tree staged last time seeds the next build, which is
+        # what keeps the LiteLLM install off a repeat build.
+        self.assertIn('$PreviousRuntime = Join-Path $AppRoot "windows\\$WindowsArch\\Release\\Core\\runtime"', script)
+        # A packaged run holds its own executable, and the payload copy used to
+        # die halfway through on it; the build replaces that instance.
+        self.assertIn('Stopping the running packaged app (pid $($instance.Id))', script)
+        self.assertLess(
+            script.index('Stopping the running packaged app (pid $($instance.Id))'),
+            script.index('Copy-Item -LiteralPath $_.FullName -Destination $PackagePayload'),
+        )
+
+    def test_the_runtime_seed_is_reused_only_when_it_can_carry_litellm(self) -> None:
+        # A seed directory that lost its interpreter -- ``bin\Lib`` and
+        # ``bin\DLLs`` copied by an interrupted staging run, no ``python.exe`` --
+        # still takes the ``uv`` fallback that builds a fresh runtime, but the
+        # LiteLLM step used to key off the environment variable alone.  It then
+        # demanded metadata from a runtime it had just created empty and
+        # stopped the build with "does not carry LiteLLM metadata" on a
+        # checkout that only needed the install it was refusing to run.
+        script = (ROOT / "rn/scripts/build-windows.ps1").read_text(encoding="utf-8")
+
+        self.assertIn(
+            '$RuntimeSeedUsable = [bool]($RuntimeSeed -and (Test-Path (Join-Path $RuntimeSeed "bin\\python.exe")))',
+            script,
+        )
+        self.assertNotIn("if ($RuntimeSeed) {", script)
+        self.assertIn('if ($RuntimeSeedUsable) {\n    Copy-Item -Path (Join-Path $RuntimeSeed "bin\\*")', script)
+        # Inside the seed branch the repair comes before the failure: a seed
+        # whose metadata is missing or stale is refreshed, and only an install
+        # that still leaves nothing is an error.
+        seed_litellm = script.split("if ($RuntimeSeedUsable) {", 2)[2]
+        self.assertIn("Install-LiteLLM", seed_litellm)
+        self.assertLess(
+            seed_litellm.index("Install-LiteLLM"),
+            seed_litellm.index("does not carry LiteLLM metadata"),
+        )
+        self.assertIn('$SeedVersion = if ($LASTEXITCODE -eq 0) { $SeedCheck.Trim() } else { "none" }', script)
+        # ``uv pip install --target`` merges and does not uninstall the previous
+        # release, so upgrading a seed leaves both ``litellm-1.106.4.dist-info``
+        # and ``litellm-1.106.6.dist-info``; metadata resolution then cannot name
+        # either and the build reports the update it just made as missing.
+        self.assertIn('Remove-Stale-LiteLLM-Metadata', script)
+        self.assertIn('-Filter "litellm-*.dist-info"', script)
+        self.assertIn('$_.Name -ne "litellm-$LiteLLMVersion.dist-info"', script)
+        install_function = script.split("function Install-LiteLLM", 1)[1].split("\n  if ($RuntimeSeedUsable)", 1)[0]
+        self.assertEqual(install_function.count("Remove-Stale-LiteLLM-Metadata"), 2, install_function[-200:])
+        # The release Core is the next build's seed, and ``robocopy /E`` merges:
+        # a metadata directory the staged tree dropped survives there and makes
+        # the seed unusable, which is what sent every build back through the
+        # whole install.  The same rule runs on that copy.
+        self.assertIn(
+            'Remove-Stale-LiteLLM-Metadata -SitePackages (Join-Path $ReleaseCore "runtime\\bin\\Lib\\site-packages")',
+            script,
+        )
+        self.assertIn("param([string]$SitePackages = $RuntimeSitePackages)", script)
 
     def test_the_build_proves_the_staged_workbuddy_surface_is_still_published(self) -> None:
         # WorkBuddy ships the desktop credential format and both model
@@ -1094,6 +1196,10 @@ class ReactNativeReleaseTests(unittest.TestCase):
         # back.  A native source is refused by name, because the exe is the only
         # thing that can carry it.
         script = (ROOT / "scripts" / "dev-loop-windows.ps1").read_text(encoding="utf-8")
+        # A comment naming a flag is not an invocation of it.
+        executable = "\n".join(
+            line for line in script.splitlines() if line.strip() and not line.lstrip().startswith("#")
+        )
         self.assertIn("YOUNG_ROUTER_WINDOWS_TREE", script)
         self.assertIn("node_modules", script)
         self.assertIn("index.windows.bundle", script)
@@ -1109,6 +1215,42 @@ class ReactNativeReleaseTests(unittest.TestCase):
         # the restart is the last thing the sync does.
         self.assertIn("Join-Path $installDirectory 'YoungRouter\\Bundle'", script)
         self.assertLess(script.index("index.windows.bundle"), script.index("shell:AppsFolder"))
+
+        # One Metro server answers every run.  ``react-native bundle`` starts
+        # Metro, builds the whole graph and exits, and its ``--reset-cache``
+        # discarded the transform cache first -- measured 109 s per edit, of
+        # which 3 s was the bundle.  A server left running answers the same
+        # bundle in 0-1 s and 3 s after an edit.
+        self.assertNotIn("--reset-cache", executable)
+        self.assertIn("$MetroBase/status", script)
+        self.assertIn("index.bundle?platform=windows&dev=false&minify=false", script)
+
+        # A machine that has never built has no working copy, and the checkout
+        # may be on its own disk (debug in place) or behind a shared folder
+        # (it cannot hold node_modules, so copy it once).  The share is found
+        # by its reparse point, not its drive letter: Parallels mounts one on a
+        # fixed drive that reports ``Fixed``.
+        self.assertIn("function Test-SharedPath", script)
+        self.assertIn("[System.IO.FileAttributes]::ReparsePoint", script)
+        self.assertNotIn("DriveType", script)
+        self.assertIn("debugging the checkout in place", script)
+        self.assertIn("[switch]$InitTree", script)
+        self.assertIn("[switch]$Install", script)
+        self.assertIn("/XD node_modules .staging-cache .venv __pycache__ .pytest_cache Pods", script)
+        self.assertIn("[switch]$StopMetro", script)
+        # The server appends how to fetch its own source map.  A file bundle that
+        # carries those two lines is not what ``react-native bundle`` writes, and
+        # the Release host aborts on it with no red box to say why.
+        self.assertIn("'^//# sourceMappingURL='", script)
+        self.assertIn("'^//# sourceURL='", script)
+        # A wedge or a duplicate would each cost the whole graph, so both the
+        # reuse probe and the replacement run through one instance per port.
+        self.assertIn("function Stop-MetroServer", script)
+        self.assertIn("Stop-MetroServer | Out-Null", script)
+        # Assets are copied only from the roots the packager mirrors; recursing
+        # ``rn\apps`` walked every file in ``node_modules`` on each run.
+        self.assertIn("'packages\\shared\\src'", script)
+        self.assertNotIn("Join-Path $packagerRoot 'apps')", script)
 
         reader = (ROOT / "scripts" / "windows-ui.ps1").read_text(encoding="utf-8")
         # A Chinese element name from Git Bash and a click on an unfocused
@@ -1142,11 +1284,32 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("--root $ProjectRoot", build)
         self.assertIn("node_modules\\react-native-windows\\target\\$WindowsArch\\Release\\Microsoft.ReactNative\\Microsoft.ReactNative.dll", build)
         self.assertIn("RNW source-build output is missing", build)
-        self.assertIn("UseExperimentalNuget=false", build)
-        self.assertIn("_WindowsAppSDKFoundationPlatform=$WindowsArch", build)
+        self.assertIn("UseExperimentalNuget=true", build)
+        self.assertNotIn("UseExperimentalNuget=false", build)
+        self.assertNotIn("_WindowsAppSDKFoundationPlatform", build)
         self.assertLess(build.index("RNW source-build output is missing"), build.index("pnpm run build"))
         self.assertLess(build.index("patch-react-native-windows.mjs"), build.index("pnpm run build"))
         self.assertIn('if ($LASTEXITCODE -ne 0) { throw "React Native Windows host build failed." }', build)
+        # The shipped binary is the prepared source build, swapped in after the
+        # NuGet host build and only when both report the same version.
+        self.assertIn("does not match the packaged RNW", build)
+        # A machine without the prepared DLL must be able to build something:
+        # the opt-out is explicit, and nothing claims the mapping for it.
+        self.assertIn("[switch]$AllowUpstreamWheel", build)
+        self.assertIn("YOUNG_ROUTER_ALLOW_UPSTREAM_WHEEL", build)
+        self.assertIn("Building with upstream React Native Windows", build)
+        self.assertIn("Copy-Item -LiteralPath $ReactNativeTargetDll -Destination $PackagedReactNativeDll -Force", build)
+        # The raw-output convenience exe and the host share one path, and the
+        # launcher is compiled there after the payload copy: the next build then
+        # packaged the launcher as the app executable, which hands off to the
+        # installed MSIX -- which starts the launcher.  The sidecar says which
+        # file is which, and the payload copy skips it by that answer.
+        self.assertIn("YoungRouter.exe.launcher", build)
+        self.assertIn("$RawHostIsLauncher", build)
+        self.assertLess(
+            build.index("$RawHostIsLauncher = (Get-Content -Raw -LiteralPath $LauncherMarker)"),
+            build.index("Copy-Item -LiteralPath $_.FullName -Destination $PackagePayload"),
+        )
 
     def test_the_js_loop_reloads_the_bundle_in_place_and_only_from_a_known_good_one(self) -> None:
         # A UI edit's shortest path is a reload, not a restart: `RCTHost`

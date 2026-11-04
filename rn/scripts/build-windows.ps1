@@ -1,3 +1,11 @@
+param(
+  # A machine that has never built React Native Windows has no patched
+  # Microsoft.ReactNative.dll to swap in, and a source build of it is half an
+  # hour with no valid PRI.  This lets that machine produce a working artifact
+  # with the upstream wheel mapping instead of refusing to build at all; the
+  # run says so, loudly, and nothing about the mapping is claimed.
+  [switch]$AllowUpstreamWheel
+)
 $ErrorActionPreference = "Stop"
 
 $RnRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -21,20 +29,23 @@ if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
 } else {
   $Core = Join-Path $env:RUNNER_TEMP ("young-router-rn-core-" + [guid]::NewGuid().ToString("N"))
 }
-$NodeRuntime = Join-Path ([System.IO.Path]::GetTempPath()) ("young-router-node-runtime-" + [guid]::NewGuid().ToString("N"))
 # Third-party staging lives in a persistent cache rather than a fresh GUID
 # directory, for the same reason the macOS build does it: a build stages the
 # same four releases over and over, each script resolves its upstream release
 # on every run, and re-installing a release it has already staged is the
 # largest remaining cost.  A tree is reused only when its own lookup resolves
 # that exact release (see ``reused_staged_release`` in
-# scripts/update_common.py), so deleting this directory is always safe.
+# scripts/update_common.py), so deleting this directory is always safe.  The
+# Node and Bun runtime is staged here for the same reason: it is a release too,
+# and staging it into a fresh GUID directory is what made every build download
+# both again and left their own version markers nothing to compare against.
 $StagingCache = if ($env:YOUNG_ROUTER_STAGING_CACHE) {
   $env:YOUNG_ROUTER_STAGING_CACHE
 } else {
   Join-Path $RnRoot ".staging-cache"
 }
 New-Item -ItemType Directory -Force -Path $StagingCache | Out-Null
+$NodeRuntime = Join-Path $StagingCache "node-runtime"
 $VeridropWork = Join-Path $StagingCache "veridrop"
 $ConnectWorkBuddyWork = Join-Path $StagingCache "connect-workbuddy"
 $OurFreeModelWork = Join-Path $StagingCache "our-free-model"
@@ -108,22 +119,27 @@ try {
   }
 
   # The wheel fix changes RNW source, so the matching incremental source-build
-  # output must already exist.  Without this guard, a fresh checkout silently
-  # falls back to compiling all of RNW, which is not an acceptable artifact
-  # build on the ARM64 development machine.
+  # output must already exist: this script swaps it in after the fast NuGet
+  # build, and a checkout without it would otherwise ship the upstream wheel
+  # with nothing in the build output to say so.
   $ReactNativeWheelPatch = Join-Path $RnRoot "scripts\patch-react-native-windows.mjs"
   $ReactNativeTargetDll = Join-Path $RnRoot "node_modules\react-native-windows\target\$WindowsArch\Release\Microsoft.ReactNative\Microsoft.ReactNative.dll"
-  if (-not (Test-Path -LiteralPath $ReactNativeTargetDll -PathType Leaf)) {
-    throw "RNW source-build output is missing: $ReactNativeTargetDll. Prebuild Microsoft.ReactNative.dll or restore the RNW build cache before building Windows."
+  $UseUpstreamWheel = [bool]($AllowUpstreamWheel -or $env:YOUNG_ROUTER_ALLOW_UPSTREAM_WHEEL -notin @($null, "", "0", "false", "no"))
+  if ($UseUpstreamWheel) {
+    Write-Warning "Building with upstream React Native Windows: its wheel mapping eases every event and does not follow the system lines-per-notch setting. Pass no override on a machine that has the prepared build."
+  } else {
+    if (-not (Test-Path -LiteralPath $ReactNativeTargetDll -PathType Leaf)) {
+      throw "RNW source-build output is missing: $ReactNativeTargetDll. Copy the prepared Microsoft.ReactNative.dll there, or build this machine with -AllowUpstreamWheel (or YOUNG_ROUTER_ALLOW_UPSTREAM_WHEEL=1) to ship the upstream wheel mapping instead."
+    }
+    if (-not (Test-Path -LiteralPath $ReactNativeWheelPatch -PathType Leaf)) {
+      throw "The prepared RNW wheel patch is missing: $ReactNativeWheelPatch."
+    }
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+      throw "node is required to patch the React Native Windows source tree."
+    }
+    & node $ReactNativeWheelPatch --root $ProjectRoot
+    if ($LASTEXITCODE -ne 0) { throw "Could not apply the prepared React Native Windows wheel patch." }
   }
-  if (-not (Test-Path -LiteralPath $ReactNativeWheelPatch -PathType Leaf)) {
-    throw "The prepared RNW wheel patch is missing: $ReactNativeWheelPatch."
-  }
-  if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-    throw "node is required to patch the React Native Windows source tree."
-  }
-  & node $ReactNativeWheelPatch --root $ProjectRoot
-  if ($LASTEXITCODE -ne 0) { throw "Could not apply the prepared React Native Windows wheel patch." }
 
   pnpm run build
   if ($LASTEXITCODE -ne 0) { throw "React Native Windows JavaScript build checks failed." }
@@ -143,7 +159,23 @@ try {
   $PythonInstalls = Join-Path $Core ".python-installs"
   New-Item -ItemType Directory -Path $RuntimeBin, $PythonInstalls | Out-Null
   $RuntimeSeed = $env:YOUNG_ROUTER_RUNTIME_SEED
-  if ($RuntimeSeed -and (Test-Path (Join-Path $RuntimeSeed "bin\python.exe"))) {
+  if (-not $RuntimeSeed) {
+    # The runtime this tree staged last time is this build's seed.  Its LiteLLM
+    # version is checked below, and that check is what decides whether anything
+    # has to be installed: re-resolving the whole proxy into a fresh temporary
+    # runtime on every build is minutes of work for a release that has not
+    # moved.  A runtime without an interpreter is ignored by the same check.
+    $PreviousRuntime = Join-Path $AppRoot "windows\$WindowsArch\Release\Core\runtime"
+    if (Test-Path (Join-Path $PreviousRuntime "bin\python.exe")) {
+      $RuntimeSeed = $PreviousRuntime
+    }
+  }
+  # A seed that lost its interpreter (a copy of ``bin\Lib`` and ``bin\DLLs``
+  # without ``python.exe`` is what an interrupted staging run leaves behind) is
+  # not a seed: the fallback below still produces a working runtime, and the
+  # LiteLLM step has to know that this one carries nothing to reuse.
+  $RuntimeSeedUsable = [bool]($RuntimeSeed -and (Test-Path (Join-Path $RuntimeSeed "bin\python.exe")))
+  if ($RuntimeSeedUsable) {
     Copy-Item -Path (Join-Path $RuntimeSeed "bin\*") -Destination $RuntimeBin -Recurse -Force
   } else {
     uv python install $PythonTarget --install-dir $PythonInstalls --no-bin
@@ -175,6 +207,20 @@ try {
   $RuntimeSitePackages = & $RuntimePython -c "import sysconfig; print(sysconfig.get_paths()['purelib'])"
   if ($LASTEXITCODE -ne 0 -or -not $RuntimeSitePackages) {
     throw "Could not resolve the bundled Windows runtime's site-packages path."
+  }
+  function Remove-Stale-LiteLLM-Metadata {
+    param([string]$SitePackages = $RuntimeSitePackages)
+    # ``--target`` merges into an existing directory instead of replacing it,
+    # and it does not uninstall the release it is upgrading from.  A seed that
+    # already carried 1.106.4 therefore ends up with both
+    # ``litellm-1.106.4.dist-info`` and ``litellm-1.106.6.dist-info``, and
+    # ``importlib.metadata`` stops being able to name the release at all -- which
+    # reads as "the update did nothing" and stops the build on the release it
+    # just installed.  Only the metadata directory is removed; the new files
+    # already overwrote the module tree.
+    Get-ChildItem -LiteralPath $SitePackages -Directory -Filter "litellm-*.dist-info" -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -ne "litellm-$LiteLLMVersion.dist-info" } |
+      Remove-Item -Recurse -Force
   }
   function Install-LiteLLM {
     if ($WindowsArch -eq "ARM64") {
@@ -210,21 +256,31 @@ try {
       }
       & uv pip install --python $RuntimePython --target "$RuntimeSitePackages" --upgrade @LiteLLMRequirements "fastapi==0.140.3" PyYAML
       if ($LASTEXITCODE -ne 0) { throw "Could not install the bundled Windows ARM64 runtime dependencies." }
+      Remove-Stale-LiteLLM-Metadata
       return
     }
     & uv pip install --python $RuntimePython --target "$RuntimeSitePackages" --upgrade "litellm[proxy]==$LiteLLMVersion" "fastapi==0.140.3" PyYAML
     if ($LASTEXITCODE -ne 0) { throw "Could not install the bundled Windows runtime dependencies." }
+    Remove-Stale-LiteLLM-Metadata
   }
-  if ($RuntimeSeed) {
+  if ($RuntimeSeedUsable) {
     $SeedCheck = & $RuntimePython -c "from importlib.metadata import version; print(version('litellm'))"
-    if ($LASTEXITCODE -ne 0) {
-      throw "The prebuilt runtime seed does not carry LiteLLM metadata."
-    }
-    if ($SeedCheck.Trim() -ne $LiteLLMVersion) {
+    $SeedVersion = if ($LASTEXITCODE -eq 0) { $SeedCheck.Trim() } else { "none" }
+    if ($SeedVersion -ne $LiteLLMVersion) {
       # Keep the large native/Python seed reusable while refreshing the small
-      # fast-moving LiteLLM layer when its release lock advances.
-      Write-Output "Updating LiteLLM in the prebuilt runtime seed: $($SeedCheck.Trim()) -> $LiteLLMVersion."
+      # fast-moving LiteLLM layer when its release lock advances -- or when the
+      # seed carries no metadata at all, which is what an interrupted install
+      # leaves behind and what used to stop the build here.
+      Write-Output "Updating LiteLLM in the prebuilt runtime seed: $SeedVersion -> $LiteLLMVersion."
       Install-LiteLLM
+      $SeedCheck = & $RuntimePython -c "from importlib.metadata import version; print(version('litellm'))"
+      if ($LASTEXITCODE -ne 0) {
+        throw "The prebuilt runtime seed does not carry LiteLLM metadata."
+      }
+      $SeedVersion = $SeedCheck.Trim()
+    }
+    if ($SeedVersion -ne $LiteLLMVersion) {
+      throw "The prebuilt runtime seed carries LiteLLM $SeedVersion instead of $LiteLLMVersion."
     }
   } else {
     Install-LiteLLM
@@ -362,7 +418,13 @@ print('young-router-veridrop-import-ok')
   }
   Write-Output "Building against Windows SDK $($InstalledSdk.Name)."
 
-  # Release sets UseBundle=true through RNW's Bundle.props. Passing --bundle
+  # RNW defaults this to false, which imports the ProjectReferences sheets and
+  # compiles every React Native Windows translation unit in the solution -- over
+  # half an hour here, and it also makes the package depend on a locally
+  # generated Microsoft.ReactNative.pri.  True uses the published
+  # Microsoft.ReactNative NuGet package: fast, and it brings a valid PRI.
+  #
+  # The Release sets UseBundle=true through RNW's Bundle.props. Passing --bundle
   # would select a ReleaseBundle solution configuration that this generated
   # Composition solution does not define.
   #
@@ -374,7 +436,7 @@ print('young-router-veridrop-import-ok')
     "--dir", $AppRoot, "exec", "react-native", "run-windows",
     "--no-launch", "--no-deploy", "--no-packager", "--release", "--arch", $WindowsArch,
     "--sln", "windows\YoungRouter.sln", "--proj", "windows\YoungRouter\YoungRouter.vcxproj",
-    "--msbuildprops", "YoungRouterCoreStagingDir=$CoreRoot,RunCodegenWindows=false,WindowsTargetPlatformVersion=$($InstalledSdk.Name),RestoreIgnoreFailedSources=true,RestoreForce=false,UseExperimentalNuget=false,_WindowsAppSDKFoundationPlatform=$WindowsArch"
+    "--msbuildprops", "YoungRouterCoreStagingDir=$CoreRoot,RunCodegenWindows=false,WindowsTargetPlatformVersion=$($InstalledSdk.Name),RestoreIgnoreFailedSources=true,RestoreForce=false,UseExperimentalNuget=true"
   )
   $LowResourceBuild = $WindowsArch -eq "ARM64" -and $env:YOUNG_ROUTER_LOW_RESOURCE_BUILD -notin @("0", "false", "no")
   if ($LowResourceBuild) {
@@ -387,8 +449,53 @@ print('young-router-veridrop-import-ok')
   $WindowsRelease = Join-Path $AppRoot "windows\$WindowsArch\Release"
   $PackagePayload = Join-Path $AppRoot "windows\YoungRouter.Package\bin\$WindowsArch\Release\YoungRouter"
   New-Item -ItemType Directory -Force -Path $PackagePayload | Out-Null
-  Copy-Item -Path (Join-Path $WindowsRelease "*") -Destination $PackagePayload -Recurse -Force
+  # Replacing the payload cannot overwrite an executable the running app holds:
+  # a packaged run outlives the build, and the copy then fails halfway through
+  # the artifact with "being used by another process".  The instance is this
+  # tree's own output, so the build stops it and replaces it.
+  $RunningPayload = Get-Process -Name YoungRouter -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -and $_.Path.StartsWith($PackagePayload, [System.StringComparison]::OrdinalIgnoreCase) }
+  foreach ($instance in $RunningPayload) {
+    Write-Output "Stopping the running packaged app (pid $($instance.Id)) before replacing its payload."
+    $instance | Stop-Process -Force -ErrorAction SilentlyContinue
+  }
+  if ($RunningPayload) { Start-Sleep -Milliseconds 800 }
+  # The raw-output convenience exe is the launcher this script compiles below,
+  # and it is written to the same path MSBuild puts the real host in.  Copying
+  # the release tree verbatim therefore took last build's launcher as the
+  # package's app executable: it hands off to the installed MSIX, which starts
+  # the launcher again, and the window never appears.  The sidecar the launcher
+  # build writes says which file is which.
+  $LauncherMarker = Join-Path $WindowsRelease "YoungRouter.exe.launcher"
+  $RawHostExe = Join-Path $WindowsRelease "YoungRouter.exe"
+  $RawHostIsLauncher = $false
+  if ((Test-Path -LiteralPath $LauncherMarker) -and (Test-Path -LiteralPath $RawHostExe)) {
+    $RawHostIsLauncher = (Get-Content -Raw -LiteralPath $LauncherMarker).Trim() -eq
+      (Get-FileHash -LiteralPath $RawHostExe -Algorithm SHA256).Hash
+  }
+  Get-ChildItem -LiteralPath $WindowsRelease -Force |
+    Where-Object { -not ($RawHostIsLauncher -and $_.Name -eq "YoungRouter.exe" -and $_.PSIsContainer -eq $false) } |
+    ForEach-Object {
+      Copy-Item -LiteralPath $_.FullName -Destination $PackagePayload -Recurse -Force
+    }
   Remove-Item -LiteralPath (Join-Path $PackagePayload "Bundle\Bundle") -Recurse -Force -ErrorAction SilentlyContinue
+
+  # The wheel fix lives in RNW source that upstream has not taken, so the shipped
+  # binary has to be the prepared source-build output rather than the NuGet copy
+  # the host just linked.  Both come from the same RNW version; the file version
+  # check is what keeps a stale prebuild from being paired with a newer host.
+  $PackagedReactNativeDll = Join-Path $PackagePayload "Microsoft.ReactNative.dll"
+  if (-not (Test-Path -LiteralPath $PackagedReactNativeDll -PathType Leaf)) {
+    throw "The Windows host did not produce $PackagedReactNativeDll."
+  }
+  if (-not $UseUpstreamWheel) {
+    $PatchedReactNativeVersion = (Get-Item -LiteralPath $ReactNativeTargetDll).VersionInfo.FileVersion
+    $PackagedReactNativeVersion = (Get-Item -LiteralPath $PackagedReactNativeDll).VersionInfo.FileVersion
+    if (-not $PatchedReactNativeVersion -or $PatchedReactNativeVersion -ne $PackagedReactNativeVersion) {
+      throw "The prebuilt RNW binary ($PatchedReactNativeVersion) does not match the packaged RNW ($PackagedReactNativeVersion)."
+    }
+    Copy-Item -LiteralPath $ReactNativeTargetDll -Destination $PackagedReactNativeDll -Force
+  }
 
   # The host project links Core from ``windows\<arch>\Release\Core`` as
   # deployment content, and MSBuild only rewrites a deployment item whose source
@@ -401,6 +508,12 @@ print('young-router-veridrop-import-ok')
   $ReleaseCore = Join-Path $WindowsRelease "Core"
   if (Test-Path $ReleaseCore) {
     Copy-CoreSource $CoreRoot $ReleaseCore
+    # The copy merges rather than replaces, so a release the staged tree dropped
+    # -- the previous LiteLLM metadata, for one -- would survive here and make
+    # this directory unusable as the next build's seed.  It is the seed: the next
+    # run reads its LiteLLM version to decide whether anything has to be
+    # installed at all.
+    Remove-Stale-LiteLLM-Metadata -SitePackages (Join-Path $ReleaseCore "runtime\bin\Lib\site-packages")
     $ReleaseCoreSource = Join-Path $ReleaseCore "young_router"
     if (Test-Path $ReleaseCoreSource) {
       Get-ChildItem -LiteralPath $ReleaseCoreSource -Recurse -Directory -Filter "__pycache__" |
@@ -438,6 +551,8 @@ print('young-router-veridrop-import-ok')
   }
   Remove-Item -LiteralPath $LauncherObject -Force -ErrorAction SilentlyContinue
   Write-Output "Windows raw-output launcher: $LauncherOutput"
+  Set-Content -LiteralPath (Join-Path $WindowsRelease "YoungRouter.exe.launcher") `
+    -Value (Get-FileHash -LiteralPath $LauncherOutput -Algorithm SHA256).Hash -Encoding ascii
 
   $BundledPython = Get-ChildItem -LiteralPath (Join-Path $AppRoot "windows") -Recurse -File -Filter "python.exe" |
     Where-Object { $_.FullName -match '[\\/]Core[\\/]runtime[\\/]bin[\\/]python\.exe$' } |
@@ -477,7 +592,6 @@ print('young-router-veridrop-import-ok')
   if (Test-Path $Core) {
     Remove-Item -LiteralPath $Core -Recurse -Force -ErrorAction SilentlyContinue
   }
-  if (Test-Path $NodeRuntime) {
-    Remove-Item -LiteralPath $NodeRuntime -Recurse -Force -ErrorAction SilentlyContinue
-  }
+  # ``$NodeRuntime`` is the staging cache, not this build's work: deleting it
+  # here is what made every run download Node and Bun again.
 }

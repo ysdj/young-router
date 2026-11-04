@@ -694,7 +694,8 @@ std::optional<CoreIPCBridge::RelaySessionRestoreResult> CoreIPCBridge::RestoreRe
     std::optional<std::string> const& cookie,
     std::optional<std::string> const& access_token,
     std::optional<std::string> const& refresh_token,
-    std::optional<std::string> const& user_id) {
+    std::optional<std::string> const& user_id,
+    std::optional<double> const& quota) {
   bool signed_in = login_status == "signed_in";
   bool terminal_status = login_status == "signed_out" || login_status == "expired";
   if (account_id.empty() || account_id.size() > 96 ||
