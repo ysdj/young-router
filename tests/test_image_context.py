@@ -534,9 +534,11 @@ class ImageContextFileFetchTests(_ImageContextCase):
         self.assertNotIn("view_image_by_id", note)
         self.assertNotIn("需要 IMG-", note)
 
-    def test_a_host_with_no_client_configuration_promises_nothing(self) -> None:
-        # A gateway sees no client configuration, so the only evidence that a
-        # tool exists out there is that a client has actually used it.
+    def test_a_gateway_names_the_tool_its_own_endpoint_serves(self) -> None:
+        # A gateway has no client document to edit, so the only fetch tool it
+        # can offer is its own endpoint -- and the endpoint is served from the
+        # first request, because a placeholder that waits for a client to have
+        # already called the tool it never named can never be answered.
         with mock.patch.dict(
             os.environ,
             {
@@ -544,9 +546,78 @@ class ImageContextFileFetchTests(_ImageContextCase):
                 image_context_module.IMAGE_CONTEXT_FETCH_ENV: "auto",
             },
         ):
-            self.assertEqual("ask", image_context_module.fetch_kind())
-            image_context_module.mark_endpoint_served()
             self.assertEqual("tool", image_context_module.fetch_kind())
+
+    def test_a_leftover_client_folder_on_a_gateway_is_not_a_client(self) -> None:
+        # Running the Codex CLI once on a server leaves ``~/.codex`` behind with
+        # no client document in it.  Reading that as "the client is here" handed
+        # a remote model this disk's paths and switched the fetch endpoint off.
+        home = Path(self.directory.name) / "gateway-home"
+        (home / ".codex" / "generated_images").mkdir(parents=True)
+        forwarded = {
+            "proxy_server_request": {
+                "headers": {"x-real-ip": "203.0.113.7"},
+            }
+        }
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HOME": str(home),
+                image_context_module.IMAGE_CONTEXT_FETCH_ENV: "auto",
+            },
+        ):
+            self.assertEqual(
+                "tool", image_context_module.fetch_kind(request_kwargs=forwarded)
+            )
+
+    def test_a_client_document_on_this_host_keeps_the_file_path(self) -> None:
+        home = Path(self.directory.name) / "desktop-home"
+        (home / ".codex").mkdir(parents=True)
+        (home / ".codex" / "config.toml").write_text("", encoding="utf-8")
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HOME": str(home),
+                image_context_module.IMAGE_CONTEXT_FETCH_ENV: "auto",
+            },
+        ):
+            self.assertEqual("file", image_context_module.fetch_kind())
+            self.assertEqual(
+                "file",
+                image_context_module.fetch_kind(
+                    request_kwargs={
+                        "proxy_server_request": {"headers": {"host": "127.0.0.1:4401"}}
+                    }
+                ),
+            )
+
+    def test_a_forwarded_request_never_gets_a_path_from_this_disk(self) -> None:
+        # Same deployment, somebody else's reader: the file kind is the only one
+        # that must not cross a proxy boundary.  A host that owns a client
+        # document does not serve the endpoint (the desktop client's stdio
+        # server is the tool there), so with no tool to name the placeholder
+        # falls back to asking the user rather than promising this disk.
+        home = Path(self.directory.name) / "desktop-home"
+        (home / ".codex").mkdir(parents=True)
+        (home / ".codex" / "config.toml").write_text("", encoding="utf-8")
+        forwarded = {
+            "proxy_server_request": {
+                "headers": {"x-forwarded-for": "203.0.113.7, 10.0.0.1"},
+            }
+        }
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HOME": str(home),
+                image_context_module.IMAGE_CONTEXT_FETCH_ENV: "auto",
+            },
+        ):
+            self.assertEqual(
+                "ask", image_context_module.fetch_kind(request_kwargs=forwarded)
+            )
 
     def test_forgetting_a_task_removes_its_files_too(self) -> None:
         self.rewrite_in_path_mode()
@@ -902,12 +973,16 @@ class ImageContextDeploymentTests(_ImageContextCase):
         self.assertEqual(
             image_context_module.fetch_mode(environment), "auto"
         )
-        self.assertFalse(image_context_module.fetch_available(environment))
+        # The endpoint is served from the first request and every placeholder
+        # names it: a gateway that waited for a client to call a tool it had
+        # never named never got a single fetch.
         self.assertTrue(image_context_endpoint.enabled(environment))
+        self.assertTrue(image_context_module.fetch_available(environment))
 
     def test_auto_registers_a_stdio_client_where_one_exists(self) -> None:
         home = Path(self.directory.name) / "desktop-home"
         (home / ".codex").mkdir(parents=True)
+        (home / ".codex" / "config.toml").write_text("", encoding="utf-8")
         environment = {"HOME": str(home)}
 
         self.assertTrue(image_context_module.fetch_available(environment))

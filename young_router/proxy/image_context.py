@@ -388,20 +388,80 @@ def fetch_mode(environ: Optional[Mapping[str, str]] = None) -> str:
     return value if value in IMAGE_CONTEXT_FETCH_VALUES else IMAGE_CONTEXT_FETCH_DEFAULT
 
 
+# The documents a real Codex client install owns.  The directory alone is not
+# evidence: running the Codex CLI once on a server leaves ``~/.codex`` behind
+# (this gateway had one holding nothing but ``generated_images``), and reading
+# that as "the client is here" made a remote deployment answer every omitted
+# image with a path from its own disk and switch its fetch endpoint off -- the
+# model was told to open a file that exists on the server, not on the laptop
+# reading the answer, and no client could ever call the tool meant to answer it.
+_CLIENT_CONFIG_DOCUMENTS = ("config.toml", "auth.json")
+# Headers a reverse proxy adds for the client it forwarded.  A desktop install
+# receives its client directly; a gateway never does.
+_FORWARDED_CLIENT_HEADERS = ("x-forwarded-for", "x-real-ip", "forwarded")
+
+
+def _client_config_dir(environ: Optional[Mapping[str, str]] = None) -> str:
+    env = os.environ if environ is None else environ
+    configured = str(env.get("CODEX_HOME") or "").strip()
+    if configured:
+        return os.path.expanduser(configured)
+    return os.path.join(
+        os.path.expanduser(str(env.get("HOME") or env.get("USERPROFILE") or "~")),
+        ".codex",
+    )
+
+
 def _client_config_present(environ: Optional[Mapping[str, str]] = None) -> bool:
     """Whether this host is the one that owns the client's configuration."""
 
-    env = os.environ if environ is None else environ
-    configured = str(env.get("CODEX_HOME") or "").strip()
-    home = (
-        os.path.expanduser(configured)
-        if configured
-        else os.path.join(
-            os.path.expanduser(str(env.get("HOME") or env.get("USERPROFILE") or "~")),
-            ".codex",
-        )
+    home = _client_config_dir(environ)
+    if not os.path.isdir(home):
+        return False
+    return any(
+        os.path.isfile(os.path.join(home, document))
+        for document in _CLIENT_CONFIG_DOCUMENTS
     )
-    return os.path.isdir(home)
+
+
+def _request_headers(request_kwargs: Any) -> Mapping[str, Any]:
+    """The downstream headers of the request being answered, lower-cased."""
+
+    if not isinstance(request_kwargs, Mapping):
+        return {}
+    containers: List[Any] = []
+    for container_key in ("proxy_server_request", "headers", "request_headers"):
+        container = request_kwargs.get(container_key)
+        if isinstance(container, Mapping):
+            containers.append(
+                container.get("headers")
+                if container_key == "proxy_server_request"
+                else container
+            )
+    for candidate in containers:
+        if not isinstance(candidate, Mapping) or not candidate:
+            continue
+        return {
+            str(name).strip().lower(): value
+            for name, value in candidate.items()
+            if isinstance(name, str)
+        }
+    return {}
+
+
+def _request_is_remote_client(request_kwargs: Any) -> bool:
+    """Whether this request reached us through a proxy in front of this host.
+
+    The one fact a gateway has and a desktop install cannot: whoever asked is
+    not sitting on this machine.  A placeholder may name a local path only when
+    that path is the reader's own.
+    """
+
+    headers = _request_headers(request_kwargs)
+    return any(
+        str(headers.get(name) or "").strip()
+        for name in _FORWARDED_CLIENT_HEADERS
+    )
 
 
 def endpoint_served(environ: Optional[Mapping[str, str]] = None) -> bool:
@@ -432,13 +492,19 @@ def mark_endpoint_served(environ: Optional[Mapping[str, str]] = None) -> None:
         pass
 
 
-def fetch_kind(environ: Optional[Mapping[str, str]] = None) -> str:
+def fetch_kind(
+    environ: Optional[Mapping[str, str]] = None,
+    request_kwargs: Any = None,
+) -> str:
     """How a placeholder may promise to bring an image back: ``file``, ``tool``, ``ask``.
 
     ``file`` names a file the client's own image viewer can open, which needs no
     change to the client's configuration at all; ``tool`` names
     ``view_image_by_id``; ``ask`` tells the model to ask the user.  A placeholder
-    may only promise what will actually be there.
+    may only promise what will actually be there, and *where the reader is* is
+    half of that: the same deployment serves its own window on a desktop and a
+    laptop on another continent on a server, and only the first may be handed a
+    path from this disk.
     """
 
     env = os.environ if environ is None else environ
@@ -449,18 +515,25 @@ def fetch_kind(environ: Optional[Mapping[str, str]] = None) -> str:
         return "file"
     if mode in {"stdio", "http"}:
         return "tool"
-    # ``auto``: a host that owns the client's configuration can hand it a file
-    # path and change nothing; a gateway can only offer the endpoint, and may
-    # only name the tool once a client has used it.
-    if _client_config_present(env):
+    # ``auto``: a host that owns the client's configuration *and* received this
+    # request directly can hand it a file path and change nothing.  Everything
+    # else is a gateway answering somebody else's client over its own endpoint.
+    if _client_config_present(env) and not _request_is_remote_client(request_kwargs):
         return "file"
-    return "tool" if endpoint_served(env) else "ask"
+    from . import image_context_endpoint as _endpoint_module
+
+    if _endpoint_module.enabled(env) or endpoint_served(env):
+        return "tool"
+    return "ask"
 
 
-def fetch_available(environ: Optional[Mapping[str, str]] = None) -> bool:
+def fetch_available(
+    environ: Optional[Mapping[str, str]] = None,
+    request_kwargs: Any = None,
+) -> bool:
     """Whether the model can actually fetch an omitted image on this host."""
 
-    return fetch_kind(environ) != "ask"
+    return fetch_kind(environ, request_kwargs) != "ask"
 
 
 def min_bytes(environ: Optional[Mapping[str, str]] = None) -> int:
@@ -1596,8 +1669,13 @@ def _rewrite(
     # The final line may only name the fetch tool when that tool exists here;
     # otherwise the model is told to ask the user, which is the one action that
     # can still bring the image back on a gateway with no tool of its own.
-    kind = fetch_kind() if automatic else "ask"
-    if forced and kind == "ask" and _client_config_present():
+    kind = fetch_kind(request_kwargs=request_kwargs) if automatic else "ask"
+    if (
+        forced
+        and kind == "ask"
+        and _client_config_present()
+        and not _request_is_remote_client(request_kwargs)
+    ):
         # The proxy and the client share this machine, and the replay cache has
         # already written every image to disk, so a placeholder can name a path
         # the client's own viewer opens -- the one avenue that needs no tool and

@@ -38,7 +38,17 @@ MAX_BODY_BYTES = 1 * 1024 * 1024
 
 
 def enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
-    """Whether this host should serve the endpoint at all."""
+    """Whether this host should serve the endpoint at all.
+
+    ``auto`` serves it unless this host is the client's own: a desktop install
+    registers ``view_image_by_id`` as a stdio server in the client's document
+    and needs no port, while a gateway has nowhere to put such a file and the
+    URL is the only fetch tool it can offer.  The route is authenticated with
+    this installation's own key either way, and a desktop proxy binds loopback,
+    so an unserved-as-needed port was never the boundary it looked like -- the
+    boundary that matters is *which* placeholders may name it, and that is
+    decided per request by ``image_context.fetch_kind``.
+    """
 
     env = os.environ if environ is None else environ
     mode = _image_context_module.fetch_mode(env)
@@ -48,7 +58,10 @@ def enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
         # ``stdio`` is a desktop client whose configuration this app edits, and
         # ``off`` promises no tool: neither opens a port.
         return False
-    return not _image_context_module._client_config_present(env)
+    if _image_context_module._client_config_present(env):
+        # The client is here, so its own document carries the stdio server.
+        return False
+    return True
 
 
 def _expected_token(environ: Optional[Mapping[str, str]] = None) -> str:
