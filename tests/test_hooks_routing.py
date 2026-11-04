@@ -130,7 +130,9 @@ class HookRoutingTests(HookTestCase):
 
         self.assertEqual(hooks._recovery_policy_for_exception(balance), "recovery_cooldown")
         self.assertEqual(hooks._recovery_policy_for_exception(rate_limit), "recovery")
-        self.assertEqual(hooks._recovery_policy_for_exception(overload), "recovery")
+        # A 5xx is the route failing, whatever sentence it wears: an "overloaded"
+        # 503 is a route the next request must not try first again.
+        self.assertEqual(hooks._recovery_policy_for_exception(overload), "recovery_cooldown")
         self.assertEqual(hooks._recovery_policy_for_exception(network), "recovery")
         self.assertEqual(hooks._recovery_policy_for_exception(start_timeout), "recovery_cooldown")
         self.assertEqual(hooks._recovery_policy_for_exception(idle_timeout), "recovery")
@@ -163,6 +165,65 @@ class HookRoutingTests(HookTestCase):
         self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(network))
         self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(rate_limit))
         self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(start_timeout))
+
+    def test_every_server_error_status_cools_the_route_whatever_it_says(self) -> None:
+        """A 5xx is the route failing, not a rate limit in different words.
+
+        Live 2026-11-04: one route of a five-route group answered 503
+        "Service temporarily unavailable" for an hour.  The wording matched the
+        rate-limit markers, so the failure was classified ``recovery``: it was
+        never counted against the route, never parked, and every turn paid the
+        same refused round trip before a sibling answered -- the log read as one
+        obviously dead node being retried forever.
+
+        The rule is the status, not the number and not the sentence: any
+        upstream that answered 5xx answered for this route.  The same sentences
+        on a 429 stay transient, because there a limit is exactly what they
+        describe.  Spelling only decides a failure whose status is unreadable.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_POLICY_SERVER_ENV, None)
+        self.set_env(hooks._RECOVERY_POLICY_RATE_LIMIT_ENV, None)
+
+        wordings = (
+            "ServiceUnavailableError: OpenAIException - Service temporarily unavailable",
+            "upstream overloaded",
+            "high demand",
+            "selected model is at capacity",
+            "concurrency limit reached",
+            "rate limit exceeded, retry later",
+            "too many requests",
+        )
+        for status_code in (500, 501, 502, 503, 504, 505, 507, 520, 599):
+            for wording in wordings:
+                with self.subTest(status_code=status_code, wording=wording):
+                    error = RuntimeError(wording)
+                    error.status_code = status_code
+                    self.assertEqual(
+                        hooks._recovery_policy_for_exception(error),
+                        "recovery_cooldown",
+                    )
+                    self.assertTrue(
+                        hooks._should_count_deployment_failure_for_cooldown(error)
+                    )
+
+        # The same sentences on a 429 are a limit: the route is not broken, so
+        # it is waited out rather than parked.
+        for wording in wordings:
+            with self.subTest(status_code=429, wording=wording):
+                error = RuntimeError(wording)
+                error.status_code = 429
+                self.assertEqual(hooks._recovery_policy_for_exception(error), "recovery")
+                self.assertFalse(
+                    hooks._should_count_deployment_failure_for_cooldown(error)
+                )
+
+        # A wrapper with no status at all still has only its words to go on.
+        unreadable = RuntimeError("upstream overloaded, retry later")
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(unreadable), "recovery"
+        )
 
     def test_recovery_policy_is_runtime_configurable(self) -> None:
         hooks, _proxy_server = load_hook_module()
@@ -250,7 +311,11 @@ class HookRoutingTests(HookTestCase):
         )
         server_error.status_code = 500
         self.assertFalse(hooks._is_quota_window_rate_limit_error(server_error))
-        self.assertEqual(hooks._recovery_policy_for_exception(server_error), "recovery")
+        # Rate-limit wording on a 5xx is a server that failed, not a limit:
+        # only a 429 without a stated reset stays a transient wait.
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(server_error), "recovery_cooldown"
+        )
 
     def test_quota_reset_horizon_is_runtime_configurable(self) -> None:
         """The horizon is the boundary between busy-now and closed-window."""
@@ -779,6 +844,44 @@ class HookRoutingTests(HookTestCase):
             self.assertEqual(available, [deployment])
             self.assertEqual(cooled, [])
             self.assertFalse(filtered)
+
+    async def test_a_relay_503_is_parked_instead_of_tried_first_again(self) -> None:
+        """The live shape: one relay answered 503, and every turn paid it first.
+
+        Live 2026-11-04: the first route of a five-route group answered 503
+        ``Service temporarily unavailable`` on every turn for an hour.  Its
+        sentence matched the rate-limit wording, so nothing counted against the
+        route, nothing cooled it down, and every request spent a refused round
+        trip there before a sibling answered.  The second refusal has to park
+        it, and the candidate pool of the next request must not contain it.
+        """
+
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        deployments = [
+            {"litellm_params": {"model": "openai/x-cheap"}, "model_info": {"id": "x-cheap"}},
+            {"litellm_params": {"model": "openai/x-plus"}, "model_info": {"id": "x-plus"}},
+        ]
+        request_kwargs = {
+            "model": "default-chat",
+            "litellm_params": {"model": "openai/x-cheap"},
+            "model_info": {"id": "x-cheap"},
+        }
+
+        for _attempt in range(hooks._deployment_cooldown_failure_threshold()):
+            error = RuntimeError(
+                "ServiceUnavailableError: OpenAIException - Service temporarily unavailable"
+            )
+            error.status_code = 503
+            hooks._mark_exception_for_deployment_failover(error, request_kwargs)
+
+        filtered = await hook.async_filter_deployments(
+            "default-chat",
+            deployments,
+            messages=None,
+            request_kwargs={},
+        )
+        self.assertEqual(filtered, [deployments[1]])
 
     async def test_deployment_cooldown_defaults_to_two_failures(self) -> None:
         hooks, _ = load_hook_module()

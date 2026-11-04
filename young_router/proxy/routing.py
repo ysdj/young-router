@@ -1179,6 +1179,24 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
             _RECOVERY_POLICY_COOLDOWN,
         )
 
+    # A server-error status is the route's own answer, so it outranks every
+    # sentence below.  ``_UPSTREAM_TEMPORARY_ERROR_MARKERS`` holds the wording a
+    # rate-limiting upstream uses -- and the *same* wording a relay puts on a
+    # dead channel: "service temporarily unavailable", "overloaded", "try again
+    # later".  Read first, that sentence turned a 503 into "busy, retry" (live
+    # 2026-11-04: one route answered 503 for an hour and was never parked, so
+    # every turn paid it before a sibling answered), and it never counted a
+    # failure against the route.  The number is the evidence a wrapper cannot
+    # garble: every 5xx means this route failed, whether it says 500, 502, 503,
+    # 504 or 599, and the configured server-error policy is what decides what to
+    # do about that.  Wording still decides a failure whose status this proxy
+    # could not read.
+    if status_code == 408 or (status_code is not None and status_code >= 500):
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_SERVER_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
+        )
+
     if status_code == 429 or any(
         marker in text for marker in _UPSTREAM_TEMPORARY_ERROR_MARKERS
     ):
@@ -1198,11 +1216,9 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
             return _RECOVERY_POLICY_COOLDOWN
         return rate_limit_policy
 
-    if (
-        status_code == 408
-        or (status_code is not None and status_code >= 500)
-        or type(exception).__name__ in _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES
-    ):
+    # A timeout-carrying class with no readable status is still a route that
+    # failed to answer, so it keeps the server-error reading.
+    if type(exception).__name__ in _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES:
         return _recovery_policy_setting(
             _RECOVERY_POLICY_SERVER_ENV,
             _RECOVERY_POLICY_COOLDOWN,
