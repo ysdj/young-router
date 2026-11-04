@@ -844,6 +844,15 @@ _RESPONSES_COMPLETION_STREAM_DEFAULT_DONE_PATCH_ATTR = (
 _RESPONSES_COMPLETION_STREAM_COMPLETED_PATCH_ATTR = (
     "_responses_completion_stream_completed_patch"
 )
+#: The reasoning phase's own two patch points: LiteLLM decides to close the
+#: thinking on a frame that carries no answer, and it delivers the frame that
+#: closed it while no thinking item is open any more.
+_RESPONSES_COMPLETION_STREAM_REASONING_END_PATCH_ATTR = (
+    "_responses_completion_stream_reasoning_end_patch"
+)
+_RESPONSES_COMPLETION_STREAM_TRANSFORM_PATCH_ATTR = (
+    "_responses_completion_stream_transform_patch"
+)
 _RESPONSES_TOOL_SEARCH_BRIDGE_PATCH_ATTR = "_responses_tool_search_bridge_patch"
 # The chat-bridge input pass that keeps a thinking upstream's replay contract.
 _RESPONSES_CHAT_BRIDGE_REASONING_PATCH_ATTR = (

@@ -38,6 +38,8 @@ from .base import (
     _RESPONSES_COMPLETION_STREAM_COMPLETED_PATCH_ATTR,
     _RESPONSES_COMPLETION_STREAM_DEFAULT_DONE_PATCH_ATTR,
     _RESPONSES_COMPLETION_STREAM_PATCH_ATTR,
+    _RESPONSES_COMPLETION_STREAM_REASONING_END_PATCH_ATTR,
+    _RESPONSES_COMPLETION_STREAM_TRANSFORM_PATCH_ATTR,
     _RESPONSES_CHAT_BRIDGE_REASONING_PATCH_ATTR,
     _RESPONSES_TOOL_SEARCH_BRIDGE_PATCH_ATTR,
     _ROUTING_CONSTRAINT_PATCH_ATTR,
@@ -1949,6 +1951,62 @@ def _chunk_reasoning_fragment(chunk: Any) -> str:
     return fragment if isinstance(fragment, str) else ""
 
 
+def _chunk_closes_reasoning_without_an_answer(chunk: Any) -> bool:
+    """Whether this Chat frame would end the thinking while saying nothing.
+
+    LiteLLM ends a reasoning phase on the first frame that carries ``content``,
+    ``function_call`` or ``tool_calls``, and it says so by queueing the
+    summary's ``done`` frames and its item's ``done`` ahead of that frame.  Two
+    shapes carry nothing the reader can see and still close the block:
+
+    * a whitespace-only ``content`` delta -- the blank line a thinking model
+      writes as it leaves its thinking (a DeepSeek route streams one before
+      its answer);
+    * the retired, content-free ``function_call`` mirror a Chat shim repeats
+      on every frame of every turn.
+
+    A model that goes back to thinking after one of those then has its
+    remaining deltas arrive for an item the client already finished, and Codex
+    renders a summary delta it has no open item for **inside the answer**:
+    observed live 2026-11-04 on a ``deepseek-v4.1-flash`` turn, two paragraphs
+    of English planning landed in the middle of a Chinese answer, and the
+    client stored them as that message's text.  Nothing had been delivered yet
+    at that point, so the frame is not the answer and may not end the phase.
+    """
+
+    get = _web_search_native_module._response_item_get
+    choices = get(chunk, "choices")
+    if not isinstance(choices, (list, tuple)) or not choices:
+        return False
+    choice = choices[0]
+    # A terminal frame ends the phase whatever it carries: the turn is over.
+    if get(choice, "finish_reason") is not None:
+        return False
+    if get(chunk, "usage") is not None:
+        return False
+    delta = get(choice, "delta")
+    if delta is None:
+        return False
+    if get(delta, "tool_calls"):
+        return False
+    content = get(delta, "content")
+    if isinstance(content, str) and content.strip():
+        return False
+    legacy = get(delta, "function_call")
+    if legacy is not None:
+        name = get(legacy, "name")
+        arguments = get(legacy, "arguments")
+        if (isinstance(name, str) and name.strip()) or (
+            isinstance(arguments, str) and arguments.strip()
+        ):
+            return False
+    reasoning = get(delta, "reasoning_content")
+    if isinstance(reasoning, str) and reasoning.strip():
+        # Thinking is the phase itself, not what ends it.
+        return False
+    return True
+
+
 def _pending_content_part_done_text(pending: list[Any], queued_from: int) -> Any:
     for event in pending[queued_from:]:
         if _web_search_native_module._response_item_get(event, "type") != "response.content_part.done":
@@ -2171,9 +2229,11 @@ def _open_reasoning_summary_items(
             opening.append(_reasoning_summary_part_added_event(item_id, output_index))
             opened.add(item_id)
         if fragment and not fragment_added:
-            opening.append(
-                _reasoning_summary_text_event(item_id, output_index, "delta", fragment)
-            )
+            # The stock iterator answers this same chunk with its own summary
+            # delta; restating the fragment here delivered the block's first
+            # fragment twice (live 2026-11-04, the thinking opened on "WeWe
+            # need answer Chinese").  Only the accumulated text is kept, for
+            # the item this block completes with.
             text += fragment
             texts[item_id] = text
             fragment_added = True
@@ -2254,6 +2314,14 @@ def _install_responses_completion_stream_patch() -> None:
                 chunk
             ):
                 return None
+            # A frame that would only close the thinking does not begin the
+            # answer either: opening the message item on it announced an empty
+            # answer ahead of the thinking that was still streaming.
+            if (
+                getattr(self, "_reasoning_active", False)
+                and _chunk_closes_reasoning_without_an_answer(chunk)
+            ):
+                return None
             pending = getattr(self, "_pending_response_events", None)
             queued_before = len(pending) if isinstance(pending, list) else 0
             result = original_ensure_output_item_for_chunk(self, chunk)
@@ -2273,6 +2341,93 @@ def _install_responses_completion_stream_patch() -> None:
         )
         LiteLLMCompletionStreamingIterator._ensure_output_item_for_chunk = (
             patched_ensure_output_item_for_chunk
+        )
+
+    original_is_reasoning_end = getattr(
+        LiteLLMCompletionStreamingIterator,
+        "_is_reasoning_end",
+        None,
+    )
+    if callable(original_is_reasoning_end) and not getattr(
+        original_is_reasoning_end,
+        _RESPONSES_COMPLETION_STREAM_REASONING_END_PATCH_ATTR,
+        False,
+    ):
+
+        def patched_is_reasoning_end(self: Any, chunk: Any) -> Any:
+            # LiteLLM closes the thinking on any frame that carries content, a
+            # legacy ``function_call`` or a tool call.  A blank line and the
+            # content-free mirror carry neither a call nor a word, and the
+            # model that wrote them goes on thinking: closing the block there
+            # strands the rest of its summary on a finished item, which the
+            # client renders inside the answer (see
+            # ``_chunk_closes_reasoning_without_an_answer``).
+            if _chunk_closes_reasoning_without_an_answer(chunk):
+                return False
+            return original_is_reasoning_end(self, chunk)
+
+        setattr(
+            patched_is_reasoning_end,
+            _RESPONSES_COMPLETION_STREAM_REASONING_END_PATCH_ATTR,
+            True,
+        )
+        setattr(
+            patched_is_reasoning_end,
+            "_original_is_reasoning_end",
+            original_is_reasoning_end,
+        )
+        LiteLLMCompletionStreamingIterator._is_reasoning_end = (
+            patched_is_reasoning_end
+        )
+
+    original_transform_chunk = getattr(
+        LiteLLMCompletionStreamingIterator,
+        "_transform_chat_completion_chunk_to_response_api_chunk",
+        None,
+    )
+    if callable(original_transform_chunk) and not getattr(
+        original_transform_chunk,
+        _RESPONSES_COMPLETION_STREAM_TRANSFORM_PATCH_ATTR,
+        False,
+    ):
+
+        def patched_transform_chat_completion_chunk(
+            self: Any,
+            chunk: Any,
+        ) -> Any:
+            # The frame that only carries the answer's blank line is held back
+            # with its phase: nothing was delivered before it, so its text
+            # cannot be the start of a word, and delivering it would open the
+            # answer over a thinking block that is still streaming.
+            if (
+                getattr(self, "_reasoning_active", False)
+                and _chunk_closes_reasoning_without_an_answer(chunk)
+            ):
+                return None
+            # Once the summary's terminal frames are out, the client's thinking
+            # block is finished and it has no item to append a late delta to --
+            # Codex renders one under the answer instead.  Thinking that comes
+            # back after its block closed has no ordered place, so it is not
+            # delivered rather than shown as prose.
+            if (
+                getattr(self, "_reasoning_done_emitted", False)
+                and _chunk_reasoning_fragment(chunk)
+            ):
+                return None
+            return original_transform_chunk(self, chunk)
+
+        setattr(
+            patched_transform_chat_completion_chunk,
+            _RESPONSES_COMPLETION_STREAM_TRANSFORM_PATCH_ATTR,
+            True,
+        )
+        setattr(
+            patched_transform_chat_completion_chunk,
+            "_original_transform_chat_completion_chunk_to_response_api_chunk",
+            original_transform_chunk,
+        )
+        LiteLLMCompletionStreamingIterator._transform_chat_completion_chunk_to_response_api_chunk = (
+            patched_transform_chat_completion_chunk
         )
 
     original_return_default_done_events = getattr(
