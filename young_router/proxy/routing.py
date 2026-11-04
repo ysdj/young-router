@@ -1019,6 +1019,17 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
             _RECOVERY_POLICY_SERVER_ENV,
             _RECOVERY_POLICY_COOLDOWN,
         )
+    if _is_thinking_tool_choice_unsupported_error(exception):
+        # One Codex task paid this refusal on every turn -- ~10 s and one full
+        # upload of a 60 MB replay, 178 times in three hours -- because a 4xx was
+        # read as ``error``, the turn ended on the first route, and no cooldown
+        # was ever counted.  The group's sibling serves the same bytes, so the
+        # refusal parks the route (ordinary failure threshold, ordinary window)
+        # and the turn advances exactly as it did.
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_REQUEST_ERROR_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
+        )
     # A server that refuses this route by policy or region answers the same way
     # to every replay, so the route is unusable until someone changes the
     # account, key, or region.  Waiting it out is not recovery; cooling it down
@@ -5389,6 +5400,10 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         # A trace that said only ``other`` is exactly why this refusal read as
         # the request's own 400 while the route kept being selected first.
         reason = "upstream-client-version-rejected"
+    elif _is_thinking_tool_choice_unsupported_error(exception):
+        # Named so triage can tell it from the generic compatibility refusal it
+        # used to land in -- that label is what hid a refusal paid on every turn.
+        reason = "thinking-tool-choice-refused"
     elif _is_upstream_tool_history_rejected_error(exception):
         reason = "upstream-tool-history-rejected"
     elif _is_upstream_request_field_rejected_error(exception):
@@ -7171,6 +7186,31 @@ def _should_count_deployment_failure_for_cooldown(
     return _recovery_policy_for_exception(exception) == _RECOVERY_POLICY_COOLDOWN
 
 
+def _cooldown_failure_declined(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+    reason: str,
+) -> None:
+    """Say why a failed attempt was not counted against its route.
+
+    A refusal this proxy classified as ``recovery_cooldown`` that still leaves no
+    cooldown behind reads in the trace exactly like one it never classified at
+    all -- and that is how a route kept being selected first on every turn while
+    the classification said it should have been parked.
+    """
+
+    _trace_module._route_trace(
+        "deployment_cooldown_declined",
+        request_id=_trace_request_id(request_kwargs),
+        session=_trace_session_context(request_kwargs),
+        model_group=_responses_execution_module._request_model_group(request_kwargs),
+        deployment_id=_deployment_id_from_request(request_kwargs),
+        route_key=_deployment_route_key_from_request(request_kwargs),
+        reason=reason,
+        exception=_trace_exception(exception),
+    )
+
+
 def _record_deployment_failure_for_cooldown(
     exception: Exception,
     request_kwargs: Optional[dict],
@@ -7178,10 +7218,17 @@ def _record_deployment_failure_for_cooldown(
     force: bool = False,
 ) -> None:
     if not _deployment_cooldown_enabled():
+        _cooldown_failure_declined(exception, request_kwargs, "cooldown_disabled")
         return
     if not _deployment_cooldown_recording_enabled_for_request(request_kwargs):
+        _cooldown_failure_declined(
+            exception, request_kwargs, "recording_disabled_for_request_class"
+        )
         return
     if _is_sanitized_upstream_route_failure_error(exception):
+        _cooldown_failure_declined(
+            exception, request_kwargs, "sanitized_route_failure"
+        )
         return
     # `force` only bypasses the once-per-fallback de-duplication gate. It
     # must never turn a deterministic request/construction error into a
@@ -7190,8 +7237,14 @@ def _record_deployment_failure_for_cooldown(
     # protocol-fallback force path.
     recovery_policy = _recovery_policy_for_exception(exception)
     if recovery_policy != _RECOVERY_POLICY_COOLDOWN:
+        _cooldown_failure_declined(
+            exception, request_kwargs, f"policy:{recovery_policy}"
+        )
         return
     if getattr(exception, _DEPLOYMENT_COOLDOWN_FAILURE_RECORDED_ATTR, False):
+        _cooldown_failure_declined(
+            exception, request_kwargs, "already_recorded_for_this_attempt"
+        )
         return
 
     deployment_id = _responses_execution_module._failed_deployment_id(exception) or _deployment_id_from_request(request_kwargs)
@@ -7204,6 +7257,9 @@ def _record_deployment_failure_for_cooldown(
         request_kwargs=request_kwargs,
     )
     if not cooldown_keys:
+        _cooldown_failure_declined(
+            exception, request_kwargs, "no_route_identity_on_the_request"
+        )
         return
 
     try:
@@ -8457,6 +8513,48 @@ def _is_forced_tool_choice_auto_retry_error(
             "invalid parameters combination",
             "invalid combination of parameters",
             "invalid request parameter combination",
+        )
+    )
+
+
+def _is_thinking_tool_choice_unsupported_error(exception: Exception) -> bool:
+    """Whether the upstream refuses *any* ``tool_choice`` in thinking mode.
+
+    DeepSeek answers ``400 thinking mode does not support this tool_choice`` to a
+    payload that carries ``tool_choice`` -- including ``auto`` -- whenever the
+    request also asks for reasoning.  The refusal is not the field: measured
+    live 2026-11-04, the identical replay with ``tool_choice`` removed is refused
+    the same way, and the same payload signature is served outright about half
+    the time (160 of 305 attempts on one deployment).  So it is the route
+    answering about this turn, and what it must not do is keep its place in
+    front of a sibling that can answer.
+
+    Read on the wording plus the status, never on the status alone: a 400 that
+    names ``tool_choice`` for a *validation* reason (a tool that does not exist)
+    is the caller's body, and a route that would have answered it keeps its
+    place.
+    """
+
+    if _exception_status_code(exception) not in {400, 422}:
+        return False
+    if _is_terminal_prompt_or_policy_error(exception):
+        return False
+    text = _exception_text(exception)
+    if not text:
+        return False
+    if "tool_choice" not in text and "tool choice" not in text:
+        return False
+    if "thinking" not in text and "reasoning" not in text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "not support",
+            "does not support",
+            "unsupported",
+            "not allowed",
+            "不支持",
+            "不允许",
         )
     )
 
