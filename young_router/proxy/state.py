@@ -289,7 +289,23 @@ def _recent_requests_log_path() -> Optional[str]:
     return None
 
 
+# Where a deployment says its own state lives.  A desktop install imports the
+# package out of ``<root>/.litellm-runtime`` and needs nothing; a gateway imports
+# it out of an immutable snapshot directory, and without one of these it had no
+# runtime root at all -- so the cooldown document, the cross-worker concurrency
+# leases and the route-recovery state silently became per-process memory.
+# Observed live 2026-11-04 on the gateway: a route refused on every request and
+# no cooldown was ever written, because each of eight workers kept its own count
+# and never reached the failure threshold.
+_RUNTIME_ROOT_ENV = "LITELLM_RUNTIME_ROOT"
+_RUNTIME_ROOT_FALLBACK_ENV = "YOUNG_ROUTER_HOME"
+
+
 def _runtime_root_from_this_file() -> Optional[str]:
+    for name in (_RUNTIME_ROOT_ENV, _RUNTIME_ROOT_FALLBACK_ENV):
+        configured = str(os.getenv(name, "") or "").strip()
+        if configured:
+            return os.path.expanduser(configured)
     runtime_dir = os.path.dirname(os.path.abspath(__file__))
     if os.path.basename(runtime_dir) == ".litellm-runtime":
         return os.path.dirname(runtime_dir)

@@ -4311,3 +4311,56 @@ class HookSlowFailureRecoveryTests(HookTestCase):
         elapsed = hooks._current_attempt_elapsed_seconds()
         self.assertIsNotNone(elapsed)
         self.assertGreaterEqual(elapsed, 0.0)
+
+
+class RuntimeRootStateTests(HookTestCase):
+    """Where a deployment says its state lives, it must be honoured.
+
+    A gateway imports this package out of an immutable snapshot directory, not
+    out of ``.litellm-runtime``.  Without an env root the cooldown document, the
+    cross-worker concurrency leases and the route-recovery state were all
+    silently per-process: eight workers each counted their own failures, so a
+    route that refused on every request never reached the threshold and was
+    never parked.  Observed live 2026-11-04 on the gateway.
+    """
+
+    def test_the_configured_runtime_root_owns_the_state_files(self) -> None:
+        hooks, _ = load_hook_module()
+        state = sys.modules["young_router.proxy.state"]
+
+        with mock.patch.dict(
+            os.environ,
+            {"LITELLM_RUNTIME_ROOT": "/srv/young-router"},
+            clear=False,
+        ):
+            self.assertEqual(
+                "/srv/young-router/.litellm-runtime/deployment-cooldowns.json",
+                state._deployment_cooldown_file_path(),
+            )
+            self.assertEqual(
+                "/srv/young-router/.litellm-runtime/deployment-concurrency.json",
+                sys.modules["young_router.proxy.concurrency"].file_path(),
+            )
+
+    def test_the_fallback_root_is_used_when_the_first_is_absent(self) -> None:
+        hooks, _ = load_hook_module()
+        state = sys.modules["young_router.proxy.state"]
+
+        environment = {"YOUNG_ROUTER_HOME": "/srv/yr-home"}
+        with mock.patch.dict(os.environ, environment, clear=False):
+            os.environ.pop("LITELLM_RUNTIME_ROOT", None)
+            self.assertEqual(
+                "/srv/yr-home/.litellm-runtime/deployment-cooldowns.json",
+                state._deployment_cooldown_file_path(),
+            )
+
+    def test_no_root_still_answers_none(self) -> None:
+        hooks, _ = load_hook_module()
+        state = sys.modules["young_router.proxy.state"]
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LITELLM_RUNTIME_ROOT", None)
+            os.environ.pop("YOUNG_ROUTER_HOME", None)
+            os.environ.pop("YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_FILE", None)
+            # Imported out of this checkout, which is not a runtime directory.
+            self.assertIsNone(state._deployment_cooldown_file_path())
