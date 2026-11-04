@@ -253,6 +253,39 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(usage["total_tokens"], 1207)
         self.assertLessEqual(usage["input_tokens_details"]["cached_tokens"], usage["input_tokens"])
 
+    def test_a_streamed_turn_keeps_the_cache_it_wrote(self) -> None:
+        # ``response.completed`` is the only usage a streamed turn shows, and
+        # this normaliser rebuilds its details.  It used to keep only the read
+        # count, so a Claude turn that paid 1.25x to write a cache reported no
+        # write at all, while the same turn served whole kept it.
+        from young_router.proxy import base as base_module
+
+        streamed = base_module._responses_usage_for_codex(
+            {
+                "input_tokens": 8218,
+                "output_tokens": 16,
+                "input_tokens_details": {
+                    "cached_tokens": 0,
+                    "text_tokens": 2,
+                    "cache_write_tokens": 8216,
+                },
+            }
+        )
+        self.assertEqual(8216, streamed["input_tokens_details"]["cache_write_tokens"])
+
+        # Anthropic's own spelling on the route whose usage had no chat shape.
+        anthropic = base_module._responses_usage_for_codex(
+            {"input_tokens": 500, "output_tokens": 8, "cache_creation_input_tokens": 480}
+        )
+        self.assertEqual(480, anthropic["input_tokens_details"]["cache_write_tokens"])
+
+        # A write can never be larger than the input it belongs to: a relay that
+        # reports more tokens than it counted must not move the turn meter.
+        overstated = base_module._responses_usage_for_codex(
+            {"input_tokens": 100, "output_tokens": 8, "cache_creation_input_tokens": 400}
+        )
+        self.assertEqual(100, overstated["input_tokens_details"]["cache_write_tokens"])
+
 
 def _tool_image_item(chars: int = 5000) -> dict:
     """A ``view_image`` result: one text part and the picture itself."""

@@ -134,7 +134,7 @@ class HookStreamingToolEventTests(HookTestCase):
         )
         self.assertEqual(
             event["response"]["usage"]["input_tokens_details"],
-            {"cached_tokens": 0},
+            {"cached_tokens": 0, "cache_write_tokens": 0},
         )
 
     def test_responses_tool_search_bridge_patch_rewrites_non_streaming_tool_calls(self) -> None:

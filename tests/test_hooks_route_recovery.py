@@ -3345,7 +3345,7 @@ class HookRouteRecoveryTests(HookTestCase):
             usage,
             {
                 "input_tokens": 11,
-                "input_tokens_details": {"cached_tokens": 0},
+                "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
                 "output_tokens": 5,
                 "output_tokens_details": {"reasoning_tokens": 0},
                 "total_tokens": 16,

@@ -1060,6 +1060,19 @@ def _responses_usage_for_codex(
         _int_or_zero(_object_get(usage, "prompt_cache_hit_tokens")),
         _int_or_zero(_object_get(usage, "cache_read_input_tokens")),
     )
+    # The same block carries the cache a turn *wrote*, and it is dropped here when
+    # the two surfaces disagree.  This function rebuilds ``input_tokens_details``
+    # for every streamed ``response.completed``, and the Anthropic routes had just
+    # started writing 5-minute caches; a streamed turn that paid 1.25x for the
+    # write reported no write at all (measured on the live gateway 2026-11-05:
+    # non-streaming ``cache_write_tokens: 8216``, the same turn streamed -- with
+    # no entry), while the non-streaming shape LiteLLM builds keeps it.  Reading
+    # every spelling the providers use, as the cache-read count above does.
+    cache_write_tokens = max(
+        _int_or_zero(_object_get(input_details, "cache_write_tokens")),
+        _int_or_zero(_object_get(input_details, "cache_creation_tokens")),
+        _int_or_zero(_object_get(usage, "cache_creation_input_tokens")),
+    )
     # The relays these models are served from count their own way, and a count
     # that is too low is not harmless: Codex shows it as context used and
     # compacts against it, so an undercounted thread runs until the router
@@ -1078,11 +1091,13 @@ def _responses_usage_for_codex(
             total_tokens = input_tokens + output_tokens
 
     cached_tokens = min(cached_tokens, input_tokens)
+    cache_write_tokens = min(cache_write_tokens, input_tokens)
 
     return {
         "input_tokens": input_tokens,
         "input_tokens_details": {
             "cached_tokens": cached_tokens,
+            "cache_write_tokens": cache_write_tokens,
         },
         "output_tokens": output_tokens,
         "output_tokens_details": {

@@ -936,7 +936,7 @@ class HookStreamingResponseEventTests(HookTestCase):
             usage,
             {
                 "input_tokens": 7,
-                "input_tokens_details": {"cached_tokens": 0},
+                "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
                 "output_tokens": 3,
                 "output_tokens_details": {"reasoning_tokens": 0},
                 "total_tokens": 10,
@@ -968,7 +968,7 @@ class HookStreamingResponseEventTests(HookTestCase):
             parsed["response"]["usage"],
             {
                 "input_tokens": 17,
-                "input_tokens_details": {"cached_tokens": 0},
+                "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
                 "output_tokens": 4,
                 "output_tokens_details": {"reasoning_tokens": 0},
                 "total_tokens": 21,
@@ -1806,7 +1806,7 @@ class HookStreamingResponseEventTests(HookTestCase):
             chunks[-1]["response"]["usage"],
             {
                 "input_tokens": 13,
-                "input_tokens_details": {"cached_tokens": 0},
+                "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
                 "output_tokens": 8,
                 "output_tokens_details": {"reasoning_tokens": 0},
                 "total_tokens": 21,
