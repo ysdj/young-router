@@ -2698,6 +2698,46 @@ class HookRoutingTests(HookTestCase):
             hooks._is_forced_tool_choice_unsupported_error(error, no_choice_request)
         )
 
+    def test_a_thinking_route_refusal_reaches_the_auto_retry(self) -> None:
+        # The official DeepSeek endpoint answers this wording to a payload that
+        # carries ``tool_choice: required`` while thinking, and serves the same
+        # payload with ``auto`` (measured live 2026-11-04).  The wording names the
+        # mode, never "forced", so a matcher that required the forced wording
+        # left every turn paying the 400 before a sibling answered.
+        hooks, _ = load_hook_module()
+        request = {
+            "model": "default-chat",
+            "call_type": "aresponses",
+            "tool_choice": "required",
+            "tools": [{"type": "function", "name": "inspect"}],
+            "_young_router_upstream_url_surface": "openai/chat",
+            "model_info": {
+                "id": "thinking-route",
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+        error = RuntimeError(
+            "litellm.BadRequestError: OpenAIException - Thinking mode does not "
+            "support this tool_choice (request_id: 4b4fb7bb-e1ee-4f68-ad87)"
+        )
+        error.status_code = 400
+
+        self.assertTrue(
+            hooks._is_forced_tool_choice_unsupported_error(error, request)
+        )
+        self.assertTrue(
+            hooks._is_forced_tool_choice_auto_retry_error(error, request)
+        )
+
+        auto_request = {**request, "tool_choice": "auto"}
+        self.assertFalse(
+            hooks._is_forced_tool_choice_unsupported_error(error, auto_request)
+        )
+        self.assertFalse(
+            hooks._is_forced_tool_choice_auto_retry_error(error, auto_request)
+        )
+
     def test_ambiguous_forced_choice_retry_requires_a_tool_payload(self) -> None:
         hooks, _ = load_hook_module()
         error = RuntimeError("请求参数组合无效")

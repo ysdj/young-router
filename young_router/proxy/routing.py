@@ -8558,7 +8558,25 @@ def _is_forced_tool_choice_unsupported_text(exception: Exception) -> bool:
             "强制工具",
         )
     )
-    return bool(requests_auto or (has_unsupported_marker and forced_mode_marker))
+    # A thinking route refuses every forced choice for the one reason it states
+    # outright: measured live against the official DeepSeek endpoint, the same
+    # payload answered 200 with ``tool_choice: auto`` (and with ``none`` or the
+    # field absent) and 400 with ``required``.  The wording names the mode rather
+    # than "forced", so requiring the forced wording here is what made every
+    # Codex turn pay the refusal, upload included, before a sibling answered.
+    thinking_mode_marker = any(
+        marker in text
+        for marker in (
+            "thinking mode",
+            "reasoning mode",
+            "思考模式",
+            "推理模式",
+        )
+    )
+    return bool(
+        requests_auto
+        or (has_unsupported_marker and (forced_mode_marker or thinking_mode_marker))
+    )
 
 
 def _request_has_tool_compatibility_candidate(
