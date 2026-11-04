@@ -137,6 +137,9 @@ class YoungRouterHook(CustomLogger):
     ) -> None:
         if _routing_module._is_codex_compaction_capability_probe(kwargs):
             return
+        # A failed turn has no attempt in flight either; its slot goes back the
+        # moment the failure is known, not when the lease expires.
+        _routing_module._release_request_concurrency_slots(kwargs)
         # A listing or health read that failed never became a turn.  Left
         # logged, every ``/v1/models`` read a client or this app's own
         # client-model loop made while a worker was still loading its key became
@@ -400,6 +403,12 @@ class YoungRouterHook(CustomLogger):
     ) -> Optional[Any]:
         if request_data.get("stream") is not True:
             _routing_module._record_deployment_success_for_cooldown(request_data)
+            # The turn is over, so the slot it claimed is not in flight.  Without
+            # this a successful turn held its route's slot until the lease aged
+            # out -- two hours of "busy" per turn -- and eight of them parked the
+            # whole route: observed live 2026-11-04, two probe turns left two
+            # leases behind and every route of the group read as saturated.
+            _routing_module._release_request_concurrency_slots(request_data)
         response = _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(response, request_data)
         _web_search_native_module._mark_provider_native_web_search_event(
             request_data, response
@@ -550,6 +559,15 @@ class YoungRouterHook(CustomLogger):
                 request=_trace_module._trace_request_summary(request_data),
             )
             yield terminal_event
+        finally:
+            # This generator ending is the turn ending, whatever ended it: the
+            # answer completed, a terminal error frame was delivered, the client
+            # stopped reading, or this worker was torn down mid-answer.  A slot
+            # whose turn is over is not a request in flight, and the lease only
+            # ages out after the whole request budget -- two hours of a route
+            # counted as busy with nobody behind it.  Enough of those park a
+            # whole model group at its cap.
+            _routing_module._release_request_concurrency_slots(request_data)
 
     async def _post_call_streaming_iterator_pipeline(
         self,

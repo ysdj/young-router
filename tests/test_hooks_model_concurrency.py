@@ -782,3 +782,76 @@ class CallbackShapeLeaseTests(ConcurrencyStoreTestCase):
 
         self.assertEqual(hooks._attempt_lease_id(outgoing), "turn-1")
         self.assertEqual(hooks._attempt_lease_id(incoming), "turn-1")
+
+
+class TurnEndReleasesTheSlotTests(ConcurrencyStoreTestCase):
+    """A finished turn is not a request in flight.
+
+    The lease only ages out after the whole request budget, so a turn that never
+    releases its slot keeps showing as busy for two hours; eight of them park the
+    route. Observed live 2026-11-04 on the gateway: two successful turns left two
+    leases behind, and two routes of one group read as saturated within minutes.
+    """
+
+    async def test_a_successful_turn_gives_its_slot_back(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        request = _request(turn="turn-success")
+        request["stream"] = False
+        self.assertTrue(
+            hooks._claim_deployment_concurrency_slot(
+                request, _deployment("route-a"), 8
+            )
+        )
+        self.assertEqual(1, len(self.leases()))
+
+        await hooks.YoungRouterHook().async_post_call_success_deployment_hook(
+            request_data=request,
+            response={"output": []},
+            call_type="aresponses",
+        )
+
+        self.assertEqual({}, self.leases())
+
+    async def test_a_failed_turn_gives_its_slot_back(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        request = _request(turn="turn-failure")
+        request["stream"] = False
+        self.assertTrue(
+            hooks._claim_deployment_concurrency_slot(
+                request, _deployment("route-a"), 8
+            )
+        )
+
+        await hooks.YoungRouterHook().async_log_failure_event(
+            kwargs=request,
+            response_obj=RuntimeError("upstream refused"),
+            start_time=None,
+            end_time=None,
+        )
+
+        self.assertEqual({}, self.leases())
+
+    async def test_a_streamed_turn_gives_its_slot_back_when_the_reader_leaves(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        request = _request(turn="turn-stream")
+        self.assertTrue(
+            hooks._claim_deployment_concurrency_slot(
+                request, _deployment("route-a"), 8
+            )
+        )
+
+        async def endless_stream():
+            yield {"type": "response.created", "response": {"id": "resp-1"}}
+            yield {"type": "response.output_text.delta", "delta": "a"}
+            await asyncio.sleep(3600)
+
+        stream = hooks.YoungRouterHook().async_post_call_streaming_iterator_hook(
+            user_api_key_dict=None,
+            response=endless_stream(),
+            request_data=request,
+        )
+        await anext(stream)
+        await anext(stream)
+        await stream.aclose()
+
+        self.assertEqual({}, self.leases())
