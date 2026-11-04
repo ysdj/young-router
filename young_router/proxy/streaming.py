@@ -47,6 +47,7 @@ from .base import (
     _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
     _normalize_response_completed_event_usage,
+    _proxy_shutdown_in_progress,
     asyncio,
     copy,
     datetime,
@@ -1819,53 +1820,6 @@ def _raise_if_leaked_tool_call_markup(chunk: Any, request_data: Any) -> None:
     if _stream_chunk_leaked_tool_call_markup(chunk):
         raise _leaked_tool_call_markup_exception(chunk, request_data)
 
-def _local_shutdown_completed_response_event(
-    request_data: dict,
-    completion_state: Any,
-) -> Optional[_JSONStreamEvent]:
-    """Close a stream this worker itself cut, as a completed turn.
-
-    A replacement worker is stopped while it is draining, so a turn that is
-    still being written can lose its upstream mid-answer.  The upstream said
-    nothing, so there is no failure to report and nothing for the user to
-    answer: the only honest outcome is the part of the answer that already
-    arrived.  Whatever the completion state has recorded is emitted as the
-    turn's output, which is how the client keeps the conversation instead of
-    rendering ``upstream_route_failure`` and asking the user to send it again.
-
-    ``None`` means nothing usable had been produced yet, and the caller falls
-    back to ending the stream quietly rather than inventing an empty answer.
-    """
-
-    if completion_state is None:
-        return None
-    try:
-        completed_response = completion_state.completed_payload(request_data)
-    except Exception:  # pragma: no cover - a partial state that cannot be read
-        return None
-    if not isinstance(completed_response, dict):
-        return None
-    output = completed_response.get("output")
-    if not isinstance(output, list) or not output:
-        if not str(completed_response.get("output_text") or "").strip():
-            return None
-    completed_event: dict[str, Any] = {
-        "type": "response.completed",
-        "response": completed_response,
-    }
-    model = (
-        _responses_execution_module._request_model_group(request_data)
-        or request_data.get("model")
-    )
-    if isinstance(model, str) and model:
-        completed_event["model"] = model
-    _trace_module._request_route_trace(
-        "responses_stream_local_shutdown_completed_compat",
-        request_data,
-        output_items=len(output) if isinstance(output, list) else 0,
-    )
-    return _json_stream_event(completed_event)
-
 def _unclassified_stop_message() -> str:
     """The one sentence for a stop no branch in this module can name.
 
@@ -1888,7 +1842,6 @@ def _unclassified_stop_message() -> str:
 def _synthesized_failed_response_event(
     request_data: dict,
     exception: Exception,
-    completion_state: Any = None,
     *,
     after_visible_output: bool = False,
 ) -> _JSONStreamEvent:
@@ -1910,22 +1863,6 @@ def _synthesized_failed_response_event(
     stop terminal *here* -- not something the client can be told to sit through
     again.
     """
-    if _routing_module._is_local_shutdown_exception(exception):
-        # This worker truncated the stream because it is the one being replaced,
-        # not because the upstream refused.  A synthetic ``response.failed`` is
-        # terminal to Pi/Codex and turns that teardown into a user-visible
-        # ``upstream_route_failure`` the user has to answer by hand, so the
-        # stream is closed the way a completed turn is: whatever the model had
-        # already produced is delivered as the turn's output and the client
-        # keeps the conversation instead of rendering a retry tip.
-        completed = _local_shutdown_completed_response_event(request_data, completion_state)
-        if completed is not None:
-            return completed
-        # Nothing had been produced yet, so there is no partial turn to keep and
-        # no honest completion to report.  The connection is already being
-        # closed by Uvicorn, so end the stream quietly rather than naming a
-        # failure the user cannot act on.
-        raise asyncio.CancelledError
     model = _responses_execution_module._request_model_group(request_data) or request_data.get("model") or "unknown"
     is_structured_compaction = (
         _responses_request_module._request_has_structured_codex_compaction(
@@ -5272,10 +5209,10 @@ async def _yield_native_stream_with_output_limit_continuation(
             yield chunk
     except Exception as exception:
         if _routing_module._is_local_shutdown_exception(exception):
-            # The worker is being replaced.  Once the client has received
-            # answer text, a synthetic terminal failure would be rendered
-            # as ``router_restarting`` and stop the turn; let the response
-            # close so the client-side reconnect path can take over.
+            # The worker is being replaced.  A clean close would be read as a
+            # finished turn by a client that waits for a terminal frame, so
+            # state the restart and let the client resend onto the replacement.
+            yield _synthesized_native_stream_error_chunk(request_data, exception)
             return
         if saw_terminal:
             return
@@ -5589,6 +5526,20 @@ async def _yield_guarded_original_stream(
             return {}
         return None
 
+    def completed_response_has_output_items(chunk: Any) -> bool:
+        """Whether this terminal states an output list with any item at all.
+
+        A fabricated terminal that omits the answer carries a reasoning item
+        (and possibly an empty message), while a relay may legitimately state a
+        terminal with no output list at all.  Only the former can silently
+        replace an answer the reader already saw.
+        """
+
+        dumped = _stream_chunk_dump(chunk)
+        response = dumped.get("response") if isinstance(dumped, dict) else None
+        output = response.get("output") if isinstance(response, dict) else None
+        return isinstance(output, list) and bool(output)
+
     def completed_terminal_event(
         reason: str,
         *,
@@ -5726,7 +5677,36 @@ async def _yield_guarded_original_stream(
             chunk = completed_compat_chunk
             remember(chunk)
         if _responses_stream_chunk_is_completed(chunk):
-            if _responses_completed_chunk_is_empty(chunk, request_data) and not answer_output_seen:
+            empty_completed = _responses_completed_chunk_is_empty(chunk, request_data)
+            if empty_completed and _proxy_shutdown_in_progress():
+                # The terminal was fabricated while this worker was exiting, so
+                # it is not the answer's outcome.  Even an output list the
+                # sanitizer has already emptied is the same fact: a clean close
+                # here is a finished turn to the client, so state the restart
+                # and let the turn be resent.
+                yield _synthesized_failed_response_event(
+                    request_data,
+                    RuntimeError("router restarting"),
+                )
+                await _close_async_iterator_safely(response)
+                return
+            if empty_completed and completed_response_has_output_items(chunk):
+                if not answer_output_seen:
+                    break
+                # Answer text was streamed, but the fabricated terminal carries
+                # none of it.  Close with what the client actually read instead
+                # of handing it a completion whose output is a blank reasoning
+                # item.
+                completed = completed_terminal_event(
+                    "empty completed response after a streamed answer"
+                )
+                if completed is not None:
+                    remember(completed)
+                    yield completed
+                    await _close_async_iterator_safely(response)
+                    return
+                break
+            if empty_completed and not answer_output_seen:
                 break
             saw_responses_completed = True
             record_responses_stream_success()
@@ -5902,7 +5882,29 @@ async def _yield_guarded_original_stream(
                 chunk = completed_compat_chunk
                 remember(chunk)
             if _responses_stream_chunk_is_completed(chunk):
-                if _responses_completed_chunk_is_empty(chunk, request_data) and not answer_output_seen:
+                empty_completed = _responses_completed_chunk_is_empty(chunk, request_data)
+                if empty_completed and _proxy_shutdown_in_progress():
+                    # See the buffer branch above: a terminal fabricated by this
+                    # worker's own teardown must not close the turn.
+                    yield _synthesized_failed_response_event(
+                        request_data,
+                        RuntimeError("router restarting"),
+                    )
+                    await _close_async_iterator_safely(response)
+                    return
+                if empty_completed and completed_response_has_output_items(chunk):
+                    if not answer_output_seen:
+                        break
+                    completed = completed_terminal_event(
+                        "empty completed response after a streamed answer"
+                    )
+                    if completed is not None:
+                        remember(completed)
+                        yield completed
+                        await _close_async_iterator_safely(response)
+                        return
+                    break
+                if empty_completed and not answer_output_seen:
                     break
                 saw_responses_completed = True
                 record_responses_stream_success()
@@ -6009,6 +6011,11 @@ async def _yield_guarded_original_stream(
             if synthetic_completed is not None:
                 remember(synthetic_completed)
                 yield synthetic_completed
+                return
+            # Nothing usable arrived, so there is no partial turn to keep.  A
+            # clean body close is still read as a finished turn, so state the
+            # restart as the retryable stop it is.
+            yield _synthesized_failed_response_event(request_data, exc)
             return
         if saw_image_generation_activity:
             completed = completed_image_generation_terminal_event(
@@ -6084,6 +6091,12 @@ async def _yield_guarded_original_stream(
                 if synthetic_completed is not None:
                     remember(synthetic_completed)
                     yield synthetic_completed
+                    return
+                # The answer never began.  Closing the body without a terminal
+                # is read as a finished turn by the client, which is how a
+                # restart ended a main thread that still had subagents running.
+                # State the restart so the turn is resent instead.
+                yield _synthesized_failed_response_event(request_data, incomplete_exception)
                 return
             if synthesize_completed_on_clean_eof_after_visible_output:
                 terminal_items = terminal_completed_output_items()
@@ -6131,10 +6144,14 @@ async def _yield_streaming_error_fallback_or_raise(
     # failover or recovery path can quarantine a healthy deployment or turn
     # the interruption into a reconnect-triggering exception.
     if _routing_module._is_local_shutdown_exception(exception):
-        # A rolling worker replacement must never surface a synthetic failure
-        # event to the client: that event is rendered as ``router_restarting``
-        # and aborts the turn even though the replacement worker can continue
-        # it. Leave the stream open for the client-side retry/reconnect path.
+        # A rolling worker replacement must not close the body without a
+        # terminal: a client that reads a clean end of body as a finished turn
+        # ends the conversation instead of resending it.  The replacement is
+        # already listening, so this is the retryable restart stop.
+        if _request_is_responses_stream(request_data):
+            yield _synthesized_failed_response_event(request_data, exception)
+        else:
+            yield _synthesized_native_stream_error_chunk(request_data, exception)
         return
 
     # A provider may return an async iterator successfully and raise the

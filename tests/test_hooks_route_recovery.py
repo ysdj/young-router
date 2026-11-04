@@ -3690,10 +3690,18 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertEqual(request_data.get("_excluded_deployment_ids"), None)
         self.assertNotIn("c52c205f", hooks._CURRENT_EXCLUDED_DEPLOYMENT_IDS.get() or set())
 
-        # A local worker teardown must never synthesize a terminal event that
-        # tells the client to resend the turn.
-        with self.assertRaises(asyncio.CancelledError):
+        # A local worker teardown with no usable partial answer must still
+        # state its outcome.  A clean body close is a finished turn to a
+        # Responses reader, which is how a restart ended a main thread while
+        # its subagents kept running; the retryable restart stop keeps the turn
+        # alive instead.
+        terminal = jsonable_stream_chunk(
             hooks._synthesized_failed_response_event(request_data, exc)
+        )
+        self.assertEqual(terminal.get("type"), "response.failed")
+        restart_error = (terminal.get("response") or {}).get("error") or {}
+        self.assertEqual(restart_error.get("code"), "router_restarting")
+        self.assertIn("terminated", restart_error.get("message", ""))
 
     async def test_a_restart_teardown_never_reaches_failover_or_recovery(self) -> None:
         """The turn this worker truncated states the restart, not a route failure.
@@ -3704,7 +3712,9 @@ class HookRouteRecoveryTests(HookTestCase):
         exactly like an upstream fault.  Tested at the entry point the streaming
         pipeline actually calls: the classification must come first, because a
         failover or a recovery poll reached from here quarantines a healthy
-        deployment and answers a client that only has to send the turn again.
+        deployment.  The stop still has to be stated: a body that closes without
+        a terminal is read as a finished turn, so the client would end the
+        conversation instead of resending it onto the replacement.
         """
 
         hooks, _proxy_server = load_hook_module()
@@ -3751,13 +3761,20 @@ class HookRouteRecoveryTests(HookTestCase):
                 exc,
             )
         ]
-        self.assertEqual(chunks, [])
-        # A local worker replacement is intentionally silent at this layer;
-        # emitting a synthetic failure makes the client render a restart error
-        # and abort the turn.
+        # A local worker replacement must still state its outcome.  A clean
+        # body close is a finished turn to a Responses reader, so the turn has
+        # to be told to resend instead of ending with the subagents still
+        # running.
+        self.assertEqual(
+            [chunk.get("type") for chunk in chunks],
+            ["response.failed"],
+        )
+        restart_error = (chunks[0].get("response") or {}).get("error") or {}
+        self.assertEqual(restart_error.get("code"), "router_restarting")
+        self.assertIn("terminated", restart_error.get("message", ""))
         self.assertEqual(fallback_attempts, [])
 
-        # A Chat Completions turn follows the same silent teardown path.
+        # A Chat Completions turn states the same restart on its own wire.
         chat_request = {
             "model": "default-chat",
             "messages": [{"role": "user", "content": "Continue."}],
@@ -3765,16 +3782,19 @@ class HookRouteRecoveryTests(HookTestCase):
             "proxy_server_request": {"path": "/v1/chat/completions"},
         }
         chat_chunks = [
-            chunk
+            jsonable_stream_chunk(chunk)
             async for chunk in hooks._yield_streaming_error_fallback_or_raise(
                 chat_request,
                 exc,
             )
         ]
-        self.assertEqual(chat_chunks, [])
+        self.assertEqual(len(chat_chunks), 1)
+        chat_error = chat_chunks[0].get("error") or {}
+        self.assertEqual(chat_error.get("code"), "router_restarting")
+        self.assertIn("terminated", chat_error.get("message", ""))
         self.assertEqual(fallback_attempts, [])
 
-    async def test_a_restart_during_recovery_poll_does_not_emit_router_restarting(self) -> None:
+    async def test_a_restart_during_recovery_poll_states_the_restart(self) -> None:
         hooks, _proxy_server = load_hook_module()
         streaming_module = sys.modules["young_router.proxy.streaming"]
         original_attempt = streaming_module._stream_route_recovery_poll_attempt
@@ -3811,15 +3831,24 @@ class HookRouteRecoveryTests(HookTestCase):
             "model_info": {"id": "route-a", "order": 0},
         }
 
+        initial_failure = RuntimeError("temporary upstream failure")
+        initial_failure.status_code = 503
+        self.assertTrue(hooks._is_route_recovery_poll_error(initial_failure))
         chunks = [
             jsonable_stream_chunk(chunk)
             async for chunk in hooks._stream_route_recovery_poll(
                 request_data,
-                RuntimeError("initial route failure"),
+                initial_failure,
             )
         ]
 
-        self.assertEqual(chunks, [])
+        self.assertEqual(
+            [chunk.get("type") for chunk in chunks],
+            ["response.failed"],
+        )
+        restart_error = (chunks[0].get("response") or {}).get("error") or {}
+        self.assertEqual(restart_error.get("code"), "router_restarting")
+        self.assertIn("terminated", restart_error.get("message", ""))
 
     def test_a_live_worker_still_reports_a_real_upstream_failure(self) -> None:
         """The shutdown marker never widens into ordinary request failures."""

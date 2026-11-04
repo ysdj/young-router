@@ -573,8 +573,10 @@ class YoungRouterHook(CustomLogger):
             if (
                 not needs_terminal_delivery
                 or terminal_delivered
-                or _routing_module._is_local_shutdown_exception(exc)
-                or not _streaming_module._stream_failure_ended_without_terminal(exc)
+                or not (
+                    _routing_module._is_local_shutdown_exception(exc)
+                    or _streaming_module._stream_failure_ended_without_terminal(exc)
+                )
             ):
                 raise
             terminal_delivered = True

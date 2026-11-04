@@ -2171,6 +2171,117 @@ class HookStreamingResponseEventTests(HookTestCase):
             json.dumps(output, ensure_ascii=False),
         )
 
+    async def test_local_shutdown_before_an_answer_states_the_restart(self) -> None:
+        """A restart that cuts a thinking-only turn must not finish it.
+
+        Observed live 2026-11-04: a Codex main thread had started subagents and
+        was still streaming when the router restarted.  The only output that had
+        arrived was a reasoning item, so the local-shutdown branch found nothing
+        usable and closed the body silently.  A Responses client reads a clean
+        end of body as a finished turn: the main thread ended with no answer
+        while its subagents kept running with nobody to report back to.  The
+        restart is now a retryable terminal event instead.
+        """
+        hooks, _proxy_server = load_hook_module()
+
+        async def upstream_stream():
+            yield {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "rs_restart",
+                    "type": "reasoning",
+                    "status": "in_progress",
+                    "summary": [],
+                },
+            }
+            yield {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": "rs_restart",
+                    "type": "reasoning",
+                    "status": "completed",
+                    "summary": [{"type": "summary_text", "text": " "}],
+                },
+            }
+            exception = RuntimeError("peer closed while the worker was replaced")
+            hooks._mark_exception_as_local_shutdown(exception)
+            raise exception
+
+        chunks = [
+            jsonable_stream_chunk(chunk)
+            async for chunk in hooks._yield_guarded_original_stream(
+                [],
+                upstream_stream(),
+                {
+                    "model": "default-chat",
+                    "input": "continue",
+                    "stream": True,
+                    "proxy_server_request": {"path": "/v1/responses"},
+                },
+            )
+        ]
+
+        types = [chunk.get("type") for chunk in chunks]
+        self.assertEqual(types[-1], "response.failed")
+        restart_error = (chunks[-1].get("response") or {}).get("error") or {}
+        self.assertEqual(restart_error.get("code"), "router_restarting")
+        self.assertIn("terminated", restart_error.get("message", ""))
+
+    async def test_a_terminal_fabricated_during_shutdown_is_not_an_answer(self) -> None:
+        """A terminal invented while the worker exits must not close the turn.
+
+        A bridged chat route that stops mid-thinking leaves LiteLLM's completion
+        bridge to fabricate ``response.completed`` from whatever it collected --
+        a reasoning item and nothing else.  Handing that to the client is a
+        finished turn that states no outcome, so while this worker is shutting
+        down the restart is stated as a retryable stop instead.
+        """
+        hooks, _proxy_server = load_hook_module()
+
+        async def upstream_stream():
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_fabricated",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "id": "rs_fabricated",
+                            "type": "reasoning",
+                            "status": "completed",
+                            "summary": [{"type": "summary_text", "text": " "}],
+                        }
+                    ],
+                },
+            }
+
+        hooks._begin_proxy_shutdown()
+        try:
+            chunks = [
+                jsonable_stream_chunk(chunk)
+                async for chunk in hooks._yield_guarded_original_stream(
+                    [],
+                    upstream_stream(),
+                    {
+                        "model": "default-chat",
+                        "input": "continue",
+                        "stream": True,
+                        "proxy_server_request": {"path": "/v1/responses"},
+                    },
+                )
+            ]
+        finally:
+            hooks._end_proxy_shutdown()
+
+        types = [chunk.get("type") for chunk in chunks]
+        self.assertEqual(types[-1], "response.failed")
+        restart_error = (chunks[-1].get("response") or {}).get("error") or {}
+        self.assertEqual(restart_error.get("code"), "router_restarting")
+        self.assertIn("terminated", restart_error.get("message", ""))
+
     async def test_a_cancelled_worker_still_closes_the_turn(self) -> None:
         """This worker's own teardown cancels the stream; it must still close it.
 

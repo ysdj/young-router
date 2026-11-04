@@ -1680,6 +1680,18 @@ async def _stream_route_recovery_poll(
                 elapsed_seconds=round(time.monotonic() - started_at_monotonic, 3),
                 exception=_routing_module._trace_exception(last_exception),
             )
+            # The poll was stopped because this worker is exiting, not because
+            # the route refused.  A body that closes here without a terminal is
+            # a finished turn to the client, so state the restart as the
+            # retryable stop it is.
+            if uses_native_event_stream:
+                yield _streaming_module._synthesized_native_stream_error_chunk(
+                    request_data, last_exception
+                )
+            else:
+                yield _streaming_module._synthesized_failed_response_event(
+                    request_data, last_exception
+                )
             return
 
         if uses_native_event_stream:
