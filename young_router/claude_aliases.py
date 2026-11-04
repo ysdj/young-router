@@ -17,12 +17,13 @@ added later is covered without anybody editing anything.
 
 The alias is derived for both sides from one function:
 
-* this app writes ``inferenceModels`` entries named ``alias`` whose
-  ``labelOverride`` is the public name, which is how the picker still reads
+* the desktop view of ``/v1/models`` publishes the alias with the public name
+  as ``display_name`` (the retired ``inferenceModels`` writer used the same
+  alias with ``labelOverride``), which is how the picker reads
   ``deepseek-v4.1-flash``;
 * the proxy resolves an incoming ``alias`` back to the public name before
-  deployment selection, so the routing table, ``/v1/models``, and every other
-  client stay exactly as they were.
+  deployment selection, so the routing table, the canonical ``/v1/models``
+  answer, and every other client stay exactly as they were.
 
 Nothing is stored, so nothing can drift: the two sides agree because they
 compute the same string.
@@ -84,6 +85,11 @@ REFUSED_ALIAS_TOKENS = frozenset(
 ALIAS_FAMILY = "claude-mythos-"
 ALIAS_PREFIX = ALIAS_FAMILY
 
+#: Aliases this app published before ``mythos``.  A client's request can still
+#: name one after an upgrade -- its picker holds the id it was given -- so the
+#: resolver accepts the old family too and maps it back to the same route.
+LEGACY_ALIAS_FAMILIES = ("claude-fable-",)
+
 
 def _tokens(value: str) -> list[str]:
     return [token for token in re.split(r"[^a-z0-9]+", value.strip().lower()) if token]
@@ -107,14 +113,34 @@ def desktop_keeps_model_id(name: object) -> bool:
     return not (set(_tokens(name.rsplit("/", 1)[-1])) - {"claude"} & REFUSED_ALIAS_TOKENS)
 
 
+_ALIAS_DIGEST = re.compile(r"[0-9a-f]{6}$")
+
+
+def is_derived_alias(name: object) -> bool:
+    """Whether an id is one of the aliases this app derives, old or current.
+
+    The digest is six lowercase hexadecimal characters, so a real Claude id
+    (``claude-fable-5``) does not match.  The Desktop migration reads this as
+    the mark of a list this app wrote when its bookkeeping record is missing.
+    """
+
+    if not isinstance(name, str):
+        return False
+    text = name.strip().lower()
+    for family in (ALIAS_FAMILY, *LEGACY_ALIAS_FAMILIES):
+        if text.startswith(family) and _ALIAS_DIGEST.fullmatch(text[len(family):]):
+            return True
+    return False
+
+
 def claude_desktop_alias(public_name: str) -> str:
     """The id Claude Desktop sees for one public model name.
 
     Deterministic in the public name and injective in practice: the digest is
     taken over the name, so two routes cannot collide.  The id is a bare
     hexadecimal tail, which is also what keeps it free of every refused brand --
-    and the picker never shows it, because the list carries the public name as
-    ``labelOverride``.
+    and the picker never shows it, because the listing carries the public name
+    as ``display_name``.
     """
 
     text = str(public_name or "").strip()
@@ -126,6 +152,7 @@ def claude_desktop_alias(public_name: str) -> str:
 #: rebuilt only when that list changes, because this runs on every request and
 #: a served name would otherwise cost a digest per route per call.
 _INDEX_CACHE: tuple[tuple[str, ...], dict[str, str]] | None = None
+_LEGACY_INDEX_CACHE: tuple[tuple[str, ...], dict[str, str]] | None = None
 
 
 def alias_index(public_names: Iterable[str]) -> dict[str, str]:
@@ -149,6 +176,29 @@ def alias_index(public_names: Iterable[str]) -> dict[str, str]:
     return index
 
 
+def legacy_alias_index(public_names: Iterable[str]) -> dict[str, str]:
+    """Alias -> public name for the families earlier releases published.
+
+    The digest is the same one ``claude_desktop_alias`` derives; only the
+    prefix differs, so a picker that still holds ``claude-mythos-<digest>``
+    reaches the route it named before this app renamed the family.
+    """
+
+    global _LEGACY_INDEX_CACHE
+    names = tuple(str(name or "").strip() for name in public_names)
+    if _LEGACY_INDEX_CACHE is not None and _LEGACY_INDEX_CACHE[0] == names:
+        return _LEGACY_INDEX_CACHE[1]
+    index: dict[str, str] = {}
+    for name in names:
+        if not name or desktop_keeps_model_id(name):
+            continue
+        digest = claude_desktop_alias(name).removeprefix(ALIAS_FAMILY)
+        for family in LEGACY_ALIAS_FAMILIES:
+            index[f"{family}{digest}"] = name
+    _LEGACY_INDEX_CACHE = (names, index)
+    return index
+
+
 def resolve_alias(model: object, public_names: Iterable[str]) -> str | None:
     """The public model an incoming ``model`` names, or ``None``.
 
@@ -159,7 +209,9 @@ def resolve_alias(model: object, public_names: Iterable[str]) -> str | None:
 
     if not isinstance(model, str) or not model.strip():
         return None
-    return alias_index(public_names).get(model.strip())
+    names = tuple(str(name or "").strip() for name in public_names)
+    text = model.strip()
+    return alias_index(names).get(text) or legacy_alias_index(names).get(text)
 
 
 def rewrite_request_model(data: Mapping[str, Any]) -> str | None:
@@ -216,10 +268,13 @@ def public_model_names(router: object) -> list[str]:
 __all__ = [
     "ALIAS_FAMILY",
     "ALIAS_PREFIX",
+    "LEGACY_ALIAS_FAMILIES",
     "REFUSED_ALIAS_TOKENS",
     "alias_index",
     "claude_desktop_alias",
     "desktop_keeps_model_id",
+    "is_derived_alias",
+    "legacy_alias_index",
     "names_an_anthropic_model",
     "public_model_names",
     "rewrite_request_model",

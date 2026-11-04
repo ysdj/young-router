@@ -388,7 +388,7 @@ def route_serves_only_images(
     ``/v1/models`` is deliberately not this question.  The router keeps
     publishing every route it serves, because Pi and anything else speaking the
     raw OpenAI shape may legitimately call the generator; only the Codex catalog
-    and the Claude pickers this app writes consult this answer.
+    and the Claude pickers this app writes or publishes consult this answer.
 
     A registry that cannot be built answers ``False``: an unreadable cache is
     not evidence that a route is an image model, and the listing's own ``mode``

@@ -1,8 +1,9 @@
 """The loop that keeps generated client model lists current without a window.
 
 Its contract is what a person sees: an edit anywhere that changes the router's
-model names has to reach Codex's catalog and Claude Desktop's picker without
-anybody reopening a pane.
+model names has to reach Codex's catalog without anybody reopening a pane.
+Claude Desktop discovers ``/v1/models`` itself, and Claude Code's list follows
+the reload this loop asks for, so neither is rewritten on a timer.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ import tempfile
 import time
 import unittest
 
-from young_router.core.client_model_sync import ClientModelSyncScheduler
+from young_router.core.client_model_sync import ClientModelSyncScheduler, attach
 
 
 def _wait_for(predicate, *, seconds: float = 6.0) -> bool:
@@ -116,6 +117,26 @@ class ClientModelSyncSchedulerTests(unittest.TestCase):
         before = len(calls)
         document.write_text("two\n", encoding="utf-8")
         self.assertTrue(_wait_for(lambda: len(calls) >= before + 2, seconds=6.0))
+
+    def test_the_background_pass_never_rewrites_claude(self) -> None:
+        # The loop still owns Codex's catalog and the reload it asks for; the
+        # Claude lists are discovery's and the reload's, not a timer's.
+        class Core:
+            def __init__(self) -> None:
+                self.refreshed: list[bool] = []
+
+            def refresh_client_model_lists(self, *, include_claude: bool = True) -> None:
+                self.refreshed.append(include_claude)
+
+            def adopt_external_route_change(self) -> None:
+                return None
+
+        core = Core()
+        scheduler = attach(core)
+        scheduler.start()
+        self.addCleanup(scheduler.stop)
+        self.assertTrue(_wait_for(lambda: core.refreshed))
+        self.assertEqual([False], core.refreshed)
 
     def test_a_failing_pass_does_not_kill_the_loop(self) -> None:
         calls: list[int] = []

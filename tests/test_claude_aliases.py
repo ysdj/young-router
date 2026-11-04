@@ -1,8 +1,8 @@
 """The alias Claude Desktop is handed, and the proxy's way back to the model.
 
 Both directions are one function, so the two sides cannot drift: what the
-Core writes into ``inferenceModels`` is what the proxy resolves before
-deployment selection.
+Desktop listing publishes (or the old ``inferenceModels`` list wrote) is what
+the proxy resolves before deployment selection.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import unittest
 
 from young_router.claude_aliases import (
     ALIAS_FAMILY,
+    LEGACY_ALIAS_FAMILIES,
     REFUSED_ALIAS_TOKENS,
     alias_index,
     claude_desktop_alias,
@@ -45,9 +46,7 @@ class ClaudeDesktopAliasTests(unittest.TestCase):
     def test_the_alias_family_is_the_one_the_app_gives_a_reasoning_ladder_to(self) -> None:
         # Verified on the app: an id under this prefix kept its label and showed
         # an active Effort control, while an invented version of a real family
-        # (``claude-sonnet-9-9``) showed none.  ``mythos`` is the one that also
-        # leaves no subtitle -- the picker's per-family description table lists
-        # haiku, sonnet, opus and fable, and nothing for mythos.
+        # (``claude-sonnet-9-9``) showed none.
         self.assertTrue(claude_desktop_alias("anything").startswith(ALIAS_FAMILY))
         self.assertEqual("claude-mythos-", ALIAS_FAMILY)
 
@@ -75,6 +74,15 @@ class ClaudeDesktopAliasTests(unittest.TestCase):
         self.assertIsNone(resolve_alias("claude-fable-000000", names))
         self.assertIsNone(resolve_alias(None, names))
         self.assertIsNone(resolve_alias("", names))
+
+    def test_the_previous_alias_family_still_resolves(self) -> None:
+        # A picker that already holds the alias this app published before the
+        # family was renamed keeps reaching the same route.
+        names = ["deepseek-v4.1-flash"]
+        digest = claude_desktop_alias(names[0]).removeprefix(ALIAS_FAMILY)
+        for family in LEGACY_ALIAS_FAMILIES:
+            with self.subTest(family=family):
+                self.assertEqual(names[0], resolve_alias(f"{family}{digest}", names))
 
     def test_a_real_claude_name_is_never_mapped_through_an_alias(self) -> None:
         # Two routers can serve the same third-party name; the alias is derived

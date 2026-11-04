@@ -78,13 +78,14 @@ class CoreServiceReloadTests(unittest.TestCase):
             self.assertEqual(["reload"], reload_calls)
             self.assertIn("model: openai/new-chat", config_path.read_text(encoding="utf-8"))
 
-    def test_provider_apply_regenerates_the_claude_model_lists(self) -> None:
-        """A route change reaches Claude Desktop the same way it reaches Codex.
+    def test_provider_apply_regenerates_the_claude_code_model_list(self) -> None:
+        """A route change reaches Claude Code's picker through the reload.
 
         Adding or renaming a model is an Apply, and an Apply reloads the proxy.
-        Every reload regenerates the client model lists this app generates --
-        the Codex catalog and the Claude picker -- so a route the operator just
-        changed is in the client without anybody reopening the pane.
+        The reload regenerates the one Claude list this app still writes --
+        Claude Code's picker -- so a route the operator just changed is in the
+        client without anybody reopening the pane.  Claude Desktop discovers
+        ``/v1/models`` instead and needs no file rewritten.
         """
 
         with tempfile.TemporaryDirectory() as directory:

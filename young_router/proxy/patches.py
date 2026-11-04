@@ -3355,6 +3355,11 @@ def install_all() -> None:
     # place to mark it: without this every Codex thread pays full input price.
     _enable_anthropic_prompt_caching()
     _install_model_listing_efforts_patch()
+    # Claude Desktop's picker discovers from /v1/models; the view is installed
+    # beside the listing patch so both listing branches publish it.
+    from . import claude_desktop_listing as _claude_desktop_listing
+
+    _claude_desktop_listing.install_patch()
     _install_chatgpt_account_credential_patch()
     _install_pre_call_token_count_patch()
     _install_routing_constraint_patch()

@@ -342,7 +342,7 @@ class ClaudeDesktopConfig:
         self._meta_draft = {**self._meta_draft, "appliedId": config_id, "entries": entries}
 
     def patch(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        allowed = {"inferenceProvider", "inferenceGatewayBaseUrl", "inferenceGatewayAuthScheme", "inferenceCredentialKind", "inferenceModels", "inferenceCustomHeaders"}
+        allowed = {"inferenceProvider", "inferenceGatewayBaseUrl", "inferenceGatewayAuthScheme", "inferenceCredentialKind", "inferenceModels", "inferenceCustomHeaders", "modelPrefer1mContext"}
         if set(payload).difference(allowed):
             raise ClaudeDesktopConfigError("Unknown Claude Desktop configuration field")
         candidate = copy.deepcopy(self._draft)

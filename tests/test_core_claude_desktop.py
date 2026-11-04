@@ -374,9 +374,12 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
             self.assertTrue(enabled["clients"]["claudeDesktop"]["model_list_enabled"])
             self.assertEqual(["claude-opus-5-5"], enabled["desktop"]["model_names"])
 
+            # Desktop discovers /v1/models now; a background refresh never
+            # rewrites its profile, so the list the switch wrote stays until
+            # the switch is turned off.
             with mock.patch.object(domain, "_public_models", return_value=["claude-opus-5-5", "claude-sonnet-4-5"]):
-                self.assertTrue(domain.refresh_model_lists())
-            self.assertEqual(["claude-opus-5-5", "claude-sonnet-4-5"], domain.snapshot()["desktop"]["model_names"])
+                self.assertFalse(domain.refresh_model_lists())
+            self.assertEqual(["claude-opus-5-5"], domain.snapshot()["desktop"]["model_names"])
 
             cleared = domain.dispatch("claude.models.set", {"client": "claudeDesktop", "enabled": False})
             self.assertFalse(cleared["clients"]["claudeDesktop"]["model_list_enabled"])
@@ -579,12 +582,9 @@ general_settings:
 
             self.assertEqual(public, [row.get("labelOverride") or row["name"] for row in entries])
 
-    def test_a_snapshot_repairs_a_list_the_router_outgrew(self) -> None:
-        # A proxy reload regenerates the list, which covers a provider Apply.
-        # The other order is a route that changed while no reload was owed, and
-        # an open window is then the only thing that looks: its snapshot makes
-        # the list current, the way the Codex catalog is kept current by the
-        # snapshot that draws it.
+    def test_a_snapshot_leaves_the_desktop_list_to_discovery(self) -> None:
+        # Discovery reads /v1/models at launch, so an open window must not reach
+        # into the profile and rewrite the list the retired switch wrote.
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             desktop_root = root / "configLibrary"
@@ -598,20 +598,20 @@ general_settings:
             with mock.patch.object(domain, "_public_models", return_value=["deepseek-v4.1-flash"]):
                 domain.dispatch("claude.models.set", {"client": "claudeDesktop", "enabled": True})
                 domain.apply()
-            before = len(domain.snapshot()["desktop"]["model_names"])
+            before = list(domain.snapshot()["desktop"]["model_names"])
 
             with mock.patch.object(
                 domain,
                 "_public_models",
                 return_value=["deepseek-v4.1-flash", "brand-new-route"],
             ):
-                domain._model_list_refreshed_at = 0.0
-                after = domain.snapshot()["desktop"]["model_names"]
+                after = list(domain.snapshot()["desktop"]["model_names"])
 
-            self.assertEqual(before + 1, len(after))
-            self.assertIn(alias_claude_desktop("brand-new-route"), after)
+            self.assertEqual(before, after)
 
-    def test_a_snapshot_does_not_re_derive_the_list_on_every_poll(self) -> None:
+    def test_a_snapshot_does_not_read_the_public_list_for_desktop(self) -> None:
+        # The retired list has no snapshot-driven refresh left at all: a poll is
+        # a read of the draft, not a loopback /v1/models request.
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             desktop_root = root / "configLibrary"
@@ -622,16 +622,10 @@ general_settings:
                 runtime_config_path=root / "config.yaml",
                 runtime_root=root,
             )
-            with mock.patch.object(domain, "_public_models", return_value=["deepseek-v4.1-flash"]):
-                domain.dispatch("claude.models.set", {"client": "claudeDesktop", "enabled": True})
-                domain.apply()
-                domain._model_list_refreshed_at = 0.0
-                with mock.patch.object(domain, "_public_models", return_value=["deepseek-v4.1-flash"]) as reader:
-                    domain.snapshot()
-                    calls_after_first = reader.call_count
-                    domain.snapshot()
-                    domain.snapshot()
-                    self.assertEqual(calls_after_first, reader.call_count)
+            with mock.patch.object(domain, "_public_models") as reader:
+                domain.snapshot()
+                domain.snapshot()
+            reader.assert_not_called()
 
     def test_desktop_list_never_needs_a_claude_shaped_public_name(self) -> None:
         # The point of deriving the id: a router whose public names are all
@@ -652,9 +646,9 @@ general_settings:
                 )
             self.assertEqual(2, len(snapshot["desktop"]["model_names"]))
 
-    def test_a_new_public_model_reaches_the_desktop_list_without_edits(self) -> None:
-        # The complaint that produced the derivation: a provider added later
-        # must appear by itself, because nothing here is a maintained table.
+    def test_a_new_public_model_does_not_rewrite_the_desktop_list(self) -> None:
+        # A provider added later reaches Desktop through the discovery view at
+        # its next launch, not through this app editing its profile.
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             desktop_root = root / "configLibrary"
@@ -668,19 +662,128 @@ general_settings:
             with mock.patch.object(domain, "_public_models", return_value=["deepseek-v4.1-flash"]):
                 domain.dispatch("claude.models.set", {"client": "claudeDesktop", "enabled": True})
                 domain.apply()
-            before = domain.snapshot()["desktop"]["model_names"]
+            before = list(domain.snapshot()["desktop"]["model_names"])
             with mock.patch.object(
                 domain, "_public_models", return_value=["deepseek-v4.1-flash", "some-new-model-x"]
             ):
-                self.assertTrue(domain.refresh_model_lists())
-            after = domain.snapshot()["desktop"]["model_names"]
-            self.assertEqual(len(before) + 1, len(after))
-            self.assertIn(alias_claude_desktop("some-new-model-x"), after)
+                self.assertFalse(domain.refresh_model_lists())
+            self.assertEqual(before, domain.snapshot()["desktop"]["model_names"])
 
-    def test_a_picker_desktop_stripped_still_reads_as_on_and_is_repaired(self) -> None:
-        # Desktop deletes the entries it cannot map, so a list this app wrote
-        # can come back shorter than the record.  Reading that as "off" left the
-        # file permanently broken: no refresh would ever run again.
+    def test_the_desktop_profile_prefers_the_1m_option_on_this_proxy(self) -> None:
+        # A discovery row states 1M through max_input_tokens; without this
+        # preference the picker also offers a 200k standard row, and that is the
+        # number a session on it reports.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(
+                desktop_root,
+                {
+                    "inferenceProvider": "gateway",
+                    "inferenceGatewayBaseUrl": "http://127.0.0.1:4100",
+                },
+            )
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with mock.patch.object(domain, "desktop_uses_local_api", return_value=True):
+                domain._prefer_one_million_context()
+            config = json.loads(domain.raw_text(document="desktop", include_sensitive=True))
+            self.assertTrue(config["modelPrefer1mContext"])
+
+    def test_an_explicit_1m_preference_is_not_overridden(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(
+                desktop_root,
+                {
+                    "inferenceProvider": "gateway",
+                    "inferenceGatewayBaseUrl": "http://127.0.0.1:4100",
+                    "modelPrefer1mContext": False,
+                },
+            )
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with mock.patch.object(domain, "desktop_uses_local_api", return_value=True):
+                domain._prefer_one_million_context()
+            config = json.loads(domain.raw_text(document="desktop", include_sensitive=True))
+            self.assertFalse(config["modelPrefer1mContext"])
+
+    def test_a_saved_route_profile_does_not_gain_the_1m_preference(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(
+                desktop_root,
+                {
+                    "inferenceProvider": "gateway",
+                    "inferenceGatewayBaseUrl": "https://relay.example.test",
+                },
+            )
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with mock.patch.object(domain, "desktop_uses_local_api", return_value=False):
+                domain._prefer_one_million_context()
+            config = json.loads(domain.raw_text(document="desktop", include_sensitive=True))
+            self.assertNotIn("modelPrefer1mContext", config)
+
+    def test_a_list_carrying_this_apps_alias_is_retired_without_a_record(self) -> None:
+        # The record can be lost while the profile still holds the list.  An id
+        # in this app's own alias namespace is the mark that says the list is
+        # the one it wrote.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(
+                desktop_root,
+                {
+                    "inferenceModels": [
+                        {"name": "claude-opus-5-5"},
+                        {"name": "claude-fable-eb1394"},
+                    ]
+                },
+            )
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            self.assertEqual([], domain.snapshot()["desktop"]["model_names"])
+
+    def test_a_hand_written_claude_list_is_not_retired(self) -> None:
+        # A profile the user curates with real Claude names has neither the
+        # record nor a derived alias, so the migration leaves it alone.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(
+                desktop_root, {"inferenceModels": [{"name": "claude-opus-5-5"}]}
+            )
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            self.assertEqual(["claude-opus-5-5"], domain.snapshot()["desktop"]["model_names"])
+
+    def test_a_generated_desktop_list_is_retired_on_reload(self) -> None:
+        # The upgrade path: a list this app wrote for the old switch is cleared
+        # once, so Desktop goes back to discovering /v1/models.  The record is
+        # what distinguishes it from a hand-written profile.
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             desktop_root = root / "configLibrary"
@@ -695,26 +798,13 @@ general_settings:
             with mock.patch.object(domain, "_public_models", return_value=public):
                 domain.dispatch("claude.models.set", {"client": "claudeDesktop", "enabled": True})
                 domain.apply()
+            self.assertNotEqual([], domain.snapshot()["desktop"]["model_names"])
 
-            # Desktop rewrites the file on disk, so the observation comes from
-            # disk rather than from a staged draft -- a draft would be the
-            # user's own edit and a refresh must not commit it.
-            config_path = domain._desktop.desktop_config_path
-            self.assertIsNotNone(config_path)
-            stored = json.loads(config_path.read_text(encoding="utf-8"))
-            stored["inferenceModels"] = stored["inferenceModels"][:1]
-            config_path.write_text(json.dumps(stored), encoding="utf-8")
             domain.reload()
-            self.assertTrue(domain.snapshot()["clients"]["claudeDesktop"]["model_list_enabled"])
-
-            with mock.patch.object(domain, "_public_models", return_value=public):
-                self.assertTrue(domain.refresh_model_lists())
-            self.assertEqual(2, len(domain.snapshot()["desktop"]["model_names"]))
-            # A refresh rewrites the list, so it has to carry the labels too:
-            # writing the bare ids is what left the picker showing
-            # ``claude-mythos-xxxxxx`` instead of the model each one stands for.
-            refreshed = json.loads(domain.raw_text(document="desktop", include_sensitive=True))
-            self.assertTrue(all(row.get("labelOverride") for row in refreshed["inferenceModels"]))
+            self.assertFalse(domain.snapshot()["clients"]["claudeDesktop"]["model_list_enabled"])
+            self.assertEqual([], domain.snapshot()["desktop"]["model_names"])
+            stored = json.loads(domain.raw_text(document="desktop", include_sensitive=True))
+            self.assertNotIn("inferenceModels", stored)
 
     def test_use_saved_model_never_writes_a_name_desktop_would_delete(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

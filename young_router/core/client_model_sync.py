@@ -1,7 +1,10 @@
 """Keep the generated client model lists current with no window open.
 
-The Codex catalog and Claude Desktop's picker are both generated from the
-router's public model names.
+The Codex catalog is generated from the router's public model names.  Claude
+Desktop no longer is: its picker discovers the alias view ``/v1/models``
+publishes for the desktop app's own request, and Claude Code's generated list
+follows the proxy reload this loop asks for, so neither needs a timer to
+rewrite a client document.
 
 Three things can make those names change, and each has its own trigger:
 
@@ -12,8 +15,8 @@ Three things can make those names change, and each has its own trigger:
   backup, a model toggled by another tool, a file replaced while the app was
   closed.  This loop covers it by watching the document's own timestamp, so the
   lists follow within a second rather than on a clock.
-* **A window that is open anyway** re-derives the list on its snapshot, which
-  costs nothing extra.
+* **A window that is open anyway** re-derives the catalog on its snapshot,
+  which costs nothing extra.
 
 The refresh is idempotent -- both generators compare the document on disk with
 what the router serves and write only a difference -- so watching rather than
@@ -155,7 +158,9 @@ def attach(core: Any, watch_paths: Iterable[Any] = ()) -> ClientModelSyncSchedul
     adopt = getattr(core, "adopt_external_route_change", None)
 
     def refresh() -> None:
-        core.refresh_client_model_lists()
+        # Claude Desktop discovers /v1/models; this loop owns the lists still
+        # written to a client document (Codex's catalog), never Claude's.
+        core.refresh_client_model_lists(include_claude=False)
 
     def change() -> None:
         # A change this process did not make is also invisible to the running
