@@ -4583,7 +4583,12 @@ def _ensure_attempt_lease_id(request_kwargs: Optional[dict]) -> Optional[str]:
     existing = _attempt_lease_id(request_kwargs)
     if existing:
         return existing
-    lease_id = os.urandom(8).hex()
+    # Prefer an identifier LiteLLM already puts on both copies of the request.
+    # A marker of this proxy's own making is stripped from some of them, and then
+    # the claim and the release each compute a different name for one turn's
+    # slot -- measured live 2026-11-04: every release named an id no lease in the
+    # file carried, so every turn leaked the slot it had just claimed.
+    lease_id = _litellm_request_identifier(request_kwargs) or os.urandom(8).hex()
     metadata = _request_context_module._request_metadata_dict(
         request_kwargs, "litellm_metadata"
     )
@@ -4603,6 +4608,28 @@ def _ensure_attempt_lease_id(request_kwargs: Optional[dict]) -> Optional[str]:
         nested[_ATTEMPT_LEASE_ID_KEY] = lease_id
         litellm_params["litellm_metadata"] = nested
     return lease_id
+
+
+def _litellm_request_identifier(request_kwargs: Optional[dict]) -> Optional[str]:
+    """The identifier LiteLLM itself gives this call, if it already has one."""
+
+    if not isinstance(request_kwargs, dict):
+        return None
+    containers = [request_kwargs]
+    for key in ("litellm_params", "litellm_metadata", "metadata"):
+        nested = request_kwargs.get(key)
+        if isinstance(nested, dict):
+            containers.append(nested)
+            for inner in ("litellm_metadata", "metadata"):
+                deeper = nested.get(inner)
+                if isinstance(deeper, dict):
+                    containers.append(deeper)
+    for key in ("litellm_trace_id", "litellm_call_id"):
+        for container in containers:
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
 
 
 def _attempt_lease_id(request_kwargs: Optional[dict]) -> Optional[str]:

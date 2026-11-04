@@ -881,3 +881,26 @@ class TurnEndReleasesTheSlotTests(ConcurrencyStoreTestCase):
         hooks._mark_exception_for_deployment_failover(failure, request)
 
         self.assertEqual({}, self.leases())
+
+    def test_the_lease_is_named_by_the_identifier_both_copies_carry(self) -> None:
+        """One turn's slot must have one name on the way in and on the way out.
+
+        A marker of this proxy's own making is stripped from some copies of the
+        request; when it is, the release falls back to LiteLLM's own id and no
+        longer names the lease it has to give back. Measured live 2026-11-04:
+        every release named an id no lease carried.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        request = _request(turn="ignored")
+        request.pop("_young_router_attempt_lease_id")
+        request["litellm_trace_id"] = "trace-abc"
+
+        self.assertEqual("trace-abc", hooks._attempt_lease_id(request))
+        # The same request after a callback dropped the metadata this proxy
+        # stamped still resolves to that one name.
+        stripped = {
+            "litellm_trace_id": "trace-abc",
+            "model_info": {"id": "route-a"},
+        }
+        self.assertEqual("trace-abc", hooks._attempt_lease_id(stripped))
