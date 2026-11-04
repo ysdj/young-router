@@ -71,12 +71,12 @@ class ConcurrencyStoreTestCase(HookTestCase):
 
 
 class ModelConcurrencyTests(ConcurrencyStoreTestCase):
-    def test_the_global_limit_defaults_to_eight(self) -> None:
+    def test_the_global_limit_defaults_to_sixteen(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(hooks.MODEL_CONCURRENCY_LIMIT_ENV, None)
 
-        self.assertEqual(hooks._model_concurrency_limit(), 8)
-        self.assertEqual(hooks._model_concurrency_cap(_deployment("route-a")), 8)
+        self.assertEqual(hooks._model_concurrency_limit(), 16)
+        self.assertEqual(hooks._model_concurrency_cap(_deployment("route-a")), 16)
 
     def test_a_route_states_its_own_cap_and_zero_is_unlimited(self) -> None:
         hooks, _ = load_hook_module()

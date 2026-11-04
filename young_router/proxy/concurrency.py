@@ -39,7 +39,7 @@ from .launcher_settings import _DEPLOYMENT_CONCURRENCY_FILE_ENV
 #: value it takes when it states nothing.  Stated here because this module is
 #: the one reader that has to answer before any settings document is parsed.
 MODEL_CONCURRENCY_LIMIT_ENV = "YOUNG_ROUTER_MODEL_CONCURRENCY_LIMIT"
-MODEL_CONCURRENCY_LIMIT_DEFAULT = 8
+MODEL_CONCURRENCY_LIMIT_DEFAULT = 16
 #: The ``model_info`` key one route states its own cap in.  Read on the
 #: deployment the Router already holds, so no second lookup decides a cap.
 MODEL_CONCURRENCY_LIMIT_KEY = "max_concurrency"

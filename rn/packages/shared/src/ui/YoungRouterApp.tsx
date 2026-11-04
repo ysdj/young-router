@@ -5941,7 +5941,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // The concurrency cap a route that states none of its own follows, read from the
   // same snapshot the routes arrive in: the model detail explains this number,
   // so it must be the one the proxy will actually use.
-  const globalConcurrencyLimit = numberValue(state.model_concurrency_default, 8);
+  const globalConcurrencyLimit = numberValue(state.model_concurrency_default, 16);
   // Why the last relay-bound Apply refused: Core hands back the rows it named,
   // so the pane marks the key or route instead of only stating the outcome.
   const bindingIssues = asRecords(state.binding_issues);
