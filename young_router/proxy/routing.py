@@ -4002,6 +4002,19 @@ def _request_public_model(request_kwargs: Optional[dict]) -> Optional[str]:
     return _responses_execution_module._request_model_group(request_kwargs)
 
 
+def _request_log_surface(value: Any) -> str:
+    """The protocol name a request row states, with "unknown" said as nothing.
+
+    The Log tab's two protocol columns answer "which wire carried this turn",
+    so a row that could not tell has to leave the cell empty.  ``unknown`` is a
+    word about the absence of evidence, and drawn in a protocol column it would
+    read as a wire no client ever called in on.
+    """
+
+    text = _state_module._safe_log_text(value, limit=40)
+    return "" if text.casefold() in {"", "unknown"} else text
+
+
 def _request_log_record(
     status: str,
     request_kwargs: Optional[dict],
@@ -4086,6 +4099,18 @@ def _request_log_record(
             _completion_start_time(request_kwargs, end_time)[0]
         ),
         "call_type": _state_module._safe_log_text(request_kwargs.get("call_type"), limit=80),
+        # The two wires this turn used: what the client called in on, and what
+        # the request actually left on.  The outbound name is the adapted wire
+        # (never the route's declared backup protocol), because a ``fallback``
+        # route that answers Responses natively still declares a chat surface
+        # and a row that copied the declaration would report a call that never
+        # happened.
+        "client_surface": _request_log_surface(
+            _trace_module._trace_client_surface(request_kwargs)
+        ),
+        "upstream_surface": _request_log_surface(
+            _trace_module._trace_outbound_surface(request_kwargs)
+        ),
         "model_group": _state_module._safe_log_text(_responses_execution_module._request_model_group(request_kwargs), limit=160),
         "public_model": _state_module._safe_log_text(public_model, limit=160),
         "deployment_id": deployment_id,
@@ -7898,6 +7923,97 @@ def _deployment_cooldown_trace_entry(
         3,
     )
     return entry
+
+
+#: What a route key says when the base it was written from was a reference.
+#:
+#: ``config.dump._deployment_route_key`` reads the *declared* base through
+#: ``_api_base_host``, which parses ``os.environ/NAME`` as the hostname
+#: ``os.environ``.  That substring is the only record of the declaration that
+#: outlives LiteLLM's own resolution: for an unset reference LiteLLM deletes
+#: ``api_base`` and ``api_key`` from the deployment outright -- it does not
+#: blank them -- so what is left is a route with no address at all.
+_UNRESOLVED_MANAGED_HOST = "host=os.environ"
+
+
+def _deployment_environment_reference(value: Any) -> Optional[str]:
+    """The variable an ``os.environ/`` reference names, or ``None``."""
+
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text.startswith("os.environ/"):
+        return None
+    name = text[len("os.environ/") :].strip()
+    return name or None
+
+
+def _deployment_unresolved_managed_address(deployment: Any) -> Optional[str]:
+    """The environment variable this route needs and this process never got.
+
+    ``None`` means the route has an address.  An empty string means the route
+    was written from a reference and states no address any more, which is what
+    LiteLLM leaves behind once it has resolved one that nothing set.
+    """
+
+    if not isinstance(deployment, dict):
+        return None
+    params = deployment.get("litellm_params")
+    if not isinstance(params, dict):
+        params = {}
+    declared = params.get("api_base")
+    name = _deployment_environment_reference(declared)
+    if name is not None:
+        if os.environ.get(name, "").strip():
+            return None
+        return name
+    if str(declared or "").strip():
+        return None
+    model_info = deployment.get("model_info")
+    if not isinstance(model_info, dict):
+        return None
+    if _UNRESOLVED_MANAGED_HOST not in str(model_info.get("route_key") or ""):
+        return None
+    return ""
+
+
+def _with_resolvable_deployment_addresses(
+    deployments: List[dict],
+) -> tuple[List[dict], list[dict[str, Any]], bool]:
+    """Drop routes whose address this process never resolved.
+
+    A bundled worker publishes its loopback origin as an ``os.environ/``
+    reference, and ``young_router.adapters.managed`` resolves it in the
+    environment it execs the proxy with.  A host that never staged that worker
+    sets nothing, and LiteLLM answers by deleting ``api_base`` and ``api_key``
+    from the deployment -- after which the route is an OpenAI route with no
+    address and no bearer.
+
+    Leaving such a route in the pool is expensive, and observed live on the LV
+    gateway 2026-11-04: a WorkBuddy route written from a reference that host
+    could not resolve was selected first on every turn, cost the full round trip
+    to `api.openai.com`'s address validation, and answered ``Missing
+    credentials``; the fill-over then charged the same refusal twice more before
+    the route was parked.  An address nothing resolved is not a route this
+    process can serve, so it is not offered: the group's other routes answer,
+    and a group with none left says it has none instead of inventing one.
+    """
+
+    if not deployments:
+        return deployments, [], False
+    available: list[dict] = []
+    unresolved: list[dict[str, Any]] = []
+    for deployment in deployments:
+        name = _deployment_unresolved_managed_address(deployment)
+        if name is None:
+            available.append(deployment)
+            continue
+        entry = _trace_deployment(deployment)
+        entry["unresolved_environment"] = name
+        unresolved.append(entry)
+    if not unresolved:
+        return deployments, [], False
+    return available, unresolved, True
 
 
 def _with_active_deployment_cooldowns(

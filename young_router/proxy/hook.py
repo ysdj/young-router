@@ -287,6 +287,20 @@ class YoungRouterHook(CustomLogger):
                 request_kwargs,
             )
             after_constraints = candidate_deployments
+            # A route this process never received an address for is not a route
+            # it can serve.  Narrowed before the cooldown is consulted, so a
+            # worker this host never staged can neither be selected nor parked
+            # on evidence from a refusal that was never about it; its only other
+            # life is a full round trip that ends in the provider's own
+            # "Missing credentials".
+            (
+                candidate_deployments,
+                unresolved_address_deployments,
+                unresolved_address_filtered,
+            ) = _routing_module._with_resolvable_deployment_addresses(
+                candidate_deployments
+            )
+            after_addresses = candidate_deployments
             candidate_deployments, cooldown_deployments, cooldown_filtered = (
                 _routing_module._with_active_deployment_cooldowns(
                     candidate_deployments,
@@ -389,6 +403,11 @@ class YoungRouterHook(CustomLogger):
                     cooldown_deployments and not after_cooldown
                 ),
                 deployment_cooldown_deployments=cooldown_deployments,
+                unresolved_address_filtered=unresolved_address_filtered,
+                unresolved_address_all_candidates=bool(
+                    unresolved_address_deployments and not candidate_deployments
+                ),
+                unresolved_address_deployments=unresolved_address_deployments,
                 image_tool_unsupported_filtered=image_tool_unsupported_filtered,
                 image_tool_unsupported_all_candidates=bool(
                     image_tool_unsupported_deployments and not candidate_deployments
@@ -410,6 +429,7 @@ class YoungRouterHook(CustomLogger):
                 request=_trace_module._trace_request_summary(request_kwargs, messages=messages),
                 healthy=_routing_module._trace_deployments(original_deployments),
                 after_constraints=_routing_module._trace_deployments(after_constraints),
+                after_addresses=_routing_module._trace_deployments(after_addresses),
                 after_cooldown=_routing_module._trace_deployments(after_cooldown),
                 selected_candidates=_routing_module._trace_deployments(candidate_deployments),
             )

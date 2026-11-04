@@ -4316,5 +4316,85 @@ class HookRoutingTests(HookTestCase):
         )
 
 
+    async def test_filter_deployments_drops_a_route_whose_address_never_resolved(self) -> None:
+        """A worker this host never staged is not a route it can serve.
+
+        ``young_router.adapters.managed`` resolves a bundled worker's loopback
+        origin in the environment it execs the proxy with.  A host that never
+        staged that worker sets nothing, and LiteLLM deletes ``api_base`` and
+        ``api_key`` from the deployment rather than blanking them -- so what
+        reaches the filter is a route with no address and a route key that still
+        records the reference it was written from.  Offering that route costs
+        every turn a round trip that ends in ``Missing credentials``.
+        """
+
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        self.set_env("YOUNG_ROUTER_TEST_UNSET_BASE", None)
+        resolved = {
+            "litellm_params": {
+                "model": "openai/default-chat",
+                "api_base": "https://api.backup.example/v1",
+                "order": 2,
+            },
+            "model_info": {
+                "id": "resolved-route",
+                "provider": "backup_provider",
+                "route_key": "model=default-chat / provider=backup_provider / host=api.backup.example / order=2",
+            },
+        }
+        still_a_reference = {
+            "litellm_params": {
+                "model": "openai/default-chat",
+                "api_base": "os.environ/YOUNG_ROUTER_TEST_UNSET_BASE",
+                "api_key": "os.environ/YOUNG_ROUTER_TEST_UNSET_KEY",
+                "order": 1,
+            },
+            "model_info": {"id": "reference-route", "provider": "wb"},
+        }
+        resolved_by_litellm_and_lost = {
+            "litellm_params": {"model": "openai/default-chat", "order": 1},
+            "model_info": {
+                "id": "lost-route",
+                "provider": "wb",
+                "route_key": "model=default-chat / provider=wb / host=os.environ / key=workbuddy-local / order=1",
+            },
+        }
+
+        filtered = await hook.async_filter_deployments(
+            "default-chat",
+            [still_a_reference, resolved_by_litellm_and_lost, resolved],
+            messages=[],
+            request_kwargs={"call_type": "acompletion", "stream": True},
+        )
+
+        self.assertEqual([item["model_info"]["id"] for item in filtered], ["resolved-route"])
+
+    async def test_filter_deployments_keeps_a_reference_this_process_resolved(self) -> None:
+        """The desktop side of the same rule: a published reference is a route."""
+
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        self.set_env("YOUNG_ROUTER_TEST_SET_BASE", "http://127.0.0.1:45870/v1")
+        deployment = {
+            "litellm_params": {
+                "model": "openai/default-chat",
+                "api_base": "os.environ/YOUNG_ROUTER_TEST_SET_BASE",
+                "api_key": "os.environ/YOUNG_ROUTER_TEST_SET_KEY",
+                "order": 1,
+            },
+            "model_info": {"id": "managed-route", "provider": "wb"},
+        }
+
+        filtered = await hook.async_filter_deployments(
+            "default-chat",
+            [deployment],
+            messages=[],
+            request_kwargs={"call_type": "acompletion", "stream": True},
+        )
+
+        self.assertEqual(filtered, [deployment])
+
+
 if __name__ == "__main__":
     unittest.main()
