@@ -904,3 +904,40 @@ class TurnEndReleasesTheSlotTests(ConcurrencyStoreTestCase):
             "model_info": {"id": "route-a"},
         }
         self.assertEqual("trace-abc", hooks._attempt_lease_id(stripped))
+
+    def test_a_slot_is_released_under_any_name_the_turn_is_known_by(self) -> None:
+        """The claim and the release see different copies of the request.
+
+        One copy keeps this proxy's marker, another keeps only LiteLLM's trace
+        id, a third only the client's own request id. A slot registered under one
+        name and looked for under another is never given back, which is what made
+        every turn leak the slot it had just claimed.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        claim_copy = {
+            "_young_router_attempt_lease_id": "lease-1",
+            "model_info": {"id": "route-a"},
+        }
+        release_copy = {
+            "litellm_trace_id": "trace-1",
+            "model_info": {"id": "route-a"},
+        }
+
+        self.assertTrue(
+            hooks._claim_deployment_concurrency_slot(
+                claim_copy, _deployment("route-a"), 8
+            )
+        )
+        # Both copies name the same turn by its marker, so the release finds it.
+        self.assertEqual(
+            ["lease-1"], hooks._lease_identifier_candidates(claim_copy)
+        )
+
+        hooks._HELD_CONCURRENCY_LEASES.setdefault(
+            "trace-1", set()
+        ).add(sorted(hooks._HELD_CONCURRENCY_LEASES["lease-1"])[0])
+        hooks._release_request_concurrency_slots(release_copy)
+
+        self.assertEqual({}, self.leases())
+        self.assertEqual({}, dict(hooks._HELD_CONCURRENCY_LEASES))

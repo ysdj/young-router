@@ -4679,6 +4679,31 @@ def _attempt_lease_id(request_kwargs: Optional[dict]) -> Optional[str]:
     return None
 
 
+def _lease_identifier_candidates(request_kwargs: Optional[dict]) -> list[str]:
+    """Every name this turn's slot could be known by, in the copy at hand.
+
+    The request reaches this proxy in several copies -- the pre-call dict, the
+    deployment kwargs, and the logging layer's copy the callbacks receive -- and
+    each drops different fields. A claim that registered its slot under one name
+    and a release that looked for another leaked the slot, which is exactly what
+    the traces showed. So both sides work with the whole set: the claim registers
+    under all of them and the release collects by all of them, and one shared name
+    is enough for the slot to come back.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return []
+    names: list[str] = []
+    for name in (
+        _attempt_lease_id(request_kwargs),
+        _litellm_request_identifier(request_kwargs),
+        _trace_request_id(request_kwargs),
+    ):
+        if isinstance(name, str) and name.strip() and name.strip() not in names:
+            names.append(name.strip())
+    return names
+
+
 def _attempt_lease_key(request_kwargs: Optional[dict], deployment: Any) -> Optional[str]:
     """The lease naming one turn's hold on one deployment, or ``None``."""
 
@@ -4716,8 +4741,7 @@ def _claim_deployment_concurrency_slot(
         return False
     # Remember what this process holds, so the turn can give exactly its own
     # slots back instead of scanning the shared file for them.
-    lease_id = _attempt_lease_id(request_kwargs)
-    if lease_id:
+    for lease_id in _lease_identifier_candidates(request_kwargs):
         with _HELD_CONCURRENCY_LEASES_LOCK:
             _HELD_CONCURRENCY_LEASES.setdefault(lease_id, set()).add(lease_key)
     return True
@@ -4758,23 +4782,36 @@ def _release_request_concurrency_slots(request_kwargs: Optional[dict]) -> None:
     request nobody is serving.
     """
 
-    lease_id = _attempt_lease_id(request_kwargs)
-    if not lease_id:
+    names = _lease_identifier_candidates(request_kwargs)
+    if not names:
         return
+    held: set = set()
     with _HELD_CONCURRENCY_LEASES_LOCK:
-        held = _HELD_CONCURRENCY_LEASES.pop(lease_id, None)
+        for lease_id in names:
+            found = _HELD_CONCURRENCY_LEASES.pop(lease_id, None)
+            if found:
+                held |= set(found)
     if not held:
         # Nothing to give back is the ordinary shape (a turn that never claimed,
         # a listing).  It stays silent: a trace per request would drown the ones
         # that matter.
         return
     _concurrency_module.release(sorted(held))
+    # The same slot may be registered under more than one of this turn's names;
+    # once it is given back, no name may still claim to hold it.
+    with _HELD_CONCURRENCY_LEASES_LOCK:
+        for lease_id, keys in list(_HELD_CONCURRENCY_LEASES.items()):
+            remaining = set(keys) - held
+            if remaining:
+                _HELD_CONCURRENCY_LEASES[lease_id] = remaining
+            else:
+                _HELD_CONCURRENCY_LEASES.pop(lease_id, None)
     _trace_module._route_trace(
         "concurrency_slot_release",
         request_id=_trace_request_id(request_kwargs),
         model_group=_responses_execution_module._request_model_group(request_kwargs),
         deployment_id=_deployment_id_from_request(request_kwargs),
-        lease_id=lease_id,
+        lease_ids=names,
         released=len(held),
         held_after=len(_HELD_CONCURRENCY_LEASES),
     )
