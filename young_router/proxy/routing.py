@@ -6886,6 +6886,14 @@ def _mark_exception_for_deployment_failover(
         pass
     _remember_request_body_size_rejection(exception, request_kwargs)
     _apply_current_selected_deployment_to_request(request_kwargs)
+    # The attempt that held this route's slot is over, whatever comes next: the
+    # hop this exception starts claims again (and asking for a slot this turn
+    # already holds refreshes it), so releasing here cannot under-count. Without
+    # it, every turn that failed over left its slot on the failed route counted
+    # for the whole lease window -- observed live 2026-11-04: three turns that
+    # refused on one route and were served by a sibling left three leases behind,
+    # and that is exactly the traffic a refusing route produces.
+    _release_request_concurrency_slots(request_kwargs)
     deployment_id = _deployment_id_from_request(request_kwargs)
     route_key = _deployment_route_key_from_request(request_kwargs)
     _record_image_generation_tool_unsupported(exception, request_kwargs)

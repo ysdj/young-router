@@ -855,3 +855,29 @@ class TurnEndReleasesTheSlotTests(ConcurrencyStoreTestCase):
         await stream.aclose()
 
         self.assertEqual({}, self.leases())
+
+    async def test_a_failed_attempt_gives_its_slot_back_before_the_hop(self) -> None:
+        """A turn that fails over must not leave the failed route's slot taken.
+
+        This is the shape a refusing route produces on every turn: the attempt
+        claims a slot, the route refuses, the turn advances to a sibling. The
+        lease stayed behind and the failed route kept counting a request nobody
+        was serving, until enough of them parked it.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        request = _request(turn="turn-hop")
+        self.assertTrue(
+            hooks._claim_deployment_concurrency_slot(
+                request, _deployment("route-a"), 8
+            )
+        )
+        self.assertEqual(1, len(self.leases()))
+
+        class Refused(Exception):
+            status_code = 400
+
+        failure = Refused("thinking mode does not support this tool_choice")
+        hooks._mark_exception_for_deployment_failover(failure, request)
+
+        self.assertEqual({}, self.leases())
