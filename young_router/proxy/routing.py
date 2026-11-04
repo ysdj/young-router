@@ -163,6 +163,7 @@ from .base import (
     _UPSTREAM_HTML_BAD_REQUEST_MARKERS,
     _UPSTREAM_RELAY_CAPACITY_MARKERS,
     _UPSTREAM_TOOL_HISTORY_REJECTION_MARKERS,
+    _UPSTREAM_DUPLICATE_TOOL_NAME_MARKERS,
     _UPSTREAM_FIELD_REJECTION_MARKERS,
     _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES,
     _UPSTREAM_TEMPORARY_ERROR_MARKERS,
@@ -8341,6 +8342,11 @@ def _is_upstream_request_field_rejected_error(exception: Exception) -> bool:
     ordinary 400 about the conversation stays the request's verdict and keeps
     its own message, and one whose sentence names no field at all (a bare
     ``invalid_request_error``) still belongs to the unclassified branch.
+
+    A tools list that carries one name twice belongs here too: the duplicate is
+    a tool this installation added to the body (the bridge's provider search is
+    named ``web_search``), so the sentence names a field it built even though it
+    never writes the words ``extra`` or ``unexpected``.
     """
 
     status_code = _exception_status_code(exception)
@@ -8349,6 +8355,8 @@ def _is_upstream_request_field_rejected_error(exception: Exception) -> bool:
     if status_code not in {400, 422}:
         return False
     text = _exception_text(exception)
+    if any(marker in text for marker in _UPSTREAM_DUPLICATE_TOOL_NAME_MARKERS):
+        return True
     if not any(marker in text for marker in _UPSTREAM_FIELD_REJECTION_MARKERS):
         return False
     return any(

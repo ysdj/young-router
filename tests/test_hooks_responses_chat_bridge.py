@@ -2801,6 +2801,80 @@ class BridgeProviderSearchTests(unittest.TestCase):
         assert bridge is not None
         self.assertIn("web_search_options", bridge)
 
+    def test_a_client_function_named_like_the_provider_tool_keeps_it_out(self) -> None:
+        """One tool namespace means the caller's own name wins.
+
+        LiteLLM names the declaration ``web_search`` on the Messages body, and
+        Anthropic refuses a body that carries one name twice: observed live
+        2026-11-04, HTTP 400 ``tools: tool names must be unique`` on every
+        ``/v1/responses`` turn from a client (Pi) whose searcher is a function
+        of exactly that name.  That function is the executor for the turn, so
+        the provider's tool is not a capability the request lacks.
+        """
+
+        pi_web_search = {
+            "type": "function",
+            "name": "web_search",
+            "description": "Search the web.",
+            "parameters": {"type": "object", "properties": {}},
+        }
+
+        bridge = self.hooks._responses_chat_bridge_preemptive_kwargs(
+            self._request("anthropic", tools=[pi_web_search])
+        )
+
+        assert bridge is not None
+        self.assertNotIn("web_search_options", bridge)
+        self.assertEqual(
+            ["web_search"],
+            [tool.get("name") for tool in bridge.get("tools") or []],
+        )
+        self.assertEqual(
+            "tool_name_taken",
+            (bridge.get("litellm_metadata") or {}).get(
+                "web_search_provider_declined"
+            ),
+        )
+
+    def test_a_nested_function_declaration_is_read_the_same_way(self) -> None:
+        bridge = self.hooks._responses_chat_bridge_preemptive_kwargs(
+            self._request(
+                "anthropic",
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+            )
+        )
+
+        assert bridge is not None
+        self.assertNotIn("web_search_options", bridge)
+
+    def test_a_function_of_another_name_still_gets_the_declaration(self) -> None:
+        bridge = self.hooks._responses_chat_bridge_preemptive_kwargs(
+            self._request(
+                "anthropic",
+                tools=[
+                    {
+                        "type": "function",
+                        "name": "fetch_content",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            )
+        )
+
+        assert bridge is not None
+        self.assertEqual(
+            {"search_context_size": "medium"},
+            bridge.get("web_search_options"),
+        )
+
     def test_the_declaration_names_the_type_the_provider_reads(self) -> None:
         # The name is the contract: it is what makes LiteLLM emit
         # ``web_search_20250305`` instead of an unknown Chat tool.

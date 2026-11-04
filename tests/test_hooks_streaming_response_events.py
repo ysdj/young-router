@@ -2648,6 +2648,57 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         self.assertFalse(hooks._is_upstream_request_field_rejected_error(exception))
         self.assertEqual(hooks._trace_exception(exception)["reason"], "other")
 
+    def test_a_duplicate_tool_name_stop_names_the_payload_defect(self) -> None:
+        """Anthropic's one tool namespace makes a same-named declaration a 400.
+
+        LiteLLM names the bridge's provider search ``web_search``, so a caller
+        function carrying that name sent it twice and the route answered HTTP
+        400 ``tools: tool names must be unique``.  Observed live 2026-11-04 on
+        the gateway: every ``/v1/responses`` turn from a client declaring that
+        function ended as ``upstream_route_failure`` / "the router could not
+        classify the stop", and Pi resent the identical body until its budget
+        ran out.  The refusal names a field this installation built, so it is
+        readable and must reach the branch that invites no resend.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+
+        class AnthropicBadRequestError(Exception):
+            pass
+
+        exception = AnthropicBadRequestError(
+            "litellm.BadRequestError: AnthropicException - b'{\"error\":"
+            "{\"message\":\"tools: tool names must be unique.\","
+            "\"type\":\"upstream_error\"}}'"
+        )
+        exception.status_code = 400
+        responses_request = {
+            "model": "claude-opus-5-5",
+            "input": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+        }
+
+        self.assertTrue(hooks._is_upstream_request_field_rejected_error(exception))
+        self.assertEqual(
+            hooks._trace_exception(exception)["reason"],
+            "upstream-request-field-rejected",
+        )
+
+        event = streaming_module._synthesized_failed_response_event(
+            responses_request,
+            exception,
+        )
+        payload = event if isinstance(event, dict) else json.loads(event.data or "{}")
+        error = payload["response"]["error"]
+
+        self.assertEqual("invalid_request_error", error["type"])
+        self.assertEqual("invalid_prompt", error["code"])
+        self.assertNotIn("could not classify", error["message"])
+        self.assertIn("field layout", error["message"])
+        self.assertNotIn("ended without", error["message"].lower())
+
     def test_an_incomplete_tool_history_stop_names_the_new_task(self) -> None:
         """The stop a cut tool record produces must name the only fix.
 

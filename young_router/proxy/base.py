@@ -1366,6 +1366,16 @@ _UPSTREAM_FIELD_REJECTION_MARKERS = (
     "additional_properties_not_allowed",
     "not permitted",
 )
+# One name carried by two tools.  Anthropic serves client functions and server
+# tools from a single namespace, and LiteLLM names the tool it derives from
+# ``web_search_options`` ``web_search`` -- so a bridge that also forwards a
+# caller function of that name sends the name twice and the route refuses the
+# whole body.  That refusal is a payload defect no resend changes; it is not a
+# verdict on the conversation and not an unnameable stop.
+_UPSTREAM_DUPLICATE_TOOL_NAME_MARKERS = (
+    "tool names must be unique",
+    "duplicate tool name",
+)
 _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES = {
     "APIConnectionError",
     "APIError",
@@ -1547,6 +1557,10 @@ _WEB_SEARCH_NATIVE_EVENT_SEEN_METADATA_KEY = "native_web_search_event_seen"
 # that cannot carry a Hosted tool.  The route then runs the search itself and
 # the client sees `web_search_call` / citation items instead of nothing.
 _WEB_SEARCH_PROVIDER_DECLARED_METADATA_KEY = "web_search_provider_declared"
+# Set instead of the declaration when the caller already sends a tool the
+# provider would name the same way.  The bridge then stays silent on purpose,
+# and the trace says so rather than looking like a request that never asked.
+_WEB_SEARCH_PROVIDER_DECLINED_METADATA_KEY = "web_search_provider_declined"
 
 
 @dataclass(frozen=True)

@@ -39,6 +39,7 @@ from .base import (
     _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
     _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
     _WEB_SEARCH_PROVIDER_DECLARED_METADATA_KEY,
+    _WEB_SEARCH_PROVIDER_DECLINED_METADATA_KEY,
     copy,
     inspect,
     litellm,
@@ -87,6 +88,14 @@ def _sync_bridge_extra_body_tools(request_kwargs: dict, tools: list[dict]) -> No
     request_kwargs["extra_body"] = updated_extra_body
 
 
+_PROVIDER_SEARCH_TOOL_NAME = "web_search"
+"""The tool name LiteLLM gives the declaration it derives from the option.
+
+``AnthropicMessagesConfig.map_web_search_tool`` hard-codes it, so a body that
+already carries a tool of that name cannot also declare ``web_search_options``.
+"""
+
+
 def _with_responses_chat_bridge_provider_search(
     bridge_kwargs: dict,
     bridge_metadata: dict,
@@ -103,6 +112,17 @@ def _with_responses_chat_bridge_provider_search(
     Only a route that declares the capability receives it, and only when the
     caller asked for search at all; see
     :func:`responses_tools._responses_bridge_anthropic_search_options`.
+
+    A caller function already bearing the provider tool's name keeps it out.
+    Anthropic serves client functions and server tools from one namespace, and
+    LiteLLM names this declaration ``web_search`` -- the same name Pi's own
+    searcher carries.  Declaring both sent one name twice and the route refused
+    the whole body.  Observed live 2026-11-04 on the gateway: HTTP 400 ``tools:
+    tool names must be unique`` on every ``/v1/responses`` turn from a client
+    that declares a function named ``web_search``, reported to the reader as
+    the unclassified ``upstream_route_failure``; the identical request with the
+    function renamed completed.  The caller's function is the executor for
+    that turn, so nothing is missing when the declaration is dropped.
     """
 
     if bridge_kwargs.get("web_search_options") is not None:
@@ -114,8 +134,46 @@ def _with_responses_chat_bridge_provider_search(
         return
     if not _request_asked_for_web_search(bridge_kwargs):
         return
+    if _bridge_sends_tool_named(bridge_kwargs, _PROVIDER_SEARCH_TOOL_NAME):
+        bridge_metadata[_WEB_SEARCH_PROVIDER_DECLINED_METADATA_KEY] = (
+            "tool_name_taken"
+        )
+        return
     bridge_kwargs["web_search_options"] = options
     bridge_metadata[_WEB_SEARCH_PROVIDER_DECLARED_METADATA_KEY] = True
+
+
+def _bridge_sends_tool_named(request_kwargs: dict, name: str) -> bool:
+    """Whether the body this bridge builds already carries a tool called ``name``."""
+
+    if name in _bridge_tool_names(request_kwargs.get("tools")):
+        return True
+    additional_tools = _responses_tools_module._responses_input_additional_tools(
+        request_kwargs.get("input")
+    )
+    return name in _bridge_tool_names(additional_tools)
+
+
+def _bridge_tool_names(tools: Any) -> set[str]:
+    """Every name a declaration becomes on the bridged wire, in any shape."""
+
+    names: set[str] = set()
+    if not isinstance(tools, list):
+        return names
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") == "namespace":
+            names.update(_bridge_tool_names(tool.get("tools")))
+            continue
+        function = tool.get("function")
+        function_dict = function if isinstance(function, dict) else {}
+        tool_name = _routing_module._valid_chat_tool_name(
+            function_dict.get("name") or tool.get("name")
+        )
+        if tool_name:
+            names.add(tool_name)
+    return names
 
 
 def _request_asked_for_web_search(request_kwargs: dict) -> bool:
