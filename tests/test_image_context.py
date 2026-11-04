@@ -1361,3 +1361,126 @@ class ImageContextSizeModeTests(_ImageContextCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class ImageContextPreviewTests(_ImageContextCase):
+    """What a reader sees when its client has no fetch tool at all.
+
+    A gateway cannot edit the client's MCP configuration, so a placeholder there
+    named a tool the model could not call: three hours of one live task omitted
+    73 images per request and fetched none.  A bounded thumbnail keeps the picture
+    visible at a fraction of the bytes, which is the only path that needs no
+    client change.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.environment.stop()
+        # A gateway: no client documents on this host, so the fetch kind is the
+        # endpoint nobody has configured a client to call.
+        self.gateway_home = os.path.join(self.directory.name, "gateway-home")
+        os.makedirs(self.gateway_home, exist_ok=True)
+        self.environment.start()
+        # After the base env is applied: its own update would otherwise win.
+        os.environ["HOME"] = self.gateway_home
+        os.environ[image_context_module.IMAGE_CONTEXT_FETCH_ENV] = "auto"
+        os.environ[image_context_module.IMAGE_CONTEXT_PREVIEW_ENV] = "auto"
+
+    def aged_replay(self) -> list:
+        return [
+            _user_turn("第一轮", _upload_parts(_png(1200, 900, noisy=True))),
+            _assistant("看过了"),
+            _tool_image(_png(1000, 800, noisy=True, seed=7)),
+            _user_turn("第二轮"),
+        ]
+
+    def images_in(self, result: dict) -> list:
+        found = []
+        for item in result["input"]:
+            for part in item.get("content") or item.get("output") or []:
+                if isinstance(part, dict) and part.get("type") == "input_image":
+                    found.append(part)
+        return found
+
+    def test_a_gateway_sends_a_thumbnail_instead_of_nothing(self) -> None:
+        result = self.rewritten(self.aged_replay())
+
+        images = self.images_in(result)
+        self.assertTrue(images, "no thumbnail was attached")
+        url = images[0]["image_url"]
+        self.assertTrue(url.startswith("data:image/jpeg;base64,"), url[:32])
+        # A thumbnail, not the original: well under the uploaded bytes.
+        self.assertLess(len(url), len(base64.b64encode(_png(1200, 900, noisy=True))))
+
+    def test_the_caption_still_names_the_id_and_says_it_is_a_thumbnail(self) -> None:
+        result = self.rewritten(self.aged_replay())
+
+        texts = [
+            part.get("text") or ""
+            for item in result["input"]
+            for part in (item.get("content") or [])
+            if isinstance(part, dict) and part.get("type") == "input_text"
+        ]
+        joined = "\n".join(texts)
+        self.assertIn("IMG-001", joined)
+        self.assertIn("此处为缩略图", joined)
+        self.assertIn("view_image_by_id", joined)
+
+    def test_the_note_says_the_thumbnails_are_there(self) -> None:
+        result = self.rewritten(self.aged_replay())
+
+        notes = [
+            item["content"][0]["text"]
+            for item in result["input"]
+            if item.get("role") == "developer"
+        ]
+        self.assertTrue(any("缩略图" in note for note in notes), notes)
+
+    def test_a_desktop_client_keeps_the_path_and_no_thumbnail(self) -> None:
+        # The client here can open a path itself, so a second copy of the same
+        # picture would only cost bytes.
+        home = Path(self.directory.name) / "desktop-home"
+        (home / ".codex").mkdir(parents=True)
+        (home / ".codex" / "config.toml").write_text("", encoding="utf-8")
+        os.environ["HOME"] = str(home)
+        os.environ[image_context_module.IMAGE_CONTEXT_FETCH_ENV] = "auto"
+        result = self.rewritten(self.aged_replay())
+
+        self.assertEqual([], self.images_in(result))
+
+    def test_off_keeps_the_bare_placeholder(self) -> None:
+        os.environ[image_context_module.IMAGE_CONTEXT_PREVIEW_ENV] = "off"
+
+        result = self.rewritten(self.aged_replay())
+
+        self.assertEqual([], self.images_in(result))
+
+    def test_the_budget_bounds_how_many_travel(self) -> None:
+        os.environ[image_context_module.IMAGE_CONTEXT_PREVIEW_TOKENS_ENV] = "500"
+
+        result = self.rewritten(self.aged_replay())
+
+        # One 512px thumbnail is ~400 tokens, so a 500-token budget allows one.
+        self.assertLessEqual(len(self.images_in(result)), 1)
+
+    def test_a_picture_that_travelled_once_keeps_travelling(self) -> None:
+        """The set must not move as the replay grows.
+
+        A thumbnail that appears or disappears between turns rewrites an item the
+        upstream has already read, and every step re-reads the bytes after it.
+        """
+
+        first = self.rewritten(self.aged_replay())
+        first_urls = [image["image_url"] for image in self.images_in(first)]
+        self.assertTrue(first_urls)
+
+        grown = self.aged_replay() + [
+            _assistant("又一个结果"),
+            _tool_image(_png(1000, 800, noisy=True, seed=11)),
+            _user_turn("第三轮"),
+        ]
+        second = self.rewritten(grown)
+        second_urls = [image["image_url"] for image in self.images_in(second)]
+
+        # Everything that travelled before still travels, with the same bytes.
+        self.assertEqual(first_urls[: len(second_urls)], second_urls[: len(first_urls)])
