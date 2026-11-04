@@ -3430,12 +3430,27 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     if (contentWidth < viewportWidth) {
       laidOutColumnWidths.back() += viewportWidth - contentWidth;
     } else if (contentWidth > viewportWidth) {
-      CGFloat deficit = contentWidth - viewportWidth;
-      for (NSUInteger index = columnCount; index-- > 0 && deficit > 0.5;) {
-        const CGFloat minimumWidth = _tableView.tableColumns[index].minWidth;
-        const CGFloat reduction = MIN(deficit, MAX(0, laidOutColumnWidths[index] - minimumWidth));
-        laidOutColumnWidths[index] -= reduction;
-        deficit -= reduction;
+      // The deficit is shared across the columns in proportion to the room each
+      // one can give, the way AppKit's own uniform autoresizing shares a
+      // resize.  Taking it from the trailing column alone read a column's
+      // position as its priority: the routes table keeps 顺序 last because
+      // that is where it is read, and it was the column that vanished first —
+      // a table whose header says 顺序 while no row can state an order.  Giving
+      // it all to the widest column instead just moves the loss onto whichever
+      // name happens to be longest.  Every column keeps a share of its own
+      // slack, so none collapses while another stays whole.
+      const CGFloat deficit = contentWidth - viewportWidth;
+      std::vector<CGFloat> slack(columnCount, 0);
+      CGFloat totalSlack = 0;
+      for (NSUInteger index = 0; index < columnCount; index++) {
+        slack[index] = MAX(0, laidOutColumnWidths[index] - _tableView.tableColumns[index].minWidth);
+        totalSlack += slack[index];
+      }
+      if (totalSlack > 0) {
+        const CGFloat share = MIN(static_cast<CGFloat>(1), deficit / totalSlack);
+        for (NSUInteger index = 0; index < columnCount; index++) {
+          laidOutColumnWidths[index] -= slack[index] * share;
+        }
       }
     }
   }

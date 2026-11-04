@@ -2945,7 +2945,18 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("preferredContentWidth > availableColumnWidth + 0.5", controls)
         self.assertIn("std::vector<CGFloat> laidOutColumnWidths = _requestedColumnWidths;", controls)
         self.assertIn("laidOutColumnWidths[index] = MAX(laidOutColumnWidths[index], _tableView.tableColumns[index].minWidth);", controls)
-        self.assertIn("const CGFloat reduction = MIN(deficit, MAX(0, laidOutColumnWidths[index] - minimumWidth));", controls)
+        # A deficit is shared across the columns in proportion to the room each
+        # one can give, the way AppKit's own uniform autoresizing shares a
+        # resize.  Taking it from the trailing column alone read a column's
+        # position as its priority — the routes table keeps 顺序 last because
+        # that is where it is read, and it was the column that vanished first —
+        # and giving it all to the widest column only moved the loss onto the
+        # longest name.
+        self.assertIn("slack[index] = MAX(0, laidOutColumnWidths[index] - _tableView.tableColumns[index].minWidth);", controls)
+        self.assertIn("totalSlack += slack[index];", controls)
+        self.assertIn("const CGFloat share = MIN(static_cast<CGFloat>(1), deficit / totalSlack);", controls)
+        self.assertIn("laidOutColumnWidths[index] -= slack[index] * share;", controls)
+        self.assertNotIn("for (NSUInteger index = columnCount; index-- > 0 && deficit > 0.5;)", controls)
         self.assertIn("_automaticColumnAdjustments[index] = width - _requestedColumnWidths[index];", controls)
         self.assertNotIn("contentWidth > availableColumnWidth + 0.5", controls)
         self.assertIn("cellHorizontalPadding?: WithDefault<Float, 8>;", (SHARED / "ui" / "macos" / "NativeTableNativeComponent.ts").read_text(encoding="utf-8"))

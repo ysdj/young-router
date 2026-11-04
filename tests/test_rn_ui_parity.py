@@ -1344,19 +1344,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('routeWorkspaceWithInspector', self.ui)
         self.assert_ui_has('routeTablePane: { flex: 1, minWidth: 0, minHeight: 0 }')
         self.assert_ui_has('onSelectionChange={(key) => selectRouteTableRow(key)}')
-        self.assert_ui_has('label: translate("providers.upstream"), width: 160 }, { label: translate("providers.provider"), width: 84 }, { label: translate("common.order"), width: 48')
+        self.assert_ui_has('label: translate("providers.upstream"), width: 160 }, { label: translate("providers.provider"), width: 84 }, { label: translate("providers.providerKey"), width: 150')
         # The routes table leads with the upstream model — the model a route
-        # actually calls — then names its provider, its order, and the
-        # credential that serves it.  顺序 has to hold its whole width: the
-        # native table takes a deficit off its trailing columns first, so a
-        # number that sits behind the credential is the first thing the pane
-        # ellipsizes.  The credential carries the pane instead — its values are
-        # long, already ellipsized, and the column that can afford to yield.
-        # The trailing column beyond it carries nothing: the native table grows
-        # its last column to the pane's width.
-        self.assert_ui_has('{ label: translate("providers.providerKey"), width: 150 }, ROUTE_TABLE_SPACER_COLUMN]} rows={routeRows}')
+        # actually calls — then names its provider, key, and order.  The
+        # trailing column carries nothing: the native table grows its last
+        # column to the pane's width, and 顺序 is a header and a number, not
+        # the widest thing in the pane.
+        self.assert_ui_has('{ label: translate("common.order"), width: 48 }, ROUTE_TABLE_SPACER_COLUMN]} rows={routeRows}')
         self.assert_ui_has('const ROUTE_TABLE_SPACER_COLUMN = { label: "", width: 1 };')
-        self.assert_ui_has(r'cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model) || translate("common.notAvailable")}`, providerDisplayName(entry.provider), order, modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources, providerCredentials(entry.provider, translate))]')
+        self.assert_ui_has(r'cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model) || translate("common.notAvailable")}`, providerDisplayName(entry.provider), modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources, providerCredentials(entry.provider, translate)), order]')
         self.assertNotIn('providers.orderSource', self.ui)
         self.assertNotIn('providers.effectiveOrder', self.ui)
         self.assert_ui_has('const activeRouteGroupUsesMultiplier = activeRouteGroup.some((entry) => modelOrderMode(entry.model) === "relay_multiplier");')
@@ -6597,7 +6593,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # reaches a key lookup: an account-backed route reads as its account.
         self.assertIn('const credential = modelCredential(model, provider, credentials);', self.ui)
         self.assertIn('grouped.set(key.id, { label: modelProviderKeyLabel(item, provider ?? {}, translate, undefined, relaySources), models: [item] });', self.ui)
-        self.assertIn('order, modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources, providerCredentials(entry.provider, translate))]', self.ui)
+        self.assertIn('modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources, providerCredentials(entry.provider, translate)), order],', self.ui)
         self.assertIn('const sourceName = relaySourceName(choice.source) || name;', self.ui)
         self.assertIn('label={relaySourceName(source) || source.resourceLabel}', self.ui)
         self.assertIn('label: remoteDelete.label', self.ui)
