@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# Only this module jitters: the model-concurrency queue polls a shared file, and
+# sixteen workers waking in lockstep would turn a wait into the load.
+import random
+
 from . import responses_output as _responses_output_module
 from . import image_inputs as _image_inputs_module
 from . import responses_request as _responses_request_module
@@ -115,7 +119,9 @@ from .base import (
     _SAME_DEPLOYMENT_RETRY_EXHAUSTED_ATTR,
     _RouteRecoveryStreamResponse,
     _SANITIZED_UPSTREAM_ROUTE_FAILURE_ATTR,
+    _SANITIZED_UPSTREAM_ROUTE_FAILURE_LOCAL_ATTR,
     _SANITIZED_UPSTREAM_ROUTE_FAILURE_POLICY_ATTR,
+    _SANITIZED_UPSTREAM_ROUTE_FAILURE_REASON_ATTR,
     _SANITIZED_UPSTREAM_ROUTE_FAILURE_STATUS_CODE,
     _SAME_DEPLOYMENT_RETRIES_DEFAULT,
     _SAME_DEPLOYMENT_RETRIES_ENV,
@@ -173,6 +179,7 @@ from .base import (
     _exception_text,
     _is_local_shutdown_exception,
     asyncio,
+    contextvars,
     datetime,
     timedelta,
     json,
@@ -205,6 +212,23 @@ _TEXT_ONLY_COMPLETION_MIN_DURATION_MS = 4000
 # worker's leases are never this process's to release.
 _HELD_CONCURRENCY_LEASES: dict[str, set[str]] = {}
 _HELD_CONCURRENCY_LEASES_LOCK = threading.Lock()
+# When each turn in this process first found its model's pool full.  The stamp
+# is what the shared queue orders on, so it must survive every hop of the turn:
+# a fresh stamp per attempt would put a turn that has been waiting for a minute
+# behind one that just arrived.
+_WAIT_TICKETS: dict[str, float] = {}
+# Until when the attempt running in this task may stay queued for a slot.  Set
+# by the route-recovery round -- the only place a wait is honest, because it is
+# the only place the client is receiving keepalives -- and read by the candidate
+# filter.  ``None`` means "no queue here": an ordinary attempt that meets a full
+# pool refuses at once, and the recovery round that follows is what waits,
+# carrying this turn's place in line with it.
+_CURRENT_CONCURRENCY_WAIT_DEADLINE: contextvars.ContextVar[Optional[float]] = (
+    contextvars.ContextVar(
+        "young_router_concurrency_wait_deadline",
+        default=None,
+    )
+)
 _CONCURRENCY_STORE_UNAVAILABLE_TRACED = False
 # Set on an exception this proxy raised because a route was already serving its
 # whole concurrency cap.  It is not an upstream answer, so every classifier that
@@ -3853,6 +3877,25 @@ def _request_log_error_summary(
     standard = _as_dict(request_kwargs.get("standard_logging_object"))
     error: dict[str, Any] = {}
 
+    if exception is not None and _is_local_turn_refusal_error(exception):
+        # Nothing upstream answered, so the row may not borrow an upstream
+        # status or an upstream class: the sanitized copy this proxy hands the
+        # client wears ``503 ServiceUnavailableError`` so a client resends, and
+        # copying that into the log made this router's own concurrency cap
+        # indistinguishable from a provider's outage (live 2026-11-04).  The
+        # route it refused is still named, which is the useful half.
+        traced = _trace_exception(exception)
+        error["local"] = True
+        if traced.get("reason"):
+            error["reason"] = traced.get("reason")
+        if traced.get("failed_deployment_id"):
+            error["failed_deployment_id"] = traced.get("failed_deployment_id")
+        if traced.get("failed_deployment_route_key"):
+            error["failed_route_key"] = traced.get("failed_deployment_route_key")
+        if traced.get("failed_deployment_order") is not None:
+            error["failed_deployment_order"] = traced.get("failed_deployment_order")
+        return error
+
     if exception is not None:
         traced = _trace_exception(exception)
         if traced.get("class"):
@@ -4747,13 +4790,32 @@ def _claim_deployment_concurrency_slot(
     identifier it already holds refreshes its own lease instead of taking a
     second slot, which is what makes a protocol-fallback retry on one
     deployment cost one slot and not two.
+
+    A turn that waited for this slot (see ``_await_model_concurrency_slot``)
+    claims with the moment it joined the line, so a slot that just freed goes to
+    the turn that has been queued longest rather than to whichever request
+    happened to ask next.
     """
 
     lease_key = _attempt_lease_key(request_kwargs, deployment)
     if not lease_key or cap <= 0:
         return True
     deployment_key = lease_key.split("|", 1)[0]
-    if not _concurrency_module.claim(lease_key, deployment_key, cap):
+    lease_id = _attempt_lease_id(request_kwargs)
+    if not _concurrency_module.claim(
+        lease_key,
+        deployment_key,
+        cap,
+        requested_at=_existing_concurrency_wait_ticket(request_kwargs),
+        turn_key=lease_id,
+    ):
+        # The pool is full here.  Take (or keep) this turn's place in line now,
+        # so the attempt that comes back -- the recovery poll's next round -- is
+        # ahead of a request that arrives after this one.  Releasing the turn
+        # withdraws it, so an abandoned turn never holds the head of the line.
+        ticket = _open_concurrency_wait_ticket(request_kwargs)
+        if ticket is not None and lease_id:
+            _concurrency_module.queue(lease_id, deployment_key, ticket)
         return False
     # Remember what this process holds, so the turn can give exactly its own
     # slots back instead of scanning the shared file for them.
@@ -4802,17 +4864,24 @@ def _release_request_concurrency_slots(request_kwargs: Optional[dict]) -> None:
     if not names:
         return
     held: set = set()
+    queued = False
     with _HELD_CONCURRENCY_LEASES_LOCK:
         for lease_id in names:
             found = _HELD_CONCURRENCY_LEASES.pop(lease_id, None)
             if found:
                 held |= set(found)
-    if not held:
+            if _WAIT_TICKETS.pop(lease_id, None) is not None:
+                queued = True
+    if not held and not queued:
         # Nothing to give back is the ordinary shape (a turn that never claimed,
         # a listing).  It stays silent: a trace per request would drown the ones
         # that matter.
         return
-    _concurrency_module.release(sorted(held))
+    # The turn's place in line goes with it.  A turn that ends while still
+    # queued holds no lease at all, so releasing only leases would leave its
+    # ticket at the head of the line and keep refusing every later request for
+    # that route.
+    _concurrency_module.release(sorted(held), ticket_keys=names if queued else [])
     # The same slot may be registered under more than one of this turn's names;
     # once it is given back, no name may still claim to hold it.
     with _HELD_CONCURRENCY_LEASES_LOCK:
@@ -4876,6 +4945,165 @@ def _with_active_model_concurrency(
     return deployments, [], False
 
 
+def _existing_concurrency_wait_ticket(request_kwargs: Optional[dict]) -> Optional[float]:
+    """When this turn first had to wait for a slot, or ``None`` if never.
+
+    The queue orders on this stamp, so it belongs to the turn: every hop of one
+    request (a fallback peer, a recovery round) must present the same moment it
+    joined the line.  Re-stamping per attempt would let a turn that has been
+    waiting fall behind one that arrived a second ago.
+    """
+
+    lease_id = _attempt_lease_id(request_kwargs)
+    if not lease_id:
+        return None
+    with _HELD_CONCURRENCY_LEASES_LOCK:
+        return _WAIT_TICKETS.get(lease_id)
+
+
+def _open_concurrency_wait_ticket(request_kwargs: Optional[dict]) -> Optional[float]:
+    """This turn's place in line, stamped now if it has none yet.
+
+    Opened by a refusal as well as by a wait: the refusal is what sends the turn
+    to the recovery round, and that round's next attempt is the one that must be
+    ahead of a fresh request when a slot frees.
+    """
+
+    lease_id = _attempt_lease_id(request_kwargs)
+    if not lease_id:
+        return None
+    with _HELD_CONCURRENCY_LEASES_LOCK:
+        if len(_WAIT_TICKETS) > 4096:
+            # A ticket is dropped when its turn ends; this bound covers the turn
+            # whose end this process never saw (a cancelled worker frame).  The
+            # stamps are the only unbounded thing here, so they are what ages
+            # out -- one float per abandoned turn is not worth a long-running
+            # proxy growing for.
+            cutoff = time.time() - _concurrency_module.lease_seconds()
+            for key, stamp in list(_WAIT_TICKETS.items()):
+                if stamp < cutoff:
+                    _WAIT_TICKETS.pop(key, None)
+        return _WAIT_TICKETS.setdefault(lease_id, time.time())
+
+
+def _concurrency_wait_deadline() -> Optional[float]:
+    """Until when this attempt may stay queued, or ``None`` to not queue.
+
+    The one caller that sets it is the route-recovery round, with the deadline
+    it already obeys.  There is deliberately no setting of its own: a queue is
+    the recovery window's job, so it ends exactly when recovery ends -- four
+    hours by default, and the operator's own value when it was changed.
+    """
+
+    return _CURRENT_CONCURRENCY_WAIT_DEADLINE.get()
+
+
+def _set_concurrency_wait_deadline(value: Optional[float]) -> Any:
+    return _CURRENT_CONCURRENCY_WAIT_DEADLINE.set(value)
+
+
+def _reset_concurrency_wait_deadline(token: Any) -> None:
+    _CURRENT_CONCURRENCY_WAIT_DEADLINE.reset(token)
+
+
+async def _await_model_concurrency_slot(
+    deployments: List[dict],
+    *,
+    request_kwargs: Optional[dict] = None,
+    deadline: Optional[float] = None,
+) -> List[dict]:
+    """Wait for a route of this pool to have room, and answer what has room.
+
+    A route at its concurrency cap is busy, not broken: the turn takes its place
+    in line and is served when a running request finishes.  Refusing it instead
+    made every turn above the cap end with an error, which a client can only
+    answer by retrying -- the same request arriving again at the same full pool
+    (live 2026-11-04: a group at its cap produced refusal after refusal every
+    five seconds for minutes).
+
+    Only an attempt that is already inside the recovery round queues: that
+    round is where the client is receiving keepalives, and its deadline is what
+    bounds the wait.  An ordinary attempt answers ``[]`` immediately, is refused
+    by the caller, and the recovery round that follows does the waiting while
+    holding this turn's place in line.
+    """
+
+    if not deployments:
+        return []
+    until = deadline if deadline is not None else _concurrency_wait_deadline()
+    if until is None:
+        return []
+    remaining = until - time.monotonic()
+    if remaining <= 0:
+        return []
+    lease_id = _attempt_lease_id(request_kwargs)
+    if not lease_id:
+        # No turn identity means no place in line to hold, and a queue entry
+        # nothing can withdraw would block the route for every later request.
+        return []
+    requested_at = _open_concurrency_wait_ticket(request_kwargs)
+    if requested_at is None:
+        return []
+    interval = _concurrency_module.MODEL_CONCURRENCY_WAIT_INTERVAL_SECONDS
+    model_group = _responses_execution_module._request_model_group(request_kwargs)
+    waited_from = time.monotonic()
+    queued = False
+    available: List[dict] = []
+    saturated: list[dict[str, Any]] = []
+    _trace_module._route_trace(
+        "model_concurrency_queue_start",
+        request_id=_trace_request_id(request_kwargs),
+        session=_trace_session_context(request_kwargs),
+        model_group=model_group,
+        wait_seconds=round(remaining, 3),
+        candidates=_trace_deployments(deployments),
+    )
+    try:
+        while True:
+            available, saturated, _filtered = _with_active_model_concurrency(
+                deployments,
+                request_kwargs=request_kwargs,
+            )
+            if available:
+                break
+            # Join exactly one line: the first route with no room.  A turn that
+            # queued on a different route earlier moved on, and its old place
+            # is dropped by the claim that took the new one.
+            if not queued:
+                for deployment in deployments:
+                    cap = _model_concurrency_cap(deployment)
+                    deployment_key = _deployment_cooldown_key_from_deployment(
+                        deployment
+                    )
+                    if cap <= 0 or not deployment_key:
+                        continue
+                    _concurrency_module.queue(lease_id, deployment_key, requested_at)
+                    queued = True
+                    break
+            now = time.monotonic()
+            if now >= until:
+                break
+            # Jitter keeps sixteen workers from polling in lockstep, which is a
+            # file write each time.
+            delay = interval * (0.6 + random.random() * 0.8)
+            await asyncio.sleep(min(delay, max(0.0, until - now)))
+    finally:
+        _trace_module._route_trace(
+            "model_concurrency_queue_end",
+            request_id=_trace_request_id(request_kwargs),
+            session=_trace_session_context(request_kwargs),
+            model_group=model_group,
+            waited_seconds=round(time.monotonic() - waited_from, 3),
+            served=bool(available),
+            saturated=saturated,
+        )
+    # Empty means the budget ran out: the caller keeps the pool, so this round
+    # ends the way a full pool has to and the next round queues again under the
+    # same ticket.  The ticket is not dropped here -- this turn is still ahead
+    # of whatever arrived after it.
+    return available
+
+
 def _trace_concurrency_store_unavailable(request_kwargs: Optional[dict]) -> None:
     global _CONCURRENCY_STORE_UNAVAILABLE_TRACED
     if _CONCURRENCY_STORE_UNAVAILABLE_TRACED:
@@ -4893,6 +5121,29 @@ def _is_model_concurrency_rejection_error(exception: Exception) -> bool:
     """Whether *exception* is this proxy's own "that route is full" answer."""
 
     return bool(getattr(exception, _MODEL_CONCURRENCY_REJECTION_ATTR, False))
+
+
+def _is_local_turn_refusal_error(exception: Exception) -> bool:
+    """Whether *this* proxy refused the turn before any upstream answered.
+
+    Two stops wear an upstream shape while being answers this installation
+    produced: a full concurrency pool (raised between deployment selection and
+    the call, then sanitized into a ``ServiceUnavailableError`` so the client
+    resends) and a caller key this gateway would not accept.  Neither is
+    evidence about a provider, and a reader who sees ``HTTP 503`` on such a row
+    goes looking for an outage that does not exist -- live 2026-11-04 the
+    request log showed the group's own cap refusals as upstream 503s while the
+    real upstream refusal on the same model was still arriving.
+
+    The sanitized copy keeps this verdict on an attribute, because the sentence
+    it carries no longer says who refused.
+    """
+
+    if _is_model_concurrency_rejection_error(exception):
+        return True
+    if bool(getattr(exception, _SANITIZED_UPSTREAM_ROUTE_FAILURE_LOCAL_ATTR, False)):
+        return True
+    return _is_local_gateway_auth_rejection_error(exception)
 
 
 def _model_concurrency_rejection_exception(
@@ -5493,7 +5744,18 @@ def _trace_session_context(request_kwargs: Optional[dict]) -> dict[str, Any]:
 def _trace_exception(exception: Exception) -> dict[str, Any]:
     status_code = _exception_status_code(exception)
     text = _exception_text(exception)
-    if _is_local_shutdown_exception(exception):
+    # A sanitized stop is a copy this proxy built, so the classifiers below can
+    # only see its rewritten sentence.  The reason the original earned is
+    # carried across, which is what keeps a full concurrency pool or a rejected
+    # caller key from reading as the 503 the sanitized copy wears on the wire.
+    preserved_reason = getattr(
+        exception,
+        _SANITIZED_UPSTREAM_ROUTE_FAILURE_REASON_ATTR,
+        None,
+    )
+    if isinstance(preserved_reason, str) and preserved_reason.strip():
+        reason = preserved_reason.strip()
+    elif _is_local_shutdown_exception(exception):
         reason = "local-proxy-shutdown"
     elif _is_local_gateway_auth_rejection_error(exception):
         # This proxy answered, before any route existed: the caller's key was
@@ -5626,6 +5888,32 @@ def _recovery_diagnostic(exception: Exception) -> dict[str, Any]:
     """Return a stable, secret-free explanation for local recovery status."""
     status_code = _exception_status_code(exception)
     text = _exception_text(exception)
+
+    if _is_local_turn_refusal_error(exception):
+        # This router refused, not a provider: a full concurrency pool carries
+        # the words "concurrency limit", which the rate-limit branch below read
+        # as an upstream asking for a wait.  The recovery tab then told the user
+        # an upstream was throttling while every route was simply at the cap
+        # this installation set -- and nothing upstream had been contacted.
+        if _is_local_gateway_auth_rejection_error(exception):
+            return {
+                "kind": "local_gateway_auth",
+                "title": "This router rejected the client key",
+                "detail": (
+                    "The request never reached a provider: this gateway did not "
+                    "accept the caller's key. Change the client's key."
+                ),
+            }
+        return {
+            "kind": "local_capacity",
+            "title": "This router's concurrency limit",
+            "detail": (
+                "Every route of this model was already serving as many requests "
+                "at once as this installation allows, so the turn was not sent "
+                "upstream. Nothing is broken at the provider; the turn waits for "
+                "a running request to finish."
+            ),
+        }
 
     if any(marker in text for marker in _UPSTREAM_BALANCE_ERROR_MARKERS):
         result = {
@@ -8310,6 +8598,22 @@ def _sanitized_upstream_route_exception(
         )
     except Exception:
         pass
+    # The copy is what the request log and every later classifier see, so it has
+    # to carry the two facts the rewritten sentence no longer states: why the
+    # turn stopped, and whether an upstream was involved at all.
+    try:
+        setattr(
+            sanitized,
+            _SANITIZED_UPSTREAM_ROUTE_FAILURE_REASON_ATTR,
+            _trace_exception(exception).get("reason"),
+        )
+    except Exception:
+        pass
+    if _is_local_turn_refusal_error(exception):
+        try:
+            setattr(sanitized, _SANITIZED_UPSTREAM_ROUTE_FAILURE_LOCAL_ATTR, True)
+        except Exception:
+            pass
     try:
         sanitized.status_code = (  # type: ignore[attr-defined]
             _REQUEST_BODY_SIZE_REJECTED_STATUS_CODE

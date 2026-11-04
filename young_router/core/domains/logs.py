@@ -506,6 +506,19 @@ def _trace_detail(raw: Mapping[str, Any]) -> str:
             ("all_cooled", _trace_bool(raw.get("cooldown_all_candidates")), ""),
         )
 
+    if event.startswith("model_concurrency_queue"):
+        # This router's own queue, not an upstream event: the row says how long
+        # the turn waited for a slot of this installation's cap, and whether the
+        # wait produced one.  The saturation list is a count for the same reason
+        # every other deployment list is: the rows are in the trace payload, and
+        # what a reader needs from the detail column is how many routes were
+        # full.
+        return _trace_detail_parts(
+            ("waited", raw.get("waited_seconds") or raw.get("wait_seconds"), "s"),
+            ("served", _trace_bool(raw.get("served")), ""),
+            ("cooling", _trace_count(raw.get("saturated")), ""),
+        )
+
     if event == "next_order_fallback_available":
         return _trace_detail_parts(
             ("failed_order", raw.get("failed_order"), ""),

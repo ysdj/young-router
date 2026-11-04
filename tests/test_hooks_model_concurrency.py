@@ -46,6 +46,20 @@ def _request(turn: str = "turn-1", *, deployment_id: str = "route-a") -> dict:
     }
 
 
+def _queue_deadline(hooks, until: float):
+    """Enter the queue the way one recovery round does.
+
+    The deadline is a context variable set around the round's own attempt, not
+    a setting: it is the moment that attempt must stop waiting.
+    """
+
+    return hooks._set_concurrency_wait_deadline(until)
+
+
+def _leave_queue(hooks, token) -> None:
+    hooks._reset_concurrency_wait_deadline(token)
+
+
 class ConcurrencyStoreTestCase(HookTestCase):
     """Loads the hook module against a private leases file.
 
@@ -941,3 +955,210 @@ class TurnEndReleasesTheSlotTests(ConcurrencyStoreTestCase):
 
         self.assertEqual({}, self.leases())
         self.assertEqual({}, dict(hooks._HELD_CONCURRENCY_LEASES))
+
+
+        self.assertEqual(hooks._deployment_in_flight_count("id:route-a"), 0)
+
+
+class ConcurrencyQueueTests(ConcurrencyStoreTestCase):
+    """A full pool queues the turn; it does not end it.
+
+    A route at its cap is busy, not broken.  Refusing the turn made the client
+    answer the only way it could -- by sending the same request again at the
+    same full pool -- which is why one at-cap group read as an outage: refusal
+    after refusal, every five seconds, until a slot happened to free.
+
+    The wait lives in the recovery round, because that is the only attempt the
+    client is watching through keepalives.  It has no budget of its own: the
+    round's own deadlines are what bound it, and the recovery window -- four
+    hours by default -- is the longest a turn can stay in line.
+    """
+
+    def _queueing(self, hooks, seconds: float = 5.0):
+        """Enter the queue the way a recovery round does."""
+
+        return _queue_deadline(hooks, time.monotonic() + seconds)
+
+    async def test_the_recovery_round_waits_and_is_served_when_a_slot_frees(self) -> None:
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        self.set_env(hooks.MODEL_CONCURRENCY_LIMIT_ENV, "1")
+        deployment = _deployment("route-only")
+        busy = _request("turn-busy", deployment_id="route-only")
+        self.assertTrue(hooks._claim_deployment_concurrency_slot(busy, deployment, 1))
+
+        async def free_the_slot() -> None:
+            # A running request finishes while this turn is queued.
+            await asyncio.sleep(0.3)
+            hooks._release_request_concurrency_slots(busy)
+
+        task = asyncio.create_task(free_the_slot())
+        token = self._queueing(hooks)
+        started = time.monotonic()
+        try:
+            filtered = await hook.async_filter_deployments(
+                "default-chat",
+                [deployment],
+                messages=None,
+                request_kwargs=_request("turn-waiting", deployment_id="route-only"),
+            )
+        finally:
+            _leave_queue(hooks, token)
+            await task
+
+        waited = time.monotonic() - started
+        # The route stayed in the pool: it was not refused, it was waited for.
+        self.assertEqual([item["model_info"]["id"] for item in filtered], ["route-only"])
+        self.assertGreaterEqual(waited, 0.25)
+        self.assertLess(waited, 5.0)
+
+    async def test_an_ordinary_attempt_never_waits(self) -> None:
+        """Only the recovery round queues; the first attempt answers at once.
+
+        Outside that round the client is receiving nothing, so a wait there is
+        silence the client answers with its own timeout.  The refusal is the
+        honest answer, and it is what hands the turn to the round that can
+        wait with keepalives.
+        """
+
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        self.set_env(hooks.MODEL_CONCURRENCY_LIMIT_ENV, "1")
+        deployment = _deployment("route-only")
+        busy = _request("turn-busy", deployment_id="route-only")
+        self.assertTrue(hooks._claim_deployment_concurrency_slot(busy, deployment, 1))
+
+        started = time.monotonic()
+        filtered = await hook.async_filter_deployments(
+            "default-chat",
+            [deployment],
+            messages=None,
+            request_kwargs=_request("turn-new", deployment_id="route-only"),
+        )
+        waited = time.monotonic() - started
+
+        self.assertLess(waited, 1.0)
+        # The pool is kept, so the attempt reaches the claim and is refused by
+        # this proxy with a reason of its own rather than "no deployments".
+        self.assertEqual([item["model_info"]["id"] for item in filtered], ["route-only"])
+        self.assertEqual(
+            [deployment],
+            [item for item in filtered],
+        )
+
+    async def test_a_pool_that_never_frees_ends_the_round_and_keeps_the_place(self) -> None:
+        """The wait is bounded by the round's deadline, and the ticket remains."""
+
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        self.set_env(hooks.MODEL_CONCURRENCY_LIMIT_ENV, "1")
+        deployment = _deployment("route-only")
+        busy = _request("turn-busy", deployment_id="route-only")
+        self.assertTrue(hooks._claim_deployment_concurrency_slot(busy, deployment, 1))
+
+        token = self._queueing(hooks, 0.4)
+        started = time.monotonic()
+        try:
+            filtered = await hook.async_filter_deployments(
+                "default-chat",
+                [deployment],
+                messages=None,
+                request_kwargs=_request("turn-waiting", deployment_id="route-only"),
+            )
+        finally:
+            _leave_queue(hooks, token)
+        waited = time.monotonic() - started
+
+        self.assertEqual([item["model_info"]["id"] for item in filtered], ["route-only"])
+        self.assertGreaterEqual(waited, 0.35)
+        self.assertLess(waited, 3.0)
+        # The place in line survives a spent deadline: the round did not get in,
+        # and the next round must still be ahead of a request that arrived after
+        # this turn.
+        self.assertEqual(hooks._concurrency_module.waiting_count("id:route-only"), 1)
+        hooks._release_request_concurrency_slots(
+            _request("turn-waiting", deployment_id="route-only")
+        )
+        self.assertEqual(hooks._concurrency_module.waiting_count("id:route-only"), 0)
+
+    async def test_the_turn_that_waited_longest_gets_the_freed_slot(self) -> None:
+        """A freed slot goes to the head of the line, not to the newest ask.
+
+        Without the queue order a steady arrival of fresh requests holds a
+        waiting turn out for as long as the arrivals keep coming: the turn's
+        request is refused repeatedly while its own place is never reached.
+        """
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks.MODEL_CONCURRENCY_LIMIT_ENV, "1")
+        deployment = _deployment("route-a")
+        lease_key = "id:route-a|turn-a"
+        self.assertTrue(hooks._concurrency_module.claim(lease_key, "id:route-a", 1))
+
+        now = time.time()
+        # The waiting turn joined the line a minute ago; the newcomer is asking
+        # right now and holds no place at all.
+        self.assertTrue(
+            hooks._concurrency_module.queue("turn-old", "id:route-a", now - 60)
+        )
+        hooks._concurrency_module.release([lease_key])
+
+        self.assertFalse(
+            hooks._concurrency_module.claim("id:route-a|turn-new", "id:route-a", 1)
+        )
+        self.assertTrue(
+            hooks._concurrency_module.claim(
+                "id:route-a|turn-old",
+                "id:route-a",
+                1,
+                requested_at=now - 60,
+                turn_key="turn-old",
+            )
+        )
+        # Taking the slot withdraws the ticket: the next newcomer is not blocked
+        # by a queue entry that has already been served.
+        self.assertEqual(hooks._concurrency_module.waiting_count("id:route-a"), 0)
+        hooks._concurrency_module.release(["id:route-a|turn-old"])
+        self.assertTrue(
+            hooks._concurrency_module.claim("id:route-a|turn-new", "id:route-a", 1)
+        )
+
+    async def test_a_queued_turn_that_ends_withdraws_its_place(self) -> None:
+        """An abandoned turn must not hold the head of the line."""
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks.MODEL_CONCURRENCY_LIMIT_ENV, "1")
+        deployment = _deployment("route-a")
+        held = _request("turn-held", deployment_id="route-a")
+        self.assertTrue(hooks._claim_deployment_concurrency_slot(held, deployment, 1))
+
+        queued = _request("turn-queued", deployment_id="route-a")
+        # A refusal opens this turn's place in line, so the attempt that comes
+        # back (the next recovery round) is ahead of a fresh request.
+        self.assertFalse(hooks._claim_deployment_concurrency_slot(queued, deployment, 1))
+        self.assertEqual(hooks._concurrency_module.waiting_count("id:route-a"), 1)
+
+        hooks._release_request_concurrency_slots(queued)
+
+        self.assertEqual(hooks._concurrency_module.waiting_count("id:route-a"), 0)
+
+    def test_the_queue_is_bounded_by_the_recovery_window(self) -> None:
+        """One deadline decides: the earlier of the attempt and the poll.
+
+        There is no queue setting to keep in step with the recovery window: the
+        round's own deadlines are what bound a wait, and the default recovery
+        window is four hours.
+        """
+
+        from young_router.proxy import streaming_recovery
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, None)
+        self.assertEqual(hooks._recovery_max_seconds(), 14400.0)
+        self.assertEqual(
+            streaming_recovery._concurrency_queue_deadline(90.0, 50.0), 50.0
+        )
+        self.assertEqual(
+            streaming_recovery._concurrency_queue_deadline(None, 50.0), 50.0
+        )
+        self.assertIsNone(streaming_recovery._concurrency_queue_deadline(None, None))

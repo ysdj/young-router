@@ -156,6 +156,15 @@ class YoungRouterHook(CustomLogger):
         if _routing_module._is_local_control_plane_read(kwargs):
             return
         _trace_codex_fast_tier_result(kwargs, response_obj, outcome="failure")
+        # A turn that ends failed has no attempt in flight either.  The success
+        # callback is where a delivered answer gives its slot back, and a
+        # failure that reached the failover machinery already released there;
+        # a failure that never did would otherwise hold its route's slot for the
+        # whole lease window.  A streaming turn keeps its slot -- the
+        # client-facing stream owns that boundary, and its recovery rounds keep
+        # claiming under the same turn.
+        if kwargs.get("stream") is not True:
+            _routing_module._release_request_concurrency_slots(kwargs)
         if _routing_module._should_suppress_recent_failure_log(kwargs, response_obj):
             return
         _state_module._append_recent_request(
@@ -297,6 +306,14 @@ class YoungRouterHook(CustomLogger):
             # route's model group has nowhere else to go -- that attempt is told
             # its limit was reached after the request is routed, and another hop
             # is never invented for it.
+            # A route at its concurrency cap is busy, not broken.  When the
+            # whole group is at its cap, the recovery round queues the turn here
+            # and serves it as soon as a running request finishes; refusing it
+            # was the only answer a client could complete with a retry against
+            # the same full pool, which is what made one at-cap group look like
+            # an outage.  Only that round may wait -- an ordinary attempt returns
+            # at once and is refused, which is what hands the turn to the round
+            # that can wait while the client still receives keepalives.
             concurrency_saturated: list[dict[str, Any]] = []
             concurrency_filtered = False
             if candidate_deployments:
@@ -308,6 +325,13 @@ class YoungRouterHook(CustomLogger):
                     candidate_deployments,
                     request_kwargs=request_kwargs,
                 )
+                if not concurrency_available and concurrency_saturated:
+                    concurrency_available = (
+                        await _routing_module._await_model_concurrency_slot(
+                            candidate_deployments,
+                            request_kwargs=request_kwargs,
+                        )
+                    )
                 if concurrency_available:
                     candidate_deployments = concurrency_available
                 else:

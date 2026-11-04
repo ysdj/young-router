@@ -4364,3 +4364,168 @@ class RuntimeRootStateTests(HookTestCase):
             os.environ.pop("YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_FILE", None)
             # Imported out of this checkout, which is not a runtime directory.
             self.assertIsNone(state._deployment_cooldown_file_path())
+
+
+class LocalRefusalReadsAsLocalTests(HookTestCase):
+    """This router's own refusal must not be logged as an upstream answer.
+
+    Live 2026-11-04: a group's remaining routes were all at this installation's
+    concurrency cap, so each turn was refused here before any upstream was
+    called -- and the sanitized copy the client receives wears ``503
+    ServiceUnavailableError`` so the client resends.  The request log copied
+    that status and class, so the Log tab showed rows identical to the real
+    relay 503 arriving on the same model at the same minute: one dead node and
+    one full local pool were indistinguishable, and the recovery tab called the
+    local cap an upstream rate limit.
+    """
+
+    def _sanitized_refusal(self, hooks):
+        deployment = {
+            "litellm_params": {"model": "openai/deepseek-v4.1-flash"},
+            "model_info": {"id": "route-full", "order": 0.5},
+        }
+        request = {
+            "model": "deepseek-v4.1-flash",
+            "litellm_params": {"model": "openai/deepseek-v4.1-flash", "order": 0.5},
+            "model_info": {"id": "route-full", "order": 0.5},
+        }
+        refusal = hooks._model_concurrency_rejection_exception(request, deployment)
+        # The client-facing copy is what the failure callback logs.
+        return request, hooks._sanitized_upstream_route_exception(
+            "deepseek-v4.1-flash",
+            refusal,
+            request,
+        )
+
+    def test_the_log_row_does_not_borrow_an_upstream_status_or_class(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        request, sanitized = self._sanitized_refusal(hooks)
+
+        summary = hooks._request_log_error_summary({"exception": sanitized}, None)
+
+        self.assertTrue(summary.get("local"))
+        self.assertEqual(summary.get("reason"), "model-concurrency-limit")
+        # The sanitized copy answers the client with a 503 so it resends; that
+        # number belongs to the wire, never to the route record.
+        self.assertNotIn("status_code", summary)
+        self.assertNotIn("type", summary)
+        # The route that refused is still named, which is the actionable half.
+        self.assertEqual(summary.get("failed_deployment_id"), "route-full")
+
+    def test_the_recovery_tab_names_the_local_cap_instead_of_a_rate_limit(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        _request, sanitized = self._sanitized_refusal(hooks)
+
+        diagnostic = hooks._recovery_diagnostic(sanitized)
+
+        self.assertEqual(diagnostic["kind"], "local_capacity")
+        self.assertNotIn("status_code", diagnostic)
+        self.assertIn("not sent upstream", diagnostic["detail"])
+
+    def test_a_real_upstream_503_keeps_its_status_and_class(self) -> None:
+        """The distinction is origin, not wording: a provider's 503 stays one."""
+
+        hooks, _proxy_server = load_hook_module()
+        request = {
+            "model": "deepseek-v4.1-flash",
+            "litellm_params": {"model": "openai/deepseek-v4.1-flash"},
+            "model_info": {"id": "relay-route"},
+        }
+        upstream = RuntimeError("OpenAIException - Service temporarily unavailable")
+        upstream.status_code = 503
+        upstream.failed_deployment_id = "relay-route"
+        sanitized = hooks._sanitized_upstream_route_exception(
+            "deepseek-v4.1-flash",
+            upstream,
+            request,
+        )
+
+        summary = hooks._request_log_error_summary({"exception": sanitized}, None)
+
+        self.assertNotIn("local", summary)
+        self.assertEqual(summary.get("status_code"), 503)
+        self.assertEqual(summary.get("reason"), "upstream-status-503")
+        self.assertEqual(
+            hooks._recovery_diagnostic(sanitized)["kind"],
+            "unknown",
+        )
+
+
+class RecoveryRoundQueuesForConcurrencyTests(HookTestCase):
+    """A full pool is queued by the round that can wait, and only by it.
+
+    Live 2026-11-04: one model group's every route sat at this installation's
+    concurrency cap.  Nothing upstream was broken, and the client could only
+    complete the turn by retrying the same request at the same full pool, so the
+    request log filled with identical refusals.  The queue belongs to the
+    recovery round: it is the one attempt the client is watching through
+    keepalives, and its own deadline is what bounds the wait -- no separate
+    setting, and the recovery window (four hours by default) is the cap.
+    """
+
+    def _deadline_seen_by_attempt(self, hooks):
+        """Read the queue deadline as the round's attempt would see it."""
+
+        return hooks._concurrency_wait_deadline()
+
+    async def test_the_round_arms_the_queue_and_the_attempt_reads_it(self) -> None:
+        """Inside the round the attempt may queue; outside it may not.
+
+        The arming belongs to the round, so the observation point is the round's
+        own router call -- the seam the candidate filter sits behind.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = sys.modules["young_router.proxy.streaming"]
+        original_round = streaming_module._stream_streaming_error_fallback_round
+        observed: list[object] = []
+
+        async def round_(request_data, exception, **kwargs):
+            observed.append(self._deadline_seen_by_attempt(hooks))
+            yield {
+                "type": "response.output_text.delta",
+                "delta": "served",
+            }
+            yield {"type": "response.completed", "response": {"id": "resp-queued"}}
+
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "60")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        streaming_module._stream_streaming_error_fallback_round = round_
+        try:
+            request_data = {
+                "model": "default-chat",
+                "input": [{"role": "user", "content": "Continue."}],
+                "stream": True,
+                "model_info": {"id": "order1-a", "order": 1},
+            }
+
+            async for _chunk in hooks._stream_route_recovery_poll(
+                request_data,
+                RuntimeError("no deployments available for selected model"),
+            ):
+                pass
+        finally:
+            streaming_module._stream_streaming_error_fallback_round = original_round
+
+        self.assertTrue(observed)
+        self.assertIsInstance(observed[0], float)
+        self.assertIsNone(self._deadline_seen_by_attempt(hooks))
+
+    async def test_an_attempt_outside_the_round_is_not_armed(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        self.assertIsNone(self._deadline_seen_by_attempt(hooks))
+        # The context variable is per task: arming it in one task must not leak
+        # into the process's other requests.
+        armed = asyncio.Event()
+        released = asyncio.Event()
+
+        async def holder():
+            hooks._set_concurrency_wait_deadline(time.monotonic() + 5)
+            armed.set()
+            await released.wait()
+
+        task = asyncio.create_task(holder())
+        await armed.wait()
+        self.assertIsNone(self._deadline_seen_by_attempt(hooks))
+        released.set()
+        await task

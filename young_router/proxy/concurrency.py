@@ -45,6 +45,14 @@ MODEL_CONCURRENCY_LIMIT_DEFAULT = 16
 MODEL_CONCURRENCY_LIMIT_KEY = "max_concurrency"
 MODEL_CONCURRENCY_MAX = 4096
 
+#: How often a queued turn looks again.  The count lives in a locked file, so
+#: this is a read-modify-write; a quarter second is long enough that sixteen
+#: workers waiting do not become the load, and short enough that a freed slot
+#: is taken while the caller still reads it as "thinking".  A cadence, not a
+#: setting: nothing an operator would tune, and the queue's own bound is the
+#: recovery window that is already configured.
+MODEL_CONCURRENCY_WAIT_INTERVAL_SECONDS = 0.25
+
 #: The proxy's own request budget, which is also the longest a live request can
 #: hold a slot.  A lease outliving that is a lease nobody is behind anymore.
 _REQUEST_TIMEOUT_ENV = "YOUNG_ROUTER_REQUEST_TIMEOUT_SECONDS"
@@ -192,6 +200,21 @@ def _leases_map(payload: dict[str, Any]) -> dict[str, Any]:
     return leases
 
 
+def _waiters_map(payload: dict[str, Any]) -> dict[str, Any]:
+    """The turns waiting for a slot, in the same document as the slots.
+
+    A queue and the count it queues against are one fact: a waiter that cannot
+    see the leases cannot tell when its turn came, and a claim that cannot see
+    the waiters is what let a new request jump a line that was already waiting.
+    """
+
+    waiters = payload.setdefault("waiters", {})
+    if not isinstance(waiters, dict):
+        waiters = {}
+        payload["waiters"] = waiters
+    return waiters
+
+
 def _prune(leases: dict[str, Any], now: float) -> None:
     ttl = lease_seconds()
     for lease_key, state in list(leases.items()):
@@ -200,6 +223,38 @@ def _prune(leases: dict[str, Any], now: float) -> None:
             leases.pop(lease_key, None)
         elif cleaned is not state:
             leases[lease_key] = cleaned
+
+
+def _prune_waiters(waiters: dict[str, Any], now: float) -> None:
+    """Drop tickets nobody is holding any more.
+
+    Same two rules as a lease: a ticket belongs to a live process and to a turn
+    that is still waiting.  A ticket left behind by a killed worker or an
+    abandoned turn would hold the head of the line forever, which is worse than
+    the refusal this queue replaced -- the route would look busy to every later
+    request while serving nobody.
+    """
+
+    ttl = lease_seconds()
+    for wait_key, state in list(waiters.items()):
+        if not isinstance(state, Mapping):
+            waiters.pop(wait_key, None)
+            continue
+        deployment = state.get("deployment")
+        try:
+            requested_at = float(state.get("requested_at") or 0.0)
+        except (TypeError, ValueError):
+            waiters.pop(wait_key, None)
+            continue
+        if (
+            not isinstance(deployment, str)
+            or not deployment.strip()
+            or not math.isfinite(requested_at)
+            or requested_at <= 0
+            or now - requested_at > ttl
+            or _pid_alive(state.get("pid")) is False
+        ):
+            waiters.pop(wait_key, None)
 
 
 def _update(callback: Any) -> Any:
@@ -212,8 +267,10 @@ def _update(callback: Any) -> Any:
     def update(payload: dict[str, Any]) -> Any:
         now = time.time()
         leases = _leases_map(payload)
+        waiters = _waiters_map(payload)
         _prune(leases, now)
-        return callback(leases, now), now
+        _prune_waiters(waiters, now)
+        return callback(leases, waiters, now), now
 
     try:
         return _state_module._locked_json_state_update(path, update)
@@ -226,7 +283,11 @@ def _update(callback: Any) -> Any:
 def counts() -> Optional[dict[str, int]]:
     """In-flight requests per deployment, or ``None`` when there is no store."""
 
-    def read(leases: dict[str, Any], _now: float) -> dict[str, int]:
+    def read(
+        leases: dict[str, Any],
+        _waiters: dict[str, Any],
+        _now: float,
+    ) -> dict[str, int]:
         counted: dict[str, int] = {}
         for state in leases.values():
             deployment = state.get("deployment")
@@ -247,21 +308,43 @@ def count_for(deployment_key: str) -> Optional[int]:
     return counted.get(deployment_key, 0)
 
 
-def claim(lease_key: str, deployment_key: str, cap: int) -> bool:
+def claim(
+    lease_key: str,
+    deployment_key: str,
+    cap: int,
+    *,
+    requested_at: Optional[float] = None,
+    turn_key: Optional[str] = None,
+) -> bool:
     """Take this turn's slot on *deployment_key*, or report that it is full.
 
     A turn that already holds the slot keeps it: the claim of a second attempt
     on the same deployment refreshes the lease it has instead of taking another
     one, which is what makes a protocol-fallback retry cost one request.
+
+    ``requested_at`` is when this turn first found the pool full (see
+    :func:`queue`).  A slot that frees goes to the turn that has been waiting
+    longest, not to whoever asks next: without that, a route at its cap is a
+    queue only by accident, and a stream of fresh requests can hold a waiting
+    turn out for as long as it keeps arriving.
     """
 
     if not lease_key or not deployment_key or cap <= 0:
         return True
+    # The queue is per turn (one ticket names the route it waits on), while a
+    # lease is per turn *and* deployment.  Taking a slot withdraws the turn's
+    # one place, whatever route it was queued for.
+    ticket_key = turn_key or lease_key
 
-    def take(leases: dict[str, Any], now: float) -> bool:
+    def take(
+        leases: dict[str, Any],
+        waiters: dict[str, Any],
+        now: float,
+    ) -> bool:
         if lease_key in leases:
             leases[lease_key]["claimed_at"] = now
             leases[lease_key]["pid"] = os.getpid()
+            waiters.pop(ticket_key, None)
             return True
         in_flight = sum(
             1
@@ -270,11 +353,29 @@ def claim(lease_key: str, deployment_key: str, cap: int) -> bool:
         )
         if in_flight >= cap:
             return False
+        mine = (
+            requested_at
+            if isinstance(requested_at, (int, float)) and math.isfinite(requested_at)
+            else float("inf")
+        )
+        for wait_key, state in waiters.items():
+            if wait_key == ticket_key or not isinstance(state, Mapping):
+                continue
+            if state.get("deployment") != deployment_key:
+                continue
+            try:
+                theirs = float(state.get("requested_at") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            # Strictly older wins; an unreadable ticket must not block a line.
+            if math.isfinite(theirs) and theirs < mine:
+                return False
         leases[lease_key] = {
             "deployment": deployment_key,
             "claimed_at": now,
             "pid": os.getpid(),
         }
+        waiters.pop(ticket_key, None)
         return True
 
     result = _update(take)
@@ -288,22 +389,93 @@ def claim(lease_key: str, deployment_key: str, cap: int) -> bool:
     return True
 
 
-def release(lease_keys: Iterable[str]) -> int:
-    """Give back the slots one turn holds, by their exact keys."""
+def queue(lease_key: str, deployment_key: str, requested_at: float) -> bool:
+    """Join the line for *deployment_key*, keeping the place already held.
+
+    One ticket per turn, naming the route it is waiting on.  Re-entering (a
+    recovery round asking again) refreshes the same ticket rather than taking a
+    new place, which is what makes the wait survive between attempts.
+    """
+
+    if not lease_key or not deployment_key:
+        return False
+    if not isinstance(requested_at, (int, float)) or not math.isfinite(requested_at):
+        return False
+
+    def join(
+        leases: dict[str, Any],
+        waiters: dict[str, Any],
+        now: float,
+    ) -> bool:
+        if lease_key in leases:
+            return True
+        state = waiters.get(lease_key)
+        if isinstance(state, dict) and state.get("deployment") == deployment_key:
+            state["pid"] = os.getpid()
+            state["requested_at"] = float(requested_at)
+            return True
+        waiters[lease_key] = {
+            "deployment": deployment_key,
+            "requested_at": float(requested_at),
+            "pid": os.getpid(),
+            "queued_at": now,
+        }
+        return True
+
+    result = _update(join)
+    return bool(isinstance(result, tuple) and result[0] is True)
+
+
+def release(
+    lease_keys: Iterable[str],
+    *,
+    ticket_keys: Iterable[str] = (),
+) -> int:
+    """Give back the slots one turn holds, by their exact keys.
+
+    ``ticket_keys`` drops this turn's places in line as well.  A turn that ends
+    while still queued holds no lease, so releasing only leases would leave its
+    ticket at the head of the line and refuse every later request that route.
+    """
 
     keys = [key for key in lease_keys if isinstance(key, str) and key]
-    if not keys:
+    tickets = [key for key in ticket_keys if isinstance(key, str) and key]
+    if not keys and not tickets:
         return 0
 
-    def drop(leases: dict[str, Any], _now: float) -> int:
+    def drop(
+        leases: dict[str, Any],
+        waiters: dict[str, Any],
+        _now: float,
+    ) -> int:
         dropped = 0
         for key in keys:
             if leases.pop(key, None) is not None:
                 dropped += 1
+        for key in tickets:
+            waiters.pop(key, None)
         return dropped
 
     result = _update(drop)
     return result[0] if isinstance(result, tuple) and isinstance(result[0], int) else 0
+
+
+def waiting_count(deployment_key: str) -> Optional[int]:
+    """How many turns are queued for one route right now."""
+
+    def read(
+        _leases: dict[str, Any],
+        waiters: dict[str, Any],
+        _now: float,
+    ) -> int:
+        return sum(
+            1
+            for state in waiters.values()
+            if isinstance(state, Mapping) and state.get("deployment") == deployment_key
+        )
+
+    result = _update(read)
+    return result[0] if isinstance(result, tuple) and isinstance(result[0], int) else None
 
 
 def reset_leases() -> int:
@@ -312,11 +484,18 @@ def reset_leases() -> int:
     Called once when the proxy starts: every lease then belongs to a process
     this start replaced, and a fresh worker that inherited one would be serving
     fewer requests than its own cap allows for the rest of the lease window.
+    The queue goes with them, for the same reason: every ticket then belongs to
+    a turn this start ended.
     """
 
-    def clear(leases: dict[str, Any], _now: float) -> int:
+    def clear(
+        leases: dict[str, Any],
+        waiters: dict[str, Any],
+        _now: float,
+    ) -> int:
         dropped = len(leases)
         leases.clear()
+        waiters.clear()
         return dropped
 
     result = _update(clear)

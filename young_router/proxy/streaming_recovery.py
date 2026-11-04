@@ -210,6 +210,25 @@ def _route_recovery_next_poll_order(
     orders = _streaming_module._configured_deployment_orders(router, request_data)
     return _streaming_module._next_configured_order(orders, _streaming_module._route_recovery_exhausted_order(request_data, exception))
 
+
+def _concurrency_queue_deadline(
+    attempt_deadline: Optional[float],
+    poll_deadline: Optional[float],
+) -> Optional[float]:
+    """The latest moment one recovery attempt may stay queued for a slot.
+
+    Both deadlines already exist and the queue borrows them, so there is no
+    separate wait setting to keep in step: this attempt's own start budget ends
+    the wait it is inside, and the recovery window is what bounds the whole
+    turn (four hours by default).  Two deadlines, one answer: the earlier one,
+    because waiting past either ends a round that has not started answering.
+    """
+
+    candidates = [
+        value for value in (attempt_deadline, poll_deadline) if value is not None
+    ]
+    return min(candidates) if candidates else None
+
 async def _stream_streaming_error_fallback(
     request_data: dict,
     exception: Exception,
@@ -463,9 +482,23 @@ async def _stream_route_recovery_poll_attempt(
                 selected_deployment_box_token = _CURRENT_SELECTED_DEPLOYMENT_BOX.set(
                     selected_deployment_box
                 )
+                # A full pool is a queue here, not a refusal: this round is the
+                # only attempt the client is watching through keepalives, so it
+                # is the only attempt allowed to wait for a slot.  The wait is
+                # bounded by the deadlines this round already obeys -- the
+                # attempt's own start budget and the recovery window -- so no
+                # separate setting decides how long a turn may queue.
+                concurrency_deadline_token = (
+                    _routing_module._set_concurrency_wait_deadline(
+                        _concurrency_queue_deadline(attempt_deadline, deadline)
+                    )
+                )
                 try:
                     next_chunk_task = asyncio.create_task(fallback_iterator.__anext__())
                 finally:
+                    _routing_module._reset_concurrency_wait_deadline(
+                        concurrency_deadline_token
+                    )
                     _CURRENT_SELECTED_DEPLOYMENT_BOX.reset(selected_deployment_box_token)
             try:
                 wait_seconds = _streaming_module._ROUTE_RECOVERY_SSE_KEEPALIVE_SECONDS
@@ -822,11 +855,21 @@ async def _stream_native_route_recovery_poll_attempt(
                 selected_deployment_box_token = _CURRENT_SELECTED_DEPLOYMENT_BOX.set(
                     selected_deployment_box
                 )
+                # See the chunked round above: only this attempt, which the
+                # client watches through keepalives, may queue for a slot.
+                concurrency_deadline_token = (
+                    _routing_module._set_concurrency_wait_deadline(
+                        _concurrency_queue_deadline(attempt_deadline, deadline)
+                    )
+                )
                 try:
                     next_chunk_task = asyncio.create_task(
                         fallback_iterator.__anext__()
                     )
                 finally:
+                    _routing_module._reset_concurrency_wait_deadline(
+                        concurrency_deadline_token
+                    )
                     _CURRENT_SELECTED_DEPLOYMENT_BOX.reset(
                         selected_deployment_box_token
                     )

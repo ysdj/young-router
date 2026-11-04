@@ -694,6 +694,17 @@ _SANITIZED_UPSTREAM_ROUTE_FAILURE_STATUS_CODE = 503
 _SANITIZED_UPSTREAM_ROUTE_FAILURE_POLICY_ATTR = (
     "_sanitized_upstream_route_failure_recovery_policy"
 )
+# A sanitized stop is a *new* exception object, so the evidence that explained
+# the original is gone unless it is copied.  The reason is what a reader sorts on
+# (the request log writes it, the route trace names it), and the local marker is
+# what keeps this proxy's own refusals -- a full concurrency pool, a rejected
+# caller key -- from reading as an upstream answer the upstream never gave.
+_SANITIZED_UPSTREAM_ROUTE_FAILURE_REASON_ATTR = (
+    "_sanitized_upstream_route_failure_reason"
+)
+_SANITIZED_UPSTREAM_ROUTE_FAILURE_LOCAL_ATTR = (
+    "_sanitized_upstream_route_failure_local"
+)
 # A stream that dies while this process is shutting down was not killed by the
 # upstream.  ``uvicorn.Server.shutdown`` closes every accepted connection
 # before it waits for the in-flight requests, so an event that was still being
