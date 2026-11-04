@@ -3,6 +3,22 @@ from __future__ import annotations
 from hook_test_utils import *
 
 
+def _declared_stream_start_seconds() -> float:
+    """The stream-start budget this deployment is configured to use.
+
+    Read from the module that owns it rather than restated in an assertion:
+    the default moved from 120 s to 300 s for a real reason (a max-effort turn
+    sat longer than two minutes between upstream chunks and was cut), and a
+    copied number turns that deliberate change into a test failure nobody can
+    interpret.  What these tests are about is that the trace *reports* the
+    deployed budget; which value the deployment chose is not their subject.
+    """
+
+    from young_router.proxy import routing as routing_module
+
+    return routing_module._stream_start_timeout_seconds_for_request({})
+
+
 class HookTraceLoggingTests(HookTestCase):
     def test_the_row_eviction_keeps_a_stream_that_is_still_reporting(self) -> None:
         """The cap evicts the least recently touched row, not the oldest one.
@@ -130,7 +146,15 @@ class HookTraceLoggingTests(HookTestCase):
         self.assertTrue(summary["interface"]["stream"])
         self.assertEqual(summary["reasoning"]["effort"], "xhigh")
         self.assertEqual(summary["reasoning"]["text_verbosity"], "low")
-        self.assertEqual(summary["timeouts"]["stream_start_seconds"], 120.0)
+        # The summary states the budget the route step would deploy, not a
+        # number copied into this test.  The cap moved from 120 s to 300 s
+        # because a max-effort turn genuinely sat longer than two minutes
+        # between upstream chunks, and a hardcoded 120 made that change look
+        # like a regression here for as long as nobody ran this module.
+        self.assertEqual(
+            summary["timeouts"]["stream_start_seconds"],
+            _declared_stream_start_seconds(),
+        )
         self.assertEqual(summary["timeouts"]["recovery_max_seconds"], 14400.0)
         self.assertEqual(summary["tools"]["count"], 2)
         self.assertIn("web_search", summary["tools"]["types"])
@@ -181,7 +205,10 @@ class HookTraceLoggingTests(HookTestCase):
         self.assertEqual(tools["top_level_count"], 0)
         self.assertEqual(tools["additional_tools_count"], 2)
         self.assertEqual(tools["origins"], ["additional_tools"])
-        self.assertEqual(summary["timeouts"]["stream_start_seconds"], 120.0)
+        self.assertEqual(
+            summary["timeouts"]["stream_start_seconds"],
+            _declared_stream_start_seconds(),
+        )
         self.assertIn("custom", tools["types"])
         self.assertIn("namespace", tools["types"])
         self.assertIn("exec", tools["names"])
