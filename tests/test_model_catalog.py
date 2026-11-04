@@ -20,6 +20,7 @@ from young_router.core.model_contexts import (
     DEFAULT_MODEL_CONTEXT_REFRESH_HOURS,
     MODEL_CONTEXT_SOURCES,
     ModelContextRegistry,
+    published_reasoning_levels,
 )
 from young_router.core.runtime_settings_schema import runtime_settings_metadata
 
@@ -1275,14 +1276,18 @@ class ModelCatalogTests(unittest.TestCase):
             self.assertEqual(capability.supported_levels, cached_capability.supported_levels)
             self.assertEqual(capability.thinking_level_map, cached_capability.thinking_level_map)
 
-    def test_a_custom_route_publishes_ultra_beside_every_max_and_never_alone(self) -> None:
-        """A route that reaches ``max`` also states ``ultra``, one step above it.
+    def test_every_reasoning_route_publishes_max_and_ultra_even_without_one(self) -> None:
+        """The client's top tiers are published for a route that maps neither.
 
-        ``ultra`` is Codex's own tier over ``max`` -- maximum reasoning plus task
-        delegation -- and pi.dev's ladder has no such step, so the route
-        capability (what the request path clamps against) never carries it.  The
-        catalog is the client's slider, and a route able to serve the hardest
-        thinking must read with the same top tier as the client's own models.
+        Codex's own resolver does not require ``max``: ``reasoning_effort_for_
+        request`` in ``codex-rs/core/src/client.rs`` takes the model's
+        ``multi_agent_reasoning_effort`` when it is supported, else its ``max``,
+        else its highest supported non-``ultra`` level, and the client's
+        ``ultra_reasoning_uses_highest_non_ultra`` test pins that fallback with
+        ``ultra`` listed on a model that has no ``max``.  So the catalog states
+        the top of the dial for every route that can think at all, and the
+        request path folds the pick onto the hardest level the route maps
+        (``proxy.reasoning._clamp_reasoning_level``).
         """
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1344,6 +1349,7 @@ class ModelCatalogTests(unittest.TestCase):
             # The capability itself stays provider-wire only: the proxy maps a
             # client's ``ultra`` down rather than sending the word upstream.
             capability = registry.reasoning_for("route-with-max")
+            through_high_capability = registry.reasoning_for("route-through-high")
 
         self.assertEqual(
             ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
@@ -1353,13 +1359,23 @@ class ModelCatalogTests(unittest.TestCase):
             "Maximum reasoning with automatic task delegation",
             with_max["supported_reasoning_levels"][-1]["description"],
         )
+        # ``route-through-high`` maps nothing above ``high``, and still reads
+        # with the client's top tiers: the pick is folded onto ``high``.
         self.assertEqual(
-            ["minimal", "low", "medium", "high"],
+            ["minimal", "low", "medium", "high", "max", "ultra"],
             [item["effort"] for item in through_high["supported_reasoning_levels"]],
         )
         self.assertIsNotNone(capability)
         assert capability is not None
+        # The capability itself stays provider-wire only: the published top
+        # tiers never enter it, so nothing unmapped can reach an upstream.
         self.assertNotIn("ultra", capability.supported_levels)
+        self.assertIsNotNone(through_high_capability)
+        assert through_high_capability is not None
+        self.assertEqual(
+            ("minimal", "low", "medium", "high"),
+            through_high_capability.supported_levels,
+        )
 
     def test_pi_reasoning_catalog_uses_safe_intersection_across_routes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1583,6 +1599,142 @@ class SharedContextCacheTests(unittest.TestCase):
         self.assertEqual(200_000, effective.context_window)
         self.assertEqual(1_048_576, default.context_window)
 
+    def test_a_relay_model_publishes_the_ladder_its_copies_agree_on(self) -> None:
+        """One provider copy may not decide a relay model's thinking for the route.
+
+        ``deepseek-v4.1-flash`` is DeepSeek's own model, and this installation
+        reaches it through relays whose deployment spells it
+        ``openai/deepseek-v4.1-flash`` -- a wire prefix no public catalog owns,
+        so the registry's suffix match finds every provider that serves the
+        model.  Reading the first copy in the cache made *that* provider's wire
+        the route's ladder: the copy Baseten publishes maps ``low`` to ``null``,
+        and it came first, so the catalog offered ``none/high/max`` for a model
+        whose own vendor entry (pi.dev's ``deepseek`` provider, the same
+        "DeepSeek V4.1 Flash") serves ``low``, ``high`` and ``max``.  A cache
+        refresh that reordered the copies published a different ladder for the
+        same route.
+
+        ``medium`` is deliberately absent from the result: DeepSeek's own entry
+        states ``medium: null``, and offering a tier the provider cannot take is
+        the same defect in the other direction.
+        """
+
+        # The copies the public catalogs publish for this model, as of the
+        # observation.  Only the ones spelled ``.../deepseek-v4.1-flash``
+        # participate in the route's suffix match; the vendor's own entry is
+        # named ``deepseek-flash`` and is the reference the merge must reproduce.
+        copies: dict[str, dict[str, str | None] | None] = {
+            "baseten/deepseek-ai/deepseek-v4.1-flash": {
+                "off": "none", "minimal": None, "low": None, "medium": None,
+                "high": "high", "xhigh": None, "max": "max",
+            },
+            "huggingface/deepseek-ai/deepseek-v4.1-flash": {
+                "off": "none", "minimal": None, "low": "low", "medium": None,
+                "high": "high", "xhigh": "xhigh", "max": "max",
+            },
+            "nvidia/deepseek-ai/deepseek-v4.1-flash": {
+                "minimal": None, "low": None, "medium": None,
+                "high": "high", "max": "max",
+            },
+            "opencode-go/deepseek-v4.1-flash": {
+                "off": None, "minimal": None, "low": "low", "medium": None,
+                "high": "high", "xhigh": None, "max": "max",
+            },
+            "opencode/deepseek-v4.1-flash": {
+                "off": None, "minimal": None, "low": "low", "medium": None,
+                "high": "high", "xhigh": None, "max": "max",
+            },
+            "openrouter/deepseek/deepseek-v4.1-flash": {
+                "off": "none", "minimal": None, "low": "low", "medium": None,
+                "high": "high", "xhigh": None, "max": "max",
+            },
+            "qwen-token-plan/deepseek-v4.1-flash": {
+                "off": None, "minimal": None, "low": "low", "medium": None,
+                "high": "high", "xhigh": None, "max": "max",
+            },
+            "radius/deepseek-v4.1-flash": {
+                "off": "none", "minimal": None, "low": "low", "medium": None,
+                "high": "high", "xhigh": None, "max": "max",
+            },
+            # Together states no thinking above ``high``.
+            "together/deepseek-ai/deepseek-v4.1-flash": {
+                "minimal": None, "low": None, "medium": None,
+            },
+            # A copy that states no level map at all states nothing about the
+            # ladder, so it takes no part in the merge.
+            "vercel-ai-gateway/deepseek/deepseek-v4.1-flash": None,
+            # The vendor's own ladder, under the id its own provider uses.
+            "deepseek/deepseek-flash": {
+                "minimal": None, "low": "low", "medium": None,
+                "high": "high", "max": "max",
+            },
+        }
+
+        ladders: list[list[str]] = []
+        defaults: list[str] = []
+        for order in (list(copies), list(reversed(copies))):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                runtime = root / "config.yaml"
+                runtime.write_text(
+                    "model_list:\n"
+                    "  - model_name: deepseek-v4.1-flash\n"
+                    "    litellm_params:\n"
+                    "      model: openai/deepseek-v4.1-flash\n",
+                    encoding="utf-8",
+                )
+                records = {}
+                for key in order:
+                    record = self._profile(1_000_000)
+                    record["reasoning"] = True
+                    if copies[key] is not None:
+                        record["thinking_level_map"] = dict(copies[key])
+                    records[key] = record
+                cache = root / "model-contexts.json"
+                cache.write_text(json.dumps(self._cache(records)), encoding="utf-8")
+                registry = ModelContextRegistry(
+                    runtime_config_path=runtime,
+                    cache_path=cache,
+                    refresh_enabled=False,
+                )
+                with mock.patch(
+                    "young_router.core.model_catalog.load_native_catalog",
+                    return_value=[
+                        {
+                            "slug": "native-agent",
+                            "base_instructions": "Native prompt",
+                            "model_messages": {"instructions_template": "Native prompt"},
+                            "default_reasoning_level": "medium",
+                            "supported_reasoning_levels": [
+                                {"effort": level, "description": f"Native {level}"}
+                                for level in ("minimal", "low", "medium", "high")
+                            ],
+                        }
+                    ],
+                ), mock.patch("litellm.model_cost", {}):
+                    model = catalog_payload(
+                        ["deepseek-v4.1-flash"], registry=registry
+                    )["models"][0]
+                ladders.append(
+                    [item["effort"] for item in model["supported_reasoning_levels"]]
+                )
+                defaults.append(model["default_reasoning_level"])
+                vendor = registry.reasoning_for_model_id("deepseek/deepseek-flash")
+                self.assertIsNotNone(vendor)
+                assert vendor is not None
+                self.assertEqual(
+                    published_reasoning_levels(vendor.supported_levels),
+                    ladders[-1],
+                )
+
+        # DeepSeek's own ladder, not the first copy's: low is offered, medium is
+        # not, and the hardest tier keeps its published step above it.
+        self.assertEqual(["none", "low", "high", "max", "ultra"], ladders[0])
+        # The cache's record order is an accident of the last refresh; it may
+        # never be what decides a route's ladder.
+        self.assertEqual(ladders[0], ladders[1])
+        self.assertEqual(["low", "low"], defaults)
+
     def test_a_route_ladder_is_the_one_the_request_path_maps(self) -> None:
         """The catalog and the Pi-facing listing must state one ladder.
 
@@ -1661,6 +1813,64 @@ class SharedContextCacheTests(unittest.TestCase):
         )
         self.assertEqual("high", model["default_reasoning_level"])
 
+    def test_a_custom_route_keeps_ultra_at_its_own_top(self) -> None:
+        """A relay route's ``ultra`` must not inherit a weaker native pin.
+
+        Codex sends the model's ``multi_agent_reasoning_effort`` when a person
+        picks ``ultra``, falling back to ``max`` and then to the model's highest
+        supported non-``ultra`` level.  ``gpt-6.1-sol`` pins ``xhigh`` on
+        purpose (measured on the installed client: picking Ultra sent
+        ``reasoning.effort: xhigh``), so a route that inherited the pin sent
+        ``xhigh`` for Ultra while the ``max`` published directly below it sent
+        ``max`` -- the top tier thinking less than the one under it.  A custom
+        route therefore keeps the client's fallback, and its own model is
+        untouched.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(
+                "model_list:\n"
+                "  - model_name: relay-agent\n"
+                "    litellm_params:\n"
+                "      model: openai/agent-x\n"
+                "  - model_name: gpt-6.1-sol\n"
+                "    litellm_params:\n"
+                "      model: openai/gpt-6.1-sol\n",
+                encoding="utf-8",
+            )
+            cache = root / "model-contexts.json"
+            cache.write_text(json.dumps(self._cache({})), encoding="utf-8")
+            registry = ModelContextRegistry(
+                runtime_config_path=runtime, cache_path=cache, refresh_enabled=False
+            )
+            native = {
+                "slug": "native-agent",
+                "base_instructions": "Native prompt",
+                "model_messages": {"instructions_template": "Native prompt"},
+                "multi_agent_version": "v2",
+                "multi_agent_reasoning_effort": "xhigh",
+                "default_reasoning_level": "medium",
+                "supported_reasoning_levels": [
+                    {"effort": level, "description": f"Native {level}"}
+                    for level in ("low", "medium", "high", "xhigh", "max", "ultra")
+                ],
+            }
+            own_model = {**native, "slug": "gpt-6.1-sol", "priority": 1}
+            with mock.patch(
+                "young_router.core.model_catalog.load_native_catalog",
+                return_value=[own_model, native],
+            ), mock.patch("litellm.model_cost", {}):
+                custom = catalog_payload(["relay-agent"], registry=registry)["models"][0]
+                exact = catalog_payload(["gpt-6.1-sol"], registry=registry)["models"][0]
+
+        self.assertNotIn("multi_agent_reasoning_effort", custom)
+        # Delegation itself stays: ``ultra`` still turns on proactive agents.
+        self.assertEqual("v2", custom["multi_agent_version"])
+        # The client's own model keeps the pin it declares.
+        self.assertEqual("xhigh", exact["multi_agent_reasoning_effort"])
+
     def test_an_image_route_publishes_only_its_disabled_step(self) -> None:
         """A reasoning slider on an image route is a control that does nothing.
 
@@ -1723,8 +1933,10 @@ class SharedContextCacheTests(unittest.TestCase):
             [item["effort"] for item in image_model["supported_reasoning_levels"]],
         )
         self.assertEqual("none", image_model["default_reasoning_level"])
+        # The same cache, read as a text route: it keeps its own ladder and
+        # gains the client's top tiers, exactly as every reasoning route does.
         self.assertEqual(
-            ["low", "high"],
+            ["low", "high", "max", "ultra"],
             [item["effort"] for item in text_model["supported_reasoning_levels"]],
         )
 

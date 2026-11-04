@@ -448,6 +448,30 @@ def _apply_direct_tool_surface(model: dict[str, Any]) -> None:
     model["tool_mode"] = "direct"
 
 
+def _apply_own_reasoning_top(model: dict[str, Any]) -> None:
+    """Let a custom route's ``ultra`` mean its own hardest level.
+
+    ``multi_agent_reasoning_effort`` is the effort Codex uses when a person
+    picks ``ultra``: its resolver takes that field when the model supports it,
+    then the model's ``max``, then its highest supported non-``ultra`` level.
+    Some native profiles pin it lower on purpose -- ``gpt-6.1-sol`` ships
+    ``xhigh``, so selecting Ultra on OpenAI's own model sends ``xhigh``, and
+    measured here on the installed client (0.166.0-alpha.5.1, its own bundled
+    catalog, ``model_reasoning_effort = "ultra"``) the request carried
+    ``reasoning.effort: xhigh``.
+
+    A relay route is not that model: its catalog states ``ultra`` above the
+    hardest level the route maps, so the inherited pin would make the top tier
+    think *less* than the ``max`` directly below it -- ``claude-opus-5-5`` sent
+    ``xhigh`` for Ultra while Max sent ``max``. Dropping the pin leaves the
+    client's documented fallback: its own ``max`` when the ladder states one,
+    else its highest supported non-``ultra`` level, and ``proxy.reasoning``
+    clamps that onto what the route actually maps.
+    """
+
+    model.pop("multi_agent_reasoning_effort", None)
+
+
 def _apply_search_tool_capability(
     model: dict[str, Any],
     registry: ModelContextRegistry,
@@ -492,6 +516,7 @@ def _catalog_model(
         if not exact_native_match:
             model["display_name"] = name
             _apply_direct_tool_surface(model)
+            _apply_own_reasoning_top(model)
 
     # These are the route-specific fields owned by Young Router. Everything
     # else remains native metadata whenever a native profile was available.

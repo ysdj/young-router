@@ -146,14 +146,20 @@ class ModelListingEffortsTests(HookTestCase):
         # from "this route published nothing".
         self.assertNotIn("supported_efforts", builder("gpt-image-2.5"))
 
-    def test_a_published_max_always_carries_ultra(self) -> None:
-        """Every ``max`` in a listing is followed by ``ultra``, and only then.
+    def test_every_reasoning_route_tops_out_at_max_and_ultra(self) -> None:
+        """A reasoning route states the top of the client's dial, whatever it maps.
 
-        ``ultra`` is the tier Codex's own catalog places above ``max``, so a
-        route whose hardest thinking reaches ``max`` states it too; a route
-        that stops short of ``max`` never gains a tier it cannot serve.  The
+        ``ultra`` is Codex's own tier above ``max``, and Codex resolves the
+        request effort itself: ``reasoning_effort_for_request`` in the client
+        prefers the model's ``multi_agent_reasoning_effort``, then its ``max``,
+        then its highest supported non-``ultra`` level.  The client's own
+        ``ultra_reasoning_uses_highest_non_ultra`` test lists ``ultra`` on a
+        model with no ``max`` and expects ``xhigh`` on the wire, so a route may
+        state the top tier without serving a provider tier by that name --
+        this proxy clamps the pick onto the hardest level the route maps.  The
         array is Pi's, so this also proves the Pi-side spelling rule: the
-        disabled step is ``off``, never this app's Codex-side ``none``.
+        disabled step is ``off``, never this app's Codex-side ``none``; a route
+        that can only be switched off keeps that one step alone.
         """
 
         hooks, _ = load_hook_module()
@@ -199,14 +205,16 @@ class ModelListingEffortsTests(HookTestCase):
             ["off", "low", "medium", "high", "xhigh", "max", "ultra"],
             builder("with-max")["supported_efforts"],
         )
+        # A route whose provider states no ``max`` still offers the top tier;
+        # the request path folds it onto the hardest level it does map.
         self.assertEqual(
-            ["off", "low", "medium", "high"],
+            ["off", "low", "medium", "high", "max", "ultra"],
             builder("through-high")["supported_efforts"],
         )
-        # Pi's own default ladder for a route that only declares reasoning:
-        # through ``high``, in Pi's names.
+        # Pi's own default ladder for a route that only declares reasoning,
+        # in Pi's names, topped out the same way.
         self.assertEqual(
-            ["off", "minimal", "low", "medium", "high"],
+            ["off", "minimal", "low", "medium", "high", "max", "ultra"],
             builder("no-map")["supported_efforts"],
         )
 
@@ -251,7 +259,7 @@ class ModelListingEffortsTests(HookTestCase):
         builder = self._install_listing_patch(hooks, {})
 
         self.assertEqual(
-            ["low", "medium", "high"],
+            ["low", "medium", "high", "max", "ultra"],
             builder("shared-model")["supported_efforts"],
         )
 
@@ -284,8 +292,72 @@ class ModelListingEffortsTests(HookTestCase):
         builder = self._install_listing_patch(hooks, {})
 
         self.assertEqual(
-            ["low", "medium", "high", "xhigh"],
+            ["low", "medium", "high", "xhigh", "max", "ultra"],
             builder("space-bunny")["supported_efforts"],
+        )
+
+    def test_a_relay_model_publishes_the_ladder_its_copies_agree_on(self) -> None:
+        """Every provider that serves the model is a copy, not the route's rule.
+
+        The route is ``deepseek-v4.1-flash`` behind relays, so its deployment
+        reads ``openai/deepseek-v4.1-flash`` and the registry's suffix match
+        finds each provider that serves the model.  The copy that happened to
+        be written first maps ``low`` to ``null``; reading it as the route's own
+        ladder reported ``off,high,max,ultra`` while the vendor's entry for the
+        same model serves ``low`` through ``max`` and the request path maps it.
+        """
+
+        hooks, _ = load_hook_module()
+        copies = {
+            "baseten/deepseek-ai/deepseek-v4.1-flash": {
+                "off": "none", "minimal": None, "low": None, "medium": None,
+                "high": "high", "xhigh": None, "max": "max",
+            },
+            "huggingface/deepseek-ai/deepseek-v4.1-flash": {
+                "minimal": None, "low": "low", "medium": None,
+                "high": "high", "max": "max",
+            },
+            "nvidia/deepseek-ai/deepseek-v4.1-flash": {
+                "minimal": None, "low": None, "medium": None,
+                "high": "high", "max": "max",
+            },
+            "opencode-go/deepseek-v4.1-flash": {
+                "off": None, "minimal": None, "low": "low", "medium": None,
+                "high": "high", "xhigh": None, "max": "max",
+            },
+            "opencode/deepseek-v4.1-flash": {
+                "off": None, "minimal": None, "low": "low", "medium": None,
+                "high": "high", "xhigh": None, "max": "max",
+            },
+            "openrouter/deepseek/deepseek-v4.1-flash": {
+                "off": "none", "minimal": None, "low": "low", "medium": None,
+                "high": "high", "xhigh": None, "max": "max",
+            },
+            "qwen-token-plan/deepseek-v4.1-flash": {
+                "off": None, "minimal": None, "low": "low", "medium": None,
+                "high": "high", "xhigh": None, "max": "max",
+            },
+            "qwen-token-plan-cn/deepseek-v4.1-flash": {
+                "off": None, "minimal": None, "low": "low", "medium": None,
+                "high": "high", "xhigh": None, "max": "max",
+            },
+            "radius/deepseek-v4.1-flash": {
+                "off": "none", "minimal": None, "low": "low", "medium": None,
+                "high": "high", "xhigh": None, "max": "max",
+            },
+            "together/deepseek-ai/deepseek-v4.1-flash": {
+                "minimal": None, "low": None, "medium": None,
+            },
+        }
+        self._runtime(
+            {key: self._record(levels) for key, levels in copies.items()},
+            ("deepseek-v4.1-flash", "openai/deepseek-v4.1-flash"),
+        )
+        builder = self._install_listing_patch(hooks, {})
+
+        self.assertEqual(
+            ["off", "low", "high", "max", "ultra"],
+            builder("deepseek-v4.1-flash")["supported_efforts"],
         )
 
     def test_a_second_install_replaces_nothing_and_the_lookup_precedes_the_key(self) -> None:

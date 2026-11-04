@@ -10,6 +10,7 @@ records privately for the next run.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 import hashlib
 import re
@@ -55,14 +56,27 @@ _UPSTREAM_MAX_BYTES = 8 * 1024 * 1024
 _PI_REASONING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 _CODEX_REASONING_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 # A published listing -- Pi's ``supported_efforts`` and this app's Codex catalog
-# alike -- states ``ultra`` wherever it states ``max``.  ``ultra`` is the tier
-# Codex's own catalog places above ``max`` (it asks the client for task
-# delegation on top of maximum reasoning), and pi.dev's ladder stops at ``max``,
-# so the level never reaches a route's provider-wire capability and would
-# otherwise vanish from any route that can serve the hardest thinking.  The
-# request path clamps a client's ``ultra`` back down to ``max`` for the same
-# reason: the wire value stays one this proxy maps.
+# alike -- tops every reasoning ladder out at ``max`` and states ``ultra`` beside
+# it.  ``ultra`` is the tier Codex's own catalog places above ``max`` (maximum
+# reasoning plus task delegation), and pi.dev's ladder stops at ``max``, so the
+# level never reaches a route's provider-wire capability and would otherwise
+# vanish from any route that can serve the hardest thinking.
+#
+# ``max`` is published the same way, and for the same reason: it is the top of
+# the client's dial, not a claim about one provider's table.  Codex resolves the
+# request effort itself -- ``reasoning_effort_for_request`` in ``codex-rs/core/
+# src/client.rs`` maps ``ultra`` onto the model's ``multi_agent_reasoning_effort``,
+# else its ``max``, else its highest supported non-``ultra`` level (its own
+# ``ultra_reasoning_uses_highest_non_ultra`` test adds ``ultra`` to a model that
+# lists no ``max`` and expects ``xhigh`` on the wire) -- so a route can state the
+# top tier without serving a provider tier by that name.  This proxy clamps a
+# requested ``max``/``ultra`` down to the highest level the route maps
+# (``proxy.reasoning._clamp_reasoning_level``; the Google surface also folds
+# ``max`` onto ``high`` in ``_GOOGLE_THINKING_LEVEL_BY_EFFORT``), so the knob
+# selects the hardest thinking a route actually has instead of sending a value
+# its provider would refuse.
 _ULTRA_REASONING_LEVEL = "ultra"
+_TOP_REASONING_LEVEL = "max"
 
 
 def published_reasoning_levels(
@@ -75,6 +89,13 @@ def published_reasoning_levels(
     ``pi_spelling`` renders this app's Codex-side ``none`` as Pi's ``off``: the
     array is read by a Pi client, whose ladder names the disabled step ``off``
     and has no member called ``none``.
+
+    A route that can think at all tops out at ``max`` and ``ultra``: the top of
+    the client's dial is what a person picks for the hardest work, and every
+    route behind this proxy answers that pick with the hardest level it maps.
+    The one exception is a ladder that states nothing but the disabled step (an
+    image route), which keeps it alone -- a slider with two tiers it cannot
+    honour is worse than no slider.
     """
 
     published: list[str] = []
@@ -82,8 +103,10 @@ def published_reasoning_levels(
         rendered = "off" if pi_spelling and level == "none" else level
         if rendered not in published:
             published.append(rendered)
-    if "max" in published and _ULTRA_REASONING_LEVEL not in published:
-        published.insert(published.index("max") + 1, _ULTRA_REASONING_LEVEL)
+    if any(level != "none" for level in levels) and _TOP_REASONING_LEVEL not in published:
+        published.append(_TOP_REASONING_LEVEL)
+    if _TOP_REASONING_LEVEL in published and _ULTRA_REASONING_LEVEL not in published:
+        published.insert(published.index(_TOP_REASONING_LEVEL) + 1, _ULTRA_REASONING_LEVEL)
     return published
 
 
@@ -600,6 +623,103 @@ class RecordLookupIndex(dict):
         self.tail_index = None
 
 
+#: The fields a record states about a route's thinking, as opposed to its
+#: context window.  They travel together because a ladder is one statement:
+#: taking them from different provider copies produces a surface no provider
+#: describes (``_consensus_reasoning`` is the merge that keeps them honest).
+_REASONING_RECORD_KEYS = (
+    "reasoning",
+    "thinking_level_map",
+    "supported_reasoning_levels",
+    "default_reasoning_level",
+)
+
+
+def _consensus_reasoning(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Merge several provider copies of one model into the ladder they share.
+
+    The registry's keys are provider-qualified, so one public model served by
+    many providers has many records.  A route asks for the *model*, and a relay
+    deployment spells it ``openai/deepseek-v4.1-flash`` -- a wire prefix that
+    names no catalog provider -- so the suffix match below has several copies
+    and no way to tell which one describes this route.
+
+    Reading the first copy in the cache made that copy's restrictions the
+    route's own: the copy that came first for ``deepseek-v4.1-flash`` mapped
+    ``low``/``medium`` to ``null``, so the listing offered ``none, high, max``
+    for a model whose own vendor (pi.dev's ``deepseek/deepseek-flash``, the same
+    "DeepSeek V4.1 Flash") serves ``low``, ``high`` and ``max``.  The answer
+    also moved whenever a cache refresh reordered the records.
+
+    The copies are independent statements about the same model, so a level is
+    part of the model's ladder when a strict majority of the copies that state
+    a level map serve it, carrying the value most of them map it to.  A level
+    the majority does not serve is stated as unsupported, so the merged record
+    answers exactly the ladder a listing publishes.  Every value here comes
+    from a record; nothing is inferred from the model's name or family.
+    """
+
+    capabilities = [
+        capability
+        for capability in (_reasoning_capability(record) for record in records)
+        if capability is not None
+    ]
+    if not capabilities:
+        return {}
+
+    agreed: dict[str, Any] = {}
+    reasoning_values = {capability.reasoning for capability in capabilities}
+    if len(reasoning_values) == 1:
+        reasoning = reasoning_values.pop()
+        if reasoning is not None:
+            agreed["reasoning"] = reasoning
+
+    mapped = [capability for capability in capabilities if capability.thinking_level_map]
+    declared = [
+        capability
+        for capability in capabilities
+        if not capability.thinking_level_map and capability.supported_levels
+    ]
+    if not mapped:
+        # No copy states a level map; the ones that state a level array are the
+        # only statements there are, and they merge the same way.
+        counts = Counter(
+            level for capability in declared for level in capability.supported_levels
+        )
+        levels = [
+            level
+            for level in _CODEX_REASONING_LEVELS
+            if counts[level] * 2 > len(declared)
+        ]
+        if levels:
+            agreed["supported_reasoning_levels"] = levels
+        return agreed
+
+    ladder: dict[str, Any] = {}
+    served_any = False
+    for level in _CODEX_REASONING_LEVELS:
+        serving = [capability for capability in mapped if level in capability.supported_levels]
+        if len(serving) * 2 <= len(mapped):
+            ladder[level] = None
+            continue
+        served_any = True
+        values = [
+            (capability.thinking_level_map or {}).get(level) for capability in serving
+        ]
+        stated = [value for value in values if value is not None]
+        if stated:
+            ladder[level] = Counter(stated).most_common(1)[0][0]
+        # A served level no copy states a value for stays unstated: that is how
+        # a record says the level is passed through as the client sent it.
+    if not served_any:
+        # Every copy disagrees about every level.  Stating an empty ladder would
+        # publish a reasoning control with no steps, so the caller keeps the
+        # record it already selected rather than this merge.
+        return {}
+    agreed["thinking_level_map"] = ladder
+    return agreed
+
+
 def _lookup(records: Mapping[str, Mapping[str, Any]], model_id: str) -> dict[str, Any] | None:
     candidates = _candidate_ids(model_id)
     if not candidates:
@@ -637,6 +757,10 @@ def _lookup(records: Mapping[str, Mapping[str, Any]], model_id: str) -> dict[str
         selected["context_window"] = context
         selected["max_context_window"] = maximum
         selected["effective_context_window_percent"] = percent
+        consensus = _consensus_reasoning(top_records)
+        for key in _REASONING_RECORD_KEYS:
+            selected.pop(key, None)
+        selected.update(consensus)
         return selected
     return direct_match[2] if direct_match is not None else None
 
@@ -803,7 +927,7 @@ class ModelContextRegistry:
         # deployments, model ids, search capability).  Parsing that document
         # once per file generation replaces the per-model re-reads that made a
         # single catalog build parse a 33 KB YAML three dozen times.
-        self._route_index_key: tuple[int, int] | None = None
+        self._route_index_key: tuple[int, int, int] | None = None
         # The contents digest the cached index was built from.  An unchanged
         # mtime is only evidence of an unchanged file when the digest agrees.
         self._route_index_digest: str | None = None
@@ -1064,14 +1188,20 @@ class ModelContextRegistry:
     def _route_index(self) -> dict[str, list[dict[str, Any]]]:
         """Return the parsed ``model_list`` of the provider config, by name.
 
-        The index is keyed by the configuration file's (mtime, size) so an
-        edited file is picked up immediately while repeated lookups inside one
-        catalog build reuse a single parse.  The window between Core's own
-        write of that file and this reader's ``stat`` can be shorter than the
-        filesystem's timestamp resolution, which would leave the key unchanged
-        for a file that did change; a file small enough to digest therefore
-        keys on its contents, and reading it here costs a fraction of the walk
-        the cached index saves.
+        The index is keyed by the configuration file's identity so an edited
+        file is picked up immediately while repeated lookups inside one catalog
+        build reuse a single parse.  The window between Core's own write of that
+        file and this reader's ``stat`` can be shorter than the filesystem's
+        timestamp resolution, which would leave the key unchanged for a file
+        that did change; a file small enough to digest therefore keys on its
+        contents.
+
+        The digest is only paid when the file's (inode, mtime, size) identity
+        moved.  Every writer this app owns replaces the document atomically, so
+        a change always arrives as a new inode even when a coarse timestamp
+        cannot tell the two writes apart.  Re-reading and hashing the whole
+        document on every call is what made one catalog build digest a 33 KB
+        file five hundred times.
         """
 
         if self.runtime_config_path is None:
@@ -1080,18 +1210,19 @@ class ModelContextRegistry:
         digest: str | None = None
         try:
             details = self.runtime_config_path.stat()
-            key: tuple[int, int] | None = (details.st_mtime_ns, details.st_size)
+            key: tuple[int, int, int] | None = (
+                details.st_ino,
+                details.st_mtime_ns,
+                details.st_size,
+            )
         except OSError:
             key = None
         if key is not None and key == self._route_index_key:
-            try:
-                text = self.runtime_config_path.read_text(encoding="utf-8")
-                digest = _route_index_text_digest(text)
-            except OSError:
-                text = None
-                digest = None
-            if digest is None or digest == self._route_index_digest:
-                return self._route_index_cache
+            # The identity moved with the bytes: an inode, a nanosecond mtime
+            # and a size that all match the copy this index was built from.  A
+            # re-read here proved the same thing and cost the read it was meant
+            # to save, once per lookup.
+            return self._route_index_cache
         index: dict[str, list[dict[str, Any]]] = {}
         try:
             if text is None:
