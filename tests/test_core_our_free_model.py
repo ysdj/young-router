@@ -6,6 +6,7 @@ the seam instead of the network: a stub runtime stands in for the worker.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -18,6 +19,7 @@ from young_router.adapters import our_free_model
 from young_router.config.schema import PUBLIC_MODEL_CONTEXT_KEY
 from young_router.core.domains import DomainError
 from young_router.core.domains.providers_models import ProvidersModelsDomain
+from young_router.core.model_catalog import catalog_payload
 from young_router.core.provider_auth import ProviderAuthManager
 from young_router.core.service import CoreStore
 
@@ -1219,9 +1221,9 @@ class ChannelProviderSplitTests(unittest.TestCase):
             # to Responses is what made the probe report a missing protocol.
             model, _ = routes["big-pickle"]
             self.assertEqual(model["upstream_url_surface"], "openai/chat")
-            # No route declares a window; the group resolves one from the live
-            # catalog read, so the public model reports the upstream's number
-            # rather than the unknown-model fallback.
+            # No route declares a window, so the public model publishes the
+            # registry's profile; the number this row's own catalog states is a
+            # reading beside it, not the window.
             self.assertIsNone(model["max_input_tokens"])
 
             model, _ = routes["kilo-auto/free"]
@@ -1237,8 +1239,14 @@ class ChannelProviderSplitTests(unittest.TestCase):
             # after Apply — the same order a pane sees it in.
             domain.apply()
             contexts = domain.snapshot()["model_contexts"]
-            self.assertEqual(contexts["big-pickle"]["context_window"], 200_000)
-            self.assertEqual(contexts["kilo-auto/free"]["context_window"], 131_072)
+            # Neither id is in the bundled profiles, so both groups answer the
+            # unknown-model window, and neither row's advertised number (200,000
+            # and 131,072) becomes the public window.
+            self.assertEqual(contexts["big-pickle"]["context_window"], 272_000)
+            self.assertEqual(contexts["kilo-auto/free"]["context_window"], 272_000)
+            self.assertEqual(
+                routes["kilo-auto/free"][0]["upstream_context_window"], 131_072
+            )
 
     def test_the_co_paid_channel_is_refused_instead_of_offered_empty(self) -> None:
         """An entry that could only fail its import is not an entry.
@@ -1317,14 +1325,19 @@ class ChannelRuntime(StubRuntime):
         }
 
 
-class StatedWindowIsDisplayedTests(unittest.TestCase):
-    """The window the pane shows is the group's own, not the registry's guess.
+class StatedWindowIsAReadingTests(unittest.TestCase):
+    """The window a route's catalog states is a reading, never the public window.
 
-    The projection used ``default_record_for``, which resolves registry metadata
-    while *ignoring* the user's declaration.  An imported route states its window
-    through its own upstream, so the pane displayed the unknown-model fallback
-    (272,000) for a row whose own catalog entry said 1,048,576 — the number was
-    in hand and the pane read around it.
+    The pane's public window is the number this app hands a client, so it is
+    resolved exactly as the managed catalog resolves it -- the group's
+    declaration, else the registry's profile.  The number a route's own catalog
+    advertises belongs in its own row (``upstream_context_window``): a catalog
+    read changes it, and letting it stand in for the public window made one route
+    state two different windows at once.  Observed live 2026-11-04: the free
+    lane's table has no entry for ``pulse-alpha-free``, so it published its
+    fallback 131,072 for a 1,048,576 model; the pane proposed 131,072 while the
+    managed catalog written in the same minute published 1,048,576, and a reader
+    who pressed 设置 would have declared 131,072 on every route of the group.
     """
 
     def _domain(self, runtime):
@@ -1337,7 +1350,7 @@ class StatedWindowIsDisplayedTests(unittest.TestCase):
         )
         return directory, domain
 
-    def test_an_upstream_window_reaches_the_pane(self) -> None:
+    def test_an_upstream_window_is_reported_beside_its_own_route(self) -> None:
         directory, domain = self._domain(ChannelRuntime())
         with directory:
             for provider_id in our_free_model.OUR_FREE_MODEL_PROVIDERS:
@@ -1353,11 +1366,48 @@ class StatedWindowIsDisplayedTests(unittest.TestCase):
             # The projection reads the saved document, so it is taken after the
             # write, the same way a pane sees it.
             contexts = domain.snapshot()["model_contexts"]
-            self.assertEqual(contexts["big-pickle"]["context_window"], 200_000)
-            self.assertEqual(contexts["kilo-auto/free"]["context_window"], 131_072)
+            # Neither stub id is in the bundled profiles, so the registry's own
+            # answer is the unknown-model window -- a reading never raises it.
+            self.assertEqual(contexts["big-pickle"]["context_window"], 272_000)
+            self.assertEqual(contexts["kilo-auto/free"]["context_window"], 272_000)
+            # The same catalog read still reaches the pane, in the row that says
+            # whose number it is.
+            read = {
+                model["upstream_model"]: model["upstream_context_window"]
+                for provider in domain.snapshot()["providers"]
+                for model in provider["models"]
+            }
+            self.assertEqual(
+                read,
+                {"big-pickle": 200_000, "kilo-auto/free": 131_072},
+            )
             # The co-paid row travels in the same answer, and no provider here
             # serves it: importing it would stage a route nothing can call.
             self.assertNotIn("opencode/deepseek-v4.1-flash-free", contexts)
+
+    def test_the_pane_and_the_managed_catalog_publish_one_window(self) -> None:
+        """One route, one window: the field states what the client is handed.
+
+        Two resolutions for the same public name is what let a lane's fallback
+        stand in for the model's own window in the pane while Codex compacted
+        against another number.
+        """
+
+        directory, domain = self._domain(ChannelRuntime())
+        with directory:
+            domain.dispatch(
+                "service_provider.add",
+                {"kind": "our_free_model_login", "channel": "", "name": "OpenCode"},
+            )
+            domain.apply()
+            contexts = domain.snapshot()["model_contexts"]
+            catalog = catalog_payload(
+                ["big-pickle"], registry=domain._context_registry()
+            )
+            self.assertEqual(
+                catalog["models"][0]["context_window"],
+                contexts["big-pickle"]["context_window"],
+            )
 
     def test_a_user_declaration_wins_over_the_upstream(self) -> None:
         """The user knows the relay in front of the route; their number is kept.
@@ -1374,57 +1424,115 @@ class StatedWindowIsDisplayedTests(unittest.TestCase):
                 "service_provider.add",
                 {"kind": "our_free_model_login", "channel": "", "name": "OpenCode"},
             )
-            provider = domain.snapshot()["providers"][0]
             domain.dispatch(
                 "public_model.patch",
                 {"public_model": "big-pickle", "changes": {PUBLIC_MODEL_CONTEXT_KEY: 64_000}},
             )
             domain.apply()
-            self.assertEqual(
-                domain.snapshot()["model_contexts"]["big-pickle"]["context_window"], 64_000
-            )
+            contexts = domain.snapshot()["model_contexts"]["big-pickle"]
+            self.assertEqual(contexts["context_window"], 64_000)
+            # The recommendation is still the registry's own profile, so the
+            # mark beside the field keeps naming the value pi.dev states.
+            self.assertEqual(contexts["recommended_context_window"], 272_000)
 
-    def test_a_group_takes_the_smallest_window_its_routes_state(self) -> None:
-        """One group, two routes, two upstreams: the narrowest one governs.
+    def test_a_lane_fallback_never_stands_in_for_the_models_own_window(self) -> None:
+        """The reported defect, end to end: 131,072 proposed, 1,048,576 published.
 
-        A group is only as usable as its narrowest route, so declaring the
-        largest would promise a window part of the group cannot accept.
+        ``pulse-alpha-free`` has no entry in the lane's capability table, so the
+        lane advertises its generic fallback for it -- 131,072, which happens to
+        be the figure the model's own card states as its *output* ceiling.  Read
+        as the public window it put 131,072 in front of the reader while the
+        managed catalog handed Codex the model's 1,048,576 profile.
         """
 
-        class TwoWindows(StubRuntime):
+        class FallbackLane(StubRuntime):
             def models(self, provider=our_free_model.OUR_FREE_MODEL_PROVIDER, *, refresh=False):  # noqa: D102
                 return {
                     "available": True,
                     "detail": "",
                     "source": "adapter",
-                    "models": [
-                        {"id": "big-pickle", "context_window": 1_048_576},
-                        {"id": "mimo-v2.6-flash-free", "context_window": 131_072},
-                    ],
-                    "channels": {"big-pickle": "", "mimo-v2.6-flash-free": ""},
-                    "wires": {"big-pickle": "chat", "mimo-v2.6-flash-free": "chat"},
+                    "models": [{"id": "pulse-alpha-free", "context_window": 131_072}],
+                    "channels": {"pulse-alpha-free": ""},
+                    "wires": {"pulse-alpha-free": "chat"},
                     "status": self.provider_status(provider),
                 }
 
-        directory, domain = self._domain(TwoWindows())
-        with directory:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / ".litellm-runtime"
+            runtime.mkdir()
+            config = runtime / "config.yaml"
+            config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+            # The profile pi.dev publishes for this id, as the Codex domain's
+            # own refresh writes it.
+            (root / "model-contexts.json").write_text(
+                json.dumps(
+                    {
+                        "fetched_at": 1_000_000.0,
+                        "records": {
+                            "opencode/pulse-alpha-free": {
+                                "context_window": 1_048_576,
+                                "max_context_window": 1_048_576,
+                                "effective_context_window_percent": 95,
+                                "source": "https://pi.dev/api/models",
+                                "priority": 40,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            domain = ProvidersModelsDomain(
+                config, auth_manager=ProviderAuthManager(root), our_free_model=FallbackLane()
+            )
             domain.dispatch(
                 "service_provider.add",
-                {
-                    "kind": "our_free_model_login",
-                    "channel": "",
-                    "name": "OpenCode",
-                    "models": [
-                        # One public name, two upstreams with different windows.
-                        {"name": "shared", "upstream_model": "big-pickle"},
-                        {"name": "shared", "upstream_model": "mimo-v2.6-flash-free"},
-                    ],
-                },
+                {"kind": "our_free_model_login", "channel": "", "name": "OpenCode"},
             )
-            # A supplied roster skips the import, so the catalog read that
-            # records upstream windows happens as the pane's own 获取模型 does.
-            domain.dispatch("our_free_model_models", {"refresh": True})
             domain.apply()
+            contexts = domain.snapshot()["model_contexts"]["pulse-alpha-free"]
+            route = domain.snapshot()["providers"][0]["models"][0]
+            # The lane's number is still reported, in the row that says whose
+            # number it is ...
+            self.assertEqual(route["upstream_context_window"], 131_072)
+            # ... and the public window is the model's own profile, which is
+            # also what the managed catalog hands Codex.
+            self.assertEqual(contexts["context_window"], 1_048_576)
+            catalog = catalog_payload(
+                ["pulse-alpha-free"], registry=domain._context_registry()
+            )
+            self.assertEqual(catalog["models"][0]["context_window"], 1_048_576)
+
+    def test_a_group_takes_the_smallest_window_its_routes_declare(self) -> None:
+        """One group, two routes, two declarations: the narrowest one governs.
+
+        A group is only as usable as its narrowest route, so publishing the
+        largest would promise a window part of the group cannot accept.  The
+        pane writes one number to every route, so this arrives only from a
+        hand-written document -- which is exactly why the read path states the
+        rule instead of trusting that every route agrees.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(
+                "model_list:\n"
+                "  - model_name: shared\n"
+                "    litellm_params:\n"
+                "      model: openai/big-pickle\n"
+                "    model_info:\n"
+                "      max_input_tokens: 1048576\n"
+                "  - model_name: shared\n"
+                "    litellm_params:\n"
+                "      model: openai/mimo-v2.6-flash-free\n"
+                "    model_info:\n"
+                "      max_input_tokens: 131072\n",
+                encoding="utf-8",
+            )
+            domain = ProvidersModelsDomain(
+                config, auth_manager=ProviderAuthManager(root)
+            )
             self.assertEqual(
                 domain.snapshot()["model_contexts"]["shared"]["context_window"], 131_072
             )

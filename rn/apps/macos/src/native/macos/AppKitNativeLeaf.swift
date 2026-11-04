@@ -210,6 +210,7 @@ private enum NativeRelayOriginPolicy {
         "routeCodexSettings": "External", "routeClaudeSettings": "Claude Settings",
         "routeRuntimeSettings": "Runtime",
         "routeDataManagement": "Data Management", "routeLogs": "Logs",
+        "routeWebDavSettings": "WebDAV Sync Settings",
         "modelChooserTitle": "Choose Models to Add", "modelChooserHeading": "Choose models to add",
         "modelChooserProvider": "Provider", "modelChooserKey": "Key", "modelChooserSearch": "Search models",
         "modelChooserAll": "All", "modelChooserSelectAllVisible": "Select all visible models",
@@ -380,7 +381,7 @@ private enum NativeRelayOriginPolicy {
             // the screen only when the user opens the document it edits.
             configureImmediatePresentation(window)
             withoutAnimations { window.orderOut(nil) }
-        } else if windowRoute == "provider-wizard" || windowRoute == "file-editor" {
+        } else if windowRoute == "provider-wizard" || windowRoute == "file-editor" || windowRoute == "webdav-settings" {
             // The wizard and the file editor are children of the workspace they
             // open from: each is its own movable window with the rest of the
             // app locked until it closes, exactly like the model chooser. A
@@ -594,9 +595,10 @@ private enum NativeRelayOriginPolicy {
         let completion: ([String]?) -> Void
     }
 
-    /// Present a child surface — the provider wizard, the file editor, 分组管理,
-    /// the relay sign-in browser, the relay usage log, the read-only document
-    /// viewer, the official provider sign-in, or the model chooser — the way
+    /// Present a child surface — the provider wizard, the file editor, the
+    /// WebDAV detail form, 分组管理, the relay sign-in browser, the relay usage
+    /// log, the read-only document viewer, the official provider sign-in, or
+    /// the model chooser — the way
     /// the app presents every child: its own movable titled window in front of
     /// the app, attached above the window it was opened from, with that
     /// window's content locked until the child closes.
@@ -2743,14 +2745,16 @@ private enum NativeRelayOriginPolicy {
             // scrollbar. The window is full-size content view, so its content
             // height includes the transparent title strip.
             // The provider workspace is three fixed columns and a model
-            // list that needs 288 pt for its own three: a 180 pt list and a
-            // 320 pt inspector beside it leave the middle pane short of that
-            // floor at 960, which scrolls 倍率 out of its table.  This is the
-            // smallest width that holds all three; the minimum keeps a resize
-            // from breaking it again.
+            // list whose own three carry floors: the upstream id read in full,
+            // a public name that may be ellipsized, and 倍率.  A 140 pt list
+            // (its names are short) and a 320 pt inspector beside it leave the
+            // middle pane those floors at 980, so the default spends only the
+            // little a wider window adds on the two name columns, and the
+            // minimum is the narrowest the window goes before they scale down
+            // together.
             return RouteWindowLayout(
-                contentSize: NSSize(width: 1120, height: 660),
-                minSize: NSSize(width: 1010, height: 560),
+                contentSize: NSSize(width: 1010, height: 660),
+                minSize: NSSize(width: 980, height: 560),
                 maxSize: nil
             )
         }
@@ -2768,6 +2772,16 @@ private enum NativeRelayOriginPolicy {
             return RouteWindowLayout(
                 contentSize: NSSize(width: 900, height: 560),
                 minSize: NSSize(width: 720, height: 420),
+                maxSize: nil
+            )
+        case "webdav-settings":
+            // The detail form is one column of the settings grid's rows: 600
+            // holds the label column plus the widest control (the WebDAV
+            // address) inside both insets, and the height covers those rows
+            // above the pinned footer.
+            return RouteWindowLayout(
+                contentSize: NSSize(width: 600, height: 470),
+                minSize: NSSize(width: 520, height: 400),
                 maxSize: nil
             )
         default:
@@ -2799,6 +2813,7 @@ private enum NativeRelayOriginPolicy {
         case "providers-models": return localized("routeProvidersModels", fallback: "Providers & Models")
         case "provider-wizard": return localized("routeProviderWizard", fallback: "Add Provider")
         case "file-editor": return localized("routeFileEditor", fallback: "Edit File")
+        case "webdav-settings": return localized("routeWebDavSettings", fallback: "WebDAV Sync Settings")
         case "codex-settings", "claude-settings": return localized("routeCodexSettings", fallback: "External")
         case "runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime")
         case "data-management": return localized("routeDataManagement", fallback: "Data Management")
@@ -2819,6 +2834,7 @@ private enum NativeRelayOriginPolicy {
         case "home": return localized("routeHome", fallback: "Young Router")
         case "provider-wizard": return localized("routeProviderWizard", fallback: "Add Provider")
         case "file-editor": return localized("routeFileEditor", fallback: "Edit File")
+        case "webdav-settings": return localized("routeWebDavSettings", fallback: "WebDAV Sync Settings")
         default: return nil
         }
     }

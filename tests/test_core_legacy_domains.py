@@ -2802,6 +2802,197 @@ class CodexSettingsDomainTests(unittest.TestCase):
             self.assertIn("replace-me-secret", documents["auth_text"])
             self.assertNotIn("sk-young-router", documents["auth_text"])
 
+    @mock.patch("young_router.core.codex_config.local_exposed_models", return_value=([], False))
+    def test_use_saved_model_clears_the_settings_that_name_this_proxy(self, _live_models) -> None:
+        """A client leaving the proxy takes the proxy's own settings with it.
+
+        The managed model list and the standalone search opt-in are both
+        written into the client's document and both name this app: the list
+        holds public model names only the proxy serves, and the opt-in aims
+        Codex at ``{base_url}/alpha/search``, which only a gateway this app
+        fronts answers.  Left behind, the first would list models the direct
+        route cannot resolve and the second would aim the client at an endpoint
+        the provider does not serve -- and the pane's disabled switches beside
+        "use this app's API" would keep reading them as on.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            catalog_path = home / "model-catalog.json"
+            # Codex refuses a configuration whose catalog names a missing file,
+            # so the domain drops such a pointer while loading the document: a
+            # usable file is what lets this test start from "the list is on".
+            catalog_path.write_text('{"models": [{"slug": "default-chat"}]}', encoding="utf-8")
+            (home / "config.toml").write_text(
+                'model = "default-chat"\n'
+                f'model_catalog_json = "{catalog_path}"\n'
+                'web_search = "live"\n'
+                'model_provider = "newapi"\n'
+                '\n'
+                '[model_providers.newapi]\n'
+                'name = "newapi"\n'
+                'base_url = "http://127.0.0.1:12390/v1"\n'
+                'wire_api = "responses"\n'
+                'requires_openai_auth = true\n'
+                'supports_standalone_web_search = true\n',
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text('{"OPENAI_API_KEY": "sk-young-router"}\n', encoding="utf-8")
+            domain = CodexSettingsDomain(runtime, codex_home=home)
+            self.assertTrue(domain.snapshot()["model_catalog"]["enabled"])
+            self.assertTrue(domain.snapshot()["standalone_search"])
+
+            left = domain.dispatch(
+                "use_saved_model",
+                {"model": "default-chat", "provider": "primary", "deployment_id": "00000071"},
+            )
+            domain.apply()
+
+            documents = domain.export(include_sensitive=True)
+            self.assertNotIn("model_catalog_json", documents["config_text"])
+            self.assertNotIn("supports_standalone_web_search", documents["config_text"])
+            self.assertFalse(left["model_catalog"]["enabled"])
+            self.assertFalse(domain.snapshot()["standalone_search"])
+
+            # Adoption states the opt-in again.  An off direction that wrote
+            # ``false`` instead of clearing the key would have read as the
+            # operator's own decision and kept search off for good.
+            domain.dispatch("use_local_api", {})
+            domain.apply()
+            self.assertIn(
+                "supports_standalone_web_search = true",
+                domain.export(include_sensitive=True)["config_text"],
+            )
+
+    def test_use_saved_model_refuses_a_route_the_client_cannot_talk_to(self) -> None:
+        """A chat-only route is refused instead of becoming an invalid document.
+
+        Codex accepts only ``responses`` from a custom provider row, so a saved
+        route that serves the chat API alone can never be a direct backend.
+        Writing ``wire_api = "chat"`` for it made the whole document invalid —
+        Codex refused it together with the pane, and the staged refusal then
+        replaced the draft's projection with an empty one.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(
+                textwrap.dedent(PROVIDER_CONFIG).lstrip().replace(
+                    "upstream_url_surface: openai/responses",
+                    "upstream_url_surface: openai/chat",
+                ),
+                encoding="utf-8",
+            )
+            home = root / "codex"
+            home.mkdir()
+            original = (
+                'model = "stale-model"\n'
+                'model_provider = "newapi"\n'
+                '\n'
+                '[model_providers.newapi]\n'
+                'name = "newapi"\n'
+                'base_url = "http://127.0.0.1:12390/v1"\n'
+                'wire_api = "responses"\n'
+                'requires_openai_auth = true\n'
+            )
+            (home / "config.toml").write_text(original, encoding="utf-8")
+            (home / "auth.json").write_text('{"OPENAI_API_KEY": "sk-young-router"}\n', encoding="utf-8")
+            domain = CodexSettingsDomain(runtime, codex_home=home)
+
+            with self.assertRaises(DomainError) as raised:
+                domain.dispatch(
+                    "use_saved_model",
+                    {"model": "default-chat", "provider": "primary", "deployment_id": "00000071"},
+                )
+            self.assertIn("responses", str(raised.exception))
+            # The refusal left the document alone: no chat wire, and the
+            # provider the client names is still the one it named.
+            self.assertEqual(original, domain.export(include_sensitive=True)["config_text"])
+            self.assertEqual(
+                "newapi",
+                (domain.snapshot()["structured"] or {}).get("model_provider"),
+            )
+
+    def test_a_rejected_patch_leaves_the_projection_it_was_staged_against(self) -> None:
+        """A refused structured edit reports instead of emptying the draft.
+
+        ``sync_editor`` treats a rejected edit as non-fatal so the raw text
+        panes can keep a user's work on screen, and it answers with an empty
+        projection beside the unchanged text.  For an action that already
+        decided what to write that answer became the draft's state: the next
+        action then read no provider row at all, and reported the proxy's model
+        catalog as off while it was still the client's list.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text(
+                'model = "default-chat"\n'
+                'model_provider = "newapi"\n'
+                '\n'
+                '[model_providers.newapi]\n'
+                'name = "newapi"\n'
+                'base_url = "http://127.0.0.1:12390/v1"\n'
+                'wire_api = "responses"\n'
+                'requires_openai_auth = true\n',
+                encoding="utf-8",
+            )
+            (home / "auth.json").write_text('{}\n', encoding="utf-8")
+            domain = CodexSettingsDomain(runtime, codex_home=home)
+
+            with self.assertRaises(DomainError) as raised:
+                domain.dispatch(
+                    "patch",
+                    {"providers": [{"id": "newapi", "name": "newapi", "wire_api": "chat"}]},
+                )
+            self.assertIn("wire_api", str(raised.exception))
+            structured = domain.snapshot()["structured"] or {}
+            self.assertEqual("newapi", structured.get("model_provider"))
+            self.assertEqual(["newapi"], [row.get("id") for row in structured.get("providers") or []])
+
+    def test_a_created_provider_row_keeps_the_clients_own_provider_id(self) -> None:
+        """The off direction never moves the client onto a second provider.
+
+        A document whose provider table the projection cannot read used to take
+        the fallback row, which renamed ``model_provider`` to this app's own
+        ``custom``; the reconciliation then deleted the row the client had
+        named.  The identity is what the action promises to keep, so the row is
+        created under the client's own id.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / "config.yaml"
+            runtime.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            home = root / "codex"
+            home.mkdir()
+            (home / "config.toml").write_text(
+                'model = "default-chat"\nmodel_provider = "newapi"\n', encoding="utf-8"
+            )
+            (home / "auth.json").write_text('{}\n', encoding="utf-8")
+            domain = CodexSettingsDomain(runtime, codex_home=home)
+
+            staged = domain.dispatch(
+                "use_saved_model",
+                {"model": "default-chat", "provider": "primary", "deployment_id": "00000071"},
+            )
+            self.assertEqual("newapi", (staged["structured"] or {}).get("model_provider"))
+            domain.apply()
+            text = domain.export(include_sensitive=True)["config_text"]
+            self.assertIn('model_provider = "newapi"', text)
+            self.assertIn("[model_providers.newapi]", text)
+            self.assertNotIn("model_provider = \"custom\"", text)
+            self.assertNotIn("[model_providers.custom]", text)
+
     def test_staged_edits_preserve_existing_codex_file_presence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3927,6 +4118,36 @@ class WebDAVSettingsDomainTests(unittest.TestCase):
             self.assertEqual("probe", recorded["action"])
             self.assertTrue(recorded["ok"])
             self.assertEqual(0o600, stat.S_IMODE(status.stat().st_mode))
+
+    def test_a_candidate_probe_tests_the_form_values_without_staging_them(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status = root / "webdav-sync-status.json"
+            domain = WebDAVSettingsDomain(root / "webdav.json", enabled_path=root / "enabled", status_path=status)
+            domain.dispatch("patch", {"url": "https://saved.test/webdav/", "remote_name": "config.json"})
+            seen: dict[str, str] = {}
+
+            class Client:
+                def __init__(self, settings: object) -> None:
+                    seen["url"] = str(getattr(settings, "url", ""))
+
+                def try_mkcol(self, url: str) -> None:
+                    seen["collection"] = url
+
+                def head(self, url: str) -> tuple[int, dict[str, str]]:
+                    return 404, {}
+
+            with mock.patch("young_router.webdav.core.WebDAVClient", Client):
+                result = domain.probe({"values": {"url": "https://draft.test/webdav/", "sync_interval": "5"}})
+
+            self.assertTrue(result["ok"])
+            # The probe named the form's URL, and the form's values were not
+            # staged: the saved settings and the recorded status are untouched.
+            self.assertEqual("https://draft.test/webdav/", seen["url"])
+            self.assertEqual("https://saved.test/webdav/", domain.snapshot()["url"])
+            self.assertEqual("unknown", domain.snapshot()["last_probe"])
+            self.assertFalse(status.exists())
+
 
 
 if __name__ == "__main__":

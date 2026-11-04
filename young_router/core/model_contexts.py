@@ -850,6 +850,12 @@ def _litellm_record(model_ids: Sequence[str]) -> dict[str, Any] | None:
             value = litellm.model_cost.get(candidate)
             if not isinstance(value, Mapping):
                 continue
+            # ``max_tokens`` is LiteLLM's own legacy fallback for the window, as
+            # its cost map's ``sample_spec`` entry states: an entry that carries
+            # only it has stated one number, not an output ceiling beside an
+            # unknown window.  Read as an output cap it would be exactly the
+            # context/max-output confusion, and the entries that state both keep
+            # ``max_input_tokens`` first, which is the larger, real window.
             context = _positive_int(value.get("max_input_tokens")) or _positive_int(value.get("max_tokens"))
             if context is not None:
                 return _record(context, source="litellm", priority=15)
@@ -893,7 +899,6 @@ class ModelContextRegistry:
         refresh_enabled: bool | None = None,
         fetcher: Callable[[str], object] | None = None,
         clock: Callable[[], float] | None = None,
-        upstream_windows: Callable[[], Mapping[str, int]] | None = None,
     ) -> None:
         self.runtime_config_path = Path(runtime_config_path).expanduser() if runtime_config_path else None
         self.runtime_settings_path = Path(runtime_settings_path).expanduser() if runtime_settings_path else None
@@ -904,12 +909,6 @@ class ModelContextRegistry:
         self.refresh_enabled = bool(runtime_settings_path) if refresh_enabled is None else bool(refresh_enabled)
         self._fetcher = fetcher or self._fetch_json
         self._clock = clock or time.time
-        # The window each route's own upstream states, as the live catalog read
-        # reported it.  Injected rather than stored: the number is the
-        # upstream's, it changes when the upstream changes, and copying it into
-        # the configuration would make a stale reading outlive the read that
-        # produced it.
-        self._upstream_windows = upstream_windows
         self._records: dict[str, dict[str, Any]] = RecordLookupIndex()
         # The record keys grouped by their last path segment, for `_lookup`.
         self._record_tail_index: dict[str, tuple[str, ...]] = {}
@@ -1372,40 +1371,28 @@ class ModelContextRegistry:
         return _positive_int(model_info.get("max_input_tokens"))
 
     def _custom_contexts(self, public_name: str) -> list[int]:
-        """Collect every window the routes of one group answer with.
+        """Collect the windows the *user* declared on the routes of one group.
 
-        Three answers count, in the order the group resolves them: the window
-        the user declared on a route, the window that route's own upstream
-        stated in its live catalog, and — when neither exists for any route —
-        whatever the registry infers later.  The group takes the smallest of
-        them, because a group is only as usable as its narrowest route.
+        The group takes the smallest of them, because a group is only as usable
+        as its narrowest route.
 
-        The upstream's number is read through ``upstream_windows`` rather than
-        from the deployment: it belongs to the upstream, it changes when the
-        upstream changes, and the caller that performed the read is the one that
-        knows it.  Storing it in the configuration would make one stale reading
-        outlive every read after it.
+        A window an upstream advertises for a model is deliberately not one of
+        these.  It is a *reading*: the model detail reports it in its own row
+        (``upstream_context_window``), it changes whenever that upstream's
+        catalog is read again, and nothing here decides it.  Letting a reading
+        stand in for the declaration made the two numbers of one route disagree:
+        the pane proposed the advertised number while the managed catalog -- the
+        only surface that actually hands a window to a client -- published the
+        registry's, so ``pulse-alpha-free`` read 131,072 in the pane (its lane
+        states its fallback for an id its table does not know) and 1,048,576 in
+        the catalog written the same minute.
         """
 
-        deployments = self._load_route_deployments(public_name)
-        stated = self._upstream_windows() if self._upstream_windows else {}
         contexts: list[int] = []
-        for deployment in deployments:
+        for deployment in self._load_route_deployments(public_name):
             declared = self._deployment_context(deployment)
             if declared is not None:
                 contexts.append(declared)
-                continue
-            # The upstream's answer about *this route's* wire, keyed by the
-            # model id the route addresses.
-            params = deployment.get("litellm_params")
-            if not isinstance(params, Mapping):
-                continue
-            model_id = str(params.get("model", "")).strip()
-            for candidate in _candidate_ids(model_id):
-                window = stated.get(candidate) if isinstance(stated, Mapping) else None
-                if isinstance(window, int) and not isinstance(window, bool) and window > 0:
-                    contexts.append(window)
-                    break
         return contexts
 
     def _resolved_route_records(self, public_name: str) -> list[dict[str, Any]]:

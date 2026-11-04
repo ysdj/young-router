@@ -15,6 +15,12 @@
 #include <winrt/Windows.ApplicationModel.DataTransfer.h>
 
 namespace {
+// Child surfaces open as their own process window: the provider wizard, the raw
+// file editor, and the WebDAV detail form.
+bool IsChildRoute(std::wstring_view route) {
+  return route == L"provider-wizard" || route == L"file-editor" || route == L"webdav-settings";
+}
+
 std::wstring Utf8ToWide(std::string const& value) {
   if (value.empty()) return {};
   int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), nullptr, 0);
@@ -175,7 +181,7 @@ void WinUI3NativeLeafModule::Initialize(winrt::Microsoft::ReactNative::ReactCont
 
 void WinUI3NativeLeafModule::OpenWindow(std::wstring const& route) noexcept {
   try {
-    if ((route == L"provider-wizard" || route == L"file-editor") && !leaf_->IsChildHost()) {
+    if (IsChildRoute(route) && !leaf_->IsChildHost()) {
       OpenReactChildWindow(route);
       return;
     }
@@ -187,7 +193,7 @@ void WinUI3NativeLeafModule::OpenWindow(std::wstring const& route) noexcept {
 
 void WinUI3NativeLeafModule::CloseWindow(std::optional<std::wstring> const& route) noexcept {
   try {
-    if (route && (*route == L"provider-wizard" || *route == L"file-editor") && leaf_->IsChildHost()) {
+    if (route && IsChildRoute(*route) && leaf_->IsChildHost()) {
       CloseReactChildWindow();
       return;
     }
@@ -201,7 +207,7 @@ void WinUI3NativeLeafModule::CloseWindow(std::optional<std::wstring> const& rout
 
 void WinUI3NativeLeafModule::FocusWindow(std::wstring const& route) noexcept {
   try {
-    if ((route == L"provider-wizard" || route == L"file-editor") && !leaf_->IsChildHost()) {
+    if (IsChildRoute(route) && !leaf_->IsChildHost()) {
       OpenReactChildWindow(route);
       return;
     }

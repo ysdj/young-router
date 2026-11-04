@@ -25,6 +25,7 @@ export type AppRoute =
   | "claude-settings"
   | "runtime-settings"
   | "data-management"
+  | "webdav-settings"
   | "relay-accounts"
   | "relay-add"
   | "provider-wizard"
@@ -372,8 +373,11 @@ export interface ProviderModelSummary {
 }
 
 export interface PublicModelContext {
+  /** The window this app hands a client: the group's declaration, else the registry's profile. */
   context_window: number;
   max_context_window: number;
+  /** The value pi.dev recommends for the name, which the pane states beside the field. */
+  recommended_context_window: number;
 }
 
 export interface ProvidersModelsSummary {
@@ -479,7 +483,7 @@ export interface IpcParams {
   validate: { domain: ConfigDomain; revision?: number };
   apply: ({ domain: ConfigDomain; domains?: never } | { domains: ConfigDomain[]; domain?: never }) & { revision: number; confirmation?: string | string[] };
   reload: { domain?: ConfigDomain; revision?: number };
-  probe: { domain?: "providers_models" | "webdav"; provider_id?: string; model_id?: string };
+  probe: { domain?: "providers_models" | "webdav"; provider_id?: string; model_id?: string; values?: Record<string, unknown> };
   export: { sections: ConfigDomain[]; destination_token: string };
   import_preview: { source_token: string; revision: number };
   import: { import_plan_token: string; sections: ConfigDomain[]; revision: number };
@@ -608,7 +612,7 @@ export interface IpcClient {
   apply(domain: ConfigDomain, revision: number, confirmation?: string | string[]): Promise<IpcResults["apply"]>;
   applyDomains(domains: ConfigDomain[], revision: number, confirmation?: string | string[]): Promise<IpcResults["apply"]>;
   reload(domain?: ConfigDomain, revision?: number): Promise<{ revision: number }>;
-  probe(providerId?: string, modelId?: string, domain?: "providers_models" | "webdav"): Promise<IpcResults["probe"]>;
+  probe(providerId?: string, modelId?: string, domain?: "providers_models" | "webdav", values?: Record<string, unknown>): Promise<IpcResults["probe"]>;
   export(sections: ConfigDomain[], destinationToken: string): Promise<IpcResults["export"]>;
   previewImport(sourceToken: string, revision: number): Promise<IpcResults["import_preview"]>;
   importPlan(importPlanToken: string, revision: number, sections: ConfigDomain[]): Promise<IpcResults["import"]>;
@@ -703,6 +707,7 @@ export interface NativeLocalization {
   routeGeneralSettings: string;
   routeRuntimeSettings: string;
   routeDataManagement: string;
+  routeWebDavSettings: string;
   routeProviderWizard: string;
   routeFileEditor: string;
   routeLogs: string;

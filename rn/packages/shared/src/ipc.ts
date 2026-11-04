@@ -109,10 +109,11 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
     apply: async (domain: ConfigDomain, revision: number, confirmation?: string | string[]): Promise<IpcResults["apply"]> => call("apply", confirmation === undefined ? { domain, revision } : { domain, revision, confirmation }),
     applyDomains: async (domains: ConfigDomain[], revision: number, confirmation?: string | string[]): Promise<IpcResults["apply"]> => call("apply", confirmation === undefined ? { domains, revision } : { domains, revision, confirmation }),
     reload: async (domain?: ConfigDomain, revision?: number): Promise<{ revision: number }> => call("reload", domain === undefined && revision === undefined ? {} : { ...(domain === undefined ? {} : { domain }), ...(revision === undefined ? {} : { revision }) }),
-    probe: async (providerId?: string, modelId?: string, domain?: "providers_models" | "webdav"): Promise<IpcResults["probe"]> => call("probe", {
+    probe: async (providerId?: string, modelId?: string, domain?: "providers_models" | "webdav", values?: Record<string, unknown>): Promise<IpcResults["probe"]> => call("probe", {
       ...(domain === undefined ? {} : { domain }),
       ...(providerId === undefined ? {} : { provider_id: providerId }),
       ...(modelId === undefined ? {} : { model_id: modelId }),
+      ...(values === undefined ? {} : { values }),
     }),
     export: async (sections: ConfigDomain[], destinationToken: string): Promise<IpcResults["export"]> => call("export", { sections, destination_token: destinationToken }),
     previewImport: async (sourceToken: string, revision: number): Promise<IpcResults["import_preview"]> => call("import_preview", { source_token: sourceToken, revision }),

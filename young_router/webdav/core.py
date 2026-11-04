@@ -793,12 +793,16 @@ def save_sync_state(path: pathlib.Path, settings: Settings, manifest: dict[str, 
     _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"))
 
 
-def save_sync_status(path: pathlib.Path, action: str, ok: bool) -> None:
-    data = {
+def save_sync_status(path: pathlib.Path, action: str, ok: bool, code: str | None = None) -> None:
+    data: dict[str, Any] = {
         "action": action,
         "checked_at": _utc_now(),
         "ok": bool(ok),
     }
+    # A stopped run keeps the cause that stopped it, so the pane can name the
+    # step that clears it instead of only saying the run failed.
+    if not ok and code:
+        data["code"] = code
     _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"))
 
 

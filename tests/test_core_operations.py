@@ -1836,9 +1836,21 @@ class CoreOperationsTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(
-                {"action": "sync", "ok": False, "at": "2026-09-25T02:00:00Z"},
+                {"action": "sync", "ok": False, "code": "", "at": "2026-09-25T02:00:00Z"},
                 webdav.snapshot()["last_result"],
             )
+
+            # The cause travels with the outcome, so the pane can name the step
+            # that clears it instead of only saying the run failed.
+            from young_router.webdav import core as webdav_core
+
+            webdav_core.save_sync_status(webdav.status_path, "sync", False, "webdav_sync_conflict")
+            self.assertEqual("webdav_sync_conflict", webdav.snapshot()["last_result"]["code"])
+            # A run that succeeded has no cause to report, and the file says so
+            # by carrying no code at all.
+            webdav_core.save_sync_status(webdav.status_path, "sync", True)
+            self.assertEqual("", webdav.snapshot()["last_result"]["code"])
+            self.assertNotIn("code", json.loads(webdav.status_path.read_text(encoding="utf-8")))
 
     def test_smart_sync_keeps_an_unreadable_remote_file_and_pushes_over_it(self) -> None:
         """Smart sync resolves a remote file from another version by itself.

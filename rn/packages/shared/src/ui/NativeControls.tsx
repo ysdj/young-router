@@ -986,12 +986,15 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
     columnLabels: columns.map((column) => column.label),
     columnWidths: columns.map((column) => column.width),
     rowKeys: rows.map((row) => row.key),
-    // Spanning (group) rows paint one full-width cell, but the native tables
-    // address cells positionally by row * columnCount. Pad every spanning row
-    // to the column count so following rows keep their columns aligned.
-    cells: rows.flatMap((row) => row.spanning
-      ? [row.cells[0] ?? "", ...Array(Math.max(0, columns.length - 1)).fill("")]
-      : row.cells),
+    // The native tables address cells positionally by row * columnCount, so
+    // every row owns exactly one columnCount slice.  A spanning (group) row
+    // carries one value for its full-width cell, and a trailing spacer column
+    // carries none, so both are padded here — an unpadded row shifted every
+    // row after it into its neighbour's columns.
+    cells: rows.flatMap((row) => {
+      const cells = row.spanning ? [row.cells[0] ?? ""] : row.cells.slice(0, columns.length);
+      return [...cells, ...Array(Math.max(0, columns.length - cells.length)).fill("")];
+    }),
     selectedKey,
     alternatingRows: stripedRows,
     compact,

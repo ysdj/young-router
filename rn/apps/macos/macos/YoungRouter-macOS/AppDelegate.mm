@@ -92,18 +92,21 @@
     }
     // The settings window is a native full-height source-list window: one
     // sidebar material behind the whole window, a transparent title bar, and
-    // the shared React surface painting the opaque detail column on top.
+    // the shared React surface painting the chrome (the sidebar and the title
+    // band as one L) and the opaque detail column on top.
     // Mirror isSettingsShellRoute() in rn/packages/shared/src/routes.ts: every
-    // route except the home surface and the provider wizard renders the shared
+    // route except the home surface and the child windows (the provider
+    // wizard, the raw editor, and the WebDAV detail form) renders the shared
     // shell, so an explicit whitelist here silently gives a missed pane
     // (General) a plain titled window while the shell still reserves its
     // title-bar inset.
-    NSSet<NSString *> *standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor"]];
+    NSSet<NSString *> *standaloneRoutes = [NSSet setWithArray:@[@"home", @"provider-wizard", @"file-editor", @"webdav-settings"]];
     const BOOL settingsShell = ![standaloneRoutes containsObject:route];
     NSView *rootView = (NSView *)[rootViewFactory viewWithModuleName:@"YoungRouter" initialProperties:props];
     // RCTSurfaceHostingView defaults to an opaque white background on macOS.
-    // The route windows paint every surface themselves, so clearing it lets a
-    // window-level sidebar material show through the shared layout.
+    // The shared surface paints every pane and the chrome itself, so clearing
+    // it leaves the native material at the window's rounded edge instead of a
+    // white rectangle behind the layout.
     [(id)rootView setBackgroundColor:NSColor.clearColor];
     rootView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     NSView *contentView = rootView;

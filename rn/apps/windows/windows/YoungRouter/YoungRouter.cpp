@@ -52,6 +52,30 @@ std::wstring CanonicalRoute(std::wstring route) {
   return route;
 }
 
+// Child surfaces are their own process window, so the command line, the
+// spawner, and the window geometry all have to agree on the list.
+bool IsChildRoute(std::wstring_view route) {
+  return route == L"provider-wizard" || route == L"file-editor" || route == L"webdav-settings";
+}
+
+// A child window's own content size, in 96-DPI DIPs: the wizard is the small
+// sign-in-sized one, the WebDAV detail form is a wider field grid, and the raw
+// file editor gets the room a document needs.
+void ChildContentSize(std::wstring_view route, LONG& width, LONG& height) {
+  if (route == L"provider-wizard") {
+    width = 620;
+    height = 460;
+    return;
+  }
+  if (route == L"webdav-settings") {
+    width = 600;
+    height = 540;
+    return;
+  }
+  width = 900;
+  height = 560;
+}
+
 std::wstring RouteWithAllowedTab(std::wstring route, std::wstring_view query) {
   route = CanonicalRoute(AllowedRoute(std::move(route)));
   if (route != L"logs" || query.empty()) return route;
@@ -127,8 +151,7 @@ std::wstring RequestedChildRouteFromCommandLine() {
     }
   }
   LocalFree(arguments);
-  return route == L"provider-wizard" || route == L"file-editor"
-      ? route : std::wstring{};
+  return IsChildRoute(route) ? route : std::wstring{};
 }
 
 std::wstring RequestedChildFileTargetFromCommandLine() {
@@ -282,8 +305,9 @@ void RunReactChildHost(std::shared_ptr<ReactChildHostState> state) {
     auto app_window = child.AppWindow();
     app_window.Title(YoungRouter::WinUI3NativeLeaf::Shared()->RouteTitleFor(state->route));
     child_handle = winrt::Microsoft::UI::GetWindowFromWindowId(app_window.Id());
-    const LONG content_width = state->route == L"provider-wizard" ? 620 : 900;
-    const LONG content_height = state->route == L"provider-wizard" ? 460 : 560;
+    LONG content_width = 0;
+    LONG content_height = 0;
+    ChildContentSize(state->route, content_width, content_height);
     const auto frame = FrameTrackSizeForContentDips(child_handle, content_width, content_height);
     app_window.Resize({frame.x, frame.y});
     {
@@ -319,7 +343,7 @@ void RunReactChildHost(std::shared_ptr<ReactChildHostState> state) {
 
 void OpenReactChildWindow(std::wstring_view route, std::wstring_view initial_file_target) {
   if (g_child_process_mode) return;
-  if (route != L"provider-wizard" && route != L"file-editor") return;
+  if (!IsChildRoute(route)) return;
   const auto parent = WinUI3NativeLeaf::Shared()->WindowHandle();
   if (parent == nullptr) return;
   {
@@ -513,8 +537,11 @@ _Use_decl_annotations_ int CALLBACK WinMain(HINSTANCE instance, HINSTANCE, PSTR 
   // creates it; resizing the still-hidden window afterwards (the old
   // 1120x680 start, then OpenRoute's 960x660 DIP) left the composition root
   // at the smaller size and the window painted the rest as empty background.
-  const auto initialContentWidth = childMode && childRoute == L"provider-wizard" ? 620 : childMode ? 900 : 960;
-  const auto initialContentHeight = childMode && childRoute == L"provider-wizard" ? 460 : childMode ? 560 : 660;
+  LONG initialContentWidth = 960;
+  LONG initialContentHeight = 660;
+  if (childMode) {
+    ChildContentSize(childRoute, initialContentWidth, initialContentHeight);
+  }
   // Keep the parent settings-shell geometry explicit; child windows use their
   // own content dimensions below.
   const auto initialFrame = childMode

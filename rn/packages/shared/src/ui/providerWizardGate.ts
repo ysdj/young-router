@@ -6,6 +6,11 @@
  * those partial edits while the sheet is open: an immediate apply would reload
  * the proxy on an incomplete configuration.
  *
+ * Every child surface with its own explicit action list holds the gate the
+ * same way — the raw editor, 分组管理, and the WebDAV detail form — because
+ * each one writes behind its own button while the pane underneath stays open
+ * and would otherwise apply the same draft first.
+ *
  * Every React root shares one JS runtime, so a module-level gate is enough.
  * The wizard root opens the gate while it is mounted and closes it on unmount,
  * which lets the provider workspace apply the finished draft immediately.
@@ -13,6 +18,7 @@
 let providerWizardOpen = false;
 let assistantEditorOpen = false;
 let groupManagerOpen = false;
+let webDavSettingsOpen = false;
 const listeners = new Set<() => void>();
 
 function notify(): void {
@@ -58,6 +64,23 @@ export function setGroupManagerOpen(open: boolean): void {
 
 export function isGroupManagerOpen(): boolean {
   return groupManagerOpen;
+}
+
+/**
+ * The WebDAV detail form is a child window with its own 保存并关闭. Its fields
+ * are one local draft, so the sync pane underneath must not auto-apply the
+ * domain while it is open: that apply would commit the secret the form staged
+ * on its own and leave every other edit of the form unwritten. One JS runtime
+ * carries both roots, so a module-level gate covers the window that opened it.
+ */
+export function setWebDavSettingsOpen(open: boolean): void {
+  if (webDavSettingsOpen === open) return;
+  webDavSettingsOpen = open;
+  notify();
+}
+
+export function isWebDavSettingsOpen(): boolean {
+  return webDavSettingsOpen;
 }
 
 export function subscribeProviderWizard(listener: () => void): () => void {

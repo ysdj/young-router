@@ -1145,33 +1145,9 @@ class ProvidersModelsDomain:
                 _runtime_root_for_config(self.config_path)
             ),
             refresh_enabled=False,
-            # The windows this pane already holds from the catalog reads it
-            # performed.  Handed over rather than written down: the numbers are
-            # the upstreams', and this domain is the only place that read them.
-            upstream_windows=self._live_upstream_windows,
         )
         self._model_context_registry = registry
         return registry
-
-    def _live_upstream_windows(self) -> dict[str, int]:
-        """Every window a catalog read has reported, keyed by model id.
-
-        Live, not stored: each entry is what an upstream answered the last time
-        this domain read it.  The two reads that record windows answer different
-        questions — one is a provider's own ``/v1/models`` listing, the other an
-        integration's catalog — so both are merged here and the nearest answer
-        wins by provider order.
-        """
-
-        windows: dict[str, int] = {}
-        for listing in (*self._catalog_windows.values(), *self._listing_windows.values()):
-            if not isinstance(listing, Mapping):
-                continue
-            for model_id, window in listing.items():
-                name = str(model_id or "").strip()
-                if name and isinstance(window, int) and not isinstance(window, bool) and window > 0:
-                    windows[name] = window
-        return windows
 
     def _public_model_context_registry(self):
         """Registry used by explicit model-list reads for public fallbacks."""
@@ -1262,19 +1238,23 @@ class ProvidersModelsDomain:
         projection: dict[str, Any] = {}
         for name in names:
             try:
-                # The number the pane shows is the one the group resolves, so it
-                # is read with the user's own declaration in it.  Reading
-                # ``default_record_for`` here answered the registry's opinion and
-                # ignored the declaration this very document carries: an
-                # imported route that declared 1,048,576 from its own upstream
-                # was displayed as the unknown-model fallback, 272,000, because
-                # the registry knows no free-lane id.
+                # Two numbers, two questions, so both are published rather than
+                # one standing in for the other.  ``context_window`` is what this
+                # app hands a client -- the group's declaration when it has one,
+                # the registry's profile otherwise -- and it is the same number
+                # the managed catalog writes, because both resolve through
+                # ``record_for``.  ``recommended_context_window`` is the value
+                # pi.dev recommends for the name, which the pane's help mark
+                # states beside it; a declaration must not be reported back as
+                # the recommendation.
                 record = registry.record_for(name)
+                recommended = registry.default_record_for(name)
             except Exception:
                 continue
             projection[name] = {
                 "context_window": record.context_window,
                 "max_context_window": record.max_context_window,
+                "recommended_context_window": recommended.context_window,
             }
         return projection
 

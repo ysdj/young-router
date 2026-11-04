@@ -429,6 +429,84 @@ general_settings:
             self.assertFalse(snapshot["clients"]["claudeCode"]["uses_local_api"])
             self.assertEqual("prov-a", snapshot["clients"]["claudeCode"]["designated_route"]["provider"])
 
+    def test_use_saved_model_clears_the_picker_list_that_named_this_proxy(self) -> None:
+        """A client leaving the proxy drops the picker list this app generated.
+
+        Claude Code's lineup holds this router's public model names, which only
+        its proxy serves, so it leaves with the switch that pointed the client
+        at the proxy: the pane's disabled list switch has to read the state the
+        client is actually in.  Desktop is judged by the record of what this app
+        generated, so a route whose own model is also in that record would
+        otherwise let a background refresh put the whole proxy list back onto a
+        client that no longer talks to it.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            runtime_config = root / "config.yaml"
+            runtime_config.write_text(
+                """
+model_list:
+  - model_name: public-a
+    litellm_params:
+      model: anthropic/claude-upstream
+      api_base: https://relay.example.test/v1
+      api_key: sk-route
+    model_info:
+      id: dep-a
+      provider: prov-a
+      upstream_url_surface: anthropic
+providers:
+  prov-a:
+    api_base: https://relay.example.test/v1
+    api_keys:
+      - name: default
+        value: sk-route
+general_settings:
+  master_key: sk-router
+""",
+                encoding="utf-8",
+            )
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(desktop_root, {})
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                runtime_config_path=runtime_config,
+                runtime_root=root,
+            )
+            public = ["public-a", "claude-opus-5-5"]
+            with mock.patch.object(domain, "_public_models", return_value=public):
+                for client in ("claudeCode", "claudeDesktop"):
+                    domain.dispatch("claude.models.set", {"client": client, "enabled": True})
+            domain.apply()
+            self.assertIn("modelPicker", json.loads(domain.raw_text(include_sensitive=True)))
+            self.assertTrue(domain.snapshot()["clients"]["claudeDesktop"]["model_list_enabled"])
+
+            left = domain.dispatch(
+                "use_saved_model",
+                {"client": "claudeCode", "model": "public-a", "provider": "prov-a", "deployment_id": "dep-a"},
+            )
+            self.assertNotIn("modelPicker", json.loads(domain.raw_text(include_sensitive=True)))
+            self.assertFalse(left["clients"]["claudeCode"]["model_list_enabled"])
+            # Desktop is still on this app's list: leaving for one client never
+            # touches the other's picker.
+            self.assertTrue(left["clients"]["claudeDesktop"]["model_list_enabled"])
+
+            desktop = domain.dispatch(
+                "use_saved_model",
+                {"client": "claudeDesktop", "model": "public-a", "provider": "prov-a", "deployment_id": "dep-a"},
+            )
+            self.assertFalse(desktop["clients"]["claudeDesktop"]["model_list_enabled"])
+            # Desktop keeps only a name it can map onto an Anthropic model, so
+            # this route's own public name leaves an empty list -- and that is
+            # what the record must say, or a refresh would read "a subset of
+            # what we generated" and put the whole proxy list back.
+            self.assertEqual([], desktop["desktop"]["model_names"])
+            with mock.patch.object(domain, "_public_models", return_value=["public-a", "public-b"]):
+                self.assertFalse(domain.refresh_model_lists())
+            self.assertEqual([], domain.snapshot()["desktop"]["model_names"])
+
     def test_desktop_list_derives_an_alias_for_every_model_it_would_drop(self) -> None:
         # Verified against the app: it keeps an id that reads as an Anthropic
         # model and drops everything else.  The list is therefore derived, not

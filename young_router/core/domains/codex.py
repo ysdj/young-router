@@ -38,6 +38,7 @@ from ..model_contexts import (
 )
 from ..persistence import PersistenceError, read_json
 from ..security import redact
+from ..codex_config import RESERVED_PROVIDER_IDS
 from ._shared import (
     DomainError,
     _action_name,
@@ -1336,6 +1337,19 @@ class CodexSettingsDomain:
         if not isinstance(result, Mapping) or not isinstance(result.get("config_text"), str) or not isinstance(result.get("auth_text"), str):
             raise DomainError("Codex settings are invalid")
         synced = copy.deepcopy(dict(result))
+        # ``sync_editor`` treats a rejected edit as non-fatal so the raw text
+        # panes can keep the user's work on screen.  A structured *action* is a
+        # different caller: it has already decided what to write, so a refusal
+        # has to reach the pane instead of becoming this draft's state.  Left
+        # as state, the refusal replaced the whole projection with an empty one
+        # (``editor_payload({}, {})``), and the next action then read no
+        # provider row at all: "use a specific API" invented a second provider,
+        # renamed the client onto it, and could no longer tell that this app's
+        # model catalog was the one it was leaving.
+        if patch is not None:
+            errors = synced.get("validation_errors")
+            if isinstance(errors, list) and errors:
+                raise DomainError(str(errors[0]))
         # ``sync_editor`` validates and rewrites an in-memory draft without
         # touching CODEX_HOME, so its payload intentionally has no filesystem
         # existence fields. Those fields describe the loaded disk baseline,
@@ -1353,6 +1367,15 @@ class CodexSettingsDomain:
         ``model_provider`` already names, so the client talks to the provider
         itself instead of this app's proxy — the counterpart of the "use this
         API" action — and the client's own provider identity never changes.
+
+        The two settings that exist only for this proxy's own surface leave
+        with it, because both are written *into* the client's document and
+        would keep applying to a client that no longer talks to this app: the
+        managed catalog names models only this proxy serves, and the standalone
+        search opt-in points Codex at ``{base_url}/alpha/search``, which only a
+        gateway this app fronts answers.  Clearing the opt-in (rather than
+        stating ``false``) is what keeps adoption able to state it again, and
+        it is also the state the pane's disabled switches then read.
         """
 
         runtime, rows = saved_routes(self.runtime_config_path)
@@ -1361,13 +1384,30 @@ class CodexSettingsDomain:
         if not base_url:
             raise DomainError("The selected model has no saved provider endpoint")
         surface = str(row.get("upstream_url_surface") or "").strip().lower()
+        if not surface.endswith("responses"):
+            # A client talking to the provider itself speaks Codex's wire, and
+            # Codex accepts only ``responses`` from a custom provider row.  A
+            # chat-only route can therefore never be a direct backend, and
+            # writing ``wire_api = "chat"`` here made the whole document
+            # invalid, which Codex refuses together with the settings pane.
+            raise DomainError(
+                "The selected route serves only the chat API; Codex can only connect to a responses route"
+            )
         patch = self._active_provider_patch(
             base_url=base_url,
             key=saved_route_api_key(runtime, str(row.get("deployment_id") or "")),
-            wire_api="responses" if surface.endswith("responses") else "chat",
+            wire_api="responses",
         )
         if not patch.get("api_key"):
             patch.pop("api_key", None)
+        if self._is_catalog_enabled(self._draft):
+            patch["model_catalog_json"] = None
+        structured = self._draft.get("structured")
+        structured = structured if isinstance(structured, Mapping) else {}
+        active = str(structured.get("model_provider") or "").strip()
+        for entry in patch.get("providers") or []:
+            if isinstance(entry, dict) and str(entry.get("id") or "").strip() == active:
+                entry["supports_standalone_web_search"] = None
         patch["model"] = _direct_model_id(str(row.get("upstream_model") or row.get("model") or ""))
         return patch
 
@@ -1767,8 +1807,22 @@ class CodexSettingsDomain:
             (item for item in providers if str(item.get("id") or "").strip() == LOCAL_API_PROVIDER_ID),
             None,
         )
+        # The row this client names is not in the table the projection could
+        # read, so one is created here.  It takes the client's own id whenever
+        # that id can name a row at all: the provider identity is what this
+        # whole action promises not to change, and moving the client onto a
+        # second provider leaves the first row for the reconciliation below to
+        # delete.  Only an empty or reserved id (a built-in Codex provider, or
+        # none) falls back to this app's own row.
+        fallback_id = LOCAL_API_PROVIDER_ID
+        if active and active.lower() not in RESERVED_PROVIDER_IDS:
+            entry = next(
+                (item for item in providers if str(item.get("id") or "").strip() == active),
+                None,
+            )
+            fallback_id = active
         if entry is None:
-            entry = {"id": LOCAL_API_PROVIDER_ID, "name": LOCAL_API_PROVIDER_ID}
+            entry = {"id": fallback_id, "name": fallback_id}
             providers.append(entry)
         entry.update(
             {
@@ -1779,7 +1833,7 @@ class CodexSettingsDomain:
         )
         if standalone_web_search is not None:
             entry["supports_standalone_web_search"] = standalone_web_search
-        return {"api_key": key, "model_provider": LOCAL_API_PROVIDER_ID, "providers": providers}
+        return {"api_key": key, "model_provider": fallback_id, "providers": providers}
 
     @staticmethod
     def _active_provider_endpoint(structured: Mapping[str, Any], active: str) -> str:

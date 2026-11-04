@@ -23,6 +23,39 @@ from ._shared import (
     _same_file,
 )
 
+_SETTINGS_FIELDS = (
+    "url",
+    "username",
+    "password",
+    "remote_name",
+    "sync_interval_minutes",
+    "timeout_seconds",
+    "sync_direction",
+)
+_SETTINGS_ALIASES = {
+    "sync_interval": "sync_interval_minutes",
+    "timeout": "timeout_seconds",
+    "direction": "sync_direction",
+}
+_RETAINED_PASSWORD = "__YOUNG_ROUTER_RETAIN_EXISTING__"
+
+
+def _settings_updates(data: Mapping[str, Any]) -> dict[str, Any]:
+    """One settings payload, under the names this domain stores.
+
+    Shared by the stage path and the probe candidate so the form's field names
+    and the probe's names cannot drift.
+    """
+
+    source = data.get("settings", data.get("values", data))
+    updates = _mapping(source, "WebDAV settings")
+    updates = {_SETTINGS_ALIASES.get(key, key): value for key, value in updates.items()}
+    unknown = set(updates).difference(set(_SETTINGS_FIELDS) | {"enabled", "keep_password", "clear_password"})
+    if unknown:
+        raise DomainError("WebDAV settings contain an unsupported field")
+    return updates
+
+
 class WebDAVSettingsDomain:
     """Staged WebDAV settings using the existing WebDAV core client."""
 
@@ -154,9 +187,13 @@ class WebDAVSettingsDomain:
         if not isinstance(checked_at, str) or not checked_at.strip():
             return None
         action = status.get("action")
+        code = status.get("code")
         return {
             "action": action if isinstance(action, str) else "",
             "ok": status.get("ok") is True,
+            # Why a failed run stopped: the pane states the cause and the step
+            # that clears it, so "failed" alone never reaches the reader.
+            "code": code if isinstance(code, str) else "",
             "at": checked_at,
         }
 
@@ -179,25 +216,30 @@ class WebDAVSettingsDomain:
             "settings": copy.deepcopy(self._draft_settings),
         }
 
+    def _probe_candidate(self, values: object) -> dict[str, Any]:
+        """What a settings-form probe should test: the form over what is saved.
+
+        The form never carries the password — the native secure field stages it
+        through Core — so the candidate keeps whatever password the domain
+        currently holds.  The candidate is built, probed, and dropped: a test
+        must not save the values it tests.
+        """
+
+        updates = _settings_updates({"values": values})
+        candidate = copy.deepcopy(self._draft_settings)
+        for key in _SETTINGS_FIELDS:
+            if key in updates and key != "password":
+                candidate[key] = updates[key]
+        return candidate
+
     def _patch(self, data: Mapping[str, Any]) -> None:
-        allowed = {"url", "username", "password", "remote_name", "sync_interval_minutes", "timeout_seconds", "sync_direction"}
-        source = data.get("settings", data.get("values", data))
-        updates = _mapping(source, "WebDAV settings")
-        aliases = {
-            "sync_interval": "sync_interval_minutes",
-            "timeout": "timeout_seconds",
-            "direction": "sync_direction",
-        }
-        updates = {aliases.get(key, key): value for key, value in updates.items()}
-        unknown = set(updates).difference(allowed | {"enabled", "keep_password", "clear_password"})
-        if unknown:
-            raise DomainError("WebDAV settings contain an unsupported field")
+        updates = _settings_updates(data)
         draft = copy.deepcopy(self._draft_settings)
-        for key in allowed:
+        for key in _SETTINGS_FIELDS:
             if key not in updates:
                 continue
             value = updates[key]
-            if key == "password" and value == "__YOUNG_ROUTER_RETAIN_EXISTING__":
+            if key == "password" and value == _RETAINED_PASSWORD:
                 continue
             draft[key] = value
         if updates.get("clear_password") is True:
@@ -368,11 +410,16 @@ class WebDAVSettingsDomain:
             self._draft_enabled = bool(data["enabled"])
         self.revision += 1
 
-    def probe(self, _payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def probe(self, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
         from ...webdav import core as webdav_core
 
+        data = _mapping(payload or {}, "WebDAV probe")
+        # A test from the settings form names the values it tests, so the probe
+        # must neither stage them nor record a status the saved configuration
+        # did not produce: the strip under the form states this one result.
+        transient = data.get("values") is not None
         try:
-            settings = self._settings()
+            settings = self._settings(self._probe_candidate(data["values"]) if transient else None)
             if not settings.configured:
                 raise DomainError("WebDAV is not configured")
             client = webdav_core.WebDAVClient(settings)
@@ -382,15 +429,18 @@ class WebDAVSettingsDomain:
             except webdav_core.WebDAVHTTPError as exc:
                 if exc.code != 404:
                     raise
+            if transient:
+                return {"ok": True, "protocols": ["webdav"], "detail": "WebDAV probe succeeded"}
             self._last_probe = "ok"
             atomic_write_json(self.status_path, {"action": "probe", "checked_at": webdav_core._utc_now(), "ok": True})
             return {"ok": True, "protocols": ["webdav"], "detail": "WebDAV probe succeeded"}
         except Exception:
-            self._last_probe = "failed"
-            try:
-                atomic_write_json(self.status_path, {"action": "probe", "checked_at": webdav_core._utc_now(), "ok": False})
-            except PersistenceError:
-                pass
+            if not transient:
+                self._last_probe = "failed"
+                try:
+                    atomic_write_json(self.status_path, {"action": "probe", "checked_at": webdav_core._utc_now(), "ok": False})
+                except PersistenceError:
+                    pass
             return {"ok": False, "protocols": ["webdav"], "detail": "WebDAV probe failed"}
 
 __all__ = ["WebDAVSettingsDomain"]

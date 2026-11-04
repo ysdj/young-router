@@ -3434,16 +3434,16 @@ class CoreStore:
                 self._disk = core_checkpoint["disk"]
                 self._disk_identities = core_checkpoint["disk_identities"]
                 self._service = core_checkpoint["service"]
-                try:
-                    webdav_core.save_sync_status(status_path, operation, False)
-                except Exception:
-                    pass
                 # A sync error names its own cause (an incompatible remote
                 # bundle, a conflict); anything else is a plain failure.  The
                 # cause keeps its name even when the rollback itself failed:
                 # the pane has to state why the sync stopped, and "the rollback
                 # failed too" is not something the reader can act on.
                 cause_code = exc.code if isinstance(exc, webdav_core.SyncError) else "webdav_sync_failed"
+                try:
+                    webdav_core.save_sync_status(status_path, operation, False, cause_code)
+                except Exception:
+                    pass
                 if rollback_failed:
                     raise CoreError(cause_code, "WebDAV sync could not roll back local files") from None
                 if isinstance(exc, CoreError):

@@ -13,11 +13,15 @@ export const ROUTES: readonly RouteDefinition[] = [
   { id: "claude-settings", titleKey: "status.claude" },
   { id: "data-management", titleKey: "status.dataManagement" },
   { id: "provider-wizard", titleKey: "providers.wizard.title" },
+  // WebDAV's detail form is its own child window, opened from the sync pane it
+  // belongs to; it is a route because a child surface is a window, never an
+  // overlay over the pane that opened it.
+  { id: "webdav-settings", titleKey: "webdav.detailsTitle" },
   { id: "logs", titleKey: "status.logs" },
 ];
 
 export const MENU_ROUTES: readonly RouteDefinition[] = ROUTES.filter(
-  ({ id }) => id !== "claude-settings" && id !== "provider-wizard",
+  ({ id }) => id !== "claude-settings" && id !== "provider-wizard" && id !== "webdav-settings",
 );
 
 /**
@@ -50,7 +54,7 @@ export function isSettingsPaneRoute(route: AppRoute | undefined): boolean {
 
 /** Every non-home, non-sheet route renders inside the settings shell. */
 export function isSettingsShellRoute(route: AppRoute | undefined): boolean {
-  return route !== undefined && route !== "home" && route !== "provider-wizard" && route !== "file-editor";
+  return route !== undefined && route !== "home" && route !== "provider-wizard" && route !== "file-editor" && route !== "webdav-settings";
 }
 
 export function routeMenuActions(

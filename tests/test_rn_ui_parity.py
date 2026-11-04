@@ -164,10 +164,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }')
 
     def test_child_surfaces_state_their_result_beside_their_own_buttons(self) -> None:
-        # A child window (分组管理, the provider wizard, the raw file editor)
-        # keeps no status bar of its own: it states its result beside its own
-        # footer buttons, and the buttons keep their position.  The window that
-        # opened it states nothing about work it did not start.
+        # A child window (分组管理, the provider wizard, the raw file editor,
+        # the WebDAV detail form) keeps no status bar of its own: it states its
+        # result beside its own footer buttons, and the buttons keep their
+        # position.  The window that opened it states nothing about work it did
+        # not start.
         types = (ROOT / "rn/packages/shared/src/types.ts").read_text(encoding="utf-8")
         self.assertIn("  childSaving: string;", types)
         self.assert_ui_has('childSaving: translate("common.saving"),')
@@ -175,7 +176,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # Exactly one status line, and no step body repeats it.
         self.assert_ui_has('const wizardStatus = validation || loginFeedback.current || (loginPhase === "sign-in" ? translate("relay.loginWorking") : "");')
         self.assert_ui_has('const wizardFooterStatus = wizardStatus || status || "";')
-        self.assert_ui_has('{wizardFooterStatus ? <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.providerWizardFooterStatus}>{wizardFooterStatus}</Text> : <View style={styles.providerWizardFooterSpacer} />}')
+        self.assert_ui_has('{wizardFooterStatus ? <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.childSurfaceFooterStatus}>{wizardFooterStatus}</Text> : <View style={styles.childSurfaceFooterSpacer} />}')
+        # The WebDAV detail form is a child window too: its write is stated in
+        # its footer, beside the three buttons that own it.
+        self.assert_ui_has('const footerStatus = testing')
+        self.assert_ui_has('? translate("webdav.testing")')
+        self.assert_ui_has('{footerStatus ? <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.childSurfaceFooterStatus}>{footerStatus}</Text> : <View style={styles.childSurfaceFooterSpacer} />}')
+        self.assert_ui_has('<NativeButton primary title={translate("status.saveAndClose")} busy={saving} disabled={busy || saving || syncing} onPress={() => { void save(); }} />')
         self.assert_ui_not_has("providerWizardValidation")
         self.assert_ui_not_has('<Text style={styles.providerWizardHint}>{loginFeedback.current}')
         self.assert_ui_not_has("{loginFeedback.current ? <Text")
@@ -249,7 +256,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         gate = (ROOT / "rn/packages/shared/src/ui/providerWizardGate.ts").read_text(encoding="utf-8")
         self.assertIn("export function setGroupManagerOpen(open: boolean): void {", gate)
         self.assertIn("export function isGroupManagerOpen(): boolean {", gate)
-        self.assert_ui_has("return isProviderWizardOpen() || isAssistantEditorOpen() || isGroupManagerOpen();")
+        self.assert_ui_has("return isProviderWizardOpen() || isAssistantEditorOpen() || isGroupManagerOpen() || isWebDavSettingsOpen();")
         self.assert_ui_has("const applyStagedQuietly = (): Promise<void> => apply({ quiet: true });")
         # A host whose sheet can only save on close stages those same edits
         # after it is gone and states that host's outcome in the pane.
@@ -1153,8 +1160,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'busy={cooldownClearPending}',
             'busy={pendingAction === "import"}',
             'busy={pendingAction === "export"}',
-            'busy={pendingAction === "probe"} disabled={webDavBusy("probe")}',
-            'busy={pendingAction === "sync"}',
+            'busy={testing} disabled={saving}',
+            'busy={syncing} disabled={saving || !values.enabled}',
         ):
             self.assert_ui_has(marker)
         for marker in (
@@ -1280,18 +1287,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('inspectorContent: { paddingLeft: 0, paddingRight: 6')
         self.assertNotIn("inspectorContent: { paddingTop", self.ui)
         self.assert_ui_has("providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }")
-        self.assert_ui_has("providerListPane: { width: 180, minWidth: 180, maxWidth: 180")
+        self.assert_ui_has("providerListPane: { width: 140, minWidth: 140, maxWidth: 140")
         self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 132 }]}')
         # The model list is the upstream model, the public model, and the rate
-        # the route follows.  The model list keeps about 280 pt at the settings
-        # window's own default size, so every column carries a floor that still
-        # draws its whole header and a readable prefix of its value: the two
-        # name columns just fit that pane and share whatever a wider window
-        # adds, and a pane narrower than the floors keeps them and scrolls
-        # horizontally, because a column squeezed to a few pixels is not a
-        # column.  A trailing column that does not fit is reduced to nothing by
-        # the native layout, which would make 倍率 read as a column that never
-        # existed.  顺序 stays out of it: a model's order orders the routes
+        # the route follows.  The settings window's default width leaves that
+        # pane about 296 pt, and each column's floor is what its own content
+        # asks for: the upstream ids these routes serve read in full (the child
+        # row's indent is part of the cell), the public name may be ellipsized,
+        # and 倍率 holds a header and ``×0.25``.  The two name columns share
+        # whatever a wider window adds, and a pane narrower than the floors
+        # scales all three down together, because a column squeezed to a few
+        # pixels is not a column.  A trailing column that does not fit is
+        # reduced to nothing by the native layout, which would make 倍率 read as
+        # a column that never existed.  顺序 stays out of it: a model's order orders the routes
         # that share its public name, and these rows are grouped by key, so the
         # column compared numbers from sequences that have nothing to do with
         # each other.  倍率 is the other way round — a rate is a property of the
@@ -1300,8 +1308,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # prices.
         self.assert_ui_has('onLayout={({ nativeEvent }) => setModelTableWidth')
         self.assert_ui_has('modelTableColumns(modelTableWidth, translate)')
-        self.assert_ui_has('const MODEL_TABLE_MINIMUMS = [110, 88, 60] as const;')
-        self.assertLessEqual(110 + 88 + 60, 288)
+        self.assert_ui_has('const MODEL_TABLE_MINIMUMS = [124, 88, 54] as const;')
+        self.assertLessEqual(124 + 88 + 54, 296)
         self.assert_ui_has('compact firstColumnHorizontalPadding={0} preserveColumnWidths')
         self.assertNotIn('label: translate("common.order"), width: 60', self.ui)
         self.assertNotIn("modelOrderText(providerId, item)", self.ui)
@@ -1336,10 +1344,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('routeWorkspaceWithInspector', self.ui)
         self.assert_ui_has('routeTablePane: { flex: 1, minWidth: 0, minHeight: 0 }')
         self.assert_ui_has('onSelectionChange={(key) => selectRouteTableRow(key)}')
-        self.assert_ui_has('label: translate("providers.upstream"), width: 120 }, { label: translate("providers.provider"), width: 96 }, { label: translate("providers.providerKey"), width: 130')
+        self.assert_ui_has('label: translate("providers.upstream"), width: 160 }, { label: translate("providers.provider"), width: 84 }, { label: translate("providers.providerKey"), width: 150')
         # The routes table leads with the upstream model — the model a route
-        # actually calls — then names its provider, key, and order.
-        self.assert_ui_has('{ label: translate("common.order"), width: 64 }]} rows={routeRows}')
+        # actually calls — then names its provider, key, and order.  The
+        # trailing column carries nothing: the native table grows its last
+        # column to the pane's width, and 顺序 is a header and a number, not
+        # the widest thing in the pane.
+        self.assert_ui_has('{ label: translate("common.order"), width: 48 }, ROUTE_TABLE_SPACER_COLUMN]} rows={routeRows}')
+        self.assert_ui_has('const ROUTE_TABLE_SPACER_COLUMN = { label: "", width: 1 };')
         self.assert_ui_has(r'cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model) || translate("common.notAvailable")}`, providerDisplayName(entry.provider), modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources, providerCredentials(entry.provider, translate)), order]')
         self.assertNotIn('providers.orderSource', self.ui)
         self.assertNotIn('providers.effectiveOrder', self.ui)
@@ -1727,7 +1739,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '<Text numberOfLines={2} style={styles.dataManagementActionStatus}>{result ?? ""}</Text>',
             'const routeStatus = result ?? (busy ? translate("common.working") : undefined);',
             '{routeStatus ?? translate("common.ready")}',
-            'const dispatchDataManagement: Dispatch = (type, payload = {}, targetDomain = "webdav")',
         ):
             self.assert_ui_has(marker)
         # The command and its result share one field row: the row names the
@@ -1739,14 +1750,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )
         self.assertLess(workspace.index('{controls}'), workspace.index('<Text numberOfLines={2} style={styles.dataManagementActionStatus}>{result ?? ""}</Text>'))
         self.assert_ui_has('dataManagementActionStatus: { flexShrink: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14 }')
-        # The WebDAV row also states when the last sync landed, so a probe
-        # that succeeds beside a sync that fails says why: the pane names the
+        # The sync category also states when the last run landed, so a manual
+        # sync that fails says why the stamp stopped: the category names the
         # cause Core reported (an incompatible remote bundle, a conflict, or a
         # plain failure) instead of repeating one generic sentence.
         self.assert_ui_has('const lastSyncAt = stringValue(asRecord(asRecord(state.last_sync)).at);')
         self.assert_ui_has('translate("dataManagement.lastSync", { time: formatActionTimestamp(lastSyncAt) })')
         self.assert_ui_has('function formatActionTimestamp(value: string): string {')
-        self.assert_ui_has("</>, status, actionHint)}")
+        self.assert_ui_has('{translate("webdav.serverLabel")}{host === "" ? translate("webdav.notSet") : host}')
+        self.assert_ui_has('style={[styles.webdavSectionFact, lastFailed && styles.webdavSectionFactFailed]}')
+        self.assert_ui_has('{lastFailed ? ` ${translate("webdav.failedSuffix")}` : ""}')
+        self.assert_ui_has('function webdavHost(url: string): string {')
         self.assert_ui_has('const lastFailed = lastResult.ok === false && ["sync", "push", "pull"].includes(stringValue(lastResult.action));')
         self.assertIn('"dataManagement.lastSyncFailed": "上次同步失败（{time}），将在下个间隔重试"', self.zh)
         self.assert_ui_has("{hint === undefined ? null : <View style={SETTINGS_FIELD_HELP_SLOT}><Text style={SETTINGS_FIELD_HELP_TEXT}>{hint}</Text></View>}")
@@ -1761,10 +1775,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '"error.webdavSyncIncompatible": "远端文件由旧版本创建，无法直接同步。请改用“推送到远端”覆盖。"',
             '"error.webdavSyncConflict": "本机有未同步的改动，或两侧都已改动，同步已停止。请先保存或重新加载，或改用“推送到远端”/“从远端拉取”。"',
             '"error.webdavSyncFailed": "同步失败，请检查网络与 WebDAV 设置。"',
-            '"dataManagement.lastSync": "上次同步 {time}"',
+            '"dataManagement.lastSync": "上次同步：{time}"',
+            '"webdav.serverLabel": "服务器："',
+            '"webdav.failedSuffix": "失败"',
         ):
             self.assertIn(marker, self.zh)
-        self.assertIn('"dataManagement.lastSync": "Last sync {time}"', self.en)
+        self.assertIn('"dataManagement.lastSync": "Last sync: {time}"', self.en)
         # A sync that had to set an unreadable remote file aside says so, using
         # the summary Core returns with the dispatch.
         self.assert_ui_has('if (stringValue(summary.archived_remote) !== "") return "dataManagement.syncedReplacingRemote";')
@@ -1776,21 +1792,27 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # rather than per-window: the interval loop reads the same setting.
         self.assert_ui_has('translate("webdav.syncEveryHint")')
         self.assertIn(
-            '"webdav.syncEveryHint": "分钟；开启同步后按此间隔自动同步，填 0 表示只手动同步。"',
+            '"webdav.syncEveryHint": "开启同步后按此间隔自动同步，填 0 表示只手动同步。"',
             self.zh,
         )
-        self.assert_ui_has('const savedDirection = stringValue(state.sync_direction);')
         # The pane's settings are what the interval loop reads, so changing one
         # stages the patch and applies it — the switch has to reach the flag
         # file, and a draft the route never applies would leave it meaningless.
-        self.assert_ui_has("const commitWebDavSettings = (patch: UnknownRecord): Promise<void> => {")
+        # The summary's switch commits at once; the detail window's 保存并关闭
+        # sends the same staged patch through the same one write path.
+        self.assert_ui_has("const writeWebDavSettings = (patch: UnknownRecord): Promise<IpcResults[\"apply\"] | undefined> => {")
         self.assert_ui_has('const staged = await enqueueDispatch("patch", patch, "webdav");')
-        self.assert_ui_has('const applied = await ipc.apply("webdav", revision.current, diskChanged ? ["overwrite_external_webdav"] : undefined);')
-        self.assert_ui_has('onCommitSetting={(patch) => { void onCommitWebDavSettings(patch); }}')
-        self.assert_ui_has('onValueChange={(enabled) => onCommitSetting({ enabled })}')
+        self.assert_ui_has('applied = await ipc.apply("webdav", revision.current, diskChanged ? ["overwrite_external_webdav"] : undefined);')
+        # The switch lives in the form, so its enable commit is the form's
+        # 保存并关闭; the category only states whether it is on.
+        self.assert_ui_has('{webDavStateLabel(translate, enabled)}')
+        self.assert_ui_has('patch.enabled = draft.enabled;')
         self.assertIn("const DATA_MANAGEMENT_DIRTY_DOMAINS: readonly ConfigDomain[] = DATA_PACKAGE_DOMAINS;", self.ui)
-        self.assert_ui_has('onCommitSetting({ sync_direction: option.id === "sync" ? "smart" : option.id })')
-        self.assert_ui_has("onPress={() => onSync(selectedSync.id)}")
+        # The direction picker edits the detail window's draft, and the one
+        # "smart" spelling Core stores is written by the patch builder.
+        self.assert_ui_has('if (option) update({ sync_direction: option.id });')
+        self.assert_ui_has('patch.sync_direction = draft.sync_direction === "sync" ? "smart" : draft.sync_direction;')
+        self.assert_ui_has("await onSync(values.sync_direction);")
         self.assertNotIn("const [syncAction, setSyncAction] = useState<WebDavSyncAction>", self.ui)
         # Every secondary line of a data-management pane is one typography: the
         # result beside the buttons reads exactly like the tips under them.
@@ -1880,11 +1902,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('importLandingContent', self.ui)
         self.assert_ui_has('importIntro: { minHeight: 0, paddingHorizontal: 12, paddingVertical: 0, gap: 10 }')
         self.assert_ui_has('paneHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }')
-        # The WebDAV tab is a pane of the same grid: its fields spread the one
-        # shared field list instead of a form with its own widths and gaps, and
-        # the per-pane copy override that made its tips a different type step
-        # is gone.
-        self.assert_ui_has('webdavFieldList: { ...SETTINGS_FIELD_LIST }')
+        # A sync category keeps the one pane inset and reports in captions over
+        # values; the form it opens is fields of the same grid the panes draw.
+        for marker in (
+            'webdavSection: { gap: 6 }',
+            'webdavSectionSummary: { flexDirection: "row", alignItems: "center", gap: 12 }',
+            'webdavSectionFact: { flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 17 }',
+            'webdavSectionFactFailed: { color: systemColors.red }',
+            'webdavDialogBodyContent: { padding: SETTINGS_PANE_INSET }',
+        ):
+            self.assert_ui_has(marker)
+        self.assertIn('webdavFieldList: { ...SETTINGS_FIELD_LIST }', self.ui)
         self.assertNotIn('compactText:', self.ui)
         self.assertNotIn('webDavFormRows:', self.ui)
         self.assert_ui_has('dataManagementSectionList: { gap: 4 }')
@@ -1895,6 +1923,25 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('runtimeInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }')
         self.assert_ui_has('runtimeModifiedBar: { position: "absolute", left: 0, top: 3, bottom: 3, width: 2, borderRadius: 1, backgroundColor: "transparent" }')
         self.assert_ui_has('externalSettingsInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }')
+        # One width scale for every control in the grid, chosen by what the
+        # control holds: a switch takes its own slot, a number keeps only its
+        # digits beside its unit, a short value takes the value column, and a
+        # value that is text by nature takes the wide column.
+        for marker in (
+            "const SETTINGS_FIELD_VALUE_WIDTH = 160;",
+            "const SETTINGS_FIELD_NUMBER_WIDTH = 84;",
+            "const SETTINGS_FIELD_TEXT_WIDTH = 420;",
+            "runtimeNumberControl: { width: SETTINGS_FIELD_NUMBER_WIDTH",
+            "runtimeTextControl: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0 }",
+            "runtimeValueCellWide: { flex: 1, minWidth: 0, maxWidth: SETTINGS_FIELD_TEXT_WIDTH",
+            "runtimeValueSlot: { ...SETTINGS_FIELD_CELL }",
+            "externalSettingsValueSlot: { ...SETTINGS_FIELD_VALUE_SLOT }",
+            "generalApiKeyField: { flex: 1, minWidth: 0, maxWidth: SETTINGS_FIELD_TEXT_WIDTH }",
+            'width="number" value={portValue}',
+        ):
+            self.assert_ui_has(marker)
+        # No pane keeps a control column of its own beside the value column.
+        self.assertNotIn("SETTINGS_FIELD_ROUTE", self.ui)
         # The General pane is a settings pane too, so its labelled rows spread
         # the same grid instead of restating the label width, the tip indent,
         # and a pane inset of its own.
@@ -1921,7 +1968,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             1,
         )[0]
         export_pane = workspace.split('{tab === "export" ? <PersistentScrollView', 1)[1].split(
-            '<WebDavWorkspace',
+            '<WebDavSummary',
             1,
         )[0].rsplit('{tab === "webdav" ?', 1)[0]
         self.assertIn('{tab === "export" ? <PersistentScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>', workspace)
@@ -1967,26 +2014,41 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "function RuntimeField(",
             1,
         )[0]
-        webdav = self.ui.split("function WebDavWorkspace(", 1)[1].split("function WebDavPasswordField(", 1)[0]
+        webdav = self.ui.split("function WebDavSyncSection(", 1)[1].split("function WebDavSettingsPanel(", 1)[0]
+        webdav_form = self.ui.split("function WebDavSettingsPanel(", 1)[1].split("function WebDavPasswordField(", 1)[0]
         for marker in (
             "dataManagementToolbarButtons:",
             "dataManagementImportFileRow: { width: \"100%\", minHeight: 28, flexDirection: \"row\", alignItems: \"center\", gap: SETTINGS_FIELD_GAP, paddingLeft: SETTINGS_FIELD_LEAD }",
             "dataManagementImportFileLabel: { ...SETTINGS_FIELD_LABEL }",
         ):
             self.assert_ui_has(marker)
-        # The WebDAV form is fields of the shared grid, not a card of its own:
-        # every row spreads the one row/label/slot geometry the other panes use.
+        # A sync category reports instead of holding a form: captions over
+        # values, the one switch, and the command it exists for. The form it
+        # opens draws the same grid every pane does, including the label column.
         for marker in (
-            '<View style={styles.webdavFieldList}>',
-            '<View style={SETTINGS_FIELD}>',
-            '<View style={SETTINGS_FIELD_ROW_INDENTED}>',
-            'style={SETTINGS_FIELD_SWITCH_SLOT}',
-            '<View style={SETTINGS_FIELD_HELP_SLOT}>',
-            'style={SETTINGS_FIELD_ROW_INDENTED}',
-            'style={SETTINGS_FIELD_LABEL}',
-            'style={SETTINGS_FIELD_HELP_TEXT}',
+            '<View style={styles.webdavSection}>',
+            'style={styles.webdavSectionState}',
+            'style={styles.webdavSectionFact}',
+            '{translate("webdav.serverLabel")}{host === "" ? translate("webdav.notSet") : host}',
+            '<ActionButton title={translate("webdav.details")}',
         ):
             self.assertIn(marker, webdav)
+        self.assertNotIn("<NativeToggle", webdav)
+        for marker in (
+            '<PersistentScrollView style={styles.webdavDialogBody} contentContainerStyle={styles.webdavDialogBodyContent}',
+            '<WebDavField label=',
+        ):
+            self.assertIn(marker, webdav_form)
+        # The field is one helper, so every row of the form reads the same.
+        for marker in (
+            'function WebDavField({ label, hint, children }',
+            'style={styles.webdavFieldLabel}',
+            'style={styles.webdavFieldHelpSlot}',
+            'style={styles.webdavFieldHelpText}',
+        ):
+            self.assert_ui_has(marker)
+        self.assertNotIn('SETTINGS_FIELD_LABEL', webdav)
+        self.assertIn('webdavFieldLabel: { ...SETTINGS_FIELD_LABEL }', self.ui)
         self.assertNotIn('<DataManagementGroup style={styles.webDavForm}>', self.ui)
         for legacy_form in (
             "webdavFormBody:",
@@ -2026,19 +2088,26 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('DataManagementGroup title=', workspace)
         self.assertIn('dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: SETTINGS_FIELD_GAP, paddingLeft: SETTINGS_FIELD_LEAD }', self.ui)
         self.assertIn('dataManagementImportFileValue: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground }', self.ui)
-        self.assertIn('<NativePicker labels={syncOptions.map(({ title }) => title)} selectedValue={selectedSync.title}', webdav)
-        # A sync direction is a short fixed list, so its picker takes the one
-        # control column the text fields above it take.
-        self.assertIn('dataManagementDirectionPicker: { width: SETTINGS_FIELD_VALUE_WIDTH, height: 24', self.ui)
+        self.assertIn('<NativePicker labels={syncOptions.map(({ title }) => title)} selectedValue={selectedSync.title}', webdav_form)
+        # Every width here is the shared grid's scale, not a number this pane
+        # chose: a picker and a short name take the value column, the address
+        # and the filename are text and take the wide column, and a number of
+        # seconds keeps only its digits.
+        self.assertIn('webdavFieldPicker: { width: SETTINGS_FIELD_VALUE_WIDTH, height: 26, flexGrow: 0, flexShrink: 0 }', self.ui)
+        self.assertIn('webdavFieldText: { flex: 1, minWidth: 0, maxWidth: SETTINGS_FIELD_TEXT_WIDTH }', self.ui)
+        self.assertIn('webdavFieldShort: { width: SETTINGS_FIELD_VALUE_WIDTH, flexGrow: 0, flexShrink: 0, minWidth: 0 }', self.ui)
+        self.assertIn('webdavFieldNumber: { width: SETTINGS_FIELD_NUMBER_WIDTH, height: 26, flexGrow: 0, flexShrink: 0 }', self.ui)
         self.assertNotIn('<WindowTabs values={syncOptions}', workspace)
         self.assertNotIn('<ActionButton primary title={translate("dataManagement.chooseImportFile")}', workspace)
         self.assertIn('{actionRow(<ActionButton primary title={translate("dataManagement.importSelected")}', workspace)
         # One primary action per pane, and it is a field of that pane's grid:
-        # export keeps its own, while the WebDAV pane's two actions live in the
-        # WebDAV field surface it draws.
+        # export keeps its own, while the sync category's own command is an
+        # ordinary button and its test lives in the form it opens.
         self.assertIn('<ActionButton primary title={translate("dataManagement.exportSelected")}', workspace)
-        self.assertIn('title={translate("dataManagement.testConnection")}', webdav)
-        self.assertIn('title={translate("dataManagement.syncNow")}', webdav)
+        self.assertIn('<ActionButton title={translate("webdav.details")}', webdav)
+        self.assertNotIn('primary title={translate("webdav.details")}', webdav)
+        self.assertIn('title={translate("dataManagement.testConnection")}', webdav_form)
+        self.assertNotIn('translate("dataManagement.testConnection")', webdav)
 
     def test_import_stages_sections_and_immediate_apply_writes_them(self) -> None:
         workspace = self.ui.split("function DataManagementWorkspace(", 1)[1].split(
@@ -2085,10 +2154,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for command in (
             '{actionRow(<ActionButton primary title={translate("dataManagement.importSelected")}',
             '{actionRow(<ActionButton primary title={translate("dataManagement.exportSelected")}',
-            '{actionRow(<><ActionButton title={translate("dataManagement.testConnection")}',
-            '<ActionButton primary title={translate("dataManagement.syncNow")}',
         ):
             self.assertIn(command, self.ui)
+        # The sync category has no command of its own: its run lives in the form.
+        self.assertNotIn('dataManagement.syncNow', self.ui)
         # A command stands in the control column of an unlabelled action row:
         # the label column stays (so the buttons land on the pane's control
         # column) and stays empty, because each button names its own action.
@@ -2138,14 +2207,26 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The header band carries no rule of its own.  The sidebar and the
         # pane used to each draw a hairline under their title, so the window
         # showed two lines that read as artifacts rather than as structure;
-        # the sidebar's material boundary is its own edge, so no column rule
-        # is left over it either.
+        # the sidebar's chrome boundary is its own edge, so no column rule is
+        # left over it either.
         self.assertNotIn('settingsSidebarDivider', self.ui)
         self.assertNotIn('settingsPaneDivider', self.ui)
-        # The sidebar draws no column rule: its vibrant material already ends
-        # at the edge, and the rule read as a line floating over it.  The
-        # rail's own divider is what still tells a second column apart.
-        self.assertIn('settingsSidebar: { width: 200, minWidth: 0, flexShrink: 0, minHeight: 0 }', self.ui)
+        # The window's chrome is one L: the title bar and the sidebar draw the
+        # border's own colour, so the two read as a single surface and no rule
+        # cuts across it.  A transparent sidebar showed the desktop through the
+        # window and left the header band as white as the content beside it.
+        self.assertIn(
+            'settingsShellHeader: { flexShrink: 0, flexDirection: "row", minWidth: 0, '
+            'backgroundColor: systemColors.separator }, '
+            'settingsShellHeaderWindows: { backgroundColor: systemColors.window, '
+            'borderBottomWidth: 1, borderBottomColor: systemColors.separator }',
+            self.ui,
+        )
+        self.assertIn(
+            'settingsSidebar: { width: 200, minWidth: 0, flexShrink: 0, minHeight: 0, '
+            'backgroundColor: systemColors.separator }',
+            self.ui,
+        )
         # The rail's column rule is a sibling divider, so it stays whole where
         # the list reaches past the list container's own edge.
         self.assertIn(
@@ -2173,9 +2254,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # user sees where a list ends, so dropping the 1 pt box left the
         # provider and model lists, the keys list and the log table unbounded
         # against the window background.  The two columns that are not content
-        # lists opt out: the sidebar's own source list sits on the vibrant
-        # sidebar material, and the rail is a column of its pane bounded by the
-        # one right divider it draws itself.  A box around either one drew a top
+        # lists opt out: the sidebar's own source list sits on the window's
+        # chrome, and the rail is a column of its pane bounded by the one right
+        # divider it draws itself.  A box around either one drew a top
         # and a bottom rule that belonged to no row plus a right edge doubling
         # an edge that already exists, so the opt-out exists exactly twice.
         self.assertEqual(7, self.ui.count("<NativeTable"))
@@ -2224,13 +2305,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('native.window.open(next);', shell)
         self.assertIn('native.window.close(Platform.OS === "windows" ? pane : windowRoute);', shell)
         self.assertIn('<RouteSurface route={pane} shell', shell)
-        # Beta Display's native settings layout: an app identity header with a
-        # hairline, a pane source list, and a flexible spacer. About lives in
-        # the native application/tray menu instead of the sidebar.
+        # Beta Display's native settings layout: an app identity header, a pane
+        # source list, and a flexible spacer. About lives in the native
+        # application/tray menu instead of the sidebar.
         self.assertIn('<Text numberOfLines={1} style={styles.settingsSidebarTitle}>{translate("app.title")}</Text>', shell)
         self.assertIn('<View style={styles.settingsSidebarSpacer} />', shell)
         self.assertIn('<View style={[styles.settingsPaneHeader, styles.settingsPaneHeaderIntegrated]}>', shell)
-        self.assertIn('<View style={styles.settingsShellHeader}>', shell)
+        self.assertIn('<View style={[styles.settingsShellHeader, Platform.OS === "windows" && styles.settingsShellHeaderWindows]}>', shell)
         self.assertIn('void native.versionInfo().then((next) => { if (active) setAppInfo(next); })', shell)
         self.assertNotIn("lastSelection", shell)
         self.assertNotIn('AboutPane', shell)
@@ -2472,7 +2553,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '"status.dataManagement": "Backup & Sync"',
             '"dataManagement.tab.import": "Import"',
             '"dataManagement.tab.export": "Export"',
-            '"dataManagement.tab.webdav": "WebDAV Sync"',
+            '"dataManagement.tab.webdav": "Sync"',
             '"dataManagement.section.providersModels": "Providers & Models"',
             '"dataManagement.section.relayAccounts": "Provider accounts"',
             '"dataManagement.importHint": "Choose a file to detect its importable configuration automatically."',
@@ -2483,7 +2564,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '"status.dataManagement": "备份与同步"',
             '"dataManagement.tab.import": "导入"',
             '"dataManagement.tab.export": "导出"',
-            '"dataManagement.tab.webdav": "WebDAV 同步"',
+            '"dataManagement.tab.webdav": "同步"',
             '"dataManagement.section.providersModels": "供应商与模型"',
             '"dataManagement.section.relayAccounts": "供应商账号"',
             '"dataManagement.importHint": "选择文件后会自动识别可导入的配置项。"',
@@ -2822,7 +2903,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "AssistantSettingsWorkspace": ("externalSettingsWorkspace:", "externalSettingsPane:"),
             "RuntimeWorkspace": ("runtimeWorkspace:", "runtimeScrollSurface:"),
             "DataManagementWorkspace": ("dataManagementWorkspace:", "dataManagementPane:"),
-            "WebDavWorkspace": ("dataManagementPane:", "webdavFieldList:"),
+            "WebDavSyncSection": ("webdavSection:", "webdavSectionHeader:"),
+            "WebDavSettingsPanel": ("webdavDialogSurface:", "webdavDialogBody:", "webdavDialogBodyContent:"),
             "LogsWorkspace": (
                 "logsWindow:",
                 "logsToolbar:",
@@ -2896,7 +2978,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("if len(candidates) != 1:", shared)
         self.assertIn("function clientRouteLabel(provider: string, model: string): string {", self.ui)
         self.assertIn("function savedRouteMenuGroups(models: UnknownRecord[], translate: Translate)", self.ui)
-        self.assertIn("function ClientBackendFields({ accessibilityPrefix, models, native, localApiActive, designatedRoute, designatedSelection, modelList, modelListHint, busy, onUseLocalApi, onUseSavedModel, translate }", self.ui)
+        self.assertIn("function ClientBackendFields({ accessibilityPrefix, models, native, localApiActive, designatedRoute, designatedSelection, modelList, modelListHint, busy, onStatus, onUseLocalApi, onUseSavedModel, translate }", self.ui)
 
     def test_external_settings_list_only_registered_client_files_with_paths(self) -> None:
         # The client controls and the file rows are two components because one
@@ -2974,7 +3056,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'translate("codex.modelCatalogHint")',
             "const toggleCatalog = (enabled: boolean): void => {",
             "void onToggleCodexModelCatalog(enabled).finally(() => setCatalogBusy(false));",
-            "disabled={(busy && !listBusy) || listBusy}",
+            # This app's model list names models only its proxy serves, so the
+            # row is one of the pane's proxy-scoped switches: it is disabled,
+            # and says why, while the client points somewhere else.
+            "proxyOnly={localApiActive}",
+            "disabled={busy || !proxyOnly}",
+            'translate("settings.useLocalApiRequired")',
+            "styles.externalSettingsFieldLabelUnavailable",
             "styles.externalSettingsFieldLabel",
             "styles.externalSettingsValueSlot",
             "styles.externalSettingsHelpSlot",
@@ -3008,24 +3096,29 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "styles.externalSettingsHelpSlot",
             # One on/off setting is a switch, never a checkbox.
             "<NativeToggle",
-            "disabled={(busy && !listBusy) || listBusy}",
             "void onUseLocalApi(designatedSelection ?? {}).finally(() => setClientActionBusy(false));",
             # On the proxy the model is only a public name, so the route the
             # user last chose decides where "off" goes instead of the first
             # matching row; Core remembers it because the client's own file no
             # longer carries it.
             "designatedSelection={codexRoute}",
-            "if (!designatedSelection) { assembleSwitch(); return; }",
+            # A client that never named a route has no destination to return to,
+            # so unchecking asks for one at the control that names a route
+            # instead of bouncing the box back onto the proxy.
+            "if (designatedSelection) { designateSavedModel(designatedSelection); return; }",
+            "const savedModelCount = menuGroups.reduce((total, group) => total + group.labels.length, 0);",
+            'onStatus?.(translate("settings.designateAsUnavailable"));',
+            'onStatus?.(translate("settings.useLocalApiOffPrompt"));',
+            "openSavedModelMenu(designateButtonRef.current);",
             "designateSavedModel(designatedSelection);",
             "value={localApiActive}",
             'accessibilityLabel={labelled("settings.useLocalApi")}',
             'translate("settings.useLocalApiHint")',
             # The switch is a real two-way switch driven by the config: on
             # adopts this app's proxy, off returns the client to the saved
-            # route the control names (resolved from the client's own provider
-            # and model, so unchecking opens no menu).  A check that cannot
-            # name a saved route changes nothing and re-mounts the box onto the
-            # configured value.
+            # route the control names, and a client that never named one is
+            # asked for a route instead of having the box bounce back.  A check
+            # nobody can answer re-mounts the box onto the configured value.
             "disabled={(busy && !(clientActionBusy || designateBusy)) || clientActionBusy || designateBusy}",
             "onValueChange={toggleLocalApi}",
             "const toggleLocalApi = (enabled: boolean): void => {",
@@ -3389,10 +3482,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "rn/apps/windows/windows/YoungRouter/YoungRouter.cpp",
         ):
             self.assertNotIn("image-context", (ROOT / path).read_text(encoding="utf-8"), path)
-        # The two remaining child surfaces are the wizard and the raw editor.
-        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" {', MACOS_LEAF.read_text(encoding="utf-8"))
+        # The remaining child surfaces are the wizard, the raw editor, and the
+        # WebDAV detail form.
+        self.assertIn('if windowRoute == "provider-wizard" || windowRoute == "file-editor" || windowRoute == "webdav-settings" {', MACOS_LEAF.read_text(encoding="utf-8"))
         self.assertIn(
-            'if (route != L"provider-wizard" && route != L"file-editor") return;',
+            'if (!IsChildRoute(route)) return;',
             (ROOT / "rn/apps/windows/windows/YoungRouter/YoungRouter.cpp").read_text(encoding="utf-8"),
         )
 
@@ -4011,6 +4105,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "runtimeJsonField:",
             "runtimeUnit:",
             "runtimeActionSlot:",
+            # A number and its unit share the one value cell, so the unit and
+            # the row's action land on the grid instead of drifting with the
+            # old full-width field.
+            '<View style={textValue ? styles.runtimeValueCellWide : styles.runtimeValueSlot}>',
+            'width={numericKind ? "number" : "text"}',
             "runtimeHelpSlot:",
             "runtimeWorkspaceBody:",
             "<SettingsRail rows={tocRows}",
@@ -7029,8 +7128,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('"providers.effectiveOrder"', self.zh)
         self.assertIn('"providers.keyName": "密钥名"', self.zh)
         self.assertIn('"providers.keyValue": "密钥值"', self.zh)
+        # The list is a column of provider names, and its widest row is
+        # ``youyangai``: a 140 pt pane holds that beside the row's padding and
+        # leaves the models their width.  The pane is fixed, so a long name
+        # ellipsizes instead of pushing the two panes beside it.
         self.assert_ui_has('columns={[{ label: translate("providers.provider"), width: 132 }]}')
-        self.assert_ui_has('providerListPane: { width: 180, minWidth: 180, maxWidth: 180')
+        self.assert_ui_has('providerListPane: { width: 140, minWidth: 140, maxWidth: 140')
         # The providers side's model list is the upstream model, its public
         # model, and the rate the route follows: it carries no 顺序 column,
         # because that number orders one public model's routes while these rows
@@ -7126,25 +7229,34 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "function RuntimeField(",
             1,
         )[0]
+        section = self.ui.split("function WebDavSyncSection(", 1)[1].split("function WebDavSettingsPanel(", 1)[0]
+        form = self.ui.split("function WebDavSettingsPanel(", 1)[1].split("function WebDavPasswordField(", 1)[0]
         for marker in (
-            "function WebDavWorkspace(",
+            "function WebDavSyncSection(",
+            "function WebDavSettingsPanel(",
             '{tab === "webdav" ? <PersistentScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>',
-            '<WebDavWorkspace snapshot={snapshot} busy={busy || webDavOperationBusy} pendingAction={pendingAction} webDavBusy={webDavBusy} actionRow={actionRow} onProbe={() => { void runPendingAction("probe", onProbeWebDav); }} onSync={(direction) => { void runPendingAction("sync", () => onSyncWebDav(direction)); }} status={statuses.webdav} translate={translate} dispatch={dispatch} onSecretState={onSecretState} onCommitSetting={(patch) => { void onCommitWebDavSettings(patch); }} />',
-            '<NativeToggle accessibilityLabel={translate("webdav.enabled")} value={booleanValue(state.enabled)} disabled={busy} onValueChange={(enabled) => onCommitSetting({ enabled })} style={SETTINGS_FIELD_SWITCH_SLOT} />',
-            '<View style={SETTINGS_FIELD_ROW_INDENTED}>',
-            '<Text style={SETTINGS_FIELD_LABEL}>{translate("webdav.enabled")}</Text>',
-            'webdavFieldList: { ...SETTINGS_FIELD_LIST }',
-            'webdavFieldUnit: { width: 68, flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }',
-            'label={translate("webdav.url")}',
-            'label={translate("webdav.remoteFile")}',
-            'label={translate("webdav.syncEvery")}',
+            '<WebDavSyncSection snapshot={snapshot} onOpenSettings={onOpenWebDavSettings} status={statuses.webdav} translate={translate} />',
+            '{webDavStateLabel(translate, enabled)}',
+            # The category names itself and carries its own 设置: that button
+            # belongs to WebDAV 同步, not to the 同步 tab that lists categories.
+            '<Text numberOfLines={1} style={styles.webdavSectionTitle}>{translate("webdav.sectionTitle")}</Text>',
+            '<ActionButton title={translate("webdav.details")} onPress={onOpenSettings} />',
+            # The category is two lines: the title with its state and 设置, then
+            # the server it syncs to with the last run's outcome.
+            '<View style={styles.webdavSectionHeader}>',
+            '<View style={styles.webdavSectionSummary}>',
+            '<Text numberOfLines={1} style={styles.webdavSectionFact}>{translate("webdav.serverLabel")}{host === "" ? translate("webdav.notSet") : host}</Text>',
+            '<Text numberOfLines={1} style={[styles.webdavSectionFact, lastFailed && styles.webdavSectionFactFailed]}>{translate("dataManagement.lastSync", { time: formatActionTimestamp(lastSyncAt) })}{lastFailed ? ` ${translate("webdav.failedSuffix")}` : ""}</Text>',
+            # The form it opens is fields of the shared settings grid.
+            '<View style={styles.webdavFieldList}>',
+            '<WebDavField label={translate("webdav.url")}>',
+            'label={translate("webdav.remoteFile")} hint={translate("webdav.remoteFileHint")}',
+            'label={translate("webdav.syncEvery")} hint={translate("webdav.syncEveryHint")}',
             'label={translate("webdav.httpTimeout")}',
+            'label={translate("dataManagement.syncDirection")} hint={translate(selectedSync.hintKey)}',
             "function WebDavPasswordField(",
-            'hint={configured ? translate("webdav.passwordHintConfigured") : translate("webdav.passwordHintOptional")}',
-            'webdavPasswordInput: { width: SETTINGS_FIELD_VALUE_WIDTH, minHeight: 26 }',
-            'labelWidth={SETTINGS_FIELD_LABEL_WIDTH}',
-            'controlWidth={SETTINGS_FIELD_VALUE_WIDTH}',
-            'style={SETTINGS_FIELD_ROW_INDENTED}',
+            'placeholder={configured ? translate("webdav.passwordHintConfigured") : translate("webdav.passwordHintOptional")}',
+            'webdavDialogBodyContent: { padding: SETTINGS_PANE_INSET }',
             "dataManagementToolbarButtons:",
         ):
             self.assert_ui_has(marker)
@@ -7152,15 +7264,80 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '<NativeSecretField label={translate("webdav.password")}',
             self.ui,
         )
-        self.assertEqual(1, workspace.count("<WebDavWorkspace "))
+        self.assertEqual(1, workspace.count("<WebDavSyncSection "))
+        # The category reports in captions; the dialog's labelled rows are the
+        # grid's, so one edit to the grid moves 运行时, 外部 and this form together.
+        self.assertNotIn("SETTINGS_FIELD_LABEL", section)
+        self.assertIn("webdavFieldRow: { ...SETTINGS_FIELD_ROW_INDENTED }", self.ui)
+        self.assertIn("webdavFieldLabel: { ...SETTINGS_FIELD_LABEL }", self.ui)
+        # The display states the state; the switch itself is the form's.
+        self.assertNotIn("<NativeToggle", section)
+        self.assertIn('<NativeToggle accessibilityLabel={translate("webdav.enabled")} value={values.enabled}', form)
+        # Nothing else may join the category: two rows is the whole display,
+        # and everything that acts (the switch, the one-off run, the probe)
+        # stays in the form.
+        for removed in ("webdavFact", "webdavEnableRow", "webdavSectionActions"):
+            self.assertNotIn(removed, section)
+        self.assertNotIn("dataManagement.webdavHint", self.ui)
+        self.assertNotIn("dataManagement.syncNow", self.ui)
+        self.assertNotIn("dataManagement.webdavScope", self.ui)
+        # The probe sits beside the file it tests; the one-off run is its own row
+        # under the switch it needs.
+        self.assertNotIn('translate("dataManagement.testConnection")', section)
+        self.assertIn('<NativeButton title={translate("dataManagement.testConnection")} busy={testing} disabled={saving}', form)
+        self.assertIn('<NativeButton title={translate("webdav.syncNow")} busy={syncing} disabled={saving || !values.enabled}', form)
+        # A 44 pt switch leaves no room for a button beside it: pushed together
+        # the two read as one crowded control. The command therefore takes its
+        # own row on the grid's control column, and no spacer moves it to the
+        # row's far edge where it would read as the window's commit.
+        self.assertIn('<WebDavField label={translate("webdav.enabled")}>\n          <NativeToggle', form)
+        self.assertIn('<Text style={styles.webdavFieldLabel}>{""}</Text>\n            <NativeButton title={translate("webdav.syncNow")}', form)
+        self.assertNotIn('webdavDialogSpacer', self.ui)
+        self.assertNotIn('webdavFieldSpacer', self.ui)
+        # A stopped run states the step that clears it, not just "failed": the
+        # cause Core recorded picks the sentence, and the sentence names the
+        # control (推送 / 拉取 / 测试连接) that clears it.
+        self.assert_ui_has('const failureRemedy = webdavFailureRemedy(stringValue(lastResult.code));')
+        self.assert_ui_has('function webdavFailureRemedy(code: string): TranslationKey {')
+        self.assert_ui_has('{lastFailed && lastSyncAt !== "" ? <Text numberOfLines={1} style={styles.webdavSectionStatus}>{translate(failureRemedy)}</Text> : null}')
+        self.assertIn('"webdav.remedy.conflict": "两侧都已改动，请在设置里改选「推送到远端」或「从远端拉取」"', self.zh)
+        self.assertIn('"webdav.remedy.incompatible": "远端文件由旧版本创建，请在设置里选「推送到远端」"', self.zh)
+        self.assertIn('"webdav.remedy.disconnected": "连接失败，请在设置里测试连接"', self.zh)
+        self.assertNotIn('translate("dataManagement.testConnection")} busy={testing} disabled={saving || busy} onPress={() => { void test(); }} />\n        <NativeButton title={translate("status.close")}', form)
+        # The form is a child window: it is opened from the category, and every
+        # control of it edits a draft that only 保存并关闭 writes.
+        self.assert_ui_has('onOpenWebDavSettings={() => { native.window.open("webdav-settings"); native.window.focus("webdav-settings"); }}')
+        self.assert_ui_has('{route === "webdav-settings" ? <WebDavSettingsPanel snapshot={snapshot} busy={busy} status={dataManagementStatuses.webdav} translate={translate} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onProbe={probeWebDavDetails} onSave={saveWebDavDetails} onSync={syncWebDav} onClose={closeRoute} /> : null}')
+        self.assert_ui_has('const saveWebDavDetails = (patch: UnknownRecord): Promise<boolean> => writeWebDavSettings(patch).then((applied) => applied !== undefined);')
+        self.assert_ui_has('const patch = webDavDetailPatch(values, saved);')
+        self.assert_ui_has('<NativeButton primary title={translate("status.saveAndClose")} busy={saving} disabled={busy || saving || syncing} onPress={() => { void save(); }} />')
+        # The form holds the pane's auto-apply while it is open: its values are
+        # one draft until 保存并关闭, so nothing of it may reach Core early.
+        self.assert_ui_has('setWebDavSettingsOpen(true);')
+        self.assert_ui_has('return isProviderWizardOpen() || isAssistantEditorOpen() || isGroupManagerOpen() || isWebDavSettingsOpen();')
+        # 保存并关闭 flushes the field the user was typing — the native secure
+        # field stages the password — and 关闭 drops whatever Core staged, so
+        # neither button leaves half a draft behind.
+        self.assert_ui_has('await onFlushPendingFields();')
+        self.assert_ui_has('nothingToWrite = Object.keys(patch).length === 0 && !stagedSecret.current;')
+        self.assert_ui_has('void enqueueDispatch("cancel", {}, "webdav").catch(() => undefined);')
+        # 测试连接 tests the form's values, not the saved ones: the candidate
+        # rides the probe request, so a test stages and saves nothing.
+        # A probe is one action of this child surface: it keeps the window's
+        # controls live, so the reader can close it or fix a field while the
+        # server is being asked.
+        self.assert_ui_has('const probeWebDavDetails = (values: UnknownRecord): Promise<void> => runDataManagement("webdav", () => ipc.probe(undefined, undefined, "webdav", values), (value) => (asRecord(value).ok === true ? "webdav.probeOk" : "webdav.probeFailed"), true);')
+        self.assert_ui_has('const waiting = busy || saving;')
+        self.assertNotIn('const waiting = busy || saving || testing || syncing;', self.ui)
+        self.assert_ui_has('await onProbe(webDavDetailProbe(values));')
+        self.assert_ui_has('function webDavDetailProbe(draft: WebDavDetailDraft): UnknownRecord {')
         # The tab's name rides the shared header band, so the retired 同步设置
         # heading left both the copy and the styles.
         self.assertNotIn("dataManagement.syncSettings", self.ui)
         self.assertNotIn("dataManagementPolishStyles.paneHeading", self.ui)
         self.assertNotIn('dataManagementGroupDivider', workspace)
         # The form was a stack of its own rows, its own two action lines, and
-        # two style layers that cancelled each other's rules; the pane now
-        # draws grid fields and lets one action row and the strip report.
+        # two style layers that cancelled each other's rules.
         for legacy in (
             "webdavFormBody:",
             "webdavFormRows:",
@@ -7176,16 +7353,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertNotIn(legacy, self.ui)
         self.assertNotIn('webdavActionSpacer:', self.ui)
         self.assertNotIn('webdavHeaderActions:', self.ui)
-        webdav_component = self.ui.split("function WebDavWorkspace(", 1)[1].split("function WebDavPasswordField(", 1)[0]
         # The enable row states the setting and nothing else: the connection
-        # state is the pane's own work, and the window's one strip reports it.
-        # A status line under the switch read as a second report surface.
-        self.assertNotIn("webdavMenuStatus(snapshot.service.webdav", webdav_component)
-        # Immediate apply: neither the fields nor the pane's action row keeps
-        # an Apply button — the staged fields are written by the shell's
-        # auto-apply, and 测试连接 / 立即同步 run the two WebDAV operations.
-        self.assertNotIn('title={translate("common.saveAndApply")}', webdav_component)
-        self.assertIn('const syncOptions = WEBDAV_SYNC_OPTIONS.map(', webdav_component)
+        # state is the category's own work, and the window's one strip reports it.
+        self.assertNotIn("webdavMenuStatus(snapshot.service.webdav", form)
+        # The form has one explicit write and no Apply button of its own.
+        self.assertNotIn('title={translate("common.saveAndApply")}', form)
+        self.assertIn('const syncOptions = WEBDAV_SYNC_OPTIONS.map(', form)
         self.assertNotIn("dataManagementSectionGrid:", self.ui)
         self.assertNotIn("footerCompact:", self.ui)
         self.assertNotIn("dataManagementRelayRow:", self.ui)
@@ -7197,19 +7370,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '{ id: "sync", labelKey: "dataManagement.syncSmart", hintKey: "dataManagement.syncSmartHint" }',
             '{ id: "push", labelKey: "dataManagement.syncPush", hintKey: "dataManagement.syncPushHint" }',
             '{ id: "pull", labelKey: "dataManagement.syncPull", hintKey: "dataManagement.syncPullHint" }',
-            'onSyncWebDav: (action: WebDavSyncAction) => Promise<void>;',
+            'onSync: (action: WebDavSyncAction) => Promise<void>;',
             'const runWebDavOperation = async (operation: () => Promise<unknown>, message: ResultMessage): Promise<void> => {',
             'if (webDavOperationInFlight.current) return;',
-            'webDavOperationBusy={webDavOperationBusy}',
-            'disabled={webDavBusy("sync") || snapshot?.webdav.enabled !== true}',
             'type: action, payload: { sections: [...WEBDAV_SYNC_DOMAINS] }',
-            '{actionRow(<><ActionButton title={translate("dataManagement.testConnection")} busy={pendingAction === "probe"} disabled={webDavBusy("probe")} onPress={onProbe} />',
+            '<NativeToggle accessibilityLabel={translate("webdav.enabled")} value={values.enabled} disabled={waiting} onValueChange={(enabled) => update({ enabled })} style={styles.webdavFieldSwitch} />',
+            '<NativeButton title={translate("webdav.syncNow")} busy={syncing} disabled={saving || !values.enabled} onPress={() => { void syncNow(); }} />',
         ):
             self.assert_ui_has(marker)
-        # The scope sentence is derived from the sections Core actually syncs,
-        # so the pane cannot claim a scope the dispatch does not send.
-        self.assert_ui_has('const syncScope = DATA_PACKAGE_SECTIONS.filter(({ domain }) => WEBDAV_SYNC_DOMAINS.includes(domain)).map(({ labelKey }) => translate(labelKey)).join(" · ");')
-        self.assertNotIn('translate("dataManagement.section.providersModels")} · {translate("dataManagement.section.relayAccounts")', self.ui)
+        # The scope is every section the dispatch sends; it is not a field, so
+        # no control can claim a narrower one.
+        self.assert_ui_has('await onSync(values.sync_direction);')
+        self.assertNotIn('dataManagement.webdavScope', self.ui)
+        self.assertNotIn('syncScope', self.ui)
 
     def test_native_toggles_size_themselves_instead_of_a_wrapper(self) -> None:
         """A native control owns its frame; a wrapper view cannot size it."""
@@ -7745,7 +7918,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_external_settings_and_webdav_actions_keep_visible_labels(self) -> None:
         self.assert_ui_has('title={translate("dataManagement.testConnection")}')
         self.assert_ui_has('title={translate("dataManagement.testConnection")}')
-        self.assert_ui_has('title={translate("dataManagement.syncNow")}')
+        self.assert_ui_has('title={translate("webdav.syncNow")}')
         # The pane edits files directly; the old structured heading is gone,
         # and the one remaining client-level shortcut lives in Codex's header.
         self.assertNotIn('translate("settings.structured")', self.ui)
@@ -7874,15 +8047,25 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("statusMenuOrder", self.macos_leaf)
         self.assertNotIn("makeMenu", self.macos_leaf)
 
-    def test_data_management_route_replaces_standalone_webdav_route_everywhere(self) -> None:
+    def test_webdav_detail_form_is_a_child_window_of_the_sync_tab(self) -> None:
+        # WebDAV stays a tab of Backup & Sync, never a sidebar pane: the tab's
+        # full form is the one child window it opens, so the route exists
+        # without ever becoming a menu entry or a settings pane, and it keeps
+        # no status strip of its own.
         routes = (ROOT / "rn/packages/shared/src/routes.ts").read_text(encoding="utf-8")
         types = (ROOT / "rn/packages/shared/src/types.ts").read_text(encoding="utf-8")
         macos_app = (ROOT / "rn/apps/macos/macos/YoungRouter-macOS/AppDelegate.mm").read_text(encoding="utf-8")
         windows_app = (ROOT / "rn/apps/windows/windows/YoungRouter/YoungRouter.cpp").read_text(encoding="utf-8")
         for source in (self.ui, routes, types, self.macos_leaf, self.platform_entry, self.windows_leaf, macos_app, windows_app):
-            self.assertNotIn('"webdav-settings"', source)
             self.assertNotIn('"open-webdav-settings"', source)
             self.assertNotIn("routeWebdavSettings", source)
+        self.assertIn('{ id: "webdav-settings", titleKey: "webdav.detailsTitle" }', routes)
+        # A child route is no pane: it is filtered out of the sidebar rail, the
+        # menu actions, and the shared settings shell.
+        self.assertIn('id !== "provider-wizard" && id !== "webdav-settings"', routes)
+        self.assertIn('route !== "file-editor" && route !== "webdav-settings"', routes)
+        self.assertIn('| "webdav-settings"', types)
+        self.assertIn("routeWebDavSettings: string;", types)
         self.assertIn('{ id: "general-settings", titleKey: "status.general" }', routes)
         self.assertIn('{ id: "data-management", titleKey: "status.dataManagement" }', routes)
         self.assertIn('| "data-management"', types)
@@ -7893,6 +8076,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # map a per-route window title for data management.
         for source in (self.macos_leaf, self.windows_leaf):
             self.assertIn("data-management", source)
+        # The child window is presented and titled by both hosts, and both
+        # spawn it beside the workspace it belongs to.
+        self.assertIn('case "webdav-settings": return localized("routeWebDavSettings", fallback: "WebDAV Sync Settings")', self.macos_leaf)
+        self.assertIn('if (route == L"webdav-settings") return Localized("routeWebDavSettings", L"WebDAV Sync Settings");', self.windows_leaf)
+        self.assertIn('@[@"home", @"provider-wizard", @"file-editor", @"webdav-settings"]', macos_app)
+        self.assertIn('route == L"webdav-settings"', windows_app)
+        # Both hosts present it the way every child surface is presented, so
+        # the pane behind it is locked until the form closes.
+        self.assertIn('windowRoute == "webdav-settings"', self.macos_leaf)
+        self.assertIn('native.window.open("webdav-settings")', self.ui)
 
     def test_language_uses_the_native_application_menu_without_a_dedicated_screen(self) -> None:
         for marker in (

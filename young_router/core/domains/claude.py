@@ -2099,6 +2099,14 @@ class ClaudeSettingsDomain:
             # instead of going through this app's proxy.  A client on the proxy
             # has nothing left to read -- the proxy serves public names -- so
             # the pane names the route explicitly.
+            #
+            # This router's generated picker lineup names models only its proxy
+            # serves, so it leaves with the switch that pointed the client at
+            # the proxy: Claude Code goes back to its built-in list, and Desktop
+            # is left holding the route's own model.  The record of what this
+            # app generated is cleared beside it, or a route whose public name
+            # is also in that record would let a background refresh put the
+            # whole proxy list back onto a client that no longer talks to it.
             client = _claude_client(data)
             runtime, rows = saved_routes(self.runtime_config_path)
             row = one_saved_route(rows, data)
@@ -2127,9 +2135,11 @@ class ClaudeSettingsDomain:
                     )
                 except ClaudeDesktopConfigError as exc:
                     raise ClaudeSettingsError(str(exc)) from None
+                store_generated_models(self.app_state_root, "claudeDesktop", [])
                 self._revision += 1
                 return self.snapshot()
             candidate = copy.deepcopy(self._draft)
+            candidate.pop("modelPicker", None)
             env = _mapping(candidate.get("env", {}), "env")
             env["ANTHROPIC_BASE_URL"] = anthropic_base_url(route_base_url)
             # The saved route's own key is the credential this route answers,
@@ -2146,6 +2156,7 @@ class ClaudeSettingsDomain:
             if errors:
                 raise ClaudeSettingsError(errors[0])
             self._draft = candidate
+            store_generated_models(self.app_state_root, "claudeCode", [])
             self._revision += 1
             return self.snapshot()
         if name in {"desktop_models_patch", "desktopmodelspatch"}:
