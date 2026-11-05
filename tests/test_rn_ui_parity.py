@@ -4711,7 +4711,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const workbuddySignedIn = stringValue(workbuddyAccount?.state) === "signed-in"',
             '|| stringValue(asRecord(provider.auth_observed).state) === "signed-in";',
             'await dispatchWithOutcome("workbuddy_login", { provider: providerKey }, "providers_models", true);',
-            'title: translate("providers.wizard.workbuddyLoginTitle"),',
+            'title: translate("providers.wizard.workbuddyLoginTitle", { name: workbuddyName }),',
             # Reading the account never disables the rest of the pane, and the
             # pane-wide wait is counted only by the runs that ask for it.
             'await dispatchWithOutcome("workbuddy_status", { refresh }, "providers_models", true);',

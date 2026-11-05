@@ -585,6 +585,22 @@ function progressText(busy: boolean, translate: Translate): string | undefined {
   return busy ? translate("common.loading") : undefined;
 }
 
+/**
+ * The display name of one installed Codex desktop surface.
+ *
+ * The keys come from the Codex app's own `cua_repl` server
+ * (`CUA_REPL_ENABLED_SURFACES`, one `<surface>_use` flag per entry), so this
+ * app cannot know the set — only shape a name out of whatever it is handed:
+ * `web_search_use` reads "Web search", `image_generation_use` reads "Image
+ * generation".  Returns `undefined` for a key with no surface part, so the
+ * caller keeps the generic caption rather than drawing an empty label.
+ */
+function codexSurfaceName(feature: string): string | undefined {
+  const surface = feature.endsWith("_use") ? feature.slice(0, -"_use".length) : feature;
+  const words = surface.split(/[_\-\s]+/).filter((word) => word.length > 0);
+  return words.length === 0 ? undefined : words.map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(" ");
+}
+
 function providerKindLabel(kind: ProviderKind, translate: Translate): string {
   return kind === "relay"
     ? translate("providers.type.relay")
@@ -8334,9 +8350,13 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     }
     setWorkbuddyStatusBusy(true);
     try {
+      // The title interpolates the app's own name; calling it without values
+      // left a literal `{name}` in both languages, in the one question that
+      // opens the sign-in.
+      const workbuddyName = workbuddyAppName(kind, translate);
       const accepted = await native.showConfirmation({
-        title: translate("providers.wizard.workbuddyLoginTitle"),
-        message: translate("providers.wizard.workbuddyLoginPrompt", { name: workbuddyAppName(kind, translate) }),
+        title: translate("providers.wizard.workbuddyLoginTitle", { name: workbuddyName }),
+        message: translate("providers.wizard.workbuddyLoginPrompt", { name: workbuddyName }),
         confirmLabel: translate("providers.wizard.workbuddyLoggedIn"),
       });
       if (!accepted) return;
@@ -9368,13 +9388,19 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
             translate={translate}
           />
           {codexFeatureRows.map((feature) => {
-            const label = translate("codex.surfaceFeature");
+            const surface = codexSurfaceName(feature);
+            // Each row names its own surface.  Every row used to print the one
+            // static "Desktop surface" caption, so a set of them read as a
+            // column of identical switches — indistinguishable by sight, and
+            // one repeated name to a screen reader.
+            const label = surface ? surface : translate("codex.surfaceFeature");
+            const fullLabel = surface ? `${label} — ${translate("codex.surfaceFeature")}` : label;
             return <View key={feature} style={styles.externalSettingsField}>
               <View style={styles.externalSettingsInputRow}>
-                <TooltipText numberOfLines={1} tooltip={label} style={styles.externalSettingsFieldLabel} accessibilityLabel={label}>{label}</TooltipText>
+                <TooltipText numberOfLines={1} tooltip={fullLabel} style={styles.externalSettingsFieldLabel} accessibilityLabel={fullLabel}>{label}</TooltipText>
                 <View style={styles.externalSettingsValueSlot}>
                   <NativeToggle
-                    accessibilityLabel={label}
+                    accessibilityLabel={fullLabel}
                     value={codexFeatures?.[feature] === true}
                     disabled={busy}
                     onValueChange={(enabled) => void onToggleCodexFeature(feature, enabled)}
@@ -9382,7 +9408,7 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
                   />
                 </View>
               </View>
-              <View style={styles.externalSettingsHelpSlot}><Text style={styles.externalSettingsHelpText}>{translate("codex.surfaceFeatureHint")}</Text></View>
+              <View style={styles.externalSettingsHelpSlot}><Text style={styles.externalSettingsHelpText}>{translate("codex.surfaceFeatureHint", { key: feature })}</Text></View>
             </View>;
           })}
         </> : null}

@@ -81,7 +81,12 @@ const optionLabels: Record<string, string> = {
 };
 
 function isChinese(translate: Translator): boolean {
-  return translate("common.empty") === "空";
+  // A sentinel word, not the dictionary's own string: this probe compared
+  // against "空" while `common.empty` has always been "(空)", so it never
+  // matched and the option table below was dead in every language.  CJK code
+  // points cannot collide with an English dictionary value, which is what
+  // makes this a language test rather than a copy of one entry.
+  return /[\u4e00-\u9fff]/u.test(translate("common.empty"));
 }
 
 export function assistantSettingOptions(values: Array<string | AssistantSettingOption>, translate: Translator): AssistantSettingOption[] {

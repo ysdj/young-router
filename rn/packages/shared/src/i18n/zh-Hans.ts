@@ -142,7 +142,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "logs.routeTrace.protocolChat": "Chat",
   "logs.routeTrace.protocolMessages": "Messages",
   "logs.routeTrace.protocolImages": "Images",
-  "logs.routeTrace.protocolOther": "Upstream",
+  "logs.routeTrace.protocolOther": "上游",
   "logs.routeTrace.fallbackFromProtocol": "原协议: {value}",
   "logs.routeTrace.fallbackToProtocol": "备用协议: {value}",
   "logs.routeTrace.protocolMemory": "记忆 {value} 秒",
@@ -366,7 +366,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "codex.standaloneSearch": "联网搜索",
   "codex.standaloneSearchHint": "让模型用 Codex 自带的 web.run 直接联网搜索，而不是用 curl 抓网页。",
   "codex.surfaceFeature": "桌面能力",
-  "codex.surfaceFeatureHint": "安装的 Codex 应用提供的桌面能力；跟随 config.toml 对应开关。",
+  "codex.surfaceFeatureHint": "安装的 Codex 应用提供的桌面能力；跟随 config.toml 对应开关（{key}）。",
   "codex.modelCatalogEditTitle": "编辑模型列表文件",
   "codex.modelCatalogEditBody": "该文件由漾路由根据公开模型列表自动生成，并会在模型列表变化、保存配置或“模型上下文刷新间隔”到期时重写（默认每 6 小时，可在“运行时”中调整），手动修改可能被覆盖。仍要编辑吗？",
   "codex.modelCatalogEditConfirm": "仍要编辑",
@@ -742,7 +742,7 @@ export const zhHans: Record<TranslationKey, string> = {
   // the service describe the same split.
   "providers.laneSource": "分组",
   "providers.laneRoute.main": "Our Free Model",
-  "providers.laneRoute.region": "Our Free Model · region-limited",
+  "providers.laneRoute.region": "Our Free Model · 地区受限",
   // The producers one roster is served from, as the upstream catalog tags them.
   // A row's id does not identify its producer, so these headings are the only
   // thing that tells an anonymous-lane model from a Kilo one.
