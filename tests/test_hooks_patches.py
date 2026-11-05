@@ -4458,6 +4458,56 @@ class ChatBridgeReasoningReplayTests(HookTestCase):
         self.assertEqual("responses_chat_bridge_reasoning_replay_repaired", record["event"])
         self.assertEqual(["call_1"], record["repaired_tool_call_ids"])
 
+    def test_a_reasoning_only_assistant_message_keeps_a_standable_content(self) -> None:
+        """A summary-only reasoning item is not sent as ``content: null``.
+
+        LiteLLM moves a reasoning item's summary into ``reasoning_content`` and
+        leaves its assistant message with ``content: None``.  DeepSeek refuses
+        that message outright -- ``Invalid assistant message: content or
+        tool_calls must be set`` -- before reading any of the history, so one
+        thinking step in a replay cost the whole turn: measured live
+        2026-11-04/05, 318 refusals of this exact shape on the group's first
+        route, each one after a full replay upload.  The empty string is the
+        shape the validator accepts and the one measured to answer.
+        """
+
+        hooks, _ = load_hook_module()
+        hooks._install_responses_chat_bridge_reasoning_replay_patch()
+        from litellm.responses.litellm_completion_transformation.transformation import (
+            LiteLLMCompletionResponsesConfig,
+        )
+
+        request = {
+            "model": "deepseek-flash",
+            "input": [
+                {"role": "user", "content": "step 1"},
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [{"type": "summary_text", "text": "thinking"}],
+                    "encrypted_content": "opaque",
+                },
+                {"role": "user", "content": "step 2"},
+            ],
+            "max_output_tokens": 64,
+        }
+
+        built = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+            model="deepseek-flash",
+            input=request["input"],
+            responses_api_request=request,
+            stream=False,
+            custom_llm_provider="openai",
+            kwargs={},
+        )
+
+        assistant = [m for m in built["messages"] if m.get("role") == "assistant"]
+        self.assertEqual(1, len(assistant))
+        # The summary still rides where the upstream reads thinking from; the
+        # content is the same absence, stated in the accepted shape.
+        self.assertEqual("thinking", assistant[0].get("reasoning_content"))
+        self.assertEqual("", assistant[0].get("content"))
+
     def test_a_replay_that_already_carries_the_field_is_left_alone(self) -> None:
         hooks, _ = load_hook_module()
         hooks._install_responses_chat_bridge_reasoning_replay_patch()

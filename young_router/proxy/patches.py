@@ -2580,6 +2580,20 @@ def _chat_bridge_reasoning_replay_repaired_messages(
     already carries the field is left alone.  Only assistant messages with tool
     calls are touched, because that is the shape the contract names.
 
+    The same transform has a second, broader hole that does not involve tool
+    calls at all: a reasoning item *with* a visible summary becomes its own
+    ``{"role": "assistant", "content": None, "reasoning_content": <summary>}``
+    message, and DeepSeek refuses the whole request with HTTP 400 ``Invalid
+    assistant message: content or tool_calls must be set``.  A Codex replay
+    carries such an item after every thinking step, so this is the common case
+    and not an edge one -- measured live 2026-11-04/05 on api.deepseek.com, 318
+    refusals of exactly this shape, each one costing a full replay upload before
+    the group's sibling route answered it.  Measured side by side on the same
+    history: ``content: null`` is refused, ``content: ""`` is answered.  So the
+    repair writes the empty string and nothing else -- an empty content states
+    exactly as little as ``null`` did, no text moves between fields, and a
+    message that already has content or tool calls is left alone.
+
     Returns the tool-call ids it repaired, for the trace.
     """
 
@@ -2590,6 +2604,9 @@ def _chat_bridge_reasoning_replay_repaired_messages(
     )
     if not isinstance(messages, list):
         return []
+    messages = _chat_bridge_empty_assistant_replayed_messages(messages)
+    if isinstance(litellm_completion_request, dict):
+        litellm_completion_request["messages"] = messages
     repaired: list[str] = []
     for message in messages:
         if not isinstance(message, dict):
@@ -2607,6 +2624,32 @@ def _chat_bridge_reasoning_replay_repaired_messages(
                 call_id = call.get("id")
                 if isinstance(call_id, str) and call_id.strip():
                     repaired.append(call_id.strip())
+    return repaired
+
+
+def _chat_bridge_empty_assistant_replayed_messages(
+    messages: list[Any],
+) -> list[Any]:
+    """Keep a bridged assistant message from being rejected as empty.
+
+    LiteLLM emits ``content: None`` for a reasoning item once it has moved that
+    item's payload into ``reasoning_content``, and a thinking upstream refuses
+    the message as having neither content nor tool calls.  The empty string is
+    the same absence stated in the shape the validator accepts; this writes it
+    only where the message would otherwise be refused.
+    """
+
+    repaired: list[Any] = []
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            content = message.get("content")
+            tool_calls = message.get("tool_calls")
+            if content is None and not (
+                isinstance(tool_calls, list) and tool_calls
+            ):
+                repaired.append(dict(message, content=""))
+                continue
+        repaired.append(message)
     return repaired
 
 
