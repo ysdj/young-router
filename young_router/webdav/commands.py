@@ -51,12 +51,11 @@ def _settings_from_payload(payload: dict[str, Any], existing: Settings) -> Setti
         "timeout_seconds": payload.get("timeout_seconds", existing.timeout_seconds),
         "sync_direction": payload.get("sync_direction", existing.sync_direction),
     }
-    if "password" in payload:
-        raw["password"] = payload.get("password", "")
-    elif payload.get("keep_password"):
-        raw["password"] = existing.password
-    else:
-        raw["password"] = existing.password
+    # An absent password keeps the stored one.  A payload that names it owns the
+    # value, empty string included -- that is how a form clears a password it no
+    # longer wants, and a later branch that also kept the stored one made the
+    # two cases indistinguishable.
+    raw["password"] = payload["password"] if "password" in payload else existing.password
     return _settings_from_raw(raw)
 
 

@@ -701,12 +701,12 @@ def _image_generation_stream_chunk_with_payload(
     replaced = False
     updated_lines: list[str] = []
     for line in lines:
+        # Replace the first data: line; every other line -- a second data: line,
+        # a comment, a blank separator -- is carried through untouched.
         if line.startswith("data:") and not replaced:
             newline = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
             updated_lines.append(f"data: {encoded_payload}{newline}")
             replaced = True
-        elif line.startswith("data:"):
-            updated_lines.append(line)
         else:
             updated_lines.append(line)
     return "".join(updated_lines) if replaced else chunk
