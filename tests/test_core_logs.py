@@ -1028,6 +1028,66 @@ model_list:
             self.assertEqual(7, record["usage"]["output_tokens"])
             self.assertEqual(18, record["usage"]["total_tokens"])
 
+    def test_request_log_projects_the_cache_counts_the_row_reported(self) -> None:
+        """The 缓存命中 column reads one canonical cache read and write count.
+
+        The runtime already reconciled the spellings a relay answers with, so
+        the projection only has to answer the one key the pane reads; a row
+        that reported nothing keeps no key at all, which is how the column
+        stays empty instead of claiming a measured miss.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = [
+                {
+                    "status": "success",
+                    "usage": {
+                        "prompt_tokens": 20000,
+                        "completion_tokens": 120,
+                        "cache_read_tokens": 18000,
+                    },
+                },
+                {
+                    "status": "success",
+                    "usage": {
+                        "input_tokens": 9000,
+                        "output_tokens": 40,
+                        "cache_write_tokens": 8216,
+                    },
+                },
+                {
+                    "status": "success",
+                    "usage": {
+                        "prompt_tokens": 800,
+                        "completion_tokens": 10,
+                        "cached_tokens": 300,
+                    },
+                },
+                {
+                    "status": "success",
+                    "usage": {"prompt_tokens": 640, "completion_tokens": 10},
+                },
+            ]
+            (root / "recent-requests.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+
+            records = LogsDomain(root).view("requests")["log"]["records"]
+            usages = {record["usage"]["input_tokens"]: record["usage"] for record in records}
+
+            self.assertEqual(18000, usages[20000]["cache_read_tokens"])
+            self.assertNotIn("cache_write_tokens", usages[20000])
+            self.assertEqual(8216, usages[9000]["cache_write_tokens"])
+            self.assertNotIn("cache_read_tokens", usages[9000])
+            # A row written by an older build spells the same count its own way.
+            self.assertEqual(300, usages[800]["cache_read_tokens"])
+            # A turn whose upstream reported no cache states none, so the
+            # column draws an empty cell rather than a measured zero.
+            self.assertNotIn("cache_read_tokens", usages[640])
+            self.assertNotIn("cache_write_tokens", usages[640])
+
     def test_service_log_omits_litellm_banner_noise(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

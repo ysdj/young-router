@@ -10625,6 +10625,17 @@ type RenderedLogRecord = {
   action: string;
   duration: string;
   tokens: string;
+  /**
+   * The share of this turn's input the upstream served from cache, as
+   * `62% · 5.3` (rate · cached count in k).  Empty when the upstream reported
+   * no cache count at all.
+   *
+   * Only the *read* is stated on the row: the cache a turn wrote, which a
+   * 5-minute cache bills at 1.25x, is a separate count with no column of its
+   * own, and it stays in the record the row's double-click shows rather than
+   * being folded into a rate it is not part of.
+   */
+  cacheHit: string;
   /** The relay's control plane (NewAPI / Sub2API), kept apart from its name. */
   family: string;
   /** Which login of the relay the row belongs to, when the station has more than one. */
@@ -10719,6 +10730,33 @@ function formatLogTokens(value: string): string {
   const tokens = Number(value);
   if (!Number.isFinite(tokens)) return value;
   return `${Math.round(tokens / 100) / 10}`;
+}
+
+/**
+ * How much of a turn's input the upstream answered from its own cache.
+ *
+ * The count alone does not say whether a step was cheap: 12k cached tokens is
+ * a nearly cold replay of a 100k prompt and a perfectly warm one of 13k.  The
+ * ratio is therefore what the column states, and the count is written beside
+ * it so a reader checking one specific step still sees the number the rate was
+ * computed from.  A row that reported no cache at all leaves the cell empty:
+ * "0%" would claim a measured miss for a turn whose upstream never answered.
+ */
+function formatLogCacheHit(cached: string, input: string): string {
+  const cachedTokens = Number(cached);
+  if (!cached || !Number.isFinite(cachedTokens)) return "";
+  // The count is a subset of the input it is drawn against: every usage this
+  // proxy logs is OpenAI-shaped, where ``prompt_tokens`` already includes the
+  // tokens the upstream served from cache.  An Anthropic-shaped block that
+  // reports the cached count *beside* a smaller input is normalized by LiteLLM
+  // before it reaches this row, so the two numbers share one denominator.
+  const inputTokens = Number(input);
+  const share = input && Number.isFinite(inputTokens) && inputTokens > 0
+    ? Math.max(0, Math.min(1, cachedTokens / inputTokens))
+    : undefined;
+  const rate = share === undefined ? "" : `${Math.round(share * 100)}%`;
+  const count = formatLogTokens(cached);
+  return rate ? `${rate} · ${count}` : count;
 }
 
 function routeTraceEventLabel(value: string, translate: Translate): string {
@@ -11229,6 +11267,7 @@ function parseTextLogRecord(record: string, tab: LogTab, _index: number, transla
     action,
     duration: "",
     tokens,
+    cacheHit: "",
     family: "",
     account: "",
     // A plain-text row states no grouping of its own; the record shape is the
@@ -11298,6 +11337,7 @@ function renderOnlineUsageRecord(record: unknown, value: UnknownRecord, translat
   const rawStatus = compactLogValue(value.status);
   const status = rawStatus ? requestStatusLabel(rawStatus, translate) : "";
   const tokens = logTokenPair(value);
+  const cacheReadTokens = compactLogValue(value.cache_tokens);
   const detailFields: Array<[string, string]> = [
     [translate("logs.source"), source],
     [translate("logs.account"), account],
@@ -11307,7 +11347,7 @@ function renderOnlineUsageRecord(record: unknown, value: UnknownRecord, translat
     [translate("logs.tokenCount"), tokens],
     [translate("logs.promptTokens"), compactLogValue(value.prompt_tokens)],
     [translate("logs.completionTokens"), compactLogValue(value.completion_tokens)],
-    [translate("logs.cacheTokens"), compactLogValue(value.cache_tokens)],
+    [translate("logs.cacheTokens"), cacheReadTokens],
     [translate("logs.channel"), compactLogValue(value.channel)],
     [translate("logs.group"), compactLogValue(value.group)],
     [translate("logs.apiKeyName"), compactLogValue(value.key_name)],
@@ -11341,6 +11381,9 @@ function renderOnlineUsageRecord(record: unknown, value: UnknownRecord, translat
     // states the same seconds every other tab shows.
     duration: formatLogDuration(compactLogValue(value.duration)),
     tokens,
+    // The relay states the cached count beside the prompt it was cached from,
+    // so this tab reads the same rate-and-count cell the requests tab does.
+    cacheHit: formatLogCacheHit(cacheReadTokens, compactLogValue(value.prompt_tokens)),
     detail: details.join(" | "),
     // The double-click detail is the same labelled fields, one per line, so
     // opening a row states the whole report without re-reading the record's
@@ -11400,6 +11443,18 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
   const tokens = sentTokens && receivedTokens
     ? `${formatLogTokens(sentTokens)} / ${formatLogTokens(receivedTokens)}`
     : formatLogTokens(totalTokens);
+  // How much of the input came from the upstream's cache.  The same spellings
+  // the runtime's own usage summary reconciles are read here, so a row written
+  // by an older build -- which recorded only the bare count -- still fills the
+  // column instead of going blank until the next turn.
+  const cacheReadTokens = compactLogValue(
+    usage.cache_read_tokens
+      ?? usage.cached_tokens
+      ?? usage.cache_hit_tokens
+      ?? value.cache_read_tokens
+      ?? value.cached_tokens,
+  );
+  const cacheHit = formatLogCacheHit(cacheReadTokens, sentTokens);
   const details: string[] = [];
   const abortedDetail = tab === "requests" ? requestAbortedDetail(value.aborted, translate) : "";
   if (abortedDetail) details.push(abortedDetail);
@@ -11473,6 +11528,7 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
     action,
     duration,
     tokens,
+    cacheHit,
     family: "",
     account: "",
     group: compactLogValue(value.group),
@@ -11481,7 +11537,7 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
   };
 }
 
-function logTimestampNumber(value: string): number | undefined {
+function logTimestampNumber(value: string, year = new Date().getFullYear()): number | undefined {
   if (!value) return undefined;
   const numeric = Number(value);
   if (Number.isFinite(numeric) && /^[-+]?\d+(?:\.\d+)?$/.test(value.trim())) {
@@ -11495,7 +11551,7 @@ function logTimestampNumber(value: string): number | undefined {
   const clock = value.trim().match(/^(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
   if (clock) {
     return Date.parse(
-      `${new Date().getFullYear()}-${clock[1]}-${clock[2]}T${clock[3]}:${clock[4]}:${clock[5]}`,
+      `${year}-${clock[1]}-${clock[2]}T${clock[3]}:${clock[4]}:${clock[5]}`,
     );
   }
   const parsed = Date.parse(value);
@@ -11503,12 +11559,17 @@ function logTimestampNumber(value: string): number | undefined {
 }
 
 function renderLogRecords(records: Array<Record<string, unknown> | string>, tab: LogTab, translate: Translate): RenderedLogRecord[] {
-  const rendered = records.map((record, index) => ({ row: renderLogRecord(record, tab, index, translate), index }));
+  // Each row's time is parsed once, before the sort.  The comparator used to
+  // run the clock regex and `Date.parse` on both sides of every comparison —
+  // O(n log n) parses per projection, on every poll of a full log tail.
+  const year = new Date().getFullYear();
+  const rendered = records.map((record, index) => {
+    const row = renderLogRecord(record, tab, index, translate);
+    return { row, index, time: logTimestampNumber(row.time, year) };
+  });
   rendered.sort((left, right) => {
-    const leftRow = left.row;
-    const rightRow = right.row;
-    const leftTime = logTimestampNumber(leftRow.time);
-    const rightTime = logTimestampNumber(rightRow.time);
+    const leftTime = left.time;
+    const rightTime = right.time;
     if (leftTime === undefined && rightTime === undefined) return right.index - left.index;
     if (leftTime === undefined) return 1;
     if (rightTime === undefined) return -1;
@@ -11606,6 +11667,15 @@ const LOG_TIME_COLUMN_WIDTH = 120;
 // header plus the cell's 8 pt padding on each side.  It is not flexible: a wire
 // name that stretched across a wide window would push the model columns apart.
 const LOG_PROTOCOL_COLUMN_WIDTH = 82;
+// A fully cached long prompt reads `100% · 1000.0`: 84.8 pt in the table's
+// 13 pt face plus the cell's 8 pt padding on each side. The two tabs that show
+// a cache share declare the same width so the fact does not change size
+// between them.
+const LOG_CACHE_COLUMN_WIDTH = 104;
+// `1183.4 / 12.5`: 80.3 pt in the table's 13 pt face plus the cell's 8 pt
+// padding on each side. The header `令牌数(k)` is narrower than the pair, so
+// the pair decides.
+const LOG_TOKEN_PAIR_COLUMN_WIDTH = 96;
 
 /**
  * Whether this page actually needs a column to tell its rows apart.
@@ -11628,6 +11698,7 @@ function logColumns(
   hasFamily = true,
   hasSource = true,
   hasGroup = false,
+  hasCache = true,
 ): LogColumn[] {
   const time = { label: translate("logs.localTime"), width: LOG_TIME_COLUMN_WIDTH, value: (row: RenderedLogRecord) => row.time };
   const status = { label: translate("common.status"), width: 68, value: (row: RenderedLogRecord) => row.status };
@@ -11647,7 +11718,25 @@ function logColumns(
     { label: translate("logs.apiKeyName"), width: 64, value: (row) => row.apiKeyName },
     { ...status, width: 68 },
     { label: translate("logs.duration"), width: 62, value: (row) => row.duration },
-    { label: translate("logs.tokenCountK"), width: 79, value: (row) => row.tokens },
+    // A five-digit pair (`1183.4 / 12.5`) measures 80.3 pt in the table's
+    // 13 pt face, so 96 is the narrowest width that shows both counts with the
+    // cell's 8 pt padding. It was 79 — sized to the `令牌数(k)` header alone —
+    // and the cells it could not hold were ellipsized mid-number
+    // (`594.2 / 0…`), which reads as a count the row never reported.
+    { label: translate("logs.tokenCountK"), width: LOG_TOKEN_PAIR_COLUMN_WIDTH, value: (row) => row.tokens },
+    // Cache hit reads after the token pair it is a share of, because “62%”
+    // means nothing until the reader has seen the input it came out of. It
+    // states the rate first and the cached count second: the rate is what
+    // tells a cheap step from a replayed prefix, and the count is what the
+    // rate was computed from.
+    //
+    // The header is not the widest thing here — a fully cached million-token
+    // prompt reads `100% · 1000.0`, which measures 84.8 pt in the table's
+    // 13 pt face, so 104 is that plus the cell's 8 pt padding on each side. A
+    // page whose rows reported no cache at all drops the column instead of
+    // leaving a strip of empty cells, which is what a log tail written before
+    // the runtime recorded the count would otherwise be.
+    ...(hasCache ? [{ label: translate("logs.cacheHit"), width: LOG_CACHE_COLUMN_WIDTH, value: (row: RenderedLogRecord) => row.cacheHit }] : []),
     { ...detail, width: 240 },
   ];
   if (tab === "actions") return [
@@ -11711,6 +11800,11 @@ function logColumns(
     // 8 pt padding on each side, with room for the sort indicator AppKit draws
     // in the header.
     { label: translate("logs.tokenPair"), width: 140, value: (row) => row.tokens },
+    // The relay's own cached count sits beside the pair it belongs to, under
+    // the requests tab's own header and width: a reader meeting the same fact
+    // on two tabs should not have to learn two spellings of it. A station that
+    // reports no cache leaves the column out entirely.
+    ...(hasCache ? [{ label: translate("logs.cacheHit"), width: LOG_CACHE_COLUMN_WIDTH, value: (row: RenderedLogRecord) => row.cacheHit }] : []),
     { label: translate("logs.duration"), width: 62, value: (row) => row.duration },
   ];
   return [
@@ -12152,6 +12246,10 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
         // The relay's grouping is a per-row fact (it prices the request), so it
         // is drawn whenever the rows carry one.
         rows.some((row) => Boolean(row.group)),
+        // 缓存命中 is drawn only when this page has a cache count to state. A
+        // log tail written before the runtime recorded one would otherwise
+        // spend 96 pt of the frame on empty cells.
+        rows.some((row) => Boolean(row.cacheHit)),
       ),
       tableWidth,
     ),

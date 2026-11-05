@@ -1168,6 +1168,13 @@ def _safe_request_record(
         # Relays report either input/output or prompt/completion pairs.  Keep
         # both spellings under one canonical pair so the UI can always show
         # sent/received tokens.
+        #
+        # The cache counts are projected the same way, because the request
+        # table's 缓存命中 column names how much of that input the upstream
+        # served from a cached prefix.  One quantity has several spellings and
+        # a relay zeroes the ones it does not mean, so a larger value is the
+        # more complete report; a row written before these keys existed simply
+        # has no cache count, which the column draws as an empty cell.
         projected_usage: dict[str, Any] = {}
         for raw_key, projected_key in (
             ("input_tokens", "input_tokens"),
@@ -1175,9 +1182,15 @@ def _safe_request_record(
             ("output_tokens", "output_tokens"),
             ("completion_tokens", "output_tokens"),
             ("total_tokens", "total_tokens"),
+            ("cache_read_tokens", "cache_read_tokens"),
+            ("cache_hit_tokens", "cache_read_tokens"),
+            ("cached_tokens", "cache_read_tokens"),
+            ("cache_write_tokens", "cache_write_tokens"),
         ):
             value = usage.get(raw_key)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if projected_key in projected_usage and projected_usage[projected_key] >= value:
+                    continue
                 projected_usage[projected_key] = value
         result["usage"] = projected_usage
     error = raw.get("error")

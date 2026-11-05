@@ -522,6 +522,7 @@ export const en: Record<TranslationKey, string> = {
   "logs.onlineUsageUnavailable": "Relay usage is unavailable.",
   "logs.onlineUsageDetail": "Usage Detail",
   "logs.status": "STATUS",
+  "logs.cacheHit": "CACHE HIT",
   "logs.tokenPair": "TOKENS IN / OUT (K)",
   "logs.promptTokens": "INPUT TOKENS",
   "logs.completionTokens": "OUTPUT TOKENS",

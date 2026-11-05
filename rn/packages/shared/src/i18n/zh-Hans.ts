@@ -526,6 +526,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "logs.onlineUsageUnavailable": "中转站用量不可用。",
   "logs.onlineUsageDetail": "用量详情",
   "logs.status": "状态",
+  "logs.cacheHit": "缓存命中",
   "logs.tokenPair": "令牌 输入 / 输出(k)",
   "logs.promptTokens": "输入令牌",
   "logs.completionTokens": "输出令牌",

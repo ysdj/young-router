@@ -3832,6 +3832,73 @@ def _first_not_none(*values: Any) -> Any:
     return None
 
 
+def _usage_detail_count(usage: dict[str, Any], container: str, key: str) -> int:
+    details = usage.get(container)
+    if not isinstance(details, dict):
+        details = _as_dict(details)
+    value = details.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _usage_int(value: Any) -> int:
+    """One reported count, read from either a number or a numeric string.
+
+    ``litellm`` hands a Responses usage back as its own model, and a relay that
+    answers Anthropic-shaped blocks sometimes spells a count as text.  A
+    missing or unparseable value is zero, which the caller treats as "not
+    reported" rather than as a cache miss.
+    """
+
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if math.isfinite(value) else 0
+    if isinstance(value, str):
+        try:
+            return int(float(value.strip()))
+        except ValueError:
+            return 0
+    return 0
+
+
+def _usage_cache_counts(usage: dict[str, Any], input_tokens: int) -> tuple[int, int]:
+    """How much of this turn's input the upstream served from, and wrote to, cache.
+
+    The log's 缓存命中 column answers one question -- was this step cheap or
+    was its whole prefix billed again -- so it reads the same set of spellings
+    the Responses projection already reconciles, largest first.  A relay states
+    the same fact several ways and zeroes the spellings it does not mean (the
+    DeepSeek route answers ``prompt_tokens_details.cached_tokens`` *with*
+    ``cache_read_input_tokens: 0``), so a maximum can only be a more complete
+    report of one quantity, never a different one.  Everything is bounded by
+    the input count: a reader that was told 30k cached of an 8k prompt would
+    otherwise be reading a ratio that cannot exist.
+    """
+
+    cached = max(
+        _usage_detail_count(usage, "input_tokens_details", "cached_tokens"),
+        _usage_detail_count(usage, "prompt_tokens_details", "cached_tokens"),
+        _usage_detail_count(usage, "prompt_tokens_details", "cache_read_tokens"),
+        _usage_detail_count(usage, "prompt_tokens_details", "cache_hit_tokens"),
+        _usage_int(usage.get("cached_tokens")),
+        _usage_int(usage.get("cache_read_input_tokens")),
+        _usage_int(usage.get("prompt_cache_hit_tokens")),
+    )
+    written = max(
+        _usage_detail_count(usage, "input_tokens_details", "cache_write_tokens"),
+        _usage_detail_count(usage, "prompt_tokens_details", "cache_write_tokens"),
+        _usage_detail_count(usage, "prompt_tokens_details", "cache_creation_tokens"),
+        _usage_int(usage.get("cache_creation_input_tokens")),
+        _usage_int(usage.get("cache_write_tokens")),
+    )
+    if input_tokens:
+        cached = min(cached, input_tokens)
+        written = min(written, input_tokens)
+    return cached, written
+
+
 def _usage_summary(response_obj: Any, request_kwargs: dict[str, Any]) -> dict[str, Any]:
     usage = getattr(response_obj, "usage", None)
     if not isinstance(usage, dict) and hasattr(usage, "model_dump"):
@@ -3856,6 +3923,14 @@ def _usage_summary(response_obj: Any, request_kwargs: dict[str, Any]) -> dict[st
             value = usage.get(source_key)
             if isinstance(value, int):
                 result[target_key] = value
+        input_tokens = _usage_int(result.get("input_tokens", result.get("prompt_tokens")))
+        cached, written = _usage_cache_counts(usage, input_tokens)
+        # Only a reported count is written: a turn whose upstream said nothing
+        # about its cache leaves the cells empty rather than claiming a miss.
+        if cached:
+            result["cache_read_tokens"] = cached
+        if written:
+            result["cache_write_tokens"] = written
     return result
 
 

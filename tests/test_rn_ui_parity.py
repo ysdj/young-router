@@ -3732,10 +3732,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # `32642.1 /` and cut the completion count off behind an ellipsis on
         # every row whose counts reached five digits.
         self.assertIn('{ label: translate("logs.tokenPair"), width: 140, value: (row) => row.tokens }', columns)
+        # The relay's cached count sits beside the pair it belongs to, under
+        # the same name the requests tab gives it.  The header `CACHE HIT` and
+        # the widest value a station reports (`9999.9`) both fit 96 pt at the
+        # table's 13 pt face, so the width is the header plus padding.
+        self.assertIn(
+            '...(hasCache ? [{ label: translate("logs.cacheHit"), width: LOG_CACHE_COLUMN_WIDTH, value: (row: RenderedLogRecord) => row.cacheHit }] : []),',
+            columns,
+        )
         # The set must total less than the pane's own width, so a row is read
         # without scrolling sideways. The timestamp is the widest fixed column,
         # and only the relay column absorbs what is left over.
-        widths = [168, 164, 140, 62]
+        widths = [168, 164, 140, 104, 62]
         # The account column is only there when the relay has more than one
         # login, and it must still fit inside the pane at its narrowest: the
         # other fixed columns plus the relay's floor leave it room.
@@ -3785,13 +3793,27 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The grouping is a per-row fact — it is what priced the request — so it
         # is drawn whenever the rows carry one, unlike the constant relay name.
         self.assertIn(
-            "  hasGroup = false,\n): LogColumn[] {",
+            "  hasGroup = false,\n  hasCache = true,\n): LogColumn[] {",
             self.ui,
         )
         self.assertIn(
             '...(hasGroup ? [{ label: translate("logs.group"), width: 96, value: (row: RenderedLogRecord) => row.group }] : []),',
             columns,
         )
+        # 缓存命中 is a share of the input the token pair states, so it follows
+        # that pair rather than standing before it.  It is drawn only when a
+        # page has a count to show: a log tail written before the runtime
+        # recorded one would otherwise spend 96 pt of the frame on empty cells.
+        self.assertIn(
+            '...(hasCache ? [{ label: translate("logs.cacheHit"), width: LOG_CACHE_COLUMN_WIDTH, value: (row: RenderedLogRecord) => row.cacheHit }] : []),',
+            columns,
+        )
+        self.assertIn("rows.some((row) => Boolean(row.cacheHit)),", logs)
+        # The width has to hold the widest cell this column can carry, not the
+        # header: a fully cached million-token prompt reads `100% · 1000.0`
+        # (84.8 pt at 13 pt) plus the cell's 8 pt padding on each side.
+        self.assertIn("const LOG_CACHE_COLUMN_WIDTH = 104;", self.ui)
+        self.assertGreaterEqual(104, 85 + 16)
         # The row's own fields travel in the detail, one per line, rather than
         # as a re-splitting of the joined string.
         self.assertIn("const details = detailFields.flatMap", renderer)
@@ -5390,7 +5412,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "const duration = formatLogDuration(compactLogValue(value.duration_ms));",
             "`${formatLogTokens(sentTokens)} / ${formatLogTokens(receivedTokens)}`",
             "{ label: translate(\"logs.duration\"), width: 62, value: (row) => row.duration }",
-            "{ label: translate(\"logs.tokenCountK\"), width: 79, value: (row) => row.tokens }",
+            "{ label: translate(\"logs.tokenCountK\"), width: LOG_TOKEN_PAIR_COLUMN_WIDTH, value: (row) => row.tokens }",
+            "const LOG_TOKEN_PAIR_COLUMN_WIDTH = 96;",
         ):
             self.assertIn(marker, self.ui)
 

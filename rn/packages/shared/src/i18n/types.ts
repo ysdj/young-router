@@ -537,6 +537,7 @@ export type TranslationKey =
   | "logs.onlineUsageUnavailable"
   | "logs.onlineUsageDetail"
   | "logs.status"
+  | "logs.cacheHit"
   | "logs.tokenPair"
   | "logs.promptTokens"
   | "logs.completionTokens"

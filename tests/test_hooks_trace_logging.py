@@ -813,6 +813,62 @@ class HookTraceLoggingTests(HookTestCase):
         self.assertNotIn("client_surface", record)
         self.assertNotIn("upstream_surface", record)
 
+    def test_request_log_states_the_cache_the_upstream_reported(self) -> None:
+        """缓存命中 reads the spellings a relay actually answers with.
+
+        A DeepSeek-shaped body states the reused prefix in
+        ``prompt_tokens_details.cached_tokens`` *and* a literal zero in
+        ``cache_read_input_tokens``; taking the first spelling alone would
+        report a cold cache on a warm thread.  A turn whose upstream said
+        nothing about its cache states nothing, so the column stays empty
+        instead of claiming a measured miss.
+        """
+
+        hooks, _ = load_hook_module()
+
+        def success(usage: dict) -> dict:
+            response = {"id": "response-cache-log", "usage": dict(usage)}
+            return hooks._request_log_record(
+                "success",
+                {"model": "public-chat", "request_id": "req-cache-log"},
+                response,
+            )
+
+        warm = success(
+            {
+                "prompt_tokens": 20000,
+                "completion_tokens": 120,
+                "prompt_tokens_details": {"cached_tokens": 18000},
+                "cache_read_input_tokens": 0,
+            }
+        )
+        self.assertEqual(18000, warm["usage"]["cache_read_tokens"])
+        self.assertNotIn("cache_write_tokens", warm["usage"])
+
+        written = success(
+            {
+                "input_tokens": 9000,
+                "output_tokens": 40,
+                # The cache write is reported by the provider's own spelling.
+                "cache_creation_input_tokens": 8216,
+            }
+        )
+        self.assertEqual(8216, written["usage"]["cache_write_tokens"])
+
+        # A count larger than the input it was drawn against cannot be a share
+        # of that input, so it is bounded instead of logging a ratio above 1.
+        bounded = success(
+            {
+                "prompt_tokens": 800,
+                "completion_tokens": 10,
+                "prompt_cache_hit_tokens": 5000,
+            }
+        )
+        self.assertEqual(800, bounded["usage"]["cache_read_tokens"])
+
+        silent = success({"prompt_tokens": 800, "completion_tokens": 10})
+        self.assertEqual({}, {key: silent["usage"][key] for key in ("cache_read_tokens", "cache_write_tokens") if key in silent["usage"]})
+
     def test_request_log_classifies_pre_route_failures_and_trace_reasons(self) -> None:
         hooks, _ = load_hook_module()
 
