@@ -4216,7 +4216,12 @@ def _request_log_record(
         "has_web_search_tool": tools_summary["has_web_search_tool"],
         "has_image_generation_tool": tools_summary["has_image_generation_tool"],
         "has_image_input": _image_inputs_module._request_has_image_input(request_kwargs),
-        "cache_hit": request_kwargs.get("cache_hit"),
+        # LiteLLM's own response cache, not the upstream prompt cache: a hit here
+        # means this router answered without calling the provider at all.  The
+        # token counts that describe an upstream prompt cache are in `usage`
+        # (`cache_read_tokens` / `cache_write_tokens`); a row with
+        # `router_response_cache_hit` false says nothing about them.
+        "router_response_cache_hit": request_kwargs.get("cache_hit"),
         "response_cost": response_cost,
         "usage": _usage_summary(response_obj, request_kwargs),
         "response_types": _response_type_summary(response_obj),
