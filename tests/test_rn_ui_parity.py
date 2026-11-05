@@ -112,6 +112,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         boundary = (ROOT / "rn/packages/shared/src/ui/renderFaultBoundary.tsx").read_text(encoding="utf-8")
         self.assertIn("export class RenderFaultBoundary extends React.Component<", boundary)
+        # The fault screen must be escapable: a window that threw once used to
+        # stay on it for the life of the process.  Recovery is a fresh mount,
+        # not a reuse of the instance that holds the bad state, so the retry
+        # clears the error and re-keys the subtree.
+        self.assertIn("this.setState({ error: undefined });", boundary)
+        self.assertIn("<React.Fragment key={this.attempt}>{this.props.children}</React.Fragment>", boundary)
+        self.assertIn('translate("error.renderFaultRetry"', boundary)
         self.assertIn("static getDerivedStateFromError(error: unknown): RenderFaultState {", boundary)
         self.assertIn("componentDidCatch(error: Error): void {", boundary)
         # The handler of last resort may not throw again: a failure inside it
@@ -121,8 +128,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         bootstrap = (ROOT / "rn/packages/shared/src/bootstrap.tsx").read_text(encoding="utf-8")
         self.assertIn('import { RenderFaultBoundary } from "./ui/renderFaultBoundary";', bootstrap)
         # One boundary per window root, wrapping the whole app.
-        self.assertEqual(1, bootstrap.count("<RenderFaultBoundary>"))
-        self.assertIn("return <RenderFaultBoundary><YoungRouterApp {...dependencies}", bootstrap)
+        self.assertEqual(1, bootstrap.count("<RenderFaultBoundary"))
+        self.assertIn("return <RenderFaultBoundary translate={dependencies.translate}><YoungRouterApp {...dependencies}", bootstrap)
         self.assertIn("nativeAction={nativeAction} /></RenderFaultBoundary>;", bootstrap)
 
     def test_menu_bar_home_is_not_a_dashboard_or_sidebar_shell(self) -> None:

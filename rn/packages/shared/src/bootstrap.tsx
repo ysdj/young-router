@@ -49,6 +49,6 @@ export function registerYoungRouter(componentName: string, dependencies: Desktop
     // stated pane instead of an aborted process.  See RenderFaultBoundary for
     // the failure this answers: an uncaught render error escapes the React
     // TurboModule call as a C++ exception and takes the app down with it.
-    return <RenderFaultBoundary><YoungRouterApp {...dependencies} initialSnapshot={initialSnapshot} isPrimaryHost={isPrimaryHost} isWindowManagerHost={props.isWindowManagerHost === true} routeRequest={routeRequest ?? props.initialRoute} routeRequestSequence={routeRequestSequence} logTabRequest={logTabRequest ?? props.initialLogTab} fileIdRequest={props.initialFileTarget} nativeAction={nativeAction} /></RenderFaultBoundary>;
+    return <RenderFaultBoundary translate={dependencies.translate}><YoungRouterApp {...dependencies} initialSnapshot={initialSnapshot} isPrimaryHost={isPrimaryHost} isWindowManagerHost={props.isWindowManagerHost === true} routeRequest={routeRequest ?? props.initialRoute} routeRequestSequence={routeRequestSequence} logTabRequest={logTabRequest ?? props.initialLogTab} fileIdRequest={props.initialFileTarget} nativeAction={nativeAction} /></RenderFaultBoundary>;
   });
 }

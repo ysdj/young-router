@@ -5798,7 +5798,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       // waits.  The row list it stages still applies as a normal write.
       const next = await dispatchWithOutcome(action, payload, "providers_models", true);
       if (!next) {
-        onStatus(translate("providers.fetchFailed", { detail: translate("providers.fetchKeyUnavailable") }));
+        // The dispatch refused, and the run that refused it already published
+        // its cause to this same strip.  Guessing "the key could not be
+        // resolved" here overwrote that sentence, so a station that was not
+        // ready, an expired login, and a refused key all read as one wrong
+        // diagnosis.
         return;
       }
       const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
@@ -9872,7 +9876,7 @@ function DataManagementWorkspace({ snapshot, tab, onTabChange, statuses, busy, t
             {sectionList(DATA_PACKAGE_DOMAINS, exportSections, busy, (domain, enabled) => toggleSection(setExportSections, domain, enabled))}
           </View>
         </View>
-        {actionRow(<ActionButton primary title={translate("dataManagement.exportSelected")} busy={pendingAction === "export"} disabled={controlsBusy("export") || exportSections.length === 0} onPress={() => { void runPendingAction("export", () => onExport(exportSections)); }} />, statuses.export)}
+        {actionRow(<ActionButton primary title={translate("dataManagement.exportSelected")} busy={pendingAction === "export"} disabled={controlsBusy("export") || exportSections.length === 0} onPress={() => { if (pendingAction === "export") return; void runPendingAction("export", () => onExport(exportSections)); }} />, statuses.export)}
         {/* The standing warning is this field's tip, where every pane explains
             the row it draws. */}
         <View style={SETTINGS_FIELD_HELP_SLOT}><Text numberOfLines={2} style={SETTINGS_FIELD_HELP_TEXT}>{translate("dataManagement.sensitiveHint")}</Text></View>
@@ -9951,7 +9955,7 @@ function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSec
     // faulted inside Microsoft.UI.Xaml.dll (c0000005).  The island is the
     // crash; a text field has none, and it also keeps the document readable,
     // which is the point of an advanced field.
-    control = <RuntimeJsonField label={label} value={value} hint={item.retained === true ? translate("runtime.secretRetained") : translate("runtime.jsonPlaceholder")} busy={busy} resetToken={jsonResetToken} resetValue={rawDefaultValue} target={key} native={native} translate={translate} onStatus={onStatus} onCommitted={() => setJsonResetToken((current) => current + 1)} />;
+    control = <RuntimeJsonField label={label} value={value} hint={item.retained === true ? translate("runtime.secretRetained") : translate("runtime.jsonPlaceholder")} busy={busy} resetToken={jsonResetToken} resetValue={rawDefaultValue} target={key} native={native} translate={translate} onStatus={onStatus} onCommitted={() => undefined} />;
     action = <ActionButton title={item.will_clear === true ? translate("common.willClear") : translate("common.clear")} disabled={busy || item.retained !== true || item.will_clear === true} onPress={() => { void clearSecret({ domain: "runtime", field: "setting", target: key }).then(() => setJsonResetToken((current) => current + 1)); }} />;
   } else if (item.secret === true) {
     control = <NativeSecretInputControl label={label} hint={item.retained === true ? translate("runtime.secretRetained") : undefined} busy={busy} domain="runtime" field="setting" target={key} autoCommit onSecretState={onSecretState} />;
@@ -10052,7 +10056,13 @@ function RuntimeJsonField({ label, value, hint, busy, resetToken, resetValue, ta
   // Core's stored document is the truth, and a reset replaces the draft with
   // the field's default.
   useEffect(() => { if (loaded) setDraft(document); }, [document, loaded]);
-  useEffect(() => { setDraft(resetValue); }, [resetToken]);
+  // Only a reset request replaces the draft, and only after the first one: on
+  // mount the token is 0, and an unguarded effect overwrote a stored document
+  // with the schema default the moment the field was drawn.  A successful save
+  // no longer bumps this token either (`commit` below holds the saved text),
+  // which is what made saving a JSON setting snap the editor back to the
+  // default while the saved value was the one just written.
+  useEffect(() => { if (resetToken > 0) setDraft(resetValue); }, [resetToken, resetValue]);
   const commit = async (): Promise<void> => {
     const next = draft.trim();
     if (next === document.trim()) return;
@@ -12326,6 +12336,20 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     // The button reports progress instead of going dead, so a second press
     // must not queue a second clear.
     if (cooldownClearPending) return;
+    // This is not the view-only clear beside it: Core writes empty collections
+    // over both persisted routing files, so every parked deployment becomes
+    // eligible for the very next request and nothing restores it.  The scope
+    // is the whole app, not the rows on screen, and the question says so.
+    void native.showConfirmation({
+      title: translate("logs.clearRecoveryCooldownConfirmTitle"),
+      message: translate("logs.clearRecoveryCooldownConfirmBody"),
+      confirmLabel: translate("logs.clearRecoveryCooldown"),
+      destructive: true,
+    }).then((accepted) => {
+      if (accepted) clearCooldownsConfirmed(tab);
+    }).catch(() => undefined);
+  };
+  const clearCooldownsConfirmed = (tab: typeof LOG_TABS[number]): void => {
     setCooldownClearPending(true);
     void dispatch("logs.clear_recovery_and_cooldowns", { tab }, "logs").then(async () => {
       try {
@@ -12679,10 +12703,31 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
       if (rows !== undefined && rows !== onlineUsagePageRows) setOnlineUsagePageRows(rows);
     }} style={styles.logPagerPageSize} />
   </View> : null;
+  // `usageStatusControls` is a fresh element on every render, so an effect that
+  // depended on it re-ran every render — and since it publishes into the
+  // window's status bar, that state write re-rendered this workspace and built
+  // another element.  Observed as an online-usage tab that never settled: the
+  // pager republished itself forever.  The element is still rebuilt each
+  // render (its buttons must close over current state), but it reaches the
+  // strip only when one of the values it *shows* changes.
+  const usageStatusControlsRef = useRef(usageStatusControls);
+  usageStatusControlsRef.current = usageStatusControls;
+  const usageStatusControlsKey = [
+    selected,
+    onlineUsagePagerDisabled ? "1" : "0",
+    onlineUsageLoadedPage,
+    onlineUsagePageCount,
+    onlineUsageRemaining,
+    onlineUsagePageDraft,
+    onlineUsagePageRows,
+    onlineUsageLoadingMore ? "1" : "0",
+    onlineUsagePrevious,
+    onlineUsageNext,
+  ].join("|");
   useEffect(() => {
-    onStatusBar?.(usageStatusControls);
+    onStatusBar?.(usageStatusControlsRef.current);
     return () => onStatusBar?.(null);
-  }, [onStatusBar, usageStatusControls]);
+  }, [onStatusBar, usageStatusControlsKey]);
   const editOnlineUsageRange = (): void => {
     const prompt = native.textPrompt;
     if (!prompt) {
