@@ -22,6 +22,8 @@ type NativeModule = {
   showActionMenu?: (title: string, items: string[], anchor: NativeMenuAnchor) => Promise<number | undefined>;
   showGroupedActionMenu?: (title: string, groups: Array<{ title: string; items: string[] }>, anchor: NativeMenuAnchor) => Promise<{ group: number; item: number } | undefined>;
   showConfirmation?: (title: string, message: string, confirmLabel: string, cancelLabel: string, destructive: boolean) => Promise<boolean>;
+  /** The native preset box: a value in, a value or null out. */
+  textPrompt?: (title: string, value: string, confirmLabel: string, cancelLabel: string) => Promise<string | null>;
   showReadOnlyText?: (title: string, text: string, closeLabel: string, language: "json" | "toml" | "text", html: string) => Promise<void>;
   showProviderAuth?: (options: {
     provider: "openai";
@@ -172,6 +174,13 @@ const nativeBridge: NativeLeafBridge = {
   showActionMenu: async (title, items, anchor) => leaf.showActionMenu?.(title, items, anchor),
   showGroupedActionMenu: async (title, groups, anchor) => leaf.showGroupedActionMenu?.(title, groups, anchor),
   showConfirmation: async (title, message, confirmLabel, cancelLabel, destructive) => leaf.showConfirmation?.(title, message, confirmLabel, cancelLabel, destructive === true) ?? false,
+  // The macOS host implements this and declares it to its RCT bridge, but the
+  // shared layer never forwarded it, so `native.textPrompt` was undefined and
+  // the 自定义 time range answered every press with the generic failure.
+  textPrompt: async (title, value, confirmLabel, cancelLabel) => {
+    if (!leaf.textPrompt) throw new Error("The native text prompt is unavailable.");
+    return leaf.textPrompt(title, value, confirmLabel, cancelLabel);
+  },
   showReadOnlyText: async (title, text, closeLabel, language, html) => {
     if (!leaf.showReadOnlyText) throw new Error("The native code viewer is unavailable.");
     await leaf.showReadOnlyText(title, text, closeLabel, language, html);

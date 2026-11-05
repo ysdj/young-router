@@ -1,5 +1,5 @@
 import React from "react";
-import { PlatformColor, StyleSheet, Text, View } from "react-native";
+import { Platform, PlatformColor, StyleSheet, Text, View } from "react-native";
 import { NativeTable } from "./NativeControls";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
@@ -25,8 +25,10 @@ export function AccountsTable({
   onSelectionChange,
   alertRowKeys,
   emptyText,
-  tableHeight = 84,
-  alertRowKeysHint: _alertRowKeysHint,
+  // Three rows plus the header.  A Windows row is 30 pt tall (macOS draws
+  // 22 pt ones), so a fixed 84 showed a single account there and made a list of
+  // several look like a list of one.
+  tableHeight = Platform.OS === "windows" ? 116 : 84,
 }: {
   title: string;
   /** The list's own buttons, drawn to the right of the title. */

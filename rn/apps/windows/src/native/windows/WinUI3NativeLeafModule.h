@@ -19,6 +19,11 @@ struct WinUI3NativeLeafModule {
   REACT_METHOD(SetTrayActions, L"setTrayActions");
   REACT_METHOD(OpenFileEditor, L"openFileEditor");
   REACT_METHOD(PrepareFileEditor, L"prepareFileEditor");
+  // Registered beside its sibling: the method was declared and implemented,
+  // but without this line RNW never exposed it, so the shared bridge's
+  // `leaf.openFilePicker?.(...)` resolved to undefined and Data Management
+  // 导入 did nothing at all on Windows — no dialog, no message.
+  REACT_METHOD(OpenFilePicker, L"openFilePicker");
   REACT_METHOD(SaveFilePicker, L"saveFilePicker");
   REACT_METHOD(ShowConfirmation, L"showConfirmation");
   REACT_METHOD(ShowReadOnlyText, L"showReadOnlyText");

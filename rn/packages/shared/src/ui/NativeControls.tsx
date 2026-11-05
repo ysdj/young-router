@@ -177,6 +177,8 @@ type PickerProps = {
   compact?: boolean;
   /** A macOS overlay that must remain above native content controls. */
   overlayLayer?: boolean;
+  /** The row the picker belongs to; it names the control for a screen reader. */
+  accessibilityLabel?: string;
   onChange?: (event: NativeSyntheticEvent<{ value: string; index: number }>) => void;
   style?: StyleProp<ViewStyle>;
 };
@@ -401,7 +403,7 @@ type WindowsActionMenuBridge = {
   ) => Promise<number | undefined>;
 };
 
-function WindowsPicker({ labels, selectedValue, disabled, compact = true, onChange, style }: PickerProps): React.JSX.Element {
+function WindowsPicker({ labels, selectedValue, disabled, compact = true, accessibilityLabel, onChange, style }: PickerProps): React.JSX.Element {
   const triggerRef = React.useRef<View>(null);
   const selectedIndex = labels.indexOf(selectedValue);
   const choose = (index: number): void => {
@@ -425,7 +427,7 @@ function WindowsPicker({ labels, selectedValue, disabled, compact = true, onChan
     onPress={openMenu}
     onAccessibilityTap={openMenu}
     accessibilityRole="button"
-    accessibilityLabel={selectedValue}
+    accessibilityLabel={accessibilityLabel ? `${accessibilityLabel}: ${selectedValue}` : selectedValue}
     accessibilityState={{ disabled: disabled === true, selected: selectedIndex >= 0 }}
     style={[styles.windowsPicker, compact && styles.windowsPickerCompact, disabled && styles.windowsPickerDisabled, style]}
   >
@@ -567,7 +569,7 @@ export function NativeSelectableRow({ title, detail, selected, disabled, onPress
   if (Platform.OS === "macos") {
     return <AppKitSelectableRow title={title} detail={detail} selected={selected} disabled={disabled} onPress={onPress} style={style} />;
   }
-  return <Pressable style={[styles.selectableRow, selected && styles.selectableRowSelected, style]} disabled={disabled} onPress={onPress} accessibilityRole="button"><View style={styles.selectableText}><Text style={styles.selectableTitle}>{title}</Text>{detail ? <Text style={styles.selectableDetail}>{detail}</Text> : null}</View></Pressable>;
+  return <Pressable style={[styles.selectableRow, selected && styles.selectableRowSelected, style]} disabled={disabled} onPress={onPress} accessibilityRole="button" accessibilityLabel={detail ? `${title}, ${detail}` : title} accessibilityState={{ selected: selected === true, disabled: disabled === true }}><View style={styles.selectableText}><Text style={styles.selectableTitle}>{title}</Text>{detail ? <Text style={styles.selectableDetail}>{detail}</Text> : null}</View></Pressable>;
 }
 
 export function NativeCheckbox({ label, value, disabled, compact = true, labelVisible = true, onValueChange, style }: CheckboxProps): React.JSX.Element {
@@ -581,12 +583,12 @@ export function NativeCheckbox({ label, value, disabled, compact = true, labelVi
   return <Pressable style={[styles.checkboxFallback, sizedStyle]} disabled={disabled} onPress={() => onValueChange?.(!value)} accessibilityRole="checkbox" accessibilityLabel={label} accessibilityState={{ checked: value, disabled }}><StaticBooleanIndicator value={value} />{labelVisible ? <Text style={styles.controlText}>{label}</Text> : null}</Pressable>;
 }
 
-export function NativePicker({ labels, selectedValue, disabled, compact = true, overlayLayer = false, onChange, style }: PickerProps): React.JSX.Element {
+export function NativePicker({ labels, selectedValue, disabled, compact = true, overlayLayer = false, accessibilityLabel, onChange, style }: PickerProps): React.JSX.Element {
   if (Platform.OS === "windows") {
-    return <WindowsPicker labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={onChange} style={style} />;
+    return <WindowsPicker labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} accessibilityLabel={accessibilityLabel} onChange={onChange} style={style} />;
   }
   if (Platform.OS === "macos") {
-    return <AppKitPicker labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} overlayLayer={overlayLayer} onChange={onChange} style={[compact && style === undefined ? { minWidth: pickerLabelWidth(labels, selectedValue) } : null, style]} />;
+    return <AppKitPicker labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} overlayLayer={overlayLayer} accessibilityLabel={accessibilityLabel} onChange={onChange} style={[compact && style === undefined ? { minWidth: pickerLabelWidth(labels, selectedValue) } : null, style]} />;
   }
   return <NativeSegmentedControl labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={onChange} style={style} />;
 }
@@ -711,6 +713,13 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   const [hovered, setHovered] = React.useState(false);
   const stripe = stripedRows && !selected && !disabled && index % 2 === 1;
   const textColor = alert ? WINDOWS_CONTROL.warning : (disabled ? WINDOWS_CONTROL.textDisabled : WINDOWS_CONTROL.text);
+  // The row is the whole of this list's interactive surface, so what a screen
+  // reader announces has to come from it: without a role, a label and its
+  // selected state, a Windows table was a list of anonymous press targets —
+  // the source list and the settings rail included.  The label joins every
+  // cell there is, because a row's meaning is its cells taken together, and a
+  // spanning group row is a heading rather than a choice.
+  const rowLabel = row.cells.filter((cell) => cell.length > 0).join(", ");
   const rowStyle = [
     windowsTableStyles.row,
     { height: rowHeight },
@@ -729,6 +738,9 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
     onPress={() => onSelect(row, index)}
     onHoverIn={sourceList ? () => setHovered(true) : undefined}
     onHoverOut={sourceList ? () => setHovered(false) : undefined}
+    accessibilityRole={spanning ? "header" : "button"}
+    accessibilityLabel={rowLabel}
+    accessibilityState={spanning ? { disabled: disabled || !selectableSpanning } : { selected, disabled }}
     style={rowStyle}
   >
     {sourceList && selected ? <View style={[windowsTableStyles.sourceSelectionIndicator, { top: rowHeight / 2 - 8 }]} /> : null}
@@ -979,49 +991,52 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
     const spanning = new Set(spanningRowKeys);
     return new Set(selectableSpanningRowKeys.filter((key) => spanning.has(key)));
   }, [spanningRowKeys, selectableSpanningRowKeys]);
-  // Every key here must also appear in the macOS wrapper's own parameter list:
-  // `AppKitControls.tsx` forwards props by hand, so a prop added on one host and
-  // forgotten on the other arrives empty instead of failing to compile.
-  const nativeProps = {
-    columnLabels: columns.map((column) => column.label),
-    columnWidths: columns.map((column) => column.width),
-    rowKeys: rows.map((row) => row.key),
-    // The native tables address cells positionally by row * columnCount, so
-    // every row owns exactly one columnCount slice.  A spanning (group) row
-    // carries one value for its full-width cell, and a trailing spacer column
-    // carries none, so both are padded here — an unpadded row shifted every
-    // row after it into its neighbour's columns.
-    cells: rows.flatMap((row) => {
-      const cells = row.spanning ? [row.cells[0] ?? ""] : row.cells.slice(0, columns.length);
-      return [...cells, ...Array(Math.max(0, columns.length - cells.length)).fill("")];
-    }),
-    selectedKey,
-    alternatingRows: stripedRows,
-    compact,
-    followBottom,
-    scrollToRow,
-    borderless: !framed,
-    sourceList,
-    rowSymbols,
-    rowSymbolColors,
-    rowImageNames,
-    disabledRowKeys,
-    secondaryCellKeys,
-    // An all-empty list is the same as none: the native table reads a non-empty
-    // list as "these rows are two lines tall", so the padding below never has to
-    // invent a second line the UI did not ask for.
-    rowDetails: rows.some((_, index) => (rowDetails[index] ?? "").length > 0)
-      ? rows.map((_, index) => rowDetails[index] ?? "")
-      : EMPTY_STRINGS,
-    alertRowKeys,
-    spanningRowKeys,
-    selectableSpanningRowKeys: Array.from(selectableSpanningKeys),
-  };
   if (Platform.OS === "windows") {
     // This React table is the only Windows table path.
     return <WindowsTable columns={columns} rows={rows} selectedKey={selectedKey} stripedRows={stripedRows} compact={compact} followBottom={followBottom} scrollToRow={scrollToRow} framed={framed} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} rowImageNames={rowImageNames} disabledRowKeys={disabledRowKeys} secondaryCellKeys={secondaryCellKeys} rowDetails={rowDetails} selectableSpanningKeys={selectableSpanningKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} alertRowKeys={alertRowKeys} style={[styles.table, style]} />;
   }
+  // The macOS bridge props are built per render, and the list above them can be
+  // thousands of rows: building them before the platform branch made a Windows
+  // log table flatten every cell into a second copy nobody read.
   if (Platform.OS === "macos") {
+    // Every key here must also appear in the macOS wrapper's own parameter list:
+    // `AppKitControls.tsx` forwards props by hand, so a prop added on one host and
+    // forgotten on the other arrives empty instead of failing to compile.
+    const nativeProps = {
+      columnLabels: columns.map((column) => column.label),
+      columnWidths: columns.map((column) => column.width),
+      rowKeys: rows.map((row) => row.key),
+      // The native tables address cells positionally by row * columnCount, so
+      // every row owns exactly one columnCount slice.  A spanning (group) row
+      // carries one value for its full-width cell, and a trailing spacer column
+      // carries none, so both are padded here — an unpadded row shifted every
+      // row after it into its neighbour's columns.
+      cells: rows.flatMap((row) => {
+        const cells = row.spanning ? [row.cells[0] ?? ""] : row.cells.slice(0, columns.length);
+        return [...cells, ...Array(Math.max(0, columns.length - cells.length)).fill("")];
+      }),
+      selectedKey,
+      alternatingRows: stripedRows,
+      compact,
+      followBottom,
+      scrollToRow,
+      borderless: !framed,
+      sourceList,
+      rowSymbols,
+      rowSymbolColors,
+      rowImageNames,
+      disabledRowKeys,
+      secondaryCellKeys,
+      // An all-empty list is the same as none: the native table reads a non-empty
+      // list as "these rows are two lines tall", so the padding below never has to
+      // invent a second line the UI did not ask for.
+      rowDetails: rows.some((_, index) => (rowDetails[index] ?? "").length > 0)
+        ? rows.map((_, index) => rowDetails[index] ?? "")
+        : EMPTY_STRINGS,
+      alertRowKeys,
+      spanningRowKeys,
+      selectableSpanningRowKeys: Array.from(selectableSpanningKeys),
+    };
     return <AppKitTable {...nativeProps} cellHorizontalPadding={cellHorizontalPadding} firstColumnHorizontalPadding={firstColumnHorizontalPadding} preserveColumnWidths={preserveColumnWidths} scrollTrailingColumnOverflow={scrollTrailingColumnOverflow} onSelectionChange={(event) => onSelectionChange?.(event.nativeEvent.key, event.nativeEvent.index)} onRowDoublePress={(event) => onRowDoublePress?.(event.nativeEvent.key, event.nativeEvent.index)} style={[styles.table, style]} />;
   }
   return <View style={[styles.tableFallback, !framed && styles.tableFallbackUnframed, style]}>{rows.map((row, index) => {

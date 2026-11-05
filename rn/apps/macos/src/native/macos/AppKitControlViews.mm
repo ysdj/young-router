@@ -2048,6 +2048,13 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitCheckboxCls(void)
   if (oldViewProps.disabled != newViewProps.disabled) {
     _picker.enabled = !newViewProps.disabled;
   }
+  // A picker is named by the row it belongs to, not by the value it happens to
+  // hold: VoiceOver read the selected option alone, so a pane with several
+  // pickers announced a column of values with nothing saying which is which.
+  if (oldViewProps.accessibilityLabel != newViewProps.accessibilityLabel) {
+    const std::string label = newViewProps.accessibilityLabel;
+    _picker.accessibilityLabel = label.empty() ? nil : StringFromStdString(label);
+  }
   if (oldViewProps.overlayLayer != newViewProps.overlayLayer) {
     self.layer.zPosition = newViewProps.overlayLayer ? 1000 : 0;
   }
@@ -3580,8 +3587,26 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   return [self isSpanningRow:row];
 }
 
+- (BOOL)isDisabledRow:(NSInteger)row
+{
+  const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitTableProps>(_props);
+  if (row < 0 || static_cast<size_t>(row) >= viewProps.rowKeys.size()) {
+    return NO;
+  }
+  const std::string &rowKey = viewProps.rowKeys[static_cast<size_t>(row)];
+  return std::find(viewProps.disabledRowKeys.begin(), viewProps.disabledRowKeys.end(), rowKey) !=
+      viewProps.disabledRowKeys.end();
+}
+
 - (BOOL)tableView:(__unused NSTableView *)tableView shouldSelectRow:(NSInteger)row
 {
+  // A disabled row is painted in secondary ink and means "not now", so it must
+  // not become the selection either.  Windows already refuses it; macOS only
+  // grayed the text and kept the row selectable, which left the pane acting on
+  // a row the user could not use.
+  if ([self isDisabledRow:row]) {
+    return NO;
+  }
   return ![self isSpanningRow:row];
 }
 
@@ -3879,6 +3904,11 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   // row click also returns the detail pane from a model to its provider —
   // would then keep showing the pane the previous click opened.  Report the
   // row only in that case, where the notification is not already coming.
+  // A disabled row answers no click, including the one that repeats the
+  // selection it already holds.
+  if ([self isDisabledRow:row]) {
+    return;
+  }
   if (_tableView.selectedRow == row && row == SegmentIndex(viewProps.rowKeys, viewProps.selectedKey)) {
     LiteLLMAppKitTableEventEmitter::OnSelectionChange event{
         viewProps.rowKeys[static_cast<size_t>(row)], static_cast<int>(row)};

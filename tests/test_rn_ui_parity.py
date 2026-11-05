@@ -979,8 +979,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # inside that pane instead of clipped by the column beside it.
             'function HelpTip({ open, text, title, onToggle, align = "right" }: { open: boolean; text: string; title: string; onToggle: () => void; align?: "left" | "right" }): React.JSX.Element {',
             '<NativeButton title="" symbol="help" link plainLink toolTip={title} accessibilityLabel={title} onPress={onToggle} style={styles.helpTipButton} />',
-            '{open ? <View style={align === "left" ? styles.helpTipPopupLeft : styles.helpTipPopup}><Text style={styles.helpTipText}>{text}</Text></View> : null}',
-            'helpTipPopupLeft: { position: "absolute", left: 0, bottom: 22, width: 208, zIndex: 4,',
+            # The panel is text a screen reader is told about: the mark's own
+            # label names the tip, and the sentence it opens is announced when
+            # it appears rather than being reachable only by reading the pane.
+            '{open ? <View accessibilityRole="text" accessibilityLiveRegion="polite" style={align === "left" ? styles.helpTipPopupLeft : styles.helpTipPopup}><Text style={styles.helpTipText}>{text}</Text></View> : null}',
+            'helpTipPopupLeft: { position: "absolute", left: 0, bottom: 25, width: 208, zIndex: 4,',
             'const protocolHint = translate(fixed ? "providers.protocolModeFixedHint" : "providers.protocolModeFallbackHint");',
             'accessory={<HelpTip open={tipOpen} text={protocolHint} title={translate("providers.protocolModeHelp")} onToggle={() => setTipOpen((current) => !current)} />}',
             'const [tipOpen, setTipOpen] = useState(false);',
@@ -995,8 +998,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # so the tip closes on the next click outside itself.
             '{open ? <Pressable accessible={false} onPress={onToggle} style={styles.helpTipDismiss} /> : null}',
             'helpTipDismiss: { position: "absolute", left: -2400, right: -2400, top: -2400, bottom: -2400 }',
-            'helpTipButton: { width: 16, height: 16, minWidth: 16, minHeight: 16 }',
-            'helpTipPopup: { position: "absolute", right: 0, bottom: 22, width: 208',
+            # The mark keeps its 16 pt glyph but owns a 22 pt target: the
+            # negative margins give back the extra points, so the glyph does
+            # not move while the click area reaches the platform minimum.
+            'helpTipButton: { width: 22, height: 22, minWidth: 22, minHeight: 22, marginHorizontal: -3, marginVertical: -3 }',
+            'helpTipPopup: { position: "absolute", right: 0, bottom: 25, width: 208',
             'helpTipText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }',
         ):
             self.assert_ui_has(marker)
@@ -2907,7 +2913,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('label === "⧉" ? "copy"', self.ui)
         self.assertIn('label === "↑" ? "chevron-up"', self.ui)
         self.assertIn('label === "↓" ? "chevron-down"', self.ui)
-        self.assertIn('iconButton: { minWidth: 22, width: 22, minHeight: 22, height: 22', self.ui)
+        self.assertIn('iconButton: { minWidth: 24, width: 24, minHeight: 24, height: 24', self.ui)
         self.assertIn('button: { minWidth: 28, height: 24 }', self.native_controls)
         appkit_controls = (ROOT / "rn/packages/shared/src/ui/AppKitControls.tsx").read_text(encoding="utf-8")
         self.assertIn('button: { minWidth: 28, height: 24 }', appkit_controls)
@@ -7321,7 +7327,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertEqual(1, shared.count("striped"))
         self.assertNotIn("striped={false}", shared)
         self.assertNotIn("<NativeTable", relay)
-        self.assertIn("tableHeight = 84", shared)
+        # Three rows plus the header, at each platform's own row height: a
+        # Windows row is 30 pt tall, so one fixed 84 showed a single account.
+        self.assertIn('tableHeight = Platform.OS === "windows" ? 116 : 84', shared)
 
     def test_relay_resource_columns_fit_the_initial_minimum_viewport(self) -> None:
         """The unified keys table is a single readable column in the detail pane."""
