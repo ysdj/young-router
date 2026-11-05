@@ -129,7 +129,12 @@ class HookRoutingTests(HookTestCase):
         account_pool_exhausted.status_code = 403
 
         self.assertEqual(hooks._recovery_policy_for_exception(balance), "recovery_cooldown")
-        self.assertEqual(hooks._recovery_policy_for_exception(rate_limit), "recovery")
+        # A rate limit is a route the next request must not try first again:
+        # measured on the live gateway, one route refused 691 times and
+        # recovered within five minutes four times, while every request kept
+        # selecting it first.  The default parks it after the ordinary
+        # failure threshold instead of retrying in place forever.
+        self.assertEqual(hooks._recovery_policy_for_exception(rate_limit), "recovery_cooldown")
         # A 5xx is the route failing, whatever sentence it wears: an "overloaded"
         # 503 is a route the next request must not try first again.
         self.assertEqual(hooks._recovery_policy_for_exception(overload), "recovery_cooldown")
@@ -163,7 +168,9 @@ class HookRoutingTests(HookTestCase):
         self.assertEqual(hooks._recovery_policy_for_exception(rejected), "recovery_cooldown")
         self.assertEqual(hooks._recovery_diagnostic(rejected)["kind"], "authentication")
         self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(network))
-        self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(rate_limit))
+        # The default now counts a rate limit against the route's cooldown, so
+        # two consecutive refusals park it exactly as a 5xx does.
+        self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(rate_limit))
         self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(start_timeout))
 
     def test_every_server_error_status_cools_the_route_whatever_it_says(self) -> None:
@@ -208,21 +215,29 @@ class HookRoutingTests(HookTestCase):
                         hooks._should_count_deployment_failure_for_cooldown(error)
                     )
 
-        # The same sentences on a 429 are a limit: the route is not broken, so
-        # it is waited out rather than parked.
+        # The same sentences on a 429 are a limit, and the default now parks a
+        # limited route too: the live gateway spent 113 minutes of a 10.7-hour
+        # window retrying one route that recovered four times out of 691
+        # refusals.  A limit that repeats is a route the next request must not
+        # try first again, so it is cooled rather than waited out.
         for wording in wordings:
             with self.subTest(status_code=429, wording=wording):
                 error = RuntimeError(wording)
                 error.status_code = 429
-                self.assertEqual(hooks._recovery_policy_for_exception(error), "recovery")
-                self.assertFalse(
+                self.assertEqual(
+                    hooks._recovery_policy_for_exception(error), "recovery_cooldown"
+                )
+                self.assertTrue(
                     hooks._should_count_deployment_failure_for_cooldown(error)
                 )
 
-        # A wrapper with no status at all still has only its words to go on.
+        # A wrapper with no status at all still has only its words to go on,
+        # and those words are a rate-limit marker: the route is parked under the
+        # same default as a 429, because the alternative is paying the same
+        # refusal on every request.
         unreadable = RuntimeError("upstream overloaded, retry later")
         self.assertEqual(
-            hooks._recovery_policy_for_exception(unreadable), "recovery"
+            hooks._recovery_policy_for_exception(unreadable), "recovery_cooldown"
         )
 
     def test_recovery_policy_is_runtime_configurable(self) -> None:
@@ -275,16 +290,19 @@ class HookRoutingTests(HookTestCase):
             hooks._recovery_diagnostic(window_closed)["kind"], "rate_limit_window"
         )
 
-    def test_transient_rate_limit_keeps_the_configured_recovery_policy(self) -> None:
-        """An answer that never said when it would be ready is still retried.
+    def test_transient_rate_limit_keeps_a_stated_recovery_policy(self) -> None:
+        """An answer that never said when it would be ready keeps what was chosen.
 
-        Only a named reset beyond the horizon is a closed window; a bare burst
+        Only a named reset beyond the horizon is a closed window.  A bare burst
         limit, a reset inside the horizon, and a non-429 upstream error all keep
-        the configured policy so the default stays honest.
+        the configured policy -- and the default is now ``recovery_cooldown``,
+        so this test states ``recovery`` explicitly to keep asserting the
+        contract that matters: an operator who asks for in-place retries gets
+        them, and the window rule does not quietly override that choice.
         """
 
         hooks, _proxy_server = load_hook_module()
-        self.set_env(hooks._RECOVERY_POLICY_RATE_LIMIT_ENV, None)
+        self.set_env(hooks._RECOVERY_POLICY_RATE_LIMIT_ENV, "recovery")
         self.set_env(hooks._QUOTA_RESET_COOLDOWN_HORIZON_SECONDS_ENV, None)
 
         bare_burst = RuntimeError("RateLimitError: rate limit exceeded, retry later")
@@ -1556,7 +1574,7 @@ class HookRoutingTests(HookTestCase):
         )
         self.assertEqual(filtered, deployments)
 
-    async def test_deployment_cooldown_does_not_count_rate_limit_or_request_errors_by_default(self) -> None:
+    async def test_deployment_cooldown_does_not_count_request_errors_but_counts_rate_limits(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
@@ -1586,10 +1604,14 @@ class HookRoutingTests(HookTestCase):
 
         rate_limit_error = RuntimeError("rate limit exceeded; retry after 10 seconds")
         rate_limit_error.status_code = 429
-        errors.append(rate_limit_error)
 
         for error in errors:
             hooks._mark_exception_for_deployment_failover(error, request_kwargs)
+
+        # A rate limit is not a request-shaped error: the default counts it
+        # against the route, so it parks the route exactly as a server error
+        # would.  Request and context errors stay uncounted (asserted above).
+        hooks._mark_exception_for_deployment_failover(rate_limit_error, request_kwargs)
 
         filtered = await hook.async_filter_deployments(
             "default-chat",
@@ -1597,7 +1619,7 @@ class HookRoutingTests(HookTestCase):
             messages=None,
             request_kwargs={},
         )
-        self.assertEqual(filtered, deployments)
+        self.assertEqual(filtered, [deployments[1]])
 
     async def test_deployment_cooldown_counts_server_timeouts_but_not_stream_idle_errors(self) -> None:
         hooks, _ = load_hook_module()

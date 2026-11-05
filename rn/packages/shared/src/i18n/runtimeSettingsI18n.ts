@@ -55,7 +55,7 @@ const zh: Record<string, RuntimeCopy> = {
   YOUNG_ROUTER_RECOVERY_INTERVAL_SECONDS: { label: "恢复探测间隔", help: "两次实际路由恢复探测之间的等待时间。" },
   YOUNG_ROUTER_SAME_DEPLOYMENT_RETRIES: { label: "同路由重试", help: "失败部署切换到下一个同级路由或顺序前的额外尝试次数。默认 0 会立即推进，也会覆盖漾路由的重试计数。" },
   YOUNG_ROUTER_RECOVERY_POLICY_BALANCE: { label: "余额 / 配额", help: "余额不足、配额或计费失败的处理方式。" },
-  YOUNG_ROUTER_RECOVERY_POLICY_RATE_LIMIT: { label: "限流 / 过载", help: "HTTP 429、上游过载或容量不足的处理方式。默认恢复，不让部署进入冷却。" },
+  YOUNG_ROUTER_RECOVERY_POLICY_RATE_LIMIT: { label: "限流 / 过载", help: "HTTP 429、上游过载或容量不足的处理方式。默认冷却：连续失败达到「冷却失败次数」后暂停该部署，后续请求直接交给能服务的路由，不再每次都先吃同一个拒绝。设为「恢复」则每次都在原路由重试。" },
   YOUNG_ROUTER_RECOVERY_POLICY_SERVER: { label: "服务器 / 网关", help: "临时服务器故障、没有健康路由和网关超时的处理方式。" },
   YOUNG_ROUTER_RECOVERY_POLICY_NETWORK: { label: "网络", help: "断连、DNS 故障和连接错误的处理方式。默认恢复不会让部署进入冷却。" },
   YOUNG_ROUTER_RECOVERY_POLICY_STREAM_START_TIMEOUT: { label: "首事件超时", help: "上游首个流事件到达前发生本地超时时的处理方式。" },

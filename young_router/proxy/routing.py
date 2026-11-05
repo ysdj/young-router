@@ -1227,14 +1227,22 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
     ):
         rate_limit_policy = _recovery_policy_setting(
             _RECOVERY_POLICY_RATE_LIMIT_ENV,
-            _RECOVERY_POLICY_RECOVERY,
+            _RECOVERY_POLICY_COOLDOWN,
         )
+        # The default cools a rate-limited route down, because the alternative
+        # was measured on the live gateway: one route answered 691 refusals in
+        # 10.7 hours, recovered within five minutes four times (0.6%), and was
+        # still tried first on every request -- 113 minutes of the window spent
+        # waiting for a route that was not going to answer.  Two consecutive
+        # failures now park it for the ordinary window, so the next request
+        # starts on the tier that can serve.
+        #
         # An explicit policy is never overridden: a user who set ``error`` wants
-        # a terminal answer, and one who set ``recovery_cooldown`` already has
-        # every 429 cooled.  Only the default is refined, and only for an
-        # answer that named a reset beyond the retry horizon — the route cannot
-        # serve before then, so retrying it first on every request buys nothing
-        # but a failed round trip and a log full of the same refusal.
+        # a terminal answer, and one who set ``recovery`` wants every 429 retried
+        # in place even when it repeats.  Only that ``recovery`` setting is
+        # refined, and only for an answer that named a reset beyond the retry
+        # horizon -- the route cannot serve before then, so retrying it first on
+        # every request buys only the same refusal.
         if rate_limit_policy == _RECOVERY_POLICY_RECOVERY and _is_quota_window_rate_limit_error(
             exception
         ):
