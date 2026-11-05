@@ -6513,6 +6513,14 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       {viewMode === "routes" ? <View style={styles.routeWorkspace}>
         <TablePane wide style={styles.routeTablePane} title={translate("providers.routes")} actions={<><IconButton label="+" title={translate("providers.newRoute")} disabled={busy || providers.length === 0} onPress={addRoute} />{activeRoute || selectedPublicModel !== undefined ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteRoute} /> : null}<IconButton label="↑" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveUp")} disabled={busy || !canMoveRouteUp} onPress={() => moveRoute("up")} /><IconButton label="↓" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveDown")} disabled={busy || !canMoveRouteDown} onPress={() => moveRoute("down")} /></>}>
           <NativeTable columns={[{ label: translate("providers.upstream"), width: 160 }, { label: translate("providers.provider"), width: 84 }, { label: translate("providers.providerKey"), width: 150 }, { label: translate("common.order"), width: 48 }, ROUTE_TABLE_SPACER_COLUMN]} rows={routeRows} disabledRowKeys={disabledRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => selectRouteTableRow(key)} style={styles.nativeRouteTable} />
+          {/* The routes table is grouped by public model, so an empty Core and a
+              Core whose every group is collapsed both draw a blank table.  Say
+              which one this is and what creates the first row, rather than
+              leaving the pane to guess from a header with nothing under it. */}
+          {routeRows.length === 0 ? <View style={styles.routesEmpty}>
+            <Text style={styles.routesEmptyTitle}>{translate("providers.routesEmpty")}</Text>
+            <Text style={styles.routesEmptyHint}>{translate("providers.routesEmptyHint")}</Text>
+          </View> : null}
         </TablePane>
       </View> : providers.length === 0 ? <View style={styles.providerEmptyState}>
         <View style={styles.providerEmptyGlyph}><Text style={styles.providerEmptyGlyphText}>+</Text></View>
@@ -8433,6 +8441,20 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   };
   const logoutAccount = async (accountRef: string): Promise<void> => {
     if (!accountRef || authPending !== undefined) return;
+    // Signing out ends this row's session and takes the account off the list;
+    // the list's − is one press away from a control the user aimed at, and a
+    // mis-press costs a full sign-in.  A station's − already asks.
+    const confirmed = await native.showConfirmation({
+      title: translate("relay.officialProviderLogoutTitle"),
+      // Name the account the list names it, so the question and the row being
+      // answered match: a bare ref would ask about an id the user never saw.
+      message: translate("relay.officialProviderLogoutBody", {
+        name: authAccountRows.find((row) => row.key === accountRef)?.cells[0] || accountRef,
+      }),
+      confirmLabel: translate("relay.officialProviderLogout"),
+      destructive: true,
+    });
+    if (!confirmed) return;
     setAuthPending(`logout:${accountRef}`);
     try {
       await dispatchWithOutcome("service_provider.auth_logout", { provider_id: id, account_ref: accountRef }, "providers_models");
@@ -13784,7 +13806,7 @@ const styles = StyleSheet.create({
   // window's whole height (a `flex: 1` the sibling panes rely on), but packs its
   // glyph, title, and action against the top so the space below stays available
   // for the first provider that arrives instead of reading as a blank page.
-  providerEmptyState: { flex: 1, minWidth: 0, minHeight: 0, alignItems: "center", justifyContent: "flex-start", paddingHorizontal: 28, paddingTop: 24, paddingBottom: 24, gap: 8, backgroundColor: systemColors.textBackground }, providerEmptyGlyph: { width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center", backgroundColor: systemColors.selectedContent }, providerEmptyGlyphText: { color: systemColors.selectedControlText, fontSize: 28, fontWeight: "300", lineHeight: 34 }, providerEmptyTitle: { color: systemColors.label, fontSize: 17, fontWeight: "600", textAlign: "center" }, providerEmptyHint: { maxWidth: 380, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 18, textAlign: "center" }, providerEmptyActions: { alignSelf: "center", flexDirection: "row", alignItems: "center", gap: 8, paddingTop: 6 },
+  routesEmpty: { paddingHorizontal: 12, paddingVertical: 16, gap: 4 }, routesEmptyTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, routesEmptyHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 18 }, providerEmptyState: { flex: 1, minWidth: 0, minHeight: 0, alignItems: "center", justifyContent: "flex-start", paddingHorizontal: 28, paddingTop: 24, paddingBottom: 24, gap: 8, backgroundColor: systemColors.textBackground }, providerEmptyGlyph: { width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center", backgroundColor: systemColors.selectedContent }, providerEmptyGlyphText: { color: systemColors.selectedControlText, fontSize: 28, fontWeight: "300", lineHeight: 34 }, providerEmptyTitle: { color: systemColors.label, fontSize: 17, fontWeight: "600", textAlign: "center" }, providerEmptyHint: { maxWidth: 380, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 18, textAlign: "center" }, providerEmptyActions: { alignSelf: "center", flexDirection: "row", alignItems: "center", gap: 8, paddingTop: 6 },
   keysPane: { flex: 1, minWidth: 0, minHeight: 0 }, keysInline: { minWidth: 0, gap: 6, paddingTop: 6, borderTopWidth: 1, borderTopColor: systemColors.separator }, keysInlineBody: { minWidth: 0, height: KEYS_INLINE_LIST_HEIGHT, flexDirection: "row", alignItems: "flex-start", gap: 6 }, keysTableInline: { flex: 1, minWidth: 0, height: KEYS_INLINE_LIST_HEIGHT, minHeight: KEYS_INLINE_LIST_HEIGHT }, keysEditorInline: { width: KEYS_INLINE_EDITOR_WIDTH, minWidth: 0, flexGrow: 0, flexShrink: 0, gap: 5 }, keysEditorField: { minWidth: 0, gap: 2 }, keysEditorFieldHeader: { height: 22, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 4 }, keysEditorFieldLabel: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE },
   keysTable: { flex: 1, minHeight: 120 },
   keysEditor: { minWidth: 0, gap: 5, paddingTop: 5, paddingLeft: 8, borderLeftWidth: 2, borderLeftColor: systemColors.separator },

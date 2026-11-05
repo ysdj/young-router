@@ -5825,7 +5825,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("&& observed !== null;", relay)
         self.assertIn("&& observed < sessionRecheckSeconds;", relay)
         self.assertNotIn('const fresh = account.loginStatus === "signed_in"', relay)
-        self.assertIn("if (!fresh) {", relay)
+        # The probe runs for a session the window no longer covers, and its
+        # answer is what decides whether the account is released back to
+        # unattempted: a refused round trip observed nothing, so leaving the id
+        # attempted suppressed the mount check for the life of the panel.
+        self.assertIn("if (!fresh && active) answered = await restoreSavedSession(account);", relay)
+        self.assertIn("if (!answered) attemptedAccounts.current.delete(account.id);", relay)
+        self.assertIn("let active = true;", relay)
+        self.assertIn("return () => { active = false; };", relay)
         self.assertIn("sessionRecheckSeconds?: number;", relay)
         self.assertIn("export function relaySessionRecheckSeconds(snapshot?: CoreSnapshot): number | undefined {", relay)
         self.assertIn("sessionRecheckSeconds={relaySessionRecheckSeconds(snapshotForCleanups)}", self.ui)

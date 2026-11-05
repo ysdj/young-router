@@ -637,7 +637,16 @@ export function StationAccountsPanel({
   // The session lane is cleared against *this* id, so the lane and the account
   // it belongs to can never drift apart.
   const pendingLoginRef = useRef<string | undefined>(undefined);
-  const [formBusy, setFormBusy] = useState(false);
+  // A count, not a flag: sign-in, refresh, remove and the group manager can
+  // overlap (a refresh pressed while the post-login read is still running),
+  // and a single boolean let the first one to finish re-enable every control
+  // with the other still in flight — the row could be removed out from under
+  // it.  The window-wide writer in `RouteSurface` counts for the same reason.
+  const [formBusyRuns, setFormBusyRuns] = useState(0);
+  const formBusy = formBusyRuns > 0;
+  const setFormBusy = (busy: boolean): void => {
+    setFormBusyRuns((current) => (busy ? current + 1 : Math.max(current - 1, 0)));
+  };
   // Which account action is running: the button that started one keeps its own
   // inline spinner instead of graying out.
   const [pendingAction, runPendingAction] = usePendingAction<"cleanup" | "add" | "login" | "remove" | "refresh">();
@@ -944,6 +953,11 @@ export function StationAccountsPanel({
   const attemptedAccounts = useRef(new Set<string>());
   useEffect(() => {
     if (busy) return;
+    // A probe that settles after this panel has been replaced must not write
+    // its state into the row set the replacement is rendering: the station
+    // editor is keyed by station, so switching stations swaps this panel out
+    // while an unbounded station round trip may still be running.
+    let active = true;
     for (const account of stationAccounts) {
       if (attemptedAccounts.current.has(account.id) || isAccountLoading(account.id)) continue;
       attemptedAccounts.current.add(account.id);
@@ -969,12 +983,19 @@ export function StationAccountsPanel({
         // through an explicitly remembered session when it has one.  A session
         // the window already covers skips the probe entirely, and the pane goes
         // straight to the key list it actually came to show.
-        if (!fresh) {
-          await restoreSavedSession(account);
-        }
+        //
+        // A refused round trip observed nothing, so the account is released
+        // back to unattempted: one transient station timeout used to suppress
+        // the mount check for the life of the panel, leaving 未登录 + 去登录 on
+        // an account whose login was never actually questioned.
+        let answered = fresh;
+        if (!fresh && active) answered = await restoreSavedSession(account);
+        if (!active) return;
+        if (!answered) attemptedAccounts.current.delete(account.id);
         await refreshAccountResources(account, { silent: true });
       })();
     }
+    return () => { active = false; };
   }, [busy, sessionRecheckSeconds, stationAccounts]);
   // The add flow never reserves an account slot. The webview login runs
   // first (its own modal window over the workspace); Core creates the account
