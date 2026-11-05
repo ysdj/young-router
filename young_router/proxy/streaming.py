@@ -5119,6 +5119,18 @@ async def _yield_native_stream_with_output_limit_continuation(
     # Everything this answer has delivered, so a continuation resumes from the
     # end of it instead of restarting the answer.
     delivered_text_parts: List[str] = []
+    # The output tokens this route reported for the answer it just ended.  A
+    # route that honours ``stream_options.include_usage`` states them in a
+    # trailing frame of their own, *after* the ``finish_reason`` one, so the
+    # ceiling frame alone carries no count -- and a decision that could only
+    # read that frame refused every route that answers a ceiling this way.
+    answered_output_tokens: Optional[int] = None
+
+    def remember_route_accounting(chunk: Any) -> None:
+        nonlocal answered_output_tokens
+        tokens = _responses_incomplete_output_tokens(chunk)
+        if tokens is not None:
+            answered_output_tokens = tokens
 
     def remember_delivered_text(chunk: Any) -> Any:
         text = _responses_output_module._response_text(chunk)
@@ -5140,6 +5152,7 @@ async def _yield_native_stream_with_output_limit_continuation(
         visible_output_delivered = (
             visible_output_delivered or _stream_chunk_has_visible_output(chunk)
         )
+        remember_route_accounting(chunk)
         saw_terminal = saw_terminal or _native_stream_chunk_is_terminal(
             chunk,
             request_data,
@@ -5183,6 +5196,7 @@ async def _yield_native_stream_with_output_limit_continuation(
                 withheld_ceiling_terminal = chunk
                 ceiling_withheld = True
                 native_chunk_count += 1
+                remember_route_accounting(chunk)
                 # The terminal frame that closes this answer arrives in its own
                 # transport read on some routes.  Returning here read the
                 # ceiling and dropped the stop: with no continuation possible
@@ -5199,6 +5213,7 @@ async def _yield_native_stream_with_output_limit_continuation(
                 # Same answer, so the same fate as the ceiling frame.
                 withheld_ceiling_closers.append(chunk)
                 native_chunk_count += 1
+                remember_route_accounting(chunk)
                 continue
             if not inspect_native_chunk(chunk):
                 return
@@ -5252,6 +5267,8 @@ async def _yield_native_stream_with_output_limit_continuation(
                 "stream_idle_timeout_seconds",
                 _routing_module._stream_idle_timeout_seconds_for_request,
             ),
+            ceiling_chunk=withheld_ceiling_terminal,
+            answered_output_tokens=answered_output_tokens,
         ):
             continued = True
             yield remember_delivered_text(chunk)

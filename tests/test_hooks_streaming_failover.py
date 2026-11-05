@@ -3247,34 +3247,136 @@ class HookOutputStreamContinuationTests(HookTestCase):
         self.assertNotIn("max_tokens", payload)
         self.assertNotIn("max_completion_tokens", payload)
 
-    async def test_continuation_is_off_by_default(self) -> None:
-        """The client's ceiling belongs to the client's own configuration.
+    async def test_continuation_off_leaves_a_client_answered_to_its_own_ceiling(self) -> None:
+        """A budget the client stated, and was answered to, is not overrun.
 
-        Fixing it there is the right repair, so the router only takes over when
-        an operator turns this on.
+        The switch is off by default and it is what decides this case: the
+        answer stopped exactly where the request asked it to, so continuing
+        would spend an upstream call to overrun a ceiling somebody chose.
         """
         _, _proxy_server = load_hook_module()
         continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        request_data = self._chat_request()
+        request_data["max_tokens"] = 4096
+        ceiling = {
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+            "usage": {"completion_tokens": 4096},
+        }
 
         self.assertFalse(
-            continuation_module._request_is_continuable_native_stream(
-                self._chat_request()
+            continuation_module._continuation_is_decided_by_the_engine(
+                request_data,
+                ceiling,
             )
         )
 
-    async def test_the_runtime_toggle_enables_continuation(self) -> None:
+    async def test_a_route_ceiling_below_the_clients_budget_is_continued(self) -> None:
+        """The live 2026-11-05 case: the route's own ceiling cut the answer.
+
+        A relay serving `gemini-3.8-flash` answered a 400-row document table with
+        `finish_reason: length` and `completion_tokens: 8188` while the request
+        stated `max_tokens: 32000`, so the ceiling was the route's own and the
+        turn arrived as a `success` with 24 rows of 400. There is nothing in the
+        client to change, so the numbers alone decide it, with the switch off.
+        """
+        _, _proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        request_data = self._chat_request()
+        request_data["max_tokens"] = 32000
+        ceiling = {
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+            "usage": {"completion_tokens": 8188},
+        }
+
+        self.assertFalse(
+            continuation_module._routing_module._env_bool(
+                continuation_module._STREAM_CONTINUATION_ENV,
+                False,
+            )
+        )
+        self.assertTrue(
+            continuation_module._continuation_is_decided_by_the_engine(
+                request_data,
+                ceiling,
+            )
+        )
+
+    async def test_a_request_that_states_no_budget_is_continued(self) -> None:
+        """Nothing asked for this ceiling, so the route imposed it."""
+        _, _proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        ceiling = {
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+            "usage": {"completion_tokens": 8188},
+        }
+
+        self.assertTrue(
+            continuation_module._continuation_is_decided_by_the_engine(
+                self._chat_request(),
+                ceiling,
+            )
+        )
+
+    async def test_an_unknown_output_count_leaves_the_answer_alone(self) -> None:
+        # No number is proof either way, so the client's own budget wins: the
+        # answer already ends where somebody asked it to.
+        _, _proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        request_data = self._chat_request()
+        request_data["max_tokens"] = 4096
+        ceiling = {
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+        }
+
+        self.assertFalse(
+            continuation_module._continuation_is_decided_by_the_engine(
+                request_data,
+                ceiling,
+            )
+        )
+
+    async def test_the_runtime_toggle_extends_a_client_answered_to_its_ceiling(self) -> None:
+        """The switch is still what lets an operator overrun a client budget."""
         hooks, _proxy_server = load_hook_module()
         continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        request_data = self._chat_request()
+        request_data["max_tokens"] = 4096
+        ceiling = {
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+            "usage": {"completion_tokens": 4096},
+        }
+        self.assertFalse(
+            continuation_module._continuation_is_decided_by_the_engine(
+                request_data,
+                ceiling,
+            )
+        )
+
         self.set_env(continuation_module._STREAM_CONTINUATION_ENV, "1")
         self.assertTrue(
-            continuation_module._request_is_continuable_native_stream(
-                self._chat_request()
+            continuation_module._continuation_is_decided_by_the_engine(
+                request_data,
+                ceiling,
             )
         )
         self.set_env(continuation_module._STREAM_CONTINUATION_ENV, "0")
+
+    async def test_the_continuation_refuses_a_turn_it_cannot_run(self) -> None:
+        # The shape test still runs first: a tool turn, a Responses stream, and
+        # a non-streaming request are never continued, whatever the toggle says.
+        _, _proxy_server = load_hook_module()
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        self.set_env(continuation_module._STREAM_CONTINUATION_ENV, "1")
+        ceiling = {
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+        }
+        tool_turn = self._chat_request()
+        tool_turn["tools"] = [{"type": "function", "function": {"name": "probe"}}]
+
         self.assertFalse(
-            continuation_module._request_is_continuable_native_stream(
-                self._chat_request()
+            continuation_module._continuation_is_decided_by_the_engine(
+                tool_turn,
+                ceiling,
             )
         )
 
@@ -3377,6 +3479,9 @@ class HookOutputStreamContinuationTests(HookTestCase):
                 request_data,
                 "第一段已经译好的内容。",
                 stream_idle_timeout_seconds=5.0,
+                ceiling_chunk={
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+                },
             )
         ]
 
@@ -3445,6 +3550,9 @@ class HookOutputStreamContinuationTests(HookTestCase):
                 self._chat_request(),
                 "已经译好的内容",
                 stream_idle_timeout_seconds=5.0,
+                ceiling_chunk={
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+                },
             )
         ]
 
@@ -3579,6 +3687,171 @@ class HookOutputStreamContinuationTests(HookTestCase):
             assistant_text,
             expected[-continuation_module._CONTINUATION_TAIL_CHARS:],
         )
+
+    async def test_a_route_ceiling_is_continued_with_the_switch_off(self) -> None:
+        """The live case end to end: 8192 tokens under a 32000-token budget.
+
+        Cherry Studio's 默认助手 had its per-assistant limit off, so no ceiling
+        in the client could be fixed; the relay reported `length` at its own
+        8188 tokens anyway and the turn arrived as a `success` with the table
+        ending at row 24. The delivery loop must splice the rest in without an
+        operator toggle, and the answer must end once -- on the continuation's
+        own `stop`, never on the withheld `length`.
+
+        The route states its usage in a *trailing* frame, after the one that
+        carries `finish_reason` (that is what `stream_options.include_usage`
+        buys, and what the live route did).  Reading only the ceiling frame
+        found no number there and refused the continuation, so the answer still
+        stopped at the route's ceiling with the fix in place.
+        """
+        hooks, proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        self.set_env(continuation_module._STREAM_CONTINUATION_ENV, None)
+        calls: list[dict] = []
+
+        class StubRouter:
+            async def acompletion(self, **kwargs):
+                calls.append(kwargs)
+
+                async def stream():
+                    yield {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": "| 25 | 2025-08-13 | 周疗 |"},
+                                "finish_reason": None,
+                            }
+                        ]
+                    }
+                    yield {
+                        "choices": [
+                            {"index": 0, "delta": {}, "finish_reason": "stop"}
+                        ]
+                    }
+
+                return stream()
+
+        original_router = getattr(proxy_server, "llm_router", None)
+        proxy_server.llm_router = StubRouter()
+        self.addCleanup(setattr, proxy_server, "llm_router", original_router)
+
+        async def upstream():
+            for row in range(24):
+                yield {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": f"| {row} | 2021-07-{row:02d} |\n"},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            yield {
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+            }
+            yield {
+                "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+                "usage": {"completion_tokens": 8188, "prompt_tokens": 3320},
+            }
+
+        request_data = {
+            "model": "default-chat",
+            "stream": True,
+            "max_tokens": 32000,
+            "messages": [{"role": "user", "content": "整理成一张治疗表格。"}],
+            "proxy_server_request": {"path": "/v1/chat/completions"},
+        }
+
+        delivered = [
+            chunk
+            async for chunk in streaming._yield_native_stream_with_output_limit_continuation(
+                [],
+                upstream(),
+                request_data,
+                stream_started_at=0.0,
+            )
+        ]
+
+        # One continuation round was asked for, and it dropped the ceiling the
+        # route had already ignored once.
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("max_tokens", calls[0])
+        self.assertIn("| 0 | 2021-07-00 |", calls[0]["messages"][-2]["content"])
+
+        reasons = [
+            choice.get("finish_reason")
+            for chunk in delivered
+            for choice in (chunk.get("choices") or [])
+            if choice.get("finish_reason")
+        ]
+        self.assertEqual(reasons, ["stop"])
+        text = "".join(
+            (choice.get("delta") or {}).get("content") or ""
+            for chunk in delivered
+            for choice in (chunk.get("choices") or [])
+        )
+        self.assertIn("| 25 | 2025-08-13 | 周疗 |", text)
+
+    async def test_a_client_answered_to_its_own_ceiling_is_left_alone(self) -> None:
+        """With the switch off, a ceiling the client chose is not overrun.
+
+        The same delivery loop, one number apart: the route stopped at the
+        budget the request stated, so the withheld frame is what the client
+        gets and no upstream call is spent.
+        """
+        hooks, proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        self.set_env(continuation_module._STREAM_CONTINUATION_ENV, None)
+        calls: list[dict] = []
+
+        class StubRouter:
+            async def acompletion(self, **kwargs):
+                calls.append(kwargs)
+                raise AssertionError("a client ceiling must not be overrun")
+
+        original_router = getattr(proxy_server, "llm_router", None)
+        proxy_server.llm_router = StubRouter()
+        self.addCleanup(setattr, proxy_server, "llm_router", original_router)
+
+        async def upstream():
+            yield {
+                "choices": [
+                    {"index": 0, "delta": {"content": "Half an answer."}, "finish_reason": None}
+                ]
+            }
+            yield {
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+                "usage": {"completion_tokens": 4096, "prompt_tokens": 100},
+            }
+
+        request_data = {
+            "model": "default-chat",
+            "stream": True,
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "写一段话。"}],
+            "proxy_server_request": {"path": "/v1/chat/completions"},
+        }
+
+        delivered = [
+            chunk
+            async for chunk in streaming._yield_native_stream_with_output_limit_continuation(
+                [],
+                upstream(),
+                request_data,
+                stream_started_at=0.0,
+            )
+        ]
+
+        self.assertEqual(calls, [])
+        reasons = [
+            choice.get("finish_reason")
+            for chunk in delivered
+            for choice in (chunk.get("choices") or [])
+            if choice.get("finish_reason")
+        ]
+        self.assertEqual(reasons, ["length"])
 
 
 class HookCoalescedNativeReadTests(HookTestCase):

@@ -11,6 +11,16 @@ where it stopped, and the continuation is spliced back into the stream the
 client is already reading.  The client sees one answer that completes instead
 of one that quietly ends.
 
+Observed live 2026-11-05: a 花体 document table on `gemini-3.8-flash` stopped at
+row 24 of 400 and Cherry Studio reported the turn `success`, because that route
+answers a long answer with its own 8192-token ceiling whatever `max_tokens` the
+request stated (measured against the endpoint directly: `finish_reason:
+length`, `completion_tokens: 8188`, with no ceiling in the body and with
+`max_tokens: 32000` alike).  A ceiling the *route* imposes is not a ceiling the
+user can fix in Cherry Studio -- that assistant had the per-assistant limit
+off -- so it is decided here, by the numbers, rather than by an operator
+toggle.
+
 The turn still ends on the route's terms.  Each continuation carries the text
 already produced, so the model resumes rather than restarts, and the loop is
 bounded by :data:`_MAX_CONTINUATION_ROUNDS` plus the request's own
@@ -164,24 +174,29 @@ _CONTINUATION_REQUEST_KEYS = (
 )
 
 
-def _request_is_continuable_native_stream(request_data: Optional[dict]) -> bool:
-    """Whether this request is one the router may extend on its own.
+# A route that stops a whole ceiling's worth of tokens short of what the client
+# asked for is reporting a limit of its own.  The gap has to be wide enough to
+# tell that apart from a model that simply finished near the ceiling it was
+# given, so the comparison allows one chunk of slack on either side.
+_ROUTE_CEILING_SHORTFALL_TOKENS = 256
 
-    Off unless ``YOUNG_ROUTER_STREAM_CONTINUATION_ENABLED`` is turned on: the
-    ceiling belongs to the client's own configuration, and most of the time the
-    right fix is there rather than here.
+
+def _request_is_continuable_native_stream(request_data: Optional[dict]) -> bool:
+    """Whether this request is a native stream the router may ever extend.
 
     Only a plain text answer is extended.  A turn that declares tools is
     deliberately excluded: a ceiling inside a tool-call turn means the call
     the model was writing is incomplete, and replaying that as more text would
     hand the client a half-written call it cannot execute.
+
+    This is the shape test only.  Whether *this* ceiling belongs to the route
+    or to the client's own budget is :func:`_continuation_is_decided_by_the_engine`,
+    which needs the ceiling frame's own numbers.
     """
 
     from . import streaming as _streaming_module
 
     if not isinstance(request_data, dict):
-        return False
-    if not _routing_module._env_bool(_STREAM_CONTINUATION_ENV, False):
         return False
     if _responses_request_module._request_is_responses_api(request_data):
         return False
@@ -190,6 +205,74 @@ def _request_is_continuable_native_stream(request_data: Optional[dict]) -> bool:
     if request_data.get("tools") or request_data.get("functions"):
         return False
     return True
+
+
+def _stopped_at_the_routes_own_ceiling(
+    request_data: Optional[dict],
+    output_tokens: Optional[int],
+) -> bool:
+    """True when the route's ceiling, not the client's, ended the answer.
+
+    A route that resells a smaller model reports its own cap and ignores the
+    budget in the request.  Measured 2026-11-05 on `gemini-3.8-flash` through a
+    relay: `max_tokens: 32000` in the body, `completion_tokens: 31996` only when
+    the relay honoured it, and 8188 -- its own ceiling -- on the route that
+    ignores it.  The client asked for far more, so the stop is the route's
+    truncation and this router is the only place that can continue it.
+
+    No number is proof either way, so an unknown one answers "the client's":
+    the client's own budget already ended the answer where it asked, and
+    continuing it would spend an upstream call to overrun a limit somebody
+    chose.
+    """
+
+    from . import streaming as _streaming_module
+
+    if not isinstance(output_tokens, int) or isinstance(output_tokens, bool):
+        return False
+    if output_tokens <= 0:
+        return False
+    budget = _streaming_module._request_output_token_budget(request_data)
+    if budget is None:
+        # Nothing in the request stated a ceiling, so the ceiling that stopped
+        # this answer is the route's by definition.
+        return True
+    return output_tokens < max(1, budget - _ROUTE_CEILING_SHORTFALL_TOKENS)
+
+
+def _continuation_is_decided_by_the_engine(
+    request_data: Optional[dict],
+    ceiling_chunk: Any = None,
+    *,
+    answered_output_tokens: Optional[int] = None,
+) -> bool:
+    """Whether to continue, deciding a native stream the toggle leaves alone.
+
+    ``YOUNG_ROUTER_STREAM_CONTINUATION_ENABLED`` still decides whether a client
+    *with* a ceiling of its own is overrun.  A request that states no ceiling,
+    or that was answered short of the one it stated, is decided by the numbers
+    alone -- see :func:`_stopped_at_the_routes_own_ceiling`.
+
+    The output count arrives either way: ``answered_output_tokens`` when the
+    caller already collected the answer's accounting frames, else read from
+    ``ceiling_chunk``.  A route states its usage in a frame of its own -- a
+    trailing chunk beside the ``finish_reason`` one when ``stream_options``
+    asks for it -- so the ceiling frame alone often carries no number, and a
+    decision that could only read that frame would refuse every such route.
+    """
+
+    from . import streaming as _streaming_module
+
+    if not _request_is_continuable_native_stream(request_data):
+        return False
+    if _routing_module._env_bool(_STREAM_CONTINUATION_ENV, False):
+        return True
+    output_tokens = answered_output_tokens
+    if output_tokens is None:
+        output_tokens = _streaming_module._responses_incomplete_output_tokens(
+            ceiling_chunk
+        )
+    return _stopped_at_the_routes_own_ceiling(request_data, output_tokens)
 
 
 def _continuation_request_payload(
@@ -290,6 +373,8 @@ async def _stream_native_continuation_rounds(
     delivered_text: str,
     *,
     stream_idle_timeout_seconds: float,
+    ceiling_chunk: Any = None,
+    answered_output_tokens: Optional[int] = None,
 ) -> AsyncIterator[Any]:
     """Ask the same route for the rest of an answer it cut off at its ceiling.
 
@@ -297,11 +382,19 @@ async def _stream_native_continuation_rounds(
     frame: the route's first ``finish_reason`` belongs to the answer the client
     already read, so it is withheld here and re-emitted once the answer is
     actually complete.
+
+    ``ceiling_chunk`` and ``answered_output_tokens`` are what tell a ceiling of
+    the route's own from one the client asked for, so a caller that supplies
+    neither continues nothing (see :func:`_continuation_is_decided_by_the_engine`).
     """
 
     from . import streaming as _streaming_module
 
-    if not _request_is_continuable_native_stream(request_data):
+    if not _continuation_is_decided_by_the_engine(
+        request_data,
+        ceiling_chunk,
+        answered_output_tokens=answered_output_tokens,
+    ):
         return
     from litellm.proxy.proxy_server import llm_router
 
