@@ -1602,7 +1602,7 @@ export function StationAccountsPanel({
             back; a verified account never needed it. */}
         {selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}
         {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"} disabled={controlsBusy && pendingAction !== "refresh"} onPress={() => { void refreshSelected(); }} /> : null}
-        {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.groupManager")} titleWidth="tight" compact disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} /> : null}
+        {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.groupManager")} titleWidth="tight" compact toolTip={native.showGroupManager ? undefined : translate("relay.groupManagerUnavailable")} disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} /> : null}
       </View>
     </View> : null}
     {removalDialogHosted ? null : removalDialog}

@@ -47,6 +47,10 @@ MAX_FILTER_CHARS = 256
 RECOVERY_HEARTBEAT_TTL_SECONDS = 45.0
 MENU_ACTIONS = frozenset(
     {
+        # Every entry `routes.ts` publishes as a menu route: the hosts build
+        # their menu from that list, so a route missing here was emitted,
+        # refused as invalid, and silently dropped from the 动作 log.
+        "open-general-settings",
         "open-providers-models",
         "open-runtime-settings",
         "open-codex-settings",

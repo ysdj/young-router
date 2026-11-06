@@ -28,7 +28,7 @@ import { setBrowserSecretReader, setBrowserSecretStager } from "./platform/brows
 import { dismissChildLayer, presentChildLayer } from "./platform/childLayers";
 import { HostChromeHost } from "./ui/HostChrome";
 import { registerYoungRouter } from "./bootstrap";
-import { canonicalWindowRoute, ROUTES } from "./routes";
+import { canonicalWindowRoute, isSettingsShellRoute, ROUTES } from "./routes";
 import type { AppRoute } from "./types";
 
 function routeFromHash(): AppRoute {
@@ -54,31 +54,33 @@ const language = resolveLanguage("system", systemLocale);
 
 // One document per window, so a route is the address rather than a window
 // registry: opening a second tab is `window.open` and coming back is history.
-const listeners = new Set<(route: AppRoute) => void>();
 let currentRoute = routeFromHash();
+
+/**
+ * Record the route the app is already drawing in the address bar.
+ *
+ * This host is the window for every pane, so the shared shell (a sidebar click,
+ * a launch presentation) changes its own route and asks the host to open that
+ * window; here that request is answered by writing the address down, never by
+ * re-rendering. A remount would throw away the pane's staged fields for a
+ * navigation that has already happened.
+ */
 function navigate(route: AppRoute): void {
   const next = canonicalWindowRoute(route) as AppRoute;
   if (next === currentRoute) return;
   currentRoute = next;
   window.location.hash = next === "home" ? "" : `#/${next}`;
-  for (const listener of listeners) listener(next);
 }
 
 // One bridge for this document: several would each exchange the one-shot
 // bootstrap token, and the second would be refused.
 const core = createBrowserIpcBridge(transport);
 
+// The page's bootstrap table. Every other string is drawn by the app, which
+// switches language from Core's snapshot; the host-level chrome (a child
+// layer's title, a dialog's buttons) is drawn outside the React tree, so it
+// asks the snapshot the same question the tree asks (`presentChild` below).
 const translate = createTranslator("system", systemLocale);
-
-/**
- * The language the window is being drawn in.
- *
- * `translate` above is this page's bootstrap table; the app switches language
- * from Core's snapshot, and the host-level chrome (a child layer's title, a
- * dialog's buttons) is drawn outside the React tree, so it has to ask the same
- * question the tree asks instead of keeping its own answer.
- */
-
 
 /**
  * One child surface, in this page.
@@ -90,13 +92,22 @@ const translate = createTranslator("system", systemLocale);
  * panel exists to avoid.
  */
 let visibleChildRoute: AppRoute | undefined;
+// The pane the page has drawn. A child surface arrives over it, and an address
+// that names the child (a typed fragment, a second tab) still leaves this one
+// underneath, which is where the address returns when the layer closes.
+let shellRoute: AppRoute = "home";
 
 function presentChild(route: AppRoute): void {
+  const underneath = currentRoute === route ? shellRoute : currentRoute;
   visibleChildRoute = route;
   // The layer's title follows the language the panes are drawn in, which is the
   // snapshot's choice, not this page's accept-language: a browser set to en-US
-  // was titling a 中文 wizard "Configure provider".
-  const titleKey = ROUTES.find((entry) => entry.id === route)?.titleKey ?? route;
+  // was titling a 中文 wizard "Configure provider". The raw editor is a child
+  // surface without a ROUTES entry (native hosts title it from `routeFileEditor`
+  // in their localization table), so its id would otherwise be the literal text
+  // `file-editor` on the title bar.
+  const titleKey = ROUTES.find((entry) => entry.id === route)?.titleKey
+    ?? (route === "file-editor" ? "settings.editFile" : route);
   // `ipc.latestSnapshot()` is the same projection the panes read, so the layer
   // and the pane it covers cannot disagree about the language.
   const language = ipc.latestSnapshot()?.language ?? "system";
@@ -134,6 +145,10 @@ function presentChild(route: AppRoute): void {
       // The host's stack can already be empty when the shared pane calls
       // closeWindow: the dismissal is still real, and must not navigate away.
       if (visibleChildRoute === route) visibleChildRoute = undefined;
+      // An address that named the child would otherwise stay on screen as a
+      // surface that no longer exists: the page went back to its pane, so the
+      // address says that pane again.
+      if (currentRoute === route) navigate(underneath);
       native.window.close(route);
     },
   });
@@ -182,37 +197,65 @@ void ipc.snapshot().catch(() => {
   window.location.reload();
 });
 
-window.addEventListener("popstate", () => {
-  currentRoute = routeFromHash();
-  for (const listener of listeners) listener(currentRoute);
-});
+registerYoungRouter("YoungRouter", { ipc, native, translate });
 
-registerYoungRouter("YoungRouter", {
-  ipc,
-  native,
-  translate,
-  subscribeNativeAction: (listener) => {
-    // The native hosts receive menu actions from their own menu bar. Here the
-    // address bar is the menu: a route change in this tab or another one is
-    // the same signal.
-    const forward = (route: AppRoute): void => {
-      if (route === "home") return;
-      listener(`open-${route}`);
-    };
-    listeners.add(forward);
-    return () => { listeners.delete(forward); };
-  },
-});
+// The page's one React root. Re-rendering it with a new `initialRoute` is how
+// this host answers an address it did not write (a typed fragment, Back, a
+// second tab): the shared shell receives that route as a request and moves to
+// it. `isWindowManagerHost: false` is the load-bearing part — with it true the
+// shell answers a route request by asking the host to open a window it has
+// already opened, so the pane never changed and the address bar described a
+// surface the page was not showing.
+let root: ReturnType<typeof createRoot> | undefined;
+function presentRoute(route: AppRoute): void {
+  shellRoute = route;
+  const application = (AppRegistry as unknown as {
+    getApplication(key: string, parameters?: { initialProps?: Record<string, unknown> }): { element: React.ReactElement };
+  }).getApplication("YoungRouter", {
+    initialProps: { initialRoute: route, isPrimaryHost: true, isWindowManagerHost: false },
+  });
+  root ??= createRoot(document.getElementById("root") as HTMLElement);
+  root.render(application.element);
+}
 
-AppRegistry.runApplication("YoungRouter", {
-  rootTag: document.getElementById("root"),
-  // `isWindowManagerHost` is what tells the shared shell "the native host has
-  // already opened the window for this route, so do not ask for another". The
-  // browser host has exactly one document and one address, so it is its own
-  // window manager: without this, opening the initial pane also asked for a
-  // child layer showing the same pane twice.
-  initialProps: { initialRoute: currentRoute, isPrimaryHost: true, isWindowManagerHost: true },
-});
+/** The routes this host draws as a layer rather than as the page's pane. */
+const CHILD_SURFACES: readonly AppRoute[] = ["provider-wizard", "file-editor", "webdav-settings"];
+
+/**
+ * Adopt an address this page did not write.
+ *
+ * `navigate` above writes `currentRoute` before it touches `location.hash`, so
+ * the hash change it causes arrives here already equal and is ignored — this
+ * handler is only for a person typing a fragment, a bookmark, a second tab, or
+ * Back/Forward. A child surface has no address of its own (see
+ * `platform/childLayers.ts`): landing on one presents its layer over the pane
+ * already on screen instead of replacing that pane with a second copy.
+ */
+function adoptAddress(): void {
+  const next = routeFromHash();
+  if (next === currentRoute) return;
+  currentRoute = next;
+  if (CHILD_SURFACES.includes(next)) {
+    presentChild(next);
+    return;
+  }
+  presentRoute(next);
+}
+
+window.addEventListener("hashchange", adoptAddress);
+window.addEventListener("popstate", adoptAddress);
+
+// A launch that arrives on a child surface's address still needs the page
+// underneath it: the layer is drawn over the settings shell, exactly as it is
+// when a pane opens it. Landing the shell on the child route as well would
+// draw a second copy of the surface behind its own layer.
+if (CHILD_SURFACES.includes(currentRoute)) {
+  const surface = currentRoute;
+  presentRoute("providers-models");
+  presentChild(surface);
+} else {
+  presentRoute(currentRoute);
+}
 
 // The host's own surfaces — a decision panel, a text prompt, the record viewer,
 // the model picker, an anchored menu — are React, mounted beside the app root so

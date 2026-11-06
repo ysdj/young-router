@@ -23,6 +23,7 @@ WINDOWS_LEAF = ROOT / "rn/apps/windows/src/native/windows/WinUI3NativeLeaf.cpp"
 WINDOWS_RELAY = ROOT / "rn/apps/windows/src/native/windows/WindowsRelayLogin.cpp"
 CODE_EDITOR_WEB = ROOT / "rn/packages/shared/src/ui/code-editor/CodeEditorWeb.ts"
 CODE_EDITOR_WRAPPER = ROOT / "rn/packages/shared/src/ui/code-editor/CodeEditorWebView.tsx"
+CODE_EDITOR_PAGE = ROOT / "rn/packages/shared/src/ui/code-editor/codeEditorPage.ts"
 ZH_HANS = ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts"
 EN = ROOT / "rn/packages/shared/src/i18n/en.ts"
 
@@ -39,6 +40,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         cls.windows_leaf = WINDOWS_LEAF.read_text(encoding="utf-8")
         cls.code_editor_web = CODE_EDITOR_WEB.read_text(encoding="utf-8")
         cls.code_editor_wrapper = CODE_EDITOR_WRAPPER.read_text(encoding="utf-8")
+        cls.code_editor_page = CODE_EDITOR_PAGE.read_text(encoding="utf-8")
         cls.zh = ZH_HANS.read_text(encoding="utf-8")
         cls.en = EN.read_text(encoding="utf-8")
         cls.relay = RELAY_MANAGER.read_text(encoding="utf-8")
@@ -4117,7 +4119,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'type EditorLanguage = "json" | "toml" | "yaml" | "text";',
             "type ReplaceDocumentCommand = {",
             'type SetBaselineCommand = { type: "setBaseline"; baseline: string };',
-            'type HostCommand = ReplaceDocumentCommand | SetBaselineCommand | InsertTextCommand | { type: "scale"; scale: number } | { type: "focus" };',
+            'type HostCommand = ReplaceDocumentCommand | SetBaselineCommand | InsertTextCommand | { type: "scale"; scale: number } | { type: "focus" } | { type: "labels"; labels: unknown };',
+            'window.addEventListener("message", (event) => {',
+            'if (window.parent !== window) window.parent.postMessage(serialized, window.location.origin);',
             "type AceSession = {",
             "type AceEditor = {",
             "type AceApi = { edit: (element: HTMLElement, options?: Record<string, unknown>) => AceEditor };",
@@ -4165,14 +4169,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertNotIn(marker, self.code_editor_web)
         self.assertNotIn('fontSize: "13px"', self.code_editor_web)
-        self.assertIn('const ACE_EDITOR_FONT = Platform.OS === "windows" ? "16px/1.45" : "12px/1.55";', self.code_editor_wrapper)
-        self.assertIn('font: ${ACE_EDITOR_FONT} ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;', self.code_editor_wrapper)
-        self.assertIn('${Platform.OS === "windows" ? `', self.code_editor_wrapper)
-        self.assertIn("zoom: var(--editor-scale);", self.code_editor_wrapper)
-        self.assertIn("window.LiteLLMCodeEditorPlatform", self.code_editor_wrapper)
+        self.assertIn('return platform === "windows" ? "16px/1.45" : "12px/1.55";', self.code_editor_page)
+        self.assertIn("font: ${aceEditorFont(platform)} ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;", self.code_editor_page)
+        self.assertIn('${platform === "windows" ? `', self.code_editor_page)
+        self.assertIn("zoom: var(--editor-scale);", self.code_editor_page)
+        self.assertIn("window.LiteLLMCodeEditorPlatform", self.code_editor_page)
         self.assertIn("aceEditor.setFontSize(baseFontSize * effectiveScale);", self.code_editor_web)
         self.assertIn("applyEditorScale(message.scale);", self.code_editor_web)
-        self.assertIn("calc(184px * var(--editor-scale))", self.code_editor_wrapper)
+        self.assertIn("calc(184px * var(--editor-scale))", self.code_editor_page)
         for marker in (
             "#code-editor-layout {",
             "body.diff-sidebar-enabled #code-editor-layout {",
@@ -4194,18 +4198,25 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '<div id="editor-menu" role="menu" hidden></div>',
             "window.LiteLLMCodeEditorMenuLabels",
         ):
-            self.assertIn(marker, self.code_editor_wrapper)
-        self.assertNotIn("#diff-summary", self.code_editor_wrapper)
+            self.assertIn(marker, self.code_editor_page)
+        self.assertNotIn("#diff-summary", self.code_editor_page)
         self.assertIn("window.webkit?.messageHandlers?.litellmCodeEditor", self.code_editor_web)
-        self.assertIn("window.chrome?.webview?.postMessage", self.code_editor_web)
+        self.assertIn("const webViewHandler = window.chrome?.webview;", self.code_editor_web)
         package = json.loads((ROOT / "rn/package.json").read_text(encoding="utf-8"))
         self.assertEqual(package["dependencies"].get("ace-builds"), "1.44.0")
         self.assertIn("<NativeCodeWebView", self.code_editor_wrapper)
-        self.assertIn("window.LiteLLMCodeEditorInitialCommand", self.code_editor_wrapper)
+        self.assertIn("window.LiteLLMCodeEditorInitialCommand", self.code_editor_page)
         self.assertIn("const [initialHtml] = React.useState(() => codeEditorHtml({", self.code_editor_wrapper)
         self.assertIn("Rebuilding the HTML for every document-key change reloads", self.code_editor_wrapper)
         self.assertNotIn("const initialHtml = React.useMemo", self.code_editor_wrapper)
         self.assertIn("html={initialHtml}", self.code_editor_wrapper)
+        # The browser host frames the same page as its own document: a
+        # `srcdoc`/blob frame would inherit the shell's CSP and never run it.
+        self.assertIn('src: "./editor.html"', self.code_editor_wrapper)
+        self.assertIn("React.createElement(\"iframe\", {", self.code_editor_wrapper)
+        self.assertIn("event.source !== frame.contentWindow", self.code_editor_wrapper)
+        self.assertIn("event.origin !== window.location.origin", self.code_editor_wrapper)
+        self.assertIn("contentWindow.postMessage(JSON.stringify(message), window.location.origin)", self.code_editor_wrapper)
         bundler = (ROOT / "rn/scripts/build-code-editor.mjs").read_text(encoding="utf-8")
         self.assertIn("entryPoints: [source]", bundler)
         self.assertIn('format: "iife"', bundler)
@@ -6314,7 +6325,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # relay messages carry ("请点击刷新资源") therefore point at a button the
         # row shows once there is a session to refresh.
         self.assertIn('{selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"} disabled={controlsBusy && pendingAction !== "refresh"} onPress={() => { void refreshSelected(); }} /> : null}', relay)
-        self.assertIn('{selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.groupManager")} titleWidth="tight" compact disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} /> : null}', relay)
+        self.assertIn('{selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.groupManager")} titleWidth="tight" compact toolTip={native.showGroupManager ? undefined : translate("relay.groupManagerUnavailable")} disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} /> : null}', relay)
         self.assertIn('title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"}', relay)
         self.assertIn('const refreshSelected = async (): Promise<void> => {', relay)
         self.assertIn('await refreshAccountResources({ id: account.id }, { force: true });', relay)
@@ -6371,9 +6382,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         windows_module = (ROOT / "rn/apps/windows/src/native/windows/WinUI3NativeLeafModule.cpp").read_text(encoding="utf-8")
         windows_module_header = (ROOT / "rn/apps/windows/src/native/windows/WinUI3NativeLeafModule.h").read_text(encoding="utf-8")
         windows_leaf = (ROOT / "rn/apps/windows/src/native/windows/WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
-        self.assertIn("showGroupManager(options: {", types)
+        self.assertIn("showGroupManager?(options: {", types)
         self.assertIn("export type RelayGroupManagerResult = {", types)
-        self.assertIn("showGroupManager(options: {", native_bridge)
+        self.assertIn("showGroupManager?(options: {", native_bridge)
         self.assertIn("showGroupManager?: (options: {", platform_entry)
         self.assertIn("@objc(showGroupManager:resolver:rejecter:)", mac_module)
         self.assertIn("RCT_EXTERN_METHOD(showGroupManager:(NSDictionary *)options", mac_bridge)

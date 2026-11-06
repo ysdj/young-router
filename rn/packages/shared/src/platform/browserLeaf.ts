@@ -36,17 +36,17 @@ export type BrowserCoreTransport = {
   baseURL: string;
 };
 
-const SESSION_STORAGE_KEY = "young-router.core-session";
-
-function sessionStore(): Storage | undefined {
-  try {
-    return window.sessionStorage;
-  } catch {
-    // A browser in a storage-partitioned or denied context still works: the
-    // session then lives only as long as this module does.
-    return undefined;
-  }
-}
+/**
+ * The session this document learned, kept in memory for this page only.
+ *
+ * It is deliberately not written to `sessionStorage`. The credential is the
+ * `HttpOnly` cookie Core set at sign-in, and a remembered copy in page storage
+ * outlived the Core that minted it: after a Core restart the browser sent the
+ * stale lease in `Authorization`, the fresh cookie disagreed with it, and Core
+ * refused every request — a page stuck on 加载中 under a storm of 401s. Asking
+ * `hello` once per document costs one round trip and cannot outlive its Core.
+ */
+let rememberedSession: string | undefined;
 
 /**
  * The browser cannot read `X-LiteLLM-Core-Session`, so Core hands it the same
@@ -91,7 +91,7 @@ export type BrowserCoreBridge = NativeIpcBridge & {
 };
 
 export function createBrowserIpcBridge(transport: BrowserCoreTransport): BrowserCoreBridge {
-  let session: string | undefined = sessionStore()?.getItem(SESSION_STORAGE_KEY) ?? undefined;
+  let session: string | undefined = rememberedSession;
   let pending: Promise<void> | undefined;
 
   /**
@@ -107,13 +107,8 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
     if (session !== undefined) return Promise.resolve();
     if (pending !== undefined) return pending;
     const exchange = (async () => {
-      const remembered = sessionStore()?.getItem(SESSION_STORAGE_KEY) ?? "";
-      if (remembered !== "") {
-        session = remembered;
-        return;
-      }
       session = await hello(transport);
-      sessionStore()?.setItem(SESSION_STORAGE_KEY, session);
+      rememberedSession = session;
     })();
     // Cleared by identity, and only after the assignment below, so two callers
     // that arrive in the same tick both await the exchange instead of one of
@@ -127,16 +122,31 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
    * One Core call.
    *
    * A 401 is not retried: the cookie either is a session or is not, and asking
-   * twice cannot change Core's answer. The caller that needs to recover
-   * reloads, and Core then answers with its password form.
+   * twice cannot change Core's answer. It is, however, the moment this page has
+   * to leave: a Core that restarted (the app replaced it, or it was upgraded)
+   * forgot every session, so this document's tab would otherwise keep asking a
+   * server that will answer 401 forever — the app frozen on its last snapshot
+   * under a stream of failed requests, with no surface saying why. Reloading
+   * hands the decision back to Core, which answers the shell with its password
+   * form. One reload per document, so a Core that refuses the fresh sign-in
+   * cannot turn the page into a reload loop.
    */
+  let leavingForSignIn = false;
+  const leaveForSignIn = (): void => {
+    if (leavingForSignIn) return;
+    leavingForSignIn = true;
+    window.location.reload();
+  };
+
   const call = async (path: string, body: string): Promise<Response> => {
     await establish();
-    return coreRequest(transport, path, {
+    const response = await coreRequest(transport, path, {
       method: "POST",
       body,
       headers: { "Content-Type": "application/json" },
     }, session);
+    if (response.status === 401) leaveForSignIn();
+    return response;
   };
 
   const send = async (request: string): Promise<string> => {
@@ -192,6 +202,13 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
               headers: session ? { Authorization: `Bearer ${session}` } : {},
             },
           );
+          if (response.status === 401) {
+            // The event stream is the page's first request after a Core
+            // restart notices nothing; a refused stream is the same answer a
+            // refused call gives, and the page leaves the same way.
+            leaveForSignIn();
+            return;
+          }
           if (!response.ok) {
             subscription = undefined;
             await new Promise((resolve) => setTimeout(resolve, 1_000));
@@ -372,12 +389,10 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
       // settings window is the page itself, so the faithful answer is to show
       // that pane in place — which also keeps the address bar describing what
       // is on screen. A layer here would put the pane on top of the same pane.
-      if (isSettingsShellRoute(route)) {
-        // A settings pane is the page, not a child of it. Navigating is the
-        // whole request, and navigating to the pane already on screen is a
-        // no-op — which is what makes the launch presentation (it asks for the
-        // pane it is drawing) harmless here instead of a second copy.
-        options.navigate(route);
+      // `home` is that same answer: a page has no hidden window to bring back,
+      // so asking for it changes nothing rather than presenting a blank layer.
+      if (route === "home" || isSettingsShellRoute(route)) {
+        if (route !== "home") options.navigate(route);
         return;
       }
       // Everything else is a child surface: the provider wizard, the raw editor
@@ -397,8 +412,8 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
       // A settings pane is the page, so focusing it is showing it — the same
       // answer `openWindow` gives, and the same reason a native host focuses
       // the settings window rather than a child surface.
-      if (isSettingsShellRoute(route)) {
-        options.navigate(route);
+      if (route === "home" || isSettingsShellRoute(route)) {
+        if (route !== "home") options.navigate(route);
         return;
       }
       // A child surface focuses the layer that already shows it; the layer
@@ -479,7 +494,10 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
       // load without ever running.
       await requestHostChrome<void>({ kind: "viewer", title, text, closeLabel });
     },
-    showProviderAuth: async () => undefined,
+    // No `showProviderAuth`: a page has no WebKit the provider could talk to,
+    // and defining a no-op here would tell the shared UI the device-code
+    // challenge was shown while nothing appeared. Leaving it undefined is what
+    // selects the read-only viewer fallback, which states the URL and code.
     chooseModelsToAdd: async (models, providerName, keyName) => requestHostChrome<string[] | undefined>({
       kind: "picker",
       title: strings?.modelChooserTitle ?? providerName,
@@ -489,9 +507,18 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
       confirmLabel: strings?.modelChooserAddSelected ?? "",
       cancelLabel: strings?.cancel ?? "",
     }),
-    showGroupManager: async () => undefined,
     editSecret: async () => undefined,
-    clearSecret: async () => undefined,
+    clearSecret: async (domain, field, target) => {
+      // Clearing is the same two host-only exchanges as staging, with the
+      // `clear` form of the stage body: no value, an empty sentinel, or a
+      // second editor ever reaches React.
+      const capability = await secretCapability("/ipc/host/secret/capability", { domain, field, target, purpose: "settings" });
+      const token = typeof capability?.secret_token === "string" ? capability.secret_token : undefined;
+      if (token === undefined || capability?.present !== true) return undefined;
+      const staged = await secretCapability("/ipc/host/secret/stage", { secret_token: token, clear: true });
+      const revision = typeof staged?.revision === "number" ? staged.revision : undefined;
+      return revision === undefined ? undefined : { revision, present: staged?.present === true };
+    },
     readSecret: async ({ domain, field, target }) => {
       const capability = await secretCapability("/ipc/host/secret/read-capability", { domain, field, target });
       const token = typeof capability?.secret_read_token === "string" ? capability.secret_read_token : undefined;
@@ -523,10 +550,14 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
       }
     },
     relayLogin: async (options) => {
-      // A page cannot host the station's authenticated browser, so sign-in
-      // happens in a separate tab and the result comes back through Core's
-      // existing host route. The shared UI already awaits this answer; an
-      // empty object keeps that wait honest without inventing credentials.
+      // A page has no authenticated browser to put the station's login form in,
+      // and a cookie minted in another tab is unreadable here. What a page can
+      // do is ask Core to use the credential it already holds: the restore route
+      // probes the saved session first and, when that is refused, signs in with
+      // the remembered password. The answer is the login state, exactly the
+      // shape the pane reads from a native sign-in — a station Core cannot sign
+      // in to without a browser answers `signed_out`, and the pane says so
+      // instead of the row waiting on a sign-in that never started.
       try {
         const body = {
           account_id: options.accountId,
@@ -534,14 +565,12 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
           label: options.label,
           origin: options.origin,
           username: options.username ?? "",
-          pending_account: Boolean(options.pendingAccount),
-          station_id: options.stationId,
-          station_name: options.stationName,
-          station_type: options.stationType,
-          station_origin: options.stationOrigin,
+          login_status: "signed_out",
         };
-        await core.hostRoute("/ipc/host/relay/login", body);
-        return undefined;
+        const result = await core.hostRoute("/ipc/host/relay/restore", body);
+        return result.login_status === "signed_in"
+          ? { revision: Number(result.revision ?? 0), loginStatus: "signed_in", username: String(result.username ?? options.username ?? "") }
+          : undefined;
       } catch {
         return undefined;
       }
@@ -567,9 +596,9 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
     openRelayDashboard: async (options) => { window.open(options.origin, "_blank", "noopener"); },
     clearRelayPassword: async () => undefined,
     clearRelayCredentials: async () => undefined,
-    setLaunchAtLogin: async () => {
-      throw new Error("A page has no login item.");
-    },
+    // No `setLaunchAtLogin`: a page cannot register a login item, so the
+    // general pane states that instead of offering a switch that would answer
+    // `saved` while the system never heard of it.
     versionInfo: async () => ({ app: "web", litellm: "" }),
     openExternalURL: (url) => { window.open(url, "_blank", "noopener"); },
     setLocalization: (next) => { strings = next; },

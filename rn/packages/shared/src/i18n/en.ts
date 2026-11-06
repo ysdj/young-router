@@ -395,6 +395,7 @@ export const en: Record<TranslationKey, string> = {
   "runtime.categories": "Runtime categories",
   "general.startup": "Startup",
   "general.autoStart": "Launch at login",
+  "general.autoStartUnavailable": "Only the desktop app can register a login item, so this switch is off here.",
   "general.runInBackground": "Run in background at startup",
   "general.runInBackgroundHint": "When on, every launch shows no window and keeps only the menu bar icon and the background proxy service. When off, a launch opens Providers & Models directly.",
   "general.service": "Service",
@@ -871,6 +872,7 @@ export const en: Record<TranslationKey, string> = {
   // The help mark beside the switch: what it does, in one sentence.
   "relay.apiKeyAutoGroupingHelp": "When on, this app rearranges the station's keys by group: one key per group, renamed to that group's name.",
   "relay.groupManager": "Group Manager",
+  "relay.groupManagerUnavailable": "Group Manager is available only in the desktop app.",
   "relay.groupManagerLoading": "Reading the station…",
   "relay.apiKeyGroup": "Group",
   "relay.apiKeyMultiplier": "Rate",

@@ -58,7 +58,12 @@ export interface NativeLeafBridge {
     browserLabel: string;
   }): Promise<void>;
   chooseModelsToAdd(models: string[], providerName: string, keyName: string): Promise<string[] | undefined>;
-  showGroupManager(options: {
+  /**
+   * Optional: the sheet exists only on a host that can host it. A browser page
+   * has no panel to put it in, so it leaves this undefined rather than
+   * answering a no-op — the pane disables 分组 from the same absence.
+   */
+  showGroupManager?(options: {
     title: string;
     /** The account that owns the keys; names the copy action's secret target. */
     accountId: string;
@@ -150,7 +155,8 @@ export interface NativeLeafBridge {
   }): Promise<void>;
   clearRelayPassword(accountId: string): Promise<void>;
   clearRelayCredentials(accountId: string): Promise<void>;
-  setLaunchAtLogin(enabled: boolean): Promise<void>;
+  /** Absent on a host with no login item to register (the browser page). */
+  setLaunchAtLogin?(enabled: boolean): Promise<void>;
   showVersion?(): void;
   versionInfo?(): Promise<{ app: string; litellm: string; icon?: string }>;
   openExternalURL?(url: string): void;
@@ -217,7 +223,7 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
       ? (options) => bridge.showProviderAuth!(options)
       : undefined,
     chooseModelsToAdd: ({ models, providerName, keyName }) => bridge.chooseModelsToAdd(models, providerName, keyName),
-    showGroupManager: (options) => bridge.showGroupManager(options),
+    showGroupManager: bridge.showGroupManager ? (options) => bridge.showGroupManager!(options) : undefined,
     awaitGroupManagerApply: bridge.awaitGroupManagerApply
       ? () => bridge.awaitGroupManagerApply!()
       : undefined,
@@ -241,7 +247,7 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
       : undefined,
     clearRelayPassword: (accountId) => bridge.clearRelayPassword(accountId),
     clearRelayCredentials: (accountId) => bridge.clearRelayCredentials(accountId),
-    setLaunchAtLogin: (enabled) => bridge.setLaunchAtLogin(enabled),
+    setLaunchAtLogin: bridge.setLaunchAtLogin ? (enabled) => bridge.setLaunchAtLogin!(enabled) : undefined,
     showVersion: () => bridge.showVersion?.(),
     versionInfo: bridge.versionInfo ? () => bridge.versionInfo!() : undefined,
     openExternalURL: bridge.openExternalURL ? (url) => bridge.openExternalURL!(url) : undefined,

@@ -37,7 +37,7 @@ type ReplaceDocumentCommand = {
 };
 type SetBaselineCommand = { type: "setBaseline"; baseline: string };
 type InsertTextCommand = { type: "insertText"; text: string };
-type HostCommand = ReplaceDocumentCommand | SetBaselineCommand | InsertTextCommand | { type: "scale"; scale: number } | { type: "focus" };
+type HostCommand = ReplaceDocumentCommand | SetBaselineCommand | InsertTextCommand | { type: "scale"; scale: number } | { type: "focus" } | { type: "labels"; labels: unknown };
 
 type AceSession = {
   getValue: () => string;
@@ -222,7 +222,19 @@ function readMenuLabels(): EditorMenuLabels {
   return labels;
 }
 
-const menuLabels = readMenuLabels();
+let menuLabels = readMenuLabels();
+/** A framing host localizes the page after load; a missing label keeps the one
+ *  already in hand rather than reverting that row to English. */
+function applyMenuLabels(input: unknown): void {
+  if (!input || typeof input !== "object") return;
+  const source = input as Record<string, unknown>;
+  const next: EditorMenuLabels = { ...menuLabels };
+  for (const key of Object.keys(FALLBACK_MENU_LABELS) as Array<keyof EditorMenuLabels>) {
+    const value = source[key];
+    if (typeof value === "string" && value) next[key] = value.slice(0, 64);
+  }
+  menuLabels = next;
+}
 type MenuAction = "undo" | "redo" | "cut" | "copy" | "paste" | "selectAll";
 const MENU_ENTRIES: ReadonlyArray<MenuAction | "separator"> = ["undo", "redo", "separator", "cut", "copy", "paste", "separator", "selectAll"];
 
@@ -426,7 +438,16 @@ function post(message: unknown): void {
     webKitHandler.postMessage(serialized);
     return;
   }
-  window.chrome?.webview?.postMessage(serialized);
+  const webViewHandler = window.chrome?.webview;
+  if (webViewHandler) {
+    webViewHandler.postMessage(serialized);
+    return;
+  }
+  // The browser host serves this page as its own same-origin document and
+  // frames it, because a page in this app's own document would be refused by
+  // the shell's CSP. A frame talks to the page that embedded it; the origin is
+  // stated rather than '*', so nothing but this app can drive the editor.
+  if (window.parent !== window) window.parent.postMessage(serialized, window.location.origin);
 }
 
 type DiffHunk = { beforeStart: number; beforeEnd: number; afterStart: number; afterEnd: number };
@@ -742,6 +763,8 @@ function receive(input: unknown): void {
     applyEditorScale(message.scale);
   } else if (message.type === "focus") {
     aceEditor?.focus();
+  } else if (message.type === "labels") {
+    applyMenuLabels(message.labels);
   }
 }
 
@@ -753,6 +776,14 @@ function insertHostText(text: string): void {
 }
 
 window.LiteLLMCodeEditor = { receive };
+// A host that framed this page sends its commands the same way a native host
+// evaluates them, one JSON string at a time. The sender is checked by identity
+// and origin: a frame's parent is the only window allowed to drive it.
+window.addEventListener("message", (event) => {
+  if (window.parent === window || event.source !== window.parent) return;
+  if (event.origin !== window.location.origin) return;
+  receive(event.data);
+});
 const initialCommand = window.LiteLLMCodeEditorInitialCommand;
 delete window.LiteLLMCodeEditorInitialCommand;
 if (initialCommand !== undefined) receive(initialCommand);

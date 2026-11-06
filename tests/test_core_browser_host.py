@@ -141,6 +141,7 @@ class BrowserPageTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         (self.root / "index.html").write_text("<!doctype html><title>Young Router</title><script src=\"/bundle.js\"></script>\n", encoding="utf-8")
         (self.root / "bundle.js").write_text("export {};\n", encoding="utf-8")
+        (self.root / "editor.html").write_text("<!doctype html><title>Editor</title>\n", encoding="utf-8")
         (self.root.parent / "outside.txt").write_text("not part of the bundle\n", encoding="utf-8")
 
     def _get(self, path: str, *, host: str | None = None, cookie: str | None = None) -> tuple[int, dict[str, str], bytes]:
@@ -179,6 +180,25 @@ class BrowserPageTests(unittest.TestCase):
         self.assertEqual(200, script_status)
         self.assertIn("javascript", script_headers["content-type"])
         self.assertIn("immutable", script_headers["cache-control"])
+
+    def test_only_the_editor_page_may_be_framed_and_only_by_this_origin(self) -> None:
+        """The shell frames exactly one document, and no other origin may.
+
+        The raw editor is a page of its own because the shell's CSP would
+        refuse its inline Ace bundle and a `srcdoc`/blob frame inherits that
+        policy.  It is therefore answered `SAMEORIGIN` while every other asset
+        -- the shell included -- keeps `DENY`.
+        """
+
+        self.server.enable_web_host(self.root, password="s3cret-word")
+        cookie = _login(self.server, "s3cret-word")
+        editor_status, editor_headers, editor_body = self._get("/ui/editor.html")
+        self.assertEqual(200, editor_status)
+        self.assertEqual("SAMEORIGIN", editor_headers["x-frame-options"])
+        self.assertIn(b"Editor", editor_body)
+        for path in ("/", "/bundle.js"):
+            _status, headers, _body = self._get(path, cookie=cookie)
+            self.assertEqual("DENY", headers["x-frame-options"])
 
     def test_the_mount_root_redirects_so_the_page_finds_its_script(self) -> None:
         """`/ui` without the slash asks the wrong root for the shell's script.

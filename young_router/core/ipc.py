@@ -109,6 +109,9 @@ WEB_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "[::1]"})
 # answer.  The spelling is one constant because the page's own bundle refers
 # to its script by relative path -- moving the prefix moves every asset too.
 WEB_UI_PREFIX = "/ui"
+# The one document the shell frames: the raw editor's own page. See
+# `serve_web_host` for why it must be a document of its own.
+WEB_EDITOR_PAGE = "editor.html"
 # The browser host is one built bundle of static files: the page, its script,
 # and whatever the script imports.  Anything else the listener would have to
 # guess, so it answers 404 instead.
@@ -1105,10 +1108,18 @@ class CoreIPCServer:
             "Cache-Control",
             "no-store" if candidate.suffix.lower() == ".html" else "public, max-age=31536000, immutable",
         )
-        # The page frames nothing and loads nothing but itself.
+        # The page frames nothing and loads nothing but itself.  One document
+        # is the exception: the raw editor is a page of its own, framed by the
+        # shell, because this page's CSP would refuse its inline editor bundle
+        # and a `srcdoc`/blob frame inherits that policy.  It is answered
+        # `SAMEORIGIN` -- no other origin may frame it, and it carries no
+        # configuration, only the editor that a signed-in page drives.
         handler.send_header("X-Content-Type-Options", "nosniff")
         handler.send_header("Referrer-Policy", "no-referrer")
-        handler.send_header("X-Frame-Options", "DENY")
+        handler.send_header(
+            "X-Frame-Options",
+            "SAMEORIGIN" if candidate.name == WEB_EDITOR_PAGE else "DENY",
+        )
         handler.end_headers()
         try:
             handler.wfile.write(body)

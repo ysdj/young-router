@@ -897,8 +897,12 @@ export interface NativeLeafAdapter {
     /** The same page in the system browser, for a WebKit the site refuses. */
     browserLabel: string;
   }): Promise<void>;
-  /** Native subordinate sheet: the station's keys with their groups. */
-  showGroupManager(options: {
+  /**
+   * Native subordinate sheet: the station's keys with their groups. Present
+   * only on a host that can present it; a browser page leaves it undefined so
+   * the pane disables the control instead of offering one that does nothing.
+   */
+  showGroupManager?(options: {
     title: string;
     /** The account that owns the keys; names the copy action's secret target. */
     accountId: string;
@@ -1020,7 +1024,12 @@ export interface NativeLeafAdapter {
   }): Promise<void>;
   clearRelayPassword(accountId: string): Promise<void>;
   clearRelayCredentials(accountId: string): Promise<void>;
-  setLaunchAtLogin(enabled: boolean): Promise<void>;
+  /**
+   * Present only on a host that can register a login item. A browser page
+   * cannot, so its absence is what turns 开机自启动 into a stated limitation
+   * instead of a switch that answers `saved` and changes nothing.
+   */
+  setLaunchAtLogin?(enabled: boolean): Promise<void>;
   /** Native About/version panel (app version and build). */
   showVersion?(): void;
   /** App and bundled LiteLLM versions for the shared About pane. */

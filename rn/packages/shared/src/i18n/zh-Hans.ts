@@ -399,6 +399,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "runtime.categories": "运行时分类",
   "general.startup": "启动",
   "general.autoStart": "开机自启动",
+  "general.autoStartUnavailable": "开机自启动只能由桌面应用登记，此页面不提供。",
   "general.runInBackground": "启动后在后台运行",
   "general.runInBackgroundHint": "开启后每次启动都不显示窗口，只在状态栏与后台运行代理服务；关闭后启动会直接打开供应商与模型。",
   "general.service": "服务",
@@ -882,6 +883,7 @@ export const zhHans: Record<TranslationKey, string> = {
   // The help mark beside 自动分组: what the switch does, in one sentence.
   "relay.apiKeyAutoGroupingHelp": "开启后，本站按中转站的分组重新整理密钥：每个分组只保留一个密钥，并把密钥重命名为该分组的名称。",
   "relay.groupManager": "分组",
+  "relay.groupManagerUnavailable": "分组管理只能在桌面应用中使用。",
   "relay.groupManagerLoading": "正在读取中转站…",
   "relay.apiKeyGroup": "分组",
   "relay.apiKeyMultiplier": "倍率",

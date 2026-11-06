@@ -16,9 +16,10 @@
  */
 
 import { build } from "esbuild";
+import { createHash } from "node:crypto";
 import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const app = resolve(root, "apps/web");
@@ -27,45 +28,6 @@ const outdir = resolve(app, "dist");
 
 await rm(outdir, { recursive: true, force: true });
 await mkdir(outdir, { recursive: true });
-
-// The page Core serves. `#root` is the one element React Native for Web mounts
-// into; the fragment carries the bootstrap token, which is why the `<base>` is
-// not used and the script is a module of the same origin.
-const html = `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <!-- The page loads nothing but itself: no font host, no analytics, no
-         remote style sheet. Core already sends X-Frame-Options and nosniff. -->
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; script-src 'self'; connect-src 'self'">
-    <!-- No icon request: this page is served under /ui, and a browser asking
-         the origin's /favicon.ico reaches the proxy's own routes, not ours. -->
-    <link rel="icon" href="data:,">
-    <title>Young Router</title>
-    <style>
-      :root { color-scheme: light dark; }
-      html, body { height: 100%; margin: 0; }
-      body { background: #f7f7f7; }
-      #root { height: 100%; display: flex; }
-      /* The host's surfaces own the viewport above every pane and child layer;
-         the container itself must not swallow clicks meant for the app. */
-      #host-chrome { position: fixed; inset: 0; z-index: 2000; pointer-events: none; }
-      #host-chrome > * { pointer-events: auto; }
-      @media (prefers-color-scheme: dark) { body { background: #1e1e1e; } }
-    </style>
-  </head>
-  <body>
-    <div id="root"></div>
-    <!-- The host's own surfaces (a decision panel, the record viewer, a menu)
-         mount here, beside the app rather than inside it: a dialog must not
-         replace the pane it was asked from. -->
-    <div id="host-chrome"></div>
-    <script type="module" src="./bundle.js"></script>
-  </body>
-</html>
-`;
-await writeFile(resolve(outdir, "index.html"), html);
 
 await build({
   entryPoints: [resolve(shared, "platformEntry.web.ts")],
@@ -94,7 +56,84 @@ await build({
   logLevel: "warning",
 });
 
+// The script's name carries its content, because Core answers a script with
+// `Cache-Control: public, max-age=31536000, immutable`. A stable `bundle.js`
+// under that header froze every browser on whichever build it first saw: a
+// rebuilt page kept loading the previous script for a year, so a fix shipped in
+// the app could not reach the page that was open. The name is what makes
+// `immutable` true — a changed bundle is a different URL.
+const bundle = await readFile(resolve(outdir, "bundle.js"));
+const digest = createHash("sha256").update(bundle).digest("hex").slice(0, 16);
+const bundleName = `bundle.${digest}.js`;
+await writeFile(resolve(outdir, bundleName), bundle);
+await rm(resolve(outdir, "bundle.js"));
+
+// The page Core serves. `#root` is the one element React Native for Web mounts
+// into; the fragment carries the bootstrap token, which is why the `<base>` is
+// not used and the script is a module of the same origin.
+const html = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!-- The page loads nothing but itself: no font host, no analytics, no
+         remote style sheet. Core already sends X-Frame-Options and nosniff. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; script-src 'self'; connect-src 'self'">
+    <!-- No icon request: this page is served under /ui, and a browser asking
+         the origin's /favicon.ico reaches the proxy's own routes, not ours. -->
+    <link rel="icon" href="data:,">
+    <title>Young Router</title>
+    <style>
+      /* The shared panes paint their own palette — the literals every host
+         falls back to — so this page is a light surface in both system
+         appearances.  A two-state color-scheme here let the browser draw its own dark
+         form chrome (a white-on-white select box) under a pane that is still
+         white, which is the one combination nobody can read. */
+      :root { color-scheme: light; }
+      html, body { height: 100%; margin: 0; }
+      body { background: #f7f7f7; }
+      #root { height: 100%; display: flex; }
+      /* The host's surfaces own the viewport above every pane and child layer;
+         the container itself must not swallow clicks meant for the app. */
+      #host-chrome { position: fixed; inset: 0; z-index: 2000; pointer-events: none; }
+      #host-chrome > * { pointer-events: auto; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <!-- The host's own surfaces (a decision panel, the record viewer, a menu)
+         mount here, beside the app rather than inside it: a dialog must not
+         replace the pane it was asked from. -->
+    <div id="host-chrome"></div>
+    <script type="module" src="./${bundleName}"></script>
+  </body>
+</html>
+`;
+await writeFile(resolve(outdir, "index.html"), html);
+
+// The raw editor page. Every host renders the same document: the native hosts
+// hand it to their WebView, and this host serves it as its own same-origin file
+// for the editor to frame. It must be a real document, not `srcdoc` or a blob:
+// both inherit this page's `script-src 'self'`, which refuses the Ace bundle the
+// editor inlines. The page is built from the shared module so the three hosts
+// cannot drift; esbuild is only the way to run that TypeScript here in Node.
+const editorPageModule = await build({
+  entryPoints: [resolve(shared, "ui/code-editor/codeEditorPage.ts")],
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  write: false,
+  logLevel: "warning",
+});
+const editorPagePath = resolve(outdir, ".editor-page.mjs");
+await writeFile(editorPagePath, editorPageModule.outputFiles[0].text);
+try {
+  const { codeEditorPageHtml } = await import(pathToFileURL(editorPagePath).href);
+  await writeFile(resolve(outdir, "editor.html"), codeEditorPageHtml({ platform: "web" }));
+} finally {
+  await rm(editorPagePath, { force: true });
+}
+
 await cp(resolve(app, "shim.js"), resolve(outdir, "shim.js")).catch(() => undefined);
 
-const bundle = await readFile(resolve(outdir, "bundle.js"));
-console.log(`browser host built: ${outdir} (bundle.js ${Math.round(bundle.length / 1024)} KB)`);
+console.log(`browser host built: ${outdir} (${bundleName} ${Math.round(bundle.length / 1024)} KB)`);

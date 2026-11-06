@@ -1975,7 +1975,10 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
     if (serviceOperation) {
       handledNativeActions.current.add(actionKey);
       void runServiceOperation(serviceOperation).then(() => recordMenuAction(action));
-    } else if (action === "toggle-autostart" && snapshot) {
+    } else if (action === "toggle-autostart" && snapshot && native.setLaunchAtLogin) {
+      // A host with no login item (the browser page) has no switch to toggle:
+      // the menu action is dropped rather than writing a preference the system
+      // will never honour.
       handledNativeActions.current.add(actionKey);
       const enabled = snapshot.service.auto_start_state !== "enabled";
       const operation = !enabled
@@ -1986,6 +1989,7 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
         try {
           const updated = await ipc.dispatch({ type: operation }, snapshot.revision);
           coreRevision = updated.revision;
+          if (native.setLaunchAtLogin === undefined) throw new Error("This host has no login item.");
           await native.setLaunchAtLogin(enabled);
           const current = await ipc.snapshot();
           receiveSnapshot(current);
@@ -9878,7 +9882,9 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
     }
   };
   const setAutoStart = async (enabled: boolean): Promise<void> => {
-    if (!snapshot || autoStartBusy) return;
+    // A host with no login item (the browser page) has no switch to flip: its
+    // toggle is drawn disabled and states the reason.
+    if (!snapshot || autoStartBusy || !native.setLaunchAtLogin) return;
     setAutoStartBusy(true);
     setRequestedAutoStart(enabled);
     // Pane results belong to the window's one permanent status strip, exactly
@@ -9954,9 +9960,12 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
           <View style={styles.generalRow}>
             <Text style={styles.generalRowLabel}>{translate("general.autoStart")}</Text>
             <View style={styles.generalValueSlot}>
-              <NativeToggle value={autoStartValue} disabled={autoStartBusy || busy || snapshot === undefined} accessibilityLabel={translate("general.autoStart")} onValueChange={(next) => { void setAutoStart(next); }} style={styles.generalToggle} />
+              <NativeToggle value={autoStartValue} disabled={autoStartBusy || busy || snapshot === undefined || !native.setLaunchAtLogin} accessibilityLabel={translate("general.autoStart")} onValueChange={(next) => { void setAutoStart(next); }} style={styles.generalToggle} />
             </View>
           </View>
+          {/* A page has no login item to register. Saying so is the difference
+              between a limitation and a switch that looks on and does nothing. */}
+          {native.setLaunchAtLogin ? null : <View style={styles.generalHelpSlot}><Text style={styles.generalHelpText}>{translate("general.autoStartUnavailable")}</Text></View>}
         </View>
         {/* The help belongs to the field above it, so the two travel as one
             block: a row and its tip are 2 apart, and one field is 10 from the
