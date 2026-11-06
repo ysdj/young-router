@@ -10,7 +10,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from young_router.claude_aliases import claude_desktop_alias
+from young_router.claude_aliases import claude_desktop_alias, resolve_alias
 from young_router.proxy import claude_desktop_listing
 
 
@@ -168,6 +168,32 @@ class ClaudeDesktopRowsTests(unittest.TestCase):
         response["data"][0]["max_input_tokens"] = 200_000
         rows = claude_desktop_listing.desktop_model_rows(response)["data"]
         self.assertEqual(1_000_000, rows[0]["max_input_tokens"])
+
+    def test_a_declared_one_million_route_is_published_as_one_suffixed_row(self) -> None:
+        # A row whose max_input_tokens reads 1M becomes two picker entries in
+        # Claude Desktop ("<name>" and "<name> 1M"), and the standard one
+        # reports the client's 200k default.  The client's own suffix states the
+        # same fact in the name: one row, resolved at 1M, and this app already
+        # strips the suffix back to the public route when a turn names it.
+        self.windows["kimi-k3.1-pro"] = 1_000_000
+        self.declared["kimi-k3.1-pro"] = 1_000_000
+        rows = claude_desktop_listing.desktop_model_rows(_response("kimi-k3.1-pro"))["data"]
+        self.assertEqual(1, len(rows))
+        self.assertEqual(f"{claude_desktop_alias('kimi-k3.1-pro')}[1m]", rows[0]["id"])
+        self.assertEqual("kimi-k3.1-pro", resolve_alias(rows[0]["id"], ["kimi-k3.1-pro"]))
+
+    def test_a_window_below_one_million_keeps_the_bare_alias(self) -> None:
+        self.windows["gpt-6.1-sol"] = 500_000
+        self.declared["gpt-6.1-sol"] = 500_000
+        rows = claude_desktop_listing.desktop_model_rows(_response("gpt-6.1-sol"))["data"]
+        self.assertEqual(claude_desktop_alias("gpt-6.1-sol"), rows[0]["id"])
+
+    def test_a_resolved_one_million_window_gets_no_suffix(self) -> None:
+        # Only the user's own declaration is a 1M claim; a window the registry
+        # merely resolved must not turn the row into a 1M route.
+        self.windows["gemini-3.8-flash"] = 1_048_576
+        rows = claude_desktop_listing.desktop_model_rows(_response("gemini-3.8-flash"))["data"]
+        self.assertEqual(claude_desktop_alias("gemini-3.8-flash"), rows[0]["id"])
 
     def test_an_undeclared_one_million_window_is_not_a_1m_claim(self) -> None:
         # The registry's published number can itself carry an upstream

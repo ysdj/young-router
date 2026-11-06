@@ -29,7 +29,7 @@ from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from typing import Any, Final
 
-from ..claude_aliases import claude_desktop_alias, desktop_keeps_model_id
+from ..claude_aliases import CONTEXT_SUFFIX, claude_desktop_alias, desktop_keeps_model_id
 
 #: A profile may name its client explicitly.  The desktop app sends
 #: ``inferenceCustomHeaders`` on the discovery request as well as on turns, so
@@ -212,10 +212,24 @@ def desktop_model_rows(
             rows.append(dict(row))
             continue
         display_name = row.get("display_name") or names.get(public_id) or public_id
+        published = _published_context(public_id, row, window_for, declared_for)
+        # Claude Desktop's 1M row is a name before it is a number: an id
+        # carrying its own ``[1m]`` suffix is read at 1M by the session, and a
+        # suffixed id is not a row that "offers 1M" to the picker, so no second
+        # variant is synthesized beside it.  Publishing the suffix here is the
+        # only gateway-side way to state a 1M route as one picker row: a
+        # ``max_input_tokens`` at 1M alone yields ``<name>`` and
+        # ``<name> 1M``, and the profile preference that collapses them
+        # (``modelPrefer1mContext``) belongs to the client, not the gateway.
+        # ``claude_aliases.context_suffix_free`` resolves the id back, so a turn
+        # naming it reaches the same route.
+        alias = claude_desktop_alias(public_id)
+        if isinstance(published, int) and not isinstance(published, bool) and published >= 1_000_000:
+            alias = f"{alias}{CONTEXT_SUFFIX}"
         rows.append(
             {
                 "type": "model",
-                "id": claude_desktop_alias(public_id),
+                "id": alias,
                 "display_name": str(display_name),
                 "created_at": row.get("created_at"),
                 # This is the app's reader of a route's window, and it decides
@@ -223,7 +237,7 @@ def desktop_model_rows(
                 # number is the route's published window, never the one the
                 # listing's upstream reading stated, and a 1M claim needs the
                 # user's own declaration (see ``_published_context``).
-                "max_input_tokens": _published_context(public_id, row, window_for, declared_for),
+                "max_input_tokens": published,
                 "max_tokens": row.get("max_tokens"),
             }
         )

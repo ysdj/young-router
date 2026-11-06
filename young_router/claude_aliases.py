@@ -119,6 +119,14 @@ _ALIAS_DIGEST = re.compile(r"[0-9a-f]{6}$")
 #: plain row, and the id it sends on a turn carries the suffix.  A gateway row
 #: that reads as 1M gets it from its ``max_input_tokens``, so this suffix is the
 #: client's, never a route the router serves.
+#:
+#: The desktop view publishes it in front of the client instead (see
+#: ``proxy.claude_desktop_listing``): a row whose id is already suffixed does
+#: not read as "offers 1M" to the client, so there is no second variant to
+#: collapse, and the session still resolves the model at 1M.  Only the browser
+#: client's own discovery sees that id; every other caller keeps the public
+#: name, and ``context_suffix_free`` is how a request naming it is resolved.
+CONTEXT_SUFFIX = "[1m]"
 _CONTEXT_SUFFIX = re.compile(r"\[1m\]$", re.IGNORECASE)
 
 
