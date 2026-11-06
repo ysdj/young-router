@@ -508,6 +508,202 @@ class HookTraceLoggingTests(HookTestCase):
             self.assertEqual(records[0]["ts"], records[-1]["ts"])
             self.assertIn("settled_at", records[-1]["aborted"])
 
+    async def test_a_heartbeat_does_not_orphan_the_settlement_watch(self) -> None:
+        """A still-reporting stream must still be closable when it stops.
+
+        The heartbeat rewrites the progress row.  Treated as a fresh start it
+        would take a new attempt serial, the watch scheduled for the original
+        start would no longer recognise the row, and the stream that later went
+        silent would never be closed -- the very state the watch exists for.
+        """
+
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            self.set_env("YOUNG_ROUTER_LOG_REQUEST_STALE_SECONDS", "0.05")
+            kwargs = {
+                "call_type": "aresponses",
+                "model": "public-chat",
+                "litellm_call_id": "heartbeat-call",
+            }
+
+            await hook.async_pre_call_deployment_hook(kwargs, call_type="aresponses")
+            hooks._touch_recent_request("heartbeat-call", interval_seconds=0)
+            await asyncio.sleep(0.2)
+
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertIn("aborted", [record["status"] for record in records])
+            with hooks._PENDING_RECENT_REQUESTS_LOCK:
+                self.assertNotIn("heartbeat-call", hooks._PENDING_RECENT_REQUESTS)
+
+    async def test_a_retry_start_is_not_closed_by_the_earlier_attempt_watch(
+        self,
+    ) -> None:
+        """A second attempt under one request id gets its own stale window.
+
+        A retry republishes the same request id.  The watch the first attempt
+        scheduled must leave that newer row alone: closing it would report the
+        retry as stale the instant it started.
+        """
+
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            self.set_env("YOUNG_ROUTER_LOG_REQUEST_STALE_SECONDS", "0.3")
+            kwargs = {
+                "call_type": "aresponses",
+                "model": "public-chat",
+                "litellm_call_id": "retry-call",
+            }
+
+            await hook.async_pre_call_deployment_hook(kwargs, call_type="aresponses")
+            # A failover round republishes the attempt under the same id.
+            await asyncio.sleep(0.05)
+            record = hooks._request_log_record("pending", kwargs)
+            hooks._append_recent_request(record)
+            await asyncio.sleep(0.05)
+
+            # The first watch expires before the second attempt's window does.
+            self.assertFalse(
+                hooks._settle_recent_request("retry-call", "no_terminal_callback", attempt=1)
+            )
+            with hooks._PENDING_RECENT_REQUESTS_LOCK:
+                self.assertIn("retry-call", hooks._PENDING_RECENT_REQUESTS)
+
+    async def test_a_client_that_stops_reading_closes_its_row_at_once(self) -> None:
+        """Pressing stop is an ending no callback reports.
+
+        LiteLLM's stream reader fires the failure callback only for an error it
+        saw itself, so a closed downstream body left the progress row saying
+        发送中 until the stale window (fifteen minutes by default) closed it.  The
+        client-facing generator is the one place that knows nobody is reading
+        any more, so its ending closes the row.
+        """
+
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+
+        class _StopsMidAnswer:
+            def __init__(self) -> None:
+                self._chunks = [
+                    {"type": "response.output_text.delta", "delta": "partial"}
+                ]
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self._chunks:
+                    raise StopAsyncIteration
+                return self._chunks.pop(0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            request_data = {
+                "call_type": "aresponses",
+                "model": "public-chat",
+                "input": [{"role": "user", "content": "hello"}],
+                "stream": True,
+                "litellm_call_id": "stopped-call",
+            }
+            await hook.async_pre_call_deployment_hook(
+                request_data, call_type="aresponses"
+            )
+
+            stream = hook.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=_StopsMidAnswer(),
+                request_data=request_data,
+            )
+            self.assertEqual(
+                {"type": "response.output_text.delta", "delta": "partial"},
+                await stream.__anext__(),
+            )
+            # The reader closes the body: the generator is finalised, exactly as
+            # it is when the client disconnects mid-answer.
+            await stream.aclose()
+
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual("aborted", records[-1]["status"])
+            self.assertEqual(
+                "client_disconnect", records[-1]["aborted"]["reason"]
+            )
+            with hooks._PENDING_RECENT_REQUESTS_LOCK:
+                self.assertNotIn("stopped-call", hooks._PENDING_RECENT_REQUESTS)
+
+    async def test_a_stream_that_ends_by_itself_is_not_a_client_stop(self) -> None:
+        """A finished stream closes through its callback, not as a stop.
+
+        The generator also ends when nothing is reading yet -- after a complete
+        Chat turn, where no Responses terminal frame exists to deliver.  That
+        ending is not a person pressing stop, so it must leave the row to the
+        success callback instead of writing an interrupted row beside it.
+        """
+
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+
+        class _AnswersAndEnds:
+            def __init__(self) -> None:
+                self._chunks = [
+                    {"type": "response.output_text.delta", "delta": "done"}
+                ]
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self._chunks:
+                    raise StopAsyncIteration
+                return self._chunks.pop(0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            request_data = {
+                "call_type": "aresponses",
+                "model": "public-chat",
+                "input": [{"role": "user", "content": "hello"}],
+                "stream": True,
+                "litellm_call_id": "finished-call",
+            }
+            await hook.async_pre_call_deployment_hook(
+                request_data, call_type="aresponses"
+            )
+
+            stream = hook.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=_AnswersAndEnds(),
+                request_data=request_data,
+            )
+            chunks = [chunk async for chunk in stream]
+            self.assertTrue(chunks)
+
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(
+                ["pending"], [record["status"] for record in records]
+            )
+            # The turn is still open for its terminal callback.
+            with hooks._PENDING_RECENT_REQUESTS_LOCK:
+                self.assertIn("finished-call", hooks._PENDING_RECENT_REQUESTS)
+
     async def test_terminal_callback_keeps_its_pending_row_open(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
@@ -792,6 +988,91 @@ class HookTraceLoggingTests(HookTestCase):
         )
         self.assertEqual("messages", bridged["client_surface"])
         self.assertEqual("chat", bridged["upstream_surface"])
+
+    def test_request_log_keeps_the_inbound_wire_of_an_adapted_body(self) -> None:
+        """A body a route's adapter already rewrote still reports its own door.
+
+        LiteLLM's deployment hook hands over the call's kwargs rebuilt from the
+        deployment parameters, so a Responses turn on a Chat-shaped route
+        arrives with ``messages`` and no ``input``.  Read at face value that
+        body called in on Chat, and the Log tab showed a Responses client's row
+        as inbound Chat -- the one column that exists to tell a bridged turn
+        from a native one.  The copy LiteLLM takes on arrival, before any hook
+        touched it, is still under ``proxy_server_request.body``.
+        """
+
+        hooks, _ = load_hook_module()
+        record = hooks._request_log_record(
+            "pending",
+            {
+                "model": "openai/public-chat",
+                "messages": [{"role": "user", "content": "hello"}],
+                "call_type": None,
+                "custom_llm_provider": "openai",
+                "use_chat_completions_api": True,
+                "proxy_server_request": {
+                    "url": "http://127.0.0.1:4000/v1/responses",
+                    "body": {
+                        "model": "public-chat",
+                        "input": [{"role": "user", "content": "hello"}],
+                        "stream": True,
+                    },
+                },
+                "model_info": {
+                    "id": "deployment-1",
+                    "upstream_url_surface": "openai/chat",
+                },
+                "_young_router_upstream_url_surface": "openai/chat",
+            },
+        )
+        self.assertEqual("responses", record["client_surface"])
+        self.assertEqual("chat", record["upstream_surface"])
+
+    def test_a_messages_client_is_never_reported_as_chat(self) -> None:
+        """``messages`` is not evidence of a wire; Claude Code sends one too.
+
+        Reading the arrival body for the client's wire fixed a Responses turn
+        being drawn as Chat, but a ``messages`` key then made every Claude Code
+        turn read 入站 Chat -- a /v1/messages client reported as Chat in the one
+        column that says which door it used.  Chat and Anthropic Messages share
+        that key, so only the URL, the call type, or an ``input`` body can name
+        the wire; the pending row and the terminal row are both covered because
+        they carry different evidence (the URL in one, the call type in the
+        other).
+        """
+
+        hooks, _ = load_hook_module()
+        body = {
+            "model": "deepseek-v4.1-flash",
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+        pending = hooks._request_log_record(
+            "pending",
+            {
+                "model": "anthropic/deepseek-v4.1-flash",
+                "messages": body["messages"],
+                "call_type": None,
+                "proxy_server_request": {
+                    "url": "http://127.0.0.1:4000/v1/messages",
+                    "body": body,
+                },
+                "_young_router_upstream_url_surface": "anthropic",
+            },
+        )
+        self.assertEqual("messages", pending["client_surface"])
+
+        # The terminal callback keeps no proxy request, only the call type.
+        terminal = hooks._request_log_record(
+            "success",
+            {
+                "model": "openai/deepseek-flash",
+                "messages": body["messages"],
+                "call_type": "anthropic_messages",
+                "_young_router_upstream_url_surface": "anthropic",
+            },
+        )
+        self.assertEqual("messages", terminal["client_surface"])
 
     def test_request_log_leaves_an_unknown_protocol_empty(self) -> None:
         """A row that cannot name a wire states none instead of ``unknown``.

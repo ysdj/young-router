@@ -568,6 +568,66 @@ def _trace_requested_endpoint(request_kwargs: Optional[dict]) -> Optional[str]:
 
 
 def _trace_client_surface(request_kwargs: Optional[dict]) -> str:
+    """The wire the client called in on, named by evidence and never guessed.
+
+    Two things make this harder than reading a field:
+
+    * A deployment hook hands over an already adapted body.  LiteLLM rebuilds
+      the call's kwargs from the deployment parameters, so a Responses turn on a
+      Chat-shaped route arrives with ``messages`` and no ``input``.
+    * Both a Chat body and an Anthropic Messages body carry ``messages``.  The
+      key therefore names no wire at all: read as one, every Claude Code turn on
+      a Messages route reported inbound Chat -- the single column a reader uses
+      to tell an adapted turn from a native one, wrong in the one case it is
+      looked at for.
+
+    So the wire is named only by evidence that identifies it: the URL the client
+    called, the call type LiteLLM is running, or an ``input`` body (which only
+    the Responses wire has).  A bare ``messages`` key is not evidence, and what
+    cannot be named is left empty rather than guessed.
+    """
+
+    request_kwargs = request_kwargs or {}
+    named = _trace_client_surface_named_by_request(request_kwargs)
+    if named:
+        return named
+    # No endpoint or call type to go on.  The body as it arrived is the better
+    # witness than the adapted one, and ``input`` is the one shape that names
+    # its own wire.
+    for candidate in (
+        _trace_original_request_body(request_kwargs),
+        request_kwargs,
+    ):
+        shaped = _trace_client_surface_from_body_shape(candidate)
+        if shaped:
+            return shaped
+    return "unknown"
+
+
+def _trace_original_request_body(request_kwargs: Optional[dict]) -> Optional[dict]:
+    """The body this request arrived with, if the callback still carries it."""
+
+    if not isinstance(request_kwargs, dict):
+        return None
+    containers: list[Any] = [request_kwargs]
+    for key in ("litellm_params", "litellm_metadata", "metadata"):
+        container = request_kwargs.get(key)
+        if isinstance(container, dict):
+            containers.append(container)
+    for container in containers:
+        proxy_request = container.get("proxy_server_request")
+        if isinstance(proxy_request, dict):
+            body = proxy_request.get("body")
+        else:
+            body = getattr(proxy_request, "body", None)
+        if isinstance(body, dict) and body:
+            return body
+    return None
+
+
+def _trace_client_surface_named_by_request(request_kwargs: Optional[dict]) -> str:
+    """The wire the client's own request states, or ``""`` when it states none."""
+
     request_kwargs = request_kwargs or {}
     endpoint = _trace_requested_endpoint(request_kwargs)
     call_type = request_kwargs.get("call_type")
@@ -587,11 +647,24 @@ def _trace_client_surface(request_kwargs: Optional[dict]) -> str:
         return "messages"
     if call_type_value in {"responses", "aresponses", "response"}:
         return "responses"
-    if request_kwargs.get("input") is not None:
-        return "responses"
-    if request_kwargs.get("messages") is not None:
+    if call_type_value in {"completion", "acompletion", "chat_completion", "achat_completion"}:
         return "chat"
-    return "unknown"
+    return ""
+
+
+def _trace_client_surface_from_body_shape(body: Optional[dict]) -> str:
+    """Name the wire only a body shape can name.
+
+    ``input`` belongs to the Responses wire alone.  ``messages`` is shared by
+    Chat and Anthropic Messages, so a body carrying it is not evidence of
+    either and is left unnamed.
+    """
+
+    if not isinstance(body, dict):
+        return ""
+    if body.get("input") is not None:
+        return "responses"
+    return ""
 
 
 def _trace_surface_name(surface: Any) -> str:

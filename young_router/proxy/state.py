@@ -47,6 +47,13 @@ _PENDING_RECENT_REQUESTS: dict[str, dict[str, Any]] = {}
 _PENDING_RECENT_REQUESTS_LOCK = threading.Lock()
 _PENDING_SETTLEMENT_TASKS: set[Any] = set()
 
+# Every in-flight start gets a serial number.  A settlement watch is scheduled
+# for the attempt that was published when it was created, and a later attempt
+# under the same request id (a retry, a fallback round) must not be closed by
+# the watch the previous one left behind.
+_ATTEMPT_SEQUENCE = 0
+_ATTEMPT_SEQUENCE_LOCK = threading.Lock()
+
 
 def _request_stale_seconds() -> float:
     """Seconds without progress after which an unfinished row is closed.
@@ -108,8 +115,18 @@ def _aborted_recent_request_record(
     return aborted
 
 
-def _track_recent_request(record: Mapping[str, Any]) -> Optional[str]:
-    """Keep an in-flight row joinable while its terminal callback may arrive."""
+def _track_recent_request(
+    record: Mapping[str, Any],
+    *,
+    attempt: Optional[int] = None,
+) -> Optional[str]:
+    """Keep an in-flight row joinable while its terminal callback may arrive.
+
+    ``attempt`` repeats the start a heartbeat is refreshing.  A heartbeat is the
+    same attempt still reporting, not a second one: giving it a new serial would
+    leave the watch scheduled for the original start unable to recognise the row
+    it was created for, and that row would then never be closed.
+    """
 
     if not isinstance(record, Mapping):
         return None
@@ -126,11 +143,15 @@ def _track_recent_request(record: Mapping[str, Any]) -> Optional[str]:
         # Re-inserting under the same key does not move a dict entry, so the
         # map is refreshed by popping first: the cap below evicts the *oldest*
         # entry, and an active stream must not be the one that is dropped.
-        tracked = _PENDING_RECENT_REQUESTS.pop(request_id, None) or {}
+        _PENDING_RECENT_REQUESTS.pop(request_id, None)
         _PENDING_RECENT_REQUESTS[request_id] = {
             "record": dict(record),
             "touched_at": now,
-            "reported_at": tracked.get("reported_at", now),
+            # A row that starts after (or while) a client closed the previous
+            # attempt says the client asked again, so the settlement clock
+            # restarts with it instead of expiring the new attempt early.
+            "reported_at": now,
+            "attempt": attempt if attempt is not None else _next_attempt_sequence(),
         }
         while len(_PENDING_RECENT_REQUESTS) > _PENDING_RECENT_REQUESTS_MAX:
             _PENDING_RECENT_REQUESTS.pop(next(iter(_PENDING_RECENT_REQUESTS)))
@@ -171,20 +192,59 @@ def _touch_recent_request(
             return
         entry["reported_at"] = now
         record = dict(entry["record"])
+        attempt = entry.get("attempt")
     _append_recent_request(
         {
             **record,
             "status": status,
             "ts": _utc_now_iso(),
             "heartbeat": True,
-        }
+        },
+        attempt=attempt if isinstance(attempt, int) else None,
     )
 
 
-def _settle_recent_request(request_id: str, reason: str) -> bool:
-    """Append the terminal row for an attempt that stopped reporting."""
+def _next_attempt_sequence() -> int:
+    global _ATTEMPT_SEQUENCE
+    with _ATTEMPT_SEQUENCE_LOCK:
+        _ATTEMPT_SEQUENCE += 1
+        return _ATTEMPT_SEQUENCE
+
+
+def _in_flight_attempt(request_id: Any) -> Optional[int]:
+    """Serial number of the attempt this request id is currently reporting.
+
+    A caller that just published a row reads it back here to say *which* start
+    its settlement belongs to; the client-facing generator reads it to close
+    whatever it was delivering.
+    """
+
+    if not isinstance(request_id, str) or not request_id.strip():
+        return None
+    with _PENDING_RECENT_REQUESTS_LOCK:
+        entry = _PENDING_RECENT_REQUESTS.get(request_id.strip())
+        return int(entry.get("attempt") or 0) if entry else None
+
+
+def _settle_recent_request(
+    request_id: str,
+    reason: str,
+    *,
+    attempt: Optional[int] = None,
+) -> bool:
+    """Append the terminal row for an attempt that stopped reporting.
+
+    ``attempt`` names the start this settlement was scheduled for.  A watch
+    that wakes up after a later attempt replaced that start leaves the newer
+    row alone: only the attempt it was created for is its to close.
+    """
 
     with _PENDING_RECENT_REQUESTS_LOCK:
+        entry = _PENDING_RECENT_REQUESTS.get(request_id)
+        if entry is None:
+            return False
+        if attempt is not None and int(entry.get("attempt") or 0) != attempt:
+            return False
         entry = _PENDING_RECENT_REQUESTS.pop(request_id, None)
     if entry is None:
         return False
@@ -197,6 +257,7 @@ def _settle_recent_request(request_id: str, reason: str) -> bool:
 async def _settle_recent_request_after(
     request_id: str,
     stale_seconds: float,
+    attempt: Optional[int] = None,
 ) -> None:
     while True:
         with _PENDING_RECENT_REQUESTS_LOCK:
@@ -209,7 +270,7 @@ async def _settle_recent_request_after(
         if remaining <= 0:
             break
         await asyncio.sleep(min(remaining, _MAX_REQUEST_HEARTBEAT_SECONDS))
-    _settle_recent_request(request_id, "no_terminal_callback")
+    _settle_recent_request(request_id, "no_terminal_callback", attempt=attempt)
 
 
 def _schedule_recent_request_settlement(record: Mapping[str, Any]) -> None:
@@ -226,7 +287,11 @@ def _schedule_recent_request_settlement(record: Mapping[str, Any]) -> None:
     except RuntimeError:
         return
     task = loop.create_task(
-        _settle_recent_request_after(request_id.strip(), stale_seconds)
+        _settle_recent_request_after(
+            request_id.strip(),
+            stale_seconds,
+            _in_flight_attempt(request_id),
+        )
     )
     _PENDING_SETTLEMENT_TASKS.add(task)
     task.add_done_callback(_PENDING_SETTLEMENT_TASKS.discard)
@@ -403,7 +468,11 @@ def _recent_requests_max_bytes() -> int:
     return log_max_bytes()
 
 
-def _append_recent_request(record: dict[str, Any]) -> Optional[str]:
+def _append_recent_request(
+    record: dict[str, Any],
+    *,
+    attempt: Optional[int] = None,
+) -> Optional[str]:
     """Append one request row and keep the in-flight registry current.
 
     The registry is updated before the write so a terminal callback always
@@ -412,7 +481,7 @@ def _append_recent_request(record: dict[str, Any]) -> Optional[str]:
     terminal row, and the viewer keeps the real outcome.
     """
 
-    request_id = _track_recent_request(record)
+    request_id = _track_recent_request(record, attempt=attempt)
     path = _recent_requests_log_path()
     if not path:
         return request_id

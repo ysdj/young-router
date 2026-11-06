@@ -1088,6 +1088,47 @@ def _safe_route_trace_record(
     return {key: value for key, value in result.items() if value not in (None, "")}
 
 
+# What LiteLLM's call type says about the wire the client used.  It is the
+# entry point this proxy was invoked through, so it names the client's door
+# outright.
+_CALL_TYPE_CLIENT_SURFACES = {
+    "messages": "messages",
+    "amessages": "messages",
+    "anthropic": "messages",
+    "anthropic_messages": "messages",
+    "responses": "responses",
+    "aresponses": "responses",
+    "response": "responses",
+    "completion": "chat",
+    "acompletion": "chat",
+    "chat_completion": "chat",
+    "achat_completion": "chat",
+}
+
+
+def _restate_client_surface_from_call_type(record: dict[str, Any]) -> None:
+    """Correct one recorded client wire against the row's own call type.
+
+    A runtime that inferred the client's wire from the body's shape reported
+    Chat for every Anthropic ``messages`` body and for every Responses turn
+    whose body an adapter had already rewritten, so rows written before
+    2026-11-06 carry ``chat`` beside a call type that names another wire.  The
+    call type is in the same row and names the entry point, so the column is
+    restated from it instead of from that guess.  Only that contradiction is
+    touched: a row whose surface and call type agree, or that carries no call
+    type at all, is left exactly as recorded.
+    """
+
+    recorded = _string_record_value(record.get("client_surface")).casefold()
+    if recorded != "chat":
+        return
+    named = _CALL_TYPE_CLIENT_SURFACES.get(
+        _string_record_value(record.get("call_type")).casefold()
+    )
+    if named and named != "chat":
+        record["client_surface"] = named
+
+
 def _safe_request_record(
     raw: Mapping[str, Any],
     configured_public_models: Mapping[str, str] | None = None,
@@ -1116,12 +1157,16 @@ def _safe_request_record(
         # a row recorded before these fields existed simply carries none.
         "client_surface",
         "upstream_surface",
+        # Kept so the client's wire can be restated from it when a row was
+        # written by a runtime that guessed that wire from the body's shape.
+        "call_type",
         "duration_ms",
         "route_key",
         "routing_state",
     ):
         if key in raw:
             result[key] = _safe_scalar(raw[key])
+    _restate_client_surface_from_call_type(result)
     route_public_model = _public_model_from_route_key(result.get("route_key"))
     if route_public_model:
         result["public_model"] = route_public_model

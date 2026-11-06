@@ -1429,6 +1429,67 @@ model_list:
             self.assertNotIn("sk-synthetic-secret", json.dumps(projected))
             self.assertIn("sk-synthetic-secret", raw)
 
+    def test_a_messages_row_written_as_chat_is_restated_from_its_call_type(
+        self,
+    ) -> None:
+        """History is read from the row's own evidence, not left mislabelled.
+
+        Rows written before 2026-11-06 recorded the client's wire from the
+        body's shape, so every Claude Code turn said inbound Chat while the same
+        row's ``call_type`` said ``anthropic_messages``.  The viewer may restate
+        that one column from the row's own call type -- it is not a guess, and it
+        is the difference between a reader trusting the column and ignoring it.
+        A row that agrees, or that carries no call type, is untouched.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = [
+                {
+                    "ts": "2026-11-06T04:30:00Z",
+                    "request_id": "claude-code",
+                    "status": "success",
+                    "client_surface": "chat",
+                    "upstream_surface": "messages",
+                    "call_type": "anthropic_messages",
+                },
+                {
+                    "ts": "2026-11-06T04:30:01Z",
+                    "request_id": "codex",
+                    "status": "success",
+                    "client_surface": "chat",
+                    "upstream_surface": "chat",
+                    "call_type": "aresponses",
+                },
+                {
+                    "ts": "2026-11-06T04:30:02Z",
+                    "request_id": "no-call-type",
+                    "status": "success",
+                    "client_surface": "chat",
+                    "upstream_surface": "chat",
+                },
+                {
+                    "ts": "2026-11-06T04:30:03Z",
+                    "request_id": "already-right",
+                    "status": "success",
+                    "client_surface": "messages",
+                    "upstream_surface": "messages",
+                    "call_type": "anthropic_messages",
+                },
+            ]
+            (root / "recent-requests.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            projected = LogsDomain(root).view("requests")["log"]["records"]
+            by_id = {row["request_id"]: row for row in projected}
+
+            self.assertEqual("messages", by_id["claude-code"]["client_surface"])
+            self.assertEqual("responses", by_id["codex"]["client_surface"])
+            self.assertEqual("chat", by_id["no-call-type"]["client_surface"])
+            self.assertEqual("messages", by_id["already-right"]["client_surface"])
+
     def test_recovery_records_are_sorted_by_updated_at(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -30,6 +30,7 @@ from .base import (
     List,
     Optional,
     _without_internal_request_keys,
+    asyncio,
     litellm,
 )
 
@@ -556,6 +557,11 @@ class YoungRouterHook(CustomLogger):
         # downstream client keeps receiving bytes while any internal wait is
         # in progress. Keepalive chunks intentionally bypass deliver_chunk():
         # they are already in final wire form and carry no output to adapt.
+        # Set by the ``GeneratorExit``/``CancelledError`` branch below: this
+        # generator was closed at a suspended ``yield``, which is what a reader
+        # that stopped reading does to it.  A stream that simply finished ends
+        # by leaving the loop normally and must not be reported as a stop.
+        _stream_ended_by_its_reader = False
         try:
             async for chunk in _streaming_module._yield_downstream_keepalive_stream(
                 self._post_call_streaming_iterator_pipeline(
@@ -581,6 +587,9 @@ class YoungRouterHook(CustomLogger):
                 ):
                     terminal_delivered = True
                 yield chunk
+        except (GeneratorExit, asyncio.CancelledError):
+            _stream_ended_by_its_reader = True
+            raise
         except Exception as exc:
             # The reader has nothing to read the end of this body from: this
             # shape ends a turn at its terminal event, so a body that closes
@@ -621,6 +630,17 @@ class YoungRouterHook(CustomLogger):
             # counted as busy with nobody behind it.  Enough of those park a
             # whole model group at its cap.
             _routing_module._release_request_concurrency_slots(request_data)
+            # A person pressing stop is the one end of a turn no callback will
+            # ever report: LiteLLM's stream reader fires the failure callback
+            # only for an error it saw itself, so a closed downstream body left
+            # the progress row saying 发送中 until the stale window (fifteen
+            # minutes) or a worker restart closed it.  This generator is the one
+            # place that knows the reader went away, so it is where that ending
+            # is recorded -- but only when the reader is what ended the
+            # generator (``GeneratorExit``/``CancelledError`` at a suspended
+            # yield), never when the answer ran to its own end.
+            if _stream_ended_by_its_reader:
+                _settle_client_stopped_stream(request_data)
 
     async def _post_call_streaming_iterator_pipeline(
         self,
@@ -836,6 +856,37 @@ class YoungRouterHook(CustomLogger):
             )
         ):
             yield chunk
+
+
+def _settle_client_stopped_stream(request_data: dict) -> None:
+    """Close this turn's progress row as stopped by the client.
+
+    Every other ending reaches the log through a callback: a delivered answer
+    through the success callback, an upstream failure through the failure one.
+    A reader that closed the connection produces neither, and the row it left
+    behind read 发送中 for the whole stale window -- the stop a person pressed
+    was the one ending the log could not name.  The request id is the join key
+    the progress row was published under (``_record_recent_request_started``
+    pins it on the selected route marker), so reading it back closes the row
+    that belongs to this turn and to no other.
+    """
+
+    if not isinstance(request_data, dict):
+        return
+    if _routing_module._proxy_shutdown_in_progress():
+        # A worker being replaced ends every stream it holds; those rows belong
+        # to the restart path (``settle_stale_recent_requests``), and naming
+        # that a client stop would send the reader to the wrong side.
+        return
+    request_id = _routing_module._trace_request_id(request_data)
+    if not request_id:
+        return
+    if _state_module._settle_recent_request(request_id, "client_disconnect"):
+        _trace_module._request_route_trace(
+            "request_log_closed_for_client_disconnect",
+            request_data,
+            request=_trace_module._trace_request_summary(request_data),
+        )
 
 
 def _trace_codex_fast_tier_result(
