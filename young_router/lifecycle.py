@@ -26,6 +26,7 @@ from pathlib import Path
 # A restart or an install never reads this (see the module docstring).
 PROXY_DRAIN_GRACE_SECONDS = 14_400.0
 
+
 # The Core owns the app-exit decision, but the proxy it stops was forked much
 # earlier and cannot see the Core's environment.  A marker file in the state
 # root both sides already resolve is what carries that one bit across the fork:

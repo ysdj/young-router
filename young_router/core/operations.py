@@ -31,9 +31,6 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from ..browser_identity import browser_request_headers
-from ..lifecycle import (
-    proxy_drain_grace_seconds,
-)
 from .. import adapters as managed_adapters
 from .. import config_paths
 from ..dsh_config_keys import (
@@ -90,6 +87,12 @@ SERVICE_HEALTH_MISS_CACHE_SECONDS = 1.0
 # Settings schema documents the same 1..600 second range; a larger host
 # environment value must not hold a failed start open indefinitely.
 MAX_SERVICE_HEALTH_WAIT_SECONDS = 600.0
+#: How long a stop waits for the group it just killed to disappear.  This is not
+#: a drain: the processes were signalled with SIGKILL, so the wait is the kernel
+#: tearing them down and the Core collecting its own child.
+_STOP_SETTLE_SECONDS = 5.0
+#: How long a rolling reload waits for its replaced workers to answer again.
+_RELOAD_READY_WAIT_SECONDS = 30.0
 # How long start/restart waits for the liveness endpoint when no runtime
 # setting says otherwise.  The proxy master prints nothing until its whole
 # runtime is imported, and that import alone measured 51 s on a warm disk here
@@ -158,18 +161,6 @@ def _provider_config_source(paths: "RuntimePaths") -> Path:
 
 def _bounded_text(value: object, *, limit: int = 240) -> str:
     return REDACT_TEXT(str(value))[:limit]
-
-
-def _proxy_drain_grace_seconds() -> float:
-    """How long a replacement the Core performs on purpose may drain.
-
-    This is the deliberate replacement's budget and not the app's restart path:
-    ``scripts/restart-app.sh`` and the installer kill the captured tree and start
-    the replacement without waiting for a drain (``young_router/lifecycle.py``
-    states which stop uses which bound).
-    """
-
-    return proxy_drain_grace_seconds()
 
 
 # LiteLLM's Router takes a per-exception retry count only inside
@@ -1666,30 +1657,52 @@ class CoreServiceController:
         return CoreServiceController._process_alive(pid)
 
     @staticmethod
-    def _stop_process_group(pid: int) -> None:
+    def _reap_own_child(pid: int) -> None:
+        """Collect the exit of a child this process started, if it has one.
+
+        A stopped proxy is this Core's own child.  Nobody collected it, so it
+        stayed a zombie in its own process group -- and a group whose only
+        member is a zombie still answers ``killpg(.., 0)`` with success.  The
+        drain wait below therefore never saw the group go away, and burned its
+        whole budget (four hours, before this was found) with nothing serving.
+        """
+
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            # Not this process's child, or already collected by whoever owns it.
+            pass
+
+    @classmethod
+    def _stop_process_group(cls, pid: int) -> None:
+        """Kill the proxy's process group, and collect it.
+
+        A stop is a kill, not a drain.  A graceful bound only decides how long
+        a replacement waits before it does this anyway, and every request
+        arriving in that window is refused either way -- so the wait buys
+        nothing and costs the port.  It cost three minutes of 502 on a host once,
+        waiting out a bound that was four hours long.
+
+        What is left is the part that is not optional: the killed leader is this
+        process's own child, and an uncollected child stays a member of its
+        group.  A group whose only member is a zombie still answers
+        ``killpg(.., 0)``, so anything that waits on this group afterwards waits
+        forever unless the zombie is collected here.
+        """
+
         try:
             if hasattr(os, "killpg"):
-                os.killpg(pid, signal.SIGTERM)
+                os.killpg(pid, signal.SIGKILL)
             else:
-                os.kill(pid, signal.SIGTERM)
+                os.kill(pid, signal.SIGKILL)
         except OSError:
             return
-        deadline = time.monotonic() + _proxy_drain_grace_seconds()
-        # The group outlives its leader: a dying master can leave forkservers
-        # and workers that still hold the listening socket.  Waiting on the
-        # leader alone returned the moment *it* exited, so SIGKILL was never
-        # sent and those survivors kept the port (and the service state stuck
-        # at unknown).  Wait on the whole group instead.
-        while time.monotonic() < deadline and CoreServiceController._group_alive(pid):
-            time.sleep(0.1)
-        if CoreServiceController._group_alive(pid):
-            try:
-                if hasattr(os, "killpg"):
-                    os.killpg(pid, signal.SIGKILL)
-                else:
-                    os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
+        settle = time.monotonic() + _STOP_SETTLE_SECONDS
+        while time.monotonic() < settle:
+            cls._reap_own_child(pid)
+            if not cls._group_alive(pid):
+                return
+            time.sleep(0.05)
 
     def stop(self) -> dict[str, Any]:
         pid = self._pid()
@@ -1702,6 +1715,9 @@ class CoreServiceController:
         return self.status()
 
     def restart(self) -> dict[str, Any]:
+        # Kill, then start.  A replacement has nothing to serve with while it
+        # waits for the old tree to finish what it accepted, and a client that
+        # is mid-turn retries either way.
         self.stop()
         return self.start()
 
@@ -1733,7 +1749,10 @@ class CoreServiceController:
         self._stage_runtime_config()
         self.reset_transient_routing_state()
         if self._rolling_restart(pid):
-            deadline = time.monotonic() + _proxy_drain_grace_seconds()
+            # Not the drain bound: this waits for the workers the reload just
+            # replaced to answer again, and a reload that took four hours to
+            # answer would be a reload that failed.
+            deadline = time.monotonic() + _RELOAD_READY_WAIT_SECONDS
             while time.monotonic() < deadline:
                 if self._health():
                     break

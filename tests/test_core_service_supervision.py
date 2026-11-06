@@ -152,8 +152,13 @@ class OrphanedProxyGroupTests(unittest.TestCase):
             stop_group.assert_called_once_with(4242)
             self.assertEqual("9999\n", controller.paths.pid.read_text(encoding="utf-8"))
 
-    def test_stop_reaches_a_group_whose_leader_is_gone(self) -> None:
-        """The wait must outlive the leader, or SIGKILL is never sent."""
+    def test_a_stop_reaches_a_group_whose_leader_is_gone(self) -> None:
+        """The group outlives its leader, and a stop still ends all of it.
+
+        The member ignores SIGTERM deliberately: this stop is a kill, so the
+        signal it ignores is not the one that ends it.  What the stop must not do
+        is wait on a leader that is already gone -- the group is the subject.
+        """
 
         code = (
             "import subprocess, sys, time;"
@@ -167,13 +172,17 @@ class OrphanedProxyGroupTests(unittest.TestCase):
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline and len(controller_members(leader.pid)) < 2:
                 time.sleep(0.05)
-            # The leader dies, the member ignores SIGTERM, and only the group
-            # probe plus the escalation can end it.
+            # The leader dies first: the member is what is left to stop.
             os.kill(leader.pid, signal.SIGKILL)
             leader.wait(timeout=5.0)
-            with mock.patch("young_router.core.operations._proxy_drain_grace_seconds", return_value=0.3):
-                CoreServiceController._stop_process_group(leader.pid)
+            started = time.monotonic()
+            CoreServiceController._stop_process_group(leader.pid)
+            elapsed = time.monotonic() - started
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and controller_members(leader.pid):
+                time.sleep(0.05)
             self.assertEqual([], controller_members(leader.pid))
+            self.assertLess(elapsed, 5.0, "the stop waited on a leader that was already gone")
         finally:
             if leader.poll() is None:
                 leader.kill()
