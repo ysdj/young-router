@@ -651,6 +651,23 @@ class ReactNativeReleaseTests(unittest.TestCase):
         # the exit so the install half can use them.
         self.assertLess(build_only_exit, script.index('if ! start_installed_app "$OLD_PIDS"; then'))
 
+    def test_both_artifact_gates_name_the_hashed_browser_bundle(self) -> None:
+        """The page ships `bundle.<digest>.js`, so the gates read that shape.
+
+        The bundle took a content hash when the browser host landed, and both
+        gates kept naming a fixed `bundle.js` -- which the builder deletes.  A
+        gate that cannot pass is not a check: every install and every release
+        stopped at "the bundled browser page is missing" over a page that was
+        there, which is also how a deploy of a native fix could not land.
+        """
+
+        installer = (ROOT / "scripts" / "build-and-install-macos.sh").read_text(encoding="utf-8")
+        release = (ROOT / "scripts" / "package-release.sh").read_text(encoding="utf-8")
+        for script in (installer, release):
+            self.assertIn('compgen -G "$CORE/web/bundle.*.js" >/dev/null', script)
+            self.assertNotIn('test -f "$CORE/web/bundle.js"', script)
+            self.assertNotIn('&& -f "$CORE/web/bundle.js"', script)
+
     def test_the_portable_smoke_relocates_instead_of_copying_a_gigabyte(self) -> None:
         # The smoke exists to prove the bundle works from somewhere other than
         # where it was built, which is what the installed app does. Copying the

@@ -79,7 +79,9 @@ test -f "$CORE/young_router/adapters/our-free-model/src/forward.js"
 test -f "$CORE/young_router/adapters/dsh_vision_worker.mjs"
 test -f "$CORE/sitecustomize.py"
 test -f "$CORE/web/index.html"
-test -f "$CORE/web/bundle.js"
+# The page references `bundle.<digest>.js`; a fixed name stopped existing when
+# the bundle took its hash, and this gate then failed every release.
+compgen -G "$CORE/web/bundle.*.js" >/dev/null
 plutil -lint "$APP/Contents/Info.plist"
 test "$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")" = "$VERSION"
 test "$(plutil -extract CFBundleVersion raw "$APP/Contents/Info.plist")" = "$BUILD_NUMBER"

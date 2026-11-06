@@ -1030,10 +1030,14 @@ fi
   echo "Bundled Core dependencies are incomplete." >&2
   exit 5
 }
-[[ -f "$CORE/web/index.html" && -f "$CORE/web/bundle.js" ]] || {
+# The page names its script by content hash (`bundle.<digest>.js`), so the gate
+# is the pair the builder actually writes: the page, and the bundle it points
+# at.  Naming a fixed `bundle.js` here failed every install after the hash
+# landed, and a gate that can never pass is not a check.
+if [[ ! -f "$CORE/web/index.html" ]] || ! compgen -G "$CORE/web/bundle.*.js" >/dev/null; then
   echo "The bundled browser page is missing; General's web address would answer nothing." >&2
   exit 5
-}
+fi
 [[ -x "$CORE/runtime/bin/python" ]] || {
   echo "A self-contained Core runtime is required. Set YOUNG_ROUTER_CORE_RUNTIME_SOURCE." >&2
   exit 5
