@@ -1837,6 +1837,20 @@ def _sanitize_web_search_stream_chunk(
     if _is_public_reasoning_summary_stream_event(chunk_type):
         return chunk if _public_reasoning_is_allowed(request_kwargs) else None
     if chunk_type.startswith("response.reasoning"):
+        # A native Responses route (DeepSeek's own /v1/responses) streams its
+        # thinking raw.  The delivery loop mirrors each raw delta into the
+        # summary frames a client that asked to see thinking renders, then
+        # suppresses the raw frame itself.  Dropping the delta here, before
+        # that loop, removed the only copy the mirror could have read: live
+        # 2026-11-06 a DeepSeek Responses route produced a reasoning item with
+        # an empty summary and no frames at all, so the thinking disappeared
+        # from the client while the answer arrived normally.  Raw reasoning
+        # stays private for a request that did not ask for it.
+        if (
+            chunk_type == "response.reasoning_text.delta"
+            and _public_reasoning_is_allowed(request_kwargs)
+        ):
+            return chunk
         return None
 
     if chunk_type in {"response.output_item.added", "response.output_item.done"}:

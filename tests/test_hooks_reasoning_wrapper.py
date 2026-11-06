@@ -262,6 +262,53 @@ class HookReasoningWrapperTests(HookTestCase):
             chunk,
         )
 
+    def test_a_raw_reasoning_delta_reaches_the_delivery_mirror(self) -> None:
+        """A DeepSeek Responses route streams its thinking raw, not as a summary.
+
+        The sanitizer used to drop every ``response.reasoning_*`` frame before
+        the delivery loop could mirror a raw delta into the summary frames the
+        client renders.  The client then got a reasoning item whose summary was
+        empty, so the thinking disappeared while the answer streamed normally.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        chunk = {
+            "type": "response.reasoning_text.delta",
+            "item_id": "rs_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "We need answer.",
+        }
+        asked_for_summary = {"reasoning": {"effort": "max", "summary": "auto"}}
+
+        sanitized = hooks._sanitize_web_search_stream_chunk(
+            chunk, asked_for_summary
+        )
+        self.assertEqual(chunk, sanitized)
+        self.assertTrue(
+            hooks._patches_module.reasoning_summary_suppresses_chunk(
+                sanitized, asked_for_summary
+            )
+        )
+        mirrored = hooks._patches_module.reasoning_summary_chunks_for_delivery(
+            sanitized, {}, set(), set(), asked_for_summary
+        )
+        self.assertEqual(
+            [
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+            ],
+            [event["type"] for event in mirrored],
+        )
+        self.assertEqual("We need answer.", mirrored[-1]["delta"])
+
+        # A request that named no summary still sees no raw thinking.
+        self.assertIsNone(
+            hooks._sanitize_web_search_stream_chunk(
+                chunk, {"reasoning": {"effort": "max"}}
+            )
+        )
+
     def test_delivery_sanitizes_the_finished_payloads(self) -> None:
         hooks, _proxy_server = load_hook_module()
         request_data = {"model": "default-chat", "stream": True, "input": "go"}
