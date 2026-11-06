@@ -558,6 +558,79 @@ class WebDAVSyncBundleTests(unittest.TestCase):
                 [entry["password"] for entry in merged["accounts"] if entry["id"] == "account-nimbus"],
             )
 
+    def test_a_pull_keeps_the_fresher_local_session_for_a_shared_account(self) -> None:
+        """A client that just signed in keeps its session against an older bundle.
+
+        The relay store is whole-file replaced on pull, so a session this Mac
+        minted moments ago was overwritten by another client's older copy of the
+        same account — and the next read then signed in again, which is exactly
+        the repeated post-login that fills a station's concurrent-session cap.
+        The side with the later ``login_observed_at`` keeps its session; an
+        older or unordered observation leaves the incoming copy in place.
+        """
+
+        nimbus_station = {"id": "station-nimbus", "name": "nimbus", "origin": "https://relay.example.test", "type": "newapi"}
+
+        def account(observed_at: str, cookie: str) -> dict[str, object]:
+            return {
+                "id": "account-nimbus",
+                "station_id": "station-nimbus",
+                "type": "newapi",
+                "label": "nimbus",
+                "origin": "https://relay.example.test",
+                "username": "person@example.test",
+                "login_status": "signed_in",
+                "remember_password": True,
+                "password": "replace-password",
+                "session": {"cookie": cookie, "access_token": "", "refresh_token": ""},
+                "balance": 1.0,
+                "last_updated_at": observed_at,
+                "login_observed_at": observed_at,
+                "resource_status": "ready",
+                "resource_error": "none",
+                "resources": [],
+                "groups": [],
+            }
+
+        def document(accounts: list[dict[str, object]]) -> dict[str, object]:
+            return {"version": 3, "stations": [nimbus_station], "accounts": accounts, "pending_credential_cleanups": []}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            local = root / "local"
+            remote = root / "remote"
+            local.mkdir()
+            remote.mkdir()
+            local_config = self.write_config(local)
+            remote_config = self.write_config(remote)
+
+            # This Mac signed in later than the bundle the other client built.
+            local_relay = webdav_core.relay_accounts_path(local_config)
+            local_relay.parent.mkdir(parents=True, exist_ok=True)
+            local_relay.write_text(
+                json.dumps(document([account("2026-01-02T00:00:00Z", "session=this-mac")])), encoding="utf-8"
+            )
+            remote_relay = webdav_core.relay_accounts_path(remote_config)
+            remote_relay.parent.mkdir(parents=True, exist_ok=True)
+            remote_relay.write_text(
+                json.dumps(document([account("2026-01-01T00:00:00Z", "session=other-mac")])), encoding="utf-8"
+            )
+
+            bundle, _manifest = webdav_core.create_bundle(remote_config)
+            webdav_core.install_bundle(bundle, local_config)
+
+            merged = json.loads(local_relay.read_text(encoding="utf-8"))
+            self.assertEqual(["session=this-mac"], [entry["session"]["cookie"] for entry in merged["accounts"]])
+
+            # An older local observation yields to the incoming session, so a
+            # client that logged in elsewhere still propagates through sync.
+            local_relay.write_text(
+                json.dumps(document([account("2025-12-31T00:00:00Z", "session=this-mac")])), encoding="utf-8"
+            )
+            webdav_core.install_bundle(bundle, local_config)
+            merged = json.loads(local_relay.read_text(encoding="utf-8"))
+            self.assertEqual(["session=other-mac"], [entry["session"]["cookie"] for entry in merged["accounts"]])
+
     def test_a_bundle_without_a_relay_store_does_not_delete_the_local_one(self) -> None:
         """An absent file in the bundle is not an instruction to delete."""
 
@@ -776,6 +849,82 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             "https://example.com/dav/resource/young-router-config.json?x-vercel-protection-bypass=secret-value",
         )
         self.assertEqual(webdav_core.DEFAULT_REMOTE_NAME, settings.remote_name)
+
+    def test_a_folder_a_reader_types_is_percent_encoded(self) -> None:
+        """A request line is ASCII; a folder name is not.
+
+        The transport hands the target to ``http.client``, which encodes it as
+        ASCII, so a collection named 我的坚果云 raised ``UnicodeEncodeError``
+        before the request was sent and a space did the same.  The folder a
+        server gives a reader is often exactly that kind, so the address is
+        quoted where it is read.  An address pasted in its encoded form stays
+        as it is: quoting twice would point at a different folder.
+        """
+
+        typed = webdav_core.Settings(url="https://dav.example.test/dav/我的坚果云/")
+        encoded = "https://dav.example.test/dav/%E6%88%91%E7%9A%84%E5%9D%9A%E6%9E%9C%E4%BA%91"
+        self.assertEqual(f"{encoded}/young-router-config.json", webdav_core.bundle_url(typed))
+        self.assertEqual(f"{encoded}/young-router-config.manifest.json", webdav_core.manifest_url(typed))
+        self.assertEqual(f"{encoded}/", webdav_core.collection_url(typed))
+
+        pasted = webdav_core.Settings(url=f"{encoded}/")
+        self.assertEqual(f"{encoded}/young-router-config.json", webdav_core.bundle_url(pasted))
+        self.assertEqual(f"{encoded}/", webdav_core.collection_url(pasted))
+
+        spaced = webdav_core.Settings(url="https://dav.example.test/dav/my folder/")
+        self.assertEqual(
+            "https://dav.example.test/dav/my%20folder/young-router-config.json",
+            webdav_core.bundle_url(spaced),
+        )
+
+    def test_collection_access_is_read_from_the_privilege_set(self) -> None:
+        """Asking whether the folder takes writes must not create anything."""
+
+        def multistatus(*privileges: str) -> bytes:
+            granted = "".join(f"<d:privilege><d:{name}/></d:privilege>" for name in privileges)
+            return (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<d:multistatus xmlns:d="DAV:"><d:response><d:href>/dav/x/</d:href>'
+                f"<d:propstat><d:prop><d:current-user-privilege-set>{granted}</d:current-user-privilege-set>"
+                "</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"
+            ).encode()
+
+        self.assertEqual("writable", webdav_core._collection_privilege_access(multistatus("read", "write")))
+        self.assertEqual("writable", webdav_core._collection_privilege_access(multistatus("all")))
+        self.assertEqual("read_only", webdav_core._collection_privilege_access(multistatus("read")))
+        # No set, or nothing parseable, leaves the question open: guessing
+        # "writable" here is what made a read-only mount point look usable.
+        self.assertEqual("unknown", webdav_core._collection_privilege_access(b"<d:multistatus xmlns:d=\"DAV:\"/>"))
+        self.assertEqual("unknown", webdav_core._collection_privilege_access(b"not xml at all"))
+
+    def test_collection_access_asks_with_propfind_and_never_mkcol(self) -> None:
+        requested: list[tuple[str, str]] = []
+
+        def request(method: str, url: str, *args: object, **kwargs: object) -> tuple[int, dict[str, str], bytes]:
+            requested.append((method, url))
+            if method == "PROPFIND":
+                return (
+                    207,
+                    {},
+                    b'<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop>'
+                    b'<d:current-user-privilege-set><d:privilege><d:read/></d:privilege>'
+                    b"</d:current-user-privilege-set></d:prop></d:propstat></d:response></d:multistatus>",
+                )
+            raise AssertionError(f"{method} is a write, and a probe must not write")
+
+        settings = webdav_core.Settings(url="https://dav.example.test/dav/")
+        client = webdav_core.WebDAVClient(settings)
+        with patch.object(client, "request", side_effect=request):
+            self.assertEqual("read_only", client.collection_access())
+
+        self.assertEqual([("PROPFIND", "https://dav.example.test/dav/")], requested)
+
+    def test_a_missing_collection_is_reported_as_missing(self) -> None:
+        settings = webdav_core.Settings(url="https://dav.example.test/dav/new/")
+        client = webdav_core.WebDAVClient(settings)
+        missing = webdav_core.WebDAVHTTPError("PROPFIND", "https://dav.example.test/dav/new/", 404, "Not Found", b"")
+        with patch.object(client, "request", side_effect=missing):
+            self.assertEqual("missing", client.collection_access())
 
     def test_timeout_seconds_is_saved_with_webdav_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1126,8 +1275,11 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             def __init__(self, settings: webdav_core.Settings) -> None:
                 self.settings = settings
 
+            def collection_access(self) -> str:
+                return "writable"
+
             def try_mkcol(self, url: str) -> None:
-                pass
+                raise AssertionError("a probe must not create the collection")
 
             def head(self, url: str) -> tuple[int, dict[str, str]]:
                 self.head_url = url

@@ -7,6 +7,7 @@ import sys
 from typing import Any
 
 from .core import (
+    BUNDLE_MISSING_STATUS,
     CONFIG_BUNDLE_MAX_BYTES,
     Settings,
     SyncError,
@@ -263,31 +264,52 @@ def command_probe(args: argparse.Namespace) -> int:
         raise SyncError("WebDAV URL is required")
 
     client = WebDAVClient(settings)
-    client.try_mkcol(collection_url(settings))
+    try:
+        access = client.collection_access()
+    except WebDAVHTTPError as exc:
+        # A server that does not answer PROPFIND still answers the HEAD below;
+        # what it will not do is tell us whether the collection is writable.
+        if exc.code not in {403, 405, 501}:
+            raise
+        access = "unknown"
+    collection = _redact_url(collection_url(settings))
+    if access == "read_only":
+        print(f"Collection is read-only: {collection}")
+        print("Push and Sync cannot write here; point the URL at a writable folder.")
+    elif access == "missing":
+        print(f"Collection is not there yet: {collection} (the first push creates it)")
+    else:
+        print(f"Collection: {access} {collection}")
     remote_bundle_url = bundle_url(settings)
     try:
         status, headers = client.head(remote_bundle_url)
     except WebDAVHTTPError as exc:
-        if exc.code == 404:
-            print(f"WebDAV probe OK: {_redact_url(collection_url(settings))}")
-            print(f"Remote bundle: missing at {_redact_url(remote_bundle_url)}")
-            print("Test did not upload a temporary file. Use Push or Sync to create the configured remote file.")
-            return 0
+        # Some servers refuse HEAD and only answer GET; every other missing
+        # answer (409 included: the collection is not there yet) is simply
+        # "no bundle yet", which is not a failed connection.
         if exc.code in {403, 405, 501}:
-            bundle_data = client.get(
-                remote_bundle_url, max_bytes=CONFIG_BUNDLE_MAX_BYTES
-            )
-            print(f"WebDAV probe OK via configured remote file: {_redact_url(remote_bundle_url)}")
-            print(f"Remote bundle HEAD unavailable: HTTP {exc.code}; verified with GET instead")
-            print(f"Remote bundle GET: bytes={len(bundle_data)}")
-            print("Test did not upload a temporary file.")
-            return 0
-        raise
+            try:
+                bundle_data = client.get(remote_bundle_url, max_bytes=CONFIG_BUNDLE_MAX_BYTES)
+            except WebDAVHTTPError as inner:
+                if inner.code not in BUNDLE_MISSING_STATUS:
+                    raise
+            else:
+                print(f"WebDAV probe OK via configured remote file: {_redact_url(remote_bundle_url)}")
+                print(f"Remote bundle HEAD unavailable: HTTP {exc.code}; verified with GET instead")
+                print(f"Remote bundle GET: bytes={len(bundle_data)}")
+                print("Test did not create, upload, or delete anything.")
+                return 0
+        if exc.code not in BUNDLE_MISSING_STATUS:
+            raise
+        print(f"WebDAV probe OK: {_redact_url(collection_url(settings))}")
+        print(f"Remote bundle: missing at {_redact_url(remote_bundle_url)}")
+        print("Test did not create, upload, or delete anything. Use Push or Sync to create the configured remote file.")
+        return 0
 
     size = headers.get("Content-Length") or headers.get("content-length") or "?"
     print(f"WebDAV probe OK via configured remote file: {_redact_url(remote_bundle_url)}")
     print(f"Remote bundle HEAD: status={status} bytes={size}")
-    print("Test did not upload a temporary file.")
+    print("Test did not create a collection, upload, or delete anything.")
     return 0
 
 

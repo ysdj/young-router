@@ -853,6 +853,50 @@ def _raise_login_refusal(exc: urllib.error.HTTPError) -> None:
     raise RelayAccountsError("Relay login was rejected") from None
 
 
+# What a New API fork writes when the session it was shown is not accepted.
+# The same refusal also arrives as an HTTP 401/403, and which one a deployment
+# answers varies by route and by fork -- the body is the shape that used to be
+# read as "this probe learned nothing", which sent one more sign-in per pane
+# entry until the account hit the site's concurrent-session cap.
+_SESSION_REFUSAL_MARKERS = (
+    "未登录",
+    "登录已过期",
+    "未登錄",
+    "登錄已過期",
+    "not logged in",
+    "login has expired",
+    "login expired",
+    "session expired",
+    "invalid session",
+    "please log in",
+    "please sign in",
+    "unauthorized",
+    "authentication required",
+)
+
+
+def _payload_refuses_session(payload: object) -> bool:
+    """Whether an answered read states that the session it carried is dead.
+
+    New API forks refuse an expired or not-yet-accepted session in two shapes:
+    an HTTP 401/403, *or* a plain 200 whose envelope says ``success: false``
+    with a message such as ``未登录或登录已过期``.  Only a body that actually says
+    so qualifies: an envelope that denies success for some other reason (a
+    missing permission, an unknown route) says nothing about the session, and
+    reading every ``success: false`` as a dead login would retire sessions over
+    errors the user can act on.
+    """
+
+    if not isinstance(payload, Mapping) or payload.get("success") is not False:
+        return False
+    message = " ".join(
+        value.strip().lower()
+        for key in ("message", "error", "msg")
+        if isinstance((value := payload.get(key)), str) and value.strip()
+    )
+    return any(marker in message for marker in _SESSION_REFUSAL_MARKERS)
+
+
 def _json_data(payload: object) -> object:
     if not isinstance(payload, Mapping):
         return payload
@@ -1080,9 +1124,18 @@ class RelayHTTPClient:
         if not isinstance(status, int) or status < 200 or status >= 300 or len(body) > MAX_RESPONSE_BYTES:
             raise RelayAccountsError("Relay returned an invalid response")
         try:
-            return json.loads(body.decode("utf-8"))
+            payload = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise RelayAccountsError("Relay returned an invalid response") from None
+        if _payload_refuses_session(payload):
+            # Same answer as the 401/403 above, and it has to land here rather
+            # than in the session probe alone: every authenticated read -- the
+            # balance, the key page, the group catalog -- passes through this
+            # one place, and a refusal only the probe recognized let the
+            # balance read stamp 已登录 onto a session the station had just
+            # refused in the body, while the key read signed in again over it.
+            raise RelayAccountsError("Relay login has expired") from None
+        return payload
 
     def json(self, origin: str, path: str, *, headers: Mapping[str, str]) -> object:
         return self._request_json(origin, path, headers=headers, method="GET")
@@ -3820,7 +3873,10 @@ class RelayAccountsDomain:
             return None
         profile = _json_data(payload)
         if not isinstance(profile, Mapping):
-            return None
+            # An unreadable body is not an answer about the session, so it must
+            # not retire one -- a caller that turns this into 未登录 then signs
+            # in again over a session the station never refused.
+            raise RelayAccountsError("Relay returned an invalid response")
         self._session_secrets[account_id] = secrets
         account["login_status"] = "signed_in"
         account["login_observed_at"] = _utc_now_iso()
@@ -4921,7 +4977,25 @@ class RelayAccountsDomain:
         # it and report a write as not applied.
         self._apply_read_memo.pop(str(self._accounts[self._index(account_id)]["id"]), None)
         result = self._refresh_resources_once(account_id, _for_apply=_for_apply, keys_only=keys_only)
-        if result.get("resource_error") == "login_expired" and self._renew_remembered_session(account_id):
+        if result.get("resource_error") != "login_expired":
+            return result
+        try:
+            renewed = self._renew_remembered_session(account_id)
+        except RelayTransportError:
+            # The station was never reached, so nothing about the session was
+            # learned.  The read reports the failure it already has instead of
+            # turning one dropped connection into a raised error for a caller
+            # that asked for the account's resources.
+            return result
+        except (RelaySessionLimitError, RelayLoginRefusedError):
+            # The station refused to mint another session -- the account is at
+            # its concurrent-session cap, or a previous refusal is still being
+            # waited out.  That is a reason the user can act on, not a crash:
+            # the read keeps its last verified keys and reports the login it
+            # actually observed, and the wait the refusal started is what stops
+            # the next entry from asking again.
+            return result
+        if renewed:
             result = self._refresh_resources_once(account_id, _for_apply=_for_apply, keys_only=keys_only)
         return result
 

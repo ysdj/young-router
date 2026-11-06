@@ -687,6 +687,34 @@ constexpr wchar_t kRelayBrowserUserAgent[] =
     L"Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0";
 constexpr wchar_t kRelayBrowserAcceptLanguage[] = L"zh-CN,zh;q=0.9,en;q=0.8";
 
+// Whether a 2xx envelope states that the session it was shown is dead.
+// Mirrors Core's ``_payload_refuses_session`` and the macOS probe's helper:
+// only an envelope that explicitly denies success *and* names the login is a
+// refusal.  An envelope that fails for another reason (a missing permission,
+// an unknown route) says nothing about the session.
+bool PayloadRefusesSession(json::JsonValue const& root) {
+  try {
+    if (root.ValueType() != json::JsonValueType::Object) return false;
+    auto object = root.GetObject();
+    if (object.GetNamedValue(L"success").GetBoolean()) return false;
+    constexpr wchar_t const* markers[] = {
+        L"未登录", L"登录已过期", L"未登錄", L"登錄已過期",
+        L"not logged in", L"login has expired", L"login expired",
+        L"session expired", L"invalid session", L"please log in",
+        L"please sign in", L"unauthorized", L"authentication required"};
+    for (auto const* key : {L"message", L"error", L"msg"}) {
+      try {
+        auto message = WideToUtf8(object.GetNamedValue(key).GetString().c_str());
+        for (auto& ch : message) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        for (auto const* marker : markers) {
+          if (message.find(WideToUtf8(marker)) != std::string::npos) return true;
+        }
+      } catch (...) {}
+    }
+  } catch (...) {}
+  return false;
+}
+
 std::optional<EndpointProbeResult> ProbeEndpoint(
     WindowsRelayLoginOptions const& options,
     ParsedOrigin const& origin,
@@ -813,6 +841,18 @@ std::optional<EndpointProbeResult> ProbeEndpoint(
     }
     try {
       auto root = json::JsonValue::Parse(Utf8ToWide(body));
+      // A New API fork refuses a session in the body as often as in the status
+      // code: a 200 carrying {"success": false, "message": "未登录或登录已过期"}
+      // is the station's own answer about the credential on hand, not a read
+      // this app failed to make.  Counting it as the latter reported 未登录
+      // with no refusal and then signed in again over the session the station
+      // had just refused -- one more minted session per pane entry, until the
+      // account's cap refused even a correct password.  Core and the macOS
+      // probe classify the same envelope the same way.
+      if (PayloadRefusesSession(root)) {
+        saw_authentication_rejection = true;
+        continue;
+      }
       auto username = FirstJsonString(root, {
           {L"data", L"username"}, {L"data", L"email"},
           {L"data", L"user", L"username"}, {L"data", L"user", L"email"},

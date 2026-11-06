@@ -423,17 +423,32 @@ class WebDAVSettingsDomain:
             if not settings.configured:
                 raise DomainError("WebDAV is not configured")
             client = webdav_core.WebDAVClient(settings)
-            client.try_mkcol(webdav_core.collection_url(settings))
+            # A test must leave nothing behind: creating the collection here is
+            # what left a folder on the server after every probe, and at a
+            # read-only mount point that folder cannot even be deleted again.
+            try:
+                access = client.collection_access()
+            except webdav_core.WebDAVHTTPError as exc:
+                if exc.code not in {403, 405, 501}:
+                    raise
+                access = "unknown"
             try:
                 client.head(webdav_core.bundle_url(settings))
             except webdav_core.WebDAVHTTPError as exc:
-                if exc.code != 404:
+                if exc.code not in webdav_core.BUNDLE_MISSING_STATUS:
                     raise
+            # Connected, but a read-only collection cannot receive the bundle:
+            # saying only "connection OK" here is what made a URL that can never
+            # sync look like a working one.
+            writable = access != "read_only"
+            detail = "WebDAV probe succeeded" if writable else "WebDAV collection is read-only"
+            if access == "missing":
+                detail = "WebDAV collection does not exist yet"
             if transient:
-                return {"ok": True, "protocols": ["webdav"], "detail": "WebDAV probe succeeded"}
+                return {"ok": True, "writable": writable, "protocols": ["webdav"], "detail": detail}
             self._last_probe = "ok"
             atomic_write_json(self.status_path, {"action": "probe", "checked_at": webdav_core._utc_now(), "ok": True})
-            return {"ok": True, "protocols": ["webdav"], "detail": "WebDAV probe succeeded"}
+            return {"ok": True, "writable": writable, "protocols": ["webdav"], "detail": detail}
         except Exception:
             if not transient:
                 self._last_probe = "failed"

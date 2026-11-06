@@ -2177,6 +2177,125 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertEqual([], [path for method, path in station.calls if path == "/api/user/login"])
             self.assertEqual("signed_in", domain.snapshot()["accounts"][0]["login_status"])
 
+    def test_an_application_level_refusal_does_not_mint_another_session(self) -> None:
+        """A 200 whose body refuses the session is not permission to sign in again.
+
+        New API forks answer an expired or not-yet-accepted session with HTTP
+        200 and ``{"success": false, "message": "未登录或登录已过期"}`` instead of a
+        401, and which shape a deployment returns varies by route and by fork.
+        Reading that body as a plain dead session made every pane entry mint one
+        more station session until the account hit the site's concurrent-session
+        cap, where even a correct password is refused.  A refusal is stated in
+        either shape; only a read this app could not make says nothing.
+        """
+
+        import io
+        import urllib.error
+
+        class Response:
+            status = 200
+
+            def __init__(self, body: bytes) -> None:
+                self.body = body
+
+            def getcode(self) -> int:
+                return self.status
+
+            def read(self, _limit: int) -> bytes:
+                return self.body
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+        class Opener:
+            def __init__(self) -> None:
+                self.paths: list[str] = []
+
+            def open(self, request: object, timeout: float) -> Response:
+                del timeout
+                url = request.full_url  # type: ignore[attr-defined]
+                self.paths.append(url.split(".test")[-1])
+                if url.endswith("/api/user/login"):
+                    # Even a correct password is refused once the cap is full,
+                    # so a spurious sign-in is a session nobody can get back.
+                    raise urllib.error.HTTPError(
+                        url,
+                        409,
+                        "Conflict",
+                        {},
+                        io.BytesIO(json.dumps({"success": False, "code": "AUTH_SESSION_LIMIT"}).encode()),
+                    )
+                return Response(
+                    json.dumps({"success": False, "message": "未登录或登录已过期", "data": None}).encode()
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            opener = Opener()
+            domain = RelayAccountsDomain(directory, http_client=RelayHTTPClient(opener=opener))
+            account_id = domain.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test", "remember_password": True},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="sample-user",
+                cookie="session=replace-cookie",
+                password="replace-password",
+                user_id=80,
+            )
+            domain.apply()
+
+            # The probe is the answer, and the probe alone: the station was
+            # asked once about the session it already holds, and no sign-in is
+            # sent on the strength of that answer.
+            self.assertIsNone(domain.restore_saved_session(account_id))
+            self.assertEqual(["/api/user/self"], opener.paths)
+
+            # A refusal the station actually stated is what permits a sign-in,
+            # so the key read's renewal spends exactly one -- and the cap it
+            # then hits is the answer that stops the loop, not a raised error
+            # for a caller that asked for the key list.
+            result = domain.refresh_resources(account_id)
+            self.assertEqual(1, opener.paths.count("/api/user/login"))
+            self.assertEqual("login_expired", result["resource_error"])
+            self.assertEqual("expired", result["login_status"])
+
+            # The cap's own wait is now in force: every later entry and every
+            # later read is answered from the session on hand, and none of them
+            # asks the station to mint another one.
+            for _ in range(3):
+                self.assertIsNone(domain.restore_saved_session(account_id))
+                result = domain.refresh_resources(account_id)
+                self.assertEqual("login_expired", result["resource_error"])
+            self.assertEqual(1, opener.paths.count("/api/user/login"))
+            # The refused session is not replaced: only the observation is,
+            # and the credential stays on hand for the station to answer again.
+            self.assertEqual("expired", domain.snapshot()["accounts"][0]["login_status"])
+            self.assertTrue(domain._has_session_credentials(domain._accounts[domain._index(account_id)]))
+
+    def test_a_non_login_envelope_failure_is_not_an_expired_session(self) -> None:
+        """A ``success: false`` about something else is not a refused session.
+
+        The envelope classification exists to catch a login refusal that arrives
+        with a 200 status; widening it to every failed envelope would retire
+        sessions over a missing permission or an unknown route, which is the
+        same bug in the opposite direction.
+        """
+
+        from young_router.core.domains.relay_accounts import _payload_refuses_session
+
+        self.assertTrue(
+            _payload_refuses_session({"success": False, "message": "未登录或登录已过期", "data": None})
+        )
+        self.assertTrue(_payload_refuses_session({"success": False, "message": "Session expired"}))
+        self.assertFalse(_payload_refuses_session({"success": False, "message": "无权访问", "data": None}))
+        self.assertFalse(_payload_refuses_session({"success": False, "message": "permission denied"}))
+        self.assertFalse(_payload_refuses_session({"success": True, "data": {"username": "u"}}))
+        self.assertFalse(_payload_refuses_session({"data": None}))
+
     def test_one_session_probe_states_the_login_and_the_balance(self) -> None:
         """The read that proves a session is the read the balance comes from.
 

@@ -8359,8 +8359,24 @@ private enum NativeRelaySessionProbe {
             }
             guard let data = outcome.0,
                   data.count <= 2 * 1024 * 1024,
-                  let object = try? JSONSerialization.jsonObject(with: data),
-                  let username = firstString(object, paths: probe.usernamePaths) ?? presetUsername,
+                  let object = try? JSONSerialization.jsonObject(with: data) else {
+                sawNonAuthenticationFailure = true
+                continue
+            }
+            // A New API fork refuses a session in the body as often as in the
+            // status code: a 200 carrying {"success": false, "message":
+            // "未登录或登录已过期"} is the station's own answer about the
+            // credential on hand, not a read this app failed to make.  Counting
+            // it as the latter reported 未登录 with no refusal and then signed
+            // in again over a session the station had just refused -- one more
+            // minted session per pane entry, until the account's cap refused
+            // even a correct password.  Core classifies the same envelope the
+            // same way, so the two probes agree about one session.
+            if Self.payloadRefusesSession(object) {
+                sawAuthenticationRejection = true
+                continue
+            }
+            guard let username = firstString(object, paths: probe.usernamePaths) ?? presetUsername,
                   !username.isEmpty, username.utf8.count <= 320 else {
                 sawNonAuthenticationFailure = true
                 continue
@@ -8382,6 +8398,28 @@ private enum NativeRelaySessionProbe {
             return .verified(NativeRelaySessionProbeResult(username: username, cookie: cookie, accessToken: accessToken, refreshToken: refreshToken, userID: userID, quota: quota))
         }
         return sawAuthenticationRejection && !sawNonAuthenticationFailure ? .expired : .unavailable
+    }
+
+    /// Whether a 2xx envelope states that the session it was shown is dead.
+    ///
+    /// Mirrors Core's ``_payload_refuses_session``: only an envelope that
+    /// explicitly denies success *and* names the login is a refusal.  An
+    /// envelope that fails for another reason (a missing permission, an
+    /// unknown route) says nothing about the session.
+    private static func payloadRefusesSession(_ value: Any) -> Bool {
+        guard let object = value as? [String: Any],
+              let success = object["success"] as? Bool, !success else { return false }
+        let markers = [
+            "未登录", "登录已过期", "未登錄", "登錄已過期",
+            "not logged in", "login has expired", "login expired",
+            "session expired", "invalid session", "please log in",
+            "please sign in", "unauthorized", "authentication required"
+        ]
+        for key in ["message", "error", "msg"] {
+            guard let message = (object[key] as? String)?.lowercased(), !message.isEmpty else { continue }
+            if markers.contains(where: { message.contains($0) }) { return true }
+        }
+        return false
     }
 
     private static func relayURL(originURL: URL, path: String) -> URL? {

@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree
 
 from ..atomic_io import atomic_write_bytes
 from ..browser_identity import browser_request_headers
@@ -51,6 +52,12 @@ PASSWORD_ENV = "LITELLM_WEBDAV_PASSWORD"
 REMOTE_NAME_ENV = "LITELLM_WEBDAV_REMOTE_NAME"
 SYNC_INTERVAL_MINUTES_ENV = "LITELLM_WEBDAV_SYNC_INTERVAL_MINUTES"
 REMOTE_FILE_SUFFIXES = (".json",)
+#: "The remote file is not there", as servers actually answer it: 404 for a
+#: file, 409 when its parent collection is missing as well (measured on 坚果云),
+#: and the statuses a server gives when it will not answer HEAD at all.  A probe
+#: reads this as "nothing to show yet", not as a broken connection -- creating
+#: the collection to make HEAD answer 404 is what left folders behind.
+BUNDLE_MISSING_STATUS = frozenset({403, 404, 405, 409, 410, 501})
 
 RELAY_ACCOUNTS_FILE = "relay-accounts.json"
 """The one synced target whose content exists nowhere else."""
@@ -546,30 +553,64 @@ def _relay_identity(document: bytes) -> set[tuple[str, str]]:
     return pairs
 
 
+def _relay_session(account: object) -> dict[str, str]:
+    """The remembered browser session one account holds, if any.
+
+    A cookie or access token is what lets a client read the station without
+    signing in again, so it is exactly the material a sync must carry between
+    clients.  Anything else in the session field is ignored: the merge only
+    ever copies what it can prove is a usable session.
+    """
+
+    if not isinstance(account, dict):
+        return {}
+    session = account.get("session")
+    if not isinstance(session, dict):
+        return {}
+    return {
+        key: value
+        for key in ("cookie", "access_token", "refresh_token")
+        if isinstance((value := session.get(key)), str) and value
+    }
+
+
+def _relay_has_session(account: object) -> bool:
+    session = _relay_session(account)
+    return bool(session.get("cookie") or session.get("access_token"))
+
+
 def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
-    """Keep the accounts this Mac holds that the incoming file would drop.
+    """Keep this Mac's accounts and its freshest sessions against the incoming copy.
 
     The relay store is the only synced file whose content exists nowhere else:
     it carries the stations, their saved sessions, and the plaintext passwords
-    that make every bound key readable again.  A remote copy is accepted for
-    the accounts it describes, but an account that exists only in the local
-    file is kept — the incoming bundle is usually simply older, and an
-    outbound run on another machine has no way to know about a station added
-    here.  Returns ``None`` when the incoming file already covers the local
-    accounts, so the caller installs it verbatim and this stays a no-op in the
-    ordinary case.
+    that make every bound key readable again.  Two kinds of local state the
+    incoming file would otherwise erase are therefore preserved:
 
-    Nothing is invented: every kept record is copied from the local file, and
-    the document keeps the local ``version``.  A remote copy that adds or
-    updates accounts still lands, so this can only ever add.
+    * An account that exists only in the local file is kept — the incoming
+      bundle is usually simply older, and an outbound run on another machine
+      has no way to know about a station added here.
+    * For an account both sides hold, the side with the more recent login
+      observation keeps its session.  A client that just signed in stamps
+      ``login_observed_at``; the other client's older bundle must not overwrite
+      that session, or the freshly logged-in client is forced to sign in again
+      on its next read — which is exactly the repeated post-login that fills a
+      station's concurrent-session cap.  When neither side has a usable
+      session, or the observations cannot be ordered, the incoming copy wins as
+      before.
+
+    Returns ``None`` when the incoming file already covers the local accounts
+    and none of its sessions are older than the local ones, so the caller
+    installs it verbatim and this stays a no-op in the ordinary case.
+
+    Nothing is invented: every kept record and every kept session is copied
+    from the local file, and the document keeps the local ``version``.  A
+    remote copy that adds accounts or carries a newer session still lands, so
+    this can only ever preserve local state, never invent it.
     """
 
     local_identity = _relay_identity(local)
     if not local_identity:
-        return None
-    # Nothing local is missing from the incoming copy: install it verbatim, so
-    # the ordinary case stays a plain whole-file replacement.
-    if not (local_identity - _relay_identity(incoming)):
         return None
     try:
         local_document = json.loads(local.decode("utf-8"))
@@ -578,20 +619,63 @@ def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
         return None
     if not isinstance(local_document, dict) or not isinstance(incoming_document, dict):
         return None
-    incoming_account_ids = {
-        account.get("id")
-        for account in incoming_document.get("accounts", [])
-        if isinstance(account, dict)
+
+    local_by_id = {
+        account.get("id"): account
+        for account in local_document.get("accounts", [])
+        if isinstance(account, dict) and isinstance(account.get("id"), str)
     }
+    incoming_by_id = {
+        account.get("id"): account
+        for account in incoming_document.get("accounts", [])
+        if isinstance(account, dict) and isinstance(account.get("id"), str)
+    }
+    # Accounts this Mac holds that the incoming copy would drop are always kept.
+    locally_only = set(local_by_id) - set(incoming_by_id)
+    # An account both sides hold whose local session is the newer one is kept
+    # too: replacing it with the incoming copy would throw away a login this
+    # client just proved, and force a sign-in the station may refuse.
+    fresher_local: set[str] = set()
+    for account_id, local_account in local_by_id.items():
+        incoming_account = incoming_by_id.get(account_id)
+        if incoming_account is None:
+            continue
+        if not _relay_has_session(local_account):
+            continue
+        local_observed = local_account.get("login_observed_at")
+        incoming_observed = incoming_account.get("login_observed_at")
+        if not (isinstance(local_observed, str) and local_observed and isinstance(incoming_observed, str) and incoming_observed):
+            # Without two comparable observations there is no basis to prefer
+            # the local session over the incoming one.
+            continue
+        if local_observed <= incoming_observed:
+            continue
+        fresher_local.add(account_id)
+
+    if not locally_only and not fresher_local:
+        # Nothing local is missing, and no local session is newer than the
+        # incoming copy's: install it verbatim, so the ordinary case stays a
+        # plain whole-file replacement.
+        return None
+    incoming_account_ids = set(incoming_by_id)
     incoming_station_ids = {
         station.get("id")
         for station in incoming_document.get("stations", [])
         if isinstance(station, dict)
     }
+    keep_ids = locally_only | fresher_local
     kept_accounts = [
         account
         for account in local_document.get("accounts", [])
-        if isinstance(account, dict) and account.get("id") not in incoming_account_ids
+        if isinstance(account, dict) and account.get("id") in keep_ids
+    ]
+    # An account kept for its fresher session replaces the incoming copy's row
+    # for the same id, so the merged document never carries two rows for one
+    # account.
+    incoming_accounts = [
+        account
+        for account in incoming_document.get("accounts", [])
+        if isinstance(account, dict) and account.get("id") not in fresher_local
     ]
     kept_station_ids = {
         account.get("station_id") for account in kept_accounts if isinstance(account.get("station_id"), str)
@@ -607,7 +691,7 @@ def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
         return None
     merged = dict(incoming_document)
     merged["stations"] = [*incoming_document.get("stations", []), *kept_stations]
-    merged["accounts"] = [*incoming_document.get("accounts", []), *kept_accounts]
+    merged["accounts"] = [*incoming_accounts, *kept_accounts]
     # A cleanup tombstone belongs to the account it names: one whose account is
     # gone in both copies is dropped, and the local tombstones for accounts the
     # merge keeps would be a contradiction.
@@ -1087,6 +1171,24 @@ def _quote_remote_name(remote_name: str) -> str:
     return urllib.parse.quote(remote_name, safe="")
 
 
+# Reserved characters keep their meaning in a path; ``%`` stays so an address
+# pasted in its already-encoded form is not encoded a second time.
+_REMOTE_PATH_SAFE = "/%:@!$&'()*+,;=-._~"
+
+
+def _quote_remote_path(path: str) -> str:
+    """Percent-encode a folder path a reader typed or pasted.
+
+    The transport hands the request target to ``http.client``, which encodes it
+    as ASCII, so a collection named 我的坚果云 raised ``UnicodeEncodeError``
+    before a single byte left the process -- and a folder with a space did the
+    same.  Quoting here, where the address is read, is what makes the folder a
+    reader can see in their client usable in the URL field at all.
+    """
+
+    return urllib.parse.quote(path, safe=_REMOTE_PATH_SAFE)
+
+
 def _remote_path_is_file(path: str) -> bool:
     return pathlib.PurePosixPath(path).name.lower().endswith(REMOTE_FILE_SUFFIXES)
 
@@ -1106,7 +1208,7 @@ def _remote_collection_path(path: str) -> str:
 
 def _remote_child_url(base: str, remote_name: str) -> str:
     parsed = urllib.parse.urlsplit(base)
-    path = f"{_remote_collection_path(parsed.path)}{_quote_remote_name(remote_name)}"
+    path = f"{_quote_remote_path(_remote_collection_path(parsed.path))}{_quote_remote_name(remote_name)}"
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
 
 
@@ -1125,7 +1227,9 @@ def bundle_url(settings: Settings) -> str:
     if parsed.path.lower().endswith((".tar.gz", ".tgz")):
         raise SyncError("WebDAV tar/tgz bundles are no longer supported; use a .json bundle")
     if _remote_path_is_file(parsed.path):
-        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, ""))
+        return urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, _quote_remote_path(parsed.path), parsed.query, "")
+        )
     return _remote_child_url(base, settings.remote_name)
 
 
@@ -1165,7 +1269,31 @@ def remote_sibling_url(settings: Settings, name: str) -> str:
 def collection_url(settings: Settings) -> str:
     url = settings.url.strip()
     parsed = urllib.parse.urlsplit(url)
-    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, _remote_collection_path(parsed.path), parsed.query, ""))
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, _quote_remote_path(_remote_collection_path(parsed.path)), parsed.query, "")
+    )
+
+
+_DAV_NAMESPACE = "{DAV:}"
+_WRITE_PRIVILEGES = frozenset({"write", "write-content", "bind", "all"})
+
+
+def _collection_privilege_access(body: bytes) -> str:
+    """Read RFC 4918 privileges: writable, read_only, or not reported."""
+
+    try:
+        root = xml.etree.ElementTree.fromstring(body)
+    except xml.etree.ElementTree.ParseError:
+        return "unknown"
+    granted = {
+        child.tag.rpartition("}")[2]
+        for privilege in root.iter(f"{_DAV_NAMESPACE}privilege")
+        for child in privilege
+        if child.tag.startswith(_DAV_NAMESPACE)
+    }
+    if not granted:
+        return "unknown"
+    return "writable" if granted & _WRITE_PRIVILEGES else "read_only"
 
 
 class WebDAVClient:
@@ -1292,7 +1420,10 @@ class WebDAVClient:
                 except Exception:
                     os.close(data_fd)
                     raise
-                config_lines.append(f"data-binary = @{_curl_config_quote(data_path)}")
+                # curl reads the quoted form as a literal filename that includes the
+                # quotes, so it fails with a read error instead of uploading. mkstemp
+                # paths never contain spaces, so the bare form is both safe and correct.
+                config_lines.append(f"data-binary = @{data_path}")
             with os.fdopen(config_fd, "w", encoding="utf-8") as handle:
                 handle.write("\n".join(config_lines))
                 handle.write("\n")
@@ -1345,6 +1476,29 @@ class WebDAVClient:
             raise
         except SyncError:
             return
+
+    def collection_access(self) -> str:
+        """Report what the configured collection allows, without writing to it.
+
+        A probe must leave nothing behind.  Asking "does this URL work" by
+        creating the collection means every test leaves a folder on the server,
+        and at a mount point the server treats as read-only that folder cannot
+        even be removed afterwards: DELETE needs write on the parent, which is
+        the very privilege that is missing (measured on 坚果云: ``MKCOL /dav/x``
+        is answered 201, ``DELETE /dav/x/`` 403).  So the answer comes from the
+        collection's own privilege set (RFC 4918 ``current-user-privilege-set``)
+        and is ``unknown`` when the server reports none -- not a guess.
+        """
+
+        try:
+            _status, _headers, body = self.request(
+                "PROPFIND", collection_url(self.settings), headers={"Depth": "0"}
+            )
+        except WebDAVHTTPError as exc:
+            if exc.code == 404:
+                return "missing"
+            raise
+        return _collection_privilege_access(body)
 
     def put(self, url: str, data: bytes, content_type: str) -> None:
         self.request("PUT", url, data, {"Content-Type": content_type})
