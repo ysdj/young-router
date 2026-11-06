@@ -6308,7 +6308,10 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     })),
     [providerDisplayName, providers],
   );
-  const disabledProviderKeys = useMemo(
+  // A provider that is turned off still dims — the list states the switch it
+  // is about — but it stays selectable: that click is the only way back to the
+  // 启用 box the row exists to open.  It is secondary ink, not a disabled row.
+  const offProviderKeys = useMemo(
     () => providers.filter((item) => !booleanValue(item.enabled, true)).map(editorIdentifier),
     [providers],
   );
@@ -6436,8 +6439,9 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // greying them — and the inspector's own 启用 box is disabled with it, so a
   // row never offers a switch the provider has already overruled.  Turning the
   // row on under a stopped provider would be a click that changes a stored
-  // boolean and nothing else.
-  const disabledModelKeys = useMemo(
+  // boolean and nothing else.  A dimmed row is still the row that opens its own
+  // switch, so this is secondary ink and not a disabled row.
+  const offModelKeys = useMemo(
     () => modelRowKeys(models.filter((item) => !booleanValue(provider?.enabled, true) || !booleanValue(item.model_enabled, booleanValue(item.enabled, true))).map(editorIdentifier)),
     [modelRowKeys, models, provider?.enabled],
   );
@@ -6530,7 +6534,9 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     }).map((entry) => entry.key)),
     [bindingIssueFor, routeGroups, validationIssues],
   );
-  const disabledRouteKeys = useMemo(
+  // A parked route dims for the same reason and keeps its click: opening the
+  // row is how its key, model or provider gets fixed.
+  const offRouteKeys = useMemo(
     () => routes.filter((entry) => !entry.providerEnabled || !entry.modelEnabled || !entry.keyAvailable).map((entry) => entry.key),
     [routes],
   );
@@ -6646,7 +6652,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       </View>
       {viewMode === "routes" ? <View style={styles.routeWorkspace}>
         <TablePane wide style={styles.routeTablePane} title={translate("providers.routes")} actions={<><IconButton label="+" title={translate("providers.newRoute")} disabled={busy || providers.length === 0} onPress={addRoute} />{activeRoute || selectedPublicModel !== undefined ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteRoute} /> : null}<IconButton label="↑" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveUp")} disabled={busy || !canMoveRouteUp} onPress={() => moveRoute("up")} /><IconButton label="↓" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveDown")} disabled={busy || !canMoveRouteDown} onPress={() => moveRoute("down")} /></>}>
-          <NativeTable columns={[{ label: translate("providers.upstream"), width: 160 }, { label: translate("providers.provider"), width: 84 }, { label: translate("providers.providerKey"), width: 150 }, { label: translate("common.order"), width: 48 }, ROUTE_TABLE_SPACER_COLUMN]} rows={routeRows} disabledRowKeys={disabledRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => selectRouteTableRow(key)} style={styles.nativeRouteTable} />
+          <NativeTable columns={[{ label: translate("providers.upstream"), width: 160 }, { label: translate("providers.provider"), width: 84 }, { label: translate("providers.providerKey"), width: 150 }, { label: translate("common.order"), width: 48 }, ROUTE_TABLE_SPACER_COLUMN]} rows={routeRows} secondaryRowKeys={offRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => selectRouteTableRow(key)} style={styles.nativeRouteTable} />
           {/* The routes table is grouped by public model, so an empty Core and a
               Core whose every group is collapsed both draw a blank table.  Say
               which one this is and what creates the first row, rather than
@@ -6666,11 +6672,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       </View> : <View style={styles.providerWorkspace}>
         <View style={styles.providerModelColumns}>
           <TablePane style={styles.providerListPane} title={translate("providers.providers")} actions={<><IconButton label="+" title={translate("providers.newProvider")} disabled={busy} onPress={addProvider} />{provider ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteProvider} /> : null}</>}>
-            <NativeTable columns={[{ label: translate("providers.provider"), width: 112 }]} rows={providerRows} disabledRowKeys={disabledProviderKeys} alertRowKeys={alertProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }} style={styles.nativeProviderTable} />
+            <NativeTable columns={[{ label: translate("providers.provider"), width: 112 }]} rows={providerRows} secondaryRowKeys={offProviderKeys} alertRowKeys={alertProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }} style={styles.nativeProviderTable} />
           </TablePane>
           <View style={styles.providerMiddlePane} onLayout={({ nativeEvent }) => setModelTableWidth(nativeEvent.layout.width)}>
             <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteModel} /> : null}</>}>
-              <View style={styles.nativeModelTable}><NativeTable columns={modelTableColumns(modelTableWidth, translate)} rows={modelRows} disabledRowKeys={disabledModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange={(key) => { if (!key) { setSelectedModel(undefined); setSelectedModelRow(undefined); setProviderSourceModel(undefined); return; } const modelID = modelIDFromRowKey(key); if (modelID === undefined) return; setSelectedModel(modelID); setSelectedModelRow(key); setProviderSourceModel(undefined); }} style={styles.modelTable} /></View>
+              <View style={styles.nativeModelTable}><NativeTable columns={modelTableColumns(modelTableWidth, translate)} rows={modelRows} secondaryRowKeys={offModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange={(key) => { if (!key) { setSelectedModel(undefined); setSelectedModelRow(undefined); setProviderSourceModel(undefined); return; } const modelID = modelIDFromRowKey(key); if (modelID === undefined) return; setSelectedModel(modelID); setSelectedModelRow(key); setProviderSourceModel(undefined); }} style={styles.modelTable} /></View>
               {provider ? <View style={styles.tableBottomRow}>{fetchKeyChoices.length > 0 ? <NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy} accessibilityLabel={translate("providers.providerKey")} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /> : null}<ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || (fetchKeyChoices.length > 0 && !selectedFetchKey)} onPress={() => { void fetchModels(); }} /></View> : null}
             </TablePane>
           </View>

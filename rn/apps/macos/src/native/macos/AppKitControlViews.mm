@@ -3121,6 +3121,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
       oldViewProps.rowSymbolColors != newViewProps.rowSymbolColors ||
       oldViewProps.rowImageNames != newViewProps.rowImageNames ||
       oldViewProps.disabledRowKeys != newViewProps.disabledRowKeys ||
+      oldViewProps.secondaryRowKeys != newViewProps.secondaryRowKeys ||
       oldViewProps.secondaryCellKeys != newViewProps.secondaryCellKeys ||
       oldViewProps.alertRowKeys != newViewProps.alertRowKeys ||
       oldViewProps.spanningRowKeys != newViewProps.spanningRowKeys ||
@@ -3750,10 +3751,13 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
 
 - (BOOL)tableView:(__unused NSTableView *)tableView shouldSelectRow:(NSInteger)row
 {
-  // A disabled row is painted in secondary ink and means "not now", so it must
-  // not become the selection either.  Windows already refuses it; macOS only
+  // A disabled row means "there is nothing here to act on", so it must not
+  // become the selection either.  Windows already refuses it; macOS only
   // grayed the text and kept the row selectable, which left the pane acting on
-  // a row the user could not use.
+  // a row the user could not use.  An entry that is merely switched off is not
+  // that: it dims through secondaryRowKeys and stays selectable, because the
+  // click that selects a parked provider, model or route is the only way back
+  // to its own 启用 switch.
   if ([self isDisabledRow:row]) {
     return NO;
   }
@@ -3993,10 +3997,11 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     label.textColor = SourceListTitleColor(self.effectiveAppearance);
   } else {
     const bool disabled = std::find(viewProps.disabledRowKeys.begin(), viewProps.disabledRowKeys.end(), rowKey) != viewProps.disabledRowKeys.end();
+    const bool secondaryRow = std::find(viewProps.secondaryRowKeys.begin(), viewProps.secondaryRowKeys.end(), rowKey) != viewProps.secondaryRowKeys.end();
     const std::string cellKey = rowKey + "\x1f" + std::to_string(columnIndex);
     const bool secondary = std::find(viewProps.secondaryCellKeys.begin(), viewProps.secondaryCellKeys.end(), cellKey) != viewProps.secondaryCellKeys.end();
     const bool alert = std::find(viewProps.alertRowKeys.begin(), viewProps.alertRowKeys.end(), rowKey) != viewProps.alertRowKeys.end();
-    NSColor *textColor = alert ? NSColor.systemBrownColor : (disabled || secondary ? NSColor.secondaryLabelColor : NSColor.labelColor);
+    NSColor *textColor = alert ? NSColor.systemBrownColor : (disabled || secondaryRow || secondary ? NSColor.secondaryLabelColor : NSColor.labelColor);
     label.font = TableCellFont();
     label.textColor = textColor;
     label.attributedStringValue = TableCellTitle(value, textColor);

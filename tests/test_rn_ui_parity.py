@@ -1075,7 +1075,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         # A provider that is off serves none of its routes, so its models read
         # as disabled in the list too — the same fact the inspector states.
-        disabled = self.ui.split("const disabledModelKeys = useMemo(", 1)[1].split("// Rows that cannot materialize", 1)[0]
+        disabled = self.ui.split("const offModelKeys = useMemo(", 1)[1].split("// Rows that cannot materialize", 1)[0]
         self.assertIn("!booleanValue(provider?.enabled, true) || !booleanValue(item.model_enabled, booleanValue(item.enabled, true))", disabled)
 
         # The row's own 启用 box keeps drawing its stored state and only loses
@@ -1100,6 +1100,39 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"providers.providerDisabledHint": "This provider is turned off. Turn the provider back on before setting this model', self.en)
         for locale in (self.zh, self.en):
             self.assertIn('"providers.providerDisabledHint"', locale)
+
+    def test_a_row_that_is_off_still_answers_the_click_that_turns_it_back_on(self) -> None:
+        """A parked entry dims; it does not become a row nobody can open.
+
+        Both hosts refuse a `disabledRowKeys` row the selection, which is right
+        for a row with nothing to act on.  A provider, model or route that is
+        merely switched off is the opposite: the click that selects it is the
+        only door to the 启用 box (and, for a route, to the key or model its
+        state is parked on).  Handing those to the disabled list left a window
+        whose off providers answered nothing, so a provider turned off could
+        never be turned back on from its own pane.
+        """
+
+        mac_native = MACOS_CONTROLS.read_text(encoding="utf-8")
+        for state_keys in ("offProviderKeys", "offModelKeys", "offRouteKeys"):
+            self.assert_ui_has(f"secondaryRowKeys={{{state_keys}}}")
+            self.assertNotIn(f"disabledRowKeys={{{state_keys}}}", self.ui)
+        # Secondary ink is ink alone: the refusal still reads the disabled list.
+        should_select = mac_native.split(
+            "- (BOOL)tableView:(__unused NSTableView *)tableView shouldSelectRow:(NSInteger)row", 1)[1].split("\n}", 1)[0]
+        self.assertIn("if ([self isDisabledRow:row]) {", should_select)
+        self.assertNotIn("isSecondaryRow", should_select)
+        self.assertIn("const bool secondaryRow = std::find(viewProps.secondaryRowKeys.begin(), viewProps.secondaryRowKeys.end(), rowKey)", mac_native)
+        self.assertIn(
+            "(disabled || secondaryRow || secondary ? NSColor.secondaryLabelColor : NSColor.labelColor)",
+            mac_native,
+        )
+        # The React Windows table paints the same ink and keeps its press.
+        self.assertIn(
+            "const textColor = alert ? WINDOWS_CONTROL.warning : (disabled ? WINDOWS_CONTROL.textDisabled : (secondaryRow ? WINDOWS_CONTROL.textSecondary : WINDOWS_CONTROL.text));",
+            self.native_controls,
+        )
+        self.assertIn("disabled={disabled || (spanning && !selectableSpanning)}", self.native_controls)
 
     def test_an_image_route_is_told_its_probe_generates_one_picture(self) -> None:
         """A generator's only honest availability test costs an image.
@@ -1415,9 +1448,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('key: routePublicModelRowKey(group.name)')
         self.assert_ui_has('spanning: true')
         self.assert_ui_has(r'cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model)')
-        self.assert_ui_has('rows={routeRows} disabledRowKeys={disabledRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => selectRouteTableRow(key)}')
-        self.assert_ui_has('rows={providerRows} disabledRowKeys={disabledProviderKeys} alertRowKeys={alertProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange=')
-        self.assert_ui_has('rows={modelRows} disabledRowKeys={disabledModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange=')
+        self.assert_ui_has('rows={routeRows} secondaryRowKeys={offRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => selectRouteTableRow(key)}')
+        self.assert_ui_has('rows={providerRows} secondaryRowKeys={offProviderKeys} alertRowKeys={alertProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange=')
+        self.assert_ui_has('rows={modelRows} secondaryRowKeys={offModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange=')
         self.assert_ui_has('columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths')
         self.assert_ui_has('rows={tableRows}')
         select_route = self.ui.split('const selectRoute = useCallback', 1)[1].split('const chooseViewMode', 1)[0]
@@ -1426,8 +1459,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('model={activeRoute.model}')
         self.assert_ui_has('onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))}')
         self.assert_ui_has('setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`)')
-        self.assert_ui_has('disabledRowKeys={disabledModelKeys}')
-        self.assert_ui_has('disabledRowKeys={disabledRouteKeys}')
+        self.assert_ui_has('secondaryRowKeys={offModelKeys}')
+        self.assert_ui_has('secondaryRowKeys={offRouteKeys}')
         self.assertNotIn('secondaryCellKeys={routeSecondaryCellKeys}', self.ui)
         self.assertNotIn('<ScrollView contentContainerStyle={styles.inspectorContent}>', self.ui)
         self.assertNotIn('native.window.open("relay-accounts")', self.ui)
@@ -2783,6 +2816,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "sourceList?: WithDefault<boolean, false>;",
             "rowImageNames?: ReadonlyArray<string>;",
             "secondaryCellKeys?: ReadonlyArray<string>;",
+            "secondaryRowKeys?: ReadonlyArray<string>;",
             "spanningRowKeys?: ReadonlyArray<string>;",
             "selectableSpanningRowKeys?: ReadonlyArray<string>;",
         ):

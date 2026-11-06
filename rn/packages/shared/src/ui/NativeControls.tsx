@@ -234,6 +234,12 @@ type TableProps = {
   preserveColumnWidths?: boolean;
   scrollTrailingColumnOverflow?: boolean;
   disabledRowKeys?: string[];
+  /**
+   * Rows painted in the same secondary ink, still selectable: an entry that is
+   * switched off is the door back to its own switch, so it dims without
+   * losing the click the way `disabledRowKeys` does.
+   */
+  secondaryRowKeys?: string[];
   secondaryCellKeys?: string[];
   /**
    * One optional second line per row, printed small under the row's own text.
@@ -724,7 +730,7 @@ function sameColumns(left: TableColumn[], right: TableColumn[]): boolean {
   return true;
 }
 
-function sameTableRow(previous: { row: TableRow; index: number; columns: TableColumn[]; compact: boolean; sourceList: boolean; stripedRows: boolean; selected: boolean; disabled: boolean; alert: boolean; rowSymbol?: string; rowSymbolColor?: string; rowImageName?: string; secondaryCellKeys: Set<string>; selectableSpanning: boolean; onSelect: (row: TableRow, index: number) => void }, next: typeof previous): boolean {
+function sameTableRow(previous: { row: TableRow; index: number; columns: TableColumn[]; compact: boolean; sourceList: boolean; stripedRows: boolean; selected: boolean; disabled: boolean; secondaryRow: boolean; alert: boolean; rowSymbol?: string; rowSymbolColor?: string; rowImageName?: string; secondaryCellKeys: Set<string>; selectableSpanning: boolean; onSelect: (row: TableRow, index: number) => void }, next: typeof previous): boolean {
   return previous.row === next.row
     && previous.index === next.index
     && previous.compact === next.compact
@@ -732,6 +738,7 @@ function sameTableRow(previous: { row: TableRow; index: number; columns: TableCo
     && previous.stripedRows === next.stripedRows
     && previous.selected === next.selected
     && previous.disabled === next.disabled
+    && previous.secondaryRow === next.secondaryRow
     && previous.alert === next.alert
     && previous.rowSymbol === next.rowSymbol
     && previous.rowSymbolColor === next.rowSymbolColor
@@ -758,6 +765,7 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   stripedRows,
   selected,
   disabled,
+  secondaryRow,
   alert,
   rowSymbol,
   rowSymbolColor,
@@ -776,6 +784,7 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   stripedRows: boolean;
   selected: boolean;
   disabled: boolean;
+  secondaryRow: boolean;
   alert: boolean;
   rowSymbol?: string;
   rowSymbolColor?: string;
@@ -789,7 +798,7 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   const spanning = row.spanning === true;
   const [hovered, setHovered] = React.useState(false);
   const stripe = stripedRows && !selected && !disabled && index % 2 === 1;
-  const textColor = alert ? WINDOWS_CONTROL.warning : (disabled ? WINDOWS_CONTROL.textDisabled : WINDOWS_CONTROL.text);
+  const textColor = alert ? WINDOWS_CONTROL.warning : (disabled ? WINDOWS_CONTROL.textDisabled : (secondaryRow ? WINDOWS_CONTROL.textSecondary : WINDOWS_CONTROL.text));
   // The row is the whole of this list's interactive surface, so what a screen
   // reader announces has to come from it: without a role, a label and its
   // selected state, a Windows table was a list of anonymous press targets —
@@ -855,7 +864,7 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   </Pressable>;
 }, sameTableRow);
 
-function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, followBottom, scrollToRow, framed, sourceList, rowSymbols, rowSymbolColors, rowImageNames, disabledRowKeys, secondaryCellKeys, rowDetails, selectableSpanningKeys, onSelectionChange, onRowDoublePress, style, alertRowKeys }: {
+function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, followBottom, scrollToRow, framed, sourceList, rowSymbols, rowSymbolColors, rowImageNames, disabledRowKeys, secondaryRowKeys, secondaryCellKeys, rowDetails, selectableSpanningKeys, onSelectionChange, onRowDoublePress, style, alertRowKeys }: {
   columns: TableProps["columns"];
   rows: TableProps["rows"];
   selectedKey: string;
@@ -869,6 +878,7 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   rowSymbolColors: string[];
   rowImageNames: string[];
   disabledRowKeys: string[];
+  secondaryRowKeys: string[];
   secondaryCellKeys: string[];
   rowDetails: string[];
   selectableSpanningKeys: Set<string>;
@@ -889,6 +899,7 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   // log that appends 20 entries a second otherwise rebuilt the same lookups
   // for every visible row on every frame.
   const disabledKeys = React.useMemo(() => new Set(disabledRowKeys), [disabledRowKeys]);
+  const secondaryRowKeysSet = React.useMemo(() => new Set(secondaryRowKeys), [secondaryRowKeys]);
   const alertKeys = React.useMemo(() => new Set(alertRowKeys), [alertRowKeys]);
   const secondaryKeys = React.useMemo(() => new Set(secondaryCellKeys), [secondaryCellKeys]);
   React.useEffect(() => {
@@ -928,6 +939,7 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
     stripedRows={stripedRows}
     selected={item.key === selectedKey}
     disabled={disabledKeys.has(item.key)}
+    secondaryRow={secondaryRowKeysSet.has(item.key)}
     alert={alertKeys.has(item.key)}
     rowSymbol={rowSymbols[index]}
     rowSymbolColor={rowSymbolColors[index]}
@@ -936,7 +948,7 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
     detail={rowDetails[index] || undefined}
     selectableSpanning={selectableSpanningKeys.has(item.key)}
     onSelect={select}
-  />, [alertKeys, columns, compact, disabledKeys, rowDetails, rowImageNames, rowSymbols, rowSymbolColors, secondaryKeys, selectableSpanningKeys, select, selectedKey, sourceList, stripedRows]);
+  />, [alertKeys, columns, compact, disabledKeys, rowDetails, rowImageNames, rowSymbols, rowSymbolColors, secondaryKeys, secondaryRowKeysSet, selectableSpanningKeys, select, selectedKey, sourceList, stripedRows]);
   const keyExtractor = React.useCallback((row: TableRow): string => row.key, []);
   const body = <View style={[windowsTableStyles.horizontalBody, !sourceList && { minWidth: totalWidth }]}>
     {!sourceList ? <View style={[windowsTableStyles.header, { minWidth: totalWidth }]}>
@@ -1060,7 +1072,7 @@ const windowsTableStyles = StyleSheet.create({
 // with them every mounted row) even when no prop changed.
 const EMPTY_STRINGS: string[] = [];
 
-export function NativeTable({ columns, rows, selectedKey = "", striped = true, compact = true, followBottom = false, scrollToRow = -1, framed = true, sourceList = false, rowSymbols = EMPTY_STRINGS, rowSymbolColors = EMPTY_STRINGS, rowImageNames = EMPTY_STRINGS, cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = EMPTY_STRINGS, secondaryCellKeys = EMPTY_STRINGS, rowDetails = EMPTY_STRINGS, selectableSpanningRowKeys = EMPTY_STRINGS, onSelectionChange, onRowDoublePress, style, alertRowKeys = EMPTY_STRINGS }: TableProps): React.JSX.Element {
+export function NativeTable({ columns, rows, selectedKey = "", striped = true, compact = true, followBottom = false, scrollToRow = -1, framed = true, sourceList = false, rowSymbols = EMPTY_STRINGS, rowSymbolColors = EMPTY_STRINGS, rowImageNames = EMPTY_STRINGS, cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = EMPTY_STRINGS, secondaryRowKeys = EMPTY_STRINGS, secondaryCellKeys = EMPTY_STRINGS, rowDetails = EMPTY_STRINGS, selectableSpanningRowKeys = EMPTY_STRINGS, onSelectionChange, onRowDoublePress, style, alertRowKeys = EMPTY_STRINGS }: TableProps): React.JSX.Element {
   // Striped rows belong to the list surface, not to its contents: the native
   // table paints its alternating bands across the whole viewport, so an empty
   // list shows the same stripes and reads as a list that happens to have no
@@ -1081,7 +1093,7 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
     // one-line-per-row list that drops every column this app reads.  The
     // Windows leaf is already a virtualized React table, so the browser host
     // gets the same rows, columns, stripes and selection instead of a stub.
-    return <WindowsTable columns={columns} rows={rows} selectedKey={selectedKey} stripedRows={stripedRows} compact={compact} followBottom={followBottom} scrollToRow={scrollToRow} framed={framed} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} rowImageNames={rowImageNames} disabledRowKeys={disabledRowKeys} secondaryCellKeys={secondaryCellKeys} rowDetails={rowDetails} selectableSpanningKeys={selectableSpanningKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} alertRowKeys={alertRowKeys} style={[styles.table, style]} />;
+    return <WindowsTable columns={columns} rows={rows} selectedKey={selectedKey} stripedRows={stripedRows} compact={compact} followBottom={followBottom} scrollToRow={scrollToRow} framed={framed} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} rowImageNames={rowImageNames} disabledRowKeys={disabledRowKeys} secondaryRowKeys={secondaryRowKeys} secondaryCellKeys={secondaryCellKeys} rowDetails={rowDetails} selectableSpanningKeys={selectableSpanningKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} alertRowKeys={alertRowKeys} style={[styles.table, style]} />;
   }
   // The macOS bridge props are built per render, and the list above them can be
   // thousands of rows: building them before the platform branch made a Windows
@@ -1123,6 +1135,7 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
       rowSymbolColors,
       rowImageNames,
       disabledRowKeys,
+      secondaryRowKeys,
       secondaryCellKeys,
       // An all-empty list is the same as none: the native table reads a non-empty
       // list as "these rows are two lines tall", so the padding below never has to
