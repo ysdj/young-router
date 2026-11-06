@@ -41,6 +41,7 @@ from ..dsh_config_keys import (
     DSH_VISION_ROUTER_LOCAL_QUICK_KEYS as _DSH_VISION_ROUTER_LOCAL_QUICK_KEYS,
     DSH_VISION_ROUTER_QUICK_KEYS as _DSH_VISION_ROUTER_QUICK_KEYS,
 )
+from .oplog import note as _note
 from .persistence import (
     PersistenceError,
     atomic_write_bytes,
@@ -1318,8 +1319,6 @@ class CoreServiceController:
             # sentence because a window shows it.  Whoever reads the host's log
             # afterwards needs the real reason: this is the path that fails
             # after the previous proxy has already been stopped.
-            from .oplog import note as _note
-
             _note("staging the document before the proxy starts failed", trace=exc)
             raise RuntimeError("Provider/model configuration is invalid") from None
 
@@ -1496,11 +1495,16 @@ class CoreServiceController:
         self._stage_runtime_config()
         self.reset_transient_routing_state()
         self.paths.runtime_config.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # A supervised start has no window to show its progress, and the step it
+        # stops at is the whole diagnosis: staging, the managed workers, or the
+        # launch itself.  Three lines per start, on the host's own log.
+        _note("staged the document; starting the proxy")
         environment = self._runtime_env()
         # The proxy resolves the WorkBuddy base URLs and the loopback bearer
         # from its own environment, so the worker has to be listening before
         # the child launches and its port must never enter config.yaml.
         environment.update(self._managed_worker_environment(autostart=True))
+        _note("managed workers answered; launching the proxy")
         owner_token = secrets.token_urlsafe(OWNER_TOKEN_BYTES)
         environment[OWNER_TOKEN_ENV] = owner_token
         # An occupied configured port steps forward to the next free port; the
@@ -1571,6 +1575,7 @@ class CoreServiceController:
                     start_new_session=os.name != "nt",
                     close_fds=True,
                 )
+            _note("proxy launched: pid %d on port %d" % (process.pid, port))
             self._write_owner_record(process, owner_token)
             atomic_write_text(self.paths.pid, f"{process.pid}\n")
             atomic_write_text(self.paths.port, f"{port}\n")
