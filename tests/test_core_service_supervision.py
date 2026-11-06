@@ -329,6 +329,26 @@ class ServiceSupervisionTests(unittest.TestCase):
 
 
 class ServiceSupervisorLoopTests(unittest.TestCase):
+    def test_a_host_with_no_window_can_ask_for_an_immediate_first_pass(self) -> None:
+        """The head start belongs to a window, not to every machine.
+
+        The loop waits five seconds before its first pass so the app's own
+        launch is not raced by a second start.  A unit that stated
+        ``--manage-service`` has no window and therefore no other starter, so
+        that wait is five seconds of a shut port: a replace on 2026-11-07 00:17
+        spent exactly that inside a 31 s outage.  The store passes the
+        caller's statement through instead of deciding it itself, because only
+        the entry point knows whether a window exists.
+        """
+
+        core = CoreStore()
+
+        default = core.service_supervisor()
+        self.assertEqual(5.0, default._initial_delay)
+
+        other = CoreStore().service_supervisor(initial_delay=0.0)
+        self.assertEqual(0.0, other._initial_delay)
+
     def test_the_loop_keeps_passing_and_stops_on_request(self) -> None:
         passes: list[int] = []
 

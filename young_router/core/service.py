@@ -3207,18 +3207,27 @@ class CoreStore:
                 except Exception:
                     pass
 
-    def service_supervisor(self) -> Any:
+    def service_supervisor(self, *, initial_delay: float | None = None) -> Any:
         """The loop that restores the proxy without a person's click.
 
         Created on request and started by the Core entry point, exactly like
         the loops above.  A pass does nothing unless this installation still
         intends to run a proxy, so an explicit 停止服务 is never undone.
+
+        ``initial_delay`` is the caller's statement about this process rather
+        than a tuning knob: a window that is about to launch the proxy itself
+        keeps the loop's own head start (``None`` uses the loop's default), and
+        a host unit that has no window asks for the first pass immediately,
+        because no other starter exists on that machine.
         """
 
         if self._service_supervisor is None:
             from .service_supervisor import ServiceSupervisor
 
-            self._service_supervisor = ServiceSupervisor(supervise=self.supervise_service_once)
+            head_start = {} if initial_delay is None else {"initial_delay": float(initial_delay)}
+            self._service_supervisor = ServiceSupervisor(
+                supervise=self.supervise_service_once, **head_start
+            )
         return self._service_supervisor
 
     def _stop_service_supervisor(self) -> None:

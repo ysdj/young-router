@@ -98,6 +98,7 @@ class CoreProtocolTests(unittest.TestCase):
     def test_core_parent_watchdog_runs_ordered_shutdown(self) -> None:
         events: list[str] = []
         record_states: list[str] = []
+        supervisor_head_start: list[float | None] = []
         server_started = threading.Event()
 
         class FakeCore:
@@ -107,7 +108,8 @@ class CoreProtocolTests(unittest.TestCase):
             def image_context_sweeper(self) -> "FakeScheduler":
                 return FakeScheduler("cleanup")
 
-            def service_supervisor(self) -> "FakeScheduler":
+            def service_supervisor(self, *, initial_delay: float | None = None) -> "FakeScheduler":
+                supervisor_head_start.append(initial_delay)
                 return FakeScheduler("supervisor")
 
             def shutdown(self, *, stopped_by: str = "app_exit") -> None:
@@ -168,6 +170,9 @@ class CoreProtocolTests(unittest.TestCase):
             events,
         )
         self.assertEqual(["core_replaced"], record_states)
+        # A native host is a window: it launches the proxy itself, so the loop
+        # keeps its head start instead of racing that launch.
+        self.assertEqual([None], supervisor_head_start)
         self.assertTrue(create_core.call_args.kwargs["reset_transient_routing_state"])
 
     def test_a_server_unit_states_that_it_supervises_the_proxy(self) -> None:
@@ -181,8 +186,9 @@ class CoreProtocolTests(unittest.TestCase):
         process that must not spawn a proxy.
         """
 
-        def run_with(argv: list[str]) -> list[str]:
+        def run_with(argv: list[str]) -> tuple[list[str], list[float | None]]:
             started: list[str] = []
+            supervisor_head_start: list[float | None] = []
 
             class FakeScheduler:
                 def __init__(self, name: str) -> None:
@@ -201,7 +207,8 @@ class CoreProtocolTests(unittest.TestCase):
                 def image_context_sweeper(self) -> FakeScheduler:
                     return FakeScheduler("cleanup")
 
-                def service_supervisor(self) -> FakeScheduler:
+                def service_supervisor(self, *, initial_delay: float | None = None) -> FakeScheduler:
+                    supervisor_head_start.append(initial_delay)
                     return FakeScheduler("supervisor")
 
                 def shutdown(self, *, stopped_by: str = "app_exit") -> None:
@@ -249,10 +256,17 @@ class CoreProtocolTests(unittest.TestCase):
                 mock.patch.object(core_main.threading, "Event", StopAtOnce),
             ):
                 self.assertEqual(0, core_main.run(argv))
-            return started
+            return started, supervisor_head_start
 
-        self.assertIn("supervisor", run_with(["--manage-service"]))
-        self.assertNotIn("supervisor", run_with([]))
+        started, head_start = run_with(["--manage-service"])
+        self.assertIn("supervisor", started)
+        # A unit that said so has no window, so no other starter exists on this
+        # machine: the loop's first pass is due at once instead of five seconds
+        # into a restart window, spent waiting for a launch that cannot come.
+        self.assertEqual([0.0], head_start)
+        started, head_start = run_with([])
+        self.assertNotIn("supervisor", started)
+        self.assertEqual([], head_start)
 
     def test_shared_schema_matches_python_and_typescript_method_contract(self) -> None:
         schema = load_protocol_schema()

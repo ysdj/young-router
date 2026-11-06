@@ -218,7 +218,17 @@ def run(argv: list[str] | None = None) -> int:
     manages_service = (
         args.manage_service or args.endpoint_file is not None or args.parent_pid is not None
     )
-    service_supervisor = core.service_supervisor() if manages_service else None
+    # ``--manage-service`` is a unit stating that this machine has no window at
+    # all, which means nothing else is going to launch the proxy: the loop's
+    # head start exists so the app's own launch is not raced by a second start,
+    # and waiting it out on a host is five seconds of a shut port waiting for a
+    # starter that was never there.  Measured 2026-11-07 00:17: a restart spent
+    # 5.0 s of a 31 s window in that wait before the first pass began.
+    service_supervisor = (
+        core.service_supervisor(initial_delay=0.0 if args.manage_service else None)
+        if manages_service
+        else None
+    )
 
     def request_stop(_signum: int, _frame: Any) -> None:
         stop.set()
