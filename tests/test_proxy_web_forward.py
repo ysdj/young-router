@@ -34,17 +34,69 @@ class PrefixOwnershipTests(unittest.TestCase):
             self.assertFalse(web_forward.forwards_path(foreign), foreign)
 
     def test_an_unset_endpoint_means_this_proxy_serves_no_page(self) -> None:
+        """No Core still owns the prefixes: it must not become LiteLLM's.
+
+        LiteLLM mounts its own dashboard at ``/ui``.  A proxy launched by hand,
+        or the gateway machine that runs the proxy alone, has no Core to answer
+        that prefix -- and letting the request fall through made a public port
+        serve an admin console behind a key that is also the clients' API key.
+        Covering the prefix and covering its absence are the same job.
+        """
+
         import os
 
         previous = os.environ.pop(web_forward.ENDPOINT_ENV, None)
         try:
             self.assertIsNone(web_forward.core_endpoint())
-            marker = type("App", (), {})()
+            installed: list[dict[str, object]] = []
+
+            class App:
+                def add_middleware(self, factory: object, **kwargs: object) -> None:
+                    installed.append({"factory": factory, **kwargs})
+
+            marker = App()
+            # Registered, and honest about there being nothing behind it.
             self.assertFalse(web_forward.register(marker))
-            self.assertFalse(hasattr(marker, "add_middleware"))
+            self.assertEqual(
+                [{"factory": web_forward.CoreForwardingMiddleware, "endpoint": None}], installed
+            )
         finally:
             if previous is not None:
                 os.environ[web_forward.ENDPOINT_ENV] = previous
+
+    def test_a_host_with_no_core_answers_the_prefix_itself(self) -> None:
+        below = _Unreached()
+        middleware = web_forward.CoreForwardingMiddleware(below, endpoint=None)
+
+        # The page: a plain statement that this host has none, and nothing
+        # about what else runs here.
+        for path in ("/ui", "/ui/", "/ui/bundle.js"):
+            below.called = False
+            status, headers, body = _call(middleware, "GET", path)
+            self.assertEqual(404, status, path)
+            self.assertTrue(headers["content-type"].startswith("text/plain"), path)
+            self.assertEqual(web_forward.NO_PAGE_BODY, body, path)
+            self.assertFalse(below.called, path)
+
+        # The settings API is asked by a program: it reads the same answer a
+        # restarting Core gives, because from a client's side they are one fact.
+        below.called = False
+        status, headers, body = _call(middleware, "POST", "/ipc", b"{}")
+        self.assertEqual(503, status)
+        self.assertEqual("application/json", headers["content-type"].split(";")[0])
+        self.assertEqual("core_unavailable", json.loads(body)["error"]["code"])
+        self.assertFalse(below.called)
+
+        # Everything else is still LiteLLM's, on this host too.  A fresh app
+        # below, because ``_Unreached`` records the call on its class.
+        litellm_side = _Unreached()
+        _Unreached.called = False
+        status, _headers, body = _call(
+            web_forward.CoreForwardingMiddleware(litellm_side, endpoint=None), "GET", "/v1/models"
+        )
+        self.assertEqual(418, status)
+        self.assertEqual(b"litellm", body)
+        self.assertTrue(litellm_side.called)
 
     def test_the_endpoint_is_one_host_and_port(self) -> None:
         import os

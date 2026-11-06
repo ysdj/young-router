@@ -14,6 +14,13 @@ implementation:
 Everything else stays LiteLLM's.  The listener's host check, the password form,
 the session cookie and the capability leases are the ones Core already owns, so
 a page cannot be signed in here and unsigned-in there.
+
+A host with no Core behind it -- a proxy launched by hand, the gateway machine
+that ships the proxy alone -- still owns these two prefixes: it answers "no
+page" and "no settings API" rather than letting the request reach LiteLLM's own
+mounts.  LiteLLM mounts a dashboard at ``/ui``, so falling through published an
+admin console nobody asked this deployment for, on a public port, behind a key
+that is also the clients' API key.  Owning a prefix means owning its absence.
 """
 
 from __future__ import annotations
@@ -23,8 +30,11 @@ import http.client
 from typing import Any, Iterable
 
 #: Where Core's own loopback listener answers.  The proxy is Core's child, so
-#: Core writes this into the child's environment before launching it; a proxy
-#: started by hand on a Core-less machine simply has no page.
+#: Core writes this into the child's environment before launching it.  A proxy
+#: started without one -- by hand, or on a gateway machine that ships the proxy
+#: alone -- has no page, and says so for these prefixes itself: LiteLLM mounts
+#: its own dashboard at ``/ui``, and falling through is how a public port came
+#: to answer with an admin console.
 ENDPOINT_ENV = "YOUNG_ROUTER_CORE_IPC_ENDPOINT"
 #: The prefixes this app owns on the published port.
 FORWARDED_PREFIXES = ("/ui", "/ipc")
@@ -43,6 +53,9 @@ HOP_BY_HOP = frozenset({
 #: one slow route: Core bounds it at ``EVENT_POLL_TIMEOUT_SECONDS``, so this
 #: only has to outlive that plus the connect/teardown around it.
 FORWARD_TIMEOUT_SECONDS = 60.0
+#: What a host with no page answers for ``/ui``.  It states the one fact a
+#: reader needs -- there is no page here -- and nothing about this machine.
+NO_PAGE_BODY = b"This host serves no page.\n"
 
 
 def forwards_path(path: str) -> bool:
@@ -122,6 +135,40 @@ def _exchange(
         connection.close()
 
 
+async def _no_page(scope_path: str, send: Any) -> None:
+    """Answer an owned prefix on a host that has no Core to forward to.
+
+    ``/ui`` is a page this host does not serve, so it says so plainly.  ``/ipc``
+    is asked by a program, which reads the same ``core_unavailable`` answer it
+    would read from a Core that is restarting: from a client's side the two are
+    one fact -- nothing answers the settings API here.
+    """
+
+    if scope_path == "/ipc" or scope_path.startswith("/ipc/"):
+        payload = b'{"ok": false, "error": {"code": "core_unavailable", "message": "The local Core is not answering"}}'
+        await send({
+            "type": "http.response.start",
+            "status": 503,
+            "headers": [
+                (b"content-type", b"application/json; charset=utf-8"),
+                (b"cache-control", b"no-store"),
+                (b"content-length", str(len(payload)).encode("latin-1")),
+            ],
+        })
+        await send({"type": "http.response.body", "body": payload})
+        return
+    await send({
+        "type": "http.response.start",
+        "status": 404,
+        "headers": [
+            (b"content-type", b"text/plain; charset=utf-8"),
+            (b"cache-control", b"no-store"),
+            (b"content-length", str(len(NO_PAGE_BODY)).encode("latin-1")),
+        ],
+    })
+    await send({"type": "http.response.body", "body": NO_PAGE_BODY})
+
+
 async def forward(scope: dict[str, Any], receive: Any, send: Any, endpoint: tuple[str, int]) -> None:
     """Answer one ASGI request from Core, or say the Core is not answering."""
 
@@ -180,34 +227,41 @@ class CoreForwardingMiddleware:
     LiteLLM's own app object and a mount matches before any later route.
     """
 
-    def __init__(self, app: Any, *, endpoint: tuple[str, int]) -> None:
+    def __init__(self, app: Any, *, endpoint: tuple[str, int] | None) -> None:
         self.app = app
+        # ``None`` is a host with no Core: the prefixes are still this app's,
+        # so they answer for themselves instead of falling through.
         self.endpoint = endpoint
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope.get("type") != "http" or not forwards_path(str(scope.get("path") or "/")):
+        path = str(scope.get("path") or "/")
+        if scope.get("type") != "http" or not forwards_path(path):
             await self.app(scope, receive, send)
+            return
+        if self.endpoint is None:
+            await _no_page(path, send)
             return
         await forward(scope, receive, send, self.endpoint)
 
 
 def register(app: Any) -> bool:
-    """Take over the page and its API on this port, when this host has one.
+    """Take over the page and its API on this port.
 
-    Returns whether the forwarder was installed: a proxy with no Core endpoint
-    (a bare LiteLLM launched by hand) keeps serving only its own routes.
+    Installed on every host, including one with no Core endpoint (a bare
+    LiteLLM launched by hand, the gateway machine that runs the proxy alone):
+    the prefixes belong to this app whether or not something answers behind
+    them, and a host that owns a prefix must own its absence too.  Returns
+    whether a Core is there to forward to.
     """
 
     endpoint = core_endpoint()
-    if endpoint is None:
-        return False
     if getattr(app, _REGISTERED_ATTR, False):
-        return True
+        return endpoint is not None
     # Added last is outermost, which is what makes this see ``/ui`` before
     # LiteLLM's own mount does.
     app.add_middleware(CoreForwardingMiddleware, endpoint=endpoint)
     setattr(app, _REGISTERED_ATTR, True)
-    return True
+    return endpoint is not None
 
 
 _REGISTERED_ATTR = "_young_router_core_forwarding"
@@ -216,6 +270,7 @@ __all__ = [
     "CoreForwardingMiddleware",
     "ENDPOINT_ENV",
     "FORWARDED_PREFIXES",
+    "NO_PAGE_BODY",
     "core_endpoint",
     "forward",
     "forwards_path",
