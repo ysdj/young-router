@@ -2068,6 +2068,9 @@ class HookRoutingTests(HookTestCase):
                 "id": "chat-route",
                 "upstream_url_surface": "openai/chat",
                 "upstream_protocol_mode": "fallback",
+                # The route states that its Responses wire does not carry the
+                # thinking this client asked to read.
+                "supports_responses_reasoning_summary": False,
             },
         }
 
@@ -2081,6 +2084,65 @@ class HookRoutingTests(HookTestCase):
                 deployment,
             ),
             "openai/chat",
+        )
+
+    def test_fallback_chat_route_keeps_the_client_protocol_when_it_states_nothing(
+        self,
+    ) -> None:
+        """A guessed chat backup must not replace the client's own protocol.
+
+        ``upstream_url_surface: openai/chat`` on a ``fallback`` route is this
+        app's inference for an unknown relay, not a statement about its
+        ``/v1/responses`` wire.  Switching every summary-asking Responses turn
+        onto Chat therefore moved a protocol the user never chose -- measured
+        live 2026-11-05, a ``kimi-k3.1-pro`` relay's Responses wire was never
+        tried while the log showed every turn leaving on Chat.
+        """
+
+        hooks, _ = load_hook_module()
+        deployment = {
+            "litellm_params": {"model": "openai/kimi-k3.1-pro", "order": 0.3},
+            "model_info": {
+                "id": "relay-route",
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+            },
+        }
+
+        self.assertEqual(
+            hooks._request_surface_for_deployment(
+                {
+                    "call_type": "aresponses",
+                    "input": "hello",
+                    "reasoning": {"effort": "max", "summary": "auto"},
+                },
+                deployment,
+            ),
+            "openai/responses",
+        )
+
+    def test_a_route_that_serves_responses_keeps_it(self) -> None:
+        hooks, _ = load_hook_module()
+        deployment = {
+            "litellm_params": {"model": "openai/vendor-model", "order": 1},
+            "model_info": {
+                "id": "declared-route",
+                "upstream_url_surface": "openai/chat",
+                "upstream_protocol_mode": "fallback",
+                "supported_upstream_url_surfaces": ["openai/chat", "openai/responses"],
+            },
+        }
+
+        self.assertEqual(
+            hooks._request_surface_for_deployment(
+                {
+                    "call_type": "aresponses",
+                    "input": "hello",
+                    "reasoning": {"effort": "max", "summary": "auto"},
+                },
+                deployment,
+            ),
+            "openai/responses",
         )
 
     def test_fallback_chat_route_keeps_the_client_protocol_without_a_summary(self) -> None:

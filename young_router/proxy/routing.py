@@ -179,6 +179,7 @@ from .base import (
     _XHIGH_REASONING_EFFORT,
     _exception_text,
     _is_local_shutdown_exception,
+    _proxy_shutdown_in_progress,
     asyncio,
     contextvars,
     datetime,
@@ -1232,17 +1233,17 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
         # The default cools a rate-limited route down, because the alternative
         # was measured on the live gateway: one route answered 691 refusals in
         # 10.7 hours, recovered within five minutes four times (0.6%), and was
-        # still tried first on every request -- 113 minutes of the window spent
-        # waiting for a route that was not going to answer.  Two consecutive
-        # failures now park it for the ordinary window, so the next request
-        # starts on the tier that can serve.
+        # still tried first on every single request -- 113 minutes of the
+        # window spent waiting for a route that was not going to answer.  Two
+        # consecutive failures now park it for the ordinary window, so the
+        # next request starts on the tier that can serve.
         #
-        # An explicit policy is never overridden: a user who set ``error`` wants
-        # a terminal answer, and one who set ``recovery`` wants every 429 retried
-        # in place even when it repeats.  Only that ``recovery`` setting is
-        # refined, and only for an answer that named a reset beyond the retry
-        # horizon -- the route cannot serve before then, so retrying it first on
-        # every request buys only the same refusal.
+        # An explicit policy is never overridden: a user who set ``error``
+        # wants a terminal answer, and one who set ``recovery`` wants every 429
+        # retried in place even when it repeats.  Only that ``recovery``
+        # setting is refined, and only for an answer that named a reset beyond
+        # the retry horizon -- the route cannot serve before then, so retrying
+        # it first on every request buys only the same refusal.
         if rate_limit_policy == _RECOVERY_POLICY_RECOVERY and _is_quota_window_rate_limit_error(
             exception
         ):
@@ -5317,6 +5318,12 @@ def _active_cooldown_state_for_key(
 
 
 _REASONING_SUMMARY_OFF_VALUES = frozenset({"", "none", "off", "null", "false"})
+# A route may state, per model, whether the thinking its Responses wire carries
+# is readable, and which surfaces it serves at all.  Both answer the one
+# question selection asks before it replaces the client's protocol, and a route
+# that states neither is unknown rather than a "no".
+_RESPONSES_WIRE_REASONING_KEY = "supports_responses_reasoning_summary"
+_SUPPORTED_UPSTREAM_URL_SURFACES_KEY = "supported_upstream_url_surfaces"
 
 
 def _request_asks_for_reasoning_summary(request_kwargs: Optional[dict]) -> bool:
@@ -5334,19 +5341,57 @@ def _request_asks_for_reasoning_summary(request_kwargs: Optional[dict]) -> bool:
     return summary.strip().casefold() not in _REASONING_SUMMARY_OFF_VALUES
 
 
+def _deployment_responses_wire_provides_reasoning(deployment: Any) -> Optional[bool]:
+    """Whether this route's Responses wire streams thinking a client can read.
+
+    Three answers, because the route's own declaration is the only evidence
+    there is: a route that lists ``openai/responses`` among the surfaces it
+    serves, or states that its Responses wire carries readable thinking, says
+    yes; a route that states the opposite says no; a relay that says nothing is
+    unknown, and unknown keeps the client's own protocol.
+    """
+
+    if not isinstance(deployment, dict):
+        return None
+    model_info = deployment.get("model_info")
+    if not isinstance(model_info, dict):
+        return None
+    supported = model_info.get(_SUPPORTED_UPSTREAM_URL_SURFACES_KEY)
+    if isinstance(supported, list) and supported:
+        surfaces = {
+            _normalized_request_surface(value) for value in supported
+        }
+        return _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES in surfaces
+    declared = model_info.get(_RESPONSES_WIRE_REASONING_KEY)
+    if isinstance(declared, bool):
+        return declared
+    return None
+
+
 def _request_prefers_declared_chat_for_reasoning_summary(
     request_kwargs: Optional[dict],
     deployment: Any,
     client_surface: str,
 ) -> bool:
-    """Use a fallback route's declared chat wire when the client wants to see thinking.
+    """Use a fallback route's declared chat wire when Responses cannot show thinking.
 
     A route that declares ``openai/chat`` is also its own protocol fallback.
-    The Responses wire of such a relay can answer without exposing the streamed
+    The Responses wire of some relays answers without exposing the streamed
     reasoning text (DeepSeek returns an encrypted reasoning item with an empty
     summary), while the declared chat stream carries ``reasoning_content``
     chunk by chunk and the Responses chat bridge turns each chunk into a
-    summary delta.  Only a client that asked for a summary needs that wire;
+    summary delta.  Only a client that asked for a summary needs that wire.
+
+    "Some relays" is not "every relay": a ``fallback`` route whose Chat slot is
+    merely this app's guess about its backup protocol may serve
+    ``/v1/responses`` perfectly well, and sending it to Chat instead is a
+    protocol change nobody asked for -- measured live 2026-11-05, every Codex
+    turn on a ``kimi-k3.1-pro`` relay left on Chat while its Responses wire was
+    never tried.  So the declared Chat wire is used only when the route states
+    that its Responses wire cannot carry thinking; a route that says nothing
+    keeps the client's own protocol and pays one refused round trip if the
+    relay really cannot answer it.
+
     ``fixed`` mode and a route that declares another surface keep their own
     protocol choice.
     """
@@ -5357,7 +5402,9 @@ def _request_prefers_declared_chat_for_reasoning_summary(
         return False
     if client_surface != _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
         return False
-    return _request_asks_for_reasoning_summary(request_kwargs)
+    if not _request_asks_for_reasoning_summary(request_kwargs):
+        return False
+    return _deployment_responses_wire_provides_reasoning(deployment) is False
 
 
 def _request_surface_for_deployment(
