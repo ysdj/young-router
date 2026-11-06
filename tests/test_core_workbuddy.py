@@ -379,6 +379,102 @@ class WorkBuddyProviderTests(unittest.TestCase):
             self.assertTrue(domain.apply()["applied"])
             self.assertIn("order: 0.79", config.read_text(encoding="utf-8"))
 
+    def test_a_route_that_cannot_follow_a_rate_never_refuses_the_next_edit(self) -> None:
+        """A dead-end draft is refused at its own edit, not at every later one.
+
+        The reported failure: a route switched to 跟随倍率 whose account had not
+        published that model's rate was staged anyway, with no effective order.
+        Nothing can write that row — the dumper refuses a route with no order —
+        and validation reads every route of the provider, so the *next* ＋ the
+        user pressed failed with 更改未生效 while the earlier row sat there
+        marked, and every retry failed the same way.  The edit that asks for the
+        rate is where the answer belongs: a rate the account states is learned
+        then, and one it does not state refuses that edit alone, leaving a draft
+        the next edit can still write.
+        """
+
+        directory, domain, config = self._domain()
+        with directory:
+            provider = domain.dispatch("service_provider.add", {"kind": "workbuddy_login"})["providers"][0]
+            provider_id = provider["id"]
+            # An upstream this account's catalog does not list: no read can
+            # state a rate for it, so nothing can finish the row.
+            added = domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {"name": "unlisted", "upstream_model": "not-in-the-catalog", "enabled": True, "order": 0},
+                },
+            )["providers"][0]["models"][-1]
+            self.assertEqual(domain._published_rates, {})
+
+            with self.assertRaisesRegex(DomainError, "not published"):
+                domain.dispatch(
+                    "model.patch",
+                    {
+                        "provider_id": provider_id,
+                        "model_id": added["id"],
+                        "changes": {"order_mode": "relay_multiplier"},
+                    },
+                )
+            # The refused edit left no half-following row behind.
+            row = next(
+                model
+                for model in domain.snapshot()["providers"][0]["models"]
+                if model["id"] == added["id"]
+            )
+            self.assertEqual("manual", row["order_mode"])
+            self.assertTrue(domain.validate()["valid"])
+
+            # The next edit — the one the user reports as 更改未生效 — applies.
+            domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {"name": "another-model", "upstream_model": "another-model", "enabled": True, "order": 0},
+                },
+            )
+            self.assertTrue(domain.validate()["valid"])
+            self.assertTrue(domain.apply()["applied"])
+            self.assertIn("another-model", config.read_text(encoding="utf-8"))
+
+    def test_the_rate_an_account_states_is_learned_by_the_edit_that_needs_it(self) -> None:
+        """跟随倍率 on a route whose row has no number yet completes the row.
+
+        The row a ＋ creates carries no effective order, and the account's own
+        catalog is the only place its rate can come from: nothing in an Apply
+        asks for one.  The switch therefore has to learn it where the user asks,
+        or the edit is accepted and the write can never succeed.
+        """
+
+        directory, domain, config = self._domain()
+        with directory:
+            provider = domain.dispatch("service_provider.add", {"kind": "workbuddy_login"})["providers"][0]
+            provider_id = provider["id"]
+            added = domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {"name": "fresh-row", "upstream_model": "glm-5.3", "enabled": True, "order": 0},
+                },
+            )["providers"][0]["models"][-1]
+            self.assertEqual("manual", added["order_mode"])
+
+            followed = domain.dispatch(
+                "model.patch",
+                {
+                    "provider_id": provider_id,
+                    "model_id": added["id"],
+                    "changes": {"order_mode": "relay_multiplier"},
+                },
+            )["providers"][0]["models"][-1]
+            self.assertEqual("relay_multiplier", followed["order_mode"])
+            self.assertEqual(0.79, followed["effective_order"])
+            self.assertEqual(0.79, followed["order"])
+            self.assertTrue(domain.validate()["valid"])
+            self.assertTrue(domain.apply()["applied"])
+            self.assertIn("order: 0.79", config.read_text(encoding="utf-8"))
+
     def test_a_model_that_states_no_rate_is_not_a_free_model(self) -> None:
         """``None`` and ``0`` stay apart: an unpublished rate is not a price of zero."""
 

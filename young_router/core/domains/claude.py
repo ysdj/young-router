@@ -2078,11 +2078,21 @@ class ClaudeSettingsDomain:
         for the 1M option alone.  The standard row assumes 200k, which is the
         wrong number for a 1M route.  Only an absent key is set: a user who
         turned the preference off keeps it.
+
+        The preference is set only while a route *declares* 1M, because it is a
+        choice about the whole picker rather than about one row.  Setting it
+        wherever this app's proxy merely answered made every route the proxy
+        resolves as 1M collapse to a 1M row the app then could not run: a route
+        reads 1,048,576 from a provider profile or LiteLLM's table without
+        anything on the route saying so, and the row it lost was the only one
+        that answered.
         """
 
         if self._desktop is None or self._desktop.is_dirty():
             return
         if not self.desktop_uses_local_api():
+            return
+        if not self._declares_one_million_context():
             return
         state = self._desktop.draft_state()
         config = state.get("config") if isinstance(state, Mapping) else None
@@ -2093,6 +2103,26 @@ class ClaudeSettingsDomain:
             self._desktop.apply()
         except Exception:
             return
+
+    def _declares_one_million_context(self) -> bool:
+        """Whether the user declared a 1M window on any route this app serves.
+
+        Read from the routes' own metadata, not from ``/v1/models``.  That
+        listing also carries windows this app only resolves (LiteLLM's table for
+        an id, a provider registry's profile), and those are readings: a
+        ``gemini-3.8-flash`` route read 1,048,576 there while nothing on the
+        route said so.  The discovery view asks the same question through
+        ``claude_desktop_listing``, so the two cannot disagree.
+        """
+
+        from ...proxy import claude_desktop_listing as _listing
+
+        names = self._public_models() or []
+        for name in names:
+            declared = _listing._declared_context_window(name)
+            if isinstance(declared, int) and declared >= 1_000_000:
+                return True
+        return False
 
     def _retire_generated_desktop_list(self) -> None:
         """Drop the list this app used to write into Claude Desktop's profile.

@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import tempfile
 import textwrap
 import unittest
 
 from young_router.core.domains import DomainError
 from young_router.core.domains.providers_models import ProvidersModelsDomain
+from collections.abc import Mapping
+
+from young_router.core.model_catalog import catalog_payload
+from young_router.core.model_contexts import ModelContextRegistry
 
 
 PUBLIC_MODEL_CONFIG = """
@@ -50,6 +55,24 @@ model_list:
       order: 2
     model_info:
       id: "00000003"
+      provider: primary
+  - model_name: MiniMax-M3.1-Flash
+    litellm_params:
+      model: openai/MiniMax-M3.1-Flash
+      api_base: "https://backup.test/v1"
+      api_key: "replace-me-secret-2"
+      order: 3
+    model_info:
+      id: "00000004"
+      provider: backup
+  - model_name: minimax-m3.1-flash
+    litellm_params:
+      model: openai/minimax-m3.1-flash
+      api_base: "https://example.test/v1"
+      api_key: "replace-me-secret"
+      order: 0.1
+    model_info:
+      id: "00000005"
       provider: primary
 """
 
@@ -260,7 +283,7 @@ class PublicModelDomainTests(unittest.TestCase):
         )
         self.domain.apply()
         before = [model["model_name"] for model in self.models()]
-        self.assertEqual(4, len(before))
+        self.assertEqual(6, len(before))
 
         result = self.domain.dispatch("public.model_delete", {"public_model": "gpt-5.6-sol"})
 
@@ -272,12 +295,17 @@ class PublicModelDomainTests(unittest.TestCase):
             },
             result["operation_summary"],
         )
-        self.assertEqual(["kimi-k3"], [model["model_name"] for model in self.models()])
+        self.assertEqual(["kimi-k3", "minimax-m3.1-flash", "MiniMax-M3.1-Flash"], [model["model_name"] for model in self.models()])
         self.assertTrue(self.domain.validate()["valid"])
 
         self.domain.apply()
         reloaded = ProvidersModelsDomain(self.path)
-        self.assertEqual(["kimi-k3"], [model["model_name"] for model in reloaded.snapshot()["providers"][0]["models"] + reloaded.snapshot()["providers"][1]["models"]])
+        remaining = [
+            model["model_name"]
+            for provider in reloaded.snapshot()["providers"]
+            for model in provider["models"]
+        ]
+        self.assertEqual(["kimi-k3", "minimax-m3.1-flash", "MiniMax-M3.1-Flash"], remaining)
         self.assertNotIn("gpt-5.6-sol", self.path.read_text(encoding="utf-8"))
 
         # A name no route serves is refused instead of silently doing nothing.
@@ -456,6 +484,87 @@ class PublicModelDomainTests(unittest.TestCase):
         contexts = self.domain.snapshot()["model_contexts"]
         self.assertEqual(272000, contexts["gpt-5.6-sol"]["context_window"])
         self.assertEqual(262144, contexts["kimi-k3"]["context_window"])
+
+    def test_one_public_model_is_one_group_in_every_case_it_is_spelled(self) -> None:
+        """A name one model answers to is one group, not one per spelling.
+
+        ``minimax-m3.1-flash`` and ``MiniMax-M3.1-Flash`` reach one model; two
+        groups meant two settings surfaces for one name, an order rewritten for
+        half the routes, and a context window each half claimed the other could
+        not honour.  The group is the name's identity, and the spelling stays
+        exactly as the document states it.
+        """
+
+        # One group's action reaches every route that spells the name.
+        self.domain.dispatch(
+            "public.model_patch",
+            {"public_model": "MiniMax-M3.1-Flash", "changes": {"max_input_tokens": 196608}},
+        )
+        self.assertEqual(196608, self.model("00000004")["max_input_tokens"])
+        self.assertEqual(196608, self.model("00000005")["max_input_tokens"])
+
+        # The projection publishes one entry for the group, and the registry
+        # resolves both routes as one name.
+        contexts = self.domain.snapshot()["model_contexts"]
+        self.assertEqual(1, len([key for key in contexts if key.lower() == "minimax-m3.1-flash"]))
+
+        # A group reorder names the routes of both spellings, and one route the
+        # caller forgot is a stale order rather than a half-rewritten group.
+        self.domain.dispatch(
+            "routes.reorder_group",
+            {
+                "public_model": "MINIMAX-M3.1-FLASH",
+                "route_ids": ["00000005", "00000004"],
+                "renumber": True,
+            },
+        )
+        self.assertEqual(0, self.model("00000005")["manual_order"])
+        self.assertEqual(1, self.model("00000004")["manual_order"])
+
+        # A rename is one identity change: the other spelling of this group is
+        # not another group standing in its way, and both routes move together.
+        # Settling a group's case is allowed — one route may restate the name it
+        # already serves.
+        self.domain.dispatch(
+            "model.patch",
+            {"provider_id": "primary", "model_id": "00000005", "changes": {"model_name": "MINIMAX-M3.1-FLASH"}},
+        )
+        self.assertEqual("MiniMax-M3.1-Flash", self.model("00000004")["model_name"])
+        self.domain.dispatch(
+            "public.model_patch",
+            {"public_model": "MiniMax-M3.1-Flash", "changes": {"name": "MiniMax-M3.2-Flash"}},
+        )
+        self.assertEqual("MiniMax-M3.2-Flash", self.model("00000004")["model_name"])
+        self.assertEqual("MiniMax-M3.2-Flash", self.model("00000005")["model_name"])
+        self.domain.apply()
+        saved = self._saved()
+        self.assertEqual(
+            ["gpt-5.6-sol", "kimi-k3", "MiniMax-M3.2-Flash"],
+            saved["litellm_settings"]["public_model_groups"],
+        )
+
+    def test_a_rename_refuses_a_name_another_group_already_has_in_any_case(self) -> None:
+        with self.assertRaisesRegex(DomainError, "already exists"):
+            self.domain.dispatch(
+                "public.model_patch",
+                {"public_model": "gpt-5.6-sol", "changes": {"name": "Kimi-K3"}},
+            )
+
+    def test_the_saved_group_table_lists_one_entry_per_identity(self) -> None:
+        """A document whose rows disagree about case publishes one group.
+
+        Both spellings are written in ``model_list`` — they are the routes' own
+        names — but the group table states the identity once, in the lower-case
+        spelling a client is most likely to send.
+        """
+
+        self.domain.apply()
+        saved = self._saved()
+        self.assertEqual(
+            ["gpt-5.6-sol", "kimi-k3", "minimax-m3.1-flash"],
+            saved["litellm_settings"]["public_model_groups"],
+        )
+        self.assertIn("model_name: MiniMax-M3.1-Flash", self.path.read_text(encoding="utf-8"))
 
     def test_the_draft_custom_limit_never_masks_the_registry_default(self) -> None:
         self.domain.dispatch(
@@ -713,6 +822,44 @@ class PublicModelDomainTests(unittest.TestCase):
         self.domain.apply()
         self.assertNotIn("router_settings", self._saved())
 
+    def test_a_hop_that_names_a_group_in_another_case_survives(self) -> None:
+        """The fallback graph names one group, in whatever case it was written.
+
+        A hop is resolved by identity, so a document that spells
+        ``MINIMAX-M3.1-FLASH`` names the group the router serves rather than a
+        group that does not exist.  Comparing the literal text dropped the hop,
+        which is a fallback the user configured silently disappearing on a
+        save.
+        """
+
+        self._with_router_settings(
+            """
+            router_settings:
+              fallbacks:
+                - kimi-k3:
+                    - MINIMAX-M3.1-FLASH
+              model_group_alias:
+                fast-minimax: MiniMax-M3.1-Flash
+            """
+        )
+
+        self.domain.dispatch(
+            "public.model_patch",
+            {"public_model": "kimi-k3", "changes": {"max_input_tokens": 262144}},
+        )
+        self.domain.apply()
+        saved = self._saved()
+
+        # The hop is restated in the spelling the group table publishes.
+        self.assertEqual(
+            [{"kimi-k3": ["minimax-m3.1-flash"]}],
+            saved["router_settings"]["fallbacks"],
+        )
+        self.assertEqual(
+            {"fast-minimax": "minimax-m3.1-flash"},
+            saved["router_settings"]["model_group_alias"],
+        )
+
     def test_the_catch_all_fallback_chain_survives_a_rename(self) -> None:
         """``"*"`` is the Router's catch-all key, not a group name.
 
@@ -741,6 +888,280 @@ class PublicModelDomainTests(unittest.TestCase):
         self.assertEqual(
             [{"*": ["sol-next", "kimi-k3"]}], saved["router_settings"]["fallbacks"]
         )
+
+
+class UnknownModelTakesItsRoutesStatedWindowTests(unittest.TestCase):
+    """A model no profile knows is published with the window its route states.
+
+    Observed live 2026-11-05: ``hy4free``/``hy4std`` on a WorkBuddy account
+    state 960,000 in that account's own catalog, and the registry resolves the
+    name from nothing -- no bundled profile, no pi.dev record, no LiteLLM entry.
+    The unknown-model placeholder 272,000 was then published for both, on every
+    surface at once: the pane's 公开上下文, the 推荐上下文 beside it, and the
+    managed catalog Codex compacts against.  A client compacted a 960,000-token
+    model at 272,000.
+
+    The rule that produced that was written for the opposite case -- a lane
+    whose capability table does not carry a model publishes its generic
+    fallback, and that number is not a window.  This test states both halves:
+    the reading answers where nothing else does, and never where a profile
+    does.
+    """
+
+    def _domain(self, root: Path, names: str) -> ProvidersModelsDomain:
+        config = root / "config.yaml"
+        config.write_text(
+            "providers:\n"
+            "  primary:\n"
+            '    api_base: "https://example.test/v1"\n'
+            "    api_keys:\n"
+            "      - name: default\n"
+            '        value: "replace-me-secret"\n'
+            "model_list:\n"
+            f"  - model_name: {names}\n"
+            "    litellm_params:\n"
+            "      model: openai/fresh-model\n"
+            f"      api_base: \"https://example.test/v1\"\n"
+            "      api_key: \"replace-me-secret\"\n"
+            "    model_info:\n"
+            "      id: \"00000001\"\n"
+            "      provider: primary\n",
+            encoding="utf-8",
+        )
+        return ProvidersModelsDomain(config)
+
+    def _write_pulse_profile(self, root: Path) -> None:
+        """The pi.dev profile the 2026-11-04 incident was measured against."""
+
+        (root / "model-contexts.json").write_text(
+            json.dumps(
+                {
+                    "fetched_at": 1_000_000.0,
+                    "records": {
+                        "opencode/pulse-alpha-free": {
+                            "context_window": 1_048_576,
+                            "max_context_window": 1_048_576,
+                            "effective_context_window_percent": 95,
+                            "source": "https://pi.dev/api/models",
+                            "priority": 40,
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_a_name_no_profile_resolves_takes_the_window_its_upstream_stated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = self._domain(root, "fresh-model")
+            domain._context_registry().remember_stated_windows({"fresh-model": 960_000})
+            contexts = domain.snapshot()["model_contexts"]["fresh-model"]
+            self.assertEqual(960_000, contexts["context_window"])
+            self.assertEqual(960_000, contexts["max_context_window"])
+            # The recommendation is the same number, because there is no pi.dev
+            # profile to name beside it: reporting the placeholder there would
+            # put two figures on one model and invite 设置 to write the wrong one.
+            self.assertEqual(960_000, contexts["recommended_context_window"])
+            # The managed catalog is written through the same resolution, so the
+            # two surfaces cannot disagree about the number a client compacts
+            # against.
+            catalog = catalog_payload(
+                ["fresh-model"], registry=domain._context_registry()
+            )
+            self.assertEqual(960_000, catalog["models"][0]["context_window"])
+
+    def test_a_profile_still_wins_over_the_number_an_upstream_advertises(self) -> None:
+        """The 2026-11-04 incident: a lane's fallback is not a window.
+
+        ``pulse-alpha-free`` resolves through the registry's own record, so a
+        catalog read stating a smaller number -- that lane advertised the model's
+        output ceiling, 131,072, against a 1,048,576 context -- must not move it.
+        This is the half of the rule that keeps the fix above from undoing the
+        protection it sits beside.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_pulse_profile(root)
+            config = root / "config.yaml"
+            config.write_text(
+                "providers:\n"
+                "  primary:\n"
+                '    api_base: "https://example.test/v1"\n'
+                "    api_keys:\n"
+                "      - name: default\n"
+                '        value: "replace-me-secret"\n'
+                "model_list:\n"
+                "  - model_name: pulse-alpha-free\n"
+                "    litellm_params:\n"
+                "      model: openai/pulse-alpha-free\n"
+                '      api_base: "https://example.test/v1"\n'
+                '      api_key: "replace-me-secret"\n'
+                "    model_info:\n"
+                '      id: "00000001"\n'
+                "      provider: primary\n",
+                encoding="utf-8",
+            )
+            domain = ProvidersModelsDomain(config)
+            domain._context_registry().remember_stated_windows(
+                {"pulse-alpha-free": 131_072}
+            )
+            contexts = domain.snapshot()["model_contexts"]["pulse-alpha-free"]
+            self.assertEqual(1_048_576, contexts["context_window"])
+            # The reading is still kept, and it is still only a reading: the
+            # cache records it for the row that says whose number it is, while
+            # the resolved window above stayed the profile's.
+            self.assertEqual(
+                131_072,
+                domain._context_registry().stated_windows().get("pulse-alpha-free"),
+            )
+
+    def test_a_declared_window_is_never_replaced_by_a_reading(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = self._domain(root, "fresh-model")
+            domain.dispatch(
+                "public.model_patch",
+                {"public_model": "fresh-model", "changes": {"max_input_tokens": 64_000}},
+            )
+            domain.apply()
+            domain._context_registry().remember_stated_windows({"fresh-model": 960_000})
+            contexts = domain.snapshot()["model_contexts"]["fresh-model"]
+            self.assertEqual(64_000, contexts["context_window"])
+            # The declaration is the group's own, and it stays untouched by the
+            # route's reading on disk as well.
+            self.assertEqual(
+                64_000,
+                next(
+                    model["max_input_tokens"]
+                    for provider in domain.snapshot()["providers"]
+                    for model in provider["models"]
+                ),
+            )
+
+class ContradictedInferenceTakesTheUpstreamsWindowTests(unittest.TestCase):
+    """A suffix match that picked an outlier loses to the serving upstream.
+
+    Observed live 2026-11-05: ``minimax-m3.1-flash`` on a WorkBuddy account was
+    published at 262,144 while that account's own catalog states 1,000,000.  The
+    public name is in no record itself, so it resolved by suffix match over every
+    provider's copy of the id: seven state 1,000,000 or 1,048,576 and one --
+    nvidia's -- states 262,144, and ``_lookup`` takes the smallest of the
+    top-priority set.  The group was published at a quarter of what its own
+    upstream will accept.
+
+    The rule that decides it reads both sides.  The upstream must agree with the
+    copies the inference passed over; when it agrees with nobody its number is
+    the 2026-11-04 fallback, a reading for its own row and not a window -- which
+    is the case this test's sibling pins.
+    """
+
+    PROFILE = {
+        "context_window": 1_000_000,
+        "max_context_window": 1_000_000,
+        "effective_context_window_percent": 95,
+        "source": "https://pi.dev/api/models",
+        "priority": 40,
+    }
+
+    def _registry(self, root: Path, copies: Mapping[str, int]) -> ModelContextRegistry:
+        (root / "model-contexts.json").write_text(
+            json.dumps(
+                {
+                    "fetched_at": 1_000_000.0,
+                    "records": {
+                        key: {**self.PROFILE, "context_window": window, "max_context_window": window}
+                        for key, window in copies.items()
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return ModelContextRegistry(
+            runtime_config_path=root / "config.yaml",
+            cache_path=root / "model-contexts.json",
+            refresh_enabled=False,
+        )
+
+    def _domain(self, root: Path, name: str, wire: str) -> ProvidersModelsDomain:
+        config = root / "config.yaml"
+        config.write_text(
+            "providers:\n"
+            "  primary:\n"
+            '    api_base: "https://example.test/v1"\n'
+            "    api_keys:\n"
+            "      - name: default\n"
+            '        value: "replace-me-secret"\n'
+            "model_list:\n"
+            f"  - model_name: {name}\n"
+            "    litellm_params:\n"
+            f"      model: openai/{wire}\n"
+            '      api_base: "https://example.test/v1"\n'
+            '      api_key: "replace-me-secret"\n'
+            "    model_info:\n"
+            '      id: "00000001"\n'
+            "      provider: primary\n",
+            encoding="utf-8",
+        )
+        return ProvidersModelsDomain(config)
+
+    def test_the_group_takes_the_window_its_own_upstream_states(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._registry(
+                root,
+                {
+                    "minimax/minimax-m3.1-flash": 1_000_000,
+                    "minimax-cn/minimax-m3.1-flash": 1_000_000,
+                    "opencode-go/minimax-m3.1-flash": 1_000_000,
+                    "huggingface/minimaxai/minimax-m3.1-flash": 1_000_000,
+                    "openrouter/minimax/minimax-m3.1-flash": 1_048_576,
+                    "nvidia/minimaxai/minimax-m3.1-flash": 262_144,
+                },
+            )
+            domain = self._domain(root, "minimax-m3.1-flash", "minimax-m3.1-flash")
+            registry = domain._context_registry()
+            self.assertEqual(262_144, registry.record_for("minimax-m3.1-flash").context_window)
+            registry.remember_stated_windows({"minimax-m3.1-flash": 1_000_000})
+            contexts = domain.snapshot()["model_contexts"]["minimax-m3.1-flash"]
+            self.assertEqual(1_000_000, contexts["context_window"])
+            self.assertEqual(1_000_000, contexts["recommended_context_window"])
+
+    def test_an_upstream_that_agrees_with_no_copy_keeps_its_reading(self) -> None:
+        """The 2026-11-04 shape: the lane's fallback is not a window.
+
+        One copy, agreeing with the upstream, is not a contradiction -- the
+        upstream disagrees with the registry here, and the rule requires the
+        upstream to agree with a copy the inference passed over.  So the lane's
+        131,072 stays the reading in its own row while the published window is
+        the model's 1,048,576.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._registry(root, {"opencode/pulse-alpha-free": 1_048_576})
+            domain = self._domain(root, "pulse-alpha-free", "pulse-alpha-free")
+            registry = domain._context_registry()
+            registry.remember_stated_windows({"pulse-alpha-free": 131_072})
+            contexts = domain.snapshot()["model_contexts"]["pulse-alpha-free"]
+            self.assertEqual(1_048_576, contexts["context_window"])
+
+    def test_an_exact_profile_is_never_contradicted(self) -> None:
+        """A record that names the id is a lookup, not an inference.
+
+        ``deepseek-v4.1-flash`` is stated exactly by several providers, so no
+        catalog read may move it however different the number it states.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._registry(root, {"deepseek/deepseek-v4.1-flash": 1_000_000})
+            domain = self._domain(root, "deepseek-v4.1-flash", "deepseek-v4.1-flash")
+            registry = domain._context_registry()
+            registry.remember_stated_windows({"deepseek-v4.1-flash": 64_000})
+            contexts = domain.snapshot()["model_contexts"]["deepseek-v4.1-flash"]
+            self.assertEqual(1_000_000, contexts["context_window"])
 
 
 if __name__ == "__main__":

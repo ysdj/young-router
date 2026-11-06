@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import stat
 import sys
+import inspect
 import tempfile
 import textwrap
 import yaml
@@ -23,6 +24,7 @@ from young_router.adapters import veridrop
 from young_router.core.domains.relay_accounts import RelayAccountsDomain
 from young_router.core.domains.runtime import RuntimeSettingsDomain
 from young_router.core.domains.webdav import WebDAVSettingsDomain
+from young_router.webdav import core as webdav_core
 from young_router.core.model_catalog import catalog_is_current
 from young_router.core.service import CoreError, CoreStore
 from young_router.core.runtime_settings_io import RuntimeSettingSpec
@@ -1494,6 +1496,51 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
+    def test_model_probe_asks_the_documented_messages_root(self) -> None:
+        """A DeepSeek base serves Messages under `/anthropic`, not its OpenAI base.
+
+        The probe is where a route's usable protocols are decided, so asking
+        the OpenAI base for `/v1/messages` reported a working Messages wire as
+        unreachable and offered no way to select it.  The probe now reads the
+        same resolver the request adapter does.
+        """
+
+        requested: list[str] = []
+
+        class Response:
+            status = 200
+
+            def read(self, _limit: int) -> bytes:
+                return b'{"content":[{"type":"text","text":"OK"}]}'
+
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, _type: object, _value: object, _traceback: object) -> bool:
+                return False
+
+        class Opener:
+            def open(self, request: object, *, timeout: float) -> Response:
+                requested.append(request.full_url)
+                return Response()
+
+        with mock.patch(
+            "young_router.core.domains.providers_models.isolated_http_opener",
+            return_value=Opener(),
+        ):
+            result = ProvidersModelsDomain._surface_probe(
+                surface="anthropic",
+                api_base="https://api.deepseek.com/v1",
+                credential="sk-synthetic-deepseek",
+                model_name="deepseek-flash",
+            )
+
+        self.assertEqual(
+            ["https://api.deepseek.com/anthropic/v1/messages"], requested
+        )
+        self.assertTrue(result["available"])
+        self.assertEqual("ok", result["status"])
+
     def test_model_probe_reports_recommendation_without_staging_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.yaml"
@@ -1945,6 +1992,208 @@ class ProvidersModelsDomainTests(unittest.TestCase):
         self.assertEqual("openai/chat", result["recommended_surface"])
         self.assertTrue(result["ok"])
         self.assertFalse(result["unreachable"])
+
+    def test_an_image_route_is_measured_on_the_wire_it_actually_serves(self) -> None:
+        """A generator refuses every chat surface by design, not by failing.
+
+        Asking a generator the three chat questions reported 0/3 with
+        «协议不通» on a route that answers its own Images endpoint perfectly,
+        and offered a protocol switch the route cannot honour.  The modality
+        decides the question, so the probe asks the Images endpoint and reports
+        one surface answering.  ``gpt-image-2.5-flare`` is the spelling the
+        bundled cost map states, which is the configuration this install ships:
+        a name the table omits is covered by the behavioural fallback below.
+        """
+
+        surfaces_asked: list[str] = []
+
+        def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
+            surfaces_asked.append(surface)
+            return {
+                "surface": surface,
+                "available": surface == "openai/images",
+                "status": "ok" if surface == "openai/images" else "http_error",
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(deep_test_config(model_name="gpt-image-2.5-flare"), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            with mock.patch.object(
+                ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe
+            ):
+                result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
+
+        self.assertEqual(["openai/images"], surfaces_asked)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["available"])
+        # The chat wires are not candidates, so there is nothing to move it to.
+        self.assertIsNone(result["recommended_surface"])
+        self.assertEqual({"openai/images": "ok"}, result["summary"]["statuses"])
+        # The staged authenticity suite compares a chat answer against the
+        # request that asked for it, and an Images answer is not one.
+        self.assertFalse(result["degradation"]["status"] == "error")
+
+    def test_a_generator_the_cost_map_omits_is_found_by_asking_the_images_wire(self) -> None:
+        """The modality is not always readable before the first request.
+
+        The Core fixes LiteLLM's cost map to the copy bundled with this install
+        (``sitecustomize`` sets ``LITELLM_LOCAL_MODEL_COST_MAP``), and
+        ``gpt-image-2.6-flare`` is absent from 1.108.1's: a provider that ships
+        a model ahead of the table leaves the modality unknown.  The answer is
+        then behavioural -- every chat wire refused, the Images wire answered --
+        and a route that answers any chat wire is never asked the extra
+        question.
+        """
+
+        surfaces_asked: list[str] = []
+
+        # The three refusals are the three shapes a relay really gives this
+        # route: 400/502 on the chat wires and a 403 permission body (read as
+        # ``egress_blocked``) on Messages.  All three are the model not being
+        # served there, so all three send the probe to the Images wire.
+        refusals = {
+            "openai/chat": "http_error",
+            "openai/responses": "http_error",
+            "anthropic": "egress_blocked",
+        }
+
+        def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
+            surfaces_asked.append(surface)
+            answered = surface == "openai/images"
+            return {
+                "surface": surface,
+                "available": answered,
+                "status": "ok" if answered else refusals.get(surface, "http_error"),
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(deep_test_config(model_name="gpt-image-2.5-flare"), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            with mock.patch.object(
+                ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe
+            ), mock.patch.object(
+                ProvidersModelsDomain, "_serves_images", return_value=False
+            ):
+                result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
+
+        self.assertIn("openai/images", surfaces_asked)
+        self.assertTrue(result["ok"])
+        self.assertEqual({"openai/images": "ok"}, result["summary"]["statuses"])
+        self.assertIsNone(result["recommended_surface"])
+
+    def test_a_transport_failure_does_not_send_the_probe_to_the_images_wire(self) -> None:
+        """An unreachable route has no answer to learn from.
+
+        A refused or timed-out connection says nothing about which wire the
+        route serves, so asking the Images endpoint would replace "could not
+        reach it" with a verdict about a wire that was never the question.
+        """
+
+        surfaces_asked: list[str] = []
+
+        def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
+            surfaces_asked.append(surface)
+            return {"surface": surface, "available": False, "status": "network_error"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(deep_test_config(model_name="gpt-image-2.5-flare"), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            with mock.patch.object(
+                ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe
+            ), mock.patch.object(
+                ProvidersModelsDomain, "_serves_images", return_value=False
+            ):
+                result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
+
+        self.assertNotIn("openai/images", surfaces_asked)
+        self.assertTrue(result["unreachable"])
+
+    def test_a_chat_route_is_never_asked_the_images_question(self) -> None:
+        """Only a route that refused every chat wire pays for the extra request."""
+
+        surfaces_asked: list[str] = []
+
+        def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
+            surfaces_asked.append(surface)
+            return {"surface": surface, "available": True, "status": "ok"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(deep_test_config(model_name="gpt-6.1-sol"), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            with mock.patch.object(
+                ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe
+            ), mock.patch.object(
+                ProvidersModelsDomain, "_serves_images", return_value=False
+            ):
+                result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
+
+        self.assertNotIn("openai/images", surfaces_asked)
+        self.assertTrue(result["ok"])
+
+    def test_the_pane_is_told_when_a_route_only_generates_images(self) -> None:
+        """The window row has nothing to state for a generator.
+
+        Core publishes ``serves_images`` on the model projection, and the pane
+        draws no 公开上下文 row when it is true -- a generator holds no
+        conversation, so a number there would describe something that does not
+        exist.  The flag travels with the same surface list the probe uses, so
+        the pane and the probe cannot disagree about the modality.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(deep_test_config(model_name="gpt-image-2.5-flare"), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            # The answer must be an instance method: as a classmethod, `self` is
+            # the class and `_context_registry` does not exist on it, so the
+            # `except` below swallowed the AttributeError and the pane kept the
+            # row it was supposed to drop.
+            self.assertNotIsInstance(
+                inspect.getattr_static(ProvidersModelsDomain, "_serves_images"),
+                classmethod,
+            )
+            with mock.patch.object(
+                ProvidersModelsDomain, "_serves_images", return_value=True
+            ):
+                model = domain.snapshot()["providers"][0]["models"][0]
+                self.assertTrue(model["serves_images"])
+                self.assertEqual(["openai/images"], model["probe_surfaces"])
+
+            with mock.patch.object(
+                ProvidersModelsDomain, "_serves_images", return_value=False
+            ):
+                model = domain.snapshot()["providers"][0]["models"][0]
+                self.assertFalse(model["serves_images"])
+                self.assertEqual(
+                    ["openai/responses", "openai/chat", "anthropic"],
+                    model["probe_surfaces"],
+                )
+
+    def test_a_text_route_is_still_measured_on_the_three_chat_wires(self) -> None:
+        """The Images question is asked only where the modality says so."""
+
+        surfaces_asked: list[str] = []
+
+        def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
+            surfaces_asked.append(surface)
+            return {"surface": surface, "available": True, "status": "ok"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(deep_test_config(model_name="gpt-6.1-sol"), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            with mock.patch.object(
+                ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe
+            ):
+                result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
+
+        self.assertEqual(["anthropic", "openai/chat", "openai/responses"], sorted(surfaces_asked))
+        self.assertNotIn("openai/images", surfaces_asked)
+        self.assertTrue(result["ok"])
 
     def test_model_probe_names_a_403_permission_body_as_an_egress_block(self) -> None:
         """A 403 that refused the network is not a refused credential.
@@ -4108,16 +4357,65 @@ class WebDAVSettingsDomainTests(unittest.TestCase):
             status = root / "webdav-sync-status.json"
             domain = WebDAVSettingsDomain(root / "webdav.json", enabled_path=root / "enabled", status_path=status)
             domain.dispatch("patch", {"url": "https://example.test/webdav/", "remote_name": "config.json"})
+
+            def must_not_create(*args: object, **kwargs: object) -> None:
+                raise AssertionError("a probe must not create the collection")
+
             with mock.patch("young_router.webdav.core.WebDAVClient.head", return_value=(200, {})), mock.patch(
-                "young_router.webdav.core.WebDAVClient.try_mkcol"
-            ):
+                "young_router.webdav.core.WebDAVClient.collection_access", return_value="writable"
+            ), mock.patch("young_router.webdav.core.WebDAVClient.try_mkcol", must_not_create):
                 result = domain.probe()
 
-            self.assertEqual({"ok": True, "protocols": ["webdav"], "detail": "WebDAV probe succeeded"}, result)
+            self.assertEqual(
+                {"ok": True, "writable": True, "protocols": ["webdav"], "detail": "WebDAV probe succeeded"}, result
+            )
             recorded = json.loads(status.read_text(encoding="utf-8"))
             self.assertEqual("probe", recorded["action"])
             self.assertTrue(recorded["ok"])
             self.assertEqual(0o600, stat.S_IMODE(status.stat().st_mode))
+
+    def test_a_collection_that_does_not_exist_yet_is_not_a_failure(self) -> None:
+        """409 is how a server answers HEAD under a folder that is not there.
+
+        坚果云 answers HEAD ``<missing folder>/bundle.json`` with 409, and a
+        probe read that as a broken connection.  It has to mean "nothing to
+        show yet": the collection is created by the first push, not by asking.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = WebDAVSettingsDomain(root / "webdav.json", enabled_path=root / "enabled", status_path=root / "status.json")
+            domain.dispatch("patch", {"url": "https://example.test/dav/new/", "remote_name": "config.json"})
+            conflict = webdav_core.WebDAVHTTPError("HEAD", "https://example.test/dav/new/config.json", 409, "Conflict", b"")
+            with mock.patch("young_router.webdav.core.WebDAVClient.head", side_effect=conflict), mock.patch(
+                "young_router.webdav.core.WebDAVClient.collection_access", return_value="missing"
+            ):
+                result = domain.probe()
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["writable"])
+            self.assertEqual("WebDAV collection does not exist yet", result["detail"])
+
+    def test_a_read_only_collection_is_not_reported_as_a_working_one(self) -> None:
+        """Connected is not the same as able to receive the bundle.
+
+        The URL that failed to sync pointed at a mount point the server grants
+        read only, and the probe still answered "connection OK" -- the one
+        fact that would have explained the failure was the one it withheld.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = WebDAVSettingsDomain(root / "webdav.json", enabled_path=root / "enabled", status_path=root / "status.json")
+            domain.dispatch("patch", {"url": "https://example.test/dav/", "remote_name": "config.json"})
+            with mock.patch("young_router.webdav.core.WebDAVClient.head", return_value=(404, {})), mock.patch(
+                "young_router.webdav.core.WebDAVClient.collection_access", return_value="read_only"
+            ):
+                result = domain.probe()
+
+            self.assertTrue(result["ok"])
+            self.assertFalse(result["writable"])
+            self.assertEqual("WebDAV collection is read-only", result["detail"])
 
     def test_a_candidate_probe_tests_the_form_values_without_staging_them(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4131,8 +4429,9 @@ class WebDAVSettingsDomainTests(unittest.TestCase):
                 def __init__(self, settings: object) -> None:
                     seen["url"] = str(getattr(settings, "url", ""))
 
-                def try_mkcol(self, url: str) -> None:
-                    seen["collection"] = url
+                def collection_access(self) -> str:
+                    seen["access"] = "asked"
+                    return "writable"
 
                 def head(self, url: str) -> tuple[int, dict[str, str]]:
                     return 404, {}

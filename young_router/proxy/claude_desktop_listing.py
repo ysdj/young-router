@@ -25,7 +25,7 @@ not the desktop app's own gets exactly what it got before this module existed.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from typing import Any, Final
 
@@ -94,9 +94,93 @@ def _route_is_image(name: str) -> bool:
         return False
 
 
+def _public_context_window(name: str) -> int | None:
+    """The window this app publishes for one route.
+
+    ``ModelContextRegistry.record_for`` is the single resolution every other
+    surface already reads (the pane's published window, the managed Codex
+    catalog), so a discovery row cannot state a second, larger reading of the
+    same route.  An unreadable registry or cache is no observation, and the row
+    then states nothing.
+    """
+
+    try:
+        from ..core.model_catalog import _image_filter_registry
+
+        return int(_image_filter_registry().record_for(name).context_window)
+    except Exception:
+        return None
+
+
+def _declared_context_window(name: str) -> int | None:
+    """The window the user declared on a route, or ``None`` when they declared none.
+
+    ``record_for`` is the published number, and it is the right number to
+    *state*.  It is not evidence that a route can run at 1M: a registry profile
+    can carry an upstream catalogue's own reading (``pulse-alpha-free`` read
+    1,048,576 there while its lane states 131,072), and the app treats any row
+    at 1M as a route that offers 1M.  Only a window the user wrote on the route
+    says that, which is what ``_custom_contexts`` collects.
+    """
+
+    try:
+        from ..core.model_catalog import _image_filter_registry
+
+        declared = _image_filter_registry()._custom_contexts(name)
+        return min(declared) if declared else None
+    except Exception:
+        return None
+
+
+def _published_context(
+    public_id: str,
+    row: Mapping[str, object],
+    public_window: Callable[[str], int | None],
+    declared_window: Callable[[str], int | None],
+) -> object:
+    """The ``max_input_tokens`` one discovery row states.
+
+    The number is the route's published window, resolved once, never the one its
+    upstream advertises in the listing.  The app reads a row at 1M as "offers
+    1M" and, beside the profile's 1M preference, hides that route's standard
+    row -- so an advertised 1048576 / 1050000 turned routes that are not 1M
+    (``gemini-3.8-flash``, ``gpt-5.4``) into 1M rows whose only picker entry
+    answered ``Invalid model name``.
+
+    A window at or above 1M is published only when the user declared one: the
+    flag that hides the standard row is a claim about the route, and a registry
+    profile is not the user.  Below 1M the published number is stated as it is
+    (it is what the picker reports), and a window this app cannot resolve states
+    nothing.
+
+    Only an alias row is rewritten: a Claude-shaped route is already listed
+    under the id it sends and keeps its own row and metadata.
+    """
+
+    if desktop_keeps_model_id(public_id):
+        return row.get("max_input_tokens")
+    try:
+        window = public_window(public_id)
+        if not isinstance(window, int) or isinstance(window, bool):
+            return None
+        # A generator resolves ``0``: its catalog states no window because it
+        # holds no conversation.  Stating ``0`` here would be a limit Claude
+        # Desktop reads as "this model cannot be given a prompt"; the row
+        # states nothing instead, exactly as for an unresolved route.
+        if window <= 0:
+            return None
+        if window >= 1_000_000 and declared_window(public_id) is None:
+            return None
+        return window
+    except Exception:
+        return None
+
+
 def desktop_model_rows(
     response: Mapping[str, object],
     display_names: Mapping[str, str] | None = None,
+    public_window: Callable[[str], int | None] | None = None,
+    declared_window: Callable[[str], int | None] | None = None,
 ) -> dict[str, object]:
     """Rewrite one Anthropic-shaped listing for Claude Desktop's discovery.
 
@@ -106,8 +190,14 @@ def desktop_model_rows(
     with the public name as ``display_name`` -- the app shows that name and
     derives the full effort ladder from the alias family.  Image generators are
     dropped in both cases.
+
+    ``public_window`` is the one public number a route states and
+    ``declared_window`` the window the user wrote on it; both are injectable so
+    the view can be checked without reading this machine's catalog cache.
     """
 
+    window_for = public_window or _public_context_window
+    declared_for = declared_window or _declared_context_window
     names = display_names if isinstance(display_names, Mapping) else {}
     rows: list[dict[str, object]] = []
     for row in response.get("data") or []:
@@ -128,12 +218,12 @@ def desktop_model_rows(
                 "id": claude_desktop_alias(public_id),
                 "display_name": str(display_name),
                 "created_at": row.get("created_at"),
-                # The app reads this to know a route's context window is 1M.
-                # Omitting it made every alias fall back to 200k, which is the
-                # wrong number the picker showed for a 1M route.  The app marks
-                # such a row as its 1M variant; modelPrefer1mContext keeps that
-                # to one row instead of a second standard one.
-                "max_input_tokens": row.get("max_input_tokens"),
+                # This is the app's reader of a route's window, and it decides
+                # one thing only: whether the row reads as offering 1M.  The
+                # number is the route's published window, never the one the
+                # listing's upstream reading stated, and a 1M claim needs the
+                # user's own declaration (see ``_published_context``).
+                "max_input_tokens": _published_context(public_id, row, window_for, declared_for),
                 "max_tokens": row.get("max_tokens"),
             }
         )

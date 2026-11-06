@@ -294,15 +294,17 @@ def _route_is_image_model(registry: ModelContextRegistry, name: str) -> bool:
 
     The public catalogs (pi.dev, models.dev) already state the modality, so the
     prefix heuristic the provider pane uses is not needed here.  A route earns
-    the answer when one of its deployments resolves an image contract and no
-    deployment states a thinking level above the disabled step: a group that
-    also serves a reasoning text model keeps its ladder, and a deployment the
-    registry cannot resolve (a retired alias beside two live ones) does not veto
-    the two that agree.
+    the answer when one of its deployments resolves an image contract -- from a
+    catalog's modality or from LiteLLM's own ``mode``, which is the table that
+    carries a name no public catalog has listed yet -- and no deployment states
+    a thinking level above the disabled step: a group that also serves a
+    reasoning text model keeps its ladder, and a deployment the registry cannot
+    resolve (a retired alias beside two live ones) does not veto the two that
+    agree.
     """
 
     model_ids = registry.route_model_ids(name) or [name]
-    if not registry.image_metadata_for_model_ids(model_ids):
+    if not registry.states_image_generation(model_ids):
         return False
     resolved = [
         capability
@@ -530,9 +532,21 @@ def _catalog_model(
     # 90% when no explicit threshold is supplied.  Keeping the raw window,
     # hard override ceiling, and effective percentage separate matches its
     # native model metadata contract.
-    model["context_window"] = context.context_window
-    model["max_context_window"] = context.max_context_window
-    model["effective_context_window_percent"] = context.effective_context_window_percent
+    #
+    # A generator states no window at all (``0``): it holds no conversation to
+    # compact, and the catalogs that describe one state its limit as ``0``.  The
+    # entry is still published -- ``/v1/models`` serves every route this app
+    # serves -- but it is published without a number rather than with the
+    # unknown-model placeholder, which would claim 272,000 tokens of memory for
+    # a model that never reads a prompt.
+    if context.context_window > 0:
+        model["context_window"] = context.context_window
+        model["max_context_window"] = context.max_context_window
+        model["effective_context_window_percent"] = context.effective_context_window_percent
+    else:
+        model.pop("context_window", None)
+        model.pop("max_context_window", None)
+        model.pop("effective_context_window_percent", None)
     _apply_search_tool_capability(model, registry, name)
     # A custom route's thinking arrives as ``response.reasoning_summary_*``
     # frames, and the proxy delivers them only to a request that named a visible

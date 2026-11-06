@@ -14,7 +14,17 @@ from ..security import safe_exception_message
 
 
 class DomainError(ValueError):
-    """A deliberately source-safe error from a staged Core domain."""
+    """A deliberately source-safe error from a staged Core domain.
+
+    ``code`` names a cause the window can act on.  A domain that states one is
+    saying "this refusal is not the generic validation failure": Core forwards
+    it as the IPC error code, so the pane's own message table decides what the
+    user reads instead of showing the English sentence to everybody.
+    """
+
+    def __init__(self, message: str, *, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _mapping(value: object, label: str = "payload") -> dict[str, Any]:

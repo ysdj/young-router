@@ -118,6 +118,27 @@ class ClaudeDesktopRowsTests(unittest.TestCase):
         )
         self.addCleanup(patcher.stop)
         patcher.start()
+        # Discovery rows state the window this app publishes for a route, so the
+        # tests that do not care about it read the same numbers a published
+        # route would (nothing) instead of this machine's catalog cache.
+        self.windows: dict[str, int] = {}
+        window_patcher = mock.patch.object(
+            claude_desktop_listing,
+            "_public_context_window",
+            side_effect=lambda name: self.windows.get(name),
+        )
+        self.addCleanup(window_patcher.stop)
+        window_patcher.start()
+        # A 1M claim is a claim about the route, so it needs the window the user
+        # wrote on it; nothing here declares one unless a test says so.
+        self.declared: dict[str, int] = {}
+        declared_patcher = mock.patch.object(
+            claude_desktop_listing,
+            "_declared_context_window",
+            side_effect=lambda name: self.declared.get(name),
+        )
+        self.addCleanup(declared_patcher.stop)
+        declared_patcher.start()
 
     def test_a_third_party_route_is_published_under_its_alias(self) -> None:
         rows = claude_desktop_listing.desktop_model_rows(
@@ -141,15 +162,76 @@ class ClaudeDesktopRowsTests(unittest.TestCase):
     def test_a_one_million_route_keeps_its_context_window(self) -> None:
         # The app reads max_input_tokens to know a route is 1M; dropping it made
         # every alias assume 200k.
+        self.windows["gemini-3.8-flash"] = 1_000_000
+        self.declared["gemini-3.8-flash"] = 1_000_000
         response = _response("gemini-3.8-flash")
-        response["data"][0]["max_input_tokens"] = 1_048_576
+        response["data"][0]["max_input_tokens"] = 200_000
         rows = claude_desktop_listing.desktop_model_rows(response)["data"]
-        self.assertEqual(1_048_576, rows[0]["max_input_tokens"])
+        self.assertEqual(1_000_000, rows[0]["max_input_tokens"])
+
+    def test_an_undeclared_one_million_window_is_not_a_1m_claim(self) -> None:
+        # The registry's published number can itself carry an upstream
+        # catalogue's reading, and the app reads any 1M row as "offers 1M" and
+        # hides the standard row.  Only the user's own declaration says a route
+        # can run at 1M.
+        self.windows["gemini-3.8-flash"] = 1_048_576
+        rows = claude_desktop_listing.desktop_model_rows(_response("gemini-3.8-flash"))["data"]
+        self.assertIsNone(rows[0]["max_input_tokens"])
+
+    def test_the_listings_advertised_window_is_never_the_published_one(self) -> None:
+        # The listing's own number is the upstream's reading.  Stating it here
+        # turned routes that are not 1M into 1M rows whose only picker entry
+        # answered ``Invalid model name``.
+        for advertised in (1_048_576, 1_050_000, 1_000_000):
+            with self.subTest(advertised=advertised):
+                self.windows.pop("gemini-3.8-flash", None)
+                response = _response("gemini-3.8-flash")
+                response["data"][0]["max_input_tokens"] = advertised
+                rows = claude_desktop_listing.desktop_model_rows(response)["data"]
+                self.assertIsNone(rows[0]["max_input_tokens"])
+
+    def test_a_declared_window_below_one_million_is_published_as_declared(self) -> None:
+        self.windows["gpt-6.1-sol"] = 500_000
+        self.declared["gpt-6.1-sol"] = 500_000
+        rows = claude_desktop_listing.desktop_model_rows(_response("gpt-6.1-sol"))["data"]
+        self.assertEqual(500_000, rows[0]["max_input_tokens"])
+
+    def test_a_published_window_below_one_million_is_stated_without_a_declaration(self) -> None:
+        # Below 1M the number is what the picker reports, and the app offers no
+        # 1M variant from it, so it needs no declaration.
+        self.windows["gpt-5.4"] = 272_000
+        rows = claude_desktop_listing.desktop_model_rows(_response("gpt-5.4"))["data"]
+        self.assertEqual(272_000, rows[0]["max_input_tokens"])
+
+    def test_the_view_can_be_checked_without_a_catalog_cache(self) -> None:
+        rows = claude_desktop_listing.desktop_model_rows(
+            _response("gemini-3.8-flash"),
+            public_window=lambda name: 1_000_000,
+            declared_window=lambda name: 1_000_000,
+        )["data"]
+        self.assertEqual(1_000_000, rows[0]["max_input_tokens"])
+
+    def test_an_unresolvable_window_states_nothing(self) -> None:
+        def broken(name: str) -> int:
+            raise RuntimeError("registry unavailable")
+
+        rows = claude_desktop_listing.desktop_model_rows(
+            _response("gemini-3.8-flash"), public_window=broken
+        )["data"]
+        self.assertIsNone(rows[0]["max_input_tokens"])
 
     def test_a_claude_shaped_route_keeps_its_own_id(self) -> None:
         rows = claude_desktop_listing.desktop_model_rows(_response("claude-opus-5-5"))["data"]
         self.assertEqual("claude-opus-5-5", rows[0]["id"])
         self.assertEqual("claude-opus-5-5", rows[0]["display_name"])
+
+    def test_a_claude_shaped_route_keeps_its_own_metadata(self) -> None:
+        # This app does not alias it, so the row is the router's own and its
+        # window is whatever the canonical listing said.
+        response = _response("claude-opus-5-5")
+        response["data"][0]["max_input_tokens"] = 1_000_000
+        rows = claude_desktop_listing.desktop_model_rows(response)["data"]
+        self.assertEqual(1_000_000, rows[0]["max_input_tokens"])
 
     def test_an_image_generator_is_never_listed(self) -> None:
         rows = claude_desktop_listing.desktop_model_rows(
@@ -179,6 +261,15 @@ class ClaudeDesktopListingPatchTests(unittest.TestCase):
 
         self.module = common_utils
         claude_desktop_listing.install_patch()
+        # The patch runs the same view, so it resolves the same windows; this
+        # machine's cache is not part of the test.
+        for attribute, value in (
+            ("_public_context_window", lambda name: None),
+            ("_declared_context_window", lambda name: None),
+        ):
+            patcher = mock.patch.object(claude_desktop_listing, attribute, side_effect=value)
+            self.addCleanup(patcher.stop)
+            patcher.start()
 
     def tearDown(self) -> None:
         claude_desktop_listing._VIEW_ACTIVE.set(False)

@@ -16,6 +16,8 @@ from young_router.core.model_catalog import (
     select_inherited_profile,
     write_catalog,
 )
+from young_router.core import model_catalog as catalog_module
+from young_router.core import model_contexts as model_contexts_module
 from young_router.core.model_contexts import (
     DEFAULT_MODEL_CONTEXT_REFRESH_HOURS,
     MODEL_CONTEXT_SOURCES,
@@ -2057,6 +2059,137 @@ class SharedContextCacheTests(unittest.TestCase):
             ):
                 self.assertTrue(route_serves_only_images("openai/gpt-image-public"))
                 self.assertFalse(route_serves_only_images("openai/text-route"))
+
+    def test_a_generator_whose_catalog_states_no_window_has_no_window(self) -> None:
+        """A generator holds no conversation, so 272,000 is not its window.
+
+        pi.dev and models.dev state ``limit.context: 0`` for
+        ``gpt-image-2.5-flare`` and its siblings.  That zero is the whole
+        statement, and the record must keep it: folding it into the
+        unknown-model placeholder published 272,000 as if the catalog had said
+        so, on the pane's 公开上下文 and in the catalog Codex compacts against.
+        """
+
+        record = model_contexts_module._record_from_payload(
+            {
+                "id": "openai/gpt-image-2.5-flare",
+                "type": "image",
+                "modalities": {"input": ["text", "image"], "output": ["image"]},
+                "limit": {"context": 0, "output": 0},
+            },
+            source="https://models.dev/models.json",
+            priority=1,
+        )
+        self.assertIsNotNone(record)
+        self.assertEqual(0, record["context_window"])
+        self.assertEqual(0, record["max_context_window"])
+
+        # A text record that states nothing still falls back to the placeholder:
+        # the rule is about a stated ``0`` beside an image modality, not about
+        # every incomplete record.
+        self.assertIsNone(
+            model_contexts_module._record_from_payload(
+                {"id": "openai/unstated-chat"}, source="pi.dev", priority=1
+            )
+        )
+
+    def test_a_generator_no_profile_describes_states_no_window(self) -> None:
+        """The placeholder is a guess about a conversation this route has none of.
+
+        ``gpt-image-2.5-flare`` is stated as ``image_generation`` by the cost
+        map bundled with this install, while the registry holds no profile for
+        it.  The pane and the managed catalog both read ``record_for``, so both
+        must answer "no window" instead of 272,000.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "model-contexts.json"
+            cache.write_text(json.dumps(self._cache({})), encoding="utf-8")
+            registry = ModelContextRegistry(cache_path=cache, refresh_enabled=False)
+
+            self.assertEqual(0, registry.record_for("gpt-image-2.5-flare").context_window)
+            self.assertEqual(0, registry.default_record_for("gpt-image-2.5-flare").context_window)
+            # A text route the registry cannot resolve keeps the placeholder:
+            # the rule is the modality, not the absence of a profile.
+            self.assertEqual(
+                272_000, registry.record_for("totally-unknown-text-route").context_window
+            )
+
+    def test_a_probe_result_reaches_the_window_and_survives_a_restart(self) -> None:
+        """The probe is the only surface that asks the Images question.
+
+        A provider that ships a model ahead of the bundled LiteLLM cost map
+        leaves the modality unreadable from any table, so a probe is what
+        settles it.  The pane and the managed catalog are written by domains
+        that never probe, so the finding has to travel through the cache they
+        both open -- exactly as a stated window does.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "model-contexts.json"
+            cache.write_text(json.dumps(self._cache({})), encoding="utf-8")
+            first = ModelContextRegistry(cache_path=cache, refresh_enabled=False)
+            with mock.patch.object(
+                model_contexts_module, "_litellm_states_image_generation", return_value=False
+            ):
+                # No table knows it: the placeholder would be published.
+                self.assertEqual(
+                    272_000, first.default_record_for("vendor/new-generator").context_window
+                )
+                first.remember_image_generator(["vendor/new-generator"])
+                self.assertEqual(
+                    0, first.default_record_for("vendor/new-generator").context_window
+                )
+
+            # A restart reads the same finding from the shared cache; no probe
+            # runs in this process at all.
+            second = ModelContextRegistry(cache_path=cache, refresh_enabled=False)
+            self.assertEqual(
+                0, second.default_record_for("vendor/new-generator").context_window
+            )
+            # The negative is recorded too, so a chat route is never re-asked
+            # and never loses its window to a stale positive.
+            self.assertFalse(second.is_remembered_image_generator(["vendor/new-chat"]))
+
+    def test_a_recorded_negative_keeps_a_chat_route_a_chat_route(self) -> None:
+        """``generator=False`` is evidence, not an absence of evidence."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "model-contexts.json"
+            cache.write_text(json.dumps(self._cache({})), encoding="utf-8")
+            registry = ModelContextRegistry(cache_path=cache, refresh_enabled=False)
+            with mock.patch.object(
+                model_contexts_module, "_litellm_states_image_generation", return_value=True
+            ):
+                registry.remember_image_generator(["openai/relay-chat"], generator=False)
+            self.assertFalse(registry.is_remembered_image_generator(["openai/relay-chat"]))
+            # The finding is remembered under the route's own spellings, and
+            # only those: a probe is a statement about one model.
+            self.assertFalse(registry.is_remembered_image_generator(["relay-chat"]))
+
+    def test_a_generator_publishes_no_reasoning_ladder_in_the_catalog(self) -> None:
+        """A generator is not a conversation, and its entry states no window.
+
+        LiteLLM's cost map is where a name no public catalog has listed yet
+        gets its modality, and that map is what keeps the Codex catalog from
+        carrying a 272,000-token window for a model that never reads a prompt.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "model-contexts.json"
+            cache.write_text(json.dumps(self._cache({})), encoding="utf-8")
+            registry = ModelContextRegistry(cache_path=cache, refresh_enabled=False)
+            with mock.patch.object(
+                catalog_module, "load_native_catalog", return_value=[]
+            ):
+                entry = catalog_payload(["gpt-image-2.5-flare"], registry=registry)["models"][0]
+
+        self.assertNotIn("context_window", entry)
+        self.assertNotIn("max_context_window", entry)
+        self.assertEqual([{"effort": "none", "description": mock.ANY}], [
+            {"effort": level["effort"], "description": level.get("description", mock.ANY)}
+            for level in entry["supported_reasoning_levels"]
+        ])
 
     def test_a_cache_that_disappears_keeps_the_records_already_in_hand(self) -> None:
         """Losing the file is not evidence a resolved window became unknown."""

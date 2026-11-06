@@ -22,12 +22,38 @@ import urllib.request
 from urllib.parse import urlparse
 
 from ..browser_identity import browser_request_headers
+from ..public_names import public_name_key
 from ..values import positive_int as _positive_int
 from .persistence import PersistenceError, atomic_write_json, read_json
 
 
 UNKNOWN_MODEL_CONTEXT_WINDOW = 272_000
 DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT = 95
+
+# How far an upstream's stated window must sit from an *inferred* one before the
+# inference is read as wrong rather than conservative.  Provider copies of one
+# model state ceilings a few percent apart (1,000,000 beside 1,048,576), and that
+# is the same window said twice; a copy stating a quarter of it is not the same
+# window at all.  Deliberately far from 1.05 and far from 2: this answers "is this
+# a different window", never "which of two nearby numbers wins".
+_OUTLIER_RATIO = 3.0
+
+
+def _same_window(left: object, right: object) -> bool:
+    """Whether two stated windows are the same window said by two providers.
+
+    Provider copies of one model state ceilings a few percent apart --
+    1,000,000 beside 1,048,576 is the same model's window as two services
+    publish it -- so equality would read that as disagreement.  ``_OUTLIER_RATIO``
+    is the same line the contradiction test draws; this uses it in the other
+    direction so the two rules cannot drift apart.
+    """
+
+    one = _positive_int(left)
+    other = _positive_int(right)
+    if one is None or other is None:
+        return False
+    return max(one, other) / min(one, other) < _OUTLIER_RATIO
 DEFAULT_MODEL_CONTEXT_REFRESH_HOURS = 6
 MODEL_CONTEXT_CACHE_FILE_NAME = "model-contexts.json"
 # Cache spellings retired inside the Codex home.  The cache is this app's
@@ -381,6 +407,24 @@ def _record_from_payload(value: object, *, source: str, priority: int) -> dict[s
     context_known = context is not None
     if context is None and not image_metadata:
         return None
+    # A generator with no stated window has no window to publish.  The public
+    # catalogs state ``limit.context: 0`` for ``gpt-image-2.5-flare`` and its
+    # siblings -- they are cogs with no conversation to hold -- and folding
+    # that into the unknown-model placeholder published 272,000 as if pi.dev
+    # had said it, on the pane's 公开上下文 and in the catalog Codex compacts
+    # against.  ``0`` is the whole statement here, so the record keeps it and
+    # every surface reads "no window" instead of a number nobody declared.
+    # A text record that states nothing still falls back, exactly as before.
+    if image_metadata and not context_known:
+        return {
+            "context_window": 0,
+            "max_context_window": 0,
+            "effective_context_window_percent": DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
+            "source": source,
+            "priority": 0,
+            "image_model_metadata": image_metadata,
+            **_reasoning_fields_from_payload(value),
+        }
     context = context or UNKNOWN_MODEL_CONTEXT_WINDOW
     maximum = max(context, maximum or context)
     percent = _positive_int(value.get("effective_context_window_percent"))
@@ -548,6 +592,29 @@ def _candidate_ids(value: str) -> list[str]:
             seen.add(candidate)
             unique.append(candidate)
     return unique
+
+
+def _image_generator_keys(model_id: object) -> list[str]:
+    """The identity forms one model id is remembered under.
+
+    Deliberately *not* ``_candidate_ids``: that name list exists to find catalog
+    profiles and includes a version split (``gpt-5.6`` -> ``6``) for Bedrock's
+    ``provider.alias`` spelling, which would file ``gpt-image-2.6-flare`` under
+    ``6-flare`` as well.  A probe finding is a statement about one model, so it
+    is remembered under its own spelling with and without the adapter prefix.
+    """
+
+    if not isinstance(model_id, str):
+        return []
+    raw = model_id.strip().casefold()
+    if not raw:
+        return []
+    keys = [raw]
+    if "/" in raw:
+        stripped = raw.split("/", 1)[1].strip()
+        if stripped:
+            keys.append(stripped)
+    return list(dict.fromkeys(keys))
 
 
 def _context_window_policy(record: Mapping[str, Any]) -> tuple[int, int, int]:
@@ -862,6 +929,53 @@ def _litellm_record(model_ids: Sequence[str]) -> dict[str, Any] | None:
     return None
 
 
+#: LiteLLM's mode for a model that generates images and answers no text turn.
+#: Its cost map is the one table that states a modality for a name no public
+#: catalog covers yet: ``gpt-image-2.6-flare`` is in it as ``image_generation``
+#: while pi.dev and models.dev have nothing under that spelling, and a route
+#: whose name is new is exactly the one a picker must not offer as a chat model.
+_IMAGE_GENERATION_MODE = "image_generation"
+
+
+def litellm_mode(model_ids: Sequence[str] | str) -> str | None:
+    """The mode LiteLLM's cost map states for one of these ids, if it states one.
+
+    Read from ``litellm.model_cost`` rather than through ``get_model_info``:
+    that function raises for a name the map does not carry, and the question
+    here is only whether the table speaks about this model at all.  The import
+    is the same one ``_litellm_record`` already pays for, and it is lazy so a
+    Core that resolves known profiles never imports the runtime.
+
+    A single name is accepted as well as a list: a string is a sequence of
+    characters, and iterating one here asked the cost map about ``g``, ``p``,
+    ``t``... and answered ``None`` for a model it does state.
+    """
+
+    if isinstance(model_ids, str):
+        model_ids = [model_ids]
+    try:
+        import litellm
+    except Exception:
+        return None
+    cost_map = getattr(litellm, "model_cost", None)
+    if not isinstance(cost_map, Mapping):
+        return None
+    for model_id in model_ids:
+        for candidate in _candidate_ids(model_id):
+            value = cost_map.get(candidate)
+            if isinstance(value, Mapping) and isinstance(value.get("mode"), str):
+                mode = value["mode"].strip().casefold()
+                if mode:
+                    return mode
+    return None
+
+
+def _litellm_states_image_generation(model_ids: Sequence[str] | str) -> bool:
+    """Whether LiteLLM's cost map calls one of these ids an image generator."""
+
+    return litellm_mode(model_ids) == _IMAGE_GENERATION_MODE
+
+
 _INSTALLED_LITELLM_VERSION: list[str | None] = []
 
 
@@ -899,6 +1013,7 @@ class ModelContextRegistry:
         refresh_enabled: bool | None = None,
         fetcher: Callable[[str], object] | None = None,
         clock: Callable[[], float] | None = None,
+        stated_windows: Callable[[], Mapping[str, int]] | None = None,
     ) -> None:
         self.runtime_config_path = Path(runtime_config_path).expanduser() if runtime_config_path else None
         self.runtime_settings_path = Path(runtime_settings_path).expanduser() if runtime_settings_path else None
@@ -932,6 +1047,25 @@ class ModelContextRegistry:
         self._route_index_digest: str | None = None
         self._route_index_cache: dict[str, list[dict[str, Any]]] = {}
         self._cache_fetched_at: float | None = None
+        # The windows the routes' own upstreams stated, as the caller that
+        # performed those catalog reads holds them (an id, a number).  The
+        # number is the upstream's, so it is never written into the
+        # configuration: a stale reading must not outlive the read that produced
+        # it.  It answers one question and one question only -- the window of a
+        # model this registry cannot resolve at all (``_stated_contexts``).  That
+        # is what keeps a catalog's generic fallback from overriding a profile
+        # the registry does know, which is the defect of 2026-11-04.
+        self._stated_windows: Callable[[], Mapping[str, int]] | None = stated_windows
+        # The readings themselves, as the shared cache holds them.  In-memory
+        # sources are not enough: the managed catalog is written by a domain
+        # that never performed a catalog read, so the number has to travel
+        # through the cache both domains open.
+        self._stated: dict[str, int] = {}
+        # Which model ids a probe measured as served by the Images wire, and
+        # which it measured as a chat model.  The same travelling problem as the
+        # windows above, for the same reason: no table carries a name that is
+        # newer than the release this app bundles.
+        self._image_generators: dict[str, bool] = {}
         # Answers the provider-registry fallback already gave: a model id mapped
         # to its record, or to None when LiteLLM does not know it either.  Kept
         # in the same cache as the fetched profiles so a start that resolves the
@@ -1018,8 +1152,83 @@ class ModelContextRegistry:
             if isinstance(model_id, str)
         }
 
+    def stated_windows(self) -> dict[str, int]:
+        """The windows catalog reads have reported, as the shared cache holds them.
+
+        Written by the side that performed the read and read by every other
+        answer, so the pane and the managed catalog resolve one number instead
+        of one of them falling back to the unknown-model placeholder.  It is a
+        *reading*: nothing here is a declaration, and the resolution rule that
+        decides when it may answer lives in ``_stated_contexts``.
+        """
+
+        self._sync_cache()
+        return dict(self._stated)
+
+    def remember_stated_windows(self, windows: Mapping[str, int]) -> None:
+        """Record the windows catalog reads reported.
+
+        Merged into what the cache already holds rather than replacing it: a
+        read answers for one provider's catalog, and the next read is of
+        another's.  Only the ids this read actually stated are rewritten, so an
+        account whose roster dropped a model keeps the other accounts' entries.
+        """
+
+        stated = {
+            name: int(window)
+            for name, window in windows.items()
+            if isinstance(name, str)
+            and name.strip()
+            and isinstance(window, int)
+            and not isinstance(window, bool)
+            and window > 0
+        }
+        if not stated:
+            return
+        self._sync_cache()
+        if all(self._stated.get(name) == window for name, window in stated.items()):
+            return
+        self._stated.update(stated)
+        self._write_cache()
+
+    def _load_stated_windows(self, payload: Mapping[str, Any]) -> None:
+        """Restore the upstream readings another writer stored."""
+
+        section = payload.get("stated_windows")
+        if not isinstance(section, Mapping):
+            return
+        self._stated = {
+            name: int(window)
+            for name, window in section.items()
+            if isinstance(name, str)
+            and isinstance(window, int)
+            and not isinstance(window, bool)
+            and window > 0
+        }
+
+    def _load_image_generators(self, payload: Mapping[str, Any]) -> None:
+        """Restore which model ids a probe measured as image generators."""
+
+        section = payload.get("image_generators")
+        if not isinstance(section, Mapping):
+            return
+        self._image_generators = {
+            name: bool(value)
+            for name, value in section.items()
+            if isinstance(name, str) and isinstance(value, bool)
+        }
+
     def _cache_payload(self) -> dict[str, Any]:
-        """Everything the private cache holds, written by one place."""
+        """Everything the private cache holds, written by one place.
+
+        The stated windows are merged with whatever the file already holds, and
+        that merge is what makes two writers one cache.  This registry is not
+        the only one in the process -- the pane's domain and the managed
+        catalog's each own one -- and a writer that has not loaded the file yet
+        otherwise replaced the other's readings with the empty map it holds,
+        which is how a catalog read's 960,000 became the placeholder again
+        between one pane refresh and the next catalog write.
+        """
 
         return {
             "fetched_at": self._cache_fetched_at,
@@ -1028,7 +1237,49 @@ class ModelContextRegistry:
                 "litellm_version": _installed_litellm_version(),
                 "records": self._provider_lookups,
             },
+            # The windows upstreams stated, keyed by their own model id.  The
+            # pane's domain is the only one that performs those reads, and the
+            # managed catalog is written by the other; without this they answer
+            # one model with two numbers.
+            "stated_windows": self._merged_stated_windows(),
+            # What a probe measured, merged for the same reason the windows are:
+            # the two domains open this file and only one of them ever probes.
+            "image_generators": self._merged_image_generators(),
         }
+
+    def _merged_stated_windows(self) -> dict[str, int]:
+        """This registry's readings merged over the ones the file already holds."""
+
+        stored = self._read_cache().get("stated_windows")
+        if not isinstance(stored, Mapping):
+            return dict(self._stated)
+        merged = {
+            name: int(window)
+            for name, window in stored.items()
+            if isinstance(name, str)
+            and isinstance(window, int)
+            and not isinstance(window, bool)
+            and window > 0
+        }
+        # This instance's own readings are the newer of the two, and its key set
+        # is authoritative for what it just read: a model whose entry lost its
+        # window must not be answered from a copy of the entry before the loss.
+        merged.update(self._stated)
+        return merged
+
+    def _merged_image_generators(self) -> dict[str, bool]:
+        """This registry's findings merged over the ones the file already holds."""
+
+        stored = self._read_cache().get("image_generators")
+        if not isinstance(stored, Mapping):
+            return dict(self._image_generators)
+        merged = {
+            name: bool(value)
+            for name, value in stored.items()
+            if isinstance(name, str) and isinstance(value, bool)
+        }
+        merged.update(self._image_generators)
+        return merged
 
     def _write_cache(self) -> None:
         if self.cache_path is None:
@@ -1103,6 +1354,11 @@ class ModelContextRegistry:
         # Drop the copy this instance holds; ``_sync_cache`` reads the new one.
         self._cache_loaded = False
         self._provider_lookups = {}
+        # The readings go with it.  They are as much that file's content as the
+        # profiles are, and a copy kept across a replacement answered a window
+        # the file no longer states.
+        self._stated = {}
+        self._image_generators = {}
 
     def _sync_cache(self) -> None:
         """Answer from the cache file as it stands, adopting another's write.
@@ -1128,6 +1384,8 @@ class ModelContextRegistry:
         if isinstance(fetched_at, (int, float)) and not isinstance(fetched_at, bool):
             self._cache_fetched_at = float(fetched_at)
         self._load_provider_lookups(payload)
+        self._load_stated_windows(payload)
+        self._load_image_generators(payload)
         cached = payload.get("records")
         if not isinstance(cached, Mapping):
             return
@@ -1201,6 +1459,13 @@ class ModelContextRegistry:
         cannot tell the two writes apart.  Re-reading and hashing the whole
         document on every call is what made one catalog build digest a 33 KB
         file five hundred times.
+
+        The key is the name's *identity* (``public_name_key``), not its
+        spelling: one public model is one group however its routes capitalise
+        it, so a lookup for the group reads every route of it.  Keying on the
+        exact spelling handed a group whose rows disagreed about case an empty
+        route list -- and an empty list is what publishes the unknown window
+        and drops the group's declared context.
         """
 
         if self.runtime_config_path is None:
@@ -1237,7 +1502,7 @@ class ModelContextRegistry:
                     continue
                 if not isinstance(deployment.get("litellm_params"), Mapping):
                     continue
-                name = str(deployment.get("model_name", "")).strip()
+                name = public_name_key(deployment.get("model_name", ""))
                 if name:
                     index.setdefault(name, []).append(dict(deployment))
         self._route_index_key = key
@@ -1250,7 +1515,7 @@ class ModelContextRegistry:
     def _load_route_deployments(self, public_name: str) -> list[dict[str, Any]]:
         """Return full deployment mappings for every route of a public model."""
 
-        deployments = self._route_index().get(public_name)
+        deployments = self._route_index().get(public_name_key(public_name))
         if not deployments:
             return []
         # Copy per call like the previous per-call parse did, so a caller can
@@ -1370,6 +1635,159 @@ class ModelContextRegistry:
             return None
         return _positive_int(model_info.get("max_input_tokens"))
 
+    def _wire_context(self, deployment: Mapping[str, Any]) -> int | None:
+        """The window this route's own upstream stated for the wire it calls.
+
+        The deployment names the wire as ``openai/<id>``; every catalog read
+        records it as the bare ``<id>`` the upstream publishes, so the adapter
+        prefix is the only part removed.
+
+        Two sources answer the same question, and the live one is asked first:
+        the caller's own in-memory readings (a pane that just refreshed), then
+        the shared cache another writer filled (the managed catalog's side, or
+        this process before it restarted).
+
+        The id is matched by identity, not by spelling.  A catalog states
+        ``minimax-m3.1-flash`` while a route of the same group may address
+        ``MiniMax-M3.1-Flash``, and an exact lookup left that route with no
+        reading at all -- which read as "this upstream states nothing" and made
+        the group look as if only half of it had answered.
+        """
+
+        params = deployment.get("litellm_params")
+        if not isinstance(params, Mapping):
+            return None
+        wire = str(params.get("model") or "").strip()
+        if "/" in wire:
+            wire = wire.split("/", 1)[1].strip()
+        if not wire:
+            return None
+        key = wire.casefold()
+        for source in (self._live_stated(), self._stated):
+            if not isinstance(source, Mapping):
+                continue
+            window = _positive_int(source.get(wire))
+            if window is not None:
+                return window
+            for name, value in source.items():
+                if isinstance(name, str) and name.casefold() == key:
+                    window = _positive_int(value)
+                    if window is not None:
+                        return window
+        return None
+
+    def _live_stated(self) -> Mapping[str, int] | None:
+        """The caller's own catalog readings, when it has any to hand over."""
+
+        if self._stated_windows is None:
+            return None
+        try:
+            live = self._stated_windows()
+        except Exception:
+            return None
+        return live if isinstance(live, Mapping) else None
+
+    def _stated_contexts(self, public_name: str) -> list[int]:
+        """The windows this group's routes' upstreams stated, where the inference is not trusted.
+
+        A route's own catalog is the authority for the window that route will
+        accept, so it answers in two cases, and the rule is the same in both:
+        the registry has no profile at all, or the window the registry inferred
+        is contradicted by the upstream that serves the route.
+
+        No profile at all.  ``hy4free``/``hy4std`` are in no bundled profile, no
+        pi.dev record and no LiteLLM entry, and the WorkBuddy catalog states
+        960,000 for both.  The unknown-model placeholder was published instead,
+        on every surface at once -- the pane's 公开上下文, the 推荐上下文 beside it,
+        and the catalog Codex compacts against -- so a 960,000-token model was
+        compacted at 272,000.
+
+        A contradicted inference.  A bare public name that no provider-qualified
+        record states exactly is resolved by suffix match over every provider's
+        copy of the id, and the copies disagree.  ``minimax-m3.1-flash`` has
+        seven copies at 1,000,000 or 1,048,576 and one -- nvidia's -- at
+        262,144, and ``_lookup`` takes the smallest of the top-priority set, so
+        the whole group was published at a quarter of what its upstream states.
+        A lone outlier among agreeing copies is what a maintenance slip looks
+        like, and the upstream serving this route is the evidence that settles
+        it.  Where the copies agree, the inference is taken at its word: the
+        disagreement rule must not turn a catalog's guess into the answer.
+
+        What is deliberately *not* here is the case of 2026-11-04: the free
+        lane publishes its generic fallback 131,072 for an id its table does not
+        carry, against a real 1,048,576.  There the copies agree on 1,048,576 and
+        the route's own upstream states something far smaller, so the registry
+        keeps its answer and the reading stays a reading.
+        """
+
+        contexts: list[int] = []
+        for deployment in self._load_route_deployments(public_name):
+            stated = self._wire_context(deployment)
+            if stated is None:
+                continue
+            params = deployment.get("litellm_params")
+            model_id = str(params.get("model") or "").strip() if isinstance(params, Mapping) else ""
+            if not model_id:
+                continue
+            resolved = self._resolve_context_record(model_id)
+            if resolved is not None and not self._inference_is_contradicted(model_id, stated):
+                continue
+            contexts.append(stated)
+        return contexts
+
+    def _inference_is_contradicted(
+        self,
+        model_id: str,
+        stated: int,
+    ) -> bool:
+        """Whether an upstream's number shows a suffix-match inference to be wrong.
+
+        The question is never "which of two numbers wins"; it is "did the
+        inference pick a copy the upstream does not agree with?".  So both sides
+        are read, and the upstream's number has to match what most of the
+        provider copies state:
+
+        * ``minimax-m3.1-flash`` -- seven copies at 1,000,000 or 1,048,576, one
+          (nvidia's) at 262,144, and the upstream states 1,000,000.  The
+          inference took the outlier; the upstream agrees with the majority.  A
+          contradicted inference.
+        * ``pulse-alpha-free`` -- one copy at 1,048,576 and the lane states its
+          generic fallback 131,072.  The upstream agrees with *nobody*, so what
+          it states is a reading to report in its own row and not a window to
+          publish.  This is the 2026-11-04 incident and the rule keeps it.
+
+        A record that names the id exactly is a profile this app looked up on
+        purpose, so it is never overridden either -- only a suffix match is.
+        """
+
+        if self._states_id_exactly(model_id):
+            return False
+        resolved = _lookup(self._records, model_id)
+        context = int(resolved.get("context_window") or 0) if resolved else 0
+        if context <= 0 or stated <= 0:
+            return False
+        larger, smaller = max(context, stated), min(context, stated)
+        if larger / smaller < _OUTLIER_RATIO:
+            # The two sit inside one family of numbers; the inference is not an
+            # outlier, so there is nothing to contradict.
+            return False
+        # The upstream has to agree with some other copy of the same id, so this
+        # asks whether a copy states its number rather than counting copies here
+        # -- ``_lookup`` already owns the question of what the registry knows.
+        keys = _suffix_match_keys(self._records, _candidate_ids(model_id))
+        return any(
+            _same_window(self._records[key]["context_window"], stated)
+            for key in keys
+            if key in self._records
+            and isinstance(self._records.get(key), Mapping)
+            and int(self._records[key]["context_window"]) != context
+        )
+
+    def _states_id_exactly(self, model_id: str) -> bool:
+        """Whether a record names this id, rather than matching it by suffix."""
+
+        return any(candidate in self._records for candidate in _candidate_ids(model_id))
+
     def _custom_contexts(self, public_name: str) -> list[int]:
         """Collect the windows the *user* declared on the routes of one group.
 
@@ -1419,8 +1837,20 @@ class ModelContextRegistry:
                 max_context_window=unknown,
                 effective_context_window_percent=DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
             )
+        windows = [int(record["context_window"]) for record in records]
+        # A zero is a statement, not a missing value: the catalog said this
+        # generator holds no conversation, and the group it belongs to answers
+        # that.  Substituting ``unknown`` here would hand the placeholder back
+        # to the one surface that resolved the record most precisely.
+        window = min(windows) if all(value > 0 for value in windows) else 0
+        if window <= 0:
+            return ContextRecord(
+                context_window=0,
+                max_context_window=0,
+                effective_context_window_percent=DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
+            )
         return ContextRecord(
-            context_window=min(int(record["context_window"]) for record in records),
+            context_window=window,
             max_context_window=min(int(record["max_context_window"]) for record in records),
             effective_context_window_percent=min(int(record.get("effective_context_window_percent", DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT)) for record in records),
         )
@@ -1431,14 +1861,68 @@ class ModelContextRegistry:
         The model inspector shows this window as the value a public model
         falls back to when the user has not customized it; ``record_for`` is
         the effective policy the managed catalog writes.
+
+        A name no profile resolves has no recommendation to offer, so the
+        answer in that case is the one its routes' own catalogs stated
+        (``_stated_contexts``) rather than the unknown-model placeholder.  A name
+        whose inferred window an upstream contradicts takes the upstream's too:
+        the inference is a suffix match over provider copies that disagreed, and
+        the route's own catalog is the one piece of evidence about the route.
+        Both surfaces read this one answer, which is what keeps the pane's field
+        and the recommendation beside it from naming two different numbers for a
+        model nothing knows.
         """
 
         self._sync_cache()
         unknown, _ = self._runtime_values()
-        return self._context_record_from_records(
-            self._resolved_route_records(public_name),
+        records = self._resolved_route_records(public_name)
+        if not records and self._public_name_generates_images(public_name):
+            # A generator no profile describes does not fall back to the
+            # unknown-model placeholder; that placeholder is a guess about a
+            # conversation, and this route has none.  The managed catalog and
+            # the pane then state "no window" instead of 272,000 tokens of
+            # memory for a model that never reads a prompt.
+            return ContextRecord(
+                context_window=0,
+                max_context_window=0,
+                effective_context_window_percent=DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
+            )
+        resolved = self._context_record_from_records(
+            records,
             unknown=unknown,
         )
+        stated = self._stated_contexts(public_name)
+        if not stated:
+            return resolved
+        window = min(stated)
+        return ContextRecord(
+            context_window=window,
+            max_context_window=window,
+            effective_context_window_percent=DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
+        )
+
+    def _public_name_generates_images(self, public_name: str) -> bool:
+        """Whether this route's model is one the app can state serves images.
+
+        Asked of the route's wire names, and of the public name beside them: a
+        group spelled one way may address an upstream under another.  The
+        catalog's modality, LiteLLM's mode and a past probe all answer here, so
+        the pane and the managed catalog agree with whatever the probe last
+        measured on a name no bundled table carries yet.
+        """
+
+        names = [
+            str(deployment.get("litellm_params", {}).get("model") or "")
+            if isinstance(deployment.get("litellm_params"), Mapping)
+            else ""
+            for deployment in self._load_route_deployments(public_name)
+        ]
+        names = [name.strip() for name in names if name.strip()]
+        names.append(public_name)
+        try:
+            return self.states_image_generation(names)
+        except Exception:
+            return False
 
     def record_for(self, public_name: str) -> ContextRecord:
         """Resolve one public model's context policy.
@@ -1501,6 +1985,64 @@ class ModelContextRegistry:
             return None
         metadata = max(matches, key=lambda item: (item[0], item[1]))[2].get("image_model_metadata")
         return dict(metadata) if isinstance(metadata, Mapping) else None
+
+    def states_image_generation(self, model_ids: Sequence[str]) -> bool:
+        """Whether this registry can say these ids are image generators.
+
+        Three statements settle the question, in the order they are trusted:
+        the public catalogs' modality, LiteLLM's cost-map ``mode``, and finally
+        this app's own probe result (``remember_image_generator``), which is the
+        only one that can name a model no table has caught up with yet.
+
+        A name none of the three carries keeps the historical answer
+        (``False``): an unreadable table is not evidence that a route generates
+        images.
+        """
+
+        if any(self.image_metadata_for_model_id(model_id) for model_id in model_ids):
+            return True
+        if _litellm_states_image_generation(model_ids):
+            return True
+        return self.is_remembered_image_generator(model_ids)
+
+    def is_remembered_image_generator(self, model_ids: Sequence[str]) -> bool:
+        """Whether a probe already established that one of these ids is a generator.
+
+        Kept beside the stated windows for the same reason: the probe is the
+        only surface that ever asks the Images question, and the pane and the
+        managed catalog are written by domains that never perform it.  A
+        reading, not a declaration -- the id keys it, exactly as a stated
+        window does.
+        """
+
+        self._sync_cache()
+        for model_id in model_ids:
+            for key in _image_generator_keys(model_id):
+                if self._image_generators.get(key) is True:
+                    return True
+        return False
+
+    def remember_image_generator(self, model_ids: Sequence[str], *, generator: bool = True) -> None:
+        """Record that a probe found these ids served (or not) by the Images wire.
+
+        Only an answered Images endpoint records here, so this is evidence and
+        not a guess; ``generator=False`` records the negative a chat-answering
+        route already proved, which is what keeps a model that later appears in
+        no table from being re-asked.
+        """
+
+        recorded = {
+            key: bool(generator)
+            for model_id in model_ids
+            for key in _image_generator_keys(model_id)
+        }
+        if not recorded:
+            return
+        self._sync_cache()
+        if all(self._image_generators.get(name) is value for name, value in recorded.items()):
+            return
+        self._image_generators.update(recorded)
+        self._write_cache()
 
     def image_metadata_for_model_ids(
         self,

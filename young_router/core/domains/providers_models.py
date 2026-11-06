@@ -55,9 +55,10 @@ from ...adapters import our_free_model as our_free_model_module
 from ...adapters import workbuddy as workbuddy_module
 from ... import adapters as managed_adapters
 from ...browser_identity import browser_request_headers
+from ...public_names import public_name_key
 from ...values import explicit_bool
 from ...values import int_or_none as _int_or_none
-from ...api_base import isolated_http_opener, service_root
+from ...api_base import api_base_for_surface, isolated_http_opener, service_root
 from ..persistence import atomic_write_text
 from ..security import (
     REDACT_TEXT,
@@ -100,6 +101,20 @@ def _public_name_for_lane_id(model_id: str) -> str:
     """
 
     return model_id
+
+
+def _route_key_renamed(route_key: str, public_model: str) -> str:
+    """A route key's ``model=`` segment, restated on a renamed public model.
+
+    The key is a `` / ``-joined list of ``name=value`` segments; only the
+    group's own segment moves, so a key that states no ``model=`` is left
+    exactly as it was.
+    """
+
+    return " / ".join(
+        f"model={public_model}" if segment.strip().startswith("model=") else segment
+        for segment in route_key.split("/")
+    )
 
 
 def _positive_or_zero(value: object) -> int | None:
@@ -1002,8 +1017,16 @@ class ProvidersModelsDomain:
                         # on exactly one, so offering the other two would be
                         # offering a choice the route cannot honour.
                         "probe_surfaces": self._probe_surfaces(
-                            self._model_api_base(provider, model), model, provider
+                            self._model_api_base(provider, model),
+                            model,
+                            provider,
+                            serves_images=self._serves_images(model),
                         ),
+                        # Whether this route only generates images.  The pane
+                        # draws no 公开上下文 row for one: a generator holds no
+                        # conversation, so a window is not a fact about it and
+                        # there is nothing for the field to state.
+                        "serves_images": self._serves_images(model),
                         "supports_responses_image_generation_tool": bool(model.get("supports_responses_image_generation_tool")),
                         "supports_responses_image_generation_tool_present": bool(model.get("supports_responses_image_generation_tool_present")),
                         "image_model_metadata": copy.deepcopy(image_model_metadata) if isinstance(image_model_metadata, Mapping) else None,
@@ -1145,9 +1168,37 @@ class ProvidersModelsDomain:
                 _runtime_root_for_config(self.config_path)
             ),
             refresh_enabled=False,
+            # The windows this pane already holds from the catalog reads it
+            # performed.  Handed over rather than written down: the numbers are
+            # the upstreams', and this domain is the only place that read them.
+            stated_windows=self._live_stated_windows,
         )
         self._model_context_registry = registry
         return registry
+
+    def _live_stated_windows(self) -> dict[str, int]:
+        """Every window a catalog read has reported, keyed by upstream model id.
+
+        Live, not stored: each entry is what an upstream answered the last time
+        this domain read it.  The reads that record windows answer different
+        questions -- one is a provider's own ``/v1/models`` listing, the other
+        an integration's catalog -- so both are merged here.
+
+        This is a *source*, not a decision.  The registry consults it only for a
+        model it cannot resolve from any profile, which is what keeps a lane's
+        generic fallback from overriding a window the app already knows
+        (``ModelContextRegistry._stated_contexts``).
+        """
+
+        windows: dict[str, int] = {}
+        for listing in (*self._catalog_windows.values(), *self._listing_windows.values()):
+            if not isinstance(listing, Mapping):
+                continue
+            for model_id, window in listing.items():
+                name = str(model_id or "").strip()
+                if name and isinstance(window, int) and not isinstance(window, bool) and window > 0:
+                    windows[name] = window
+        return windows
 
     def _public_model_context_registry(self):
         """Registry used by explicit model-list reads for public fallbacks."""
@@ -1165,6 +1216,11 @@ class ProvidersModelsDomain:
                 _runtime_root_for_config(self.config_path)
             ),
             refresh_enabled=True,
+            # The same live readings, for the same reason: an explicit
+            # model-list read answers from this registry, and it must not
+            # publish the unknown-model default for a route whose own upstream
+            # stated its window.
+            stated_windows=self._live_stated_windows,
         )
         self._public_model_contexts = registry
         return registry
@@ -1210,10 +1266,16 @@ class ProvidersModelsDomain:
         resolves when the user has not set a custom limit.  A public model the
         registry cannot resolve still reports the unknown-window default rather
         than disappearing from the pane.
+
+        One public model is one key whatever case its routes state
+        (``public_name_key``): the pane looks the window up by the group it
+        draws, and the group's declaration reaches every route that serves the
+        name.  A projection that keyed on the spelling published the same
+        group twice, once per case, and whichever half the pane read decided
+        the number it showed.
         """
 
-        names: list[str] = []
-        seen: set[str] = set()
+        names: dict[str, list[str]] = {}
         for provider in self._draft.get("providers", []):
             if not isinstance(provider, Mapping):
                 continue
@@ -1224,9 +1286,12 @@ class ProvidersModelsDomain:
                 if not isinstance(model, Mapping):
                     continue
                 name = str(model.get("model_name", "")).strip()
-                if name and name not in seen:
-                    seen.add(name)
-                    names.append(name)
+                key = public_name_key(name)
+                if not key:
+                    continue
+                spellings = names.setdefault(key, [])
+                if name not in spellings:
+                    spellings.append(name)
         if not names:
             return {}
         try:
@@ -1236,7 +1301,13 @@ class ProvidersModelsDomain:
             # take the whole providers workspace down with it.
             return {}
         projection: dict[str, Any] = {}
-        for name in names:
+        # One spelling per group, the same one the saved group table states
+        # (``config.dump._preferred_public_spelling``), so the pane's field and
+        # the document name the group with one spelling.
+        from ...config.dump import _preferred_public_spelling
+
+        for spellings in names.values():
+            name = _preferred_public_spelling(spellings)
             try:
                 # Two numbers, two questions, so both are published rather than
                 # one standing in for the other.  ``context_window`` is what this
@@ -2139,7 +2210,16 @@ class ProvidersModelsDomain:
         headers = browser_request_headers()
         headers["Content-Type"] = "application/json"
         if surface == "anthropic":
-            endpoint = f"{root}/v1/messages" if isinstance(root, str) and root else ""
+            # Ask the address the route is actually served at.  The Messages
+            # base is not always the OpenAI base with another endpoint
+            # appended — DeepSeek documents its Messages wire under
+            # `/anthropic` — so this reads the same resolver the request
+            # adapter uses instead of building a second URL here.
+            endpoint = (
+                api_base_for_surface(api_base, surface)
+                if isinstance(root, str) and root
+                else ""
+            )
             headers["x-api-key"] = credential
             headers["anthropic-version"] = "2023-06-01"
             payload: dict[str, Any] = {
@@ -2155,6 +2235,19 @@ class ProvidersModelsDomain:
                 "max_tokens": 8,
                 "stream": False,
                 "messages": [{"role": "user", "content": "Reply with OK."}],
+            }
+        elif surface == cls._IMAGE_PROBE_SURFACE:
+            # The Images wire has no dry run: the cheapest honest question is
+            # one small picture.  A route that answers it is a route whose
+            # name, key, address and channel all work, which is exactly what
+            # the three chat questions were failing to establish.
+            endpoint = f"{root}/v1/images/generations" if isinstance(root, str) and root else ""
+            headers["Authorization"] = f"Bearer {credential}"
+            payload = {
+                "model": model_name,
+                "prompt": "A grey square on a white background.",
+                "n": 1,
+                "size": "1024x1024",
             }
         else:
             endpoint = (
@@ -2223,6 +2316,14 @@ class ProvidersModelsDomain:
             headers=headers,
             method="POST",
         )
+        # The Images wire is the one answer whose size is the answer: a
+        # 1024x1024 PNG is megabytes of base64, so reading it under the chat
+        # probe's ceiling would call a working generator's picture an oversized
+        # invalid response.  Only the first chunk is read, and only for the
+        # status and the envelope -- the picture itself is never held, so an
+        # answer longer than that chunk is expected here rather than an error.
+        image_surface = surface == cls._IMAGE_PROBE_SURFACE
+        body_limit = cls._MAX_MODEL_PROBE_BYTES + 1 if not image_surface else cls._IMAGE_PROBE_READ_BYTES + 1
         for attempt in range(cls._MODEL_PROBE_ATTEMPTS):
             try:
                 with isolated_http_opener().open(
@@ -2232,7 +2333,7 @@ class ProvidersModelsDomain:
                     status = getattr(response, "status", None)
                     if status is None:
                         status = response.getcode()
-                    body = response.read(cls._MAX_MODEL_PROBE_BYTES + 1)
+                    body = response.read(body_limit)
                 break
             except urllib.error.HTTPError as exc:
                 return result(False, cls._probe_status_for_http_error(exc, account_backed=account_backed))
@@ -2241,7 +2342,8 @@ class ProvidersModelsDomain:
                 if attempt + 1 >= cls._MODEL_PROBE_ATTEMPTS or not cls._probe_transport_retryable(exc):
                     return result(False, failure)
                 time.sleep(cls._MODEL_PROBE_RETRY_DELAY_SECONDS)
-        if not isinstance(status, int) or not 200 <= status < 300 or len(body) > cls._MAX_MODEL_PROBE_BYTES:
+        oversized = len(body) > body_limit - 1 and not image_surface
+        if not isinstance(status, int) or not 200 <= status < 300 or oversized:
             return result(False, "http_error")
         if account_backed:
             # A streamed answer: any `response.created` is the route accepting
@@ -2250,6 +2352,17 @@ class ProvidersModelsDomain:
             if "event: response.created" in text or '"type":"response.created"' in text.replace(" ", ""):
                 return result(True, "ok")
             return result(False, "invalid_response")
+        if surface == cls._IMAGE_PROBE_SURFACE:
+            # An Images answer is mostly the picture itself, and this read
+            # stops well before it ends.  The envelope is what the probe asks
+            # about -- the created image list every implementation starts
+            # with -- so the answer is judged on that marker rather than on a
+            # JSON document this read deliberately cut in half.
+            head = body.decode("utf-8", "replace")
+            if '"error"' in head[:512]:
+                return result(False, "invalid_response")
+            usable = '"data"' in head or '"b64_json"' in head or '"url"' in head
+            return result(usable, "ok" if usable else "invalid_response")
         try:
             decoded = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -2457,6 +2570,21 @@ class ProvidersModelsDomain:
 
         wire_name = self._wire_model_name(model)
         public_name = str(model.get("model_name", "")).strip()
+        # The quick suite compares an answer against the chat request that
+        # asked for it, so a route that answers only the Images wire has nothing
+        # for its detectors to read.  Saying so in the plan keeps the pane from
+        # promising a check it would then report as skipped, and keeps the
+        # button from naming a test this route cannot carry.  Read through
+        # ``_serves_images`` so a name newer than the bundled cost map -- known
+        # only from a past probe -- answers here too; the cost map alone left
+        # the pane promising Veridrop and then reporting 真伪: 不适用.
+        if self._serves_images(model):
+            return {
+                "includes_degradation": False,
+                "target": None,
+                "protocol": "",
+                "surface": "",
+            }
         found = veridrop.target(wire_name, public_name)
         listed = isinstance(found, Mapping)
         protocol = (
@@ -2619,6 +2747,16 @@ class ProvidersModelsDomain:
         return result
 
     _PROBE_SURFACES: tuple[str, ...] = ("openai/responses", "openai/chat", "anthropic")
+    #: The OpenAI Images wire.  It is not one of ``_PROBE_SURFACES`` and never
+    #: becomes one: a protocol choice there is a choice between chat wires, and
+    #: a generator answers none of them.  It exists here so a route that serves
+    #: only images is measured on the endpoint it actually serves instead of
+    #: being reported as unreachable on three endpoints it refuses by design.
+    _IMAGE_PROBE_SURFACE = "openai/images"
+    #: How much of an Images answer is read.  Enough for the envelope every
+    #: implementation sends first (``"data":[{"b64_json":"...`` or a URL),
+    #: and far short of the picture beside it.
+    _IMAGE_PROBE_READ_BYTES = 2 * 1024
     #: The address LiteLLM's own ChatGPT adapter sends a turn to.  An
     #: account-backed route has no base in the document; the adapter owns it,
     #: and the probe must ask the same door the route is served through.
@@ -2747,6 +2885,8 @@ class ProvidersModelsDomain:
         api_base: str,
         model: Mapping[str, Any],
         provider: Mapping[str, Any] | None = None,
+        *,
+        serves_images: bool | None = None,
     ) -> list[str]:
         """Choose the surfaces a probe may test.
 
@@ -2775,7 +2915,67 @@ class ProvidersModelsDomain:
             if configured in cls._PROBE_SURFACES:
                 return [configured]
             return ["openai/chat"]
+        # A route that serves only images answers the Images wire and refuses
+        # every chat wire.  Asking it the chat questions reads as three
+        # failures of a route that is working, and the pane's only offer --
+        # switch protocol -- is a choice the route cannot honour.  The modality
+        # is what decides this, so it is read, not guessed from the name; the
+        # caller passes the registry-aware answer when it has one, because a
+        # name newer than the bundled cost map is only known from a past probe.
+        if serves_images is None:
+            serves_images = cls._route_generates_images(model)
+        if serves_images:
+            return [cls._IMAGE_PROBE_SURFACE]
         return list(cls._PROBE_SURFACES)
+
+    def _serves_images(self, model: Mapping[str, Any]) -> bool:
+        """Whether this route generates images and answers no text turn.
+
+        The classmethod's cost-map answer first, then the registry's -- which
+        also carries a past probe result, the only reading available for a name
+        newer than the bundled cost map.  Every surface that has to know the
+        route is a generator reads this one answer: the probe's surface matrix
+        and the pane's projection, so the two can never disagree about whether
+        a 公开上下文 row means anything.
+        """
+
+        if self._route_generates_images(model):
+            return True
+        wire_name = self._wire_model_name(model)
+        if not wire_name:
+            return False
+        try:
+            return self._context_registry().states_image_generation([wire_name])
+        except Exception:
+            return False
+
+    @classmethod
+    def _route_generates_images(cls, model: Mapping[str, Any]) -> bool:
+        """Whether this route's model generates images and answers no text turn.
+
+        Read from LiteLLM's cost map, the one modality table refreshed with
+        every install: ``gpt-image-2.6-flare`` is ``image_generation`` there
+        while no public catalog has listed that spelling yet.  A name the table
+        does not carry is ``False`` -- an unknown name is not evidence of an
+        image route, and ``_PROBE_SURFACES`` stays the answer for every route
+        this app cannot classify.
+
+        The public catalog's modality is deliberately not consulted.  It names
+        models such as ``gemini-3.1-flash-image`` that generate *and* converse,
+        and those answer a chat turn normally; the cost map's
+        ``image_generation`` mode is narrower, and a route whose only wired
+        endpoint is Images is the one whose probe needs a different question.
+        """
+
+        wire_name = cls._wire_model_name(model)
+        if not wire_name:
+            return False
+        try:
+            from ...core.model_contexts import litellm_mode
+
+            return litellm_mode(wire_name) == "image_generation"
+        except Exception:
+            return False
 
     def _probe_model(
         self,
@@ -2804,24 +3004,85 @@ class ProvidersModelsDomain:
             _key_name, credential = self._model_credential(provider, model)
             api_base = api_base or self._plain_credential_api_base(provider)
         model_name = self._wire_model_name(model)
-        surfaces = self._probe_surfaces(api_base, model, provider)
+        surfaces = self._probe_surfaces(
+            api_base, model, provider, serves_images=self._serves_images(model)
+        )
 
-        with ThreadPoolExecutor(max_workers=len(surfaces)) as executor:
-            surface_futures = {
-                surface: executor.submit(
-                    self._surface_probe,
-                    surface=surface,
-                    api_base=api_base,
-                    credential=credential,
-                    model_name=model_name,
-                    account_id=account_id,
+        def run_surfaces(targets: Sequence[str]) -> dict[str, dict[str, Any]]:
+            with ThreadPoolExecutor(max_workers=max(1, len(targets))) as executor:
+                futures = {
+                    surface: executor.submit(
+                        self._surface_probe,
+                        surface=surface,
+                        api_base=api_base,
+                        credential=credential,
+                        model_name=model_name,
+                        account_id=account_id,
+                    )
+                    for surface in targets
+                }
+                return {surface: future.result() for surface, future in futures.items()}
+
+        surface_results = run_surfaces(surfaces)
+        # The modality is not always readable before the first request: LiteLLM's
+        # cost map is fixed to the copy bundled with this install, and a provider
+        # that ships a model ahead of it (``gpt-image-2.6-flare`` is absent from
+        # 1.108.1's map) leaves ``_route_generates_images`` with nothing to read.
+        # The answer is then behavioural, and it costs nothing when the route is
+        # a chat model: only a route that refused *every* chat wire is asked the
+        # Images question, and only its own declaration-free "not supported on
+        # this endpoint" silence is what sends it there.
+        answered_images: bool | None = None
+        if (
+            self._IMAGE_PROBE_SURFACE not in surface_results
+            and surfaces
+            and all(
+                str(result.get("status", "")) != "ok"
+                and result.get("available") is not True
+                for result in surface_results.values()
+            )
+            # A surface that refused the request answered: the route was
+            # reached and the model was not served there.  Transport failures
+            # keep their own meaning and never send the probe to another wire,
+            # and neither does a 429 (the upstream read the request and refused
+            # the pace).  ``egress_blocked`` belongs here too: a relay answers
+            # the Messages wire for a model it only serves as an image with a
+            # permission body, which is still a refusal of that model, not of
+            # the route.
+            and all(
+                str(result.get("status", ""))
+                in {"http_error", "unsupported", "invalid_response", "egress_blocked"}
+                for result in surface_results.values()
+            )
+        ):
+            image_result = run_surfaces([self._IMAGE_PROBE_SURFACE])
+            if image_result[self._IMAGE_PROBE_SURFACE].get("available") is True:
+                surface_results = image_result
+                surfaces = [self._IMAGE_PROBE_SURFACE]
+                answered_images = True
+            elif str(
+                image_result[self._IMAGE_PROBE_SURFACE].get("status", "")
+            ) in {"http_error", "unsupported", "invalid_response", "egress_blocked"}:
+                # The Images endpoint answered and refused this model, which is
+                # the one statement that settles the other direction: a chat
+                # route that also refuses the Images wire.
+                answered_images = False
+        elif self._IMAGE_PROBE_SURFACE in surface_results:
+            answered_images = (
+                surface_results[self._IMAGE_PROBE_SURFACE].get("available") is True
+            )
+        if answered_images is not None:
+            # The probe is the only surface that ever asks this question, and
+            # the pane and the managed catalog are written by domains that
+            # never do.  Recording it is what makes the context window and the
+            # client pickers agree with what was just measured, for a name no
+            # bundled table carries yet.
+            try:
+                self._context_registry().remember_image_generator(
+                    [model_name], generator=answered_images
                 )
-                for surface in surfaces
-            }
-            surface_results = {
-                surface: future.result()
-                for surface, future in surface_futures.items()
-            }
+            except Exception:
+                pass
 
         configured_fallback = str(model.get("upstream_url_surface", "")).strip()
         inferred_fallback = infer_upstream_fallback_surface(model_name)
@@ -2833,12 +3094,22 @@ class ProvidersModelsDomain:
             if protocol_mode == "fixed"
             else (inferred_fallback, configured_fallback)
         )
-        priority = [
-            surface
-            for surface in (*preferred_surfaces, *surfaces)
-            if surface in surfaces
+        # A route measured on the Images wire has no fallback to rank: the
+        # chat surfaces its declaration names are wires it does not serve, and
+        # a "preferred" one of them would make the priority list empty and the
+        # finding read as no surface at all.
+        image_surfaces = [
+            surface for surface in surfaces if surface == self._IMAGE_PROBE_SURFACE
         ]
-        priority = list(dict.fromkeys(priority))
+        if image_surfaces:
+            priority = image_surfaces
+        else:
+            priority = [
+                surface
+                for surface in (*preferred_surfaces, *surfaces)
+                if surface in surfaces
+            ]
+            priority = list(dict.fromkeys(priority))
         available_surfaces = [
             surface
             for surface in priority
@@ -2855,7 +3126,16 @@ class ProvidersModelsDomain:
         # waits until the preferred surface answered.
         preferred_surface = priority[0] if priority else ""
         recommendation_blocked = statuses.get(preferred_surface) == "network_error"
-        recommended = None if recommendation_blocked else (available_surfaces[0] if available_surfaces else None)
+        # The Images wire is not one of the protocols the pane offers, so a
+        # route measured on it never produces a protocol recommendation: there
+        # is no other surface to move it to, and reporting one would make the
+        # pane offer a write that changes nothing.
+        image_only_route = priority == [self._IMAGE_PROBE_SURFACE]
+        recommended = (
+            None
+            if image_only_route or recommendation_blocked
+            else (available_surfaces[0] if available_surfaces else None)
+        )
         unavailable_surfaces = [surface for surface in priority if surface not in available_surfaces]
         # A transport failure is not a verdict about the route. Relay edges drop
         # or stall diagnostic connections while the same route serves ordinary
@@ -2913,7 +3193,9 @@ class ProvidersModelsDomain:
             surface_status=surface_status,
         )
         probe_overlay = {
-            "available": recommended is not None,
+            # An image route has no protocol to recommend and is still serving:
+            # the verdict is that the endpoint it really uses answered.
+            "available": bool(available_surfaces) if image_only_route else recommended is not None,
             "unreachable": bool(unreachable_surfaces) and len(unreachable_surfaces) == len(priority),
             "recommended_surface": recommended,
             "summary": summary,
@@ -2935,9 +3217,10 @@ class ProvidersModelsDomain:
         rate_limited_surfaces = [
             surface for surface in priority if statuses.get(surface) == "rate_limited"
         ]
+        answered = bool(available_surfaces) if image_only_route else recommended is not None
         return {
-            "ok": recommended is not None,
-            "available": recommended is not None,
+            "ok": answered,
+            "available": answered,
             # Every surface failed at the transport layer: the probe has no
             # verdict, which the UI reports separately from "unavailable".
             "unreachable": bool(unreachable_surfaces) and len(unreachable_surfaces) == len(priority),
@@ -2950,7 +3233,7 @@ class ProvidersModelsDomain:
             "summary": summary,
             "degradation": copy.deepcopy(degradation),
             "detail": "Model probe completed"
-            if recommended is not None
+            if answered
             else "The configured surface could not be reached; no protocol change is recommended"
             if recommendation_blocked
             else "The model endpoint could not be reached"
@@ -3045,7 +3328,8 @@ class ProvidersModelsDomain:
                 matched_name = [
                     index
                     for index, model in enumerate(models)
-                    if isinstance(model, Mapping) and str(model.get("model_name", "")) == direct
+                    if isinstance(model, Mapping)
+                    and public_name_key(model.get("model_name", "")) == public_name_key(direct)
                 ]
                 if len(matched_name) > 1:
                     raise DomainError(
@@ -3544,32 +3828,39 @@ class ProvidersModelsDomain:
             "providers": {provider_id: dict(observed)},
         }
 
-    def _refresh_published_rates(self, provider: Mapping[str, Any]) -> None:
+    def _refresh_published_rates(self, provider: Mapping[str, Any]) -> bool:
         """Learn the rates this provider's own account publishes, once.
 
         Called only from an explicit edit that asks a route to follow a rate.
         A snapshot, a load, and a projection must never reach this: it may
         start a worker and read the desktop credential, so it belongs to a
         user's own action, never to rendering one.
+
+        Answers whether this account's rates are known afterwards.  A kind that
+        publishes no rate at all is not a failure to learn one -- its routes
+        follow a station's multiplier instead, which the coordinator resolves
+        -- so it answers ``True``.  Only an account that should have stated its
+        rates and did not is ``False``.
         """
 
         auth_kind = self._provider_auth_state(provider)["kind"]
         if auth_kind not in managed_adapters.rate_publishing_auth_kinds():
-            return
+            return True
         provider_id = managed_adapters.rate_provider_id(auth_kind)
         if not provider_id:
-            return
+            return True
         if isinstance(self._published_rates.get(provider_id), Mapping):
             # The rates are already known; do not spend a read to learn them
             # again.  A wrong rate is corrected by reading the catalog (刷新),
             # which is the same place the 倍率 column comes from.
-            return
+            return True
         try:
             document = self._workbuddy().models(provider_id, refresh=False)
         except Exception:
-            return
+            return False
         self._remember_published_rates(provider_id, document.get("models"))
         self._remember_published_windows(provider_id, document.get("models"))
+        return isinstance(self._published_rates.get(provider_id), Mapping)
 
     def _remember_published_rates(self, provider_id: str, models: object) -> None:
         """Remember the rate one account's catalog states for each model.
@@ -3648,6 +3939,24 @@ class ProvidersModelsDomain:
                 windows[model_id] = window
         if windows:
             self._catalog_windows[provider_id] = windows
+            self._store_stated_windows(windows)
+
+    def _store_stated_windows(self, windows: Mapping[str, int]) -> None:
+        """Write these readings where the managed catalog's writer can read them.
+
+        The pane and the managed catalog are two domains with two registries,
+        and only this one performs a catalog read.  Without a shared copy the
+        catalog -- the file Codex actually compacts against -- resolved a model
+        no profile knows to the unknown-model placeholder while the pane one
+        pane away showed the window the upstream stated.
+        """
+
+        try:
+            self._context_registry().remember_stated_windows(windows)
+        except Exception:
+            # A pane read is not the place to fail over a cache write: the row
+            # still reports this read from memory, and the next one retries.
+            pass
 
     def _remember_lane_routes(self, provider_id: str, routes: object) -> None:
         """Remember which picker group the upstream put each model in.
@@ -4509,7 +4818,18 @@ class ProvidersModelsDomain:
         self,
         provider: Mapping[str, Any],
         model: dict[str, Any],
+        *,
+        staged: bool = True,
     ) -> None:
+        """Derive one route's binding state from its ProviderKey.
+
+        ``staged`` distinguishes the two callers.  An edit (``staged``) may
+        refuse: it is the user's own action, and a mode nothing can finish is
+        better refused there than turned into a draft that blocks the whole
+        provider.  A document being read may not — its rows are already saved,
+        and a refusal here would make the pane unable to open the very document
+        it has to repair — so the stored state is restated instead.
+        """
         order_mode = str(model.get("order_mode", "manual")).strip() or "manual"
         if order_mode not in MODEL_ORDER_MODES:
             raise DomainError("Order mode must be manual or relay_multiplier")
@@ -4531,6 +4851,31 @@ class ProvidersModelsDomain:
         )
         if order_mode == "relay_multiplier" and not self._route_has_rate_authority(provider, key):
             raise DomainError("Following a rate requires a provider key that publishes one")
+        if order_mode == "relay_multiplier" and not relay_selected:
+            # The authority here is the account's own catalog, and only that
+            # catalog states the number.  A route staged to follow it with no
+            # number in hand is a draft nothing can finish: the Apply never
+            # starts (the dumper refuses a route with no order) and validation
+            # reads *every* route of the provider, so the next edit of any row
+            # here reported 更改未生效 with this one still marked.  The read the
+            # edit needs is therefore taken now, where it can answer the user's
+            # own action, and an account that states no rate refuses that edit
+            # rather than staging a row nothing can write.
+            published = self._published_rate(provider, model)
+            if published is None and staged:
+                self._refresh_published_rates(provider)
+                published = self._published_rate(provider, model)
+            if published is None:
+                if staged:
+                    raise DomainError(
+                        "Following a rate needs one this account has not published",
+                        code="follow_rate_unavailable",
+                    )
+                # A saved row cannot be refused: it is already in the document
+                # this pane has to be able to open.  It keeps the order it
+                # states and reads as manual, so the next edit of any other row
+                # is not blocked by a number nothing here can supply.
+                order_mode = "manual"
         # ProviderKey.source is the single relation source of truth.  These
         # editor fields remain derived for old documents/UI readers, but they
         # are never accepted as an independent model-level binding contract.
@@ -4555,11 +4900,6 @@ class ProvidersModelsDomain:
                 # one.  A rate the account *has* published is already known,
                 # so it materializes here instead of waiting for a fetch that
                 # only a station read could satisfy.
-                # 
-                # PERFORMANCE FIX: Only check cached rates, never trigger a fresh
-                # WorkBuddy call during model addition. The published rate will be
-                # resolved lazily when actually needed (e.g., during Apply or when
-                # explicitly refreshing the catalog).
                 published = self._published_rate_cached_only(provider, model)
                 model["effective_order"] = (
                     None if published is None else self._order_value(published, label="Model rate")
@@ -4582,6 +4922,13 @@ class ProvidersModelsDomain:
         Legacy documents can carry model-level relay fields.  Reading them
         remains supported, but the selected ProviderKey wins immediately so
         stale metadata cannot survive in the staged editor state.
+
+        A route whose order mode has no number yet is restated as manual here,
+        where a stored document is read: a write cannot be refused for a row the
+        user already saved, and a mode this app cannot finish would otherwise
+        refuse every later edit of the provider.  The edit that asks for the
+        mode is what learns (or refuses) the number; see
+        ``_normalize_model_binding``.
         """
 
         if not isinstance(providers, list):
@@ -4596,23 +4943,28 @@ class ProvidersModelsDomain:
                 if not isinstance(model, dict):
                     continue
                 key = self._model_provider_key(provider, model)
-                if (
-                    str(model.get("order_mode", "manual")).strip() == "relay_multiplier"
-                    and not self._route_has_rate_authority(provider, key)
-                ):
-                    manual_order = self._order_value(
-                        model.get("manual_order", model.get("order", 0)),
-                        label="Manual route order",
-                    )
-                    model.update(
-                        {
-                            "order_mode": "manual",
-                            "manual_order": manual_order,
-                            "effective_order": manual_order,
-                            "order": manual_order,
-                        }
-                    )
-                self._normalize_model_binding(provider, model)
+                if str(model.get("order_mode", "manual")).strip() == "relay_multiplier":
+                    # Two ways a stored mode has no number: it lost its
+                    # authority entirely, or it keeps one (a relay key) that
+                    # only the coordinator can resolve, and it was saved
+                    # before that resolution ran.  The first is a mode the
+                    # document may not state; the second is a draft waiting for
+                    # its read, which the coordinator still completes.  Only
+                    # the first is restated here.
+                    if not self._route_has_rate_authority(provider, key):
+                        manual_order = self._order_value(
+                            model.get("manual_order", model.get("order", 0)),
+                            label="Manual route order",
+                        )
+                        model.update(
+                            {
+                                "order_mode": "manual",
+                                "manual_order": manual_order,
+                                "effective_order": manual_order,
+                                "order": manual_order,
+                            }
+                        )
+                self._normalize_model_binding(provider, model, staged=False)
 
     def _dispatch_provider_key(self, action: str, data: Mapping[str, Any]) -> None:
         providers = self._draft["providers"]
@@ -5680,7 +6032,7 @@ class ProvidersModelsDomain:
         # states its producer in the public name instead, which keeps both
         # reachable while naming where each one comes from.
         taken_names = {
-            str(model.get("model_name", "")).strip()
+            public_name_key(model.get("model_name", ""))
             for model in models
             if isinstance(model, Mapping) and str(model.get("model_name", "")).strip()
         }
@@ -5700,7 +6052,7 @@ class ProvidersModelsDomain:
                 },
                 used_deployment_ids,
             )
-            taken_names.add(str(row.get("model_name", "")).strip())
+            taken_names.add(public_name_key(row.get("model_name", "")))
             self._append_model_row(edited, models, row)
             existing.add(model_id)
             added += 1
@@ -5739,19 +6091,20 @@ class ProvidersModelsDomain:
         """
 
         name = _public_name_for_lane_id(model_id)
-        if name not in taken:
+        if public_name_key(name) not in taken:
             return name
         channel = str(channels.get(model_id, "") or "").strip()
         if channel:
             candidate = f"{name} ({channel})"
-            if candidate not in taken:
+            if public_name_key(candidate) not in taken:
                 return candidate
         # No producer tag to borrow, or that tag is taken too.  Returning the id
         # is not a fallback here: when the name collided because two rows share
         # an id, the id is exactly what was taken.  The suffix is what makes the
-        # second row distinguishable at all.
+        # second row distinguishable at all.  A name collides when its identity
+        # does, so a lane roster that spells one id in two cases is one row.
         suffix = 2
-        while f"{model_id} ({suffix})" in taken:
+        while public_name_key(f"{model_id} ({suffix})") in taken:
             suffix += 1
         return f"{model_id} ({suffix})"
 
@@ -7845,7 +8198,9 @@ class ProvidersModelsDomain:
                     )
                     if value
                 ]
-                if model_name != public_model or not identities:
+                # The group is the name's identity: one public model is one
+                # group however its routes capitalise it.
+                if not identities or public_name_key(model_name) != public_name_key(public_model):
                     continue
                 if str(model.get("order_mode", "manual")).strip() == "relay_multiplier":
                     raise DomainError(
@@ -7958,7 +8313,7 @@ class ProvidersModelsDomain:
                 continue
             if not any(
                 isinstance(model, Mapping)
-                and str(model.get("model_name", "")).strip() == public_model
+                and public_name_key(model.get("model_name", "")) == public_name_key(public_model)
                 for model in models
             ):
                 continue
@@ -7969,9 +8324,9 @@ class ProvidersModelsDomain:
             kept: list[Any] = []
             provider_name = str(provider_copy.get("name", "")).strip()
             for model in copied_models:
-                if isinstance(model, Mapping) and str(
+                if isinstance(model, Mapping) and public_name_key(
                     model.get("model_name", "")
-                ).strip() == public_model:
+                ) == public_name_key(public_model):
                     # A result measured on a route that no longer exists is not
                     # evidence for anything, so its probe result goes with it.
                     self._probe_overlay.get(provider_name, {}).pop(
@@ -8036,13 +8391,17 @@ class ProvidersModelsDomain:
             if not isinstance(models, list):
                 continue
             for model_index, model in enumerate(models):
-                if isinstance(model, Mapping) and str(
+                if isinstance(model, Mapping) and public_name_key(
                     model.get("model_name", "")
-                ).strip() == public_model:
+                ) == public_name_key(public_model):
                     matched.append((provider_index, model_index))
         if not matched:
             raise DomainError("The selected public model is unavailable")
-        if next_name != public_model:
+        # A rename is a change of *identity*, so another group is only in the
+        # way when it holds the same identity under another spelling.  One
+        # group's own rows disagreeing about case are this group, and the
+        # rename is how the user settles that.
+        if public_name_key(next_name) != public_name_key(public_model):
             matched_set = set(matched)
             for provider_index, provider in enumerate(self._draft["providers"]):
                 if not isinstance(provider, Mapping):
@@ -8054,7 +8413,8 @@ class ProvidersModelsDomain:
                     if (
                         isinstance(model, Mapping)
                         and (provider_index, model_index) not in matched_set
-                        and str(model.get("model_name", "")).strip() == next_name
+                        and public_name_key(model.get("model_name", ""))
+                        == public_name_key(next_name)
                     ):
                         raise DomainError(
                             "A public model with that name already exists"
@@ -8073,6 +8433,13 @@ class ProvidersModelsDomain:
                 raise DomainError("The selected public model is unavailable")
             model = self._copy_model_for_edit(models[model_index])
             model["model_name"] = next_name
+            if next_name != public_model:
+                # The route key is the route's own name in the trace and in the
+                # log's route column; a rename that left it behind labelled the
+                # row with a group nothing serves any more.
+                route_key = str(model.get("route_key", "")).strip()
+                if route_key:
+                    model["route_key"] = _route_key_renamed(route_key, next_name)
             for limit_key, limit in limits.items():
                 if limit is None:
                     model.pop(limit_key, None)

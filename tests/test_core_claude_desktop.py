@@ -15,6 +15,7 @@ from young_router.core.claude_desktop import (
     ClaudeDeveloperSettings,
 )
 from young_router.core.domains.claude import ClaudeSettingsDomain
+from young_router.proxy import claude_desktop_listing as claude_desktop_listing_module
 
 
 def _write_desktop_config(root: pathlib.Path, config: dict[str, object]) -> pathlib.Path:
@@ -838,10 +839,79 @@ general_settings:
                 runtime_config_path=root / "config.yaml",
                 runtime_root=root,
             )
-            with mock.patch.object(domain, "desktop_uses_local_api", return_value=True):
+            with mock.patch.object(domain, "desktop_uses_local_api", return_value=True), mock.patch.object(
+                domain, "_public_models", return_value=["gpt-5.4"]
+            ), mock.patch.object(
+                claude_desktop_listing_module, "_declared_context_window", return_value=1_000_000
+            ):
+                self.assertTrue(domain._declares_one_million_context())
                 domain._prefer_one_million_context()
             config = json.loads(domain.raw_text(document="desktop", include_sensitive=True))
             self.assertTrue(config["modelPrefer1mContext"])
+
+    def test_a_window_this_app_only_resolved_is_not_a_declaration(self) -> None:
+        # ``/v1/models`` can state a window nobody on the route declared
+        # (LiteLLM's table, a provider profile).  That is a reading, and a 1M
+        # reading is what made the picker hide rows that could run.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(
+                desktop_root,
+                {
+                    "inferenceProvider": "gateway",
+                    "inferenceGatewayBaseUrl": "http://127.0.0.1:4100",
+                },
+            )
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with mock.patch.object(domain, "desktop_uses_local_api", return_value=True), mock.patch.object(
+                domain, "_public_models", return_value=["gemini-3.8-flash"]
+            ), mock.patch.object(
+                claude_desktop_listing_module, "_declared_context_window", return_value=None
+            ):
+                self.assertFalse(domain._declares_one_million_context())
+                domain._prefer_one_million_context()
+            config = json.loads(domain.raw_text(document="desktop", include_sensitive=True))
+            self.assertNotIn("modelPrefer1mContext", config)
+
+    def test_no_route_declaring_1m_leaves_the_preference_off(self) -> None:
+        # The preference is about the whole picker: it hides the standard row of
+        # every route that reads as 1M.  Setting it wherever this app's proxy
+        # merely answered made the routes whose upstream advertises a large
+        # window lose the row that could run.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(
+                desktop_root,
+                {
+                    "inferenceProvider": "gateway",
+                    "inferenceGatewayBaseUrl": "http://127.0.0.1:4100",
+                },
+            )
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            rows = [
+                {"id": "gemini-3.8-flash", "max_input_tokens": None},
+                {"id": "gpt-6.1-sol", "max_input_tokens": 500_000},
+            ]
+            with mock.patch.object(domain, "desktop_uses_local_api", return_value=True), mock.patch.object(
+                domain, "_public_models", return_value=["gemini-3.8-flash", "gpt-6.1-sol"]
+            ), mock.patch.object(
+                claude_desktop_listing_module, "_declared_context_window", return_value=None
+            ):
+                domain._prefer_one_million_context()
+            config = json.loads(domain.raw_text(document="desktop", include_sensitive=True))
+            self.assertNotIn("modelPrefer1mContext", config)
 
     def test_an_explicit_1m_preference_is_not_overridden(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

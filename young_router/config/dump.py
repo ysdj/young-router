@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 import yaml
 
 from ..api_base import normalize_configured_api_base
+from ..public_names import public_name_key
 
 # PyYAML's pure-Python scanner is ~10x slower than the libyaml one, and this
 # module composes the whole configuration several times per commit: once per
@@ -841,7 +842,26 @@ GROUP_NAME_TABLES = (
 GENERIC_FALLBACK_GROUP = "*"
 
 
-def _restated_group_name(name: object, renames: dict[str, str], served: set[str]) -> str:
+def _served_spellings(renames: Mapping[str, str], served: set[str]) -> dict[str, str]:
+    """Every name a stored reference may mean, by identity.
+
+    ``renames`` reads an old public name as the one that replaced it, and
+    ``served`` is what the document now serves.  Both sides are indexed by
+    identity rather than by spelling, so a reference that states another case of
+    a served group resolves to the group instead of being dropped as unknown.
+    """
+
+    spellings: dict[str, str] = {}
+    for name in served:
+        spellings.setdefault(public_name_key(name), name)
+    for old, new in renames.items():
+        target = spellings.get(public_name_key(new)) or (new if new in served else "")
+        if target:
+            spellings[public_name_key(old)] = target
+    return spellings
+
+
+def _restated_group_name(name: object, spellings: Mapping[str, str]) -> str:
     """The served name a stored group reference means now, or ``""`` for none."""
 
     text = str(name).strip() if isinstance(name, str) or isinstance(name, (int, float)) else ""
@@ -851,16 +871,16 @@ def _restated_group_name(name: object, renames: dict[str, str], served: set[str]
         # ``"*"`` is not a group name: it is the key of the Router's catch-all
         # fallback chain, read for every request whose own group has none.
         return text
-    return text if (text := renames.get(text, text)) in served else ""
+    return spellings.get(public_name_key(text), "")
 
 
-def _restated_fallback_list(targets: object, renames: dict[str, str], served: set[str]) -> list[str]:
+def _restated_fallback_list(targets: object, spellings: Mapping[str, str]) -> list[str]:
     """One fallback target list, in order, with gone targets removed."""
 
     values = targets if isinstance(targets, list) else ([] if targets is None else [targets])
     restated: list[str] = []
     for target in values:
-        name = _restated_group_name(target, renames, served)
+        name = _restated_group_name(target, spellings)
         if name and name not in restated:
             restated.append(name)
     return restated
@@ -875,10 +895,13 @@ def _group_references_restated(
     """Restate every group reference in one ``router_settings`` map.
 
     ``renames`` reads an old public name as the one that replaced it, and
-    ``served`` is the set of names the configuration now serves.  A reference to
-    a name that is in neither is dropped, and named in the second return value:
-    the Router would never look such a group up, so keeping it only makes the
-    group's own failover list read as one hop longer than it is.
+    ``served`` is the set of names the configuration now serves.  Both are
+    matched by identity, not by spelling (``_served_spellings``): a reference
+    the user wrote in another case names the group the document serves, and is
+    restated to that group's own spelling.  A reference to a name that is in
+    neither is dropped, and named in the second return value: the Router would
+    never look such a group up, so keeping it only makes the group's own
+    failover list read as one hop longer than it is.
 
     Returns the rewritten map (a plain dict, so a caller can dump it) and the
     dropped names in document order.  The map is the input object itself when no
@@ -888,6 +911,7 @@ def _group_references_restated(
 
     if not isinstance(settings, Mapping):
         return {}, []
+    spellings = _served_spellings(renames, served)
     rewritten = dict(settings)
     dropped: list[str] = []
     changed = False
@@ -899,7 +923,7 @@ def _group_references_restated(
             restated_alias: dict[str, Any] = {}
             for alias, target in stored.items() if isinstance(stored, Mapping) else ():
                 inner = target.get("model") if isinstance(target, Mapping) else target
-                name = _restated_group_name(inner, renames, served)
+                name = _restated_group_name(inner, spellings)
                 if not name:
                     # An alias whose target no longer exists is a name the Router
                     # still accepts and then cannot place: the request fails as an
@@ -922,8 +946,8 @@ def _group_references_restated(
                 continue
             restated_entry: dict[str, Any] = {}
             for source, targets in entry.items():
-                restated_targets = _restated_fallback_list(targets, renames, served)
-                name = _restated_group_name(source, renames, served)
+                restated_targets = _restated_fallback_list(targets, spellings)
+                name = _restated_group_name(source, spellings)
                 if not name:
                     if isinstance(source, str) and source.strip():
                         dropped.append(source.strip())
@@ -935,7 +959,7 @@ def _group_references_restated(
                             dropped.append(target.strip())
                     continue
                 for target in targets if isinstance(targets, list) else ():
-                    if not _restated_group_name(target, renames, served) and isinstance(target, str) and target.strip():
+                    if not _restated_group_name(target, spellings) and isinstance(target, str) and target.strip():
                         dropped.append(target.strip())
                 restated_entry[name] = restated_targets
             if restated_entry:
@@ -947,26 +971,60 @@ def _group_references_restated(
 
 
 def _unique_model_groups(active_entries: list[dict[str, Any]], existing_groups: list[Any] | None = None) -> list[str]:
+    """The public names this document serves, once each per identity.
+
+    A group is one *identity*, not one spelling (``public_names.public_name_key``):
+    ``minimax-m3.1-flash`` and ``MiniMax-M3.1-Flash`` are one name a client
+    asks in two cases, and listing both published a group table that promised a
+    second group for rows the Router keeps in the first one's deployment set.
+
+    Order is the existing table's, then the routes': a save never reorders a
+    group table the user did not touch.  The *spelling* is the group's own
+    (``_preferred_public_spelling``), so one group is one entry whatever case
+    its rows state.
+    """
+
     active_names: list[str] = []
-    active_seen: set[str] = set()
+    active_by_key: dict[str, list[str]] = {}
     for entry in active_entries:
         name = str(entry.get("model_name", "")).strip()
-        if name and name not in active_seen:
-            active_names.append(name)
-            active_seen.add(name)
+        key = public_name_key(name)
+        if not key:
+            continue
+        spellings = active_by_key.setdefault(key, [])
+        if not spellings:
+            active_names.append(key)
+        if name not in spellings:
+            spellings.append(name)
 
+    preferred = {key: _preferred_public_spelling(names) for key, names in active_by_key.items()}
     groups: list[str] = []
     seen: set[str] = set()
     for group in existing_groups or []:
-        name = str(group).strip()
-        if name and name in active_seen and name not in seen:
-            groups.append(name)
-            seen.add(name)
-    for name in active_names:
-        if name not in seen:
-            groups.append(name)
-            seen.add(name)
+        key = public_name_key(group)
+        if key in active_by_key and key not in seen:
+            groups.append(preferred[key])
+            seen.add(key)
+    for key in active_names:
+        if key not in seen:
+            groups.append(preferred[key])
+            seen.add(key)
     return groups
+
+
+def _preferred_public_spelling(spellings: list[str]) -> str:
+    """The one spelling a group publishes, out of the cases its rows state.
+
+    A lower-case spelling wins: it is the one a client is most likely to send,
+    and the one the other rows can always be folded onto.  With no lower-case
+    spelling among them the first one stands, so the group is named by a row the
+    document already carries rather than by one this writer invented.  The pane
+    applies the same rule (``publicModelNames.preferredPublicSpelling``), so the
+    settings field and the saved group table name the group the same way.
+    """
+
+    folded = [name for name in spellings if name == name.casefold()]
+    return folded[0] if folded else spellings[0]
 
 
 def _write_atomic(path: pathlib.Path, text: str) -> None:
