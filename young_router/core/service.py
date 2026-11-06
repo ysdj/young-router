@@ -4311,6 +4311,7 @@ class CoreStore:
         """
 
         if self._service_handlers.get("reload") is None:
+            _note("an apply wanted a proxy restart, but this app has no proxy to restart")
             return
         with self._service_reload_guard:
             if self._service_reload_stopping:
@@ -4327,7 +4328,15 @@ class CoreStore:
                 self._service_reload_pending = True
                 return
             if self._service.get("state") not in {"running", "unhealthy"}:
+                _note(
+                    "an apply wanted a proxy restart, but the service reads %s"
+                    % self._service.get("state")
+                )
                 return
+            _note(
+                "an apply is replacing the proxy (%s)"
+                % ("full replacement" if self._service_reload_replace_process else "rolling reload")
+            )
             thread = threading.Thread(
                 target=self._service_reload_worker,
                 name="litellm-core-service-reload",
