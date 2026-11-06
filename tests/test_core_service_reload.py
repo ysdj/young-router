@@ -12,6 +12,7 @@ from unittest import mock
 
 from young_router.core.domains.codex import CodexSettingsDomain
 from young_router.core.domains.providers_models import ProvidersModelsDomain
+from young_router.core.domains.runtime import RuntimeSettingsDomain
 from young_router.core.persistence import atomic_write_json
 from young_router.core.service import CoreStore
 
@@ -911,6 +912,227 @@ class CoreServiceReloadTests(unittest.TestCase):
             )
             self.assertNotIn("requires_restart", result["action_summary"])
             self.assertEqual([], reload_calls)
+
+
+class WebDAVPullReloadTests(unittest.TestCase):
+    """A bundle that arrived from another machine has to reach its proxy.
+
+    Every machine now runs its own app and its own proxy, and WebDAV is the
+    only thing between them.  A pull therefore has the same obligation an Apply
+    has: the document on disk is not the document being served until the proxy
+    is told.  On the machine that is a gateway -- no window, nobody watching --
+    nothing else would ever tell it.
+    """
+
+    CONFIG = """\
+        providers:
+          primary:
+            api_base: https://example.test/v1
+            api_keys:
+              - name: default
+                value: local-secret
+        model_list:
+          - model_name: public-chat
+            litellm_params:
+              model: openai/old-chat
+              api_base: https://example.test/v1
+              api_key: local-secret
+            model_info:
+              id: deadbeef
+              provider: primary
+              upstream_url_surface: openai/responses
+        general_settings:
+          master_key: sk-local-key
+        litellm_settings:
+          public_model_groups: [public-chat]
+        """
+
+    def _core(self, root: Path, reload_calls: list[str], staged: dict[str, str]):
+        from young_router.core.domains.relay_accounts import RelayAccountsDomain
+        from young_router.core.domains.webdav import WebDAVSettingsDomain
+
+        config_path = root / "config.yaml"
+        config_path.write_text(textwrap.dedent(self.CONFIG).lstrip(), encoding="utf-8")
+        runtime_config = root / ".litellm-runtime" / "config.yaml"
+
+        def stage_runtime_config(_operation: object = None) -> dict[str, object]:
+            runtime_config.parent.mkdir(parents=True, exist_ok=True)
+            runtime_config.write_bytes(config_path.read_bytes())
+            staged["sha"] = hashlib.sha256(runtime_config.read_bytes()).hexdigest()
+            return {"fingerprint": staged["sha"]}
+
+        def reload_service(operation: str) -> dict[str, str]:
+            reload_calls.append(operation)
+            return {"state": "running"}
+
+        webdav = WebDAVSettingsDomain(
+            root / "webdav.json",
+            enabled_path=root / "webdav.enabled",
+            status_path=root / "webdav-status.json",
+            config_path=config_path,
+            state_path=root / "webdav-state.json",
+        )
+        webdav.stage_secret("password", None, "webdav-secret")
+        webdav.dispatch(
+            "patch",
+            {"url": "https://webdav.example.test/config/", "username": "person", "remote_name": "menu.json"},
+        )
+        webdav.apply()
+        providers = ProvidersModelsDomain(config_path)
+        relay = RelayAccountsDomain(storage_path=root / ".litellm-runtime" / "relay-accounts.json")
+        domains = [providers, relay, webdav]
+        core = CoreStore(
+            domains=list(domains),
+            service_handlers={
+                "status": lambda _operation: {"state": "running"},
+                "reload": reload_service,
+                "stage_runtime_config": stage_runtime_config,
+                "runtime_fingerprint": lambda _operation=None: staged.get("sha"),
+            },
+        )
+        core.snapshot()
+        # The proxy is already serving this document.
+        stage_runtime_config()
+        return core, config_path, webdav, domains
+
+    def _pull(self, core: CoreStore, remote_document: str) -> None:
+        """Install ``remote_document`` the way a pull does, and return."""
+
+        def install(_client: object, _settings: object, config_path: Path, *_args: object, **_kwargs: object) -> None:
+            config_path.write_text(textwrap.dedent(remote_document).lstrip(), encoding="utf-8")
+
+        with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
+            "young_router.webdav.operations.pull_bundle", side_effect=install
+        ):
+            core.dispatch(
+                {"domain": "webdav", "type": "pull", "payload": {"sections": ["providers_models", "relay_accounts"]}},
+                expected_revision=core.revision,
+            )
+
+    def test_an_installed_bundle_reaches_the_proxy_that_serves_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            staged: dict[str, str] = {}
+            reload_calls: list[str] = []
+            core, config_path, _webdav, _domains = self._core(Path(directory), reload_calls, staged)
+
+            self._pull(
+                core,
+                self.CONFIG.replace("openai/old-chat", "openai/new-chat"),
+            )
+
+            self.assertTrue(core.wait_for_service_reload(5.0))
+            # A rolling reload: the document moved, the key did not, so the
+            # workers can simply load it.
+            self.assertEqual(["reload"], reload_calls)
+            self.assertIn("openai/new-chat", config_path.read_text(encoding="utf-8"))
+
+    def test_a_bundle_that_changes_nothing_the_proxy_loads_does_not_replace_it(self) -> None:
+        """A pull that only touched the relay store is not a restart.
+
+        The relay document is the editor's, not the router's.  Replacing the
+        proxy for it would cut every in-flight turn to load the bytes it is
+        already serving.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            staged: dict[str, str] = {}
+            reload_calls: list[str] = []
+            core, _config_path, _webdav, _domains = self._core(Path(directory), reload_calls, staged)
+
+            self._pull(core, self.CONFIG)
+
+            self.assertTrue(core.wait_for_service_reload(5.0))
+            self.assertEqual([], reload_calls)
+
+    def test_a_key_that_arrived_with_the_bundle_replaces_the_process(self) -> None:
+        """A master key is read once at startup, so a roll cannot apply it.
+
+        LiteLLM takes ``master_key`` when it starts and this app hands it to
+        the child in its environment.  A worker forked by a rolling reload
+        keeps the key the old master was started with, so a client presenting
+        the key the bundle just installed would be refused by a proxy that
+        believes it has no such key.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            staged: dict[str, str] = {}
+            reload_calls: list[str] = []
+            core, _config_path, _webdav, _domains = self._core(Path(directory), reload_calls, staged)
+
+            self._pull(core, self.CONFIG.replace("sk-local-key", "sk-arrived-from-another-machine"))
+
+            self.assertTrue(core.wait_for_service_reload(5.0))
+            self.assertEqual(["restart"], reload_calls)
+
+    def test_the_pane_that_states_the_key_follows_the_one_that_arrived(self) -> None:
+        """The runtime pane states the proxy key, so a pulled key is its baseline.
+
+        The key lives in the provider document, but the pane that shows it is
+        the runtime one.  Without this the pane keeps a baseline from before the
+        pull and reports "changed on disk" about a file this sync itself
+        rewrote -- a permanent nag on every machine but the one that edited.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            staged: dict[str, str] = {}
+            reload_calls: list[str] = []
+            core, config_path, _webdav, domains = self._core(root, reload_calls, staged)
+            runtime_domain = RuntimeSettingsDomain(root / "runtime-settings.env", config_path=config_path)
+            core = CoreStore(
+                domains=[*domains, runtime_domain],
+                service_handlers={
+                    "status": lambda _operation: {"state": "running"},
+                    "reload": lambda operation: (reload_calls.append(operation), {"state": "running"})[1],
+                    "stage_runtime_config": lambda _operation=None: {"fingerprint": "before"},
+                    "runtime_fingerprint": lambda _operation=None: "before",
+                },
+            )
+            core.snapshot()
+            self.assertFalse(runtime_domain.external_disk_state()["changed"])
+
+            self._pull(core, self.CONFIG.replace("sk-local-key", "sk-arrived-from-another-machine"))
+
+            self.assertTrue(core.wait_for_service_reload(5.0))
+            self.assertEqual(["restart"], reload_calls)
+            # The pane now reads the document the bundle installed rather than
+            # the one it was showing before.
+            self.assertFalse(runtime_domain.external_disk_state()["changed"])
+            self.assertEqual("sk-arrived-from-another-machine", self._document_key(config_path))
+
+    @staticmethod
+    def _document_key(config_path: Path) -> str:
+        from young_router.core.domains.runtime import master_key_from_document
+
+        return master_key_from_document(config_path.read_text(encoding="utf-8"))
+
+    def test_the_interval_loop_applies_what_it_pulled(self) -> None:
+        """The unattended path owes the same reload as the button.
+
+        The interval loop is the one that runs on a machine nobody is looking
+        at, so "the pane shows the new routes" cannot be the signal that the
+        proxy caught up.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            staged: dict[str, str] = {}
+            reload_calls: list[str] = []
+            core, _config_path, webdav, _domains = self._core(Path(directory), reload_calls, staged)
+            webdav.dispatch("patch", {"enabled": True, "sync_direction": "pull"})
+            webdav.apply()
+
+            remote = textwrap.dedent(self.CONFIG.replace("openai/old-chat", "openai/arrived-chat")).lstrip()
+
+            def install(_client: object, _settings: object, config_path: Path, *_args: object, **_kwargs: object) -> None:
+                config_path.write_text(remote, encoding="utf-8")
+
+            with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
+                "young_router.webdav.operations.pull_bundle", side_effect=install
+            ):
+                core.run_automatic_webdav_sync()
+
+            self.assertTrue(core.wait_for_service_reload(5.0))
+            self.assertEqual(["reload"], reload_calls)
 
 
 if __name__ == "__main__":

@@ -1490,7 +1490,17 @@ class CoreServiceController:
                 "-c",
                 "from litellm import run_server; run_server()",
             ]
-        if os.name != "nt" and sys.platform == "darwin":
+        if os.name != "nt":
+            # Every POSIX host starts the app this repository publishes, not
+            # LiteLLM's module: the gateway object is LiteLLM's app plus the
+            # page and its API on ``/ui`` and ``/ipc``, the provider-side search
+            # route, the image-context endpoint and the managed workers.  Naming
+            # ``litellm.proxy.proxy_server`` answered ``/v1`` correctly while
+            # every one of those returned 404, so a host started from here was
+            # the only one running without the app on it -- the gateway's own
+            # launcher already names this module.
+            # The forkserver launcher is POSIX, not macOS; Windows has neither
+            # forkserver nor SIGHUP and keeps LiteLLM's own CLI below.
             command = [
                 self.python,
                 "-m",
@@ -1518,8 +1528,6 @@ class CoreServiceController:
                 "--telemetry",
                 "False",
             ]
-            if os.name != "nt":
-                command.append("--run_gunicorn")
         server_log = self.paths.root / "server.log"
         server_log.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:

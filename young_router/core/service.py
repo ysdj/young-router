@@ -769,6 +769,29 @@ def _adapter_persistence_paths(adapter: DomainAdapter) -> tuple[Path, ...]:
     return tuple(dict.fromkeys(paths))
 
 
+def _document_master_key(path: Path) -> str:
+    """The key the document on disk hands its clients, or ``""`` if unreadable.
+
+    Read through the same parser every other reader of this document uses, so
+    the answer a sync compares before and after an install is the answer the
+    proxy's own environment is built from.  An unreadable or unparsable
+    document states nothing: a comparison against ``""`` then only claims a
+    move when a key actually appears, which is the safe direction -- the worst
+    case is a rolling reload where a replacement was owed.
+    """
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    try:
+        from .domains.runtime import master_key_from_document
+
+        return master_key_from_document(text)
+    except Exception:
+        return ""
+
+
 def _same_path(left: Path, right: Path) -> bool:
     try:
         return left.resolve(strict=False) == right.resolve(strict=False)
@@ -3277,6 +3300,7 @@ class CoreStore:
             webdav = self._domains.get("webdav")
             providers = self._domains.get("providers_models")
             relay = self._domains.get("relay_accounts")
+            runtime_adapter = self._domains.get("runtime")
             if webdav is None or providers is None or relay is None:
                 raise CoreError("webdav_sync_failed", "WebDAV sync sources are unavailable")
             if not automatic:
@@ -3336,6 +3360,15 @@ class CoreStore:
             action_summary: dict[str, Any] = {}
             archived_remote: str | None = None
             adopted_remote: dict[str, Any] | None = None
+            # Read before anything is installed, because the bundle replaces
+            # both: the bytes the running proxy was handed, and the key its
+            # clients present.  A pull that installs a document without this
+            # is a copy on disk that nothing serves -- and on a machine with no
+            # window open (a gateway, a background app) nothing would ever
+            # notice, so the routes would stay as they were until the next
+            # unrelated restart.
+            runtime_document_before = self._runtime_document_fingerprint()
+            master_key_before = _document_master_key(config_path)
             try:
                 client = webdav_core.WebDAVClient(settings)
                 # A setting that still carried an earlier default name is read
@@ -3398,8 +3431,22 @@ class CoreStore:
                             webdav_core.save_sync_state(state_path, settings, local_manifest, "sync")
                             outcome = "unchanged"
 
+                master_key_moved = pulled and _document_master_key(config_path) != master_key_before
                 if pulled:
-                    for name, adapter in (("providers_models", providers), ("relay_accounts", relay)):
+                    reloaded: list[tuple[str, Any]] = [
+                        ("providers_models", providers), ("relay_accounts", relay)
+                    ]
+                    if master_key_moved and runtime_adapter is not None:
+                        # The bundle carries ``general_settings.master_key``, and
+                        # the runtime pane is where that key is stated.  A key
+                        # that arrived from another machine is this machine's key
+                        # now, so the pane's baseline has to follow it instead of
+                        # reporting a file this sync itself rewrote.  A pane with
+                        # uncommitted edits keeps them: the poll states the file
+                        # changed, and the reader decides.
+                        if not self._drafts.get("runtime", {}).get("dirty"):
+                            reloaded.append(("runtime", runtime_adapter))
+                    for name, adapter in reloaded:
                         adapter.reload()
                         self._baselines[name] = self._adapter_draft_state(name)
                         self._disk[name] = {
@@ -3491,6 +3538,12 @@ class CoreStore:
                     raise CoreError(cause_code, safe_error_message(exc)) from None
                 raise CoreError(cause_code, "WebDAV sync failed") from None
             self._emit()
+            if pulled:
+                # After the commit, not inside it: the restart runs on its own
+                # thread and a rollback must never leave one scheduled.
+                self._schedule_reload_after_webdav_pull(
+                    runtime_document_before, master_key_changed=master_key_moved
+                )
             result: dict[str, Any] = {"revision": self._revision}
             if action_summary:
                 result["action_summary"] = action_summary
@@ -4139,6 +4192,30 @@ class CoreStore:
         reader = self._service_handlers.get("runtime_fingerprint")
         value = reader() if callable(reader) else None
         return value if isinstance(value, str) else None
+
+    def _schedule_reload_after_webdav_pull(
+        self, runtime_document_before: str | None, *, master_key_changed: bool
+    ) -> None:
+        """Make a document that arrived from another machine reach its proxy.
+
+        A pull used to stop at reloading the adapters: the pane showed the new
+        routes while the proxy went on serving the old document, and on a host
+        nobody is looking at -- a gateway, a background app -- nothing ever
+        noticed.  The workers load the staged document as they come up, so
+        installing ``config.yaml`` without this is a file on disk that is not
+        served.
+
+        A key that moved needs the process replaced rather than rolled: LiteLLM
+        reads ``master_key`` once at startup and this app hands it to the child
+        in its environment, so a worker forked by a rolling reload keeps the key
+        the old master was started with.  A client presenting the key the bundle
+        just installed would then be refused by a proxy that has no such key.
+        """
+
+        if master_key_changed:
+            self._schedule_service_reload_after_apply(replace_process=True)
+            return
+        self._schedule_reload_for_applied_domains(("providers_models",), runtime_document_before)
 
     def _schedule_reload_for_applied_domains(
         self,

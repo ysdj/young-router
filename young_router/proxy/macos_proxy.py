@@ -1,10 +1,23 @@
-"""Fast macOS launcher for the managed multi-worker LiteLLM proxy.
+"""The POSIX launcher for the managed multi-worker proxy.
 
-Uvicorn normally starts every macOS worker with ``spawn``.  Each worker then
-imports the complete LiteLLM proxy independently, which dominates startup
-time at the required sixteen-worker count.  A single-threaded forkserver can
-import the app once and fork clean worker processes without forking the Core
-or the proxy master after either has started watchdog threads.
+Uvicorn normally starts every worker with ``spawn``.  Each worker then imports
+the complete LiteLLM proxy independently, which dominates startup time at the
+required sixteen-worker count.  A single-threaded forkserver can import the app
+once and fork clean worker processes without forking the Core or the proxy
+master after either has started watchdog threads.
+
+POSIX, not macOS: ``multiprocessing.forkserver`` is what makes the preload
+possible and every POSIX host has it.  macOS is where the app started, and the
+name is kept because the build and process scripts name this module; the
+platform boundary that matters is Windows, which has neither the forkserver nor
+SIGHUP and takes LiteLLM's own CLI path instead (see
+``CoreServiceController.start``).
+
+What the workers import is ``young_router.proxy.gateway``, not bare LiteLLM: the
+page and its API on ``/ui`` and ``/ipc``, the provider-side search route, the
+image-context endpoint and the account-bound workers are all additions to that
+app object.  A launch that skipped it would leave a proxy answering ``/v1``
+correctly while everything this app adds to the same port returned 404.
 """
 
 from __future__ import annotations
@@ -67,7 +80,7 @@ def _positive_workers(value: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the managed macOS LiteLLM proxy")
+    parser = argparse.ArgumentParser(description="Run the managed POSIX LiteLLM proxy")
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--host", choices=("127.0.0.1",), default="127.0.0.1")
     parser.add_argument("--port", required=True, type=_bounded_port)
@@ -91,10 +104,21 @@ def _worker_config(config: Path) -> dict[str, Any]:
 
 
 def _system_proxy_snapshot() -> dict[str, Any]:
-    """Capture macOS proxy settings before workers are forked."""
+    """Capture the system proxy settings before workers are forked.
+
+    Only macOS has a SystemConfiguration database to read; every other POSIX
+    host states its proxies in the environment, which is the same answer this
+    returns when the lookup is switched off.  Calling the macOS reader on Linux
+    raises rather than answering empty, so the platform is checked here instead
+    of letting the launcher die on a name that only exists in one build.
+    """
 
     environment_proxies = urllib.request.getproxies_environment()
-    if environment_proxies or os.environ.get("YOUNG_ROUTER_DISABLE_SYSTEM_PROXY_LOOKUP") == "1":
+    if (
+        environment_proxies
+        or sys.platform != "darwin"
+        or os.environ.get("YOUNG_ROUTER_DISABLE_SYSTEM_PROXY_LOOKUP") == "1"
+    ):
         return {
             "source": "environment",
             "proxies": dict(environment_proxies),

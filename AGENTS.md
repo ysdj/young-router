@@ -57,6 +57,8 @@
 
 - 运行时从 `.litellm-runtime/config.yaml` 起；源配置显式校验并 staging，任何文件改动都不许静默重启服务。
 - macOS proxy 跑 `LITELLM_NUM_WORKERS=16`：不许调低，也不许作为性能或恢复手段缩小。
+- **每个 POSIX 主机起的都是本仓库的 app，不是裸 litellm**：`CoreServiceController.start` 用 `-m young_router.proxy.macos_proxy`（模块名是历史，实现是 forkserver，POSIX 都有），workers 导入的是 `young_router.proxy.gateway`——LiteLLM 的 app 加上 `/ui`/`/ipc` 转发、provider 侧检索路由、image-context 端点与 managed worker。名字写成 `litellm.proxy.proxy_server` 就只剩 `/v1`，其余全 404：网关主机上曾因此没有页面可开。Windows 没有 forkserver 也没有 SIGHUP，仍走 litellm 自己的 CLI。
+- **一个 bundle 落地必须到达 proxy**：`pull` 安装完 `config.yaml` 只 `adapter.reload()` 是「文件改了、线上没改」，主机、后台 app 这种没人看的机器上永远不会被发现。同步提交后按运行时文档的指纹决定是否 reload；**主密钥变了必须替换进程**——LiteLLM 启动时读一次 `master_key`，且本 app 通过子进程环境传它，滚动重启 fork 出的 worker 拿的还是旧 key，带新 key 的客户端会被自己这台网关拒掉。
 - 重启和安装都不等 proxy drain：两者都抓 bundle 正在跑的 pid，通过唯一的 `scripts/app-processes.sh stop` 一起杀掉，进程一消失就用替换件起——替换件要的 loopback 监听在同一瞬间释放，那条路径上加信号阶梯或 grace 预算就是把等待装回去。四小时的 `PROXY_DRAIN_GRACE_SECONDS` 只属于 Core 有意做的替换，`APP_EXIT_STOP_GRACE_SECONDS` 加退出标记只属于宿主自己的退出路径（`young_router/lifecycle.py` 是这条分界），任何重启/安装路径都不许读这两个界。因为那次 stop 是 `SIGKILL`，而被杀的父留下的是孤儿不是挂断，所以每个 managed worker 都要自己盯 `process.ppid`——一个比 Core 活得久的 worker 会一直占着网关和控制端口，一条安装路径就这样留下过十七个。
 - 只有"已经不存在"的 Core 才被替换，仅某个请求失败的不换：替换会停掉旧 Core 拥有的 proxy，而 proxy master 在 forkserver 预加载完成前还握着监听口——为一个超时或被拒的请求丢掉 Core 就毁掉了窗口正在等的启动。被要求停止的启动要说出来并释放端口，而不是在剩下的预加载里继续绑着。
 - 任何产出制品的构建都先同步 `LITELLM_VERSION` 到最新可安装稳定版，并对每个 staged 集成（`dsh-vision-router`、`Veridrop`、`dsh-connect-workbuddy`、`our-free-model`）重验上游发布，失败就失败。解析发布必须一直在；能跳过的只有"已经 staged 的那一版的重装"，且要由 staging 脚本写下的记录（包名、版本、registry 摘要）加上入口、peer、仍在的 staged 适配共同证明，否则整份重来——陈旧、残缺、被改过或被篡改的树永远不许打包。绝不在这里重实现 staged 协议，也不原地改 staged 包。

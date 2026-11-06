@@ -78,6 +78,31 @@ class MacOSProxyLauncherTests(unittest.TestCase):
             snapshot["settings"],
         )
 
+    def test_a_posix_host_that_is_not_macos_reads_only_the_environment(self) -> None:
+        """SystemConfiguration exists on one platform; asking elsewhere raises.
+
+        The launcher runs on every POSIX host now, and ``getproxies_macosx_sysconf``
+        is a name only the macOS runtime has.  An empty environment therefore
+        reads as "no proxy", which is the same answer the lookup switch gives --
+        instead of the launcher dying before its first worker on a name that was
+        never there.
+        """
+
+        with mock.patch.object(
+            macos_proxy.sys, "platform", "linux"
+        ), mock.patch.object(
+            macos_proxy.urllib.request,
+            "getproxies_environment",
+            return_value={},
+        ), mock.patch.object(
+            macos_proxy.urllib.request,
+            "getproxies_macosx_sysconf",
+        ) as get_system_proxies:
+            snapshot = macos_proxy._system_proxy_snapshot()
+
+        self.assertEqual({"source": "environment", "proxies": {}}, snapshot)
+        get_system_proxies.assert_not_called()
+
     def test_run_preloads_proxy_once_and_starts_requested_workers(self) -> None:
         uvicorn = SimpleNamespace(run=mock.Mock())
         uvicorn_subprocess = SimpleNamespace(spawn=None)
@@ -123,6 +148,10 @@ class MacOSProxyLauncherTests(unittest.TestCase):
             {
                 "young_router.proxy.state": state_module,
                 "young_router.proxy.launcher_settings": settings_module,
+                # The launcher's late imports are stubbed for the same reason:
+                # they are real modules that own real state files, and this test
+                # is about the launch order, not about what they contain.
+                "young_router.proxy.concurrency": SimpleNamespace(reset_leases=mock.Mock()),
             },
         ), mock.patch.object(
             multiprocessing, "set_forkserver_preload", create=True
@@ -309,8 +338,15 @@ class WorkerHandoverGuardTests(unittest.TestCase):
         with mock.patch.dict(
             sys.modules,
             {
+                # Only what this test observes: the settle call, and the frame
+                # limit the launcher passes to uvicorn.  The rest of the
+                # launcher's own modules are imported for real -- they are
+                # standard library only -- because a stand-in has to answer every
+                # name they read, and one that answers only some of them fails
+                # inside a module this test never named.
                 "young_router.proxy.state": SimpleNamespace(settle_stale_recent_requests=mock.Mock()),
                 "young_router.proxy.launcher_settings": SimpleNamespace(_websocket_max_frame_bytes=lambda: 1),
+                "young_router.proxy.concurrency": SimpleNamespace(reset_leases=mock.Mock()),
             },
         ), mock.patch.object(multiprocessing, "set_forkserver_preload", create=True), mock.patch.object(
             multiprocessing, "get_context", return_value=object()

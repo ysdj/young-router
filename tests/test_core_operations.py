@@ -312,7 +312,17 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual("16", command[workers_index + 1])
             self.assertNotIn("--run_gunicorn", command)
 
-    def test_non_macos_posix_retains_gunicorn_workers(self) -> None:
+    def test_every_posix_host_starts_the_app_rather_than_bare_litellm(self) -> None:
+        """A Linux host is the same app on the same port, not only LiteLLM.
+
+        The gateway object is LiteLLM's app plus the page and its API on ``/ui``
+        and ``/ipc``, the provider-side search route, the image-context endpoint
+        and the managed workers.  Launching ``litellm``'s own CLI on Linux left
+        a proxy that answered ``/v1`` correctly while every one of those
+        returned 404 -- so the one host that runs this app without a native
+        window would have been the only machine without the app on it.
+        """
+
         with tempfile.TemporaryDirectory() as directory:
             controller = CoreServiceController(directory)
             process = mock.Mock(pid=4816)
@@ -324,7 +334,7 @@ class CoreOperationsTests(unittest.TestCase):
             ), mock.patch.object(
                 controller,
                 "_runtime_env",
-                return_value={"LITELLM_PORT": "4000", "LITELLM_NUM_WORKERS": "16"},
+                return_value={"LITELLM_PORT": "4000", "LITELLM_NUM_WORKERS": "8"},
             ), mock.patch.object(controller, "_write_owner_record"), mock.patch.object(
                 controller, "_health", return_value=True
             ), mock.patch(
@@ -332,7 +342,14 @@ class CoreOperationsTests(unittest.TestCase):
             ), mock.patch("young_router.core.operations.subprocess.Popen", return_value=process) as popen:
                 controller.start()
 
-            self.assertIn("--run_gunicorn", popen.call_args.args[0])
+            command = popen.call_args.args[0]
+            self.assertEqual([controller.python, "-m", "young_router.proxy.macos_proxy"], command[:3])
+            workers_index = command.index("--workers")
+            self.assertEqual("8", command[workers_index + 1])
+            # Gunicorn was what the bare CLI needed; uvicorn's own supervisor
+            # owns the rolling restart this app signals with SIGHUP.
+            self.assertNotIn("--run_gunicorn", command)
+            self.assertNotIn(controller.litellm_bin, command)
 
     def test_service_dispatch_projects_real_status_and_autostart(self) -> None:
         calls: list[str] = []
