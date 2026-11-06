@@ -19,6 +19,8 @@ from __future__ import annotations
 import threading
 from typing import Any, Callable
 
+from .oplog import note as _note
+
 INITIAL_DELAY_SECONDS = 5.0
 """Let the app's own launch start run first, so two starts do not race."""
 
@@ -69,10 +71,12 @@ class ServiceSupervisor:
     def run_once(self) -> None:
         try:
             self._supervise()
-        except Exception:
+        except Exception as exc:
             # A pass that failed is simply due again next interval; it must
-            # never take Core down or stop the loop.
-            pass
+            # never take Core down or stop the loop.  It must still be said:
+            # this loop exists for the installation nobody is looking at, and
+            # a pass that keeps failing is invisible everywhere else.
+            _note("a recovery pass failed", trace=exc)
 
     def _loop(self) -> None:
         if self._stop.wait(self._initial_delay):

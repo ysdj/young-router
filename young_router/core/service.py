@@ -29,6 +29,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
 from .log_tabs import LOG_TABS
+from .oplog import note as _note
 from .persistence import AtomicJSONStore, PersistenceError, atomic_write_bytes, atomic_write_json, read_bytes, read_json
 from .protocol import MAX_EDITOR_DOCUMENT_BYTES, PROTOCOL_VERSION, ProtocolError, is_error_code, make_event
 from .security import REDACTED, _key_text, redact, safe_exception_message, safe_error_message
@@ -4364,9 +4365,13 @@ class CoreStore:
         while True:
             try:
                 self._reload_service_after_apply()
-            except Exception:
+            except Exception as exc:
                 # A failed background restart must not kill the worker before
-                # the controller's real state is projected.
+                # the controller's real state is projected -- but it must also
+                # not be the silence that leaves a host serving nothing with
+                # nobody to ask.  The stop has already happened by the time a
+                # launch fails here, so this line is the only account of why.
+                _note("the proxy was not replaced after an apply", trace=exc)
                 self._project_service_reload_failure()
             with self._service_reload_guard:
                 if self._service_reload_stopping or not self._service_reload_pending:
@@ -4408,15 +4413,25 @@ class CoreStore:
                 if self._service_reload_stopping:
                     return
                 service_result = reloader("restart" if replace_process else "reload")
-        except Exception:
+        except Exception as exc:
+            _note("restarting the proxy after an apply failed", trace=exc)
             self._restore_replace_process_request(replace_process)
             self._project_service_reload_failure()
             return
         if not isinstance(service_result, Mapping):
+            _note("restarting the proxy returned no state: %r" % (service_result,))
             self._restore_replace_process_request(replace_process)
             self._project_service_reload_failure()
             return
         if replace_process and service_result.get("state") != "running":
+            # The replacement did not come up.  Said here rather than left to a
+            # row nobody is watching: on a host this is the difference between
+            # a page that answers and a unit that reports `active` while
+            # nothing is listening.
+            _note(
+                "the replaced proxy did not come up: state=%s port=%s"
+                % (service_result.get("state"), service_result.get("port"))
+            )
             # The replacement did not come up, so the environment this commit
             # needs is still not in the running process: keep owing it rather
             # than letting a later pass answer it with a rolling reload.
@@ -4591,6 +4606,10 @@ class CoreStore:
         handler = handlers.get(operation)
         if handler is None:
             return False
+        # Stated before the attempt, not after: a recovery that hangs or dies
+        # while replacing the proxy leaves this line as the only record that
+        # anything was being done about it.
+        _note("recovering the proxy (%s -> %s)" % (state, operation))
         with self._service_transition_guard:
             with self._lock:
                 # Re-read the decision under the guard: a stop, a Core shutdown,
@@ -4611,7 +4630,8 @@ class CoreStore:
             try:
                 try:
                     result = handler(operation)
-                except Exception:
+                except Exception as exc:
+                    _note("the proxy recovery (%s) failed" % operation, trace=exc)
                     result = None
                 with self._lock:
                     if isinstance(result, Mapping):

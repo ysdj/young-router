@@ -1313,7 +1313,14 @@ class CoreServiceController:
             atomic_write_bytes(self.paths.runtime_config, payload)
         except PersistenceError:
             raise
-        except Exception:
+        except Exception as exc:
+            # The caller is a service start, whose failure has one generic
+            # sentence because a window shows it.  Whoever reads the host's log
+            # afterwards needs the real reason: this is the path that fails
+            # after the previous proxy has already been stopped.
+            from .oplog import note as _note
+
+            _note("staging the document before the proxy starts failed", trace=exc)
             raise RuntimeError("Provider/model configuration is invalid") from None
 
     def _runtime_document_holds(self, payload: bytes) -> bool:
