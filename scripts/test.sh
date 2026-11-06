@@ -54,7 +54,19 @@ then
 fi
 
 if (($# == 0)); then
-  exec env PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=.:tests "${TEST_COMMAND[@]}" -m unittest discover -s tests -p 'test*.py' -v
+  # The whole suite, spread over the cores.  One interpreter for 100+ modules is
+  # minutes of wall clock that nothing in the suite requires: the modules are
+  # discovered independently, so they can run independently.  ``-v`` is kept for
+  # a single-shard run and replaced by one line per shard here, because
+  # interleaved verbose output from eight processes is not a report.
+  #
+  # YOUNG_ROUTER_TEST_SHARDS=1 restores the serial run, which is what to use when
+  # comparing against a stored log or bisecting an order-dependent failure.
+  shards="${YOUNG_ROUTER_TEST_SHARDS:-0}"
+  exec env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_shards.py \
+    --python "${TEST_COMMAND[0]}" \
+    --shards "$shards" \
+    -- tests/test*.py
 fi
 
 targets=()
