@@ -70,6 +70,9 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
 
   return {
     endpoint,
+    // A host-only route travels beside the protocol rather than through it,
+    // so it is passed on only when this transport has one.
+    hostRoute: transport.hostRoute ? (path, body) => transport.hostRoute!(path, body) : undefined,
     latestSnapshot: (): CoreSnapshot | undefined => latestSnapshot,
     snapshot: (): Promise<CoreSnapshot> => {
       if (latestSnapshot) return call("snapshot", {}).then(({ snapshot }) => rememberSnapshot(snapshot));
@@ -117,6 +120,7 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
     }),
     export: async (sections: ConfigDomain[], destinationToken: string): Promise<IpcResults["export"]> => call("export", { sections, destination_token: destinationToken }),
     previewImport: async (sourceToken: string, revision: number): Promise<IpcResults["import_preview"]> => call("import_preview", { source_token: sourceToken, revision }),
+    webLaunchUrl: async (): Promise<string> => (await call("web_launch_url", {})).url,
     importPlan: async (importPlanToken: string, revision: number, sections: ConfigDomain[]): Promise<IpcResults["import"]> => call("import", { import_plan_token: importPlanToken, sections, revision }),
   };
 }

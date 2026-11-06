@@ -44,6 +44,7 @@ const zh: Record<string, RuntimeCopy> = {
   YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS: { label: "首事件超时", help: "普通请求等待首个上游流事件的最长时间。设为 0 时回退到请求超时。" },
   YOUNG_ROUTER_HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS: { label: "重前缀首事件超时", help: "重放前缀序列化后超过重前缀阈值的 Responses 请求，改用此更长的首事件预算；多 MB 的签名历史会让所有路由同时推迟首个事件。设为 0 时仅使用首事件超时。" },
   YOUNG_ROUTER_HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES: { label: "重前缀阈值", help: "重放负载（input 加 instructions）序列化后超过该字节数时启用重前缀首事件超时。设为 0 可完全关闭加长预算。" },
+  YOUNG_ROUTER_WEB_PASSWORD: { label: "Web 密钥", help: "浏览器打开本地端口上的页面时用来登录的密钥。留空时自动生成。在「常规」中设置。" },
   YOUNG_ROUTER_WEBSOCKET_MAX_FRAME_BYTES: { label: "WebSocket 帧上限", help: "本地代理接受的单个 WebSocket 消息帧的最大字节数。Codex 会把整轮请求（含签名历史）作为单帧发送，上限过小会在进入路由前被 1009 关闭并触发重连循环。修改后需重启服务生效。" },
   YOUNG_ROUTER_CODEX_COMPACTION_START_TIMEOUT_SECONDS: { label: "压缩首事件超时", help: "结构化 Codex 压缩请求等待首个事件的最长时间。设为 0 时回退到请求超时。" },
   YOUNG_ROUTER_STALL_TIMEOUT_SECONDS: { label: "流空闲超时", help: "首个事件到达后，相邻流事件之间允许的最长间隔。设为 0 可取消本地流空闲上限。" },

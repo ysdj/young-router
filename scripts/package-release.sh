@@ -78,6 +78,8 @@ test -f "$CORE/young_router/adapters/our-free-model/src/core/runtime.js"
 test -f "$CORE/young_router/adapters/our-free-model/src/forward.js"
 test -f "$CORE/young_router/adapters/dsh_vision_worker.mjs"
 test -f "$CORE/sitecustomize.py"
+test -f "$CORE/web/index.html"
+test -f "$CORE/web/bundle.js"
 plutil -lint "$APP/Contents/Info.plist"
 test "$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")" = "$VERSION"
 test "$(plutil -extract CFBundleVersion raw "$APP/Contents/Info.plist")" = "$BUILD_NUMBER"
@@ -86,7 +88,7 @@ test "$(plutil -extract CFBundleVersion raw "$APP/Contents/Info.plist")" = "$BUI
 export LITELLM_LOCAL_MODEL_COST_MAP=true
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$CORE" \
   "$CORE/runtime/bin/python" -c \
-  'import litellm.proxy.proxy_server, young_router.core, young_router.core.codex_config, young_router.config, young_router.core.configuration_package, young_router.core.external_provider_import, young_router.core.remote_usage_logs, young_router.core.runtime_settings_io, young_router.webdav.core'
+  'import litellm.proxy.proxy_server, young_router.core, young_router.core.codex_config, young_router.config, young_router.core.configuration_package, young_router.core.external_provider_import, young_router.core.remote_usage_logs, young_router.core.runtime_settings_io, young_router.proxy.web_forward, young_router.webdav.core'
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$CORE" \
   "$CORE/runtime/bin/python" -m young_router.core --help >/dev/null
 PYTHONDONTWRITEBYTECODE=1 "$CORE/runtime/bin/litellm" --help >/dev/null

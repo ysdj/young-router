@@ -1004,7 +1004,7 @@ CoreIPCBridge::HttpResult CoreIPCBridge::Request(
   // `event: null` heartbeat from invalidating the one-shot Core session.
   WinHttpSetTimeouts(session.get(), 5000, 5000, 5000, receive_timeout_ms);
   WinHttpHandle connection{WinHttpConnect(session.get(), endpoint.address.c_str(), endpoint.port, 0)};
-  std::wstring target = L"/v1" + (route.empty() ? L"" : L"/" + route);
+  std::wstring target = L"/ipc" + (route.empty() ? L"" : L"/" + route);
   WinHttpHandle request{connection ? WinHttpOpenRequest(connection.get(), method.c_str(), target.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0) : nullptr};
   if (!request) throw std::runtime_error("core unavailable");
   std::wstring headers = L"Authorization: Bearer " + token + L"\r\nContent-Type: application/json\r\n";

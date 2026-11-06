@@ -792,7 +792,7 @@ class CoreOperationsTests(unittest.TestCase):
             )
 
             with mock.patch("young_router.webdav.core.WebDAVClient.head", return_value=(200, {})), mock.patch(
-                "young_router.webdav.core.WebDAVClient.try_mkcol"
+                "young_router.webdav.core.WebDAVClient.collection_access", return_value="writable"
             ):
                 core.probe(domain="webdav")
 
@@ -1979,6 +1979,82 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual("WebDAV sync failed", str(raised.exception))
             status = json.loads((root / "webdav-status.json").read_text(encoding="utf-8"))
             self.assertEqual({"action": "push", "ok": False}, {key: status[key] for key in ("action", "ok")})
+
+    def test_a_webdav_http_status_is_named_as_a_sync_failure_not_carried_as_a_code(self) -> None:
+        """The remote server's status is its word, never an IPC error code.
+
+        ``WebDAVHTTPError`` subclasses ``SyncError`` and keeps the HTTP status
+        in ``code``, which is an int; the response envelope refuses a code that
+        is not a lowercase token, and a refused answer closes the socket with
+        nothing written.  The host could only read that as a Core that is gone,
+        so a 404 on the remote file was reported as 本地 Core 不可用 while Core
+        was answering every other request.  The sentence a reader can act on
+        survives instead, on one line.
+        """
+
+        from young_router.core.protocol import is_error_code
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            providers = ProvidersModelsDomain(config)
+            relay = RelayAccountsDomain(storage_path=root / ".litellm-runtime" / "relay-accounts.json")
+            webdav = self._configured_webdav_domain(root, config)
+            core = CoreStore(domains=[providers, relay, webdav])
+
+            missing = webdav_core.WebDAVHTTPError(
+                "GET", "https://webdav.example.test/config/menu-config.json", 404, "Not Found"
+            )
+            with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
+                "young_router.webdav.operations.read_remote_manifest",
+                side_effect=missing,
+            ), self.assertRaises(CoreError) as raised:
+                core.dispatch(
+                    {"domain": "webdav", "type": "sync", "payload": {"sections": ["providers_models", "relay_accounts"]}},
+                    expected_revision=core.revision,
+                )
+
+            self.assertEqual("webdav_sync_failed", raised.exception.code)
+            self.assertTrue(is_error_code(raised.exception.code))
+            self.assertIn("HTTP 404", str(raised.exception))
+            status = json.loads((root / "webdav-status.json").read_text(encoding="utf-8"))
+            self.assertEqual("webdav_sync_failed", status["code"])
+            self.assertFalse(status["ok"])
+
+    def test_a_multiline_webdav_failure_reaches_the_pane_on_one_line(self) -> None:
+        """A remote server's paragraph is not a shape this wire can carry."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            providers = ProvidersModelsDomain(config)
+            relay = RelayAccountsDomain(storage_path=root / ".litellm-runtime" / "relay-accounts.json")
+            webdav = self._configured_webdav_domain(root, config)
+            core = CoreStore(domains=[providers, relay, webdav])
+
+            blocked = webdav_core.WebDAVHTTPError(
+                "PROPFIND",
+                "https://webdav.example.test/config/",
+                403,
+                "Forbidden",
+                b"<html><title>Vercel Security Checkpoint</title></html>",
+            )
+            self.assertIn("\n", str(blocked))
+            with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
+                "young_router.webdav.operations.read_remote_manifest",
+                side_effect=blocked,
+            ), self.assertRaises(CoreError) as raised:
+                core.dispatch(
+                    {"domain": "webdav", "type": "sync", "payload": {"sections": ["providers_models", "relay_accounts"]}},
+                    expected_revision=core.revision,
+                )
+
+            message = str(raised.exception)
+            self.assertNotIn("\n", message)
+            self.assertLessEqual(len(message.encode("utf-8")), 512)
+            self.assertEqual("webdav_sync_failed", raised.exception.code)
 
     def test_single_domain_files_are_json_and_provider_yaml_remains_importable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

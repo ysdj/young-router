@@ -423,9 +423,19 @@ def _redact_url_text(value: str) -> str:
 
 
 def safe_error_message(message: object, *, known_secrets: Sequence[str] = ()) -> str:
-    """Normalize an error to a short, single-line, secret-free message."""
+    """Normalize an error to a short, single-line, secret-free message.
+
+    ``REDACT_TEXT`` holds its result to a character count, while the IPC error
+    field is bounded in bytes.  A sentence of multi-byte characters can pass
+    the first rule and be refused by the second, and a failure the envelope
+    refuses is one the handler cannot answer at all -- so the bound this
+    function promises is the one the wire enforces.
+    """
 
     text = REDACT_TEXT(str(message), secret_values=set(known_secrets))
+    encoded = text.encode("utf-8")
+    if len(encoded) > 512:
+        text = encoded[:512].decode("utf-8", "ignore")
     return text or "Core operation failed"
 
 

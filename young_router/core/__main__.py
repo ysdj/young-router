@@ -106,7 +106,53 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--address", default="127.0.0.1", help="loopback address (never a public interface)")
     parser.add_argument("--port", type=int, default=0, help="port; zero chooses a random ephemeral port")
     parser.add_argument("--print-endpoint", action="store_true", help="print the private descriptor for a supervising host")
+    # The browser host is the third way to drive this Core: the native hosts
+    # read their React code from their own app bundle, this one reads it from
+    # ``--web-host`` through the same listener.  It is off unless named, so no
+    # native install starts serving pages because it upgraded.
+    parser.add_argument("--web-host", type=Path, help="serve this built browser bundle at /ui on the local port")
+    parser.add_argument("--web-url-file", type=Path, help="rewrite this file with the browser host's address")
+    parser.add_argument("--web-password", help="web host password; omit to use the one in the configuration")
+    # A terminal is already the proof: whoever runs this command on this machine
+    # is the machine's owner.  The address this process prints therefore signs
+    # itself in, and every other browser on the port still meets the password.
+    parser.add_argument(
+        "--web-require-password",
+        action="store_true",
+        help="make even this run's printed address ask for the web password",
+    )
     return parser
+
+
+def _packaged_web_host() -> Path | None:
+    """The browser bundle shipped beside Core, when this install has one.
+
+    ``Core/web`` is where the build puts it: the page is part of the product,
+    not an optional download, so a person who never typed ``--web-host`` still
+    finds it at the local port.  A Core run from a working tree has no such
+    directory and serves no page.
+    """
+
+    from ..node_runtime import core_root
+
+    candidate = core_root() / "web"
+    return candidate if (candidate / "index.html").is_file() else None
+
+
+def _publish_web_url(path: Path | None, url: str) -> None:
+    """Keep one small file holding the address a person should open.
+
+    The URL carries a credential in its fragment, so the file is written
+    0600 like the endpoint descriptor beside it and never logged.
+    """
+
+    if path is None or not url:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(url + "\n", encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
 
 
 def _write_endpoint(path: Path, server: CoreIPCServer) -> None:
@@ -171,6 +217,62 @@ def run(argv: list[str] | None = None) -> int:
         if stop.is_set():
             return 0
         server.start()
+        # The page a person opens is the browser host's built bundle.  An
+        # explicit ``--web-host`` states one; otherwise the copy packaged
+        # beside Core is the page, so an install that shipped it serves it
+        # without a launcher flag it would have to keep in step.
+        web_root = args.web_host or _packaged_web_host()
+        if web_root is not None:
+            # The page is answered by this listener and published on the
+            # proxy's own port, where `/ui` and `/ipc` are forwarded back here
+            # so the browser keeps one origin.  Core's child cannot discover an
+            # ephemeral port, so it is written down before anything launches
+            # that child -- a supervisor pass or a window's own start.  A Core
+            # with no page states no endpoint, because forwarding a prefix
+            # nothing answers would put Core's settings API on the model port
+            # for no reason.
+            announce = getattr(core, "announce_web_endpoint", None)
+            if callable(announce):
+                announce(server.address, server.port)
+            # The key is the Runtime document's, so a restart reopens the same
+            # page behind the same key instead of minting a secret nobody was
+            # told.  A document that states none gets one generated and
+            # written -- that is the default the General pane then shows.
+            runtime = core.settings_domain("runtime")
+            password = args.web_password or ""
+            provider = None
+            if runtime is not None and callable(getattr(runtime, "ensure_web_password", None)):
+                password = password or runtime.ensure_web_password()
+                # A key stated on this command line is the gate: the caller
+                # chose it, and a document read per sign-in would quietly
+                # replace it -- the process then tells a terminal its address
+                # is open while the document's key is the one that answers.
+                # A launch that stated none follows the document, so an edit
+                # in General reaches the next sign-in without a restart.
+                provider = None if args.web_password else runtime.web_password
+            # The gate speaks the language the window speaks, and reads it per
+            # request for the same reason the key is read per sign-in: an edit
+            # in Language changes the form without replacing the listener.
+            language = core.settings_domain("language")
+
+            def locale() -> str:
+                try:
+                    return str(language.snapshot().get("resolved") or "en") if language is not None else "en"
+                except Exception:
+                    return "en"
+
+            server.enable_web_host(
+                web_root,
+                password=password,
+                password_provider=provider,
+                locale_provider=locale,
+                auto_login=not args.web_require_password,
+            )
+            # Printed once at start and then again whenever the URL file is
+            # missing, so a person can always find the address without reading
+            # a log.
+            _publish_web_url(args.web_url_file, server.web_host_url)
+            print(server.web_host_url, flush=True)
         webdav_scheduler.start()
         if client_model_sync is not None:
             client_model_sync.start()

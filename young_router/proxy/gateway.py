@@ -15,9 +15,15 @@ from litellm.proxy.proxy_server import app as app  # noqa: F401  (uvicorn target
 from . import claude_desktop_listing as _claude_desktop_listing
 from . import image_context_endpoint as _image_context_endpoint
 from . import reasoning_capability as _reasoning_capability
+from . import web_forward as _web_forward
 from .search_endpoint import register as _register_search_endpoint
 
 _register_search_endpoint(app)
+# The page and the settings API live on Core, but on the port a person types:
+# this listener forwards `/ui` and `/ipc` to the Core that started it, so one
+# address serves the app and the router.  Registered after everything else so
+# it is the outermost middleware and sees `/ui` before LiteLLM's own mount.
+_web_forward.register(app)
 # Claude Desktop's own discovery reads the alias view this app publishes; the
 # marker lives on the app so the listing builder can tell that request from
 # every other client's /v1/models read.

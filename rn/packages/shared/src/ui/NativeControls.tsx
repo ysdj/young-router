@@ -33,6 +33,7 @@ import {
 } from "./AppKitControls";
 import WinUISecureTextInput from "./windows/NativeSecureTextInputNativeComponent";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
+import { getBrowserSecretReader, getBrowserSecretStager } from "../platform/browserSecrets";
 
 type ButtonProps = {
   title: string;
@@ -193,6 +194,16 @@ type TableColumn = {
 type TableRow = {
   key: string;
   cells: string[];
+  /**
+   * One optional tooltip per cell, for a cell that shows less than it means.
+   *
+   * The AppKit table already sets every cell's tooltip to its own text, which
+   * is right for a column that states exactly what it holds.  A cell that
+   * abbreviates (`M→C`) passes the long form here instead, so hovering it
+   * answers the question the abbreviation raised.  An empty entry keeps the
+   * default rule, cell by cell.
+   */
+  tooltips?: string[];
   spanning?: boolean;
 };
 
@@ -312,10 +323,22 @@ const WINDOWS_BUTTON_GLYPHS: Record<NonNullable<ButtonProps["symbol"]>, string> 
   "chevron-up-down": "\uE70D",
 };
 
+// Unicode has no font dependency: the browser must not draw Windows' private
+// glyph codes as empty boxes, and an icon-only action must keep its own name.
+const WEB_BUTTON_GLYPHS: Record<NonNullable<ButtonProps["symbol"]>, string> = {
+  check: "✓", close: "×", copy: "⧉", edit: "✎", help: "?",
+  import: "↓", info: "i", minus: "−", pause: "Ⅱ", play: "▶",
+  plus: "+", "power-off": "⏻", "power-on": "⏻", refresh: "↻", trash: "⌫",
+  "chevron-up": "⌃", "chevron-down": "⌄", "chevron-up-down": "↕",
+};
+
 function WindowsButton({ title, symbol, symbolWithTitle, symbolTrailing, toolTip, accessibilityLabel, disabled, busy, primary, destructive, compact, link, plainLink, titleWidth: _titleWidth, onPress, style, ref }: ButtonProps & { ref?: React.Ref<any> }): React.JSX.Element {
   const showsTitle = symbolWithTitle === true || !symbol;
-  const glyph = symbol ? WINDOWS_BUTTON_GLYPHS[symbol] ?? "\uE74D" : undefined;
-  const ink = disabled ? WINDOWS_CONTROL.textDisabled : destructive ? WINDOWS_CONTROL.danger : primary ? WINDOWS_CONTROL.fill : link ? WINDOWS_CONTROL.accent : WINDOWS_CONTROL.text;
+  const glyph = symbol ? (Platform.OS === "web" ? WEB_BUTTON_GLYPHS : WINDOWS_BUTTON_GLYPHS)[symbol] : undefined;
+  // A destructive (and a primary) button fills its bezel with that colour, so
+  // the label has to be the on-accent ink: reading in `danger` on a `danger`
+  // fill is red on red — the one button the user must be able to read.
+  const ink = disabled ? WINDOWS_CONTROL.textDisabled : destructive ? WINDOWS_CONTROL.fill : primary ? WINDOWS_CONTROL.fill : link ? WINDOWS_CONTROL.accent : WINDOWS_CONTROL.text;
   return <Pressable
     ref={ref as never}
     disabled={disabled}
@@ -340,7 +363,17 @@ const WindowsSegmentedControl = React.forwardRef<any, SegmentedProps>(function W
     if (index === selectedIndex) return;
     onChange?.({ nativeEvent: { value: label, index } } as NativeSyntheticEvent<{ value: string; index: number }>);
   };
-  return <View ref={ref} style={[styles.windowsSegmented, compact && styles.windowsSegmentedCompact, disabled && styles.windowsDisabled, style]} accessibilityRole="tablist">
+  const focusTab = (event: { key?: string; preventDefault?: () => void }, index: number): void => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight" && event.key !== "Home" && event.key !== "End") return;
+    event.preventDefault?.();
+    const next = event.key === "Home" ? 0 : event.key === "End" ? labels.length - 1 : (index + (event.key === "ArrowRight" ? 1 : -1) + labels.length) % labels.length;
+    if (labels[next] !== undefined) choose(labels[next], next);
+  };
+  // A native segmented control is one fixed-width strip; here the strip may be
+  // wider than the row it sits in, so the caller's width reservation is dropped
+  // and the segments size to their own labels. Without this the last tab was
+  // clipped ("在线用量" ended mid-glyph) instead of scrolling into view.
+  const tabs = <View ref={ref} style={[styles.windowsSegmented, compact && styles.windowsSegmentedCompact, disabled && styles.windowsDisabled, style, Platform.OS === "web" && { width: "auto", minWidth: 0 }]} accessibilityRole="tablist">
     {labels.map((label, index) => {
       const selected = index === selectedIndex;
       return <Pressable
@@ -348,15 +381,17 @@ const WindowsSegmentedControl = React.forwardRef<any, SegmentedProps>(function W
         disabled={disabled}
         onPress={() => choose(label, index)}
         onAccessibilityTap={() => choose(label, index)}
+        {...(Platform.OS === "web" ? { onKeyDown: (event: { key?: string; preventDefault?: () => void }) => focusTab(event, index) } : {})}
         accessibilityRole="tab"
         accessibilityLabel={label}
         accessibilityState={{ selected, disabled: disabled === true }}
-        style={[styles.windowsSegment, selected && styles.windowsSegmentSelected, index === 0 && styles.windowsSegmentFirst, index === labels.length - 1 && styles.windowsSegmentLast]}
+        style={[styles.windowsSegment, selected && styles.windowsSegmentSelected, index === 0 && styles.windowsSegmentFirst, index === labels.length - 1 && styles.windowsSegmentLast, Platform.OS === "web" && styles.webSegment, Platform.OS === "web" && { minWidth: Math.ceil(nativeControlTextWidth(label)) + 26 }]}
       >
         <Text numberOfLines={1} style={[styles.windowsSegmentText, selected && styles.windowsSegmentTextSelected, disabled && styles.windowsDisabledText]}>{label}</Text>
       </Pressable>;
     })}
   </View>;
+  return Platform.OS === "web" ? <ScrollView horizontal showsHorizontalScrollIndicator style={styles.webSegmentedScroll} contentContainerStyle={styles.webSegmentedContent}>{tabs}</ScrollView> : tabs;
 });
 
 function WindowsToggle({ value, disabled, onValueChange, style, accessibilityLabel }: ToggleProps): React.JSX.Element {
@@ -473,7 +508,10 @@ const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeBu
   if (Platform.OS === "macos") {
     return <AppKitButton {...buttonProps} ref={ref as never} style={[props.style, titleWidth]} />;
   }
-    return <Pressable ref={ref as never} disabled={props.disabled} onPress={props.onPress} style={[style, props.busy === true && styles.buttonBusy]} accessibilityRole={props.link ? "link" : "button"}>{props.busy === true ? <ActivityIndicator size="small" style={styles.buttonBusyIndicator} /> : null}<Text style={styles.controlText}>{props.title}</Text></Pressable>;
+  if (Platform.OS === "web") {
+    return <WindowsButton {...buttonProps} ref={ref as never} style={style} />;
+  }
+  return <Pressable ref={ref as never} disabled={props.disabled} onPress={props.onPress} style={[style, props.busy === true && styles.buttonBusy]} accessibilityRole={props.link ? "link" : "button"}>{props.busy === true ? <ActivityIndicator size="small" style={styles.buttonBusyIndicator} /> : null}<Text style={styles.controlText}>{props.title}</Text></Pressable>;
 });
 
 // Keep the long-standing function export while allowing desktop callers to
@@ -504,7 +542,7 @@ export function NativeBusySpinner({ label, style }: { label: string; style?: Sty
 }
 
 const NativeSegmentedControlWithRef = React.forwardRef<any, SegmentedProps>(function NativeSegmentedControlWithRef({ labels, selectedValue, disabled, compact = true, onChange, style }, ref): React.JSX.Element {
-  if (Platform.OS === "windows") {
+  if (Platform.OS === "windows" || Platform.OS === "web") {
     return <WindowsSegmentedControl ref={ref} labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={onChange} style={style} />;
   }
   if (Platform.OS === "macos") {
@@ -552,11 +590,13 @@ export function NativeTextField({ style, onChangeText, onSubmitEditing, onBlur, 
   if (Platform.OS === "macos") {
     return <AppKitTextField {...props} onBlur={onBlur} search={search} borderless={borderless} style={style} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} />;
   }
-  return <TextInput {...props} onFocus={onFocus} onBlur={onBlur} style={style} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} />;
+  return <View style={[styles.windowsTextField, focused && styles.windowsTextFieldFocused, style, props.editable === false && styles.windowsTextFieldDisabled]}>
+    <TextInput {...props} style={[styles.webTextFieldInput, props.multiline === true && styles.webTextFieldInputMultiline]} onFocus={(event) => { setFocused(true); onFocus?.(event); }} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} onBlur={(event) => { setFocused(false); onBlur?.(event); }} />
+  </View>;
 }
 
 export function NativeToggle({ value, disabled, onValueChange, style, accessibilityLabel }: ToggleProps): React.JSX.Element {
-  if (Platform.OS === "windows") {
+  if (Platform.OS === "windows" || Platform.OS === "web") {
     return <WindowsToggle value={value} disabled={disabled} onValueChange={onValueChange} style={style} accessibilityLabel={accessibilityLabel} />;
   }
   if (Platform.OS === "macos") {
@@ -574,7 +614,7 @@ export function NativeSelectableRow({ title, detail, selected, disabled, onPress
 
 export function NativeCheckbox({ label, value, disabled, compact = true, labelVisible = true, onValueChange, style }: CheckboxProps): React.JSX.Element {
   const sizedStyle = [{ minWidth: labelVisible ? nativeCheckboxMinimumWidth(label) : 24 }, style];
-  if (Platform.OS === "windows") {
+  if (Platform.OS === "windows" || Platform.OS === "web") {
     return <WindowsCheckbox label={label} labelVisible={labelVisible} value={value} disabled={disabled} compact={compact} onValueChange={onValueChange} style={sizedStyle} />;
   }
   if (Platform.OS === "macos") {
@@ -590,8 +630,45 @@ export function NativePicker({ labels, selectedValue, disabled, compact = true, 
   if (Platform.OS === "macos") {
     return <AppKitPicker labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} overlayLayer={overlayLayer} accessibilityLabel={accessibilityLabel} onChange={onChange} style={[compact && style === undefined ? { minWidth: pickerLabelWidth(labels, selectedValue) } : null, style]} />;
   }
+  if (Platform.OS === "web") return <WebPicker labels={labels} selectedValue={selectedValue} disabled={disabled} accessibilityLabel={accessibilityLabel} onChange={onChange} style={style} />;
   return <NativeSegmentedControl labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={onChange} style={style} />;
 }
+
+/**
+ * The browser's picker: a real `<select>`, which is the one form control every
+ * browser draws, keyboard-drives, and screen-reads the same way.
+ *
+ * The segmented fallback it replaces rendered the choices as one read-only
+ * sentence ("a / b / c (b)"), so a pane with a picker could not be changed at
+ * all in a browser.  `labels` and `selectedValue` are the same pair the native
+ * pickers take; the index in the answer is what they report.
+ */
+function WebPicker({ labels, selectedValue, disabled, accessibilityLabel, onChange, style }: PickerProps): React.JSX.Element {
+  return <View style={[styles.webPickerFrame, style]}>
+    <select
+      aria-label={accessibilityLabel}
+      disabled={disabled}
+      value={selectedValue}
+      onChange={(event) => onChange?.({ nativeEvent: { value: event.target.value, index: labels.indexOf(event.target.value) } } as unknown as NativeSyntheticEvent<{ value: string; index: number }>)}
+      style={WEB_SELECT_STYLE}
+    >
+      {labels.map((label) => <option key={label} value={label}>{label}</option>)}
+    </select>
+  </View>;
+}
+
+// RNW renders styles as CSS classes; a native `<select>` needs its own, and
+// it must follow the pane's palette rather than the browser's default chrome.
+const WEB_SELECT_STYLE: React.CSSProperties = {
+  width: "100%",
+  minHeight: 22,
+  padding: "1px 4px",
+  border: "1px solid var(--yr-separator, #d4d4d8)",
+  borderRadius: 4,
+  background: "var(--yr-control, #ffffff)",
+  color: "inherit",
+  font: "inherit",
+};
 
 
 // The Windows sidebar draws the platform's own navigation glyphs, one per SF
@@ -758,7 +835,14 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
           // overflowed the sidebar, and that overflow was scrollable, so the
           // whole column slid by a different amount on every selection.
           return <View key={`${row.key}:${columnIndex}`} style={[windowsTableStyles.cellView, sourceList ? windowsTableStyles.sourceCellViewFlex : { width: column.width }]}>
-            {rowSymbol ? <Text style={[windowsTableStyles.symbol, { color: disabled ? WINDOWS_CONTROL.textDisabled : selected ? WINDOWS_CONTROL.text : WINDOWS_CONTROL.textSecondary }]}>{windowsSourceSymbol(rowSymbol)}</Text> : sourceImage !== undefined ? <Image source={sourceImage} style={windowsTableStyles.sourceImage} /> : null}
+            {/* A source list's tile is the same bundled PNG on every host.
+                What must not happen on the web is the glyph fallback below: a
+                browser has no "Segoe MDL2 Assets", so a glyph character renders
+                as a missing-glyph box beside every sidebar row. A tile is a
+                tile, and a missing one leaves the slot empty. */}
+            {sourceImage !== undefined
+              ? <Image source={sourceImage} style={windowsTableStyles.sourceImage} />
+              : Platform.OS !== "web" && rowSymbol ? <Text style={[windowsTableStyles.symbol, { color: disabled ? WINDOWS_CONTROL.textDisabled : selected ? WINDOWS_CONTROL.text : WINDOWS_CONTROL.textSecondary }]}>{windowsSourceSymbol(rowSymbol)}</Text> : null}
             <View style={windowsTableStyles.sourceCellTextColumn}>
               <Text numberOfLines={1} style={[windowsTableStyles.cellText, { color: cellColor }]}>{visibleCell}</Text>
               {detail ? <Text numberOfLines={1} style={windowsTableStyles.sourceCellDetail}>{detail}</Text> : null}
@@ -991,8 +1075,12 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
     const spanning = new Set(spanningRowKeys);
     return new Set(selectableSpanningRowKeys.filter((key) => spanning.has(key)));
   }, [spanningRowKeys, selectableSpanningRowKeys]);
-  if (Platform.OS === "windows") {
-    // This React table is the only Windows table path.
+  if (Platform.OS === "windows" || Platform.OS === "web") {
+    // This React table is the only Windows table path, and the browser's too:
+    // a browser has no AppKit table to delegate to, and the fallback below is a
+    // one-line-per-row list that drops every column this app reads.  The
+    // Windows leaf is already a virtualized React table, so the browser host
+    // gets the same rows, columns, stripes and selection instead of a stub.
     return <WindowsTable columns={columns} rows={rows} selectedKey={selectedKey} stripedRows={stripedRows} compact={compact} followBottom={followBottom} scrollToRow={scrollToRow} framed={framed} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} rowImageNames={rowImageNames} disabledRowKeys={disabledRowKeys} secondaryCellKeys={secondaryCellKeys} rowDetails={rowDetails} selectableSpanningKeys={selectableSpanningKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} alertRowKeys={alertRowKeys} style={[styles.table, style]} />;
   }
   // The macOS bridge props are built per render, and the list above them can be
@@ -1015,6 +1103,15 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
         const cells = row.spanning ? [row.cells[0] ?? ""] : row.cells.slice(0, columns.length);
         return [...cells, ...Array(Math.max(0, columns.length - cells.length)).fill("")];
       }),
+      // Same positional rule as `cells`, for the same reason: the native table
+      // indexes a cell's tooltip by row * columnCount.  A table whose cells all
+      // say what they mean sends nothing, not a second copy of the grid.
+      cellTooltips: rows.some((row) => (row.tooltips?.length ?? 0) > 0)
+        ? rows.flatMap((row) => {
+          const tooltips = row.spanning ? [row.tooltips?.[0] ?? ""] : (row.tooltips ?? []).slice(0, columns.length);
+          return [...tooltips, ...Array(Math.max(0, columns.length - tooltips.length)).fill("")];
+        })
+        : EMPTY_STRINGS,
       selectedKey,
       alternatingRows: stripedRows,
       compact,
@@ -1072,7 +1169,130 @@ export function NativeSecureTextInput({ domain, field, target = "", label, place
   if (Platform.OS === "macos") {
     return <AppKitSecureTextInput domain={domain} field={field} target={target} label={label} placeholder={placeholder} multiline={multiline} plainText={plainText} autoCommit={autoCommit} disabled={disabled} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={(event) => onSecretState?.(event.nativeEvent)} style={style} />;
   }
-  return <View accessibilityLabel={label} style={style} />;
+  return <WebSecureTextInput domain={domain} field={field} target={target} label={label} placeholder={placeholder} multiline={multiline} plainText={plainText} disabled={disabled} commitRequest={commitRequest} resetRequest={resetRequest} onSecretState={onSecretState} style={style} />;
+}
+
+/**
+ * The browser's password field.
+ *
+ * The native hosts keep the secret inside their own field so it never enters
+ * React state; a browser has no such leaf — the value has to live in an
+ * `<input>` in this document.  It is therefore the browser host's own copy of
+ * the one exception the Windows host already documents (General's plaintext
+ * field): the value is held by the control, handed to Core through the
+ * read/stage capability leases, and reported to the pane only as a status —
+ * never echoed into a snapshot.
+ *
+ * What it deliberately does not do: cache a value across mounts, write it to
+ * storage, or report it back through `onSecretState`.  A pane learns `dirty`,
+ * `saving`, `saved`, `error`, exactly like the native leaves tell it.
+ */
+function WebSecureTextInput({ domain, field, target, label, placeholder, multiline, plainText, disabled, commitRequest, resetRequest, onSecretState, style }: {
+  domain: string;
+  field: string;
+  target: string;
+  label: string;
+  placeholder?: string;
+  multiline: boolean;
+  plainText: boolean;
+  disabled?: boolean;
+  commitRequest?: number;
+  resetRequest?: number;
+  onSecretState?: (state: SecureTextInputState) => void;
+  style?: StyleProp<ViewStyle>;
+}): React.JSX.Element {
+  // The shared UI owns commit timing for a field that commits on demand
+  // (`NativeSecretInputControl` in `YoungRouterApp.tsx`): it asks the host to
+  // commit through `commitRequest`.  An `autoCommit` field has no such asker —
+  // the native leaves stage it after their own quiet period — so this leaf
+  // owns that timer itself.
+  const inputRef = React.useRef<TextInput>(null);
+  const valueRef = React.useRef("");
+  // The loaded value is written straight into the field's DOM node. React
+  // state must not carry a secret, and React Native for Web's `setNativeProps`
+  // does not update an uncontrolled `<input>`'s value.
+  const fieldId = React.useRef(`yr-secret-${nextSecretFieldId()}`);
+  const setFieldValue = (next: string): void => {
+    const node = document.getElementById(fieldId.current);
+    if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) node.value = next;
+  };
+  const lastCommit = React.useRef(0);
+  const lastReset = React.useRef(resetRequest ?? 0);
+  const report = (status: string, present: boolean, error = "", revision = 0): void => {
+    onSecretState?.({ revision, present, status, error, commitRequest: commitRequest ?? 0 });
+  };
+  const stage = React.useCallback((): void => {
+    const stager = getBrowserSecretStager();
+    if (!stager) {
+      report("error", valueRef.current.length > 0, "The secret field is unavailable");
+      return;
+    }
+    report("saving", valueRef.current.length > 0);
+    void stager({ domain, field, target, value: valueRef.current }).then((staged) => {
+      report("ready", staged.present, "", staged.revision);
+    }).catch((error: unknown) => report("error", valueRef.current.length > 0, error instanceof Error ? error.message : "The secret could not be saved"));
+  }, [domain, field, target]);
+  React.useEffect(() => {
+    let current = true;
+    valueRef.current = "";
+    setFieldValue("");
+    inputRef.current?.clear();
+    const reader = getBrowserSecretReader();
+    if (!reader) return () => { current = false; };
+    report("loading", false);
+    void reader({ domain, field, target }).then((secret) => {
+      if (!current) return;
+      const value = secret.value ?? "";
+      valueRef.current = value;
+      if (value) setFieldValue(value);
+      report("ready", secret.present);
+    }).catch(() => { if (current) report("error", false, "The secret field is unavailable"); });
+    return () => { current = false; };
+  }, [domain, field, target]);
+  React.useEffect(() => {
+    if (lastReset.current === (resetRequest ?? 0)) return;
+    lastReset.current = resetRequest ?? 0;
+    valueRef.current = "";
+    setFieldValue("");
+    inputRef.current?.clear();
+    report("ready", false);
+  }, [resetRequest]);
+  React.useEffect(() => {
+    // This leaf is the one that asked, so its own timer's write must not be
+    // mistaken for a caller's request (`lastCommit` tracks the latter).
+    const request = commitRequest ?? 0;
+    if (request === 0 || request === lastCommit.current) return;
+    lastCommit.current = request;
+    stage();
+  }, [commitRequest, stage]);
+  return <TextInput
+    accessibilityLabel={label}
+    placeholder={placeholder}
+    nativeID={fieldId.current}
+    ref={inputRef}
+    editable={disabled !== true}
+    multiline={multiline}
+    secureTextEntry={!plainText}
+    autoCapitalize="none"
+    autoCorrect={false}
+    onChangeText={(next) => {
+      valueRef.current = next;
+      // `dirty` is what makes the shared controller schedule its quiet-period
+      // commit (for an auto-commit field) or enable its own button.  The write
+      // itself is one call, from `commitRequest`: a second timer here would
+      // stage the same edit twice and the second answer is a revision conflict.
+      report("dirty", next.length > 0);
+    }}
+    onBlur={() => report("ready", valueRef.current.length > 0)}
+    style={[styles.webSecretField, multiline && styles.webSecretFieldMultiline, style]}
+  />;
+}
+
+/** One stable DOM id per secret field, so the host can fill it without state. */
+let secretFieldSerial = 0;
+function nextSecretFieldId(): number {
+  secretFieldSerial += 1;
+  return secretFieldSerial;
 }
 
 export function NativeSplitView({ paneWidth, minPaneWidth, maxPaneWidth, paneOpen = true, disabled, onPaneWidthChange, children, style }: SplitViewProps): React.JSX.Element {
@@ -1165,7 +1385,21 @@ const styles = StyleSheet.create({
   tableFallbackGroupText: { fontWeight: "400" },
   editor: { minHeight: 160 },
   editorFallback: { minHeight: 160, textAlignVertical: "top", fontSize: UI_FONT_SIZE },
+  webPickerFrame: { minHeight: WINDOWS_CONTROL.controlHeight, justifyContent: "center" },
+  // The browser host's secret field keeps the pane's own frame: it is the only
+  // credential a browser draws, so it must not look like a browser widget.
+  webSecretField: { minHeight: WINDOWS_CONTROL.controlHeight, paddingHorizontal: 6, borderWidth: 1, borderColor: WINDOWS_CONTROL.stroke, borderRadius: WINDOWS_CONTROL.radius, backgroundColor: WINDOWS_CONTROL.fill, color: WINDOWS_CONTROL.text, fontSize: UI_FONT_SIZE },
+  webSecretFieldMultiline: { minHeight: 108, paddingTop: 4, paddingBottom: 4, textAlignVertical: "top" },
   windowsTextField: { minHeight: WINDOWS_CONTROL.controlHeight, justifyContent: "center", overflow: "hidden", borderWidth: 1, borderColor: WINDOWS_CONTROL.stroke, borderRadius: WINDOWS_CONTROL.radius, backgroundColor: WINDOWS_CONTROL.fill },
+  webTextFieldInput: { flex: 1, minWidth: 0, paddingHorizontal: 8, paddingVertical: 3, fontSize: UI_FONT_SIZE, color: WINDOWS_CONTROL.text, backgroundColor: "transparent" },
+  webTextFieldInputMultiline: { paddingTop: 6, paddingBottom: 6, textAlignVertical: "top" },
+  // The strip fills the row it was given and scrolls inside it: a browser can
+  // show a segmented control wider than its container, a native one cannot.
+  // `flexGrow: 0` undoes React Native for Web's own ScrollView default, which
+  // otherwise eats the whole column and pushed the toolbar to mid-pane.
+  webSegmentedScroll: { width: "100%", flexGrow: 0, flexShrink: 1, minWidth: 0 },
+  webSegmentedContent: { minWidth: "100%" },
+  webSegment: { flexGrow: 1, flexShrink: 0, minWidth: 64 },
   windowsTextFieldFocused: { borderColor: WINDOWS_CONTROL.accent },
   windowsTextFieldDisabled: { opacity: 0.5 },
   // RNW's Windows single-line leaf ignores `textAlignVertical`, and its own

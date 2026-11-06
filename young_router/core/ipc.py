@@ -3,7 +3,7 @@
 The native host starts this server and injects its endpoint into React Native.
 Core binds an ephemeral loopback port by default; no UI code knows or assumes
 the proxy API port. A short-lived bootstrap credential is accepted
-once at ``/v1/hello`` and exchanged for an in-memory session credential. A
+once at ``/ipc/hello`` and exchanged for an in-memory session credential. A
 current session can renew itself before it expires without restarting Core.
 
 The transport is intentionally standard-library HTTP/JSON so the same Core
@@ -15,12 +15,17 @@ JavaScript backend.  The JSON envelope itself is validated by
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import base64
+import binascii
 import hashlib
 import hmac
+import html
 import http.server
 import json
+from pathlib import Path
 import queue
 import secrets
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -31,6 +36,7 @@ import urllib.request
 import uuid
 
 from .protocol import (
+    MAX_EDITOR_DOCUMENT_BYTES,
     MAX_MESSAGE_BYTES,
     PROTOCOL_VERSION,
     ProtocolError,
@@ -38,12 +44,37 @@ from .protocol import (
     ResponseEnvelope,
     decode_message,
     encode_message,
+    is_error_code,
     make_request,
     validate_method_result,
 )
 from .protocol import _encode_json
-from .security import safe_exception_message
+from .security import safe_error_message
 from .service import ConfirmationNeeded, CoreError, CoreStore, PreparedImport, RevisionConflict
+
+
+def _failure_response(request_id: str, code: object, message: object, *, retryable: bool = False) -> ResponseEnvelope:
+    """Answer with a failure the contract accepts, keeping the cause it can.
+
+    The value a domain hands here is the domain's own: a WebDAV sync raises
+    with the remote server's HTTP status in ``code`` (an ``int``) and a
+    sentence that can hold a newline.  The envelope refuses both, and a
+    refusal raised *inside* an ``except`` block escapes ``do_POST``: the
+    handler writes no reply at all, so the peer reads a closed socket as "the
+    local Core is unavailable" while Core is answering everything else.  Only
+    the value this wire cannot carry is replaced -- a code that is already a
+    token survives -- so the reason still reaches the reader.
+    """
+
+    try:
+        return ResponseEnvelope.failure(request_id, code, message, retryable=retryable)
+    except ProtocolError:
+        return ResponseEnvelope.failure(
+            request_id,
+            code if is_error_code(code) else "core_error",
+            safe_error_message(message),
+            retryable=retryable,
+        )
 
 
 def _encode_response_body(payload: Mapping[str, Any]) -> bytes:
@@ -63,6 +94,225 @@ def _encode_response_body(payload: Mapping[str, Any]) -> bytes:
 
 BOOTSTRAP_TOKEN_TTL_SECONDS = 120.0
 SESSION_TOKEN_TTL_SECONDS = 30 * 60.0
+# The browser host's session travels in this cookie rather than a readable
+# header: page script can neither read ``X-LiteLLM-Core-Session`` nor be given
+# a session it could exfiltrate.  ``SameSite=Strict`` also keeps it out of every
+# cross-site request, which is what makes DNS rebinding a non-issue here.
+BROWSER_SESSION_COOKIE = "yr-core-session"
+# The page the browser host loads is served by Core itself, so the browser's
+# origin is this listener: ``/ipc`` is same-origin and no CORS answer, preflight,
+# or second port is involved.  Only these names are answered.
+WEB_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "[::1]"})
+# Where the page lives on the published local port.  The proxy owns that
+# listener and forwards this prefix to Core, which lets the browser keep one
+# origin: `/ui` is the page, `/ipc` is its API, and neither needs a CORS
+# answer.  The spelling is one constant because the page's own bundle refers
+# to its script by relative path -- moving the prefix moves every asset too.
+WEB_UI_PREFIX = "/ui"
+# The browser host is one built bundle of static files: the page, its script,
+# and whatever the script imports.  Anything else the listener would have to
+# guess, so it answers 404 instead.
+_WEB_CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".map": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".webp": "image/webp",
+    ".woff2": "font/woff2",
+    ".ico": "image/x-icon",
+}
+
+# The gate a browser meets before the app itself is served.
+#
+# One self-contained document: the app's bundle is not served to a page that
+# has not signed in, so the gate may not depend on it.  The script is inline and
+# posts to `/ipc/web/login`, which answers with the session cookie the app page
+# then carries.
+#
+# Two rules about its words.  It names nothing: anyone who reaches the port
+# reads this page before proving anything, so it says what a visitor has to do
+# and never what the service is.  And it speaks the language the app resolved,
+# so a window set to Chinese does not hand the browser an English form.
+#
+# `autocomplete="current-password"` lets a password manager fill it, which is
+# the whole reason a person can live with a key here at all.
+WEB_LOGIN_MESSAGES: dict[str, dict[str, str]] = {
+    "en": {
+        "lang": "en",
+        "title": "Sign in",
+        "intro": "Enter the access key to continue.",
+        "key_label": "Access key",
+        "submit": "Sign in",
+        "invalid_key": "That key is not correct.",
+        "unchecked_key": "The key could not be checked.",
+        "unreachable": "The service is not answering.",
+        "invalid_launch": "This sign-in link has expired. Enter the key instead.",
+    },
+    "zh-Hans": {
+        "lang": "zh-Hans",
+        "title": "登录",
+        "intro": "输入访问密钥以继续。",
+        "key_label": "访问密钥",
+        "submit": "登录",
+        "invalid_key": "密钥不正确。",
+        "unchecked_key": "无法校验密钥。",
+        "unreachable": "服务没有响应。",
+        "invalid_launch": "此登录链接已失效，请手动输入密钥。",
+    },
+}
+
+_WEB_LOGIN_TEMPLATE = """<!doctype html>
+<html lang="__LANG__">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<!-- No icon: the browser then asks this origin for no /favicon.ico,
+     which is not a file this page owns and would be answered 404. -->
+<link rel="icon" href="data:,">
+<title>__TITLE__</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center;
+    justify-content: center; background: #f5f5f7; color: #1d1d1f;
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    body { background: #1e1e1e; color: #f2f2f7; }
+    form { background: #2a2a2c !important; border-color: #3a3a3c !important; }
+    input { background: #1e1e1e !important; color: #f2f2f7 !important; border-color: #48484a !important; }
+  }
+  form {
+    width: 300px; padding: 28px 26px; background: #fff; border: 1px solid #d8d8dc;
+    border-radius: 10px; box-shadow: 0 8px 30px rgba(0,0,0,.10);
+  }
+  h1 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
+  p { margin: 0 0 18px; color: #8e8e93; font-size: 12px; }
+  input {
+    width: 100%; box-sizing: border-box; padding: 7px 9px; font: inherit;
+    border: 1px solid #c8c8cc; border-radius: 6px; background: #fff; color: inherit;
+  }
+  input:focus { outline: 2px solid #0a84ff; outline-offset: -1px; border-color: transparent; }
+  button {
+    width: 100%; margin-top: 14px; padding: 7px 9px; font: inherit; font-weight: 500;
+    color: #fff; background: #0a84ff; border: 0; border-radius: 6px; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  #error { margin-top: 10px; min-height: 16px; color: #ff3b30; font-size: 12px; }
+</style>
+</head>
+<body>
+<form id="login">
+  <h1>__TITLE__</h1>
+  <p>__INTRO__</p>
+  <input id="password" type="password" name="password" autocomplete="current-password"
+         autofocus aria-label="__KEY_LABEL__" required>
+  <button id="submit" type="submit">__SUBMIT__</button>
+  <div id="error" role="alert"></div>
+</form>
+<script>
+  var strings = __STRINGS__;
+  var form = document.getElementById("login");
+  var field = document.getElementById("password");
+  var button = document.getElementById("submit");
+  var error = document.getElementById("error");
+  /**
+   * A terminal launch prints an address carrying this process's launch token.
+   * Opening that address is the proof, so the form is never shown: the page
+   * signs itself in and then takes the token out of the address bar.
+   *
+   * Any other visitor reaches this page without one, and gets the form.
+   */
+  var launch = /(?:^|[#&])launch=([^&]+)/.exec(location.hash || "");
+  if (launch) {
+    button.disabled = true;
+    fetch("/ipc/web/launch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ launch: decodeURIComponent(launch[1]) }),
+      credentials: "same-origin"
+    }).then(function (response) {
+      if (response.ok) {
+        // The token has done its work and must not stay in this tab's history.
+        var address = new URL(location.href);
+        address.hash = "";
+        history.replaceState(null, "", address.toString());
+        location.reload();
+        return;
+      }
+      button.disabled = false;
+      error.textContent = strings.invalid_launch;
+    }).catch(function () {
+      button.disabled = false;
+      error.textContent = strings.unreachable;
+    });
+  }
+  form.addEventListener("submit", function (event) {
+    event.preventDefault();
+    if (field.value === "") return;
+    button.disabled = true;
+    error.textContent = "";
+    fetch("/ipc/web/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: field.value }),
+      // The cookie this answer sets is the session the app page then uses.
+      credentials: "same-origin"
+    }).then(function (response) {
+      if (response.ok) {
+        // Reload rather than swap in the app: the shell is served by the same
+        // route, so asking again now answers with it.
+        location.reload();
+        return;
+      }
+      return response.json().catch(function () { return {}; }).then(function (body) {
+        button.disabled = false;
+        field.select();
+        error.textContent = body && body.error && body.error.code === "invalid_password"
+          ? strings.invalid_key
+          : strings.unchecked_key;
+      });
+    }).catch(function () {
+      button.disabled = false;
+      error.textContent = strings.unreachable;
+    });
+  });
+</script>
+</body>
+</html>
+"""
+
+
+def _web_login_page(language: str) -> bytes:
+    """The gate in one language, from one table of words.
+
+    The language is the app's own resolution, so the form is in the language
+    the window is already speaking instead of the language this file happens
+    to be written in.
+    """
+
+    messages = WEB_LOGIN_MESSAGES.get(language, WEB_LOGIN_MESSAGES["en"])
+    page = _WEB_LOGIN_TEMPLATE
+    for name, value in messages.items():
+        page = page.replace(f"__{name.upper()}__", html.escape(value, quote=True))
+    page = page.replace(
+        "__STRINGS__",
+        json.dumps(
+            {
+                key: messages[key]
+                for key in ("invalid_key", "unchecked_key", "unreachable", "invalid_launch")
+            },
+            ensure_ascii=False,
+        ),
+    )
+    return page.encode("utf-8")
+
+
 EVENT_POLL_TIMEOUT_SECONDS = 25.0
 MAX_EVENTS = 32
 EDITOR_CAPABILITY_TTL_SECONDS = 10 * 60.0
@@ -96,7 +346,7 @@ class IpcEndpoint:
 
     @property
     def url(self) -> str:
-        return f"http://{self.address}:{self.port}/v1"
+        return f"http://{self.address}:{self.port}/ipc"
 
     @property
     def bootstrap_token(self) -> str:
@@ -273,6 +523,15 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         # than the request itself.
         return
 
+    def _browser_session_cookie_header(self, session_token: str) -> str:
+        # No ``Max-Age``: the session ends when the browser does, exactly like
+        # the native hosts' in-memory lease.  A renewed session arrives on the
+        # next request and replaces this one.
+        return (
+            f"{BROWSER_SESSION_COOKIE}={session_token}; Path=/; HttpOnly; "
+            "SameSite=Strict"
+        )
+
     def _send(self, status: int, payload: Mapping[str, Any], *, session_token: str | None = None) -> None:
         encoded = _encode_response_body(payload)
         # A body this handler never read would otherwise become the next
@@ -287,6 +546,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         if session_token:
             self.send_header("X-LiteLLM-Core-Session", session_token)
+            self.send_header("Set-Cookie", self._browser_session_cookie_header(session_token))
         self.end_headers()
         try:
             self.wfile.write(encoded)
@@ -305,13 +565,46 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
             }
         self._send(status, payload)
 
+    # The browser host is the one caller whose credential cannot travel in a
+    # readable header: page script may not read ``X-LiteLLM-Core-Session``, and
+    # a session in ``localStorage`` would be script-readable.  It is therefore
+    # carried in this cookie instead -- ``HttpOnly``, ``SameSite=Strict``, and
+    # ``Path=/`` so the same page that serves the bundle hands it back to
+    # ``/ipc``.  The two native hosts keep using the header; a request that
+    # states both must agree, or it is refused rather than resolved.
+    def _browser_session_cookie(self) -> str:
+        raw = self.headers.get("Cookie", "")
+        if not raw:
+            return ""
+        for part in raw.split(";"):
+            name, _separator, value = part.strip().partition("=")
+            if name == BROWSER_SESSION_COOKIE:
+                return value.strip()
+        return ""
+
+    def _session_authorization(self) -> str:
+        header = self._authorization()
+        cookie = self._browser_session_cookie()
+        if header and cookie and not hmac.compare_digest(header, cookie):
+            return ""
+        return header or cookie
+
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler hook
         route = urlsplit(self.path).path.rstrip("/") or "/"
-        if route == "/v1/hello":
+        if route == "/ipc/hello":
             self._owner._handle_hello(self)
             return
-        if route == "/v1/host/shutdown":
-            token = self._authorization()
+        if route == "/ipc/web/login":
+            # The one route a page may call with nothing but a typed password.
+            self._owner._handle_web_login(self)
+            return
+        if route == "/ipc/web/launch":
+            # The one route a page may call with nothing but the credential a
+            # terminal put in the address it printed.
+            self._owner._handle_web_launch(self)
+            return
+        if route == "/ipc/host/shutdown":
+            token = self._session_authorization()
             if not self._owner._valid_session(token):
                 self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
                 return
@@ -327,8 +620,98 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             self._send(200, {"protocol_version": PROTOCOL_VERSION, "stopped": True})
             return
-        if route == "/v1/host/file-capability":
-            token = self._authorization()
+        if route == "/ipc/host/file-download" and self.command == "POST":
+            token = self._session_authorization()
+            if not self._owner._valid_session(token):
+                self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
+                return
+            try:
+                data = decode_message(self._read_body())
+                if set(data) == {"purpose", "name"}:
+                    if data.get("purpose") != "export" or not isinstance(data.get("name"), str):
+                        raise CoreError("invalid_file_capability", "The selected file is unavailable")
+                    name = Path(data["name"]).name
+                    if not name or name in {".", ".."} or len(name.encode("utf-8")) > 255:
+                        raise CoreError("invalid_file_capability", "The selected file is unavailable")
+                    path = Path(tempfile.gettempdir()) / f"young-router-export-{secrets.token_urlsafe(12)}.json"
+                    capability = self._owner.register_file_capability(str(path), "export")
+                    with self._owner._browser_file_lock:
+                        self._owner._browser_files[capability] = path
+                        self._owner._browser_file_sessions[capability] = token
+                elif set(data) == {"token"}:
+                    body = self._owner.take_browser_file(data.get("token"), token)
+                    if body is None:
+                        raise CoreError("invalid_file_capability", "The export is unavailable")
+                    encoded = _encode_response_body({"protocol_version": PROTOCOL_VERSION, "data": base64.b64encode(body).decode("ascii")})
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(encoded)))
+                    self.end_headers()
+                    self.wfile.write(encoded)
+                    return
+                else:
+                    raise CoreError("invalid_file_capability", "The selected file is unavailable")
+            except (CoreError, ProtocolError, ValueError, OSError):
+                self._send_error(400, code="invalid_file_capability", message="The export is unavailable")
+                return
+            self._send(200, {"protocol_version": PROTOCOL_VERSION, "token": capability})
+            return
+        if route == "/ipc/host/file-upload":
+            token = self._session_authorization()
+            if not self._owner._valid_session(token):
+                self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
+                return
+            try:
+                data = decode_message(self._read_body())
+                if set(data) != {"purpose", "name", "size", "data"} or data.get("purpose") != "import":
+                    raise CoreError("invalid_file_capability", "The selected file is unavailable")
+                name = data.get("name")
+                size = data.get("size")
+                encoded = data.get("data")
+                if not isinstance(name, str) or type(size) is not int or not isinstance(encoded, str) or size < 0 or size > MAX_EDITOR_DOCUMENT_BYTES:
+                    raise CoreError("invalid_file_capability", "The selected file is unavailable")
+                suffix = Path(name).suffix.lower()
+                if suffix not in {".json", ".yaml", ".yml", ".toml", ".sql"}:
+                    raise CoreError("invalid_file_capability", "The selected file is unavailable")
+                content = base64.b64decode(encoded, validate=True)
+                if len(content) != size:
+                    raise CoreError("invalid_file_capability", "The selected file is unavailable")
+                # The document is Core's private, short-lived temporary file;
+                # the import capability is its only route back to the content.
+                with tempfile.NamedTemporaryFile(prefix="young-router-import-", suffix=suffix, delete=False) as stream:
+                    stream.write(content)
+                    path = Path(stream.name)
+                capability = self._owner.register_file_capability(str(path), "import")
+                with self._owner._browser_file_lock:
+                    self._owner._browser_files[capability] = path
+                    self._owner._browser_file_sessions[capability] = token
+            except (CoreError, ProtocolError, ValueError, OSError, binascii.Error):
+                self._send_error(400, code="invalid_file_capability", message="The selected file is unavailable")
+                return
+            self._send(200, {"protocol_version": PROTOCOL_VERSION, "token": capability})
+            return
+        if route == "/ipc/host/file-download":
+            token = self._session_authorization()
+            if not self._owner._valid_session(token):
+                self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
+                return
+            try:
+                data = decode_message(self._read_body())
+                if set(data) != {"purpose", "name"} or data.get("purpose") != "export" or not isinstance(data.get("name"), str):
+                    raise CoreError("invalid_file_capability", "The selected file is unavailable")
+                name = Path(data["name"]).name
+                if not name or name in {".", ".."} or len(name.encode("utf-8")) > 255:
+                    raise CoreError("invalid_file_capability", "The selected file is unavailable")
+                path = Path(tempfile.gettempdir()) / f"young-router-export-{secrets.token_urlsafe(12)}.json"
+                capability = self._owner.register_file_capability(str(path), "export")
+            except (CoreError, ProtocolError, ValueError, OSError):
+                self._send_error(400, code="invalid_file_capability", message="The selected file is unavailable")
+                return
+            self._send(200, {"protocol_version": PROTOCOL_VERSION, "token": capability})
+            return
+        if route == "/ipc/host/file-capability":
+            token = self._session_authorization()
             if not self._owner._valid_session(token):
                 self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
                 return
@@ -351,8 +734,8 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             self._send(200, {"protocol_version": PROTOCOL_VERSION, "token": capability})
             return
-        if route in {"/v1/host/secret/capability", "/v1/host/secret/stage", "/v1/host/relay/login", "/v1/host/relay/restore", "/v1/host/relay/resources", "/v1/host/relay/import"}:
-            token = self._authorization()
+        if route in {"/ipc/host/secret/capability", "/ipc/host/secret/stage", "/ipc/host/relay/login", "/ipc/host/relay/restore", "/ipc/host/relay/resources", "/ipc/host/relay/import"}:
+            token = self._session_authorization()
             if not self._owner._valid_session(token):
                 self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
                 return
@@ -449,8 +832,8 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 self._send_error(400, code="invalid_secret", message="The requested secret field is unavailable")
             return
-        if route in {"/v1/host/secret/read-capability", "/v1/host/secret/read"}:
-            token = self._authorization()
+        if route in {"/ipc/host/secret/read-capability", "/ipc/host/secret/read"}:
+            token = self._session_authorization()
             if not self._owner._valid_session(token):
                 self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
                 return
@@ -478,10 +861,10 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 self._send_error(400, code="invalid_secret", message="The requested secret field is unavailable")
             return
-        if route != "/v1":
+        if route != "/ipc":
             self._send_error(404, code="not_found", message="Core IPC route is unavailable")
             return
-        token = self._authorization()
+        token = self._session_authorization()
         if not self._owner._valid_session(token):
             self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
             return
@@ -500,10 +883,12 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler hook
         route = urlsplit(self.path)
-        if route.path.rstrip("/") != "/v1/events":
+        if route.path.rstrip("/") != "/ipc/events":
+            if self._owner.serve_web_host(self, route.path):
+                return
             self._send_error(404, code="not_found", message="Core IPC route is unavailable")
             return
-        token = self._authorization()
+        token = self._session_authorization()
         if not self._owner._valid_session(token):
             self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
             return
@@ -551,6 +936,30 @@ class CoreIPCServer:
         self._secret_capabilities: dict[str, _SecretCapability] = {}
         self._secret_read_capabilities: dict[str, _SecretReadCapability] = {}
         self._import_plans: dict[str, _ImportPlanCapability] = {}
+        self._browser_files: dict[str, Path] = {}
+        self._browser_file_lock = threading.RLock()
+        self._browser_file_sessions: dict[str, str] = {}
+        # The browser host's own bundle.  Empty means "this Core serves no web
+        # host", which is what every native install is: the two native hosts
+        # read their React code from the app bundle, never from this listener.
+        self._web_root: Path | None = None
+        # The web host's own gate: one port and one password a person types.
+        # Nothing here is a session credential for the IPC; the browser page
+        # still exchanges a session over `/ipc/hello`, but only after this
+        # password has been presented.
+        self._web_password = ""
+        # A page key edited in General is read through this, so the next
+        # sign-in uses it without replacing the listener.
+        self._web_password_provider: Callable[[], str] | None = None
+        # The language the gate is drawn in, resolved by the app's own
+        # language domain.  Read per request for the same reason the key is:
+        # changing it must not need a restart.
+        self._web_locale_provider: Callable[[], str] | None = None
+        # The credential a terminal launch puts in the printed address.  Empty
+        # for a Core started by a native host or by a plain CLI run.
+        self._web_launch_token = ""
+        # Whether the address this process publishes carries that credential.
+        self._web_auto_login = False
         self._lock = threading.RLock()
 
     @property
@@ -593,6 +1002,272 @@ class CoreIPCServer:
         """
 
         return self.core.file_capabilities.register(path, purpose)
+
+    def discard_browser_file(self, token: object) -> None:
+        if not isinstance(token, str):
+            return
+        with self._browser_file_lock:
+            path = self._browser_files.pop(token, None)
+            self._browser_file_sessions.pop(token, None)
+        if path is not None:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    def take_browser_file(self, token: object, session_token: str) -> bytes | None:
+        if not isinstance(token, str) or not token or not self._valid_session(session_token):
+            return None
+        with self._browser_file_lock:
+            if self._browser_file_sessions.get(token) != session_token:
+                return None
+            path = self._browser_files.pop(token, None)
+            self._browser_file_sessions.pop(token, None)
+        if path is None:
+            return None
+        try:
+            return path.read_bytes()
+        except OSError:
+            return None
+        finally:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    def serve_web_host(self, handler: "_CoreRequestHandler", path: str) -> bool:
+        """Answer one `GET` for the browser host, or say it is not this server's.
+
+        The page is served by the same listener that answers `/ipc`, so the
+        browser's origin is this Core: `/ipc` is same-origin, no CORS answer or
+        preflight exists, and no second port has to be published.  Only
+        loopback `Host` names are answered, which is what keeps a DNS-rebinding
+        page (whose `Host` is its own attacker domain) from reaching it.
+
+        Returns ``False`` for every path this server does not serve, so the
+        caller keeps answering 404 exactly as before when no bundle is staged.
+        """
+
+        root = self._web_root
+        if root is None:
+            return False
+        host = (handler.headers.get("Host", "").rsplit(":", 1)[0] or "").strip("[]").lower()
+        if host not in WEB_HOSTS:
+            return False
+        # One bundle, two listeners.  The proxy on the published local port
+        # forwards `/ui` here so the page and the API share one address; a
+        # Core reached directly (a terminal launch, a test) answers the same
+        # paths, because a second spelling would be a second page.
+        #
+        # The page names its script relatively, so the mount root has to end in
+        # a slash before the shell is answered: at `/ui` the browser would
+        # resolve `./bundle.js` against the proxy's root, take LiteLLM's 404 as
+        # the script, and draw the shell with nothing in it.  The published
+        # address (``web_host_url``) already carries the slash; this makes the
+        # spelling a person types reach it too.
+        if path == WEB_UI_PREFIX:
+            handler.send_response(308)
+            handler.send_header("Location", WEB_UI_PREFIX + "/")
+            handler.send_header("Cache-Control", "no-store")
+            handler.send_header("Content-Length", "0")
+            handler.end_headers()
+            return True
+        if path.startswith(WEB_UI_PREFIX + "/"):
+            path = path[len(WEB_UI_PREFIX):]
+        relative = path.lstrip("/") or "index.html"
+        if ".." in relative.split("/"):
+            return False
+        candidate = (root / relative).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            return False
+        content_type = _WEB_CONTENT_TYPES.get(candidate.suffix.lower())
+        if content_type is None or not candidate.is_file():
+            return False
+        try:
+            body = candidate.read_bytes()
+        except OSError:
+            return False
+        # The app's own shell is only handed to a page that has signed in.
+        # Everything else -- the bundle, the login page itself -- is public,
+        # because those are bytes any page could fetch from a port on this
+        # machine, and gating them behind a cookie would only mean the login
+        # page could not load.
+        if candidate.name == "index.html" and not self._page_signed_in(handler):
+            body = _web_login_page(self._web_language())
+            content_type = "text/html; charset=utf-8"
+            relative = "login.html"
+        handler.send_response(200)
+        handler.send_header("Content-Type", content_type)
+        handler.send_header("Content-Length", str(len(body)))
+        handler.send_header(
+            "Cache-Control",
+            "no-store" if candidate.suffix.lower() == ".html" else "public, max-age=31536000, immutable",
+        )
+        # The page frames nothing and loads nothing but itself.
+        handler.send_header("X-Content-Type-Options", "nosniff")
+        handler.send_header("Referrer-Policy", "no-referrer")
+        handler.send_header("X-Frame-Options", "DENY")
+        handler.end_headers()
+        try:
+            handler.wfile.write(body)
+        except OSError:
+            pass
+        return True
+
+    def _page_signed_in(self, handler: "_CoreRequestHandler") -> bool:
+        """Whether this browser already holds a live session cookie.
+
+        A signed-in page is served the app; everyone else gets the password
+        form.  The form is not a security boundary by itself -- the boundary is
+        `/ipc/web/login` and the session cookie -- but it is what a person
+        meets, so it must never be the app's shell shown empty and broken.
+        """
+
+        cookie = handler._browser_session_cookie()
+        if not cookie:
+            return False
+        with self._lock:
+            session = self._sessions.get(cookie)
+            return bool(
+                session is not None
+                and session.expires_at >= time.monotonic()
+                and hmac.compare_digest(session.token, cookie)
+            )
+
+    def enable_web_host(
+        self,
+        root: Path | str,
+        *,
+        password: str = "",
+        password_provider: Callable[[], str] | None = None,
+        locale_provider: Callable[[], str] | None = None,
+        auto_login: bool = False,
+    ) -> None:
+        """Serve one built bundle from this listener, behind one key.
+
+        The key is the page's whole gate for anyone who reaches the port: a
+        person opens the address, types it once, and the page keeps a session
+        cookie from then on.  It is a convenience lock on a port this machine's
+        owner opened -- not a cryptographic secret this code is in a position
+        to protect -- so the General pane draws it in the clear.
+
+        ``password_provider`` is how an edit in General reaches the gate
+        without a restart: the value is read per sign-in instead of captured
+        here.  ``password`` remains for a caller that states one directly (a
+        terminal, a test).  ``locale_provider`` is the same lease for the
+        gate's language: the person's choice is read per request, so changing
+        it never needs the listener replaced.
+
+        ``auto_login`` is for a caller that is *already* the proof: a terminal
+        that started this process, or the app's own window opening its page.
+        It decides whether the *published* address carries the launch
+        credential; the credential itself is always minted here, because
+        ``launch_url`` is how a native host opens a page it has already
+        proved itself to.  The credential lives only in this process's memory,
+        never in a document and never in a snapshot, so the page it opens asks
+        for no key while every other browser on that port still does.
+        """
+
+        resolved = Path(root).expanduser().resolve()
+        if not (resolved / "index.html").is_file():
+            raise IPCError("The browser host bundle has no index.html")
+        with self._lock:
+            if self._server is None:
+                raise IPCError("The browser host needs a running Core listener")
+            self._web_root = resolved
+            self._web_password = password
+            self._web_password_provider = password_provider
+            self._web_locale_provider = locale_provider
+            # Never read from the document and never written to it: a launch
+            # credential that survived a restart would be a permanent way past
+            # the password.
+            self._web_launch_token = secrets.token_urlsafe(32)
+            self._web_auto_login = bool(auto_login)
+
+    def _web_language(self) -> str:
+        """The language the gate is drawn in right now.
+
+        The app's language domain is the one authority for this; a Core started
+        without one (a test, a probe) answers in English rather than guessing
+        from the request's headers, because the window and the gate must not
+        disagree about what language the person chose.
+        """
+
+        provider = self._web_locale_provider
+        if provider is None:
+            return "en"
+        try:
+            return str(provider() or "en")
+        except Exception:
+            # An unreadable preference is not a reason to fail the gate.
+            return "en"
+
+    def set_web_password(self, password: str) -> None:
+        """Take an edited password, without a restart of the listener.
+
+        The page's gate is read per request, so an edited password applies to
+        the next sign-in and leaves already-signed-in pages signed in: changing
+        the lock must not sign out the person changing it.
+        """
+
+        with self._lock:
+            self._web_password = password
+
+    def _web_password_value(self) -> str:
+        """The key the page's gate compares against right now."""
+
+        provider = self._web_password_provider
+        if provider is None:
+            return self._web_password
+        try:
+            return str(provider() or "")
+        except Exception:
+            # A document that cannot be read is not an unlocked door.
+            return ""
+
+    @property
+    def web_host_url(self) -> str:
+        """The address a person opens.
+
+        Credential-free by default: the password is typed into the page, so the
+        URL stays something that can be spoken, bookmarked, or written on a
+        sticky note.  A Core started with ``auto_login`` adds its launch
+        credential as a fragment, which no server, log, or ``Referer`` header
+        sees, and which stops working when this process does.
+        """
+
+        with self._lock:
+            if self._web_root is None or self._web_password_value() == "":
+                return ""
+            port = self.port
+            launch = self._web_launch_token if self._web_auto_login else ""
+        if not port:
+            return ""
+        if launch:
+            return f"http://{self.address}:{port}{WEB_UI_PREFIX}/#launch={launch}"
+        return f"http://{self.address}:{port}{WEB_UI_PREFIX}/"
+
+    @property
+    def web_launch_url(self) -> str:
+        """The address a host opens after it has proved itself to Core.
+
+        The credential rides in the fragment: no request path, no server log
+        and no ``Referer`` header ever carries it, and it stops working when
+        this process does.  A native host asks for this instead of copying the
+        page key into another browser, which is what makes clicking the address
+        in General a signed-in page.
+        """
+
+        with self._lock:
+            if self._web_root is None or self._web_password_value() == "":
+                return ""
+            port = self.port
+            launch = self._web_launch_token
+        if not port:
+            return ""
+        return f"http://{self.address}:{port}{WEB_UI_PREFIX}/#launch={launch}" if launch else ""
 
     def register_editor_capability(self, domain: str, document: str, *, session_token: str) -> dict[str, Any]:
         descriptor = self.core.editor_document(domain, document)
@@ -889,10 +1564,17 @@ class CoreIPCServer:
             self._secret_capabilities.clear()
             self._secret_read_capabilities.clear()
             self._import_plans.clear()
+            files = list(self._browser_files.values())
+            self._browser_files.clear()
             self._bootstrap_token = ""
             self._bootstrap_consumed = True
         if unsubscribe is not None:
             unsubscribe()
+        for path in files:
+            try:
+                path.unlink()
+            except OSError:
+                pass
         if server is not None:
             server.shutdown()
             server.server_close()
@@ -909,44 +1591,146 @@ class CoreIPCServer:
         self.stop()
 
     def _handle_hello(self, handler: _CoreRequestHandler) -> None:
+        """Open one session: native hosts with their token, pages with the password.
+
+        Two hosts, two ways in, and they are not variants of each other:
+
+        - a native host holds the bootstrap credential this process minted and
+          handed over the private descriptor, so presenting it is the proof;
+        - a browser page presents nothing but what a person typed.  Its cookie
+          is issued by `/ipc/web/login` after the web password is accepted, and
+          from then on the cookie is the whole identity.
+
+        A page that already signed in keeps its cookie across reloads, so
+        `/ipc/hello` accepts it too instead of asking for the password again.
+        """
+
+        # Hello never reads a body, and a browser keeps its connection open for
+        # the next call: an unconsumed ``{}`` stays in the buffer and the next
+        # request line is read back as the method ``{}POST``.  ``_send`` drains
+        # it, but only on a path that answers through ``_send`` -- so the body
+        # is claimed here, before any early return below.
+        try:
+            handler._read_body()
+        except ProtocolError:
+            handler.close_connection = True
         token = handler._authorization()
+        cookie = handler._browser_session_cookie()
         with self._lock:
             now = time.monotonic()
-            valid_bootstrap = bool(
-                token
-                and not self._bootstrap_consumed
-                and now <= self._bootstrap_expires_at
-                and hmac.compare_digest(token, self._bootstrap_token)
-            )
-            session = self._sessions.get(token)
+            bootstrap = self._valid_bootstrap(token)
+            candidate = token or cookie
+            session = self._sessions.get(candidate) if candidate else None
             valid_session = bool(
-                token
+                candidate
                 and session is not None
                 and session.expires_at >= now
-                and hmac.compare_digest(session.token, token)
+                and hmac.compare_digest(session.token, candidate)
             )
-            if valid_bootstrap:
+        if bootstrap:
+            self._issue_session(handler, token, consumed_bootstrap=True)
+            return
+        if valid_session:
+            self._issue_session(handler, candidate, consumed_bootstrap=False)
+            return
+        handler._send_error(401, code="unauthorized", message="Core IPC authentication failed")
+
+    def _issue_session(self, handler: _CoreRequestHandler, token: str, *, consumed_bootstrap: bool) -> None:
+        with self._lock:
+            now = time.monotonic()
+            if consumed_bootstrap and hmac.compare_digest(token, self._bootstrap_token):
                 self._bootstrap_consumed = True
+            existing = self._sessions.get(token)
+            if existing is not None:
+                # Keep the credential stable: subscriptions and editor
+                # revisions are intentionally bound to this session.
+                existing.expires_at = now + self.session_ttl_seconds
+                session_token = existing.token
+            else:
                 session_token = secrets.token_urlsafe(32)
                 self._sessions[session_token] = _Session(
                     token=session_token,
                     expires_at=now + self.session_ttl_seconds,
                 )
-            elif valid_session and session is not None:
-                # Keep the credential stable: subscriptions and editor
-                # revisions are intentionally bound to this session.
-                session.expires_at = now + self.session_ttl_seconds
-                session_token = session.token
-            else:
-                session_token = ""
-        if not valid_bootstrap and not valid_session:
-            handler._send_error(401, code="unauthorized", message="Core IPC authentication failed")
-            return
         handler._send(
             200,
             {"protocol_version": PROTOCOL_VERSION, "ok": True, "session": {"expires_in": int(self.session_ttl_seconds)}},
             session_token=session_token,
         )
+
+    def _handle_web_login(self, handler: _CoreRequestHandler) -> None:
+        """Exchange the typed web password for this page's session cookie."""
+
+        try:
+            payload = json.loads(handler._read_body() or b"{}")
+        except (ValueError, ProtocolError):
+            payload = {}
+        submitted = payload.get("password") if isinstance(payload, Mapping) else None
+        if not isinstance(submitted, str) or not self._accepts_web_password(submitted):
+            # A refused password is the one place a page is told it was wrong,
+            # so the answer says which failure it is instead of a bare 401 the
+            # page would read as an expired session.
+            handler._send(401, {"ok": False, "error": {"code": "invalid_password", "message": "Web password is incorrect"}})
+            return
+        with self._lock:
+            session_token = secrets.token_urlsafe(32)
+            self._sessions[session_token] = _Session(
+                token=session_token,
+                expires_at=time.monotonic() + self.session_ttl_seconds,
+            )
+        handler._send(200, {"ok": True, "session": {"expires_in": int(self.session_ttl_seconds)}}, session_token=session_token)
+
+    def _handle_web_launch(self, handler: _CoreRequestHandler) -> None:
+        """Admit the page a terminal printed the address for.
+
+        The credential is the launch token this process minted and put in that
+        one address, so presenting it is the same proof the native hosts make
+        with their bootstrap token.  It is accepted repeatedly and for the life
+        of this process, because a person who opens the printed URL from a
+        terminal expects a reload of that tab to still work.
+        """
+
+        try:
+            payload = json.loads(handler._read_body() or b"{}")
+        except (ValueError, ProtocolError):
+            payload = {}
+        submitted = payload.get("launch") if isinstance(payload, Mapping) else None
+        with self._lock:
+            expected = self._web_launch_token
+        if (
+            not isinstance(submitted, str)
+            or expected == ""
+            or not hmac.compare_digest(submitted.encode("utf-8"), expected.encode("utf-8"))
+        ):
+            handler._send(401, {"ok": False, "error": {"code": "invalid_launch", "message": "This launch address is not valid"}})
+            return
+        with self._lock:
+            session_token = secrets.token_urlsafe(32)
+            self._sessions[session_token] = _Session(
+                token=session_token,
+                expires_at=time.monotonic() + self.session_ttl_seconds,
+            )
+        handler._send(200, {"ok": True, "session": {"expires_in": int(self.session_ttl_seconds)}}, session_token=session_token)
+
+    def _accepts_web_password(self, submitted: str) -> bool:
+        expected = self._web_password_value()
+        if expected == "":
+            # No password is no gate, and a page that answers its own prompt
+            # with nothing must not be what opens it.
+            return False
+        return hmac.compare_digest(submitted.encode("utf-8"), expected.encode("utf-8"))
+
+    def _valid_bootstrap(self, token: str) -> bool:
+        """Whether this is the native host's unspent one-shot credential."""
+
+        if not token:
+            return False
+        with self._lock:
+            return bool(
+                not self._bootstrap_consumed
+                and time.monotonic() <= self._bootstrap_expires_at
+                and hmac.compare_digest(token, self._bootstrap_token)
+            )
 
     def _valid_session(self, token: str) -> bool:
         if not token:
@@ -980,7 +1764,15 @@ class CoreIPCServer:
                 # never swept, so every relaunched host left subscriptions (and
                 # the events queued in them) behind for the process lifetime,
                 # and a poll reusing the id read as a quiet heartbeat.
-                for subscription_id in tuple(session.subscriptions):
+                #
+                # An unknown token has no record to walk: a browser tab that was
+                # reloaded, or any caller presenting a token this Core never
+                # minted, takes this branch with ``session is None``.  Walking
+                # its subscriptions raised AttributeError, which aborts the
+                # request handler thread and closes the connection with no
+                # answer at all — the caller then retries a request that will
+                # fail the same way.
+                for subscription_id in tuple(session.subscriptions if session is not None else ()):
                     subscription = self._subscriptions.get(subscription_id)
                     if subscription is not None and hmac.compare_digest(subscription.session_token, token):
                         self._subscriptions.pop(subscription_id, None)
@@ -1105,6 +1897,15 @@ class CoreIPCServer:
             params = request.params
             if request.method == "snapshot":
                 result: Any = {"snapshot": self.core.snapshot()}
+            elif request.method == "web_launch_url":
+                # The page's own address, with the credential this host has
+                # already proved itself for.  Answered over the authenticated
+                # protocol rather than a snapshot, so the credential never sits
+                # in state every window renders.
+                url = self.web_launch_url
+                if url == "":
+                    raise CoreError("web_unavailable", "The browser page is not being served")
+                result = {"url": url}
             elif request.method == "disk_state":
                 domains = params.get("domains")
                 if not isinstance(domains, list) or not domains or any(not isinstance(domain, str) for domain in domains):
@@ -1208,7 +2009,9 @@ class CoreIPCServer:
                 prepared = self.core.prepare_import(
                     source_token=source,
                     revision=params["revision"],
+                    remove_source=source in self._browser_files,
                 )
+                self.discard_browser_file(source)
                 result = {
                     "revision": prepared.revision,
                     "import_plan_token": self._register_import_plan(
@@ -1243,13 +2046,13 @@ class CoreIPCServer:
             validate_method_result(request.method, result)
             return ResponseEnvelope.success(request.request_id, result)
         except ConfirmationNeeded as exc:
-            return ResponseEnvelope.failure(request.request_id, exc.code, exc.message)
+            return _failure_response(request.request_id, exc.code, exc.message)
         except CoreError as exc:
-            return ResponseEnvelope.failure(request.request_id, exc.code, exc.message, retryable=exc.code in {"state_unavailable", "service_error"})
+            return _failure_response(request.request_id, exc.code, exc.message, retryable=exc.code in {"state_unavailable", "service_error"})
         except ProtocolError as exc:
-            return ResponseEnvelope.failure(request.request_id, exc.code, exc.message, retryable=exc.retryable)
+            return _failure_response(request.request_id, exc.code, exc.message, retryable=exc.retryable)
         except Exception:
-            return ResponseEnvelope.failure(request.request_id, "core_error", "Core operation failed")
+            return _failure_response(request.request_id, "core_error", "Core operation failed")
 
 
 class CoreIPCClient:
@@ -1304,7 +2107,7 @@ class CoreIPCClient:
     def _exchange_session(self, credential: str) -> None:
         # An empty byte payload forces POST; ``None`` is reserved for GET
         # event polling in ``_http``.
-        status, body, headers = self._http("/v1/hello", payload=b"", token=credential)
+        status, body, headers = self._http("/ipc/hello", payload=b"", token=credential)
         if status != 200:
             raise IPCError("Core IPC authentication failed")
         session = headers.get("X-LiteLLM-Core-Session", "")
@@ -1334,7 +2137,7 @@ class CoreIPCClient:
     def call(self, method: str, params: Mapping[str, Any] | None = None) -> Any:
         self._ensure_session()
         request = make_request(method, params, request_id=uuid.uuid4().hex)
-        status, body, _headers = self._http("/v1", payload=encode_message(request), token=self._session_token)
+        status, body, _headers = self._http("/ipc", payload=encode_message(request), token=self._session_token)
         try:
             response = ResponseEnvelope.from_mapping(decode_message(body))
         except ProtocolError:
@@ -1354,7 +2157,7 @@ class CoreIPCClient:
         self._ensure_session()
         body = encode_message({"purpose": purpose, "path": path})
         status, response_body, _headers = self._http(
-            "/v1/host/file-capability",
+            "/ipc/host/file-capability",
             payload=body,
             token=self._session_token,
         )
@@ -1380,7 +2183,7 @@ class CoreIPCClient:
 
         def poll() -> None:
             while not stop.is_set():
-                query = f"/v1/events?subscription_id={subscription_id}&timeout={EVENT_POLL_TIMEOUT_SECONDS}"
+                query = f"/ipc/events?subscription_id={subscription_id}&timeout={EVENT_POLL_TIMEOUT_SECONDS}"
                 try:
                     status, body, _headers = self._http(query, token=self._session_token)
                 except IPCError:

@@ -19,6 +19,14 @@ import type {
 export interface NativeIpcBridge {
   send(request: string): Promise<string>;
   subscribe(listener: (event: string) => void): () => void;
+  /**
+   * A host-only route beside the protocol, when this host has one.
+   *
+   * The browser host owns two values that no configuration domain owns — the
+   * port it listens on and the password that opens it — so they travel on
+   * their own route.  Neither native host serves a page, so neither has one.
+   */
+  hostRoute?(path: string, body: Record<string, unknown>): Promise<Record<string, unknown>>;
 }
 
 export interface NativeLeafBridge {
@@ -170,6 +178,9 @@ export function createNativeIpcTransport(bridge: NativeIpcBridge): IpcTransport 
     subscribe(listener: (event: IpcEvent) => void): () => void {
       return bridge.subscribe((event) => listener(parseJson<IpcEvent>(event, "IPC event")));
     },
+    hostRoute: bridge.hostRoute
+      ? (path, body) => bridge.hostRoute!(path, body)
+      : undefined,
   };
 }
 

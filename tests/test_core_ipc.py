@@ -15,6 +15,7 @@ import uuid
 from unittest import mock
 
 from young_router.core import (
+    CoreError,
     CoreIPCClient,
     CoreIPCServer,
     CoreStore,
@@ -173,7 +174,7 @@ class CoreProtocolTests(unittest.TestCase):
         schema = load_protocol_schema()
         self.assertEqual(1, schema["protocol_version"])
         self.assertEqual(
-            ["snapshot", "disk_state", "logs", "editor", "files", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import_preview", "import"],
+            ["snapshot", "disk_state", "logs", "editor", "files", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import_preview", "import", "web_launch_url"],
             schema["methods"],
         )
         typescript = (
@@ -240,6 +241,7 @@ class CoreProtocolTests(unittest.TestCase):
             "export": {"sections": ["language"], "destination_token": "destination"},
             "import_preview": {"source_token": "source", "revision": 0},
             "import": {"import_plan_token": "plan", "sections": ["language"], "revision": 0},
+            "web_launch_url": {},
         }
         invalid = {
             "snapshot": {"stale": True},
@@ -256,6 +258,7 @@ class CoreProtocolTests(unittest.TestCase):
             "export": {"sections": ["language", "language"], "destination_token": "destination"},
             "import_preview": {"source_token": "source"},
             "import": {"import_plan_token": "plan", "sections": ["language"]},
+            "web_launch_url": {"stale": True},
         }
 
         self.assertEqual(set(valid), set(load_protocol_schema()["methods"]))
@@ -332,6 +335,7 @@ class CoreProtocolTests(unittest.TestCase):
             "export": {"revision": 0, "section_count": 0, "sections": ["language"]},
             "import_preview": {"revision": 0, "import_plan_token": "plan", "detected_sections": ["language"], "preview": {}},
             "import": {"revision": 0, "draft_domains": ["language"], "preview": {}},
+            "web_launch_url": {"url": "http://127.0.0.1:12390/ui/#launch=token"},
         }
         invalid = {
             "snapshot": {"snapshot": []},
@@ -355,6 +359,7 @@ class CoreProtocolTests(unittest.TestCase):
             "export": {"revision": 0, "section_count": -1},
             "import_preview": {"revision": 0, "import_plan_token": "plan", "detected_sections": [], "preview": {}},
             "import": {"revision": 0, "draft_domains": ["unknown"], "preview": {}},
+            "web_launch_url": {"url": ""},
         }
 
         self.assertEqual(set(valid), set(load_protocol_schema()["methods"]))
@@ -1488,7 +1493,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             client.call("snapshot")
 
             status, body, _headers = client._http(
-                "/v1/host/secret/capability",
+                "/ipc/host/secret/capability",
                 payload=encode_message({"domain": "webdav", "field": "password", "purpose": "settings"}),
                 token=client._session_token,
             )
@@ -1504,7 +1509,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
                 "webdav", "password", None, session_token=client._session_token
             )
             status, body, _headers = client._http(
-                "/v1/host/secret/stage",
+                "/ipc/host/secret/stage",
                 payload=encode_message({"secret_token": fresh["secret_token"], "value": "synthetic-secret"}),
                 token=client._session_token,
             )
@@ -1548,7 +1553,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
 
             session = client._session_token
             status, body, _headers = client._http(
-                "/v1/host/secret/read-capability",
+                "/ipc/host/secret/read-capability",
                 payload=encode_message(
                     {
                         "domain": "providers_models",
@@ -1568,7 +1573,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             self.assertNotIn(api_key, body.decode("utf-8"))
 
             status, body, _headers = client._http(
-                "/v1/host/secret/read",
+                "/ipc/host/secret/read",
                 payload=encode_message({"secret_read_token": read_capability["secret_read_token"]}),
                 token=session,
             )
@@ -1581,7 +1586,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
 
             # A read lease cannot be replayed, even by the same native host.
             status, body, _headers = client._http(
-                "/v1/host/secret/read",
+                "/ipc/host/secret/read",
                 payload=encode_message({"secret_read_token": read_capability["secret_read_token"]}),
                 token=session,
             )
@@ -1590,7 +1595,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
 
             # The route is not a generic secret-read API.
             status, body, _headers = client._http(
-                "/v1/host/secret/read-capability",
+                "/ipc/host/secret/read-capability",
                 payload=encode_message({"domain": "webdav", "field": "password", "target": "x"}),
                 token=session,
             )
@@ -1658,7 +1663,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             self.assertNotIn(password, json.dumps(client.call("snapshot")))
             session = client._session_token
             status, body, _headers = client._http(
-                "/v1/host/secret/read-capability",
+                "/ipc/host/secret/read-capability",
                 payload=encode_message(
                     {"domain": "relay_accounts", "field": "password", "target": account["id"]}
                 ),
@@ -1670,7 +1675,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             self.assertNotIn(password, body.decode("utf-8"))
 
             status, body, _headers = client._http(
-                "/v1/host/secret/read",
+                "/ipc/host/secret/read",
                 payload=encode_message({"secret_read_token": read_capability["secret_read_token"]}),
                 token=session,
             )
@@ -1679,7 +1684,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
 
             # A read lease is read once: the same token answers nothing again.
             status, body, _headers = client._http(
-                "/v1/host/secret/read",
+                "/ipc/host/secret/read",
                 payload=encode_message({"secret_read_token": read_capability["secret_read_token"]}),
                 token=session,
             )
@@ -1694,7 +1699,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             )
             domain.apply()
             status, body, _headers = client._http(
-                "/v1/host/secret/read-capability",
+                "/ipc/host/secret/read-capability",
                 payload=encode_message(
                     {"domain": "relay_accounts", "field": "password", "target": account["id"]}
                 ),
@@ -1740,7 +1745,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
                     self.assertNotIn(secret, json.dumps(client.call("snapshot")))
                     session = client._session_token
                     status, body, _headers = client._http(
-                        "/v1/host/secret/read-capability",
+                        "/ipc/host/secret/read-capability",
                         payload=encode_message(
                             {"domain": domain_name, "field": field, "target": None}
                         ),
@@ -1750,7 +1755,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
                     capability = decode_message(body)
                     self.assertTrue(capability["present"])
                     read_status, read_body, _headers = client._http(
-                        "/v1/host/secret/read",
+                        "/ipc/host/secret/read",
                         payload=encode_message(
                             {"secret_read_token": capability["secret_read_token"]}
                         ),
@@ -1759,7 +1764,7 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
                     self.assertEqual(200, read_status)
                     self.assertEqual(secret, decode_message(read_body)["value"])
                     replay_status, _body, _headers = client._http(
-                        "/v1/host/secret/read",
+                        "/ipc/host/secret/read",
                         payload=encode_message(
                             {"secret_read_token": capability["secret_read_token"]}
                         ),
@@ -1786,7 +1791,7 @@ class CoreIPCKeepAliveTests(unittest.TestCase):
         connection = http.client.HTTPConnection(server.address, server.port, timeout=10)
         connection.request(
             "POST",
-            "/v1/hello",
+            "/ipc/hello",
             body=b"{}",
             headers={"Authorization": f"Bearer {server.bootstrap_token}", "Content-Type": "application/json"},
         )
@@ -1814,7 +1819,7 @@ class CoreIPCKeepAliveTests(unittest.TestCase):
                 ).encode()
                 connection.request(
                     "POST",
-                    "/v1",
+                    "/ipc",
                     body=body,
                     headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
                 )
@@ -1827,7 +1832,7 @@ class CoreIPCKeepAliveTests(unittest.TestCase):
             server.stop()
 
     def test_a_route_that_never_reads_its_body_still_leaves_a_reusable_socket(self) -> None:
-        # ``/v1/hello`` answers without parsing anything: it is the route whose
+        # ``/ipc/hello`` answers without parsing anything: it is the route whose
         # unread body corrupted the next request line.
         core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
         server = CoreIPCServer(core)
@@ -1839,7 +1844,7 @@ class CoreIPCKeepAliveTests(unittest.TestCase):
             ).encode()
             connection.request(
                 "POST",
-                "/v1",
+                "/ipc",
                 body=body,
                 headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             )
@@ -2078,7 +2083,7 @@ class CoreIPCTests(unittest.TestCase):
         request = RequestEnvelope(request_id="invalid-result", method="snapshot", params={})
 
         status, body, _headers = client._http(
-            "/v1", payload=encode_message(request), token=client._session_token
+            "/ipc", payload=encode_message(request), token=client._session_token
         )
         response = ResponseEnvelope.from_mapping(decode_message(body))
 
@@ -2094,6 +2099,75 @@ class CoreIPCTests(unittest.TestCase):
             response.error,
         )
         self.assertNotIn(secret, body.decode("utf-8"))
+
+    def test_a_safe_error_message_fits_the_field_it_crosses(self) -> None:
+        """One bound is in characters and the field's is in bytes.
+
+        A sentence of CJK characters passes the redactor's 512-character limit
+        and is still wider than the 512 bytes the error field allows, so the
+        envelope would refuse the very message meant to make it acceptable.
+        """
+
+        message = safe_error_message("远端 " * 400)
+        self.assertLessEqual(len(message.encode("utf-8")), 512)
+        self.assertNotIn("\n", message)
+        self.assertEqual("Core operation failed", safe_error_message("  \n  "))
+
+    def test_a_failure_the_wire_cannot_carry_is_still_answered(self) -> None:
+        """A refused reply is not a Core that went away.
+
+        The envelope validates its own code and message; a failure raised with
+        an HTTP status as its ``code`` (an int) or with a multi-line sentence
+        made that validation raise *inside* the handler's ``except`` block, so
+        ``do_POST`` wrote no reply at all and the socket closed.  The native
+        bridge can only read that as 本地 Core 不可用, which is how a WebDAV 404
+        was reported to a reader while this Core was answering every other
+        request.  Whatever a domain reports, the handler owes the peer an
+        answer it can carry.
+        """
+
+        core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
+        server = CoreIPCServer(core)
+        endpoint = server.start()
+        self.addCleanup(server.stop)
+        client = CoreIPCClient(endpoint, server.bootstrap_token)
+        self.addCleanup(client.close)
+        client._ensure_session()
+
+        def ask(request_id: str) -> tuple[int, ResponseEnvelope]:
+            request = RequestEnvelope(
+                request_id=request_id,
+                method="dispatch",
+                params={"action": {"domain": "webdav", "type": "sync"}},
+            )
+            status, body, _headers = client._http(
+                "/ipc", payload=encode_message(request), token=client._session_token
+            )
+            return status, ResponseEnvelope.from_mapping(decode_message(body))
+
+        with mock.patch.object(
+            core,
+            "dispatch",
+            side_effect=CoreError(404, "GET https://webdav.example.test/menu-config.json failed: HTTP 404 Not Found"),
+        ):
+            status, response = ask("status-code-as-code")
+        self.assertEqual(400, status)
+        self.assertFalse(response.ok)
+        self.assertEqual("core_error", (response.error or {})["code"])
+        self.assertIn("HTTP 404", str((response.error or {})["message"]))
+
+        with mock.patch.object(
+            core,
+            "dispatch",
+            side_effect=CoreError("webdav_sync_failed", "PROPFIND failed: HTTP 403 Forbidden\nVercel protection rejected the request"),
+        ):
+            status, response = ask("multiline-message")
+        self.assertEqual(400, status)
+        self.assertFalse(response.ok)
+        self.assertEqual("webdav_sync_failed", (response.error or {})["code"])
+        message = str((response.error or {})["message"])
+        self.assertNotIn("\n", message)
+        self.assertIn("Vercel protection rejected the request", message)
 
     def test_apply_response_keeps_the_complete_result_contract(self) -> None:
         core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
@@ -2250,7 +2324,7 @@ class CoreIPCTests(unittest.TestCase):
         client.call("snapshot")
 
         status, body, _headers = client._http(
-            "/v1/host/shutdown",
+            "/ipc/host/shutdown",
             payload=b"{}",
             token=client._session_token,
         )
@@ -2265,7 +2339,7 @@ class CoreIPCTests(unittest.TestCase):
         endpoint = server.start()
         self.addCleanup(server.stop)
         request = urllib.request.Request(
-            f"http://{endpoint.address}:{endpoint.port}/v1/host/shutdown",
+            f"http://{endpoint.address}:{endpoint.port}/ipc/host/shutdown",
             data=b"{}",
             method="POST",
         )
@@ -2310,7 +2384,7 @@ class CoreIPCTests(unittest.TestCase):
         # must keep its Core session alive instead of later forcing a Core
         # replacement while the LiteLLM proxy is serving remote streams.
         status, _body, _headers = client._http(
-            "/v1/events?subscription_id=missing&timeout=0",
+            "/ipc/events?subscription_id=missing&timeout=0",
             token=session,
         )
         self.assertEqual(200, status)
@@ -2326,7 +2400,7 @@ class CoreIPCTests(unittest.TestCase):
             server._sessions[session].expires_at = time.monotonic() - 1
 
         request = {"protocol_version": 1, "request_id": "expired-session", "method": "snapshot", "params": {}}
-        status, _body, _headers = client._http("/v1", payload=encode_message(request), token=session)
+        status, _body, _headers = client._http("/ipc", payload=encode_message(request), token=session)
         self.assertEqual(401, status)
 
     def test_subscribe_receives_versioned_snapshot_event(self) -> None:

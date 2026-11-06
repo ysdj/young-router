@@ -93,7 +93,8 @@ Editable config: `~/.young-router/config.yaml` (sanitized example: [`config.exam
 
 - The project and its distribution are named **young-router**; the Python import package is **young_router** (hyphens are not valid Python identifiers). `pyproject.toml` states that mapping, the package discovery, and the console entry points (`young-router-core`, `young-router-config`, `young-router-webdav`, …).
 - `young_router/` is the one Python package: `core/` (Core IPC, domains, and the Core-owned document modules such as `codex_config.py` and `runtime_settings_io.py`), `proxy/` (LiteLLM data plane: hook, patches, routing, streaming, responses surfaces, state, trace), `adapters/` (bundled third-party worker adapters and their scripts), `config/` (configuration schema/editor), `webdav/` (sync client), and the shared modules at its root (`callbacks.py`, `browser_identity.py`, `api_base.py`, atomic/JSON helpers). `sitecustomize.py` is the one startup shim the build copies to the Core root.
-- `rn/` is the React Native workspace (`apps/macos`, `apps/windows`, `packages/shared`), `scripts/` the build/release/update tooling, and `tests/` the Python suites. `./scripts/test.sh` runs the full suite; `pnpm run check:macos` inside `rn/` runs the UI contract and type checks.
+- `rn/` is the React Native workspace (`apps/macos`, `apps/windows`, `apps/web`, `packages/shared`), `scripts/` the build/release/update tooling, and `tests/` the Python suites. `./scripts/test.sh` runs the full suite; `pnpm run check:macos` inside `rn/` runs the UI contract and type checks.
+- `rn/apps/web` is the browser host: `pnpm run build:web` in `rn/` writes `apps/web/dist`, which the build places at `Core/web` and Core serves at `/ui` on the local port. That port is the proxy's own, so a person and a client share one address: the proxy forwards `/ui` and `/ipc` back to Core (everything else stays LiteLLM's `/v1`). The sign-in key is `YOUNG_ROUTER_WEB_PASSWORD`, generated on first use and editable only in **General**; `young-router-core --web-host <dir>` states a bundle explicitly for development. It is the third host for the same Core, for platforms neither native app builds for; it contains no component of its own.
 
 ## License
 
@@ -185,7 +186,8 @@ Windows（Developer PowerShell，需要 Windows App SDK 与 VS C++ 桌面工作�
 
 - 项目（及发行名）为 **young-router**，Python 导入包为 **young_router**（连字符不是合法的 Python 标识符）；`pyproject.toml` 声明了这一对应关系、包发现与命令行入口（`young-router-core`、`young-router-config`、`young-router-webdav` 等）。
 - `young_router/` 是唯一的 Python 包：`core/`（Core IPC、各领域模块与 Core 自有的文档模块，如 `codex_config.py`、`runtime_settings_io.py`）、`proxy/`（LiteLLM 数据面：hook、patches、routing、streaming、responses 各层、状态与 trace）、`adapters/`（内置第三方 worker 适配器与脚本）、`config/`（配置 schema 与读写）、`webdav/`（同步客户端），以及包根部的共享模块（`callbacks.py`、`browser_identity.py`、`api_base.py`、原子写/JSON 工具）。`sitecustomize.py` 是唯一在包外的启动垫片，构建时按同名复制到 Core 根目录。
-- `rn/` 是 React Native 工作区（`apps/macos`、`apps/windows`、`packages/shared`），`scripts/` 是构建/发布/更新脚本，`tests/` 是 Python 测试。`./scripts/test.sh` 运行完整测试；`rn/` 下 `pnpm run check:macos` 运行 UI 契约与类型检查。
+- `rn/` 是 React Native 工作区（`apps/macos`、`apps/windows`、`apps/web`、`packages/shared`），`scripts/` 是构建/发布/更新脚本，`tests/` 是 Python 测试。`./scripts/test.sh` 运行完整测试；`rn/` 下 `pnpm run check:macos` 运行 UI 契约与类型检查。
+- `rn/apps/web` 是浏览器宿主：`rn/` 下 `pnpm run build:web` 产出 `apps/web/dist`，构建把它放到 `Core/web`，由 Core 在本地端口的 `/ui` 提供。那个端口就是代理自己的端口，所以人和客户端只记一个地址：代理把 `/ui` 与 `/ipc` 转回 Core，其余仍是 LiteLLM 的 `/v1`。登录密钥是 `YOUNG_ROUTER_WEB_PASSWORD`，首次使用时生成，并且只在**常规**中可改；开发时用 `young-router-core --web-host <dir>` 显式指定一份 bundle。
 
 ## 许可证
 

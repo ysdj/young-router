@@ -25,10 +25,14 @@ export function AccountsTable({
   onSelectionChange,
   alertRowKeys,
   emptyText,
-  // Three rows plus the header.  A Windows row is 30 pt tall (macOS draws
-  // 22 pt ones), so a fixed 84 showed a single account there and made a list of
-  // several look like a list of one.
-  tableHeight = Platform.OS === "windows" ? 116 : 84,
+  // Three rows plus the header, in each host's own metrics: the compact
+  // AppKit table draws a 24 pt header over 22 pt rows, the Windows and browser
+  // tables a 30 pt one over 30 pt rows, and both carry the table's own 1 pt
+  // border on each side.  So 24 + 3 * 22 + 2 = 92 and 30 + 3 * 30 + 2 = 122.
+  // The old 84 was one account's height on macOS — 58 pt of body, two rows and
+  // a clipped third — and 116 was 6 pt short on the 30 pt hosts, which is the
+  // same symptom the comment used to name while still producing it.
+  tableHeight = Platform.OS === "macos" ? 92 : 122,
 }: {
   title: string;
   /** The list's own buttons, drawn to the right of the title. */
@@ -42,7 +46,6 @@ export function AccountsTable({
   emptyText: string;
   /** Room for the rows; a longer list keeps its own height and scrolls. */
   tableHeight?: number;
-  alertRowKeysHint?: string;
 }): React.JSX.Element {
   return <View style={styles.panel}>
     <View style={styles.header}>
@@ -63,11 +66,20 @@ export function AccountsTable({
   </View>;
 }
 
+// The browser host has no AppKit semantic colors, and React Native for Web
+// answers `PlatformColor` with the literal name it was given -- which CSS then
+// ignores, so a pane would paint in the browser's default ink. The third
+// argument is the same sRGB literal the shared `semanticColor` already keeps
+// for exactly this host.
+function color(name: string, fallback: string): ReturnType<typeof PlatformColor> | string {
+  return Platform.OS === "web" ? fallback : PlatformColor(name);
+}
+
 const colors = {
-  text: PlatformColor("labelColor"),
-  secondary: PlatformColor("secondaryLabelColor"),
-  separator: PlatformColor("separatorColor"),
-  panel: PlatformColor("controlBackgroundColor"),
+  text: color("labelColor", "#1d1d1f"),
+  secondary: color("secondaryLabelColor", "#6e6e73"),
+  separator: color("separatorColor", "#d4d4d8"),
+  panel: color("controlBackgroundColor", "#ffffff"),
 };
 
 const styles = StyleSheet.create({

@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Platform, PlatformColor, Pressable, StyleSheet, Text, View } from "react-native";
 import type { CoreSnapshot, NativeLeafAdapter, RelayGroupManagerResult } from "../types";
 import { AccountsTable } from "./AccountsTable";
-import { NativeButton, NativeCheckbox, NativePicker, NativeTable, NativeTextField } from "./NativeControls";
+import { NativeButton, NativeCheckbox, NativePicker, NativeTable, NativeTextField, nativeControlTextWidth } from "./NativeControls";
 import { usePendingAction } from "./pendingAction";
 import { setGroupManagerOpen } from "./providerWizardGate";
 import { useRelayDialogSurface } from "./relayDialogSurface";
@@ -327,6 +327,27 @@ function usernameShortName(account: RelayAccount): string {
   return account.username.trim();
 }
 
+/** The widest the 账号 column grows before the address wraps to the editor below. */
+const RELAY_ACCOUNT_COLUMN_MAX_WIDTH = 208;
+// What the inspector offers the account table: the pane's 320 pt less the
+// editor's own 16 pt of right padding.  Named here because the three columns
+// are budgeted against it together — see `accountBudget` where they are built.
+const RELAY_ACCOUNT_COLUMNS_WIDTH_BUDGET = 304;
+// A balance is `$` plus two decimals, so 84 pt holds a four-digit total; the
+// floor keeps the header legible when every row reads 无.
+const RELAY_BALANCE_COLUMN_MIN_WIDTH = 56;
+const RELAY_BALANCE_COLUMN_MAX_WIDTH = 84;
+// The status column is measured like the other two.  A literal 74 pt was
+// inherited from a session list that only ever said 已登录 / 未登录, which are
+// 39 pt in Chinese; the English states are not that short — `Signed out`
+// measures 66 pt and `Signing in` 60 pt, and 74 minus the cell's 16 pt of
+// padding left 58, so both English states elided to the same `Signed…` and a
+// signed-out account was indistinguishable from one mid-sign-in.  The floor
+// keeps the header legible; the cap stops one long status from eating the
+// balance column beside it.
+const RELAY_STATUS_COLUMN_MIN_WIDTH = 56;
+const RELAY_STATUS_COLUMN_MAX_WIDTH = 92;
+
 export function accountDisplayName(account: RelayAccount, translate: Translate): string {
   const username = usernameShortName(account);
   if (username) return username;
@@ -486,7 +507,7 @@ export function ApiKeyCreateDialog({ visible, groups, disabled, onClose, onCreat
               </View>
               <View style={styles.apiKeyPanelField}>
                 <Text style={styles.decisionLabel}>{translate("relay.apiKeyGroup")}</Text>
-                <NativePicker labels={groupOptions.map((group) => groupLabel(group, translate))} selectedValue={groupLabel(selectedGroup, translate)} disabled={disabled} onChange={({ nativeEvent }) => setGroupID(groupOptions[nativeEvent.index]?.id ?? "")} style={styles.decisionControl} />
+                <NativePicker labels={groupOptions.map((group) => groupLabel(group, translate))} selectedValue={groupLabel(selectedGroup, translate)} disabled={disabled} accessibilityLabel={translate("relay.apiKeyGroup")} onChange={({ nativeEvent }) => setGroupID(groupOptions[nativeEvent.index]?.id ?? "")} style={styles.decisionControl} />
               </View>
               <View style={styles.apiKeyCheckboxRow}>
                 <NativeCheckbox label={translate("relay.apiKeyEnabledField")} value={enabled} disabled={disabled} onValueChange={setEnabled} />
@@ -544,7 +565,7 @@ export function DependencyPolicyDialog<T extends string>({ visible, title, messa
         <View style={styles.dialogHeader}><Text style={styles.dialogTitle}>{title}</Text><NativeButton title={translate("status.close")} symbol="close" compact disabled={disabled} onPress={onClose} style={styles.dialogClose} /></View>
         <View style={styles.decisionContent}>
           <Text style={styles.decisionMessage}>{message}</Text>
-          <View style={styles.decisionField}><Text style={styles.decisionLabel}>{translate("relay.dependencyPolicy")}</Text><NativePicker labels={options.map((option) => option.label)} selectedValue={selectedOption.label} disabled={disabled} onChange={({ nativeEvent }) => { const option = options[nativeEvent.index]; if (option) onValueChange(option.value); }} style={styles.decisionControl} /></View>
+          <View style={styles.decisionField}><Text style={styles.decisionLabel}>{translate("relay.dependencyPolicy")}</Text><NativePicker labels={options.map((option) => option.label)} selectedValue={selectedOption.label} disabled={disabled} accessibilityLabel={translate("relay.dependencyPolicy")} onChange={({ nativeEvent }) => { const option = options[nativeEvent.index]; if (option) onValueChange(option.value); }} style={styles.decisionControl} /></View>
           <Text style={styles.decisionHint}>{selectedOption.hint}</Text>
         </View>
         <View style={styles.dialogFooter}><View style={styles.decisionSpacer} /><View style={styles.dialogActions}><NativeButton title={translate("status.cancel")} compact disabled={disabled} onPress={onClose} /><NativeButton title={confirmLabel} primary destructive={destructive} busy={busy} disabled={disabled && !busy} onPress={onConfirm} /></View></View>
@@ -1442,6 +1463,35 @@ export function StationAccountsPanel({
       account.balance === null ? translate("common.none") : balanceLabel(account, translate),
     ],
   }));
+  // The balance is measured the same way the account name is.  A fixed 58 pt
+  // cell clipped a real balance to `$670....`, which is worse than not showing
+  // the column at all: the digits the user came to read are what got dropped.
+  const balanceColumnWidth = Math.min(
+    RELAY_BALANCE_COLUMN_MAX_WIDTH,
+    Math.max(RELAY_BALANCE_COLUMN_MIN_WIDTH, ...accountRows.map((row) => Math.ceil(nativeControlTextWidth(row.cells[2] ?? "")) + 16)),
+  );
+  // The status column is measured like the balance, for the same reason: its
+  // cell is padded 8 pt on each side, so the 74 pt literal left 58 pt of text
+  // and `Signed out` (66) and `Signing in` (60) both became `Signed…` in
+  // English.  Measured, the column is only as wide as the longest state this
+  // locale actually shows.
+  const statusColumnWidth = Math.min(
+    RELAY_STATUS_COLUMN_MAX_WIDTH,
+    Math.max(RELAY_STATUS_COLUMN_MIN_WIDTH, ...accountRows.map((row) => Math.ceil(nativeControlTextWidth(row.cells[1] ?? "")) + 16)),
+  );
+  // The account column is as wide as the longest name it holds, but only with
+  // what the status and balance leave.  Measured independently the three can
+  // pass the pane — a 208 pt address beside an 81 pt `Signed out` and an 84 pt
+  // balance is 373 pt of cells in about 304 — and the table then takes the
+  // deficit from all three in proportion, which is how `$1234.56` came out as
+  // `$1234.…` and `Signed out` as `Signed…`.  The address is the one column
+  // whose full value is repeated below the list, in the selected account's
+  // editor, so it is the one that gives way.
+  const accountBudget = Math.max(96, RELAY_ACCOUNT_COLUMNS_WIDTH_BUDGET - statusColumnWidth - balanceColumnWidth);
+  const accountColumnWidth = Math.min(
+    Math.min(RELAY_ACCOUNT_COLUMN_MAX_WIDTH, accountBudget),
+    Math.max(96, ...accountRows.map((row) => Math.ceil(nativeControlTextWidth(row.cells[0] ?? "")) + 16)),
+  );
   // A stale login turns the whole row brown until the next successful probe.
   const alertAccountRows = stationAccounts
     .filter((account) => effectiveLoginStatus(account) === "expired")
@@ -1497,7 +1547,7 @@ export function StationAccountsPanel({
         {stationAccounts.length < 8 ? <NativeButton title="" symbol="plus" compact toolTip={translate("relay.addAccount")} accessibilityLabel={translate("relay.addAccount")} busy={pendingAction === "add"} disabled={controlsBusy && pendingAction !== "add"} style={styles.panelActionButton} onPress={() => { void beginAddLogin(); }} /> : null}
         {selected ? <NativeButton title="" symbol="minus" compact destructive toolTip={translate("relay.removeLocal")} accessibilityLabel={translate("relay.removeLocal")} disabled={controlsBusy} style={styles.panelActionButton} onPress={() => { setRemovalPolicy("detach"); setRemoval({ account: selected }); }} /> : null}
       </>}
-      columns={[{ label: translate("relay.accounts"), width: 96 }, { label: translate("providers.authStatus"), width: 74 }, { label: translate("relay.balance"), width: 58 }]}
+      columns={[{ label: translate("relay.accounts"), width: accountColumnWidth }, { label: translate("providers.authStatus"), width: statusColumnWidth }, { label: translate("relay.balance"), width: balanceColumnWidth }]}
       rows={accountRows}
       selectedKey={selected?.id ?? ""}
       onSelectionChange={setSelectedID}
@@ -1618,17 +1668,26 @@ export type RelayWorkspaceBridge = {
   apiKeyActions: RelayApiKeyActions;
 };
 
+// A page has neither AppKit nor WinUI semantic colors, and React Native for Web
+// answers `PlatformColor` with the literal name it was handed -- which CSS then
+// drops. The last argument is the same literal the shared palette keeps for the
+// browser host.
+function color(macos: string, windows: string, web: string): ReturnType<typeof PlatformColor> | string {
+  if (Platform.OS === "web") return web;
+  return Platform.OS === "macos" ? PlatformColor(macos) : PlatformColor(windows);
+}
+
 const colors = {
-  window: Platform.OS === "macos" ? PlatformColor("windowBackgroundColor") : PlatformColor("Window"),
-  text: Platform.OS === "macos" ? PlatformColor("labelColor") : PlatformColor("WindowText"),
-  secondary: Platform.OS === "macos" ? PlatformColor("secondaryLabelColor") : PlatformColor("GrayText"),
-  separator: Platform.OS === "macos" ? PlatformColor("separatorColor") : PlatformColor("ControlStrokeColorDefault"),
-  panel: Platform.OS === "macos" ? PlatformColor("controlBackgroundColor") : PlatformColor("ControlFillColorDefault"),
-  accent: Platform.OS === "macos" ? PlatformColor("systemBlueColor") : PlatformColor("AccentFillColorDefault"),
-  accentText: Platform.OS === "macos" ? PlatformColor("alternateSelectedControlTextColor") : PlatformColor("TextOnAccentFillColorPrimary"),
+  window: color("windowBackgroundColor", "Window", "#f7f7f7"),
+  text: color("labelColor", "WindowText", "#1d1d1f"),
+  secondary: color("secondaryLabelColor", "GrayText", "#6e6e73"),
+  separator: color("separatorColor", "ControlStrokeColorDefault", "#d4d4d8"),
+  panel: color("controlBackgroundColor", "ControlFillColorDefault", "#ffffff"),
+  accent: color("systemBlueColor", "AccentFillColorDefault", "#005fb8"),
+  accentText: color("alternateSelectedControlTextColor", "TextOnAccentFillColorPrimary", "#ffffff"),
   success: "#2A9D68",
   /** The required marker beside a form label. */
-  required: Platform.OS === "macos" ? PlatformColor("systemRedColor") : PlatformColor("SystemFillColorCriticalBrush"),
+  required: color("systemRedColor", "SystemFillColorCriticalBrush", "#b00020"),
 };
 
 const compactStyles = StyleSheet.create({

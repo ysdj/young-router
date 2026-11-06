@@ -48,6 +48,10 @@ export interface NativeTableProps extends ViewProps {
   // dates them underneath asks for a two-line row, and an empty entry keeps the
   // single-line rhythm for the rows that have nothing to add.
   rowDetails?: ReadonlyArray<string>;
+  // One optional tooltip per cell, parallel to `cells`.  Empty keeps the
+  // default: a cell's tooltip is its own text.
+  // @macos-only
+  cellTooltips?: ReadonlyArray<string>;
   secondaryCellKeys?: ReadonlyArray<string>;
   alertRowKeys?: ReadonlyArray<string>;
   spanningRowKeys?: ReadonlyArray<string>;

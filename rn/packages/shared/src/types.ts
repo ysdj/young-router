@@ -14,7 +14,8 @@ export type IpcMethod =
   | "probe"
   | "export"
   | "import_preview"
-  | "import";
+  | "import"
+  | "web_launch_url";
 
 export type AppRoute =
   | "home"
@@ -360,6 +361,12 @@ export interface ProviderModelSummary {
    * pane states that protocol instead of offering a choice the route cannot
    * honour.  Absent on a projection that predates the field.
    */
+  /**
+   * Whether this route only generates images.  A generator holds no
+   * conversation, so the pane draws no 公开上下文 row for one: there is no
+   * window to state.
+   */
+  serves_images?: boolean;
   probe_surfaces?: string[];
   deep_probe?: ModelDeepProbePlan;
   probe?: {
@@ -487,6 +494,7 @@ export interface IpcParams {
   export: { sections: ConfigDomain[]; destination_token: string };
   import_preview: { source_token: string; revision: number };
   import: { import_plan_token: string; sections: ConfigDomain[]; revision: number };
+  web_launch_url: Record<string, never>;
 }
 
 export interface IpcResults {
@@ -547,6 +555,8 @@ export interface IpcResults {
   };
   export: { revision: number; section_count: number; sections?: ConfigDomain[] };
   import_preview: { revision: number; import_plan_token: string; detected_sections: ConfigDomain[]; preview: Partial<Record<ConfigDomain, { available: boolean; will_replace_draft: boolean }>> };
+  /** The page's own address with this host's launch credential in the fragment. */
+  web_launch_url: { url: string };
   import: {
     revision: number;
     draft_domains: ConfigDomain[];
@@ -593,6 +603,8 @@ export interface IpcEvent {
 export interface IpcTransport {
   send<M extends IpcMethod>(request: IpcRequest<M>): Promise<IpcResponse<M>>;
   subscribe(listener: (event: IpcEvent) => void): () => void;
+  /** A host-only route, when this transport offers one beside the protocol. */
+  hostRoute?(path: string, body: Record<string, unknown>): Promise<Record<string, unknown>>;
   close?(): void;
 }
 
@@ -615,7 +627,25 @@ export interface IpcClient {
   probe(providerId?: string, modelId?: string, domain?: "providers_models" | "webdav", values?: Record<string, unknown>): Promise<IpcResults["probe"]>;
   export(sections: ConfigDomain[], destinationToken: string): Promise<IpcResults["export"]>;
   previewImport(sourceToken: string, revision: number): Promise<IpcResults["import_preview"]>;
+  /**
+   * The address this host opens to land already signed in.
+   *
+   * A native window has proved itself to Core already, so asking for this is
+   * that proof spent: the answer carries a credential only this process minted,
+   * in a fragment no request path or log sees.
+   */
+  webLaunchUrl(): Promise<string>;
   importPlan(importPlanToken: string, revision: number, sections: ConfigDomain[]): Promise<IpcResults["import"]>;
+  /**
+   * A host-only route, when this host has one.
+   *
+   * The browser host owns two values that belong to no configuration domain —
+   * the port it listens on and the password that opens it — so they travel on
+   * their own route instead of being forced into the snapshot's shape.  The
+   * native hosts have no such route, which is why this is optional: the pane
+   * that draws those fields asks whether the host offers it.
+   */
+  hostRoute?(path: string, body: Record<string, unknown>): Promise<Record<string, unknown>>;
 }
 
 export interface NativeWindow {

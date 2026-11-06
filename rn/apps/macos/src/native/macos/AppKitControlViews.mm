@@ -396,14 +396,99 @@ static BOOL LiteLLMTabStopIsEligible(NSView *view)
   return YES;
 }
 
+// A React view that answers a click but must not count as covering the pane
+// for the keyboard.  The shared UI's help tip draws a window-sized dismiss
+// layer behind its note; a tip is transient, never modal, so Tab has to keep
+// walking the controls behind it instead of being trapped on the mark.
+static NSString *const LiteLLMTabTransparentHitId = @"young-router-tab-transparent";
+
+// What the user can actually see of a control, in its own coordinates.  The
+// middle of `bounds` is the wrong point for a view that grows inside a clip: a
+// multiline editor is the document view of its scroll view, so a 2,100 pt
+// document has its centre far below a 120 pt viewport, the hit test there
+// answers nil, and the editor — visible, editable, and the only way into that
+// field — drops out of the tab chain.  The intersection with the nearest clip
+// view is the slice a click can reach.
+static NSRect LiteLLMTabStopProbeRect(NSView *view)
+{
+  NSView *clip = view.superview;
+  while (clip != nil && ![clip isKindOfClass:NSClipView.class]) {
+    clip = clip.superview;
+  }
+  if (clip == nil) {
+    return view.bounds;
+  }
+  return NSIntersectionRect(view.bounds, [clip convertRect:clip.bounds toView:view]);
+}
+
+// A stop the window would not hand a click to is not reachable: a relay dialog
+// draws as an absolute overlay inside the route, and every control under its
+// scrim is still mounted with the tab identifier attached.  The chain used to
+// walk those too, so Tab inside 新建密钥 moved focus onto the dimmed table and
+// buttons behind the question.  Asking the window's own hit test is what makes
+// the overlay a real modal surface: a covered control is skipped, and the loop
+// below already tries every offset before giving up, so a dialog whose content
+// is itself the topmost view still cycles normally.
+//
+// Only the control itself, one of its subviews (the field editor is one), or
+// a hit that stops on the transparent dismiss layer counts.  An ancestor is
+// not a hit on the control: accepting one made a control scrolled out of its
+// clip view pass, because the hit test landed on the scroll view that clips it.
+static BOOL LiteLLMTabStopIsReachable(NSView *view)
+{
+  NSWindow *window = view.window;
+  NSView *content = window.contentView;
+  if (content == nil || !view.acceptsFirstResponder) {
+    return NO;
+  }
+  const NSRect probe = LiteLLMTabStopProbeRect(view);
+  if (NSIsEmptyRect(probe)) {
+    return NO;
+  }
+  const NSPoint center = NSMakePoint(NSMidX(probe), NSMidY(probe));
+  NSView *hit = [content hitTest:[view convertPoint:center toView:content]];
+  if (hit == nil) {
+    return NO;
+  }
+  if (hit == view || [hit isDescendantOf:view]) {
+    return YES;
+  }
+  for (NSView *candidate = hit; candidate != nil && candidate != content; candidate = candidate.superview) {
+    if ([candidate isKindOfClass:RCTViewComponentView.class] &&
+        [((RCTViewComponentView *)candidate).nativeId isEqualToString:LiteLLMTabTransparentHitId]) {
+      return YES;
+    }
+  }
+  return NO;
+}
+
 static void CollectLiteLLMTabStops(NSView *view, NSMutableArray<NSView *> *result)
 {
-  if ([view.identifier isEqualToString:LiteLLMTabStopIdentifier] && LiteLLMTabStopIsEligible(view)) {
+  if ([view.identifier isEqualToString:LiteLLMTabStopIdentifier] &&
+      LiteLLMTabStopIsEligible(view) &&
+      LiteLLMTabStopIsReachable(view)) {
     [result addObject:view];
   }
   for (NSView *subview in view.subviews) {
     CollectLiteLLMTabStops(subview, result);
   }
+}
+
+// Whether the window has any stop a user could reach at all, covered or not.
+// Asked only when the reachable list came back empty: it separates a window
+// with nothing to focus (where Tab is not ours to swallow) from a modal whose
+// own controls are momentarily all disabled (where it is).
+static BOOL WindowHasAnyEligibleTabStop(NSView *view)
+{
+  if ([view.identifier isEqualToString:LiteLLMTabStopIdentifier] && LiteLLMTabStopIsEligible(view)) {
+    return YES;
+  }
+  for (NSView *subview in view.subviews) {
+    if (WindowHasAnyEligibleTabStop(subview)) {
+      return YES;
+    }
+  }
+  return NO;
 }
 
 static BOOL FocusAdjacentLiteLLMTabStop(NSView *source, BOOL backwards)
@@ -428,7 +513,15 @@ static BOOL FocusAdjacentLiteLLMTabStop(NSView *source, BOOL backwards)
     return NSOrderedSame;
   }];
   if (stops.count == 0) {
-    return NO;
+    // A dialog whose every control is disabled for the moment it is committing
+    // has no reachable stop, and the controls behind its scrim are filtered out
+    // as covered.  Answering NO here would hand Tab to AppKit's own key-view
+    // loop, which knows nothing about the scrim and would walk focus into the
+    // pane the dialog is covering.  There is nowhere for the key to go, so it
+    // is consumed and focus stays where it is.  A window with no eligible stop
+    // at all is a different case: nothing is being covered, and the key is not
+    // ours to swallow.
+    return WindowHasAnyEligibleTabStop(window.contentView);
   }
   NSInteger current = [stops indexOfObjectIdenticalTo:source];
   if (current == NSNotFound) {
@@ -819,6 +912,7 @@ void FloatPersistentScrollerOverContent(NSScrollView *scrollView);
 void DiscardStaleScrollerSubviews(NSScrollView *scrollView);
 void ReassertPersistentScrollerPlacement(NSScrollView *scrollView);
 void WidenTableHeaderOverVisibleWidth(NSScrollView *scrollView);
+void SyncTableHeaderScrollOffset(NSScrollView *scrollView);
 
 
 @interface LiteLLMTableScrollView : NSScrollView
@@ -857,6 +951,17 @@ void WidenTableHeaderOverVisibleWidth(NSScrollView *scrollView);
   // measures the pre-float width: re-assert the header's width here, the one
   // place every tiling pass reaches, not only from the React layout path.
   WidenTableHeaderOverVisibleWidth(self);
+  SyncTableHeaderScrollOffset(self);
+}
+
+// Every horizontal scroll of the body ends here, and only a scroll reaches it:
+// the header keeps the columns it labels by moving with them, without waiting
+// for the next tiling pass (this table's width does not always change with an
+// offset — a wide window can scroll a table that already fits its frame).
+- (void)reflectScrolledClipView:(NSClipView *)clipView
+{
+  [super reflectScrolledClipView:clipView];
+  if (clipView == self.contentView) SyncTableHeaderScrollOffset(self);
 }
 
 - (void)scrollWheel:(NSEvent *)event
@@ -1415,29 +1520,64 @@ void ReassertPersistentScrollerPlacement(NSScrollView *scrollView)
 // beside the header's trailing edge and, because the header's own chrome ends
 // there, a notch in the first row's top under the knob.  AppKit re-tiles on its
 // own (a scroller flag, a focus change, a column resize), so the width belongs
-// to every tiling pass: keep the header — and the clip view AppKit draws it
-// through, which is what actually clipped that strip — as wide as the content
-// it labels.
+// to every tiling pass.
+//
+// Two widths, and they are not the same number: the clip view AppKit draws the
+// header through takes the viewport's width (it is what covers that strip), and
+// the header inside it stays as wide as the columns it labels.  A header no
+// wider than the viewport has nothing left to draw once its clip is scrolled to
+// the right end of a horizontally scrolled table: the bottom tab was the log
+// pane, where the trailing columns' names were cut mid-word (`耗时(`) and the
+// whole rest of the band was bare while the rows under it kept their cells.
+// Sizing the header to the content costs nothing when the table fits, because
+// the clip still stops at the viewport.
 void WidenTableHeaderOverVisibleWidth(NSScrollView *scrollView)
 {
   if (scrollView == nil || ![scrollView.documentView isKindOfClass:NSTableView.class]) return;
-  NSView *header = ((NSTableView *)scrollView.documentView).headerView;
+  NSTableView *tableView = (NSTableView *)scrollView.documentView;
+  NSView *header = tableView.headerView;
   if (header == nil) return;
-  const CGFloat headerWidth = NSWidth(scrollView.bounds);
+  const CGFloat viewportWidth = NSWidth(scrollView.bounds);
   // The header's own clip view is the one that stops the header's drawing at
   // the gutter: widen it with the view it clips, or the widened header is drawn
   // clipped again and the strip stays bare.
   NSView *headerClip = header.superview;
   if (headerClip != nil && ![headerClip isKindOfClass:NSScrollView.class] &&
-      fabs(NSWidth(headerClip.frame) - headerWidth) > 0.5) {
+      fabs(NSWidth(headerClip.frame) - viewportWidth) > 0.5) {
     NSRect clipFrame = headerClip.frame;
-    clipFrame.size.width = headerWidth;
+    clipFrame.size.width = viewportWidth;
     headerClip.frame = clipFrame;
   }
+  const CGFloat headerWidth = MAX(viewportWidth, NSWidth(tableView.frame));
   NSRect headerFrame = header.frame;
   if (fabs(NSWidth(headerFrame) - headerWidth) <= 0.5) return;
   headerFrame.size.width = headerWidth;
   header.frame = headerFrame;
+}
+
+// A header wider than its clip has to travel with the body.  AppKit moves the
+// header's clip on a horizontal scroll of the document view, but it sizes both
+// from a tiling pass, and a scroll does not tile: without this the header of a
+// table scrolled to its right end kept its columns at the left of the band,
+// under cells that had already moved away.
+void SyncTableHeaderScrollOffset(NSScrollView *scrollView)
+{
+  if (scrollView == nil || ![scrollView.documentView isKindOfClass:NSTableView.class]) return;
+  NSView *header = ((NSTableView *)scrollView.documentView).headerView;
+  NSView *headerClip = header.superview;
+  if (headerClip == nil || [headerClip isKindOfClass:NSScrollView.class]) return;
+  NSClipView *bodyClip = scrollView.contentView;
+  if (bodyClip == nil) return;
+  // Only a header with more width than the clip has anywhere to travel: a
+  // header that still fills just the viewport is shifted nowhere, and moving
+  // its clip would only slide the labels off their columns.
+  const CGFloat travel = MAX(0, NSWidth(header.frame) - NSWidth(headerClip.frame));
+  const CGFloat target = MIN(MAX(0, NSMinX(bodyClip.bounds)), travel);
+  const NSRect clipBounds = headerClip.bounds;
+  if (fabs(target - NSMinX(clipBounds)) <= 0.5) return;
+  NSRect moved = clipBounds;
+  moved.origin.x = target;
+  headerClip.bounds = moved;
 }
 
 static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal, BOOL vertical)
@@ -2985,7 +3125,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
       oldViewProps.alertRowKeys != newViewProps.alertRowKeys ||
       oldViewProps.spanningRowKeys != newViewProps.spanningRowKeys ||
       oldViewProps.selectableSpanningRowKeys != newViewProps.selectableSpanningRowKeys ||
-      oldViewProps.rowDetails != newViewProps.rowDetails;
+      oldViewProps.rowDetails != newViewProps.rowDetails ||
+      oldViewProps.cellTooltips != newViewProps.cellTooltips;
   const bool dataChanged = columnsChanged || compactChanged || paddingChanged || firstColumnPaddingChanged ||
       overflowBehaviorChanged || sourceListChanged || rowsChanged;
   const BOOL initialDataLoad = !_hasLoadedData;
@@ -3100,7 +3241,16 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
 
   const NSInteger selectedIndex = SegmentIndex(newViewProps.rowKeys, newViewProps.selectedKey);
   const BOOL selectionChanged = oldViewProps.selectedKey != newViewProps.selectedKey;
-  if (selectedIndex >= 0 && [self isSelectableSpanningRow:selectedIndex]) {
+  // A disabled row is not selectable from the React side either.  AppKit does
+  // not consult shouldSelectRow: for a programmatic selection, so selectedKey
+  // could still land the highlight on a row the pane then acts from -- the
+  // provider list falls back to its first provider, and a config whose first
+  // provider is off opens with it selected.
+  if (selectedIndex >= 0 && [self isDisabledRow:selectedIndex]) {
+    if (_tableView.selectedRow >= 0) {
+      [_tableView deselectAll:nil];
+    }
+  } else if (selectedIndex >= 0 && [self isSelectableSpanningRow:selectedIndex]) {
     // A public-model row is a clickable section header, not a selectable row:
     // the selected route must not keep its highlight while the pane shows the
     // public model, so the table clears the row selection instead and paints
@@ -3851,10 +4001,18 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     label.textColor = textColor;
     label.attributedStringValue = TableCellTitle(value, textColor);
   }
-  label.toolTip = value;
-  label.accessibilityLabel = value;
-  cell.toolTip = value;
-  cell.accessibilityLabel = value;
+  // A cell that abbreviates what it holds (`M→C`) states the long form here:
+  // the tooltip and the VoiceOver label are the only places the shortened
+  // cell can still give the whole answer.  Every other cell keeps the rule that
+  // its tooltip is its own text, so an empty entry costs nothing.
+  NSString *cellTooltip = cellIndex < viewProps.cellTooltips.size()
+      ? StringFromStdString(viewProps.cellTooltips[cellIndex])
+      : @"";
+  NSString *tooltip = cellTooltip.length > 0 ? cellTooltip : value;
+  label.toolTip = tooltip;
+  label.accessibilityLabel = tooltip;
+  cell.toolTip = tooltip;
+  cell.accessibilityLabel = tooltip;
   return cell;
 }
 
@@ -3930,7 +4088,8 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   }
   const auto &viewProps = *std::static_pointer_cast<const LiteLLMAppKitTableProps>(_props);
   const NSInteger row = _tableView.clickedRow;
-  if (row < 0 || static_cast<size_t>(row) >= viewProps.rowKeys.size() || [self isSpanningRow:row]) {
+  if (row < 0 || static_cast<size_t>(row) >= viewProps.rowKeys.size() || [self isSpanningRow:row] ||
+      [self isDisabledRow:row]) {
     return;
   }
   LiteLLMAppKitTableEventEmitter::OnRowDoublePress event{
@@ -4935,7 +5094,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitBusySpinnerCls(void)
        ([target isEqualToString:@"YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"] ||
         // The General pane's proxy key, the one credential a window draws in
         // the clear so it can be copied into a client.
-        [target isEqualToString:@"YOUNG_ROUTER_MASTER_KEY"])));
+        [target isEqualToString:@"YOUNG_ROUTER_MASTER_KEY"] ||
+        // The browser page's key, drawn for the same reason: it is read out
+        // loud or pasted into another browser, and dots cannot be copied.
+        [target isEqualToString:@"YOUNG_ROUTER_WEB_PASSWORD"])));
   if ((identityChanged || activeControlChanged || visibleChanged || resetReadable) && readablePlainText) {
     [self loadPlainTextSecretForGeneration:_generation];
   }

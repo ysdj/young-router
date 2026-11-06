@@ -334,6 +334,15 @@ fi
 if [[ -f "$CORE/sitecustomize.py" ]] && ! cmp -s "$ROOT/sitecustomize.py" "$CORE/sitecustomize.py"; then
   python_changed=1
 fi
+# The browser page is Core's own copy of the shared UI, so a page edit has to
+# reach `Core/web` the same way the rest of the shared tree reaches the bundle.
+web_changed=0
+# A checkout that never built the page has nothing to compare, and an install
+# that never received one has nothing to update: without this guard a missing
+# `dist` reads as "changed" on every run and restarts the app for no edit.
+if [[ -d "$RN_ROOT/apps/web/dist" ]] && ! diff -rq "$RN_ROOT/apps/web/dist" "$CORE/web" >/dev/null 2>&1; then
+  web_changed=1
+fi
 
 if ((${#native_files[@]} > 0)); then
   echo "dev-loop-macos: native sources are newer than the installed host, so only a build carries them:"
@@ -348,6 +357,7 @@ fi
 if [[ "$MODE" == "check" ]]; then
   echo "dev-loop-macos: app         $APP"
   echo "dev-loop-macos: js bundle   $([[ "$js_changed" == 0 ]] && echo current || echo stale)"
+  echo "dev-loop-macos: web page    $([[ "$web_changed" == 0 ]] && echo current || echo stale)"
   echo "dev-loop-macos: python      $([[ "$python_changed" == 0 ]] && echo current || echo stale)"
   exit 0
 fi
@@ -360,6 +370,13 @@ sync_python() {
     "$ROOT/young_router/" "$CORE/young_router/"
   cp "$ROOT/sitecustomize.py" "$CORE/sitecustomize.py"
   echo "dev-loop-macos: python tree synced"
+}
+
+sync_web() {
+  [[ "$web_changed" == 1 ]] || return 0
+  [[ -d "$RN_ROOT/apps/web/dist" ]] || return 0
+  rsync -a --delete "$RN_ROOT/apps/web/dist/" "$CORE/web/"
+  echo "dev-loop-macos: web page synced"
 }
 
 sync_js() {
@@ -398,8 +415,9 @@ case "$MODE" in
     # this mode needs from below is the one restart that makes the app load it.
     ;;
   auto)
-    [[ "$js_changed$python_changed" != "00" ]] || { echo "dev-loop-macos: nothing changed; nothing to do"; exit 0; }
+    [[ "$js_changed$python_changed$web_changed" != "000" ]] || { echo "dev-loop-macos: nothing changed; nothing to do"; exit 0; }
     sync_python
+    sync_web
     sync_js
     ;;
 esac

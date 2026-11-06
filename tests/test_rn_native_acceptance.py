@@ -514,8 +514,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn('TraceCodeEditor("', windows_controls)
         self.assertNotIn("ProbeEditorPage", windows_controls)
         for obsolete in (
-            "/v1/host/editor/read",
-            "/v1/host/editor/stage",
+            "/ipc/host/editor/read",
+            "/ipc/host/editor/stage",
             "ReadEditorDocument",
             "StageEditorDocument",
             "RefreshEditorDocument",
@@ -2130,7 +2130,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('route: "host/relay/login"', mac_core)
         self.assertIn('payload["password"] = password', mac_core)
         self.assertIn('Set(object.keys) == Set(["protocol_version", "revision", "login_status", "username"])', mac_core)
-        self.assertIn('"/v1/host/relay/login"', core_ipc)
+        self.assertIn('"/ipc/host/relay/login"', core_ipc)
 
         self.assertIn('REACT_METHOD(RelayLogin, L"relayLogin")', windows_header)
         self.assertIn("void WinUI3NativeLeafModule::RelayLogin(", windows_module)
@@ -2323,7 +2323,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('*account_id, *account_type, *label, *origin, username, "system", false', windows_module)
         self.assertIn("RestoreWindowsRelaySession(", windows_relay)
         self.assertIn('HostRequest(L"host/relay/restore"', windows_core)
-        self.assertIn('"/v1/host/relay/restore"', core_ipc)
+        self.assertIn('"/ipc/host/relay/restore"', core_ipc)
         # The probe that proves a remembered session already read the account's
         # profile, and Core's balance is that profile divided by the site's own
         # display unit.  Both hosts therefore carry the quota they saw into the
@@ -2589,7 +2589,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         windows_header = (WIN_NATIVE / "CoreIPCBridge.h").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "CoreIPCBridge.cpp").read_text(encoding="utf-8")
 
-        self.assertIn('route in {"/v1/host/secret/read-capability", "/v1/host/secret/read"}', ipc)
+        self.assertIn('route in {"/ipc/host/secret/read-capability", "/ipc/host/secret/read"}', ipc)
         self.assertIn("_PLAINTEXT_SECRET_FIELDS", service)
         self.assertIn('(\"codex\", \"api_key\")', service)
         self.assertIn('(\"claude\", \"deployment_token\")', service)
@@ -2711,6 +2711,36 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("windowsButtonLink: { borderWidth: 0, backgroundColor: \"transparent\", paddingHorizontal: 0 }", adapter)
         self.assertIn("windowsButtonLinkTitle: { textDecorationLine: \"underline\" }", adapter)
         self.assertIn('accessibilityRole={link ? "link" : "button"}', adapter)
+
+    def test_macos_tab_chain_probes_what_is_visible_and_honours_a_transient_layer(self) -> None:
+        """Tab reaches a control the user can see, and skips what covers it.
+
+        The reachability guard asks the window what a click at the control's
+        middle would hit.  Two shapes broke when that middle was taken from
+        `bounds` and any ancestor counted as an arrival: a multiline editor is
+        the document view of its scroll view, so a long document's centre is
+        far below the viewport and the hit test answers nil — the editor, the
+        only way into that field, left the tab chain; and a control scrolled
+        out of its clip view hit-tested to the scroll view that clips it, which
+        is an ancestor, so an invisible control stayed in the chain.
+
+        The help tip's dismiss layer is the opposite case: it is window-sized
+        and would answer for every control behind it, so a transient tip would
+        trap Tab on its mark.  The layer names itself and the guard lets it
+        through; the relay dialog's scrim does not, and still covers.
+        """
+        controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
+        reachable = controls.split("static BOOL LiteLLMTabStopIsReachable", 1)[1].split(
+            "static void CollectLiteLLMTabStops", 1
+        )[0]
+        self.assertIn("LiteLLMTabStopProbeRect", reachable)
+        self.assertNotIn("NSMidX(view.bounds)", reachable)
+        # Only the control itself, its own subviews, or the named transient
+        # layer count as an arrival — never an ancestor.
+        self.assertNotIn("isDescendantOf:view", reachable.replace("[hit isDescendantOf:view]", ""))
+        self.assertIn('LiteLLMTabTransparentHitId = @"young-router-tab-transparent"', controls)
+        self.assertIn("NSIntersectionRect(view.bounds, [clip convertRect:clip.bounds toView:view])", controls)
+        self.assertIn("isKindOfClass:RCTViewComponentView.class", reachable)
 
     def test_macos_controls_use_fabric_component_views_not_legacy_managers(self) -> None:
         controls_path = MAC_NATIVE / "AppKitControlViews.mm"
@@ -2910,18 +2940,31 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("- (void)updateScrollerVisibility", controls)
         # The floating scroller strip must not expose the scroll view's (or the
         # header's own) background beside the header or over the first row's
-        # top, so every tiling pass keeps the header as wide as the content it
-        # labels — AppKit re-tiles the header on its own, at the pre-float width
-        # the legacy gutter implies.
+        # top, so every tiling pass keeps the header clip as wide as the
+        # viewport — AppKit re-tiles the header on its own, at the pre-float
+        # width the legacy gutter implies.
         self.assertIn("void WidenTableHeaderOverVisibleWidth(NSScrollView *scrollView)", controls)
-        self.assertIn("const CGFloat headerWidth = NSWidth(scrollView.bounds);", controls)
+        self.assertIn("const CGFloat viewportWidth = NSWidth(scrollView.bounds);", controls)
         # The clip view AppKit draws the header through stops the header's own
         # chrome at the gutter, so it is widened with the view it clips.
         self.assertIn("NSView *headerClip = header.superview;", controls)
-        self.assertIn("clipFrame.size.width = headerWidth;", controls)
+        self.assertIn("clipFrame.size.width = viewportWidth;", controls)
+        # The header itself stays as wide as the columns it labels.  A header
+        # cut to the viewport has no cells left to draw once its clip reaches
+        # the right end of a horizontally scrolled table: the log pane's
+        # trailing names were cut mid-word and the rest of the band was bare.
+        self.assertIn("const CGFloat headerWidth = MAX(viewportWidth, NSWidth(tableView.frame));", controls)
         self.assertIn("headerFrame.size.width = headerWidth;", controls)
         self.assertIn("WidenTableHeaderOverVisibleWidth(self);", controls)
         self.assertIn("WidenTableHeaderOverVisibleWidth(_scrollView);", controls)
+        # A header wider than its clip travels with the body.  A scroll does not
+        # tile, so the tiling pass is not enough to move it.
+        self.assertIn("void SyncTableHeaderScrollOffset(NSScrollView *scrollView)", controls)
+        self.assertIn("const CGFloat travel = MAX(0, NSWidth(header.frame) - NSWidth(headerClip.frame));", controls)
+        self.assertIn("moved.origin.x = target;", controls)
+        self.assertIn("- (void)reflectScrolledClipView:(NSClipView *)clipView", controls)
+        self.assertIn("if (clipView == self.contentView) SyncTableHeaderScrollOffset(self);", controls)
+        self.assertIn("SyncTableHeaderScrollOffset(self);", controls)
         # The gutter AppKit reserves for the persistent scroller narrows the clip
         # view, and with it the table, its columns, and its header: the fitting
         # pass removes it before it measures the viewport, and measures that
@@ -3050,7 +3093,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # travels by the track's own alignment, so a recycled row cannot leave
         # an absolutely-positioned knob behind in the previous state.
         self.assertIn("function WindowsToggle(", adapter)
-        self.assertIn("return <WindowsToggle value={value} disabled={disabled} onValueChange={onValueChange}", adapter)
+        self.assertIn('if (Platform.OS === "windows" || Platform.OS === "web")', adapter)
         self.assertIn("accessibilityRole=\"switch\"", adapter)
         self.assertIn("windowsToggleTrackOn: { justifyContent: \"flex-end\", borderColor: WINDOWS_CONTROL.accent, backgroundColor: WINDOWS_CONTROL.accent }", adapter)
         self.assertNotIn("  Switch,", adapter)
@@ -3639,6 +3682,29 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("stageSecret: leaf.stageSecret", entry)
         self.assertIn("void WinUI3NativeLeafModule::ReadSecret(", module)
         self.assertIn("void WinUI3NativeLeafModule::StageSecret(", module)
+
+    def test_the_pages_key_is_read_in_the_clear_on_both_leaves(self) -> None:
+        """The page's key behaves like the proxy key, on each host's own field.
+
+        macOS draws it with the inline secure control, which only fills itself
+        for a target its view lists; Windows has no composite secure island in
+        the General pane and reads it through the host capability.  A target
+        missing from either list renders an empty field over a key Core would
+        happily answer for, which is what shipped once.
+        """
+
+        mac_views = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
+        readable = mac_views.split("readablePlainText", 1)[1].split("if ((identityChanged", 1)[0]
+        windows_controls = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
+        windows_plain = windows_controls.split("IsPlainTextAutoCommitField", 1)[1].split("bool IsPlainTextAutoCommitField() const", 1)[0]
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
+        general = ui.split("function GeneralWorkspace", 1)[1].split("function RuntimeWorkspace", 1)[0]
+
+        for source, label in ((readable, "macOS"), (windows_plain, "Windows")):
+            self.assertIn("YOUNG_ROUTER_MASTER_KEY", source, label)
+            self.assertIn("YOUNG_ROUTER_WEB_PASSWORD", source, label)
+        self.assertIn('target="YOUNG_ROUTER_WEB_PASSWORD"', general)
+        self.assertIn('target: "YOUNG_ROUTER_WEB_PASSWORD"', general)
 
     def test_windows_legacy_secret_editor_keeps_its_native_contract(self) -> None:
         leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")

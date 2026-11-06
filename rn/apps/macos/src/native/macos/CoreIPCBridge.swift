@@ -27,7 +27,7 @@ import Foundation
         let port: Int
         let bootstrapToken: String
 
-        var baseURL: URL? { URL(string: "http://\(address):\(port)/v1") }
+        var baseURL: URL? { URL(string: "http://\(address):\(port)/ipc") }
     }
 
     private enum BridgeError: Error {

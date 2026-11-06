@@ -344,6 +344,46 @@ class GeneralApiKeyCoreTests(unittest.TestCase):
             (self.root / "runtime-settings.env").read_text(encoding="utf-8"),
         )
 
+    def test_the_pages_key_is_kept_out_of_every_snapshot_but_readable_on_request(self) -> None:
+        # The page's key is a Runtime setting now.  It has to be absent from
+        # every snapshot (the pane reads it over the plaintext lease, exactly
+        # like the API key) and present in the document that reaches the proxy.
+        store = self._store()
+        try:
+            # A plaintext secret is refused by the ordinary dispatch path: it
+            # has to arrive over the native lease, which is what keeps it out
+            # of snapshots and out of a second settings surface.
+            with self.assertRaises(Exception):
+                store.dispatch(
+                    {
+                        "domain": "runtime",
+                        "type": "set_setting",
+                        "payload": {"key": "YOUNG_ROUTER_WEB_PASSWORD", "value": "staged-page-key"},
+                    },
+                    expected_revision=store.revision,
+                )
+            staged = store.stage_secret(
+                "runtime",
+                "setting",
+                "YOUNG_ROUTER_WEB_PASSWORD",
+                "staged-page-key",
+                revision=store.revision,
+            )
+            store.apply("runtime", revision=staged["revision"])
+            store.wait_for_service_reload(10.0)
+            descriptor, value = store._trusted_secret_document_read(
+                "runtime", "setting", "YOUNG_ROUTER_WEB_PASSWORD"
+            )
+        finally:
+            store.shutdown()
+
+        self.assertEqual("staged-page-key", value)
+        self.assertTrue(descriptor["present"])
+        self.assertIn(
+            "YOUNG_ROUTER_WEB_PASSWORD=staged-page-key",
+            (self.root / "runtime-settings.env").read_text(encoding="utf-8"),
+        )
+
     def test_another_runtime_slot_cannot_borrow_the_plaintext_read(self) -> None:
         store = self._store()
         try:

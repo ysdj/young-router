@@ -1027,6 +1027,39 @@ class OurFreeModelAdapterTests(unittest.TestCase):
             self.assertEqual(bridge.stops, 1)
 
 
+class RuntimeCheckpointTests(unittest.TestCase):
+    """A runtime Apply must be able to capture itself with the lane attached.
+
+    `our_free_model` is the live bridge Core hands the runtime domain; it owns
+    locks and worker threads, so Core's fallback checkpoint — a deepcopy of the
+    domain's `__dict__` — raised `cannot pickle '_thread.RLock' object` and every
+    runtime Apply answered `apply_failed` ("Settings could not be prepared for a
+    transaction"). The domain therefore states its own transaction value.
+    """
+
+    def test_a_runtime_apply_succeeds_with_the_lane_attached(self) -> None:
+        import threading
+        from young_router.core.domains.runtime import RuntimeSettingsDomain
+
+        class Bridge:
+            settings: dict[str, str] = {}
+            _lock = threading.RLock()
+
+            def stop(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RuntimeSettingsDomain(Path(directory) / "runtime-settings.env")
+            domain.attach_our_free_model(Bridge())
+            domain.dispatch(
+                "set_setting",
+                {"key": "YOUNG_ROUTER_OUR_FREE_MODEL_MAX_TOKENS", "value": "4096"},
+            )
+            checkpoint = domain.transaction_checkpoint()
+            domain.restore_transaction(checkpoint)
+            self.assertEqual(domain.apply().get("applied", True), True)
+
+
 class LaneChannelTests(unittest.TestCase):
     """A roster is served from several upstreams, and the picker has to say so.
 
@@ -1239,11 +1272,16 @@ class ChannelProviderSplitTests(unittest.TestCase):
             # after Apply — the same order a pane sees it in.
             domain.apply()
             contexts = domain.snapshot()["model_contexts"]
-            # Neither id is in the bundled profiles, so both groups answer the
-            # unknown-model window, and neither row's advertised number (200,000
-            # and 131,072) becomes the public window.
-            self.assertEqual(contexts["big-pickle"]["context_window"], 272_000)
-            self.assertEqual(contexts["kilo-auto/free"]["context_window"], 272_000)
+            # Neither id is in the bundled profiles and this registry holds no
+            # downloaded cache, so the registry's own answer is the
+            # unknown-model placeholder.  What the rows' upstreams stated then
+            # becomes the window, in preference to the placeholder: these are
+            # models no profile resolves, and a client handed 272,000 against an
+            # upstream that accepts 200,000 is compacted too late.  A row's own
+            # number still never becomes a *declaration* — ``max_input_tokens``
+            # stays absent below, so the public-model pane still writes one.
+            self.assertEqual(contexts["big-pickle"]["context_window"], 200_000)
+            self.assertEqual(contexts["kilo-auto/free"]["context_window"], 131_072)
             self.assertEqual(
                 routes["kilo-auto/free"][0]["upstream_context_window"], 131_072
             )
@@ -1366,10 +1404,13 @@ class StatedWindowIsAReadingTests(unittest.TestCase):
             # The projection reads the saved document, so it is taken after the
             # write, the same way a pane sees it.
             contexts = domain.snapshot()["model_contexts"]
-            # Neither stub id is in the bundled profiles, so the registry's own
-            # answer is the unknown-model window -- a reading never raises it.
-            self.assertEqual(contexts["big-pickle"]["context_window"], 272_000)
-            self.assertEqual(contexts["kilo-auto/free"]["context_window"], 272_000)
+            # Neither stub id is in the bundled profiles, and this registry has
+            # no downloaded cache, so the profiles have nothing to say about
+            # them.  A reading answers only in that case -- the upstream's own
+            # number is better evidence than the placeholder, and the managed
+            # catalog publishes the same one.
+            self.assertEqual(contexts["big-pickle"]["context_window"], 200_000)
+            self.assertEqual(contexts["kilo-auto/free"]["context_window"], 131_072)
             # The same catalog read still reaches the pane, in the row that says
             # whose number it is.
             read = {
@@ -1431,9 +1472,12 @@ class StatedWindowIsAReadingTests(unittest.TestCase):
             domain.apply()
             contexts = domain.snapshot()["model_contexts"]["big-pickle"]
             self.assertEqual(contexts["context_window"], 64_000)
-            # The recommendation is still the registry's own profile, so the
-            # mark beside the field keeps naming the value pi.dev states.
-            self.assertEqual(contexts["recommended_context_window"], 272_000)
+            # Nothing else knows this id either, so the recommendation is the
+            # same number its own upstream stated: there is no pi.dev profile to
+            # name beside a declaration, and reporting the placeholder instead
+            # would put two different figures on one model.  A declaration still
+            # wins, which is the property this test exists for.
+            self.assertEqual(contexts["recommended_context_window"], 200_000)
 
     def test_a_lane_fallback_never_stands_in_for_the_models_own_window(self) -> None:
         """The reported defect, end to end: 131,072 proposed, 1,048,576 published.

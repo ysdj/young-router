@@ -398,11 +398,28 @@ class CoreServiceController:
         # Set by ``attach_our_free_model`` when Core owns the Our Free Model
         # worker; a bare controller (tests, CLI probes) simply has none.
         self._our_free_model: object | None = None
+        # Core's own IPC listener, written down by whoever started it.  The
+        # managed proxy forwards `/ui` and `/ipc` here so the page and its API
+        # share the one port a person types; empty means this Core was started
+        # without a listener of its own (a controller built by a probe).
+        self._web_endpoint = ""
 
     def attach_workbuddy(self, runtime: object | None) -> None:
         """Share the Core-owned WorkBuddy worker with this controller."""
 
         self._workbuddy = runtime
+
+    def set_web_endpoint(self, address: str, port: int) -> None:
+        """State where the page and its API are answered.
+
+        The proxy is this app's child, so it cannot discover Core's ephemeral
+        listener on its own; Core hands it over here and ``_runtime_env``
+        publishes it to the next child it starts.  An IPv6 literal is bracketed
+        because the value is one ``host:port`` pair.
+        """
+
+        host = f"[{address}]" if ":" in address and not address.startswith("[") else address
+        self._web_endpoint = f"{host}:{port}" if address and port > 0 else ""
 
     def attach_our_free_model(self, runtime: object | None) -> None:
         """Share the Core-owned Our Free Model worker with this controller."""
@@ -953,6 +970,11 @@ class CoreServiceController:
         # GitHub refresh before serving the local proxy.
         env["LITELLM_LOCAL_MODEL_COST_MAP"] = "true"
         env[CORE_PID_ENV] = str(os.getpid())
+        if self._web_endpoint:
+            # The page lives on this proxy's port and is answered by the Core
+            # that wrote this down; the forwarder reads it from its own
+            # environment rather than guessing a port number.
+            env["YOUNG_ROUTER_CORE_IPC_ENDPOINT"] = self._web_endpoint
         # WorkBuddy routes resolve their loopback base URL and bearer from the
         # proxy's own environment; an already-running worker supplies them and
         # a configured route starts one at proxy launch (see ``start``).

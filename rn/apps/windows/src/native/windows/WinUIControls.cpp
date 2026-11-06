@@ -741,8 +741,11 @@ struct SecureTextInputComponentView
     if (props.domain != "runtime" || props.field != "setting") return false;
     // The General pane's proxy key, the one credential a window draws in the
     // clear so it can be copied into a client.
+    // The browser page's key is drawn in the clear for the same reason: it is
+    // read out loud or pasted into another browser.
     return props.target == "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON" ||
-        props.target == "YOUNG_ROUTER_MASTER_KEY";
+        props.target == "YOUNG_ROUTER_MASTER_KEY" ||
+        props.target == "YOUNG_ROUTER_WEB_PASSWORD";
   }
 
   bool IsPlainTextAutoCommitField() const noexcept {

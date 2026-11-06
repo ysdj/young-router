@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import secrets
+
 import copy
 import hashlib
 import json
@@ -175,40 +177,73 @@ def master_key_from_document(text: str) -> str:
     return text_value or DEFAULT_MASTER_KEY
 
 
-def master_key_in_document(text: str, key: str) -> str:
-    """Rewrite one document's master key, touching nothing else.
+#: The runtime setting naming the browser page's key.
+#:
+#: It is a runtime setting rather than a document line because the page is one
+#: of this app's own surfaces: the General pane shows it through the plaintext
+#: lease every other credential here uses, it is staged and applied with the
+#: rest of the Runtime document, and no hand edit of ``config.yaml`` can state
+#: a second copy.  ``hidden`` keeps it out of the Runtime pane, whose rows are
+#: the ones a person tunes; this one is only ever set in General.
+WEB_PASSWORD_SETTING = "YOUNG_ROUTER_WEB_PASSWORD"
+
+
+def generate_web_password() -> str:
+    """A password nobody has to invent, and nobody can guess.
+
+    Six groups of four from a 32-character alphabet is 120 bits of entropy and
+    fits on a sticky note; the dashes make it readable when someone dictates it
+    over a call rather than pasting it.
+    """
+
+    alphabet = "abcdefghijkmnopqrstuvwxyz23456789"
+    return "-".join(
+        "".join(secrets.choice(alphabet) for _ in range(4)) for _ in range(6)
+    )
+
+
+def _setting_line_in_document(text: str, name: str, value: str) -> str:
+    """Rewrite one ``general_settings`` scalar, touching nothing else.
 
     The document is edited as text because it is the source of truth for
     everything the provider editor does not model: comments, anchors, and the
     order of every other section survive a one-line change here, and a
     hand-written document keeps its own shape.  A document without a
-    ``general_settings`` block gains one, and a block that states no
-    ``master_key`` gains the line at the block's own indentation.
+    ``general_settings`` block gains one, and a block that states no ``name``
+    gains the line at the block's own indentation.
     """
 
-    if not master_key_is_valid(key):
-        raise DomainError("The API key contains unsupported characters")
+    setter = re.compile(
+        r"^(?P<lead>[ \t]+)" + re.escape(name) + r"[ \t]*:[ \t]*(?P<rest>.*)$",
+        re.MULTILINE,
+    )
     block_match = _MASTER_KEY_BLOCK.search(text)
     if block_match is None:
-        section = f"general_settings:\n  master_key: {key}\n"
+        section = f"general_settings:\n  {name}: {value}\n"
         return section if not text.strip() else text.rstrip("\n") + "\n\n" + section
     block = block_match.group(0)
     body = block.split("\n", 1)[1] if "\n" in block else ""
     indent_match = re.match(r"[ \t]+", body)
     indent = indent_match.group(0) if indent_match is not None else "  "
-    line_match = _MASTER_KEY_LINE.search(block)
+    line_match = setter.search(block)
     if line_match is None:
-        # The key leads the block, the way every document this app writes
-        # states it; everything the block already held follows unchanged.
         head = block.split("\n", 1)[0]
-        updated = f"{head}\n{indent}master_key: {key}\n{body}"
+        updated = f"{head}\n{indent}{name}: {value}\n{body}"
     else:
         updated = (
             block[: line_match.start()]
-            + f"{line_match.group('lead')}master_key: {key}\n"
+            + f"{line_match.group('lead')}{name}: {value}\n"
             + block[line_match.end() :].lstrip("\n")
         )
     return text[: block_match.start()] + updated + text[block_match.end() :]
+
+
+def master_key_in_document(text: str, key: str) -> str:
+    """Rewrite one document's master key, touching nothing else."""
+
+    if not master_key_is_valid(key):
+        raise DomainError("The API key contains unsupported characters")
+    return _setting_line_in_document(text, "master_key", key)
 
 
 class RuntimeSettingsDomain:
@@ -224,7 +259,7 @@ class RuntimeSettingsDomain:
         MASTER_KEY_SETTING,
     })
 
-    def __init__(self, settings_path: Path | str | None = None):
+    def __init__(self, settings_path: Path | str | None = None, *, config_path: Path | str | None = None):
         self.settings_path = Path(settings_path).expanduser() if settings_path else _default_runtime_settings_path()
         self.our_free_model = None
         self.specs: dict[str, Any] = {}
@@ -238,7 +273,11 @@ class RuntimeSettingsDomain:
         # The proxy key lives in ``config.yaml``, not in this file, so it is
         # read and written beside these values; the bytes it was read from are
         # what an Apply compares against, exactly like this file's own baseline.
-        self.master_key_path: Path = _default_provider_config_path()
+        # The document is the one this Core was told to serve, so a Core run
+        # against a copy never edits the configuration the native app is using.
+        self.master_key_path: Path = (
+            Path(config_path).expanduser() if config_path else _default_provider_config_path()
+        )
         self._master_key: str = DEFAULT_MASTER_KEY
         self._master_key_bytes: bytes | None = None
         self._master_key_draft: str = DEFAULT_MASTER_KEY
@@ -379,8 +418,11 @@ class RuntimeSettingsDomain:
         projected = _dsh_effective_quick_values(self._draft_values)
         fields = [self._field_projection(key, spec, projected.get(key, "")) for key, spec in self.specs.items()]
         defaults = self._defaults(self.specs)
+        # One redaction rule for every secret: the set this class names and the
+        # ones the schema marks.  Reading only the class set leaked the page's
+        # key into the snapshot, because its spec is the one that says it.
         values = {
-            key: (REDACTED if key in self._SECRET_KEYS and value != defaults.get(key, "") else value)
+            key: (REDACTED if self._is_secret_setting(key) and value != defaults.get(key, "") else value)
             for key, value in projected.items()
         }
         return {
@@ -399,6 +441,42 @@ class RuntimeSettingsDomain:
         # same flat projection rather than a second shape, because the staging
         # it answers for is one document-wide draft.
         return {**copy.deepcopy(self._draft_values), MASTER_KEY_SETTING: self._master_key_draft}
+
+    def transaction_checkpoint(self) -> dict[str, object]:
+        """Capture the staged document, not the attached lane runtime.
+
+        ``our_free_model`` is the live bridge Core hands this domain; it owns
+        locks and worker threads, so a plain deepcopy of the domain's
+        ``__dict__`` cannot capture it — and a failed Apply is exactly when
+        Core has to restore what it captured.
+        """
+
+        return {
+            "specs": copy.deepcopy(self.specs),
+            "metadata": copy.deepcopy(self._metadata),
+            "raw_values": copy.deepcopy(self._raw_values),
+            "draft_values": copy.deepcopy(self._draft_values),
+            "dsh_legacy_bases": copy.deepcopy(self._dsh_legacy_bases),
+            "baseline_bytes": self._baseline_bytes,
+            "master_key": self._master_key,
+            "master_key_bytes": self._master_key_bytes,
+            "master_key_draft": self._master_key_draft,
+            "last_apply_master_key_changed": self._last_apply_master_key_changed,
+            "revision": self.revision,
+        }
+
+    def restore_transaction(self, checkpoint: Mapping[str, object]) -> None:
+        self.specs = copy.deepcopy(checkpoint["specs"])
+        self._metadata = copy.deepcopy(checkpoint["metadata"])
+        self._raw_values = copy.deepcopy(checkpoint["raw_values"])
+        self._draft_values = copy.deepcopy(checkpoint["draft_values"])
+        self._dsh_legacy_bases = copy.deepcopy(checkpoint["dsh_legacy_bases"])
+        self._baseline_bytes = checkpoint["baseline_bytes"]  # type: ignore[assignment]
+        self._master_key = str(checkpoint["master_key"])
+        self._master_key_bytes = checkpoint["master_key_bytes"]  # type: ignore[assignment]
+        self._master_key_draft = str(checkpoint["master_key_draft"])
+        self._last_apply_master_key_changed = bool(checkpoint["last_apply_master_key_changed"])
+        self.revision = int(checkpoint["revision"])  # type: ignore[arg-type]
 
     def _validate_values(self, values: Mapping[str, object]) -> dict[str, str]:
         from ..runtime_settings_io import validate_values
@@ -573,7 +651,7 @@ class RuntimeSettingsDomain:
             # field can draw the key in the clear without Core ever putting a
             # credential into a snapshot.
             return self._master_key_draft
-        if field != "setting" or target != "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON":
+        if field != "setting" or target not in {_DSH_VISION_ROUTER_CONFIG_KEY, WEB_PASSWORD_SETTING}:
             raise DomainError("The requested secret field is unavailable")
         if target not in self.specs or not self._is_secret_setting(target):
             raise DomainError("The requested secret field is unavailable")
@@ -609,6 +687,42 @@ class RuntimeSettingsDomain:
             raise DomainError("The requested secret field is unavailable")
         self._set_values({"values": {target: value}})
         self.revision += 1
+
+    def web_password(self) -> str:
+        """The key a browser types to open this router's page.
+
+        Read from the applied values, not the draft: the page has to keep
+        answering with the key it was given while a General edit sits staged,
+        exactly like every other setting the running service reads.
+        """
+
+        value = self._raw_values.get(WEB_PASSWORD_SETTING, "")
+        return value.strip() if isinstance(value, str) else ""
+
+    def ensure_web_password(self) -> str:
+        """Give a page that states no key one, and say it.
+
+        A page with no key serves nothing, which reads as a broken feature
+        rather than a closed door.  So the one moment a key is needed and none
+        exists, one is generated and written -- the value the General pane then
+        shows, overridable there and nowhere else.
+        """
+
+        current = self.web_password()
+        if current:
+            return current
+        password = generate_web_password()
+        if WEB_PASSWORD_SETTING not in self.specs:
+            return password
+        self._draft_values[WEB_PASSWORD_SETTING] = password
+        try:
+            atomic_write_text(self.settings_path, self._encoded_draft())
+        except PersistenceError as exc:
+            raise DomainError(safe_exception_message(exc)) from None
+        self._raw_values[WEB_PASSWORD_SETTING] = password
+        self._baseline_bytes = _file_bytes(self.settings_path)
+        self.revision += 1
+        return password
 
     def validate(self, payload: object | None = None) -> dict[str, Any]:
         try:

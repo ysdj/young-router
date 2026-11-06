@@ -30,7 +30,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from .log_tabs import LOG_TABS
 from .persistence import AtomicJSONStore, PersistenceError, atomic_write_bytes, atomic_write_json, read_bytes, read_json
-from .protocol import MAX_EDITOR_DOCUMENT_BYTES, PROTOCOL_VERSION, ProtocolError, make_event
+from .protocol import MAX_EDITOR_DOCUMENT_BYTES, PROTOCOL_VERSION, ProtocolError, is_error_code, make_event
 from .security import REDACTED, _key_text, redact, safe_exception_message, safe_error_message
 
 
@@ -80,7 +80,12 @@ _MULTILINE_SECRET_TARGETS = frozenset({
 #: the credential this app hands the user's own clients, so its field shows it
 #: instead of a placeholder; the read still goes over the read-once native lease
 #: and never through a snapshot.
-_PLAINTEXT_RUNTIME_TARGETS = _MULTILINE_SECRET_TARGETS | {"YOUNG_ROUTER_MASTER_KEY"}
+_PLAINTEXT_RUNTIME_TARGETS = _MULTILINE_SECRET_TARGETS | {
+    "YOUNG_ROUTER_MASTER_KEY",
+    # The page's key is read in the clear for the same reason the proxy key is:
+    # a person copies it into another browser's password form.
+    "YOUNG_ROUTER_WEB_PASSWORD",
+}
 _DSH_VISION_ROUTER_CONFIG_MAX_BYTES = 256 * 1024
 
 
@@ -1156,7 +1161,9 @@ class CoreStore:
         # One worker per Core process serves every Our Free Model route; the
         # service controller and the provider domain share that instance so the
         # proxy child receives the very base URL it is serving.
-        runtime_settings = RuntimeSettingsDomain(resolved_runtime_settings_path)
+        runtime_settings = RuntimeSettingsDomain(
+            resolved_runtime_settings_path, config_path=config_path
+        )
         our_free_model_runtime = OurFreeModelRuntime(
             resolved_runtime_root,
             settings={
@@ -1321,6 +1328,10 @@ class CoreStore:
         # lifecycle operation: it never touches the child process.
         service_handlers["stage_runtime_config"] = controller.stage_runtime_config
         service_handlers["runtime_fingerprint"] = controller.runtime_fingerprint
+        # Core's own listener is only known once it is started, which is after
+        # this store exists; the entry point reports it through this handler so
+        # the proxy it launches can forward the page and its API.
+        service_handlers["set_web_endpoint"] = controller.set_web_endpoint
         initial_service = controller.status()
         store = cls(
             metadata_path=metadata_path,
@@ -1468,6 +1479,16 @@ class CoreStore:
             self._drafts.pop(name, None)
             self._disk.pop(name, None)
             self._disk_identities.pop(name, None)
+
+    def settings_domain(self, name: str) -> DomainAdapter | None:
+        """One registered settings domain, for a host that needs its own door.
+
+        The browser host is such a host: its port and password are not routing
+        settings, so they never travel through the snapshot or the draft.  The
+        caller that stages them still needs the adapter that owns the document.
+        """
+
+        return self._domains.get(name)
 
     def _adapter_snapshot(self, name: str) -> object:
         adapter = self._domains.get(name)
@@ -3444,7 +3465,18 @@ class CoreStore:
                 # cause keeps its name even when the rollback itself failed:
                 # the pane has to state why the sync stopped, and "the rollback
                 # failed too" is not something the reader can act on.
-                cause_code = exc.code if isinstance(exc, webdav_core.SyncError) else "webdav_sync_failed"
+                #
+                # Only a name this wire can carry may be used.  A
+                # ``WebDAVHTTPError`` subclasses ``SyncError`` but keeps the
+                # remote server's *status* in ``code`` (an ``int``), and the
+                # sentence it carries can hold a newline.  Handing either to the
+                # response envelope made Core refuse its own answer and close
+                # the socket, which the host could only read as "the local Core
+                # is unavailable" while Core was answering everything else.  An
+                # HTTP status is the remote's word, so it stays in the message
+                # and the pane states its own sentence for the failure.
+                named_cause = isinstance(exc, webdav_core.SyncError) and is_error_code(exc.code)
+                cause_code = exc.code if named_cause else "webdav_sync_failed"
                 try:
                     webdav_core.save_sync_status(status_path, operation, False, cause_code)
                 except Exception:
@@ -3454,7 +3486,9 @@ class CoreStore:
                 if isinstance(exc, CoreError):
                     raise
                 if isinstance(exc, webdav_core.SyncError):
-                    raise CoreError(exc.code, str(exc)) from None
+                    # The remote's own sentence, redacted and held to the
+                    # one-line/512-byte rule the envelope enforces.
+                    raise CoreError(cause_code, safe_error_message(exc)) from None
                 raise CoreError(cause_code, "WebDAV sync failed") from None
             self._emit()
             result: dict[str, Any] = {"revision": self._revision}
@@ -3754,9 +3788,15 @@ class CoreStore:
                         except Exception:
                             raise CoreError("domain_error", "Linked model dependency handling could not be rolled back") from None
                     # Domain exceptions are authored to be safe; normalize
-                    # them into the stable Core protocol error shape.
+                    # them into the stable Core protocol error shape.  A cause
+                    # the domain named travels as the IPC code, so the window's
+                    # own message table decides what the user reads instead of
+                    # every locale showing the domain's English sentence.
                     if isinstance(exc, CoreError):
                         raise
+                    domain_code = getattr(exc, "code", "")
+                    if isinstance(domain_code, str) and domain_code.strip():
+                        raise CoreError(domain_code.strip(), safe_exception_message(exc)) from None
                     raise CoreError("domain_error", safe_exception_message(exc)) from None
                 after = self._adapter_draft_state(name)
                 if isinstance(result, Mapping):
@@ -5095,6 +5135,7 @@ class CoreStore:
                     raise CoreError("apply_failed", "Settings could not be rolled back") from None
                 if isinstance(exc, CoreError):
                     raise
+                self._mark_refused_draft(transaction_adapters)
                 raise CoreError("apply_failed", safe_exception_message(exc)) from None
 
             # Remote work may have succeeded even if the network connection
@@ -5133,6 +5174,34 @@ class CoreStore:
             "pending_operations": 0,
             "issues": [],
         }
+
+    def _mark_refused_draft(self, adapters: Mapping[str, DomainAdapter]) -> None:
+        """Record why a rolled-back draft could not be written, on its own rows.
+
+        A domain that refuses during ``apply`` knows which entry is unusable
+        (an order it cannot finish, a name it cannot serve).  That answer never
+        reached the window: the Apply rolled back and the strip said 更改未生效,
+        so the user was left to find the offending route in a list of dozens.
+        Asking each participating domain for its validation after the rollback
+        publishes the same coded issues a ``validate`` call would, and the pane
+        already points ``alertRowKeys`` at them.
+
+        Runs after the adapters are restored, so it reads the staged draft the
+        user still holds rather than the half-written state that refused.
+        """
+
+        for name, adapter in adapters.items():
+            try:
+                summary = _validation_summary(adapter.validate(None))
+            except Exception:
+                continue
+            record = self._drafts.get(name)
+            if record is not None and summary.get("valid") is not False:
+                # Nothing to point at: the draft validates now, so the refusal
+                # was not this row's (a disk change, a confirmation, a remote
+                # answer).  Leave the draft's own answer alone.
+                continue
+            self._drafts.setdefault(name, {})["validation"] = summary
 
     def apply(
         self,
@@ -5382,6 +5451,13 @@ class CoreStore:
                     raise ConfirmationNeeded(str(item) for item in codes) from None
                 if isinstance(exc, CoreError):
                     raise
+                # A domain that refuses its own draft says so with rows, not
+                # with a sentence: the pane marks the route or key that refuses
+                # (``alertRowKeys``) and the strip states the outcome once.  A
+                # bare rollback reported 更改未生效 with nothing marked, so the
+                # row the user had just touched — the ＋ that started this
+                # write — looked like the one that failed.
+                self._mark_refused_draft(transaction_adapters)
                 raise CoreError("apply_failed", safe_exception_message(exc)) from None
             self._emit()
             return {
@@ -5752,6 +5828,7 @@ class CoreStore:
         *,
         source_token: str,
         revision: int | None = None,
+        remove_source: bool = False,
     ) -> PreparedImport:
         """Consume a picker capability and prepare a non-mutating import plan."""
 
@@ -5870,6 +5947,19 @@ class CoreStore:
 
             self._emit()
             return {"revision": self._revision, "draft_domains": staged, "preview": preview}
+
+    def announce_web_endpoint(self, address: str, port: int) -> None:
+        """State where this Core answers the browser page and its API.
+
+        The proxy owns the published port and forwards ``/ui`` and ``/ipc``
+        here; it reads that address from its own environment, which Core can
+        only write once its listener is up.  A store built without a managed
+        proxy (a test, a CLI probe) simply has no handler to tell.
+        """
+
+        handler = self._service_handlers.get("set_web_endpoint")
+        if callable(handler):
+            handler(address, port)
 
     def set_service_status(
         self,

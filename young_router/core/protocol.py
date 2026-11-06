@@ -19,7 +19,7 @@ import math
 from pathlib import Path
 import re
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, TypeGuard
 
 try:
     # ``orjson`` ships with the managed runtime (LiteLLM depends on it) and is
@@ -500,8 +500,22 @@ def _validate_error(error: Mapping[str, Any]) -> None:
 _ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
+def is_error_code(value: object) -> TypeGuard[str]:
+    """Whether a value can name a failure on this wire at all.
+
+    A domain's own error type stays the domain's: a WebDAV failure keeps the
+    remote server's HTTP status in ``code``, which is an ``int`` where this
+    wire carries a lowercase token.  A store that reports that failure has to
+    ask this question first, or the answer it builds is one the envelope
+    refuses -- and a handler whose reply the contract refuses writes nothing at
+    all, which the peer reads as a Core that has gone away.
+    """
+
+    return isinstance(value, str) and _ERROR_CODE_RE.fullmatch(value) is not None
+
+
 def _safe_error_code(value: object) -> str:
-    if not isinstance(value, str) or not _ERROR_CODE_RE.fullmatch(value):
+    if not is_error_code(value):
         raise ProtocolError("invalid_response", "IPC error has an invalid code")
     return value
 
@@ -665,6 +679,7 @@ __all__ = [
     "SUPPORTED_METHODS",
     "decode_message",
     "encode_message",
+    "is_error_code",
     "make_event",
     "make_request",
     "load_protocol_schema",

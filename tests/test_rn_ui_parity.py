@@ -152,7 +152,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # mid-action.  A child window keeps no strip of its own.
         # The strip keeps its permanent strip and, since the usage pager lives
         # at its right end, it may also carry that route's own controls.
-        self.assert_ui_has('{shell ? <View style={[styles.routeStatusBar, Platform.OS === "windows" && styles.routeStatusBarWindows]}><View style={styles.routeStatusLead}>{busy ? <NativeBusySpinner label={translate("common.working")} /> : null}<Text numberOfLines={2} style={[styles.routeStatusText, Platform.OS === "windows" && styles.routeStatusTextWindows]}>{routeStatus ?? translate("common.ready")}</Text></View>{statusBarControls}</View> : null}')
+        self.assert_ui_has('{shell ? <View style={[styles.routeStatusBar, isWindowsShell && styles.routeStatusBarWindows]}><View style={styles.routeStatusLead}>{busy ? <NativeBusySpinner label={translate("common.working")} /> : null}<Text numberOfLines={2} style={[styles.routeStatusText, isWindowsShell && styles.routeStatusTextWindows]}>{routeStatus ?? translate("common.ready")}</Text></View>{statusBarControls}</View> : null}')
         # The strip reads from the same Windows palette as the pane above it.
         self.assert_ui_has('routeStatusBarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderTopColor: WINDOWS_CONTROL.strokeSubtle }')
         self.assertNotIn("{shell && routeStatus ? <View style={styles.routeStatusBar}>", self.ui)
@@ -398,6 +398,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # arrives reports the outcome the pane can show, exactly like any other
         # rolled-back write.
         self.assertIn('revision_conflict: "common.notApplied",', self.ui)
+        # A draft that Core refused during Apply is a validation failure too, and
+        # it has to name the row that blocked it: a bare 更改未生效 left the row
+        # the user had just touched (the ＋ that started the write) looking like
+        # the one that failed, with nothing marked anywhere in the pane.
+        self.assertIn('if (!(code === "provider_model_invalid" || code === "validation_failed" || code === "relay_preflight_failed" || code === "apply_failed")) return undefined;', self.ui)
+        self.assertIn('code === "provider_model_invalid" || code === "apply_failed"', self.ui)
         self.assertNotIn('revision_conflict: "error.revisionConflict"', self.ui)
         for source in (self.en, self.zh, translation_keys):
             self.assertNotIn('"error.revisionConflict"', source)
@@ -749,7 +755,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '? translate("providers.probeInlineRateLimited")',
             '? translate("providers.probeInlineUnsupported")',
             'const compactReason = (deepTestIncluded ? degradationLine : "")',
-            'const degradationMeasured = availableCount > 0 || Boolean(stringValue(degradation.verdict));',
+            'const degradationMeasured = deepTestIncluded\n    && (availableCount > 0 || Boolean(stringValue(degradation.verdict)));',
             'const degradationLine = degradationMeasured ? probeDegradationLine(degradation, translate) : "";',
             'const degradationSentence = degradationMeasured ? probeDegradationLine(degradation, translate, true) : "";',
             'const compact = [availabilityCount, compactReason].filter(Boolean).join("; ");',
@@ -826,7 +832,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const probeTitle = degradationIncluded',
             '? translate("providers.deepTest")',
             ': translate("providers.probe");',
-            '<ActionButton title={probeTitle} titleWidth="tight" busy={probing} toolTip={(probePresentation.compact ? probePresentation.tooltip : "") || (degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} onPress={probe} />',
+            '<ActionButton title={probeTitle} titleWidth="tight" busy={probing} toolTip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} onPress={probe} />',
             'function probeDegradationLine(degradation: UnknownRecord, translate: Translate, detailed = false): string {',
             'function probeDegradationDetails(degradation: UnknownRecord, translate: Translate): string {',
             'const degradation = asRecord(result?.degradation ?? probe.degradation);',
@@ -848,7 +854,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '? translate("providers.probeInlineRateLimited")',
             '? translate("providers.probeInlineUnsupported")',
             'const compactReason = (deepTestIncluded ? degradationLine : "")',
-            'const degradationMeasured = availableCount > 0 || Boolean(stringValue(degradation.verdict));',
+            'const degradationMeasured = deepTestIncluded\n    && (availableCount > 0 || Boolean(stringValue(degradation.verdict)));',
             'const degradationLine = degradationMeasured ? probeDegradationLine(degradation, translate) : "";',
             'const degradationSentence = degradationMeasured ? probeDegradationLine(degradation, translate, true) : "";',
             'const compact = [availabilityCount, compactReason].filter(Boolean).join("; ");',
@@ -983,6 +989,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # label names the tip, and the sentence it opens is announced when
             # it appears rather than being reachable only by reading the pane.
             '{open ? <View accessibilityRole="text" accessibilityLiveRegion="polite" style={align === "left" ? styles.helpTipPopupLeft : styles.helpTipPopup}><Text style={styles.helpTipText}>{text}</Text></View> : null}',
+            # `accessibilityLiveRegion` alone does not reach a desktop screen
+            # reader -- RN reads it on Android only, and Windows' leaf sets a UIA
+            # LiveSetting without raising the change event.  The imperative
+            # announcement is what macOS and Windows actually implement, so the
+            # tip must carry it too, and must not announce on the browser host
+            # where the live region already works.
+            'AccessibilityInfo.announceForAccessibility(text);',
+            'if (!open || Platform.OS === "web") return;',
             'helpTipPopupLeft: { position: "absolute", left: 0, bottom: 25, width: 208, zIndex: 4,',
             'const protocolHint = translate(fixed ? "providers.protocolModeFixedHint" : "providers.protocolModeFallbackHint");',
             'accessory={<HelpTip open={tipOpen} text={protocolHint} title={translate("providers.protocolModeHelp")} onToggle={() => setTipOpen((current) => !current)} />}',
@@ -995,8 +1009,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} allowShrink value={protocol}',
             'controlWidth === undefined ? null : { width: controlWidth, flex: 0 }]} />{accessory ?? null}</View>',
             # Anywhere else clicks the sheet drawn under the mark and its panel,
-            # so the tip closes on the next click outside itself.
-            '{open ? <Pressable accessible={false} onPress={onToggle} style={styles.helpTipDismiss} /> : null}',
+            # so the tip closes on the next click outside itself -- and the
+            # sheet says it is not a modal surface, so the macOS tab chain
+            # keeps walking the controls behind it instead of trapping Tab on
+            # the mark (a tip is transient; nothing behind it is unavailable).
+            '{open ? <Pressable accessible={false} nativeID="young-router-tab-transparent" onPress={onToggle} style={styles.helpTipDismiss} /> : null}',
             'helpTipDismiss: { position: "absolute", left: -2400, right: -2400, top: -2400, bottom: -2400 }',
             # The mark keeps its 16 pt glyph but owns a 22 pt target: the
             # negative margins give back the extra points, so the glyph does
@@ -1021,13 +1038,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('setTipOpen(false);\n    void dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { upstream_url_surface } });')
         # A route Core says answers on one surface only gets no pickers: both
         # would offer a choice the route cannot honour.  The fact stays readable
-        # as one value row, with the sentence explaining why on its mark.
+        # as one value row, with the sentence explaining why on its mark.  Two
+        # sentences exist because there are two reasons: a local worker mounts
+        # one wire, and a generator answers Images by definition.
         for marker in (
             'const singleSurface = stringList(model.probe_surfaces);',
             'const onlySurface = singleSurface.length === 1 ? singleSurface[0] : "";',
             'if (onlySurface) {',
             'const surfaceLabel = probeSurfaceLabel(onlySurface, translate);',
-            'const fixedHint = translate("providers.protocolSurfaceFixedHint", { surface: surfaceLabel });',
+            'const fixedHint = translate(onlySurface === "openai/images" ? "providers.protocolSurfaceImagesHint" : "providers.protocolSurfaceFixedHint", { surface: surfaceLabel });',
             'translate("providers.protocolSurfaceFixed")',
             'accessibilityLabel={fixedHint}',
         ):
@@ -1035,10 +1054,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for locale in (self.zh, self.en):
             self.assertIn('"providers.protocolSurfaceFixed":', locale)
             self.assertIn('"providers.protocolSurfaceFixedHint":', locale)
-        self.assertIn(
-            '| "providers.protocolSurfaceFixed"',
-            (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8"),
-        )
+            self.assertIn('"providers.protocolSurfaceImagesHint":', locale)
+        for key in ("providers.protocolSurfaceFixed", "providers.protocolSurfaceImagesHint"):
+            self.assertIn(
+                f'| "{key}"',
+                (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8"),
+            )
 
     def test_a_stopped_provider_greys_its_rows_and_holds_their_switches(self) -> None:
         """One fact, drawn once: the provider is off, so these routes are off.
@@ -1078,9 +1099,28 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for locale in (self.zh, self.en):
             self.assertIn('"providers.providerDisabledHint"', locale)
 
+    def test_an_image_route_is_told_its_probe_generates_one_picture(self) -> None:
+        """A generator's only honest availability test costs an image.
+
+        The Images wire has no dry run, so the probe really generates one.  The
+        button says so before it is pressed, because the user pays for it, and
+        a generator carries no 真伪 line: the deep test is not one this route
+        can run, and reporting it as "not applicable" beside a working probe
+        read as one more thing that failed.
+        """
+
+        self.assert_ui_has('(servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)')
+        self.assert_ui_has('const degradationMeasured = deepTestIncluded\n    && (availableCount > 0 || Boolean(stringValue(degradation.verdict)));')
+        for locale in (self.zh, self.en):
+            self.assertIn('"providers.probeImagesHint":', locale)
+        self.assertIn(
+            '| "providers.probeImagesHint"',
+            (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8"),
+        )
+
     def test_provider_probe_button_reports_progress_without_graying_out(self) -> None:
         self.assert_ui_has(
-            '<ActionButton title={probeTitle} titleWidth="tight" busy={probing} toolTip={(probePresentation.compact ? probePresentation.tooltip : "") || (degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} onPress={probe} />'
+            '<ActionButton title={probeTitle} titleWidth="tight" busy={probing} toolTip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} onPress={probe} />'
         )
         # The probe keeps its own name while it runs: the button carries the
         # progress as a leading spinner instead of a swapped title.
@@ -1393,6 +1433,37 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('renderRelayManager', self.ui)
         self.assertNotIn('serviceProviderTab', self.ui)
 
+    def test_a_public_model_is_one_group_however_its_routes_capitalise_it(self) -> None:
+        """One name is one settings surface, in every case a row spells it.
+
+        `minimax-m3.1-flash` and `MiniMax-M3.1-Flash` are one public model, not
+        two: grouping by the spelling drew one name as two groups of one route
+        each, two settings surfaces for it, and a context window each half
+        claimed the other could not honour.  The group publishes the lower-case
+        spelling — the one a client is most likely to send.
+        """
+
+        self.assert_ui_has('import { groupRoutesByPublicModel, publicModelKey } from "./publicModelNames";')
+        self.assert_ui_has('const routeGroups = useMemo(() => groupRoutesByPublicModel(routes), [routes]);')
+        # The selection, the row key, and the group a route belongs to are all
+        # the identity, so a group drawn from any of its spellings is the same
+        # group to every control in the pane.
+        self.assert_ui_has('return `${ROUTE_PUBLIC_MODEL_PREFIX}${publicModelKey(publicModel)}`;')
+        self.assert_ui_has('const activeRouteGroup = activeRoute ? routes.filter((entry) => publicModelKey(entry.publicModel) === publicModelKey(activeRoute.publicModel)) : [];')
+        self.assert_ui_has('const activePublicGroup = selectedPublicModel === undefined')
+        self.assert_ui_has('? undefined\n    : routeGroups.find((group) => publicModelKey(group.name) === publicModelKey(selectedPublicModel));')
+        self.assert_ui_has('if (publicModelKey(stringValue(model.model_name, stringValue(model.name))) !== key) continue;')
+
+        # The grouping itself is executed by tests/test_rn_public_model_names.mjs;
+        # that is where "one name, one group" is proved rather than spelled.
+        self.assertIn("test_rn_public_model_names.mjs", (ROOT / "rn/package.json").read_text(encoding="utf-8"))
+        names = (ROOT / "rn/packages/shared/src/ui/publicModelNames.ts").read_text(encoding="utf-8")
+        self.assertIn("export function publicModelKey(name: string): string {", names)
+        self.assertIn("return name.trim().toLocaleLowerCase();", names)
+        self.assertIn('return names.find((name) => name === name.toLocaleLowerCase()) ?? names[0] ?? "";', names)
+        self.assertIn("const key = publicModelKey(entry.publicModel);", names)
+        self.assertIn("name: preferredPublicSpelling(group.spellings),", names)
+
     def test_routes_view_public_model_rows_open_a_settings_surface(self) -> None:
         """A public model is one clickable row with its own limits and order list."""
         self.assert_ui_has('const ROUTE_PUBLIC_MODEL_PREFIX = "route-public-model:";')
@@ -1403,7 +1474,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         select_public = self.ui.split("const selectRouteTableRow = useCallback", 1)[1].split("const chooseViewMode", 1)[0]
         self.assertIn('rowKey.startsWith(ROUTE_PUBLIC_MODEL_PREFIX)', select_public)
         self.assertIn('rowKey.slice(ROUTE_PUBLIC_MODEL_PREFIX.length)', select_public)
-        self.assertIn('setSelectedPublicModel(publicModel);', select_public)
+        # The row key carries the name's identity, and the group that answers it
+        # is the one whose spelling the pane edits — a group is one public model
+        # however its routes capitalise it.
+        self.assertIn('const group = routeGroups.find((entry) => publicModelKey(entry.name) === publicModelKey(publicModel));', select_public)
+        self.assertIn('setSelectedPublicModel(group.name);', select_public)
         self.assertIn('setSelectedRoute("");', select_public)
 
         inspector = self.ui.split("function PublicModelInspector(", 1)[1].split("function ModelInspector(", 1)[0]
@@ -1484,11 +1559,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # control column with those two, so splitting it onto a row of its own —
         # which left the number unlabelled under the label and pushed the two
         # controls to the pane's far edge — is the regression this guards.
-        window_row = model_detail.split('{publicModelName ? ', 1)[1].split('{routeRate ? ', 1)[0]
+        window_row = model_detail.split('{publicModelName && !servesImages ? ', 1)[1].split('{routeRate ? ', 1)[0]
         self.assertEqual(1, window_row.count('styles.formRow'))
         self.assertIn('<Text numberOfLines={1} style={styles.modelInspectorLabel}>{translate("providers.contextWindow")}</Text>', window_row)
         self.assertIn('<View style={styles.modelWindowValue}>', window_row)
         self.assertLess(window_row.index('modelInspectorLabel'), window_row.index('modelWindowValue'))
+        # A route that only generates images gets no row at all: a generator
+        # holds no conversation, so a window is not a fact about it.  Core
+        # states the modality; the pane must not infer it from the name.
+        self.assertIn('const servesImages = booleanValue(model.serves_images);', model_detail)
+        self.assertIn('{publicModelName && !servesImages ? <View style={styles.formRow}>', self.ui)
         # 倍率 follows the public window, before the route's own fields: it is
         # the number the list's 倍率 column prices this row with and the one
         # 跟随倍率 sorts by, so it is stated through that column's own reader
@@ -1563,6 +1643,37 @@ class ReactNativeUiParityTests(unittest.TestCase):
         table_wrapper = appkit_controls.split("export function AppKitTable(", 1)[1].split("export function AppKitTextEditor(", 1)[0]
         self.assertIn("selectableSpanningRowKeys", table_wrapper)
 
+    def test_each_account_column_is_measured_inside_the_panes_budget(self) -> None:
+        """The 账号 / 状态 / 余额 columns fit the inspector together.
+
+        Measuring each column on its own is not enough: a 208 pt address beside
+        an 81 pt `Signed out` and an 84 pt balance is 373 pt of cells in about
+        304, and a table given more than its pane takes the deficit out of
+        every column in proportion — which is how `$1234.56` came out as
+        `$1234.…` and `Signed out` as `Signed…`.  The address is the one column
+        whose value is repeated below the list, so it takes what the other two
+        leave.
+        """
+
+        relay = RELAY_MANAGER.read_text(encoding="utf-8")
+        ui = self.ui
+        # Both lists budget the account column against the same 304 pt.
+        self.assertIn("const RELAY_ACCOUNT_COLUMNS_WIDTH_BUDGET = 304;", relay)
+        self.assertIn("const AUTH_ACCOUNT_COLUMNS_WIDTH_BUDGET = 304;", ui)
+        self.assertIn(
+            "RELAY_ACCOUNT_COLUMNS_WIDTH_BUDGET - statusColumnWidth - balanceColumnWidth",
+            relay,
+        )
+        self.assertIn(
+            "AUTH_ACCOUNT_COLUMNS_WIDTH_BUDGET - authStatusColumnWidth",
+            ui,
+        )
+        # The status column is measured, not a literal: the 74 pt cell left
+        # 58 pt of text, which elided both English states to `Signed…`.
+        self.assertIn("const RELAY_STATUS_COLUMN_MIN_WIDTH = 56;", relay)
+        self.assertIn("const AUTH_STATUS_COLUMN_MIN_WIDTH = 56;", ui)
+        self.assertNotIn('width: 74', relay)
+
     def test_the_account_lists_minus_is_the_sign_out(self) -> None:
         """One action, one control: − ends the account it is selected on.
 
@@ -1590,6 +1701,38 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("relay.officialProviderLogout", editor_row)
         self.assertIn('translate("relay.accountField")', editor_row)
         self.assertNotIn('translate("providers.authStatus")', editor_row)
+
+    def test_every_sign_out_asks_before_it_ends_a_session(self) -> None:
+        """Both sign-out controls ask first, and both name what they will end.
+
+        The account list's - asks; the provider wizard's own 退出登录 did not,
+        so the same irreversible act was guarded in one place and bare in the
+        other.  A session that has to be signed in again is not something a
+        single mis-press should spend.
+        """
+
+        signatures = {
+            "logoutAccount": "const logoutAccount = async (accountRef: string): Promise<void> => {",
+            "logoutOfficial": "const logoutOfficial = async (): Promise<void> => {",
+        }
+        for function, signature in signatures.items():
+            block = self.ui.split(signature, 1)[1].split("\n  };", 1)[0]
+            confirm_at = block.find("native.showConfirmation({")
+            dispatch_at = block.find("auth_logout")
+            self.assertGreater(confirm_at, -1, f"{function} asks before signing out")
+            self.assertGreater(dispatch_at, confirm_at, f"{function} signs out only after the question")
+            self.assertIn("if (!confirmed) return;", block)
+            self.assertIn("destructive: true", block)
+        # The two ask different questions because they do different things.
+        # `logoutOfficial` sends no account_ref, and Core reads that as "end
+        # every account this provider owns" — so the account-row sentence
+        # ("the remaining accounts keep the traffic") would be false on it.
+        account_block = self.ui.split(signatures["logoutAccount"], 1)[1].split("\n  };", 1)[0]
+        provider_block = self.ui.split(signatures["logoutOfficial"], 1)[1].split("\n  };", 1)[0]
+        self.assertIn('translate("relay.officialProviderLogoutBody", {', account_block)
+        self.assertNotIn('translate("relay.officialProviderLogoutBody"', provider_block)
+        self.assertIn('message: translate("relay.officialProviderSignOutAllBody", { name:', provider_block)
+        self.assertIn('title: translate("relay.officialProviderSignOutAllTitle")', provider_block)
 
     def test_an_account_backed_route_is_filed_under_the_account_it_answers_with(
         self,
@@ -1714,7 +1857,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # names the active tab and carries that pane's commands, so the pane
             # body opens on its content instead of repeating the tab name as a
             # heading and no pane draws an action bar of its own.
-            '<View style={[styles.settingsRailDetail, Platform.OS === "windows" && styles.settingsRailDetailWindows]}>',
+            '<View style={[styles.settingsRailDetail, isWindowsShell && styles.settingsRailDetailWindows]}>',
             '<SettingsDetailHeader title={dataManagementTabRows.find((row) => row.key === tab)?.cells[0] ?? ""} />',
             '{tab === "import" ? <PersistentScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>',
             '{tab === "export" ? <PersistentScrollView style={styles.dataManagementPane} contentContainerStyle={[styles.dataManagementPaneScrollContent, dataManagementPolishStyles.paneScrollContent]}>',
@@ -1949,7 +2092,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "runtimeValueCellWide: { flex: 1, minWidth: 0, maxWidth: SETTINGS_FIELD_TEXT_WIDTH",
             "runtimeValueSlot: { ...SETTINGS_FIELD_CELL }",
             "externalSettingsValueSlot: { ...SETTINGS_FIELD_VALUE_SLOT }",
-            "generalApiKeyField: { flex: 1, minWidth: 0, maxWidth: SETTINGS_FIELD_TEXT_WIDTH }",
+            "generalValueCellWide: { flex: 1, minWidth: 0, maxWidth: SETTINGS_FIELD_TEXT_WIDTH",
             'width="number" value={portValue}',
         ):
             self.assert_ui_has(marker)
@@ -1962,11 +2105,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             "generalRow: { ...SETTINGS_FIELD_ROW_INDENTED }",
             "generalRowLabel: { ...SETTINGS_FIELD_LABEL }",
+            "generalFieldList: { ...SETTINGS_FIELD_LIST }",
+            "generalField: { ...SETTINGS_FIELD }",
+            "generalValueSlot: { ...SETTINGS_FIELD_CELL }",
             "generalToggle: { ...SETTINGS_FIELD_SWITCH_SLOT }",
             "generalHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }",
             "generalHelpText: { ...SETTINGS_FIELD_HELP_TEXT }",
         ):
             self.assert_ui_has(marker)
+        # A tip belongs to the field above it, so the two are one block and the
+        # blocks are a list -- the same 2-and-10 rhythm every other settings
+        # pane has.  A row and a tip left as siblings of the section is what
+        # made this pane's help lines sit as far from their own field as from
+        # the next one.
+        self.assertIn("<View style={styles.generalFieldList}>", general)
+        self.assertIn("<View style={styles.generalField}>", general)
         self.assertIn('generalContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET', self.ui)
         self.assertIn("<View style={styles.generalHelpSlot}>", general)
         for restated in ("generalRowLabel: { width: 128", "generalRowHint:", "generalToggle: { width: 44", 'textAlign: "right"'):
@@ -2289,14 +2442,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('settingsDetailBodyWindows: { backgroundColor: WINDOWS_CONTROL.fill }', self.ui)
         self.assertIn('settingsRailDetailWindows: { backgroundColor: WINDOWS_CONTROL.fill }', self.ui)
         self.assertIn('settingsRailDetailHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fill }', self.ui)
-        self.assertIn('Platform.OS === "windows" && styles.settingsDetailBodyWindows', self.ui)
+        self.assertIn('isWindowsShell && styles.settingsDetailBodyWindows', self.ui)
         # The rail column keeps the shell colour like the sidebar, and the pane
         # behind it is the content surface: RouteSurface used to paint the window
         # colour behind every pane, so the shell's surface showed only as a
         # gutter around a white card.
         self.assertIn('settingsRailWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }', self.ui)
         self.assertIn('windowSurfaceShellWindows: { backgroundColor: WINDOWS_CONTROL.fill }', self.ui)
-        self.assertIn('shell && Platform.OS === "windows" && styles.windowSurfaceShellWindows', self.ui)
+        self.assertIn('shell && isWindowsShell && styles.windowSurfaceShellWindows', self.ui)
         self.assertIn('sourceRow: { minWidth: 0, marginHorizontal: 4, borderRadius: 4, borderBottomWidth: 0 }', self.native_controls)
         self.assertIn('sourceRowSelected: { backgroundColor: WINDOWS_CONTROL.fillSelected }', self.native_controls)
         self.assertIn('sourceSelectionIndicator:', self.native_controls)
@@ -2324,7 +2477,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('<Text numberOfLines={1} style={styles.settingsSidebarTitle}>{translate("app.title")}</Text>', shell)
         self.assertIn('<View style={styles.settingsSidebarSpacer} />', shell)
         self.assertIn('<View style={[styles.settingsPaneHeader, styles.settingsPaneHeaderIntegrated]}>', shell)
-        self.assertIn('<View style={[styles.settingsShellHeader, Platform.OS === "windows" && styles.settingsShellHeaderWindows]}>', shell)
+        self.assertIn('<View style={[styles.settingsShellHeader, isWindowsShell && styles.settingsShellHeaderWindows]}>', shell)
         self.assertIn('void native.versionInfo().then((next) => { if (active) setAppInfo(next); })', shell)
         self.assertNotIn("lastSelection", shell)
         self.assertNotIn('AboutPane', shell)
@@ -2465,7 +2618,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('void dispatch("logs.clear_recovery_and_cooldowns", { tab }, "logs").then(async () => {')
         self.assert_ui_has('NativeButton title={translate("logs.clearRecoveryCooldown")}')
         self.assert_ui_has('IconButton label="" symbol={paused ? "play" : "pause"}')
-        self.assert_ui_has('IconButton label="" symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs}')
+        self.assert_ui_has('IconButton label={Platform.OS === "web" ? translate("common.clear") : ""} symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs}')
         self.assertNotIn('dispatch("logs.refresh", { tab: selected }, "logs")', self.ui)
         self.assert_ui_has('translate("logs.apiKeyName")')
         self.assert_ui_has('value.api_key_name')
@@ -3300,7 +3453,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # The detail column is the same rail detail external clients render:
             # one shared header band naming the selected category above the
             # keyed surface.
-            '<View style={[styles.settingsRailDetail, Platform.OS === "windows" && styles.settingsRailDetailWindows]}>',
+            '<View style={[styles.settingsRailDetail, isWindowsShell && styles.settingsRailDetailWindows]}>',
             '<SettingsDetailHeader title={runtimeCategoryLabel(selectedCategory, translate)} />',
             '{(groups[selectedCategory] ?? []).map((item) => <RuntimeField',
             'translate("common.willClear")',
@@ -3784,9 +3937,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # only the flexible one: shrinking the flexible column alone left the
         # fixed ones past the frame, so the token pair was ellipsized and the
         # duration column sat outside the window invisible.
-        self.assertIn("const shrinkOrder = [...widened].sort((left, right) => right.width - left.width);", self.ui)
-        self.assertIn("const floor = columnFloor(column);", self.ui)
-        self.assertIn("function columnFloor(column: LogColumn): number {", self.ui)
+        # A frame that cannot hold the set scrolls; nothing is squeezed or
+        # dropped to make it fit.
+        self.assertIn("if (pool >= 0) return widened;", self.ui)
+        self.assertNotIn("function shrinkLogColumns(", self.ui)
+        self.assertNotIn("function columnFloor(", self.ui)
         # The row keeps its timestamp, and the fields a summary endpoint leaves
         # empty share one detail column instead of standing blank beside it.
         self.assertIn("    time,", columns)
@@ -3795,10 +3950,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # No detail column: the row's own double-click states every field, and
         # a second flexible column is what pushed the table past its frame.
         self.assertNotIn('{ ...detail, width: LOG_DETAIL_COLUMN_FLOOR }', columns)
-        self.assertIn('{ label: translate("logs.duration"), width: 62, value: (row) => row.duration }', columns)
-        # The flex floor belongs to the detail column alone, so a data column
-        # shrinks to its own declared width instead of to the text floor.
-        self.assertIn("if (column.detailFlex) return LOG_DETAIL_COLUMN_FLOOR;", self.ui)
+        self.assertIn('{ label: translate("logs.duration"), width: 66, value: (row) => row.duration }', columns)
+        # The detail column is the one flexible column, and a wide window's
+        # spare width is what grows it.
+        self.assertIn("const detail = { label: translate(\"logs.detail\"), width: 260, flex: true, detailFlex: true, value: (row: RenderedLogRecord) => row.detail };", self.ui)
         self.assertIn("flex: true, detailFlex: true, value: (row: RenderedLogRecord) => row.detail", self.ui)
         # The status column is drawn only when a row carries one: a summary
         # endpoint has no per-request outcome to report.
@@ -3822,11 +3977,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             columns,
         )
         self.assertIn("rows.some((row) => Boolean(row.cacheHit)),", logs)
-        # The width has to hold the widest cell this column can carry, not the
-        # header: a fully cached million-token prompt reads `100% · 1000.0`
-        # (84.8 pt at 13 pt) plus the cell's 8 pt padding on each side.
-        self.assertIn("const LOG_CACHE_COLUMN_WIDTH = 104;", self.ui)
-        self.assertGreaterEqual(104, 85 + 16)
+        # The cell is a rate and nothing else: `100%` is 34.1 pt in the table's
+        # 13 pt face, so the header (缓存命中, 51.6 pt) is what sets the width at
+        # 68 -- the cached token count that used to sit beside the rate cost 50 pt
+        # to restate a share the rate already gives.
+        self.assertIn("const LOG_CACHE_COLUMN_WIDTH = 68;", self.ui)
+        self.assertGreaterEqual(68, 52 + 16)
         # The row's own fields travel in the detail, one per line, rather than
         # as a re-splitting of the joined string.
         self.assertIn("const details = detailFields.flatMap", renderer)
@@ -5251,7 +5407,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # A domain-less service action must not silently reuse the route domain,
         # and the route's own actions must still require one.
         dispatch = self.ui.split("const enqueueDispatch =", 1)[1].split("const dispatch: Dispatch", 1)[0]
-        self.assertIn('if (!actionDomain && targetDomain !== null) return Promise.reject(new Error("A settings domain is required"));', dispatch)
+        self.assertIn('if (!actionDomain && targetDomain !== null) {', dispatch)
+        self.assertIn('const missingDomain: Error & { code?: string } = new Error("A settings domain is required");', dispatch)
+        # The refusal carries a code so `errorMessage` can state it in the UI's
+        # own language: the sentence alone was an English string in a Chinese app.
+        self.assertIn('missingDomain.code = "missing_domain";', dispatch)
+        self.assertIn("return Promise.reject(missingDomain);", dispatch)
         self.assertIn("const action = actionDomain === undefined ? { type, payload } : { domain: actionDomain, type, payload };", dispatch)
 
     def test_background_launch_switch_ships_every_locale(self) -> None:
@@ -5355,6 +5516,49 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # state, so the same word is never printed twice on one screen.
         self.assertIn('onStatus(translate(serviceRestart ? "service.restarted" : "service.started"));', general)
 
+    def test_the_web_page_is_one_key_and_no_second_port(self) -> None:
+        """The page lives on the proxy's own port, so General states no port.
+
+        A second port field is the failure this pins against: the page is
+        answered at ``/ui`` on the local port, so a "web port" would be a knob
+        that changes nothing.  The key is the one credential of this section and
+        it is drawn in the clear, on the same plaintext lease as the API key.
+        """
+
+        general = self.ui.split("function GeneralWorkspace(", 1)[1].split("function RuntimeWorkspace(", 1)[0]
+        for marker in (
+            'translate("general.webKey")',
+            'target="YOUNG_ROUTER_WEB_PASSWORD"',
+            'translate("general.webAddress")',
+            "webPageAddress",
+            "const webPageAddress = (() => {",
+            "`http://127.0.0.1:${port}/ui`",
+        ):
+            self.assertIn(marker, general)
+        for gone in (
+            "webHostRoute",
+            "commitWebHost",
+            "generateWebPassword",
+            'translate("general.webPort")',
+            'translate("general.webPassword")',
+        ):
+            self.assertNotIn(gone, general)
+        # The address is the one thing in a pane that is meant to be pressed:
+        # pressing it opens a page this window has already proved itself to, so
+        # the key never has to be copied into another browser.
+        for marker in (
+            'accessibilityRole="link"',
+            "void openWebPage()",
+            "await ipc.webLaunchUrl()",
+            "native.openExternalURL?.(address)",
+        ):
+            self.assertIn(marker, general)
+        for locale in (self.zh, self.en):
+            self.assertIn('"general.webKey"', locale)
+            self.assertIn('"general.webAddress"', locale)
+            for gone in ('"general.webPort"', '"general.webPassword"', '"general.webHost"'):
+                self.assertNotIn(gone, locale)
+
     def test_background_launch_is_a_promise_the_general_pane_keeps_and_the_launch_honors(self) -> None:
         """启动后在后台运行 is off by default, so a launch presents its window.
 
@@ -5408,7 +5612,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # graying out while the service restarts.
         self.assertIn("busy={serviceBusy} disabled={snapshot === undefined || (busy && !serviceBusy)}", general)
         self.assertIn("{serviceActionAvailable ? <NativeButton", general)
-        self.assertIn("generalServiceAction: { minWidth: 96 }", self.ui)
+        self.assertIn("generalActionSlot: { width: 72", self.ui)
         # The control is part of the 服务 row inside the pane, never of the
         # window's bottom action bar (which stays Close/Apply only).
         service_row = general.split('translate("general.serviceState")', 1)[1].split('translate("general.port")', 1)[0]
@@ -5424,65 +5628,252 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "Math.round(tokens / 100) / 10",
             "const duration = formatLogDuration(compactLogValue(value.duration_ms));",
             "`${formatLogTokens(sentTokens)} / ${formatLogTokens(receivedTokens)}`",
-            "{ label: translate(\"logs.duration\"), width: 62, value: (row) => row.duration }",
+            "{ label: translate(\"logs.duration\"), width: 66, value: (row) => row.duration }",
             "{ label: translate(\"logs.tokenCountK\"), width: LOG_TOKEN_PAIR_COLUMN_WIDTH, value: (row) => row.tokens }",
-            "const LOG_TOKEN_PAIR_COLUMN_WIDTH = 96;",
+            "const LOG_TOKEN_PAIR_COLUMN_WIDTH = 108;",
         ):
             self.assertIn(marker, self.ui)
 
-    def test_request_log_states_a_protocol_on_each_side_of_its_models(self) -> None:
-        """Each model column is preceded by the wire that carried it.
+    def test_every_log_column_is_narrowed_to_what_it_shows(self) -> None:
+        """A declared width is a ceiling; the content decides what it spends.
 
-        A request row reads as one inbound pair and one outbound pair: the wire
-        the client called in on and the model it named, then the wire the
-        attempt was adapted onto and the model that answered it.  The two
-        protocol columns answer different questions -- an inbound Responses turn
-        served by a chat-only relay reads ``Responses | deepseek | Chat |
-        deepseek`` -- so neither one may be drawn beside the other's model.
+        The request table declared 96 pt for the token pair, 78 for the relay,
+        68 for the status and 62 for the duration, and spent the difference on
+        nothing.  On a 1280 pt window that slack is what put the cache share and
+        the detail column behind the frame edge, so a reader had to scroll
+        sideways to reach a number the row was already reporting.
+
+        The pass is pinned with the two things it must not do: it never widens
+        a column past its ceiling, and it leaves the flex column alone, because
+        the space it frees is what `fitLogColumns` grows the detail with.
+        """
+
+        self.assert_ui_has("function fitLogColumnsToContent(rows: RenderedLogRecord[], columns: LogColumn[]): LogColumn[] {")
+        self.assert_ui_has("if (column.flex) return column;")
+        self.assert_ui_has("const measured = nativeControlTextWidth(column.value(row));")
+        self.assert_ui_has("return needed < column.width ? { ...column, width: needed } : column;")
+        # The cell's own padding, plus the margin between an estimate and the
+        # host's glyph run; the header is measured heavier because it is drawn
+        # semibold and, in English, in upper case.
+        self.assert_ui_has("const LOG_CELL_PADDING = 18;")
+        self.assert_ui_has("const LOG_PROTOCOL_COLUMN_SIZE = 56;")
+        self.assert_ui_has("const needed = Math.max(column.floor ?? 0, Math.ceil(widest + LOG_CELL_PADDING));")
+        self.assert_ui_has("const LOG_HEADER_WEIGHT = 1.2;")
+        self.assert_ui_has("Math.ceil(logHeaderTextWidth(column.label))")
+        # Only an all-caps Latin header runs wider than its estimate; a CJK
+        # header estimates level, so weighting it would be pure blank space.
+        self.assert_ui_has("const latinOnly = !/[^\\u0000-\\u024f]/u.test(label);")
+        self.assert_ui_has("return nativeControlTextWidth(label) * (latinOnly ? LOG_HEADER_WEIGHT : 1);")
+        # The pass runs before the flex distribution, so the space it frees is
+        # the detail column's.
+        self.assert_ui_has("fitLogColumnsToContent(rows, logColumns(")
+        self.assert_ui_has("      )),\n      tableWidth,")
+        # The two columns that were being clipped by the slack now declare a
+        # ceiling that holds their widest cell.
+        self.assert_ui_has("const LOG_TOKEN_PAIR_COLUMN_WIDTH = 108;")
+        self.assert_ui_has("const LOG_CACHE_COLUMN_WIDTH = 68;")
+        # The detail column is declared once, and the flex rule grows it into
+        # whatever the measured columns leave.
+        self.assert_ui_has("const LOG_DETAIL_COLUMN_WIDTH = 240;")
+        self.assert_ui_has("{ ...detail, width: LOG_DETAIL_COLUMN_WIDTH },")
+
+    def test_a_narrow_frame_scrolls_instead_of_hiding_a_column(self) -> None:
+        """Every column a row has stays; a frame too narrow scrolls sideways.
+
+        Hiding the relay, the key, or the row's message when the window is
+        narrow made the same log read differently at two window sizes, and a
+        row that does not name the key it spent is not a row a reader can act
+        on.  The columns stay, `scrollTrailingColumnOverflow` puts the scroller
+        under them, and `fitLogColumns` returns the set untouched once the
+        frame has run out of room.
+        """
+
+        # No column is ever dropped or squeezed to fit: the fit hands back the
+        # set it was given and the native table scrolls.
+        self.assert_ui_not_has("dropPriority")
+        self.assert_ui_not_has("shrinkLogColumns")
+        self.assert_ui_not_has("isRepeated(")
+        self.assert_ui_has("if (pool >= 0) return widened;")
+        self.assert_ui_has("// Step two: the frame is narrower than the set needs.")
+        self.assert_ui_has("return widened;\n}")
+        self.assertIn(
+            "columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths scrollTrailingColumnOverflow",
+            self.ui,
+        )
+        # The relay and the key are unconditional columns of a request row.
+        self.assert_ui_has('{ label: translate("common.provider"), width: 78, value: (row) => row.provider },')
+        self.assert_ui_has('{ label: translate("logs.apiKeyName"), width: 64, value: (row) => row.apiKeyName },')
+
+    def test_the_cache_column_states_a_rate_with_its_own_unit(self) -> None:
+        """`100%` is the whole fact; the count beside it was a second spelling.
+
+        The cell used to read `100% · 646.8` -- a rate and the cached token count
+        it was computed from.  The count is a second number for the same fact,
+        and under a header that says 缓存命中 a bare `100` would read as a rate
+        missing its unit.  A row with no input count has no share to state, and
+        states nothing rather than a count that looks like a rate.
+        """
+
+        self.assert_ui_has("function formatLogCacheHit(cached: string, input: string): string {")
+        self.assert_ui_has("return `${Math.round(share * 100)}%`;")
+        self.assert_ui_has("if (!input || !Number.isFinite(inputTokens) || inputTokens <= 0) {")
+        self.assert_ui_not_has("`${rate} · ${count}`")
+        # With the count gone the header is the widest thing the column holds.
+        self.assert_ui_has("const LOG_CACHE_COLUMN_WIDTH = 68;")
+
+    def test_the_model_columns_hold_a_real_model_name(self) -> None:
+        """Both model columns hold `deepseek-v4.1-flash` whole.
+
+        That id measures 123.2 pt in the table's 13 pt face, so 140 is it plus
+        the cell's 8 pt padding on each side.  The width is a floor as well as a
+        declaration: the estimator is not allowed to size the column below it,
+        and a longer id is ellipsized rather than widening every row.
+        """
+
+        self.assert_ui_has("const LOG_MODEL_COLUMN_WIDTH = 140;")
+        self.assert_ui_has('{ label: translate("logs.clientModel"), width: LOG_MODEL_COLUMN_WIDTH, floor: LOG_MODEL_COLUMN_WIDTH, value: (row) => row.model },')
+        self.assert_ui_has('{ label: translate("logs.upstreamModel"), width: LOG_MODEL_COLUMN_WIDTH, floor: LOG_MODEL_COLUMN_WIDTH, value: (row) => row.upstreamModel },')
+        # The floor bounds the content pass too, so an estimate that reads the
+        # name short cannot narrow the column under it.
+        self.assert_ui_has("const needed = Math.max(column.floor ?? 0, Math.ceil(widest + LOG_CELL_PADDING));")
+        self.assertGreaterEqual(140, 124 + 16)
+
+    def test_request_log_states_a_turns_two_wires_in_one_cell(self) -> None:
+        """One protocol column, read the way the turn travelled.
+
+        The row states which wire the client called in on and which wire the
+        attempt left on.  Two columns spent 192 pt to repeat `Messages |
+        Messages` in half the rows and left the reader to pair them up; the one
+        column states the adaption once, and sits in the same left-to-right
+        order as the model pair beside it.
+
+        The cell is abbreviated to one letter per wire (`M→C`) because a
+        routing log is scanned, not read: hovering the cell states the pair in
+        full.  The header names the pair (协议 / PROTOCOL) rather than an end --
+        入站/出站 named a station whose owner the reader had to guess.
         """
 
         self.assert_ui_has('if (tab === "requests") return [')
         requests = self.ui.split('if (tab === "requests") return [', 1)[1].split(
             'if (tab === "actions")', 1
         )[0]
-        inbound = requests.index('translate("logs.inboundProtocol")')
-        inbound_model = requests.index('translate("logs.inboundModel")')
-        outbound = requests.index('translate("logs.outboundProtocol")')
-        outbound_model = requests.index('translate("logs.outboundModel")')
-        self.assertLess(inbound, inbound_model)
-        self.assertLess(inbound_model, outbound)
-        self.assertLess(outbound, outbound_model)
-        # In the Log window a turn's direction is named once, in these words:
-        # the request rows and the recovery rows both read 入站模型 / 出站模型,
-        # because this window reports where a turn travelled.  The providers
-        # pane keeps 公开模型 / 上游模型 -- that vocabulary is about how a
-        # route is configured.
-        self.assert_ui_has('{ label: translate("logs.inboundModel"), width: 142, value: (row) => row.model },')
-        self.assert_ui_has('{ label: translate("logs.outboundModel"), width: 142, value: (row) => row.upstreamModel },')
+        protocol = requests.index('translate("logs.protocol")')
+        client_model = requests.index('translate("logs.clientModel")')
+        upstream_model = requests.index('translate("logs.upstreamModel")')
+        self.assertLess(protocol, client_model)
+        self.assertLess(client_model, upstream_model)
+        # One cell, carrying both ends -- not a column per end.
+        self.assertEqual(1, requests.count("LOG_PROTOCOL_COLUMN_WIDTH"))
+        self.assert_ui_has('value: (row) => row.protocol,')
+        self.assert_ui_has('tooltip: (row) => row.protocolSpelled,')
+        # The short form is one letter per wire, and keeps the ends' order.
+        self.assert_ui_has('function logProtocolShortLabel(value: unknown): string {')
+        self.assert_ui_has('if (normalized.includes("responses")) return "R";')
+        self.assert_ui_has('if (normalized.includes("chat")) return "C";')
+        self.assert_ui_has('if (normalized.includes("messages") || normalized.includes("anthropic")) return "M";')
+        self.assert_ui_has('if (normalized.includes("image")) return "I";')
+        self.assert_ui_has('function logProtocolShortPair(client: string, upstream: string): string {')
+        self.assert_ui_has('[logProtocolShortLabel(client), logProtocolShortLabel(upstream)].filter(Boolean).join("→");')
+        # The long form is what the cell keeps for its tooltip: an unknown end
+        # is dropped rather than printed as a bare arrow, and a row with
+        # neither end keeps an empty cell.
+        self.assert_ui_has('function logProtocolPair(client: string, upstream: string): string {')
+        self.assert_ui_has('return [client, upstream].filter(Boolean).join(" → ");')
+        # In the Log window a turn's two ends are named once, in these words:
+        # the request rows and the recovery rows both read 客户端模型 / 上游模型.
+        self.assert_ui_has('{ label: translate("logs.clientModel"), width: 142, value: (row) => row.model },')
+        self.assert_ui_has('{ label: translate("logs.upstreamModel"), width: 142, value: (row) => row.upstreamModel },')
         # A protocol is a wire name, never prose; the images wire has a name of
         # its own instead of the generic fallback.
         self.assert_ui_has('if (normalized.includes("image")) return translate("logs.routeTrace.protocolImages");')
-        self.assertIn('"logs.inboundProtocol": "INBOUND"', self.en)
-        self.assertIn('"logs.outboundProtocol": "OUTBOUND"', self.en)
-        self.assertIn('"logs.inboundModel": "Inbound model"', self.en)
-        self.assertIn('"logs.outboundModel": "Outbound model"', self.en)
-        self.assertIn('"logs.inboundProtocol": "入站协议"', self.zh)
-        self.assertIn('"logs.outboundProtocol": "出站协议"', self.zh)
-        self.assertIn('"logs.inboundModel": "入站模型"', self.zh)
-        self.assertIn('"logs.outboundModel": "出站模型"', self.zh)
+        self.assertIn('"logs.protocol": "PROTOCOL"', self.en)
+        self.assertIn('"logs.clientModel": "Client model"', self.en)
+        self.assertIn('"logs.upstreamModel": "Upstream model"', self.en)
+        self.assertIn('"logs.protocol": "协议"', self.zh)
+        self.assertIn('"logs.clientModel": "客户端模型"', self.zh)
+        self.assertIn('"logs.upstreamModel": "上游模型"', self.zh)
+        # The per-end headers are gone, not merely unused: a translation key
+        # that no column reads is a name waiting to come back.
+        for gone in ("logs.clientProtocol", "logs.upstreamProtocol"):
+            self.assertNotIn(gone, self.en)
+            self.assertNotIn(gone, self.zh)
+            self.assertNotIn(gone, self.ui)
         translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
         for key in (
-            "logs.inboundProtocol",
-            "logs.outboundProtocol",
-            "logs.inboundModel",
-            "logs.outboundModel",
+            "logs.protocol",
+            "logs.clientModel",
+            "logs.upstreamModel",
             "logs.routeTrace.protocolImages",
         ):
             self.assertIn(f'| "{key}"', translation_keys)
-        # Core records the two names; the pane only phrases them, and a row that
-        # carries neither leaves both cells empty.
-        self.assert_ui_has('tab === "requests" ? logProtocolLabel(value.client_surface, translate) : "";')
-        self.assert_ui_has('tab === "requests" ? logProtocolLabel(value.upstream_surface, translate) : "";')
+        # Core records the two names; the pane only phrases them.
+        self.assert_ui_has('logProtocolLabel(value.client_surface, translate),')
+        self.assert_ui_has('logProtocolLabel(value.upstream_surface, translate),')
+
+    def test_a_shortened_cell_states_its_long_form_on_hover(self) -> None:
+        """A one-letter cell is only honest if hovering restores the wire names.
+
+        The native table already sets every cell's tooltip to its own text, so
+        an abbreviated cell would tooltip `M→C` -- the same riddle twice.  The
+        tooltip therefore travels as its own per-cell list, alongside `cells`
+        and by the same positional rule, and the AppKit side prefers it over
+        the cell's text.  The pathway is pinned at every hop: a prop dropped in
+        one file would still typecheck, and the cell would simply go quiet.
+        """
+
+        mac_native = MACOS_CONTROLS.read_text(encoding="utf-8")
+        mac_spec = (ROOT / "rn/packages/shared/src/ui/macos/NativeTableNativeComponent.ts").read_text(encoding="utf-8")
+        # One tooltip per cell, declared as the macOS-only prop it is: the
+        # Windows table is a React list with no tooltip service to feed.
+        self.assertIn("cellTooltips?: ReadonlyArray<string>;", mac_spec)
+        spec_source = (ROOT / "rn/packages/shared/src/ui/nativeSpecs/NativeTable.spec.ts").read_text(encoding="utf-8")
+        self.assertIn("  // @macos-only\n  cellTooltips?: ReadonlyArray<string>;", spec_source)
+        self.assertIn("tooltips?: string[];", self.native_controls)
+        self.assertIn("cellTooltips: rows.some((row) => (row.tooltips?.length ?? 0) > 0)", self.native_controls)
+        self.assertIn("cellTooltips={cellTooltips}", self.appkit_controls)
+        # The AppKit cell prefers the declared tooltip and falls back to its own
+        # text, which is what every other column in the app relies on.
+        native_table = re.sub(r"\s+", " ", mac_native)
+        self.assertIn(
+            "NSString *cellTooltip = cellIndex < viewProps.cellTooltips.size() "
+            "? StringFromStdString(viewProps.cellTooltips[cellIndex]) : @\"\";",
+            native_table,
+        )
+        self.assertIn("NSString *tooltip = cellTooltip.length > 0 ? cellTooltip : value;", native_table)
+        # A tooltip-only change still has to re-tile the rows, or the cell keeps
+        # the tooltip it was first drawn with.
+        self.assertIn("oldViewProps.cellTooltips != newViewProps.cellTooltips;", native_table)
+
+    def test_the_anthropic_protocol_option_names_its_wire(self) -> None:
+        """A protocol option states a wire, and its name is ``Anthropic Messages``.
+
+        ``Anthropic`` named the company; the other two options in the same
+        picker name wires (``OpenAI Responses``, ``OpenAI Chat Completions``),
+        and a reader choosing a fallback protocol is choosing a wire.
+        """
+
+        self.assertIn('"providers.anthropic": "Anthropic Messages"', self.en)
+        self.assertIn('"providers.anthropic": "Anthropic Messages"', self.zh)
+        self.assert_ui_has('{ value: "anthropic", label: translate("providers.anthropic") },')
+        self.assert_ui_has('if (surface === "anthropic") return translate("providers.anthropic");')
+        translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
+        self.assertIn('| "providers.anthropic"', translation_keys)
+
+    def test_a_stopped_turn_says_who_stopped_it(self) -> None:
+        """The reason a turn closed is part of the row, in both languages.
+
+        ``aborted`` used to be written only by the runtime's own window or by a
+        restart, so a row a person stopped read like a runtime failure.  The
+        client-facing generator now closes its own row and states
+        ``client_disconnect``; the pane has to name that case instead of
+        falling through to the raw reason.
+        """
+
+        self.assert_ui_has('case "client_disconnect": return translate("logs.aborted.reasonClientDisconnect");')
+        self.assertIn('"logs.aborted.reasonClientDisconnect": "Stopped in the client"', self.en)
+        self.assertIn('"logs.aborted.reasonClientDisconnect": "客户端已停止"', self.zh)
+        translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
+        self.assertIn('| "logs.aborted.reasonClientDisconnect"', translation_keys)
 
     def test_logs_keep_the_legacy_dense_toolbar_and_table_frame(self) -> None:
         for marker in (
@@ -5498,9 +5889,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "function logColumns(",
             "const LOG_TIME_COLUMN_WIDTH = 120",
             "const time = { label: translate(\"logs.localTime\"), width: LOG_TIME_COLUMN_WIDTH,",
-            "const LOG_PROTOCOL_COLUMN_WIDTH = 82",
-            '{ label: translate("logs.inboundProtocol"), width: LOG_PROTOCOL_COLUMN_WIDTH, value: (row) => row.inboundProtocol }',
-            '{ label: translate("logs.outboundProtocol"), width: LOG_PROTOCOL_COLUMN_WIDTH, value: (row) => row.outboundProtocol }',
+            "const LOG_PROTOCOL_COLUMN_WIDTH = 90",
+            'value: (row) => row.protocol,',
+            'tooltip: (row) => row.protocolSpelled,',
+            "const LOG_PROTOCOL_COLUMN_WIDTH = 90",
             '<NativeTable columns={nativeTableColumns} rows={nativeTableRows}',
             "translate(\"logs.failed\")",
             "function requestStatusLabel(",
@@ -5526,7 +5918,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '() => selected === "route-trace" ? [] : rows.map((row)',
             "selectedKey={selectedKey}",
             "logTableFrame:",
-            "logFilterRow: { flex: 1, minWidth: 50",
+            "logFilterRow: { flex: 1, minWidth: Platform.OS === \"web\" ? 180 : 50",
             "logToolbarSpacer: { flex: 1, minWidth: 4",
             "logActionsRow: { height: 24, flexDirection: \"row\"",
             "onlineUsageSourcePicker: { width: 176, minWidth: 120",
@@ -5540,7 +5932,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # state are its idle text, not a second bar under it.
             "const statusLine = [",
             "useEffect(() => { onStatus?.(statusLine); }, [onStatus, statusLine]);",
-            "logsToolbar: { width: \"100%\", minWidth: 0, height: 24",
+            "logsToolbar: { width: \"100%\", minWidth: 0, minHeight: 24, height: Platform.OS === \"web\" ? undefined : 24",
             "logsTabs: { width: undefined, minWidth: 389, height: 24 }",
             "logRangeMessageSlot: { width: \"100%\", minWidth: 0, height: 16",
         ):
@@ -5612,17 +6004,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assert_ui_has(marker)
 
-    def test_logs_always_show_inbound_and_outbound_model_columns(self) -> None:
+    def test_logs_always_show_client_and_upstream_model_columns(self) -> None:
         # The two model columns are never dropped when a page happens to hold
-        # one model: they are the row's identity.  In this window they are
-        # named for the direction a turn travelled -- 入站模型 / 出站模型 -- so
-        # a reader never has to translate the providers pane's configuration
-        # vocabulary (公开模型 / 上游模型) into a request's two ends.
+        # one model: they are the row's identity.  In this window they name the
+        # turn's two ends -- 客户端模型 / 上游模型 -- so a reader never has to
+        # translate the providers pane's configuration vocabulary into a
+        # request's two ends, and 入站/出站 no longer asks whose station it was.
         for marker in (
             "const publicModel = compactLogValue(value.public_model ?? value.model_group ?? value.model);",
             "upstreamModel: compactUpstreamLogModel(upstreamModel)",
-            '{ label: translate("logs.inboundModel"), width: 142, value: (row) => row.model }',
-            '{ label: translate("logs.outboundModel"), width: 142, value: (row) => row.upstreamModel }',
+            '{ label: translate("logs.clientModel"), width: 142, value: (row) => row.model }',
+            '{ label: translate("logs.upstreamModel"), width: 142, value: (row) => row.upstreamModel }',
         ):
             self.assert_ui_has(marker)
         self.assertNotIn("function conditionalUpstreamLogModel(", self.ui)
@@ -7327,9 +7719,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertEqual(1, shared.count("striped"))
         self.assertNotIn("striped={false}", shared)
         self.assertNotIn("<NativeTable", relay)
-        # Three rows plus the header, at each platform's own row height: a
-        # Windows row is 30 pt tall, so one fixed 84 showed a single account.
-        self.assertIn('tableHeight = Platform.OS === "windows" ? 116 : 84', shared)
+        # Three rows plus the header, at each platform's own metrics: AppKit's
+        # compact table draws a 24 pt header over 22 pt rows (24 + 66 + 2 = 92)
+        # and the Windows/browser table a 30 pt header over 30 pt rows
+        # (30 + 90 + 2 = 122).  One fixed 84 showed a single account on macOS,
+        # and 116 clipped the third row on the 30 pt hosts.
+        self.assertIn('tableHeight = Platform.OS === "macos" ? 92 : 122', shared)
 
     def test_relay_resource_columns_fit_the_initial_minimum_viewport(self) -> None:
         """The unified keys table is a single readable column in the detail pane."""
@@ -7442,7 +7837,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # A probe is one action of this child surface: it keeps the window's
         # controls live, so the reader can close it or fix a field while the
         # server is being asked.
-        self.assert_ui_has('const probeWebDavDetails = (values: UnknownRecord): Promise<void> => runDataManagement("webdav", () => ipc.probe(undefined, undefined, "webdav", values), (value) => (asRecord(value).ok === true ? "webdav.probeOk" : "webdav.probeFailed"), true);')
+        self.assert_ui_has('const probeWebDavDetails = (values: UnknownRecord): Promise<void> => runDataManagement("webdav", () => ipc.probe(undefined, undefined, "webdav", values), (value) => {')
+        # A reachable collection that takes no writes is not 连接正常: the folder
+        # a reader picked decides whether a push can ever land there.
+        self.assert_ui_has('return result.writable === false ? "webdav.probeReadOnly" : "webdav.probeOk";')
         self.assert_ui_has('const waiting = busy || saving;')
         self.assertNotIn('const waiting = busy || saving || testing || syncing;', self.ui)
         self.assert_ui_has('await onProbe(webDavDetailProbe(values));')
@@ -7965,7 +8363,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('runMutationOnce(`route.delete:${activeRoute.key}`, () => native.showConfirmation({', self.ui)
         self.assertIn('dispatch("model.delete", { provider_id: routeProviderID, model_id: routeModelID })', self.ui)
         # A selected public model deletes its whole group in one action.
-        self.assertIn("const selectedGroup = selectedPublicModel !== undefined ? routeGroups.find((group) => group.name === selectedPublicModel) : undefined;", self.ui)
+        self.assertIn("const selectedGroup = selectedPublicModel !== undefined ? routeGroups.find((group) => publicModelKey(group.name) === publicModelKey(selectedPublicModel)) : undefined;", self.ui)
         self.assertIn('dispatch("public.model_delete", { public_model: selectedGroup.name })', self.ui)
         self.assertIn('translate("providers.deletePublicModelMessage", { routes: selectedGroup.entries.length })', self.ui)
         self.assertIn('{activeRoute || selectedPublicModel !== undefined ? <IconButton label="−"', self.ui)
@@ -7975,8 +8373,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         domain = (ROOT / "young_router/core/domains/providers_models.py").read_text(encoding="utf-8")
         self.assertIn("def _delete_public_model(self, data: Mapping[str, Any]) -> None:", domain)
         self.assertIn('"public_model_delete", "public_models_delete", "delete_public_model"', domain)
-        # The new row joins the group the user is looking at, as a disabled draft.
-        self.assertIn("const publicModel = (selectedPublicModel ?? activeRoute?.publicModel ?? \"\").trim();", self.ui)
+        # The new row joins the group the user is looking at, as a disabled draft,
+        # and states the group's own spelling rather than a third case of it.
+        self.assertIn("const publicModel = (selectedPublicModel ?? activePublicGroupName).trim();", self.ui)
         self.assertIn("const knownModelIds = new Set(targetModels.map(editorIdentifier));", self.ui)
         # The new row is selected through the pending key, never by a key the
         # routes list does not carry yet (that would be repaired to row one).

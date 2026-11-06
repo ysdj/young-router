@@ -648,6 +648,11 @@ if [[ -f node_modules/typescript/bin/tsc ]]; then
   RN_CONTRACT_PID=$!
   pnpm run code-editor:build &
   RN_EDITOR_PID=$!
+  # The browser page ships inside Core, so it is a build product of this
+  # artifact like the code editor's HTML: a build without it would install a
+  # General pane naming an address nothing answers.
+  pnpm run build:web &
+  RN_WEB_PID=$!
   pnpm run typecheck:no-editor &
   RN_TYPECHECK_PID=$!
 else
@@ -660,7 +665,7 @@ wait_static_checks() {
   if [[ -n "${STATIC_CHECKS_PID:-}" ]]; then
     wait "$STATIC_CHECKS_PID" || failed=1
   else
-    for pid in "$RN_TESTS_PID" "$RN_CONTRACT_PID" "$RN_EDITOR_PID" "$RN_TYPECHECK_PID"; do
+    for pid in "$RN_TESTS_PID" "$RN_CONTRACT_PID" "$RN_EDITOR_PID" "$RN_WEB_PID" "$RN_TYPECHECK_PID"; do
       wait "$pid" || failed=1
     done
   fi
@@ -786,18 +791,26 @@ rsync -a \
   --exclude '*.pyc' \
   --exclude '*.pyo' \
   "$PROJECT_ROOT/young_router/" "$CORE/young_router/"
-# Filling the Core is seven copies that share nothing: five staged adapters, the
-# portable runtime, and its Node.  Together they are about 1.3 GB, and `cp -ac`
-# clones rather than copies, so run one after another they still spent a dozen
-# seconds -- and every second was a copy waiting for a volume that had nothing
-# else to do.  They run together here, on the same trees with the same per-copy
-# outcome, and the group is waited on and checked as a group before anything
-# reads what they wrote.
+# Filling the Core is eight copies that share nothing: the browser page, five
+# staged adapters, the portable runtime, and its Node.  Together they are about
+# 1.3 GB, and `cp -ac` clones rather than copies, so run one after another they
+# still spent a dozen seconds -- and every second was a copy waiting for a volume
+# that had nothing else to do.  They run together here, on the same trees with
+# the same per-copy outcome, and the group is waited on and checked as a group
+# before anything reads what they wrote.
+#
+# The helper is defined before its first call: a call above the definition is
+# `command not found`, and this script fails *after* Xcode has built the host.
 COPY_PIDS=()
 start_copy() {
   "$@" &
   COPY_PIDS+=("$!")
 }
+# The browser page is part of the product: Core serves it from ``Core/web`` at
+# the local port behind the General pane's key, so a build that did not put it
+# there ships a pane pointing at nothing.  It is built from the same shared UI
+# the two native hosts load, and the build refuses rather than omitting it.
+start_copy copy_tree "$PROJECT_ROOT/rn/apps/web/dist" "$CORE/web"
 start_copy copy_tree "$VERIDROP_WORK" "$CORE/young_router/adapters/veridrop"
 start_copy copy_tree "$CONNECT_WORKBUDDY_WORK" "$CORE/young_router/adapters/connect-workbuddy"
 start_copy copy_tree "$DSH_VISION_ROUTER_WORK" "$CORE/young_router/adapters/dsh-vision-router"
@@ -1015,6 +1028,10 @@ fi
 }
 [[ -f "$CORE/young_router/config/api.py" ]] || {
   echo "Bundled Core dependencies are incomplete." >&2
+  exit 5
+}
+[[ -f "$CORE/web/index.html" && -f "$CORE/web/bundle.js" ]] || {
+  echo "The bundled browser page is missing; General's web address would answer nothing." >&2
   exit 5
 }
 [[ -x "$CORE/runtime/bin/python" ]] || {
@@ -1265,7 +1282,7 @@ find "$PYCACHE_SMOKE_DIR" -name '__init__.cpython-312.pyc' -path '*litellm*' -pr
   exit 5
 }
 
-PYTHONDONTWRITEBYTECODE=0 PYTHONPATH="$CORE" "$CORE/runtime/bin/python" -c 'import litellm.proxy.proxy_server, young_router.core, young_router.core.__main__, young_router.proxy.macos_proxy, young_router.core.codex_config, young_router.config, young_router.core.configuration_package, young_router.core.external_provider_import, young_router.webdav.core'
+PYTHONDONTWRITEBYTECODE=0 PYTHONPATH="$CORE" "$CORE/runtime/bin/python" -c 'import litellm.proxy.proxy_server, young_router.core, young_router.core.__main__, young_router.proxy.macos_proxy, young_router.proxy.web_forward, young_router.core.codex_config, young_router.config, young_router.core.configuration_package, young_router.core.external_provider_import, young_router.webdav.core'
 PYTHONDONTWRITEBYTECODE=1 "$CORE/runtime/bin/litellm" --help >/dev/null
 # Prove the bundle still works from somewhere other than where it was built:
 # that is what the installed app does, and an absolute path baked into a

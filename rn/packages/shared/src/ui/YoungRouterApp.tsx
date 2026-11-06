@@ -1,6 +1,6 @@
 import type { TranslationKey } from "../i18n/types";
 import React, { createContext, useCallback, useEffect, useMemo, useRef, useState, useContext } from "react";
-import { Animated, AppState, FlatList, Image, Platform, PlatformColor, Pressable, ScrollView, StyleSheet, Text, View, type HostInstance, type ScrollViewProps, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
+import { AccessibilityInfo, Animated, AppState, FlatList, Image, Platform, PlatformColor, Pressable, ScrollView, StyleSheet, Text, View, type HostInstance, type ScrollViewProps, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
 import { createTranslator } from "../i18n";
 import { assistantSettingOptions, type AssistantSettingOption } from "../i18n/assistantSettingsI18n";
 import { runtimeCategoryLabel, runtimeFieldHelp, runtimeFieldLabel, runtimeOptionLabel, runtimeUnitLabel } from "../i18n/runtimeSettingsI18n";
@@ -8,6 +8,7 @@ import { canonicalWindowRoute, isSettingsPaneRoute, isSettingsShellRoute, LOG_TA
 import { NativeButton, NativeBusySpinner, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeSecureTextInput, NativeSegmentedControl, NativeTable, NativeTextField, NativeToggle, WINDOWS_CONTROL, nativeControlTextWidth } from "./NativeControls";
 import { CodeEditorWebView, editorMenuLabels, readOnlyCodeEditorHtml } from "./code-editor/CodeEditorWebView";
 import { modelGroupRowKey, modelIDFromRowKey, modelRowKey } from "./modelRowKeys";
+import { groupRoutesByPublicModel, publicModelKey } from "./publicModelNames";
 import { AccountsTable } from "./AccountsTable";
 import { usePendingAction } from "./pendingAction";
 import {
@@ -776,10 +777,23 @@ const COLUMN_GAP = 8;
  * 290 pt pane keeps the total; this is what hands its room to the controls.
  */
 const MODEL_INSPECTOR_LABEL_WIDTH = 89;
-//: The widest the 账号 column may grow.  The inspector is 320 pt wide and the
-//: status column keeps 74, so this is everything a signed-in address can have
-//: before the two columns together stop fitting the pane.
+//: The widest the 账号 column may grow.  The inspector is 320 pt wide; the
+//: status column beside it is measured (see `AUTH_STATUS_COLUMN_*` below), so
+//: this is what a signed-in address can have before the two columns stop
+//: fitting the pane.  A name too long for any column is still stated whole by
+//: the editor below the list.
 const AUTH_ACCOUNT_COLUMN_MAX_WIDTH = 208;
+//: What the account list may use in total: the inspector's 320 pt less the
+//: editor's 16 pt of right padding.  The two columns are budgeted against it
+//: together, or a long address beside a wide status pushes the pair past the
+//: pane and the table takes the deficit out of both.
+const AUTH_ACCOUNT_COLUMNS_WIDTH_BUDGET = 304;
+//: The status column is measured, not fixed.  It was a literal 74 pt, which
+//: leaves 58 pt of text room after the cell's 16 pt of padding; `Signed out`
+//: measures 66 pt and `Signing in` 60 pt, so in English both elided to the same
+//: `Signed…` and a signed-out account read exactly like one mid-sign-in.
+const AUTH_STATUS_COLUMN_MIN_WIDTH = 56;
+const AUTH_STATUS_COLUMN_MAX_WIDTH = 92;
 const DSH_VISION_ROUTER_QUICK_KEYS = [
   "YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED",
   "YOUNG_ROUTER_DSH_VISION_ROUTER_BACKEND",
@@ -1348,6 +1362,12 @@ function errorMessage(reason: unknown, translate: Translate): string {
     // effect — the same way every other rolled-back write reports itself.
     revision_conflict: "common.notApplied",
     validation_failed: "error.validationFailed",
+    // Both of these are raised by this app, not by Core: a write that named
+    // no settings document, and a probe whose recommended surface arrived
+    // after the model it belonged to was removed. Each states the way out in
+    // the UI language instead of showing the thrown sentence as it stands.
+    missing_domain: "error.missingDomain",
+    model_unavailable: "error.modelUnavailable",
     // Core names the domain that refused the write: a provider/model draft
     // that is genuinely unusable reads as a validation failure, while a relay
     // that is not ready states its own cause instead of blaming the edit.
@@ -1365,6 +1385,11 @@ function errorMessage(reason: unknown, translate: Translate): string {
     // A write that rolled back: name the outcome the pane can show, never the
     // relay step that raised it.
     apply_failed: "common.notApplied",
+    // 跟随倍率 on a route whose own account states no rate for it.  The edit is
+    // refused rather than staged, because a row with no number to follow cannot
+    // be written at all — and staging it used to refuse every later edit of
+    // that provider, which the user saw as 新增一个模型 changing nothing.
+    follow_rate_unavailable: "error.followRateUnavailable",
     // A WebDAV sync names its cause: the remote bundle is from another app
     // version, the two sides diverged, or the sync simply failed.  Each case
     // states the way out, because the probe beside it already said the
@@ -1796,7 +1821,7 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
     setRoute("providers-models");
     native.window.open("providers-models");
     native.window.focus("providers-models");
-  }, [isPrimaryHost, native, routeRequest, snapshot]);
+  }, [isPrimaryHost, isWindowManagerHost, native, routeRequest, snapshot]);
 
   useEffect(() => {
     if (!snapshot) return;
@@ -1916,10 +1941,9 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       return;
     }
     setRoute(routeRequest);
-    if (isPrimaryHost && routeRequest !== "home") {
-      native.window.open(windowRoute);
-      native.window.focus(windowRoute);
-    }
+    // A host that is one document *is* the window for every route, so there is
+    // no second window to present here. `isWindowManagerHost` is that host's
+    // own flag, and it already returned above.
   }, [isPrimaryHost, isWindowManagerHost, native, routeRequest, routeRequestSequence]);
   useEffect(() => {
     if (!snapshot || (routeRequest && routeRequest !== "home") || !isSettingsShellRoute(route)) return;
@@ -2067,13 +2091,13 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       {!error && route !== "home" && snapshot ? (isSettingsShellRoute(route)
         ? <SettingsShell route={route} windowRoute={settingsWindowRoute.current ?? canonicalWindowRoute(route)} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} nativeAction={nativeAction} onSnapshot={receiveSnapshot} onNavigate={setRoute} onClose={() => setRoute("home")} />
         : <RouteSurface route={route} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} fileIdRequest={fileIdRequest} nativeAction={nativeAction} onSnapshot={receiveSnapshot} onNavigate={setRoute} onClose={() => setRoute(route === "provider-wizard" && Platform.OS === "windows" ? "providers-models" : "home")} />) : null}
-      {!error && route === "home" ? (Platform.OS === "windows" && !snapshot
+      {!error && route === "home" ? (isWindowsShell && !snapshot
         // Windows keeps one visible window from launch, so "home" is a real
         // surface here and an empty host reads as a blank app. State the wait
         // until the first snapshot decides which window to present.
         ? <View style={styles.startupLoading}><Text style={styles.startupLoadingText}>{translate("common.loading")}</Text></View>
         : <View style={styles.menuBarHost} />) : null}
-      {!error && route !== "home" && !snapshot && Platform.OS === "windows" ? <View style={styles.startupLoading}><Text style={styles.startupLoadingText}>{translate("common.loading")}</Text></View> : null}
+      {!error && route !== "home" && !snapshot && isWindowsShell ? <View style={styles.startupLoading}><Text style={styles.startupLoadingText}>{translate("common.loading")}</Text></View> : null}
     </View>
   );
 }
@@ -2085,6 +2109,30 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
  * only the child surfaces (the provider wizard, the raw file editor, and
  * 分组管理) keep explicit actions.
  */
+/**
+ * Whether this window is narrow enough to need one column.
+ *
+ * The native hosts refuse to shrink a settings window past their own minimum,
+ * so a sidebar always fits. A page has no such floor: on a phone or a split
+ * screen the 200 pt sidebar took half the width and left the pane unusable.
+ * Below this width the sidebar becomes a route strip above the pane.
+ */
+function useCompactWebShell(): boolean {
+  const query = "(max-width: 760px)";
+  const [compact, setCompact] = React.useState<boolean>(() => (
+    Platform.OS === "web" && typeof window !== "undefined" && window.matchMedia(query).matches
+  ));
+  React.useEffect(() => {
+    if (Platform.OS !== "web" || typeof window === "undefined") return undefined;
+    const media = window.matchMedia(query);
+    const update = (): void => setCompact(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  return compact;
+}
+
 function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, logTabRequest, nativeAction, onSnapshot, onNavigate, onClose, onRegisterFlush }: {
   route: AppRoute;
   windowRoute: AppRoute;
@@ -2138,6 +2186,7 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
   // Window-level dialog slot: a pane publishes its dialog node here so it
   // covers the whole settings window instead of the pane that opened it.
 
+  const compactWeb = useCompactWebShell();
   const [appInfo, setAppInfo] = useState<{ app: string; litellm: string; icon?: string }>();
   useEffect(() => {
     let active = true;
@@ -2167,9 +2216,35 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
     // keeps the active route in sync so a later close hides that window.
     native.window.open(next);
   };
+  const paneSurface = <RouteSurface route={pane} shell windowRoute={windowRoute} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} nativeAction={nativeAction} onSnapshot={onSnapshot} onNavigate={onNavigate} onClose={onClose} onRegisterFlush={registerFlush} />;
+  if (compactWeb) {
+    // One column: the route strip is the sidebar, and the pane keeps the whole
+    // width underneath it.
+    return <View style={styles.settingsShellFrame}>
+      <View style={[styles.settingsShellHeader, isWindowsShell && styles.settingsShellHeaderWindows]}>
+        <View style={styles.compactWebHeader}>
+          <Text numberOfLines={1} style={styles.compactWebTitle}>{translate("app.title")}</Text>
+          <Text numberOfLines={1} style={styles.compactWebPaneTitle}>{translate(paneTitleKey)}</Text>
+        </View>
+      </View>
+      <View style={styles.compactWebNav}>
+        <WindowTabs
+          values={paneRows.map(({ key, cells }) => ({ id: key, title: cells[0] ?? key }))}
+          selected={pane}
+          onSelect={selectPane}
+          style={styles.compactWebTabs}
+        />
+      </View>
+      <View style={[styles.settingsDetail, styles.settingsDetailIntegrated, styles.compactWebDetail]}>
+        <View style={[styles.settingsDetailBody, isWindowsShell && styles.settingsDetailBodyWindows, (pane === "runtime-settings" || pane === "data-management" || isAssistantSettingsRoute(pane)) && styles.settingsDetailBodyBare]}>
+          <View style={styles.settingsDetailPane}>{paneSurface}</View>
+        </View>
+      </View>
+    </View>;
+  }
   return <View style={styles.settingsShellFrame}>
-    <View style={[styles.settingsShellHeader, Platform.OS === "windows" && styles.settingsShellHeaderWindows]}>
-      <View style={[styles.settingsSidebarHeader, styles.settingsSidebarHeaderIntegrated, Platform.OS === "windows" && styles.settingsSidebarHeaderWindows]}>
+    <View style={[styles.settingsShellHeader, isWindowsShell && styles.settingsShellHeaderWindows]}>
+      <View style={[styles.settingsSidebarHeader, styles.settingsSidebarHeaderIntegrated, isWindowsShell && styles.settingsSidebarHeaderWindows]}>
         {appInfo?.icon ? <Image source={{ uri: appInfo.icon }} style={styles.settingsSidebarAppIcon} /> : null}
         <Text numberOfLines={1} style={styles.settingsSidebarTitle}>{translate("app.title")}</Text>
       </View>
@@ -2178,7 +2253,7 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
       </View>
     </View>
     <View style={styles.settingsShell}>
-      <View style={[styles.settingsSidebar, Platform.OS === "windows" && styles.settingsSidebarWindows]}>
+      <View style={[styles.settingsSidebar, isWindowsShell && styles.settingsSidebarWindows]}>
         <NativeTable
           columns={SETTINGS_SIDEBAR_COLUMNS}
           rows={paneRows}
@@ -2206,10 +2281,8 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
         <View style={styles.settingsSidebarSpacer} />
       </View>
       <View style={[styles.settingsDetail, styles.settingsDetailIntegrated]}>
-        <View style={[styles.settingsDetailBody, Platform.OS === "windows" && styles.settingsDetailBodyWindows, (pane === "runtime-settings" || pane === "data-management" || isAssistantSettingsRoute(pane)) && styles.settingsDetailBodyBare]}>
-          <View style={styles.settingsDetailPane}>
-            <RouteSurface route={pane} shell windowRoute={windowRoute} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} nativeAction={nativeAction} onSnapshot={onSnapshot} onNavigate={onNavigate} onClose={onClose} onRegisterFlush={registerFlush} />
-          </View>
+        <View style={[styles.settingsDetailBody, isWindowsShell && styles.settingsDetailBodyWindows, (pane === "runtime-settings" || pane === "data-management" || isAssistantSettingsRoute(pane)) && styles.settingsDetailBodyBare]}>
+          <View style={styles.settingsDetailPane}>{paneSurface}</View>
         </View>
       </View>
     </View>
@@ -2290,7 +2363,7 @@ function SettingsRail({ rows, selectedKey, onSelectionChange, details, style }: 
   // divider that already states where the column ends.  A source list carries
   // its own selection capsule and row rhythm, which is what tells the rows
   // apart; the rail's single right divider is its only rule.
-  return <View style={[styles.settingsRail, Platform.OS === "windows" && styles.settingsRailWindows, style]}>
+  return <View style={[styles.settingsRail, isWindowsShell && styles.settingsRailWindows, style]}>
     <NativeTable
       columns={SETTINGS_RAIL_COLUMNS}
       rows={rows}
@@ -2319,7 +2392,7 @@ function SettingsRail({ rows, selectedKey, onSelectionChange, details, style }: 
  * the rule under it read as an artifact across the full detail width.
  */
 function SettingsDetailHeader({ title, hint, actions }: { title: string; hint?: string; actions?: React.ReactNode }): React.JSX.Element {
-  return <View style={[styles.settingsRailDetailHeader, Platform.OS === "windows" && styles.settingsRailDetailHeaderWindows]}>
+  return <View style={[styles.settingsRailDetailHeader, isWindowsShell && styles.settingsRailDetailHeaderWindows]}>
     <View style={styles.settingsRailDetailTitleBlock}>
       <Text numberOfLines={1} style={styles.settingsRailDetailTitle}>{title}</Text>
       {hint ? <Text numberOfLines={1} style={styles.settingsRailDetailHint}>{hint}</Text> : null}
@@ -2465,10 +2538,18 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   };
   const validationStatusAfterFailure = async (reason: unknown): Promise<string | undefined> => {
     const code = validationFailureCode(reason);
-    if (!(code === "provider_model_invalid" || code === "validation_failed" || code === "relay_preflight_failed")) return undefined;
+    // A provider/model draft that could not be written is a validation failure
+    // however Core happened to name it: the ordinary path raises
+    // ``validation_failed``, the coordinated relay path raises
+    // ``provider_model_invalid``, and a draft that only fails inside the domain's
+    // own ``apply`` arrives as ``apply_failed``.  All three mean "a row of this
+    // pane is unusable", so all three ask the draft which row — otherwise the
+    // strip said 更改未生效 with nothing marked and the row the user had just
+    // touched (the ＋ that started the write) looked like the one that failed.
+    if (!(code === "provider_model_invalid" || code === "validation_failed" || code === "relay_preflight_failed" || code === "apply_failed")) return undefined;
     try {
-      const preferred: ConfigDomain[] = code === "provider_model_invalid"
-        ? ["providers_models"]
+      const preferred: ConfigDomain[] = code === "provider_model_invalid" || code === "apply_failed"
+        ? [domain ?? "providers_models"]
         : domain ? [domain] : ["providers_models", "relay_accounts", "codex", "claude", "clients", "runtime", "webdav"];
       // Some coordinated relay failures happen during preflight, before the
       // ordinary domain validator is called. Ask Core for that summary here so
@@ -2619,7 +2700,13 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   // "this route's domain" and stays an error when the route has none.
   const enqueueDispatch = (type: string, payload: UnknownRecord = {}, targetDomain: ConfigDomain | null | undefined = domain): Promise<IpcResults["dispatch"]> => {
     const actionDomain = targetDomain ?? undefined;
-    if (!actionDomain && targetDomain !== null) return Promise.reject(new Error("A settings domain is required"));
+    if (!actionDomain && targetDomain !== null) {
+      // The message used to be an English sentence, and `errorMessage` shows a
+      // plain Error's message as-is: the Chinese UI reported this one in English.
+      const missingDomain: Error & { code?: string } = new Error("A settings domain is required");
+      missingDomain.code = "missing_domain";
+      return Promise.reject(missingDomain);
+    }
     const issue = async (): Promise<IpcResults["dispatch"]> => {
       if (revision.current === undefined) await refresh();
       const action = actionDomain === undefined ? { type, payload } : { domain: actionDomain, type, payload };
@@ -3143,7 +3230,14 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   // The detail form's 测试连接 names the values it tests: the candidate rides
   // the request, so the probe stages nothing and the saved settings stay as
   // they are. Its result belongs to the form's footer, not to this window.
-  const probeWebDavDetails = (values: UnknownRecord): Promise<void> => runDataManagement("webdav", () => ipc.probe(undefined, undefined, "webdav", values), (value) => (asRecord(value).ok === true ? "webdav.probeOk" : "webdav.probeFailed"), true);
+  const probeWebDavDetails = (values: UnknownRecord): Promise<void> => runDataManagement("webdav", () => ipc.probe(undefined, undefined, "webdav", values), (value) => {
+    const result = asRecord(value);
+    if (result.ok !== true) return "webdav.probeFailed";
+    // Connected is not the same as able to receive the bundle: a collection the
+    // server reports as read-only takes no push, and "连接正常" hid that for a
+    // URL whose only problem was where it pointed.
+    return result.writable === false ? "webdav.probeReadOnly" : "webdav.probeOk";
+  }, true);
   const syncWebDav = (action: WebDavSyncAction): Promise<void> => runWebDavOperation(async () => {
     await flushPendingFields();
     const refreshed = await ipc.snapshot();
@@ -3208,7 +3302,11 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       revision.current = before.revision;
       onSnapshot(before);
       const currentModel = providerModelByEditorId(before, providerId, modelId);
-      if (!currentModel) throw new Error("The selected model is unavailable");
+      if (!currentModel) {
+        const unavailable: Error & { code?: string } = new Error("The selected model is unavailable");
+        unavailable.code = "model_unavailable";
+        throw unavailable;
+      }
       const currentSurface = stringValue(currentModel.upstream_url_surface, "openai/responses");
       const protocolMode = stringValue(currentModel.upstream_protocol_mode, "fallback") === "fixed"
         ? translate("providers.protocolModeFixed")
@@ -3575,7 +3673,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     setStatusBarControls(null);
   }, [route]);
 
-  return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={[styles.windowSurface, shell && Platform.OS === "windows" && styles.windowSurfaceShellWindows]}>
+  return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={[styles.windowSurface, shell && isWindowsShell && styles.windowSurfaceShellWindows]}>
     {!shell && route !== "providers-models" && route !== "logs" && route !== "provider-wizard" && route !== "file-editor" && route !== "data-management" && route !== "webdav-settings" ? <WindowTitle title={windowTitle} /> : null}
     {route === "providers-models" || route === "provider-wizard" || route === "file-editor" || route === "webdav-settings" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, (route === "provider-wizard" || route === "webdav-settings") && styles.childRouteContent, settingsRoute && styles.assistantSettingsContent, route === "logs" && styles.logsContent, route === "runtime-settings" && styles.runtimeContent, route === "data-management" && styles.dataManagementContent]}>
     {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { native.window.open("provider-wizard"); native.window.focus("provider-wizard"); }} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
@@ -3593,7 +3691,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
         mid-action and the pane below it keeps a stable height.  A child window
         keeps no strip of its own: it states its result beside its own footer
         buttons instead. */}
-    {shell ? <View style={[styles.routeStatusBar, Platform.OS === "windows" && styles.routeStatusBarWindows]}><View style={styles.routeStatusLead}>{busy ? <NativeBusySpinner label={translate("common.working")} /> : null}<Text numberOfLines={2} style={[styles.routeStatusText, Platform.OS === "windows" && styles.routeStatusTextWindows]}>{routeStatus ?? translate("common.ready")}</Text></View>{statusBarControls}</View> : null}
+    {shell ? <View style={[styles.routeStatusBar, isWindowsShell && styles.routeStatusBarWindows]}><View style={styles.routeStatusLead}>{busy ? <NativeBusySpinner label={translate("common.working")} /> : null}<Text numberOfLines={2} style={[styles.routeStatusText, isWindowsShell && styles.routeStatusTextWindows]}>{routeStatus ?? translate("common.ready")}</Text></View>{statusBarControls}</View> : null}
   </View></PendingFieldContext.Provider></TranslationContext.Provider>;
 }
 
@@ -4716,6 +4814,23 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   };
   const logoutOfficial = async (): Promise<void> => {
     if (!providerID) return;
+    // Signing out ends a session the user cannot restore without signing in
+    // again, so it asks first and names the provider it will disturb.  The
+    // account list's own logout asks the same question for the same reason; a
+    // button that is one press from a re-login should not be the exception.
+    //
+    // This button carries no account_ref, and Core reads that as "end every
+    // account this provider owns".  The account-row dialog's copy promises the
+    // other accounts stay and inherit the traffic, which is exactly what does
+    // not happen here — so this asks its own question instead of borrowing a
+    // sentence that would be false about what the press is about to do.
+    const confirmed = await native.showConfirmation({
+      title: translate("relay.officialProviderSignOutAllTitle"),
+      message: translate("relay.officialProviderSignOutAllBody", { name: selectedProviderName || providerID }),
+      confirmLabel: translate("relay.officialProviderLogout"),
+      destructive: true,
+    });
+    if (!confirmed) return;
     await dispatchWithOutcome("service_provider.auth_logout", { provider_id: providerID }, "providers_models");
   };
   /** One place that moves the wizard onto the model step, so the
@@ -5049,15 +5164,15 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         </View> : <>
         {step === "provider" ? <View style={styles.providerWizardFormSection}>
           <NativeFormRow label={translate("providers.wizard.providerType")}>
-            <NativePicker labels={servicePickerLabels} selectedValue={selectedServiceLabel} disabled={wizardBusy} onChange={({ nativeEvent }) => { const kinds: WizardType[] = ["api", "openai", "workbuddy", "workbuddyGlobal", "ourFreeModel", "ourFreeModelKilo"]; chooseProviderType(kinds[nativeEvent.index] ?? "api"); }} style={styles.providerWizardPicker} />
+            <NativePicker labels={servicePickerLabels} selectedValue={selectedServiceLabel} disabled={wizardBusy} accessibilityLabel={translate("providers.wizard.providerType")} onChange={({ nativeEvent }) => { const kinds: WizardType[] = ["api", "openai", "workbuddy", "workbuddyGlobal", "ourFreeModel", "ourFreeModelKilo"]; chooseProviderType(kinds[nativeEvent.index] ?? "api"); }} style={styles.providerWizardPicker} />
           </NativeFormRow>
           {providerMode === "new" && isOfficialLoginType ? <NativeFormRow label={translate("providers.wizard.authPath")}>
-            <NativePicker labels={[translate("providers.wizard.pathWebLogin"), translate("providers.wizard.pathCustomKey")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathWebLogin") : translate("providers.wizard.pathCustomKey")} disabled={wizardBusy} onChange={({ nativeEvent }) => { chooseOfficialAuthPath(nativeEvent.index === 1 ? "manual" : "login"); }} style={styles.providerWizardPicker} />
+            <NativePicker labels={[translate("providers.wizard.pathWebLogin"), translate("providers.wizard.pathCustomKey")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathWebLogin") : translate("providers.wizard.pathCustomKey")} disabled={wizardBusy} accessibilityLabel={translate("providers.wizard.authPath")} onChange={({ nativeEvent }) => { chooseOfficialAuthPath(nativeEvent.index === 1 ? "manual" : "login"); }} style={styles.providerWizardPicker} />
           </NativeFormRow> : null}
           {providerOptions.length > 0 ? <NativeFormRow label={translate("providers.wizard.sourceMode")}>
             <NativeSegmentedControl labels={[translate("providers.wizard.addProvider"), translate("providers.wizard.selectProvider")]} selectedValue={providerMode === "new" ? translate("providers.wizard.addProvider") : translate("providers.wizard.selectProvider")} disabled={wizardBusy} onChange={({ nativeEvent }) => chooseProviderMode(nativeEvent.index === 1 ? "existing" : "new")} style={styles.providerWizardModeControl} />
           </NativeFormRow> : null}
-          {providerMode === "existing" ? <NativeFormRow required label={translate("providers.wizard.selectProvider")}><NativePicker labels={providerPickerLabels} selectedValue={selectedProviderPickerLabel} disabled={wizardBusy || providerPickerLabels.length === 0} onChange={({ nativeEvent }) => { const option = providerOptions[nativeEvent.index]; if (option) chooseExistingProvider(option.value); }} style={styles.providerWizardPicker} /></NativeFormRow> : null}
+          {providerMode === "existing" ? <NativeFormRow required label={translate("providers.wizard.selectProvider")}><NativePicker labels={providerPickerLabels} selectedValue={selectedProviderPickerLabel} disabled={wizardBusy || providerPickerLabels.length === 0} accessibilityLabel={translate("providers.wizard.selectProvider")} onChange={({ nativeEvent }) => { const option = providerOptions[nativeEvent.index]; if (option) chooseExistingProvider(option.value); }} style={styles.providerWizardPicker} /></NativeFormRow> : null}
           {providerMode === "new" ? <>
             {wizardEditsBaseURL ? <NativeFormRow required label={translate("providers.wizard.baseUrl")}><NativeTextField value={serviceBaseURL} placeholder={translate("providers.wizard.baseUrlPlaceholder")} editable={providerType === "api" && !wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={updateProviderBaseURL} accessibilityLabel={translate("providers.wizard.baseUrl")} style={styles.providerWizardInput} /></NativeFormRow> : null}
             <NativeFormRow required label={translate("providers.wizard.providerName")}><NativeTextField value={providerName} placeholder={translate("providers.wizard.providerNamePlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={updateProviderName} accessibilityLabel={translate("providers.wizard.providerName")} style={styles.providerWizardInput} /></NativeFormRow>
@@ -5127,7 +5242,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                 <NativeButton title={translate("relay.login")} primary compact busy={loginBusy} disabled={(wizardBusy && !loginBusy) || !activeProviderBaseURL.trim()} onPress={() => { void beginRelayLogin(); }} />
               </>}
             </> : <>
-              <NativeFormRow required label={translate("providers.wizard.selectApiKey")}><NativePicker labels={keyPickerLabels} selectedValue={selectedKeyPickerLabel} disabled={wizardBusy} onChange={({ nativeEvent }) => { const option = keyOptions[nativeEvent.index]; if (!option) return; setKeySelection(option.value); resetStagedKeyField(); setKeyName(""); setValidation(""); }} style={styles.providerWizardPicker} /></NativeFormRow>
+              <NativeFormRow required label={translate("providers.wizard.selectApiKey")}><NativePicker labels={keyPickerLabels} selectedValue={selectedKeyPickerLabel} disabled={wizardBusy} accessibilityLabel={translate("providers.wizard.selectApiKey")} onChange={({ nativeEvent }) => { const option = keyOptions[nativeEvent.index]; if (!option) return; setKeySelection(option.value); resetStagedKeyField(); setKeyName(""); setValidation(""); }} style={styles.providerWizardPicker} /></NativeFormRow>
               {activeKeySelection === PROVIDER_WIZARD_NEW_KEY ? <>
                 <NativeFormRow required label={translate("providers.wizard.apiKeyName")}><NativeTextField value={keyName} placeholder={translate("providers.wizard.apiKeyNamePlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={setKeyName} accessibilityLabel={translate("providers.wizard.apiKeyName")} style={styles.providerWizardInput} /></NativeFormRow>
                 {creatingProvider ? (keyReady
@@ -5978,16 +6093,13 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     return left.deploymentID.localeCompare(right.deploymentID);
   }), [modelDisplayName, modelOrderValue, providerDisplayName, providers]);
   // Routes grouped by their client-facing name: one public model is one group
-  // in the routes table and one settings surface.
-  const routeGroups = useMemo(() => {
-    const groups = new Map<string, Array<(typeof routes)[number]>>();
-    for (const entry of routes) {
-      const list = groups.get(entry.publicModel);
-      if (list) list.push(entry);
-      else groups.set(entry.publicModel, [entry]);
-    }
-    return Array.from(groups, ([name, entries]) => ({ name, entries }));
-  }, [routes]);
+  // in the routes table and one settings surface.  The name's *identity* is the
+  // group, not its spelling: rows that spell one name in two cases are one
+  // group of several routes, which is what a client sees when it asks for the
+  // name at all.  The group publishes one spelling (lower case first) and the
+  // pane acts on that one, so a rename or a shared context reaches every row
+  // that serves the name.
+  const routeGroups = useMemo(() => groupRoutesByPublicModel(routes), [routes]);
   const modelContexts = asRecord(state.model_contexts);
   // The concurrency cap a route that states none of its own follows, read from the
   // same snapshot the routes arrive in: the model detail explains this number,
@@ -5998,10 +6110,17 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const bindingIssues = asRecords(state.binding_issues);
   const activePublicGroup = selectedPublicModel === undefined
     ? undefined
-    : routeGroups.find((group) => group.name === selectedPublicModel);
+    : routeGroups.find((group) => publicModelKey(group.name) === publicModelKey(selectedPublicModel));
   const activeRoute = routes.find((entry) => entry.key === selectedRoute);
-  const activeRouteGroup = activeRoute ? routes.filter((entry) => entry.publicModel === activeRoute.publicModel) : [];
+  // The group a route belongs to is every row serving the same name, whatever
+  // case it states it in.
+  const activeRouteGroup = activeRoute ? routes.filter((entry) => publicModelKey(entry.publicModel) === publicModelKey(activeRoute.publicModel)) : [];
   const activeRouteIndex = activeRoute ? activeRouteGroup.findIndex((entry) => entry.key === activeRoute.key) : -1;
+  // The group a move rewrites is the one the pane draws: its own spelling, so
+  // the action names the group the table and the settings pane name.
+  const activePublicGroupName = activeRoute
+    ? (routeGroups.find((group) => publicModelKey(group.name) === publicModelKey(activeRoute.publicModel))?.name ?? activeRoute.publicModel)
+    : "";
   // One route that follows a relay multiplier locks the whole group: its order
   // is the station's own number, so Core refuses to permute the group's typed
   // values at all (moving a plain route in such a group is the same rewrite).
@@ -6040,7 +6159,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     }
     const reordered = [...activeRouteGroup];
     [reordered[activeRouteIndex], reordered[targetIndex]] = [reordered[targetIndex], reordered[activeRouteIndex]];
-    const reorder = (renumber: boolean): Promise<unknown> => dispatch("routes.reorder_group", { public_model: activeRoute.publicModel, route_ids: reordered.map((entry) => entry.deploymentID), ...(renumber ? { renumber: true } : {}) });
+    const reorder = (renumber: boolean): Promise<unknown> => dispatch("routes.reorder_group", { public_model: activePublicGroupName, route_ids: reordered.map((entry) => entry.deploymentID), ...(renumber ? { renumber: true } : {}) });
     // A move keeps the numbers the group already carries — they travel with the
     // routes — so a group holding decimals is asked once whether it should
     // become 1..n instead of being renumbered behind the user's back.  Integers
@@ -6067,7 +6186,9 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // name, so the row appears in this group and the inspector asks for the
   // upstream model and the key.  A disabled draft never reaches the runtime.
   const addRoute = (): void => {
-    const publicModel = (selectedPublicModel ?? activeRoute?.publicModel ?? "").trim();
+    // The new row states the group's own spelling, so adding a route to a group
+    // never introduces a third case of its name.
+    const publicModel = (selectedPublicModel ?? activePublicGroupName).trim();
     const targetProvider = activeRoute?.provider ?? providers[0];
     if (!targetProvider) return;
     const targetProviderID = editorIdentifier(targetProvider);
@@ -6102,7 +6223,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // Core action, so the group is removed in one apply instead of route by
   // route, and the confirmation states the count it is about to remove.
   const confirmDeleteRoute = (): void => {
-    const selectedGroup = selectedPublicModel !== undefined ? routeGroups.find((group) => group.name === selectedPublicModel) : undefined;
+    const selectedGroup = selectedPublicModel !== undefined ? routeGroups.find((group) => publicModelKey(group.name) === publicModelKey(selectedPublicModel)) : undefined;
     if (selectedGroup) {
       runMutationOnce(`route.delete-group:${selectedGroup.name}`, () => native.showConfirmation({
         title: translate("providers.deletePublicModel", { model: selectedGroup.name }),
@@ -6436,9 +6557,12 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     }
     if (rowKey.startsWith(ROUTE_PUBLIC_MODEL_PREFIX)) {
       const publicModel = rowKey.slice(ROUTE_PUBLIC_MODEL_PREFIX.length);
-      const group = routeGroups.find((entry) => entry.name === publicModel);
+      const group = routeGroups.find((entry) => publicModelKey(entry.name) === publicModelKey(publicModel));
       if (!group) return;
-      setSelectedPublicModel(publicModel);
+      // The group's own spelling is what the pane edits and what Core addresses:
+      // the row key came from the table, so it is the same name, but a stale
+      // draft may hand back another case of it.
+      setSelectedPublicModel(group.name);
       setSelectedRoute("");
       setProviderSourceModel(undefined);
       // A row click has no origin model to return to; only 设置 records one.
@@ -6454,7 +6578,13 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // route removed) drops its selection instead of leaving an empty pane.
   useEffect(() => {
     if (selectedPublicModel === undefined) return;
-    if (routeGroups.some((group) => group.name === selectedPublicModel)) return;
+    const group = routeGroups.find((entry) => publicModelKey(entry.name) === publicModelKey(selectedPublicModel));
+    if (group) {
+      // A group whose spelling moved (a rename landed, or the group folded two
+      // cases onto one) keeps the selection instead of dropping the pane.
+      if (group.name !== selectedPublicModel) setSelectedPublicModel(group.name);
+      return;
+    }
     setSelectedPublicModel(undefined);
     if (viewMode === "routes" && routes.length > 0) setSelectedRoute(routes[0].key);
   }, [routeGroups, routes, selectedPublicModel, viewMode]);
@@ -6537,7 +6667,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
           <View style={styles.providerMiddlePane} onLayout={({ nativeEvent }) => setModelTableWidth(nativeEvent.layout.width)}>
             <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteModel} /> : null}</>}>
               <View style={styles.nativeModelTable}><NativeTable columns={modelTableColumns(modelTableWidth, translate)} rows={modelRows} disabledRowKeys={disabledModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange={(key) => { if (!key) { setSelectedModel(undefined); setSelectedModelRow(undefined); setProviderSourceModel(undefined); return; } const modelID = modelIDFromRowKey(key); if (modelID === undefined) return; setSelectedModel(modelID); setSelectedModelRow(key); setProviderSourceModel(undefined); }} style={styles.modelTable} /></View>
-              {provider ? <View style={styles.tableBottomRow}>{fetchKeyChoices.length > 0 ? <NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /> : null}<ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || (fetchKeyChoices.length > 0 && !selectedFetchKey)} onPress={() => { void fetchModels(); }} /></View> : null}
+              {provider ? <View style={styles.tableBottomRow}>{fetchKeyChoices.length > 0 ? <NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy} accessibilityLabel={translate("providers.providerKey")} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /> : null}<ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || (fetchKeyChoices.length > 0 && !selectedFetchKey)} onPress={() => { void fetchModels(); }} /></View> : null}
             </TablePane>
           </View>
         </View>
@@ -7289,6 +7419,11 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   const recommendedWindow = publicModelDefault(modelContexts ?? {}, publicModelName);
   const customWindow = publicModelCustomLimit(providers, publicModelName, "max_input_tokens");
   const declaredWindow = customWindow !== undefined ? customWindow : recommendedWindow;
+  // A route that only generates images holds no conversation, so a context
+  // window is not a fact about it: the row, its 设置 button and its help mark
+  // would all describe a number nothing reads.  Core states the modality, so
+  // the pane asks rather than inferring it from the name.
+  const servesImages = booleanValue(model.serves_images);
   // What the route's own upstream states for it, read from the last catalog
   // read Core made.  Absent means this upstream published no window — not that
   // the number is zero — so the row is drawn only when there is one.
@@ -7453,7 +7588,7 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
     <View style={styles.modelBreadcrumb}><NativeButton title={providerLabel} link disabled={busy} onPress={onProviderClick} style={styles.breadcrumbProvider} /><Text style={styles.breadcrumbSeparator}>&gt;</Text><Text numberOfLines={1} style={styles.inspectorHeading}>{displayLabel(upstreamName, translate("common.notAvailable"))}</Text></View>
     <View style={styles.inspectorDivider} />
     <View style={styles.inspectorBody}>
-      <View style={styles.inspectorEnabledRow}><View style={styles.inspectorEnableControl}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy || !providerEnabled} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} /></View><ActionButton title={probeTitle} titleWidth="tight" busy={probing} toolTip={(probePresentation.compact ? probePresentation.tooltip : "") || (degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} onPress={probe} />{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding} onPress={openProbeDetails} accessibilityRole="link" accessibilityLabel={probePresentation.compactSentence}><TooltipText numberOfLines={1} ellipsizeMode="tail" tooltip={probePresentation.tooltip} style={styles.inspectorProbeFindingText}>{probePresentation.compactSentence}</TooltipText></Pressable> : null}</View>
+      <View style={styles.inspectorEnabledRow}><View style={styles.inspectorEnableControl}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy || !providerEnabled} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} /></View><ActionButton title={probeTitle} titleWidth="tight" busy={probing} toolTip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} onPress={probe} />{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding} onPress={openProbeDetails} accessibilityRole="link" accessibilityLabel={probePresentation.compactSentence}><TooltipText numberOfLines={1} ellipsizeMode="tail" tooltip={probePresentation.tooltip} style={styles.inspectorProbeFindingText}>{probePresentation.compactSentence}</TooltipText></Pressable> : null}</View>
       {/* The row's switch is disabled when its provider is off, so the reason
           has to be stated in words: a greyed 启用 box under a stopped provider
           otherwise reads as the app refusing the setting for no stated cause.
@@ -7471,7 +7606,7 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
           written by the public-model pane that 设置 opens, and a route that
           carried a window of its own would make the group's number depend on
           which route happened to answer. */}
-      {publicModelName ? <View style={styles.formRow}>
+      {publicModelName && !servesImages ? <View style={styles.formRow}>
         {/* One row of the pane's own grid: the label, then the value as the
             control with 设置 and the help mark beside it — the shape every
             neighbouring row already has.  The value is one number, not the
@@ -7571,8 +7706,29 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
 // the model inspector, where a panel opening downward would fall outside the
 // workspace.
 function HelpTip({ open, text, title, onToggle, align = "right" }: { open: boolean; text: string; title: string; onToggle: () => void; align?: "left" | "right" }): React.JSX.Element {
+  // `accessibilityLiveRegion` is the right promise and the wrong mechanism on
+  // this app's own hosts: react-native reads the prop only on Android, and the
+  // Windows leaf sets a UIA LiveSetting flag without raising the change event
+  // that would make a screen reader speak.  The imperative call below is the one
+  // both desktop hosts implement — macOS posts
+  // NSAccessibilityAnnouncementRequestedNotification.  The prop stays for the
+  // browser host, where it becomes a real `aria-live` region.
+  useEffect(() => {
+    if (!open || Platform.OS === "web") return;
+    // The tip's own text is a complete sentence in both locales, so it is
+    // announced alone: joining it to the title would need a separator that is
+    // right in English and wrong in Chinese, and the title is already the
+    // mark's accessible name, spoken when the mark took focus.
+    AccessibilityInfo.announceForAccessibility(text);
+  }, [open, text]);
   return <View style={styles.helpTipAnchor}>
-    {open ? <Pressable accessible={false} onPress={onToggle} style={styles.helpTipDismiss} /> : null}
+    {/* The dismiss target covers the window so a click anywhere closes the tip,
+        but it is not a modal surface: the macOS tab chain asks the window's hit
+        test whether a control is covered, and this layer would answer yes for
+        every one of them and trap Tab on the mark.  The id is how that chain
+        tells this transient layer apart from the relay dialog's real scrim
+        (`LiteLLMTabTransparentHitId` in `AppKitControlViews.mm`). */}
+    {open ? <Pressable accessible={false} nativeID="young-router-tab-transparent" onPress={onToggle} style={styles.helpTipDismiss} /> : null}
     <NativeButton title="" symbol="help" link plainLink toolTip={title} accessibilityLabel={title} onPress={onToggle} style={styles.helpTipButton} />
     {open ? <View accessibilityRole="text" accessibilityLiveRegion="polite" style={align === "left" ? styles.helpTipPopupLeft : styles.helpTipPopup}><Text style={styles.helpTipText}>{text}</Text></View> : null}
   </View>;
@@ -7703,7 +7859,10 @@ function ProtocolPicker({ providerId, model, busy, translate, dispatch }: { prov
   };
   if (onlySurface) {
     const surfaceLabel = probeSurfaceLabel(onlySurface, translate);
-    const fixedHint = translate("providers.protocolSurfaceFixedHint", { surface: surfaceLabel });
+    // Two different reasons one route has a single surface, so two sentences:
+    // a worker on this machine mounts one wire, while a generator answers
+    // Images because that is what it does.
+    const fixedHint = translate(onlySurface === "openai/images" ? "providers.protocolSurfaceImagesHint" : "providers.protocolSurfaceFixedHint", { surface: surfaceLabel });
     return <View style={styles.protocolSettings}>
       <View style={[styles.formRow, compactStyles.formRow]}>
         <Text style={styles.modelInspectorLabel}>{translate("providers.protocolSurfaceFixed")}</Text>
@@ -7902,12 +8061,13 @@ function modelTableColumns(width: number, translate: Translate): Array<{ label: 
 const ROUTE_TABLE_SPACER_COLUMN = { label: "", width: 1 };
 
 // The public-model row key the routes table uses for one public model.  The
-// name itself is the selection identity, so the key prefix only marks the
-// row kind.
+// name's identity is the selection identity, so the key carries that and not
+// the spelling: the same group drawn after a case change keeps its row, and a
+// key can never name a second group that is really the first one's other case.
 const ROUTE_PUBLIC_MODEL_PREFIX = "route-public-model:";
 
 function routePublicModelRowKey(publicModel: string): string {
-  return `${ROUTE_PUBLIC_MODEL_PREFIX}${publicModel}`;
+  return `${ROUTE_PUBLIC_MODEL_PREFIX}${publicModelKey(publicModel)}`;
 }
 
 /**
@@ -7920,21 +8080,28 @@ function routePublicModelRowKey(publicModel: string): string {
  * line, which is what kept the full number from having to be abbreviated.
  */
 function publicModelTokensText(value: number | null | undefined, translate: Translate): string {
+  // Zero is not a missing number: it is the answer a generator's catalog
+  // states (``limit.context: 0``) because the model holds no conversation to
+  // size.  Reading it as absent is what made the field fall back to the
+  // unknown-model placeholder and print 272,000 for a model that never reads
+  // a prompt.
+  if (value === 0) return translate("common.notAvailable");
   if (value === null || value === undefined || !Number.isFinite(value) || value <= 0) return translate("common.none");
   return Math.round(value).toLocaleString("en-US");
 }
 
 // One public model's declared limit: the smallest value its routes carry, so a
 // group never promises more than every route behind it can deliver.  Absent
-// means the registry default stands.
+// means the registry default stands.  Every route serving the name counts,
+// whatever case it states the name in.
 function publicModelCustomLimit(providers: UnknownRecord[], publicModel: string, field: "max_input_tokens"): number | undefined {
-  const name = publicModel.trim();
-  if (!name) return undefined;
+  const key = publicModelKey(publicModel);
+  if (!key) return undefined;
   const values: number[] = [];
   for (const provider of providers) {
     for (const raw of asRecords(provider.models)) {
       const model = modelRecord(raw);
-      if (stringValue(model.model_name, stringValue(model.name)).trim() !== name) continue;
+      if (publicModelKey(stringValue(model.model_name, stringValue(model.name))) !== key) continue;
       const value = numberValue(model[field], 0);
       if (value > 0) values.push(value);
     }
@@ -7943,12 +8110,32 @@ function publicModelCustomLimit(providers: UnknownRecord[], publicModel: string,
 }
 
 function publicModelDefault(contexts: UnknownRecord, publicModel: string): number | undefined {
-  const record = asRecord(contexts[publicModel]);
+  // Core keys this projection by identity, so a group drawn with one of its
+  // rows' spellings reads the window of the group.
+  const record = asRecord(contexts[publicModelContextKey(contexts, publicModel)]);
   // The recommendation is the registry's own profile, never the number this
   // app hands a client: a group that declares its own window publishes that
   // declaration (``context_window``), and the mark beside the field must still
   // name the value pi.dev recommends for the same name.
-  return numberValue(record.recommended_context_window, 0) || numberValue(record.context_window, 0) || undefined;
+  //
+  // A stated zero is kept as zero.  ``||`` would read it as "no answer" and
+  // fall through to the other field, which is how a generator's "this model
+  // has no window" became the unknown-model placeholder one step later.
+  const recommended = numberValue(record.recommended_context_window, Number.NaN);
+  if (Number.isFinite(recommended)) return recommended;
+  const declared = numberValue(record.context_window, Number.NaN);
+  return Number.isFinite(declared) ? declared : undefined;
+}
+
+// The key a snapshot uses for one public model's context record.  The exact
+// spelling is tried first, because that is what the projection normally carries;
+// the identity lookup is what keeps a group drawn from another spelling of the
+// same name from losing its window entirely.
+function publicModelContextKey(contexts: UnknownRecord, publicModel: string): string {
+  if (Object.prototype.hasOwnProperty.call(contexts, publicModel)) return publicModel;
+  const key = publicModelKey(publicModel);
+  if (!key) return publicModel;
+  return Object.keys(contexts).find((candidate) => publicModelKey(candidate) === key) ?? publicModel;
 }
 
 function identifier(record: UnknownRecord): string {
@@ -8277,8 +8464,17 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   // could not say who was signed in; the selected account's whole address is
   // stated under the list as well, which is where a name too long for any
   // column is still readable.
+  const authStatusColumnWidth = Math.min(
+    AUTH_STATUS_COLUMN_MAX_WIDTH,
+    Math.max(AUTH_STATUS_COLUMN_MIN_WIDTH, ...authAccountRows.map((row) => Math.ceil(nativeControlTextWidth(row.cells[1] ?? "")) + 16)),
+  );
+  // The address gets what the status leaves, never more.  Measured on its own
+  // a 208 pt address beside an 81 pt `Signed out` is 289 pt of the 304 the
+  // pane offers, and a wider status — or a narrower window, since the
+  // inspector shrinks to 260 — overflowed the pair.  The full address is
+  // stated below the list, so this column is the one that gives way.
   const authAccountColumnWidth = Math.min(
-    AUTH_ACCOUNT_COLUMN_MAX_WIDTH,
+    Math.min(AUTH_ACCOUNT_COLUMN_MAX_WIDTH, Math.max(96, AUTH_ACCOUNT_COLUMNS_WIDTH_BUDGET - authStatusColumnWidth)),
     Math.max(96, ...authAccountRows.map((row) => Math.ceil(nativeControlTextWidth(row.cells[0] ?? "")) + 16)),
   );
   const model = asRecords(provider.models)[0];
@@ -8540,7 +8736,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
         left, and the full sentence as the link's label is 246 pt of it.  The
         label is the action in two words and the model it returns to rides the
         tooltip, so the provider name the header exists to show keeps its room. */}
-    <View style={styles.providerEditorHeader}><Text numberOfLines={1} style={styles.providerEditorHeading}>{translate("providers.provider")}: {providerName}</Text>{sourceModel ? <NativeButton title={translate("providers.backToModelShort")} toolTip={translate("providers.backToModel", { model: sourceModelLabel })} link disabled={busy} onPress={onReturnToModel} style={styles.providerReturnToModel} /> : null}</View>
+    <View style={styles.providerEditorHeader}><TooltipText numberOfLines={1} tooltip={providerName} accessibilityLabel={providerName} style={styles.providerEditorHeading}>{translate("providers.provider")}: {providerName}</TooltipText>{sourceModel ? <NativeButton title={translate("providers.backToModelShort")} toolTip={translate("providers.backToModel", { model: sourceModelLabel })} link disabled={busy} onPress={onReturnToModel} style={styles.providerReturnToModel} /> : null}</View>
     <View style={styles.providerEditorSection}>
     <ProviderIdentityFields
       provider={provider}
@@ -8597,7 +8793,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
               for the same list. */}
           {selectedAuthAccount ? <NativeButton title="" symbol="minus" compact destructive toolTip={translate("relay.officialProviderLogout")} accessibilityLabel={translate("relay.officialProviderLogout")} busy={authPending === `logout:${stringValue(selectedAuthAccount.ref)}`} disabled={(busy || loginBusy) && authPending !== `logout:${stringValue(selectedAuthAccount.ref)}`} style={styles.iconButton} onPress={() => { void logoutAccount(stringValue(selectedAuthAccount.ref)); }} /> : null}
         </>}
-        columns={[{ label: translate("relay.accounts"), width: authAccountColumnWidth }, { label: translate("providers.authStatus"), width: 74 }]}
+        columns={[{ label: translate("relay.accounts"), width: authAccountColumnWidth }, { label: translate("providers.authStatus"), width: authStatusColumnWidth }]}
         rows={authAccountRows}
         selectedKey={stringValue(selectedAuthAccount?.ref)}
         onSelectionChange={(key) => setSelectedAuthAccountRef(key || undefined)}
@@ -9370,7 +9566,7 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
       selectedKey={selectedClient}
       onSelectionChange={(key) => { if (key) setSelectedClient(key as ClientFile["client"]); }}
     />
-    <View style={[styles.settingsRailDetail, Platform.OS === "windows" && styles.settingsRailDetailWindows]}>
+    <View style={[styles.settingsRailDetail, isWindowsShell && styles.settingsRailDetailWindows]}>
       <SettingsDetailHeader
         title={translate(selectedGroup.titleKey)}
         hint={translate(selectedGroup.hintKey)}
@@ -9557,6 +9753,63 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
   const portItem = runtimeSettings.find((item) => identifier(item) === "LITELLM_PORT");
   const portValue = stringValue(portItem?.value, "");
   const portDefault = stringValue(portItem?.default, "12390");
+  // The page's own key.  It is a Runtime secret, read over the same plaintext
+  // lease the API key uses and drawn in the clear for the same reason: it is a
+  // lock somebody reads and types into another browser, and dots cannot be
+  // copied.  The page itself is served on this pane's own local port -- the
+  // proxy answers `/ui` beside `/v1` -- so there is no second port to state and
+  // none is offered; the address is derived from the port above it.
+  const openWebPage = async (): Promise<void> => {
+    // Ask Core for the address that carries this host's launch credential; a
+    // window that could not reach Core opens the plain address, where the key
+    // is typed like on any other browser.
+    let address = webPageAddress;
+    try {
+      const launch = await ipc.webLaunchUrl();
+      if (launch) address = launch;
+    } catch {
+      // A Core that cannot answer still has an address worth opening.
+    }
+    if (address) native.openExternalURL?.(address);
+  };
+  const webPageAddress = (() => {
+    const running = serviceState === "running";
+    const port = running ? stringValue(String(snapshot?.service.port ?? ""), "") : portValue;
+    return port ? `http://127.0.0.1:${port}/ui` : "";
+  })();
+  // Windows cannot draw the XAML-island secret input inside this composition
+  // host (the same reason the proxy key above is a plain field there), so the
+  // page's key takes the host's read/stage capability on that platform and the
+  // inline secure control everywhere else.
+  const [webKeyValue, setWebKeyValue] = useState("");
+  useEffect(() => {
+    if (Platform.OS !== "windows" || !native.readSecret) return undefined;
+    let active = true;
+    void native.readSecret({ domain: "runtime", field: "setting", target: "YOUNG_ROUTER_WEB_PASSWORD" })
+      .then((result) => { if (active && result) setWebKeyValue(result.value ?? ""); })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, [native]);
+  const commitWebKey = async (next: string): Promise<void> => {
+    const value = next.trim();
+    if (!value) {
+      onStatus(translate("providers.wizard.required"));
+      return;
+    }
+    try {
+      const staged = await native.stageSecret?.({
+        domain: "runtime",
+        field: "setting",
+        target: "YOUNG_ROUTER_WEB_PASSWORD",
+        value,
+      });
+      if (!staged) throw new Error(translate("error.coreUnavailable"));
+      setWebKeyValue(value);
+      onStatus(translate("common.saved"));
+    } catch (reason: unknown) {
+      onStatus(errorMessage(reason, translate));
+    }
+  };
   // The proxy's API key is the credential this window hands the user's own
   // clients, so its field is the one credential the pane draws in the clear:
   // the native control holds the value, Core hands it over the read-once
@@ -9696,34 +9949,98 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
   return <PersistentScrollView style={styles.generalScroll} contentContainerStyle={styles.generalContent}>
     <View style={styles.generalSection}>
       <Text style={styles.generalSectionTitle}>{translate("general.startup")}</Text>
-      <View style={styles.generalRow}>
-        <Text style={styles.generalRowLabel}>{translate("general.autoStart")}</Text>
-        <NativeToggle value={autoStartValue} disabled={autoStartBusy || busy || snapshot === undefined} accessibilityLabel={translate("general.autoStart")} onValueChange={(next) => { void setAutoStart(next); }} style={styles.generalToggle} />
+      <View style={styles.generalFieldList}>
+        <View style={styles.generalField}>
+          <View style={styles.generalRow}>
+            <Text style={styles.generalRowLabel}>{translate("general.autoStart")}</Text>
+            <View style={styles.generalValueSlot}>
+              <NativeToggle value={autoStartValue} disabled={autoStartBusy || busy || snapshot === undefined} accessibilityLabel={translate("general.autoStart")} onValueChange={(next) => { void setAutoStart(next); }} style={styles.generalToggle} />
+            </View>
+          </View>
+        </View>
+        {/* The help belongs to the field above it, so the two travel as one
+            block: a row and its tip are 2 apart, and one field is 10 from the
+            next, exactly like every other settings pane. */}
+        <View style={styles.generalField}>
+          <View style={styles.generalRow}>
+            <Text style={styles.generalRowLabel}>{translate("general.runInBackground")}</Text>
+            <View style={styles.generalValueSlot}>
+              <NativeToggle value={backgroundValue} disabled={backgroundBusy || busy || snapshot === undefined} accessibilityLabel={translate("general.runInBackground")} onValueChange={(next) => { void setRunInBackground(next); }} style={styles.generalToggle} />
+            </View>
+          </View>
+          <View style={styles.generalHelpSlot}><Text style={styles.generalHelpText}>{translate("general.runInBackgroundHint")}</Text></View>
+        </View>
       </View>
-      <View style={styles.generalRow}>
-        <Text style={styles.generalRowLabel}>{translate("general.runInBackground")}</Text>
-        <NativeToggle value={backgroundValue} disabled={backgroundBusy || busy || snapshot === undefined} accessibilityLabel={translate("general.runInBackground")} onValueChange={(next) => { void setRunInBackground(next); }} style={styles.generalToggle} />
-      </View>
-      <View style={styles.generalHelpSlot}><Text style={styles.generalHelpText}>{translate("general.runInBackgroundHint")}</Text></View>
     </View>
     <View style={styles.generalSection}>
       <Text style={styles.generalSectionTitle}>{translate("general.service")}</Text>
-      <View style={styles.generalRow}>
-        <Text style={styles.generalRowLabel}>{translate("general.serviceState")}</Text>
-        <Text numberOfLines={1} style={styles.generalRowValue}>{serviceLabel}</Text>
-        {serviceActionAvailable ? <NativeButton compact primary={!serviceRestart} busy={serviceBusy} disabled={snapshot === undefined || (busy && !serviceBusy)} title={serviceRestart ? translate("service.restart") : translate("service.start")} accessibilityLabel={serviceRestart ? translate("service.restart") : translate("service.start")} onPress={() => { void runServiceAction(); }} style={styles.generalServiceAction} /> : null}
+      <View style={styles.generalFieldList}>
+        <View style={styles.generalField}>
+          <View style={styles.generalRow}>
+            <Text style={styles.generalRowLabel}>{translate("general.serviceState")}</Text>
+            <View style={styles.generalValueCellWide}><Text numberOfLines={1} style={styles.generalRowValue}>{serviceLabel}</Text></View>
+            {/* The action keeps the grid's action column so a row's buttons line
+                up with every other row's, instead of sitting wherever its own
+                text happens to end. */}
+            <View style={styles.generalActionSlot}>{serviceActionAvailable ? <NativeButton compact primary={!serviceRestart} busy={serviceBusy} disabled={snapshot === undefined || (busy && !serviceBusy)} title={serviceRestart ? translate("service.restart") : translate("service.start")} accessibilityLabel={serviceRestart ? translate("service.restart") : translate("service.start")} onPress={() => { void runServiceAction(); }} style={styles.generalServiceAction} /> : null}</View>
+          </View>
+        </View>
+        <View style={styles.generalField}>
+          <View style={styles.generalRow}>
+            <Text style={styles.generalRowLabel}>{translate("general.port")}</Text>
+            <View style={styles.generalValueSlot}>
+              <RuntimeValueField label={translate("general.port")} width="number" value={portValue} keyboardType="numeric" validate={validatePort} onCommit={(next) => dispatch("set_setting", { key: "LITELLM_PORT", value: next }, "runtime")} />
+            </View>
+          </View>
+          <View style={styles.generalHelpSlot}><Text style={styles.generalHelpText}>{translate("general.portHint", { default: portDefault })}</Text></View>
+        </View>
+        <View style={styles.generalField}>
+          <View style={styles.generalRow}>
+            <Text style={styles.generalRowLabel}>{translate("general.apiKey")}</Text>
+            {/* The plaintext credential field: the key is drawn so it can be
+                copied into a client, and the value arrives over the native read
+                lease rather than through a Core snapshot. */}
+            <View style={styles.generalValueCellWide}>{masterKeyField}</View>
+          </View>
+        </View>
       </View>
-      <View style={styles.generalRow}>
-        <Text style={styles.generalRowLabel}>{translate("general.port")}</Text>
-        <RuntimeValueField label={translate("general.port")} width="number" value={portValue} keyboardType="numeric" validate={validatePort} onCommit={(next) => dispatch("set_setting", { key: "LITELLM_PORT", value: next }, "runtime")} />
-      </View>
-      <View style={styles.generalHelpSlot}><Text style={styles.generalHelpText}>{translate("general.portHint", { default: portDefault })}</Text></View>
-      <View style={styles.generalRow}>
-        <Text style={styles.generalRowLabel}>{translate("general.apiKey")}</Text>
-        {/* The one plaintext credential field: the key is drawn so it can be
-            copied into a client, and the value arrives over the native read
-            lease rather than through a Core snapshot. */}
-        <View style={styles.generalApiKeyField}>{masterKeyField}</View>
+    </View>
+    <View style={styles.generalSection}>
+      <Text style={styles.generalSectionTitle}>{translate("general.webPage")}</Text>
+      <View style={styles.generalFieldList}>
+        <View style={styles.generalField}>
+          <View style={styles.generalRow}>
+            <Text style={styles.generalRowLabel}>{translate("general.webKey")}</Text>
+            {/* The page's key, drawn in the clear for the same reason the proxy
+                key above is: it is a lock somebody reads and types into another
+                browser, and dots cannot be copied. */}
+            <View style={styles.generalValueCellWide}>
+              {Platform.OS === "windows"
+                ? <RuntimeValueField label={translate("general.webKey")} width="text" value={webKeyValue} onCommit={commitWebKey} />
+                : <NativeSecretInputControl label={translate("general.webKey")} busy={snapshot === undefined} domain="runtime" field="setting" target="YOUNG_ROUTER_WEB_PASSWORD" plainText autoCommit onSecretState={(state) => { if (state.status === "error" && state.error !== "") onStatus(state.error); }} />}
+            </View>
+          </View>
+        </View>
+        <View style={styles.generalField}>
+          <View style={styles.generalRow}>
+            <Text style={styles.generalRowLabel}>{translate("general.webAddress")}</Text>
+            {/* A link, not a label: clicking it from this window is the host
+                opening a page it has already proved itself to, so the browser
+                lands signed in and the key never has to be typed or copied. */}
+            <View style={styles.generalValueCellWide}>
+              <Pressable
+                accessibilityRole="link"
+                accessibilityLabel={translate("general.webPage")}
+                disabled={webPageAddress === ""}
+                onPress={() => { void openWebPage(); }}
+                style={styles.generalWebAddress}
+              >
+                <Text numberOfLines={1} style={[styles.generalRowValue, styles.generalWebAddressText]}>{webPageAddress}</Text>
+              </Pressable>
+            </View>
+          </View>
+          <View style={styles.generalHelpSlot}><Text style={styles.generalHelpText}>{translate("general.webPageHint")}</Text></View>
+        </View>
       </View>
     </View>
   </PersistentScrollView>;
@@ -9754,7 +10071,7 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
   return <View style={styles.runtimeWorkspaceFrame}>
     <View style={styles.runtimeWorkspaceBody}>
       <SettingsRail rows={tocRows} selectedKey={selectedCategory} onSelectionChange={selectCategory} />
-      <View style={[styles.settingsRailDetail, Platform.OS === "windows" && styles.settingsRailDetailWindows]}>
+      <View style={[styles.settingsRailDetail, isWindowsShell && styles.settingsRailDetailWindows]}>
         {selectedCategory === "" ? null : <SettingsDetailHeader title={runtimeCategoryLabel(selectedCategory, translate)} />}
         {/* The surface is keyed by its category, so a switch starts at the top of
             the new category instead of inheriting the previous scroll offset. */}
@@ -9878,7 +10195,7 @@ function DataManagementWorkspace({ snapshot, tab, onTabChange, statuses, busy, t
       selectedKey={tab}
       onSelectionChange={(key) => { if (key) switchDataManagementTab(key as DataManagementTab); }}
     />
-    <View style={[styles.settingsRailDetail, Platform.OS === "windows" && styles.settingsRailDetailWindows]}>
+    <View style={[styles.settingsRailDetail, isWindowsShell && styles.settingsRailDetailWindows]}>
     {/* One shared header band names the active tab, exactly as the runtime
         and external panes name their selection, so the pane body below it
         opens straight on its content instead of a second heading. A sync
@@ -9993,7 +10310,9 @@ function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSec
     const visibleOptionValues = optionValues.filter((option) => !(DSH_VISION_ROUTER_QUICK_KEYS.some((quickKey) => quickKey === key) && option === "inherit"));
     const optionLabels = visibleOptionValues.map((option) => runtimeOptionLabel(key, option, translate));
     const selectedIndex = visibleOptionValues.indexOf(value);
-    control = <NativePicker labels={optionLabels} selectedValue={optionLabels[selectedIndex] ?? optionLabels[0] ?? ""} disabled={busy} onChange={({ nativeEvent }) => { const next = optionValues[nativeEvent.index]; const visibleNext = visibleOptionValues[nativeEvent.index] ?? next; if (visibleNext !== undefined) void dispatch("set_setting", { key, value: visibleNext }); }} style={styles.runtimeValueControl} />;
+    // The row's own label names the control: without it the setting read as a
+    // bare value and the field it belongs to was never announced.
+    control = <NativePicker labels={optionLabels} selectedValue={optionLabels[selectedIndex] ?? optionLabels[0] ?? ""} disabled={busy} accessibilityLabel={label} onChange={({ nativeEvent }) => { const next = optionValues[nativeEvent.index]; const visibleNext = visibleOptionValues[nativeEvent.index] ?? next; if (visibleNext !== undefined) void dispatch("set_setting", { key, value: visibleNext }); }} style={styles.runtimeValueControl} />;
   } else if (isMultiline) {
     // JSON may contain provider credentials, so it is still written through
     // Core's one-time secret capability and never as a plain setting.  It is
@@ -10619,7 +10938,7 @@ function WebDavSettingsPanel({ snapshot, busy, status, translate, onSecretState,
           <Text style={styles.webdavFieldUnit}>{translate("webdav.seconds")}</Text>
         </WebDavField>
         <WebDavField label={translate("dataManagement.syncDirection")} hint={translate(selectedSync.hintKey)}>
-          <NativePicker labels={syncOptions.map(({ title }) => title)} selectedValue={selectedSync.title} disabled={waiting} onChange={({ nativeEvent }) => { const option = syncOptions[nativeEvent.index]; if (option) update({ sync_direction: option.id }); }} style={styles.webdavFieldPicker} />
+          <NativePicker labels={syncOptions.map(({ title }) => title)} selectedValue={selectedSync.title} disabled={waiting} accessibilityLabel={translate("dataManagement.syncDirection")} onChange={({ nativeEvent }) => { const option = syncOptions[nativeEvent.index]; if (option) update({ sync_direction: option.id }); }} style={styles.webdavFieldPicker} />
         </WebDavField>
       </View>
     </PersistentScrollView>
@@ -10673,10 +10992,17 @@ type RenderedLogRecord = {
   status: string;
   model: string;
   upstreamModel: string;
-  /** The wire the client called in on (Responses / Chat / Messages). */
-  inboundProtocol: string;
-  /** The wire the request actually left on, never the route's declaration. */
-  outboundProtocol: string;
+  /**
+   * The turn's two wires as one cell, in one letter each (`M→C`).
+   *
+   * The letters cost 88 pt where the spelled-out pair cost 168, and the cell's
+   * tooltip states them in full on hover: the column answers "did this turn get
+   * adapted, and where" at a glance, and answers "which wires exactly" without
+   * the row having to spend the width of a model column on it.
+   */
+  protocol: string;
+  /** The same pair spelled out, for the cell's tooltip and its VoiceOver text. */
+  protocolSpelled: string;
   provider: string;
   apiKeyName: string;
   event: string;
@@ -10720,11 +11046,29 @@ type LogColumn = {
   label: string;
   width: number;
   flex?: boolean;
-  /** This flexible column is the row's detail message, so it keeps the shared floor. */
+  /** This flexible column is the row's detail message: a wide window grows it. */
   detailFlex?: boolean;
   /** A data column's own ceiling: it absorbs slack only up to this width. */
   maxWidth?: number;
+  /**
+   * The width this column's content needs even when the estimator disagrees.
+   *
+   * `M→M` is two letters and an arrow and the narrowest thing the table draws;
+   * the estimator reads it as 28 pt where the host draws 28.4, and that half
+   * point is the difference between the arrow and an ellipsis.  A column that
+   * states its own floor is never sized below it.
+   */
+  floor?: number;
   value: (row: RenderedLogRecord) => string;
+  /**
+   * What the cell's tooltip says, when the cell shortens what it holds.
+   *
+   * The native table already sets a cell's tooltip to its own text, which is
+   * the whole story for a column that states exactly what it means.  A column
+   * that abbreviates (`M→C`) is the one case where the tooltip has to say more
+   * than the cell does, so it declares the long form here.
+   */
+  tooltip?: (row: RenderedLogRecord) => string;
 };
 
 function logClockText(parsed: Date): string {
@@ -10809,12 +11153,17 @@ function formatLogCacheHit(cached: string, input: string): string {
   // reports the cached count *beside* a smaller input is normalized by LiteLLM
   // before it reaches this row, so the two numbers share one denominator.
   const inputTokens = Number(input);
-  const share = input && Number.isFinite(inputTokens) && inputTokens > 0
-    ? Math.max(0, Math.min(1, cachedTokens / inputTokens))
-    : undefined;
-  const rate = share === undefined ? "" : `${Math.round(share * 100)}%`;
-  const count = formatLogTokens(cached);
-  return rate ? `${rate} · ${count}` : count;
+  if (!input || !Number.isFinite(inputTokens) || inputTokens <= 0) {
+    // Without the input there is no share to state, and a bare token count
+    // under a header that says 缓存命中 reads as a rate that is missing its
+    // percent sign.  The count is still in the row's own detail.
+    return "";
+  }
+  const share = Math.max(0, Math.min(1, cachedTokens / inputTokens));
+  // A rate carries its own unit: `100%` says what `100` cannot, and the cached
+  // token count beside it was a second number for a fact the rate already
+  // states.  The column is now as wide as its header.
+  return `${Math.round(share * 100)}%`;
 }
 
 function routeTraceEventLabel(value: string, translate: Translate): string {
@@ -10915,6 +11264,49 @@ function logProtocolLabel(value: unknown, translate: Translate): string {
   // before these fields existed says nothing about the protocol it used.
   const surface = compactLogValue(value);
   return surface ? routeTraceProtocolLabel(surface, translate) : "";
+}
+
+/**
+ * The one-letter wire a protocol cell shows, so a row states both ends in 88 pt
+ * instead of 168.
+ *
+ * The letters are not a code the reader has to learn: hovering the cell states
+ * the pair in full (`Messages → Chat`), and the cell is the only place this
+ * table ever spells a wire in one letter.  An end the row never recorded stays
+ * empty, the same rule the full pair follows -- an abbreviation may shorten a
+ * fact, never invent one.
+ */
+function logProtocolShortLabel(value: unknown): string {
+  const normalized = compactLogValue(value).trim().toLowerCase();
+  if (!normalized) return "";
+  if (normalized.includes("responses")) return "R";
+  if (normalized.includes("chat")) return "C";
+  if (normalized.includes("messages") || normalized.includes("anthropic")) return "M";
+  if (normalized.includes("image")) return "I";
+  // A wire this build cannot name is drawn as `?` rather than dropped: the
+  // arrow still says which end was the unknown one, and the tooltip carries
+  // the surface the row actually recorded.
+  return "?";
+}
+
+/** The wire pair a request row's protocol column shows, in one letter each. */
+function logProtocolShortPair(client: string, upstream: string): string {
+  // No spaces around the arrow: the cell is two letters and a direction, and
+  // the spelled-out pair in its tooltip keeps the spaces a sentence needs.
+  return [logProtocolShortLabel(client), logProtocolShortLabel(upstream)].filter(Boolean).join("→");
+}
+
+/**
+ * A turn's two wires as one cell, written the way the turn travelled.
+ *
+ * The pair answers what one wire could not: a Messages client served by a
+ * chat-only relay reads `Messages → Chat`, and that arrow is the whole reason
+ * the row exists in a routing log.  An unknown end is dropped instead of
+ * printed as a bare arrow -- `→ Chat` would claim a client wire the row never
+ * recorded -- so a row with neither end keeps an empty cell.
+ */
+function logProtocolPair(client: string, upstream: string): string {
+  return [client, upstream].filter(Boolean).join(" → ");
 }
 
 const ROUTE_REASON_KEYS: Record<string, Parameters<Translate>[0]> = {
@@ -11168,6 +11560,10 @@ function requestAbortedDetail(value: unknown, translate: Translate): string {
     case "no_terminal_callback": return translate("logs.aborted.reasonNoTerminalCallback");
     case "service_restart": return translate("logs.aborted.reasonServiceRestart");
     case "stale": return translate("logs.aborted.reasonStale");
+    // The one ending a person caused: the client closed the turn, so the row
+    // says so instead of borrowing the runtime's own words for a stream that
+    // simply never reported back.
+    case "client_disconnect": return translate("logs.aborted.reasonClientDisconnect");
     default: return reason;
   }
 }
@@ -11317,8 +11713,8 @@ function parseTextLogRecord(record: string, tab: LogTab, _index: number, transla
     status,
     model,
     upstreamModel: "",
-    inboundProtocol: "",
-    outboundProtocol: "",
+    protocol: "",
+    protocolSpelled: "",
     provider: "",
     apiKeyName: "",
     event: "",
@@ -11425,8 +11821,8 @@ function renderOnlineUsageRecord(record: unknown, value: UnknownRecord, translat
     status,
     model,
     upstreamModel: "",
-    inboundProtocol: "",
-    outboundProtocol: "",
+    protocol: "",
+    protocolSpelled: "",
     provider: "",
     family,
     account,
@@ -11474,12 +11870,22 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
   const apiKeyName = compactLogValue(value.api_key_name);
   const publicModel = compactLogValue(value.public_model ?? value.model_group ?? value.model);
   const upstreamModel = compactLogValue(value.upstream_model);
-  // The two protocol columns state the wire each side used.  Core records the
-  // names, the pane phrases them the way the route trace already does, and a
-  // row written before the record carried them leaves both cells empty rather
-  // than guessing a wire from the model's shape.
-  const inboundProtocol = tab === "requests" ? logProtocolLabel(value.client_surface, translate) : "";
-  const outboundProtocol = tab === "requests" ? logProtocolLabel(value.upstream_surface, translate) : "";
+  // The protocol cell states the wire each side used, in one letter each.  Core
+  // records the names, the pane phrases them the way the route trace already
+  // does, and a row written before the record carried them leaves the cell
+  // empty rather than guessing a wire from the model's shape.
+  const protocolSpelled = tab === "requests"
+    ? logProtocolPair(
+      logProtocolLabel(value.client_surface, translate),
+      logProtocolLabel(value.upstream_surface, translate),
+    )
+    : "";
+  const protocol = tab === "requests"
+    ? logProtocolShortPair(
+      compactLogValue(value.client_surface),
+      compactLogValue(value.upstream_surface),
+    )
+    : "";
   const model = publicModel || upstreamModel;
   const source = tab === "service"
     ? translate("logs.service")
@@ -11578,8 +11984,8 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
     status,
     model: model || recoveryFallback,
     upstreamModel: compactUpstreamLogModel(upstreamModel) || recoveryFallback,
-    inboundProtocol,
-    outboundProtocol,
+    protocol,
+    protocolSpelled,
     provider: provider || recoveryFallback,
     apiKeyName: apiKeyName || recoveryFallback,
     event,
@@ -11713,27 +12119,51 @@ function routeTraceOutcomeLabel(outcome: RouteTraceRequest["outcome"], translate
   return translate("logs.routeTrace.direct");
 }
 
-const LOG_DETAIL_COLUMN_FLOOR = 240;
+// The detail column is declared at this width, and the flex rule is what grows
+// it: a row's message is the last thing on the row and the only column with no
+// ceiling, so it is where a wide window's spare room goes.
+const LOG_DETAIL_COLUMN_WIDTH = 240;
 // Every log record renders its stamp as `MM-DD HH:MM:SS` in the table's 13 pt
 // face: 14 characters measure about 101 pt, plus the 8 pt cell padding on each
 // side, so 120 shows the seconds of every row.  The year is deliberately not in
 // the stamp -- a bounded tail of one log is from one era, and the four digits
 // it costs are two protocol columns' worth of a narrow window.
 const LOG_TIME_COLUMN_WIDTH = 120;
-// A protocol column holds a wire name, never prose: `Responses` (9 characters)
-// and `Messages` measure about 65 pt in the table's 13 pt face, so 82 is the
-// header plus the cell's 8 pt padding on each side.  It is not flexible: a wire
-// name that stretched across a wide window would push the model columns apart.
-const LOG_PROTOCOL_COLUMN_WIDTH = 82;
-// A fully cached long prompt reads `100% · 1000.0`: 84.8 pt in the table's
-// 13 pt face plus the cell's 8 pt padding on each side. The two tabs that show
-// a cache share declare the same width so the fact does not change size
-// between them.
-const LOG_CACHE_COLUMN_WIDTH = 104;
+// The model columns are sized to `deepseek-v4.1-flash`: 123.2 pt in the table's
+// 13 pt face, so 140 is that plus the cell's 8 pt padding on each side.  A
+// longer id is ellipsized -- a model name cannot be abbreviated the way a wire
+// can, the row's double-click carries the whole id, and spending 22 pt more of
+// every row to hold one longer name costs the columns beside it.
+const LOG_MODEL_COLUMN_WIDTH = 140;
+// One protocol column states a turn's two wires as one letter each, never
+// prose: the widest cell is `M→M`, 34.3 pt in the table's 13 pt face.  The
+// header is what sets the width now -- PROTOCOL measures 72.1 pt semibold, so
+// 90 is the header plus the cell's 8 pt padding on each side.  The spelled-out
+// pair (`Responses → Responses`, 151.0 pt) lives in the cell's tooltip instead:
+// a routing log is read for "was this turn adapted, and where", and spending
+// 168 pt of every row to spell names the reader can summon on hover cost more
+// than the answer was worth.  It is not flexible: a wire pair that stretched
+// across a wide window would push the model columns apart.
+const LOG_PROTOCOL_COLUMN_WIDTH = 90;
+// The width a protocol cell never goes below: `M→M` is 28.4 pt in the host's
+// own glyph run, so 56 is that plus the cell's 8 pt padding on each side and
+// the couple of points AppKit's own truncation needs before it draws an
+// ellipsis instead of the arrow.
+const LOG_PROTOCOL_COLUMN_SIZE = 56;
+// A cache share is a rate and nothing else -- `100%` measures 34.1 pt -- so the
+// header is what sets this column: 缓存命中 is 51.6 pt semibold, and 68 is that
+// plus the cell's 8 pt padding on each side.  It held 108 while the cell also
+// carried the cached token count, which restated a share the rate already gives
+// and cost 50 pt of a narrow frame to do it.  The two tabs that show a cache
+// share declare the same width so the fact does not change size between them.
+const LOG_CACHE_COLUMN_WIDTH = 68;
 // `1183.4 / 12.5`: 80.3 pt in the table's 13 pt face plus the cell's 8 pt
-// padding on each side. The header `令牌数(k)` is narrower than the pair, so
-// the pair decides.
-const LOG_TOKEN_PAIR_COLUMN_WIDTH = 96;
+// padding on each side, and the estimator this pane sizes with reads the same
+// pair as 90.5, so 108 is the ceiling that holds the widest pair either way.
+// It is a ceiling, not a reservation: `fitLogColumnsToContent` hands the column
+// back to its own widest cell, so a page of `645.3 / 0` rows costs 73 pt, not
+// 108. The header `令牌数(k)` is narrower than the pair, so the pair decides.
+const LOG_TOKEN_PAIR_COLUMN_WIDTH = 108;
 
 /**
  * Whether this page actually needs a column to tell its rows apart.
@@ -11763,19 +12193,31 @@ function logColumns(
   const detail = { label: translate("logs.detail"), width: 260, flex: true, detailFlex: true, value: (row: RenderedLogRecord) => row.detail };
   if (tab === "requests") return [
     time,
-    // One inbound pair, then one outbound pair: the wire the client called in
-    // on and the model it named, then the wire the request left on and the
-    // model that answered it.  The model headers say 入站/出站 rather than
-    // 公开/上游 because this table is about the direction a turn travelled,
-    // not about how a route is configured.
-    { label: translate("logs.inboundProtocol"), width: LOG_PROTOCOL_COLUMN_WIDTH, value: (row) => row.inboundProtocol },
-    { label: translate("logs.inboundModel"), width: 106, value: (row) => row.model },
-    { label: translate("logs.outboundProtocol"), width: LOG_PROTOCOL_COLUMN_WIDTH, value: (row) => row.outboundProtocol },
-    { label: translate("logs.outboundModel"), width: 106, value: (row) => row.upstreamModel },
+    // The wire the turn travelled, then the two models it named: `M→C` on one
+    // line is the adaption this app performed, and it reads in the same
+    // left-to-right order as the model pair under it.  The header names the
+    // pair rather than an end: 入站/出站 described a station and left the reader
+    // to guess whose station it was.
+    {
+      label: translate("logs.protocol"),
+      width: LOG_PROTOCOL_COLUMN_WIDTH,
+      // Two letters and an arrow is the narrowest cell in the table and the
+      // least forgiving: 10 pt of slack is what keeps `M→M` from becoming `M…`.
+      floor: LOG_PROTOCOL_COLUMN_SIZE,
+      value: (row) => row.protocol,
+      tooltip: (row) => row.protocolSpelled,
+    },
+    // A model name is the row's identity: both columns hold
+    // `deepseek-v4.1-flash` whole, and a longer id is ellipsized rather than
+    // made narrower than the one this app is read against.
+    { label: translate("logs.clientModel"), width: LOG_MODEL_COLUMN_WIDTH, floor: LOG_MODEL_COLUMN_WIDTH, value: (row) => row.model },
+    { label: translate("logs.upstreamModel"), width: LOG_MODEL_COLUMN_WIDTH, floor: LOG_MODEL_COLUMN_WIDTH, value: (row) => row.upstreamModel },
     { label: translate("common.provider"), width: 78, value: (row) => row.provider },
     { label: translate("logs.apiKeyName"), width: 64, value: (row) => row.apiKeyName },
     { ...status, width: 68 },
-    { label: translate("logs.duration"), width: 62, value: (row) => row.duration },
+    // `耗时(s)` is 45.1 pt semibold in the header (48.5 by the estimator) and
+    // the widest cell is `12.7`: the header decides at 66.
+    { label: translate("logs.duration"), width: 66, value: (row) => row.duration },
     // A five-digit pair (`1183.4 / 12.5`) measures 80.3 pt in the table's
     // 13 pt face, so 96 is the narrowest width that shows both counts with the
     // cell's 8 pt padding. It was 79 — sized to the `令牌数(k)` header alone —
@@ -11795,7 +12237,7 @@ function logColumns(
     // leaving a strip of empty cells, which is what a log tail written before
     // the runtime recorded the count would otherwise be.
     ...(hasCache ? [{ label: translate("logs.cacheHit"), width: LOG_CACHE_COLUMN_WIDTH, value: (row: RenderedLogRecord) => row.cacheHit }] : []),
-    { ...detail, width: 240 },
+    { ...detail, width: LOG_DETAIL_COLUMN_WIDTH },
   ];
   if (tab === "actions") return [
     time,
@@ -11804,10 +12246,10 @@ function logColumns(
   ];
   if (tab === "recovery") return [
     time,
-    // The same pair the request rows read: this window names a turn's
-    // direction once, so a route's two model names keep those words.
-    { label: translate("logs.inboundModel"), width: 142, value: (row) => row.model },
-    { label: translate("logs.outboundModel"), width: 142, value: (row) => row.upstreamModel },
+    // The same pair the request rows read: this window names a turn's two
+    // ends once, so a route's two model names keep those words.
+    { label: translate("logs.clientModel"), width: 142, value: (row) => row.model },
+    { label: translate("logs.upstreamModel"), width: 142, value: (row) => row.upstreamModel },
     { label: translate("common.provider"), width: 104, value: (row) => row.provider },
     { label: translate("logs.apiKeyName"), width: 120, value: (row) => row.apiKeyName },
     { ...status, width: 68 },
@@ -11863,7 +12305,10 @@ function logColumns(
     // on two tabs should not have to learn two spellings of it. A station that
     // reports no cache leaves the column out entirely.
     ...(hasCache ? [{ label: translate("logs.cacheHit"), width: LOG_CACHE_COLUMN_WIDTH, value: (row: RenderedLogRecord) => row.cacheHit }] : []),
-    { label: translate("logs.duration"), width: 62, value: (row) => row.duration },
+    // The same header as the requests tab's duration column, so the same 66:
+    // `耗时(s)` needs 48.5 pt and the widest cell `34113.8` needs 63, and 62
+    // ellipsized the header of a column that is only four characters wide.
+    { label: translate("logs.duration"), width: 66, value: (row) => row.duration },
   ];
   return [
     time,
@@ -11881,11 +12326,59 @@ function logColumns(
  * is not narrow, it is gone, and the table's horizontal scroller is the honest
  * answer for a window that cannot fit the set.
  */
-function columnFloor(column: LogColumn): number {
-  if (column.detailFlex) return LOG_DETAIL_COLUMN_FLOOR;
-  // Header text plus the cell's own padding is what stays legible; a data
-  // column never needs less than that to remain identifiable.
-  return Math.max(72, Math.min(column.width, column.maxWidth ?? column.width));
+// The table's header face is semibold, and `nativeControlTextWidth` is
+// calibrated on the regular one: measured against the host, an all-caps header
+// runs about a fifth wider than its estimate while a CJK header runs level
+// (`协议` is 25.8 pt and estimates 26).  So only a header written entirely in
+// Latin script is weighted.
+const LOG_HEADER_WEIGHT = 1.2;
+
+function logHeaderTextWidth(label: string): number {
+  const latinOnly = !/[^\u0000-\u024f]/u.test(label);
+  return nativeControlTextWidth(label) * (latinOnly ? LOG_HEADER_WEIGHT : 1);
+}
+
+// A cell's text starts and ends 8 pt inside its column, so a column has to be
+// wider than its text by that much on both sides.  The two extra points cover
+// the difference between the estimator and the host's glyph run where it
+// matters most: `M→M` measures 28.0 pt and a 44 pt column clipped its arrow to
+// `M…`, which is a protocol column that no longer states a protocol.
+const LOG_CELL_PADDING = 18;
+
+/**
+ * Narrow a log column to the widest thing it actually shows.
+ *
+ * Every width declared in `logColumns` is a ceiling, and several of them were
+ * being spent as reservations: `令牌数(k)` held 96 pt for a pair a page of
+ * `645.3 / 0` rows never used, and the relay, key, status and duration columns
+ * each kept a margin past their longest value.  On a 1280 pt window that slack
+ * is what pushed the cache share and the detail column out of the frame, so a
+ * reader had to scroll sideways to see a number the row was already reporting.
+ *
+ * Space no column claims is not lost: `fitLogColumns` hands it to the flex
+ * column, which is where the row's message lives.
+ *
+ * The header is measured with a heavier factor than its regular-face text
+ * because it is drawn semibold and, in the English build, in upper case:
+ * `PROTOCOL` measures 72.1 pt where the estimator says 60.  A header is the one
+ * thing this pass would otherwise truncate.
+ */
+function fitLogColumnsToContent(rows: RenderedLogRecord[], columns: LogColumn[]): LogColumn[] {
+  if (rows.length === 0) return columns;
+  return columns.map((column) => {
+    if (column.flex) return column;
+    let widest = Math.ceil(logHeaderTextWidth(column.label));
+    for (const row of rows) {
+      const measured = nativeControlTextWidth(column.value(row));
+      if (measured > widest) widest = measured;
+    }
+    // A declared floor is a promise about content, so it bounds this pass too:
+    // the estimator reads `M→M` as 28 pt where the host draws 28.4, and the
+    // difference is an ellipsis in a column that then names no protocol.
+    const needed = Math.max(column.floor ?? 0, Math.ceil(widest + LOG_CELL_PADDING));
+    // A ceiling stays a ceiling: this pass only takes width away.
+    return needed < column.width ? { ...column, width: needed } : column;
+  });
 }
 
 function fitLogColumns(columns: LogColumn[], availableWidth: number): LogColumn[] {
@@ -11939,22 +12432,15 @@ function fitLogColumns(columns: LogColumn[], availableWidth: number): LogColumn[
   }
   if (pool >= 0) return widened;
 
-  // Step two: the frame is narrower than the set needs.  Every column gives
-  // back space, not only the flexible ones: shrinking just the flexible column
-  // left the fixed columns over the edge, so the token pair was ellipsized and
-  // the duration column sat outside the window with no way to see it.  Columns
-  // shrink toward their own floor and stop there — a column taken to zero reads
-  // as a missing field, and the table's own horizontal scroller is the honest
-  // affordance for a window that genuinely cannot fit the set.
-  let deficit = -pool;
-  const shrinkOrder = [...widened].sort((left, right) => right.width - left.width);
-  for (const column of shrinkOrder) {
-    if (deficit <= 0) break;
-    const floor = columnFloor(column);
-    const reduction = Math.min(deficit, Math.max(0, column.width - floor));
-    column.width -= reduction;
-    deficit -= reduction;
-  }
+  // Step two: the frame is narrower than the set needs.
+  //
+  // Nothing is dropped and nothing is squeezed.  Every column a log row has is
+  // a fact the reader came for, and measuring the same window twice -- once at
+  // 990 pt and once at full screen -- must not be the difference between a row
+  // that names its key and one that does not.  The table scrolls sideways
+  // instead; `scrollTrailingColumnOverflow` is what makes that scroller appear,
+  // and it is the honest affordance for a frame that genuinely cannot hold the
+  // set.
   return widened;
 }
 
@@ -12288,7 +12774,9 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     // account column is drawn the same way: one relay with two logins needs it
     // to tell two people's rows apart, and one login would leave it blank.
     () => fitLogColumns(
-      logColumns(
+      // Every declared width is a ceiling; the content is what a column
+      // actually spends, and the rest is the detail column's.
+      fitLogColumnsToContent(rows, logColumns(
         selected,
         translate,
         selected !== "online-usage" || rows.some((row) => Boolean(row.status)),
@@ -12308,7 +12796,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
         // log tail written before the runtime recorded one would otherwise
         // spend 96 pt of the frame on empty cells.
         rows.some((row) => Boolean(row.cacheHit)),
-      ),
+      )),
       tableWidth,
     ),
     [rows, selected, tableWidth, translate],
@@ -12321,6 +12809,9 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     () => selected === "route-trace" ? [] : rows.map((row) => ({
       key: row.key,
       cells: columns.map((column) => column.value(row)),
+      // Only a column that shortens its text declares a tooltip; the rest keep
+      // the native table's own rule (tooltip = the cell's text).
+      tooltips: columns.map((column) => column.tooltip?.(row) ?? ""),
     })),
     [columns, rows, selected],
   );
@@ -12746,7 +13237,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     </View>
     <NativeButton title={translate("logs.onlineUsageNextShort")} accessibilityLabel={translate("logs.onlineUsageNext", { count: onlineUsageNext })} compact busy={onlineUsageLoadingMore} disabled={onlineUsagePagerDisabled || onlineUsageRemaining <= 0} onPress={loadMoreOnlineUsage} titleWidth="tight" />
     <NativeButton title={translate("logs.onlineUsageLast")} accessibilityLabel={translate("logs.onlineUsageLast")} compact disabled={onlineUsagePagerDisabled || onlineUsageLoadedPage >= onlineUsagePageCount} onPress={lastOnlineUsagePage} titleWidth="tight" />
-    <NativePicker overlayLayer compact labels={onlineUsagePageSizeLabels} selectedValue={translate("logs.onlineUsagePageRows", { count: onlineUsagePageRows })} disabled={onlineUsagePagerDisabled} onChange={({ nativeEvent }) => {
+    <NativePicker overlayLayer compact labels={onlineUsagePageSizeLabels} selectedValue={translate("logs.onlineUsagePageRows", { count: onlineUsagePageRows })} disabled={onlineUsagePagerDisabled} accessibilityLabel={translate("logs.onlineUsagePageRowsLabel")} onChange={({ nativeEvent }) => {
       const rows = ONLINE_USAGE_PAGE_SIZE_VALUES[nativeEvent.index];
       if (rows !== undefined && rows !== onlineUsagePageRows) setOnlineUsagePageRows(rows);
     }} style={styles.logPagerPageSize} />
@@ -12816,7 +13307,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     }} style={styles.logsTabs} />
     <View style={styles.logsToolbar}>
       <View style={styles.logFilterRow}><Text style={styles.toolbarLabel}>{translate("common.filter")}</Text><NativeTextField style={styles.logFilterInput} value={filterDraft} placeholder={translate("logs.filterCurrent")} onChangeText={(filter) => { filterDirty.current = true; setFilterDraft(filter); if (filterTimer.current) clearTimeout(filterTimer.current); filterTimer.current = setTimeout(() => { void dispatch("logs.set_filter", { tab: selected, filter }, "logs"); }, 250); }} accessibilityLabel={translate("common.filter")} /></View>
-      {selected === "online-usage" ? <><NativePicker overlayLayer labels={onlineUsageTimeLabels} selectedValue={onlineUsageTimeValue} compact onChange={({ nativeEvent }) => {
+      {selected === "online-usage" ? <><NativePicker overlayLayer labels={onlineUsageTimeLabels} selectedValue={onlineUsageTimeValue} compact accessibilityLabel={translate("logs.onlineUsageTimeLabel")} onChange={({ nativeEvent }) => {
         const option = onlineUsageTimeValues[nativeEvent.index];
         if (option) chooseOnlineUsageTime(option);
       }} style={styles.onlineUsageTimePicker} /></> : null}
@@ -12825,7 +13316,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
           `onlineUsageLoading`, which is every case this row's narrower
           `onlineUsageLoadingSource` covered.  A wheel here as well spun two for
           one read, the second one floating above the picker. */}
-      <View style={styles.logActionsRow}>{selected === "online-usage" ? <NativePicker overlayLayer labels={onlineUsageSourceLabels} selectedValue={onlineUsagePendingLabel || (onlineUsageSourceIndex >= 0 ? onlineUsageSourceLabels[onlineUsageSourceIndex] ?? "" : "")} disabled={onlineUsageSourceLabels.length === 0} onChange={({ nativeEvent }) => { const source = onlineUsageSourceValues[nativeEvent.index]; if (source !== undefined) refreshOnlineUsage(source, onlineUsageSourceLabels[nativeEvent.index] ?? ""); }} style={styles.onlineUsageSourcePicker} /> : null}{selected === "recovery" ? <NativeButton title={translate("logs.clearRecoveryCooldown")} accessibilityLabel={translate("logs.clearRecoveryCooldown")} compact busy={cooldownClearPending} disabled={busy && !cooldownClearPending} onPress={clearCooldowns} style={styles.clearCooldownButton} /> : null}<IconButton label="" symbol={paused ? "play" : "pause"} title={paused ? translate("common.resume") : translate("common.pause")} disabled={busy} onPress={togglePaused} /><IconButton label="" symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs} /></View>
+      <View style={styles.logActionsRow}>{selected === "online-usage" ? <NativePicker overlayLayer labels={onlineUsageSourceLabels} selectedValue={onlineUsagePendingLabel || (onlineUsageSourceIndex >= 0 ? onlineUsageSourceLabels[onlineUsageSourceIndex] ?? "" : "")} disabled={onlineUsageSourceLabels.length === 0} accessibilityLabel={translate("logs.onlineUsageSourceLabel")} onChange={({ nativeEvent }) => { const source = onlineUsageSourceValues[nativeEvent.index]; if (source !== undefined) refreshOnlineUsage(source, onlineUsageSourceLabels[nativeEvent.index] ?? ""); }} style={styles.onlineUsageSourcePicker} /> : null}{selected === "recovery" ? <NativeButton title={translate("logs.clearRecoveryCooldown")} accessibilityLabel={translate("logs.clearRecoveryCooldown")} compact busy={cooldownClearPending} disabled={busy && !cooldownClearPending} onPress={clearCooldowns} style={styles.clearCooldownButton} /> : null}<IconButton label="" symbol={paused ? "play" : "pause"} title={paused ? translate("common.resume") : translate("common.pause")} disabled={busy} onPress={togglePaused} /><IconButton label={Platform.OS === "web" ? translate("common.clear") : ""} symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs} /></View>
     </View>
     {/* The range message is the only thing that makes this slot exist: an empty
         row of its own height sat between the toolbar and the table for every
@@ -12837,7 +13328,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     </View> : null}
     {rows.length > 0 && !onlineUsageWaitingForSource ? selected === "route-trace"
       ? <RouteTraceWorkspace requests={routeTraceRequests} selectedKey={selectedKey} native={native} translate={translate} onSelect={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} />
-      : <View style={styles.logTablesLayout}><View style={styles.logTableFrame} onLayout={({ nativeEvent }) => setTableWidth(nativeEvent.layout.width)}><NativeTable columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths scrollTrailingColumnOverflow onSelectionChange={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} onRowDoublePress={(_key, index) => {
+      : <View style={styles.logTablesLayout} onLayout={({ nativeEvent }) => setTableWidth(nativeEvent.layout.width)}><View style={styles.logTableFrame} onLayout={({ nativeEvent }) => setTableWidth(nativeEvent.layout.width)}><NativeTable columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths scrollTrailingColumnOverflow onSelectionChange={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} onRowDoublePress={(_key, index) => {
         if (onlineUsageWaitingForSource || onlineUsageTimePending) return;
         const row = rows[index];
         if (!row) return;
@@ -13425,14 +13916,19 @@ function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"
   // verdict about what answers behind the name: dilution needs a response to
   // judge (or a run that produced one), and the availability sentence already
   // names the real failure.
-  const degradationMeasured = availableCount > 0 || Boolean(stringValue(degradation.verdict));
+  // "Measured" means the deep test *ran*: a route whose plan excludes it carries
+  // no finding, and printing 真伪: 不适用 beside a working probe read as one more
+  // thing this route failed.  The plan is Core's answer, so the sentence follows
+  // it rather than the count of surfaces that happened to answer.
+  const deepTestIncluded = booleanValue(asRecord(model.deep_probe).includes_degradation);
+  const degradationMeasured = deepTestIncluded
+    && (availableCount > 0 || Boolean(stringValue(degradation.verdict)));
   // The row shows a word; the hover hint spells the same finding out.
   const degradationLine = degradationMeasured ? probeDegradationLine(degradation, translate) : "";
   const degradationSentence = degradationMeasured ? probeDegradationLine(degradation, translate, true) : "";
   // The row reads "3/3 可用; 未注水": a plain count first, then the one finding
   // worth knowing. Routes the staged engine cannot fingerprint carry no
   // degradation wording at all - not "no degradation", nothing.
-  const deepTestIncluded = booleanValue(asRecord(model.deep_probe).includes_degradation);
   const availabilityCount = surfaces.length > 0
     ? translate("providers.probeAvailabilityCount", { available: availableCount, total: surfaces.length })
     : availabilityInline;
@@ -13557,6 +14053,10 @@ function probeSurfaceLabel(surface: string, translate: Translate): string {
   if (surface === "openai/responses") return translate("providers.responses");
   if (surface === "openai/chat") return translate("providers.chat");
   if (surface === "anthropic") return translate("providers.anthropic");
+  // A route that serves only images is measured on the Images wire, which is
+  // the endpoint it really uses.  Naming it lets the finding read as one
+  // surface answering instead of three protocols failing.
+  if (surface === "openai/images") return translate("providers.images");
   return translate("providers.probeNotRun");
 }
 
@@ -13611,6 +14111,22 @@ function semanticColor(macos: string, windows: string | undefined, fallback: str
   return fallback;
 }
 
+/**
+ * The Windows-shaped panes: WinUI and the browser host share them.
+ *
+ * Where the two native hosts differ, the difference is usually not "what this
+ * platform's toolkit draws" but "which of two pane layouts this host has": the
+ * Windows panes are the React ones (a React table, a React split, a React
+ * status strip), and macOS's are the AppKit ones. A browser has no AppKit at
+ * all, so the Windows shape is the only one it can render faithfully — and it
+ * already carries literals for every semantic color (`semanticColor`'s third
+ * argument), which is exactly what a page can paint.
+ *
+ * Naming it once is what keeps a new Windows/Unix branch from having to guess
+ * whether it is about the platform or about the layout.
+ */
+const isWindowsShell = Platform.OS === "windows" || Platform.OS === "web";
+
 const systemColors = {
   window: semanticColor("windowBackgroundColor", "SolidBackgroundFillColorBase", "#f7f7f7"),
   control: semanticColor("controlBackgroundColor", "ControlFillColorDefault", "#ffffff"),
@@ -13619,6 +14135,9 @@ const systemColors = {
   secondaryLabel: semanticColor("secondaryLabelColor", "TextFillColorSecondary", "#6e6e73"),
   separator: semanticColor("separatorColor", "ControlStrokeColorDefault", "#d4d4d8"),
   blue: semanticColor("systemBlueColor", "AccentTextFillColorPrimary", "#0a84ff"),
+  // A link reads as the system's own link colour on both hosts; the address in
+  // General is the one piece of text in a pane that is a thing to press.
+  link: semanticColor("linkColor", "AccentTextFillColorPrimary", "#0a84ff"),
   selectedContent: semanticColor("selectedContentBackgroundColor", "AccentFillColorDefault", "#0a84ff"),
   unemphasizedSelectedContent: semanticColor("unemphasizedSelectedContentBackgroundColor", "SubtleFillColorSecondary", "#e5e5ea"),
   selectedControlText: semanticColor("alternateSelectedControlTextColor", "TextOnAccentFillColorPrimary", "#ffffff"),
@@ -13796,13 +14315,23 @@ const styles = StyleSheet.create({
   // are the ones the content keeps.  A header rule would cut that surface in
   // two, which is why the band carries none and the fill alone states where it
   // ends.
+  compactWebHeader: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "baseline", gap: 10, paddingHorizontal: 14, paddingTop: 10, paddingBottom: 8 },
+  compactWebTitle: { flexShrink: 0, color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" },
+  compactWebPaneTitle: { flexShrink: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
+  compactWebNav: { flexShrink: 0, paddingHorizontal: 12, paddingBottom: 8 },
+  compactWebTabs: { width: "100%" },
+  compactWebDetail: { flex: 1, minWidth: 0, minHeight: 0 },
   settingsShellHeader: { flexShrink: 0, flexDirection: "row", minWidth: 0, backgroundColor: systemColors.separator }, settingsShellHeaderWindows: { backgroundColor: systemColors.window, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, minWidth: 0, flexShrink: 0, minHeight: 0, backgroundColor: systemColors.separator }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderIntegrated: { width: 200, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsSidebarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderRightWidth: 1, borderRightColor: WINDOWS_CONTROL.strokeSubtle }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { height: 8, flexShrink: 0 }, settingsSidebarList: { flex: 1, minWidth: 0, minHeight: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneHeaderIntegrated: { flex: 1, minWidth: 0, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailIntegrated: { paddingTop: 0 }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: systemColors.window }, settingsRailDetailHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
   routeStatusBar: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, justifyContent: "space-between", paddingHorizontal: 16, paddingVertical: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusBarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderTopColor: WINDOWS_CONTROL.strokeSubtle }, routeStatusTextWindows: { color: WINDOWS_CONTROL.textSecondary }, routeStatusLead: { minWidth: 0, flex: 1, flexDirection: "row", alignItems: "center", gap: 6 },
   // The usage pager is the window's status bar on this tab: the row count stays
   // on the left where every other route states its status, and the page controls
   // sit on the right of that same row rather than in a strip above the table.
   usageStatusBar: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, paddingHorizontal: 16, paddingVertical: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
-  generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 16, gap: 18 }, generalSection: { gap: 4 }, generalSectionTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, generalRow: { ...SETTINGS_FIELD_ROW_INDENTED }, generalRowLabel: { ...SETTINGS_FIELD_LABEL }, generalRowValue: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalToggle: { ...SETTINGS_FIELD_SWITCH_SLOT }, generalHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, generalHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, generalServiceAction: { minWidth: 96 }, generalApiKeyField: { flex: 1, minWidth: 0, maxWidth: SETTINGS_FIELD_TEXT_WIDTH }, generalApiKeyButton: { minWidth: 96, alignSelf: "flex-start" }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, toolbarSpacer: { flex: 1 }, windowTabsRow: { flex: 1, minWidth: 0, height: 28, flexDirection: "row", alignItems: "center", gap: 8 }, windowTabsToolbarRow: { flex: 1, minWidth: 0, width: "100%", height: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6, overflow: "hidden" }, windowTabs: { width: 224, height: 24 }, windowTabsWithActions: { flexShrink: 1 }, windowTabsActions: { flex: 1, minWidth: 0, maxWidth: 400, marginLeft: "auto", flexShrink: 0 },
+  // 常规 spreads the same field grid as 运行时, 外部 and WebDAV: one field is a
+  // row and its tip (2 apart), one list is fields 10 apart, and the pane's own
+  // gap is the pane inset.  Restating any of those numbers here is what made
+  // this pane's rhythm differ from every other settings surface.
+  generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 16, gap: 14 }, generalSection: { minWidth: 0, alignSelf: "stretch" }, generalSectionTitle: { paddingLeft: SETTINGS_FIELD_LEAD, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600", marginBottom: SETTINGS_FIELD_GAP }, generalFieldList: { ...SETTINGS_FIELD_LIST }, generalField: { ...SETTINGS_FIELD }, generalRow: { ...SETTINGS_FIELD_ROW_INDENTED }, generalRowLabel: { ...SETTINGS_FIELD_LABEL }, generalRowValue: { minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalValueSlot: { ...SETTINGS_FIELD_CELL }, generalValueCellWide: { flex: 1, minWidth: 0, maxWidth: SETTINGS_FIELD_TEXT_WIDTH, height: 26, flexDirection: "row", alignItems: "center", gap: SETTINGS_FIELD_GAP }, generalActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, generalToggle: { ...SETTINGS_FIELD_SWITCH_SLOT }, generalHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, generalHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, generalServiceAction: { minWidth: 72 }, generalWebAddress: { flex: 1, minWidth: 0 }, generalWebAddressText: { color: systemColors.link }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, toolbarSpacer: { flex: 1 }, windowTabsRow: { flex: 1, minWidth: 0, height: 28, flexDirection: "row", alignItems: "center", gap: 8 }, windowTabsToolbarRow: { flex: 1, minWidth: 0, width: "100%", height: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6, overflow: "hidden" }, windowTabs: { width: 224, height: 24 }, windowTabsWithActions: { flexShrink: 1 }, windowTabsActions: { flex: 1, minWidth: 0, maxWidth: 400, marginLeft: "auto", flexShrink: 0 },
   providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceModel: { flex: 1, minHeight: 0 }, providerWizardSignInPanel: { width: "100%", minHeight: 160, justifyContent: "center", gap: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, backgroundColor: systemColors.control, paddingHorizontal: 16, paddingVertical: 18 }, providerWizardAuthRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAuthStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   providerMiddlePane: { flex: 1, minWidth: 0, gap: 6 }, // The empty pane reads as the top of a list that has no rows yet, not as a
   // poster centred in a large window: it keeps the column's width and the
@@ -13887,13 +14416,13 @@ inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspec
   // Each control takes the grid's width for what it holds: the URL and the
   // filename are text, and a number of seconds keeps only its own digits.
   webdavDialogSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, webdavDialogBody: { flex: 1, minWidth: 0, minHeight: 0 }, webdavDialogBodyContent: { padding: SETTINGS_PANE_INSET }, webdavFieldList: { ...SETTINGS_FIELD_LIST }, webdavField: { ...SETTINGS_FIELD }, webdavFieldRow: { ...SETTINGS_FIELD_ROW_INDENTED }, webdavFieldLabel: { ...SETTINGS_FIELD_LABEL }, webdavFieldSwitch: { ...SETTINGS_FIELD_SWITCH_SLOT }, webdavFieldText: { flex: 1, minWidth: 0, maxWidth: SETTINGS_FIELD_TEXT_WIDTH }, webdavFieldShort: { width: SETTINGS_FIELD_VALUE_WIDTH, flexGrow: 0, flexShrink: 0, minWidth: 0 }, webdavFieldNumber: { width: SETTINGS_FIELD_NUMBER_WIDTH, height: 26, flexGrow: 0, flexShrink: 0 }, webdavFieldPicker: { width: SETTINGS_FIELD_VALUE_WIDTH, height: 26, flexGrow: 0, flexShrink: 0 }, webdavFieldUnit: { flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, webdavFieldHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, webdavFieldHelpText: { ...SETTINGS_FIELD_HELP_TEXT },
-  logsWindow: { flex: 1, minHeight: 0, gap: 4 },
+  logsWindow: { flex: 1, minHeight: 0, gap: Platform.OS === "web" ? 10 : 4 },
   logsWindowMacOS: { paddingTop: 0, paddingHorizontal: 10 },
-  logsToolbar: { width: "100%", minWidth: 0, height: 24, flexDirection: "row", alignItems: "center", gap: 6, flexShrink: 0 },
-  logFilterRow: { flex: 1, minWidth: 50, height: 24, flexDirection: "row", alignItems: "center", gap: 6 },
+  logsToolbar: { width: "100%", minWidth: 0, minHeight: 24, height: Platform.OS === "web" ? undefined : 24, flexDirection: "row", alignItems: "center", gap: Platform.OS === "web" ? 8 : 6, flexShrink: 0, flexWrap: Platform.OS === "web" ? "wrap" : "nowrap" },
+  logFilterRow: { flex: 1, minWidth: Platform.OS === "web" ? 180 : 50, height: 24, flexDirection: "row", alignItems: "center", gap: 6 },
   logFilterRowOnlineUsage: { flex: 1, minWidth: 50 },
   logToolbarSpacer: { flex: 1, minWidth: 4 },
-  logActionsRow: { height: 24, flexDirection: "row", alignItems: "center", flexShrink: 0, gap: 6 },
+  logActionsRow: { height: 24, flexDirection: "row", alignItems: "center", flexShrink: 0, gap: 6, marginLeft: Platform.OS === "web" ? "auto" : undefined },
   // A labelled picker states its own name, so it needs the width of the widest
   // label the window can put in it instead of shrinking to its intrinsic size:
   // ``全部…`` and ``选择…`` were what a 80 pt floor produced.

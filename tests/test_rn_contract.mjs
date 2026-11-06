@@ -43,7 +43,17 @@ try {
   assert.notEqual(badResult.status, 0, "result drift must fail the contract check");
   assert.match(badResult.stderr, /IpcResults\.subscribe diverges/u);
 
-  const missingMethod = run(original.replace('  | "import";', ";"));
+  // The last member of *this* union, read from its own block rather than
+  // pinned to a name: a method added after "import" would otherwise make the
+  // replacement a no-op and the drift check would silently stop testing
+  // anything.
+  const methodBlock = original.slice(
+    original.indexOf("export type IpcMethod ="),
+    original.indexOf("export type AppRoute ="),
+  );
+  const lastMethod = [...methodBlock.matchAll(/^  \| "([a-z_]+)";$/gmu)].pop()?.[1];
+  assert.ok(lastMethod, "the IpcMethod union must end with a stated member");
+  const missingMethod = run(original.replace(`  | "${lastMethod}";`, ";"));
   assert.notEqual(missingMethod.status, 0, "method drift must fail the contract check");
   assert.match(missingMethod.stderr, /IpcMethod diverges/u);
 } finally {
