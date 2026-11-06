@@ -115,6 +115,18 @@ def desktop_keeps_model_id(name: object) -> bool:
 
 _ALIAS_DIGEST = re.compile(r"[0-9a-f]{6}$")
 
+#: Claude Desktop's own 1M spelling: the picker offers ``<id>[1m]`` beside the
+#: plain row, and the id it sends on a turn carries the suffix.  A gateway row
+#: that reads as 1M gets it from its ``max_input_tokens``, so this suffix is the
+#: client's, never a route the router serves.
+_CONTEXT_SUFFIX = re.compile(r"\[1m\]$", re.IGNORECASE)
+
+
+def context_suffix_free(name: str) -> str:
+    """The id without Claude Desktop's trailing ``[1m]`` marker."""
+
+    return _CONTEXT_SUFFIX.sub("", name.strip())
+
 
 def is_derived_alias(name: object) -> bool:
     """Whether an id is one of the aliases this app derives, old or current.
@@ -122,11 +134,13 @@ def is_derived_alias(name: object) -> bool:
     The digest is six lowercase hexadecimal characters, so a real Claude id
     (``claude-fable-5``) does not match.  The Desktop migration reads this as
     the mark of a list this app wrote when its bookkeeping record is missing.
+    The picker's 1M spelling counts too: it is the same published id and the
+    same mark.
     """
 
     if not isinstance(name, str):
         return False
-    text = name.strip().lower()
+    text = context_suffix_free(name).lower()
     for family in (ALIAS_FAMILY, *LEGACY_ALIAS_FAMILIES):
         if text.startswith(family) and _ALIAS_DIGEST.fullmatch(text[len(family):]):
             return True
@@ -205,13 +219,27 @@ def resolve_alias(model: object, public_names: Iterable[str]) -> str | None:
     Only an id that is exactly one derived alias resolves.  Anything else --
     a real public name, a deployment id, a name this router does not serve --
     is left for the router to answer as it always has.
+
+    The picker's 1M spelling resolves too.  Desktop offers a route that reads
+    as 1M as ``<alias>`` plus ``<alias>[1m]`` and sends the suffixed id, which
+    is not a route this router serves: without this the chosen row answered
+    ``Invalid model name`` (one real session picked the 1M row for 11 of its 12
+    turns).  The suffix only selects a row in the client; it is stripped, so
+    the public name reaches the router and the upstream exactly as before.
     """
 
     if not isinstance(model, str) or not model.strip():
         return None
     names = tuple(str(name or "").strip() for name in public_names)
-    text = model.strip()
-    return alias_index(names).get(text) or legacy_alias_index(names).get(text)
+    index = alias_index(names)
+    legacy = legacy_alias_index(names)
+    for text in (model.strip(), context_suffix_free(model)):
+        if not text:
+            continue
+        resolved = index.get(text) or legacy.get(text)
+        if resolved is not None:
+            return resolved
+    return None
 
 
 def rewrite_request_model(data: Mapping[str, Any]) -> str | None:
@@ -272,6 +300,7 @@ __all__ = [
     "REFUSED_ALIAS_TOKENS",
     "alias_index",
     "claude_desktop_alias",
+    "context_suffix_free",
     "desktop_keeps_model_id",
     "is_derived_alias",
     "legacy_alias_index",

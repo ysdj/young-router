@@ -15,7 +15,9 @@ from young_router.claude_aliases import (
     REFUSED_ALIAS_TOKENS,
     alias_index,
     claude_desktop_alias,
+    context_suffix_free,
     desktop_keeps_model_id,
+    is_derived_alias,
     resolve_alias,
 )
 
@@ -75,6 +77,13 @@ class ClaudeDesktopAliasTests(unittest.TestCase):
         self.assertIsNone(resolve_alias(None, names))
         self.assertIsNone(resolve_alias("", names))
 
+    def test_the_one_million_suffix_is_stripped_and_nothing_else_is(self) -> None:
+        self.assertEqual("claude-mythos-eb1394", context_suffix_free("claude-mythos-eb1394[1m]"))
+        self.assertEqual("claude-mythos-eb1394", context_suffix_free("claude-mythos-eb1394[1M]"))
+        # Only the client's own marker, and only at the end.
+        self.assertEqual("[1m]claude-mythos-eb1394", context_suffix_free("[1m]claude-mythos-eb1394"))
+        self.assertEqual("claude-mythos-eb1394", context_suffix_free("claude-mythos-eb1394"))
+
     def test_the_previous_alias_family_still_resolves(self) -> None:
         # A picker that already holds the alias this app published before the
         # family was renamed keeps reaching the same route.
@@ -83,6 +92,49 @@ class ClaudeDesktopAliasTests(unittest.TestCase):
         for family in LEGACY_ALIAS_FAMILIES:
             with self.subTest(family=family):
                 self.assertEqual(names[0], resolve_alias(f"{family}{digest}", names))
+
+    def test_the_pickers_one_million_spelling_resolves_to_the_route(self) -> None:
+        # Desktop offers a route that reads as 1M as the alias plus
+        # ``<alias>[1m]`` and sends the suffixed id.  It is not a route this
+        # router serves, so without this the chosen row answered
+        # ``Invalid model name`` (a real session picked it for 11 of 12 turns).
+        names = ["deepseek-v4.1-flash", "claude-opus-5-5"]
+        alias = claude_desktop_alias(names[0])
+        for spelling in (f"{alias}[1m]", f"{alias}[1M]", f"{alias}[1m] "):
+            with self.subTest(spelling=spelling):
+                self.assertEqual(names[0], resolve_alias(spelling, names))
+
+    def test_the_one_million_spelling_resolves_for_an_older_family(self) -> None:
+        names = ["gpt-6.1-sol"]
+        digest = claude_desktop_alias(names[0]).removeprefix(ALIAS_FAMILY)
+        for family in LEGACY_ALIAS_FAMILIES:
+            with self.subTest(family=family):
+                self.assertEqual(names[0], resolve_alias(f"{family}{digest}[1m]", names))
+
+    def test_a_one_million_spelling_of_something_else_is_left_alone(self) -> None:
+        names = ["deepseek-v4.1-flash"]
+        # A public name the router serves, an unknown alias, an unknown route,
+        # and a real Claude id keep the router's own answer -- including the
+        # suffix rule LiteLLM already applies to a served name.
+        for name in (
+            "deepseek-v4.1-flash[1m]",
+            "claude-fable-000000[1m]",
+            "some-route[1m]",
+            "claude-opus-5-5[1m]",
+            "[1m]",
+            "claude-mythos-[1m]",
+        ):
+            with self.subTest(name=name):
+                self.assertIsNone(resolve_alias(name, names))
+
+    def test_a_one_million_spelling_is_the_same_aliases_mark(self) -> None:
+        # The retirement pass reads the alias namespace as proof this app wrote
+        # a list, and a picker row that carries the suffix is that same id.
+        alias = claude_desktop_alias("deepseek-v4.1-flash")
+        self.assertTrue(is_derived_alias(alias))
+        self.assertTrue(is_derived_alias(f"{alias}[1m]"))
+        self.assertFalse(is_derived_alias("claude-opus-5-5[1m]"))
+
 
     def test_a_real_claude_name_is_never_mapped_through_an_alias(self) -> None:
         # Two routers can serve the same third-party name; the alias is derived

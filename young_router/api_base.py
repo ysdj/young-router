@@ -22,6 +22,26 @@ _KNOWN_API_ENDPOINT_SUFFIXES = (
 )
 
 
+#: Services that mount the Anthropic Messages wire on a documented sibling
+#: path instead of the OpenAI base most clients are configured with.
+#:
+#: DeepSeek publishes the same API at two documented bases: the OpenAI one
+#: (``https://api.deepseek.com``, or its ``/v1`` compatibility spelling) and
+#: the Anthropic one (``https://api.deepseek.com/anthropic``), whose Messages
+#: endpoint is ``/anthropic/v1/messages``
+#: (https://api-docs.deepseek.com/guides/anthropic_api).  LiteLLM's Anthropic
+#: adapter appends ``/v1/messages`` to whatever base it is handed, so deriving
+#: the Messages address from the OpenAI base sent every DeepSeek route to
+#: ``https://api.deepseek.com/v1/messages`` — a path the service does not
+#: mount.  The sibling path is a property of the service, so the table is keyed
+#: by exact host: a lookalike host (``api.deepseek.com.example.test``) is a
+#: different service, and a base that already names a service path (the
+#: Anthropic root, a gateway prefix) is left exactly as configured.
+_DOCUMENTED_ANTHROPIC_ROOTS = {
+    "api.deepseek.com": "anthropic",
+}
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(
         self,
@@ -106,6 +126,25 @@ def _url_with_path(parsed: Any, parts: list[str]) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
 
+def _documented_anthropic_root(parsed: Any, root_parts: list[str]) -> Optional[str]:
+    """The sibling Messages root for a documented service, if this base lacks a path.
+
+    Only the service's OpenAI base spellings count: its bare root and the
+    ``/v1`` compatibility root that is still just a path segment (a complete
+    endpoint's version segment has already been stripped).  A configured path
+    is the user's statement about where that service is mounted (a gateway
+    prefix, the Anthropic root itself, or its full endpoint), so it is never
+    rewritten from the table.
+    """
+
+    segment = _DOCUMENTED_ANTHROPIC_ROOTS.get((parsed.hostname or "").lower())
+    if segment is None:
+        return None
+    if [part.lower() for part in root_parts] not in ([], ["v1"]):
+        return None
+    return segment
+
+
 def normalize_configured_api_base(value: Any) -> str:
     text = str(value or "").strip()
     if text.startswith("os.environ/"):
@@ -149,6 +188,14 @@ def api_base_for_surface(value: Any, surface: Any) -> str:
         # LiteLLM's Anthropic client appends `/v1/messages` unless that complete
         # endpoint is already present. Supplying the final endpoint prevents a
         # configured `/v1` base from becoming `/v1/v1/messages`.
+        documented_root = _documented_anthropic_root(parsed, root_parts)
+        if documented_root is not None:
+            # The service documents its Messages wire under a sibling path, so
+            # the OpenAI base is not the root to append to (DeepSeek answers
+            # `/v1/messages` with 404 and serves `/anthropic/v1/messages`).
+            return _url_with_path(
+                parsed, [documented_root, "v1", "messages"]
+            ).rstrip("/")
         anthropic_parts = [*versioned_parts]
         if endpoint_was_versioned is not False and (
             not anthropic_parts or anthropic_parts[-1].lower() != "v1"
