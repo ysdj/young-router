@@ -100,6 +100,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, help="explicit provider configuration path")
     parser.add_argument("--endpoint-file", type=Path, help="private endpoint descriptor path")
     parser.add_argument("--parent-pid", type=_positive_pid, help="native host process identifier")
+    # A machine with no window is still a machine this app runs on: a gateway
+    # under systemd states that it supervises the proxy it publishes, and does
+    # so explicitly rather than by inventing an endpoint descriptor a native
+    # host would have written.
+    parser.add_argument(
+        "--manage-service",
+        action="store_true",
+        help="supervise this installation's proxy (a server host with no native app)",
+    )
     parser.add_argument("--claude-settings", type=Path, help="explicit Claude settings path")
     parser.add_argument("--language-file", type=Path, help="explicit language preference path")
     parser.add_argument("--runtime-root", type=Path, help="private managed runtime root")
@@ -203,9 +212,12 @@ def run(argv: list[str] | None = None) -> int:
     # The proxy follows the app, not the other way round: a window that is not
     # open, a background launch, and the gap after a failed start are all served
     # by this loop, so no 不健康/已停止 state is left waiting for a click.  Only a
-    # Core a native host launched owns that promise; a bare CLI Core (no
-    # endpoint, no parent) is a diagnostic process and must not spawn a proxy.
-    manages_service = args.endpoint_file is not None or args.parent_pid is not None
+    # Core a native host launched -- or a server unit that said so with
+    # ``--manage-service`` -- owns that promise; a bare CLI Core (no endpoint,
+    # no parent, no flag) is a diagnostic process and must not spawn a proxy.
+    manages_service = (
+        args.manage_service or args.endpoint_file is not None or args.parent_pid is not None
+    )
     service_supervisor = core.service_supervisor() if manages_service else None
 
     def request_stop(_signum: int, _frame: Any) -> None:

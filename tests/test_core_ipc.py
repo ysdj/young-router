@@ -170,6 +170,90 @@ class CoreProtocolTests(unittest.TestCase):
         self.assertEqual(["core_replaced"], record_states)
         self.assertTrue(create_core.call_args.kwargs["reset_transient_routing_state"])
 
+    def test_a_server_unit_states_that_it_supervises_the_proxy(self) -> None:
+        """A machine with no window still owns the proxy it publishes.
+
+        The proxy follows the app: a gateway under systemd has no window to
+        click Start, so the loop that keeps the proxy running has to be entered
+        by the unit saying so.  It is stated with a flag rather than by
+        inventing the endpoint descriptor a native host would have written --
+        and it stays off by default, because a bare CLI Core is a diagnostic
+        process that must not spawn a proxy.
+        """
+
+        def run_with(argv: list[str]) -> list[str]:
+            started: list[str] = []
+
+            class FakeScheduler:
+                def __init__(self, name: str) -> None:
+                    self._name = name
+
+                def start(self) -> None:
+                    started.append(self._name)
+
+                def stop(self) -> None:
+                    pass
+
+            class FakeCore:
+                def webdav_scheduler(self) -> FakeScheduler:
+                    return FakeScheduler("scheduler")
+
+                def image_context_sweeper(self) -> FakeScheduler:
+                    return FakeScheduler("cleanup")
+
+                def service_supervisor(self) -> FakeScheduler:
+                    return FakeScheduler("supervisor")
+
+                def shutdown(self, *, stopped_by: str = "app_exit") -> None:
+                    pass
+
+            class FakeServer:
+                def __init__(self, _core: object, *, address: str, port: int) -> None:
+                    self.address = address
+                    self.port = port
+
+                def start(self) -> None:
+                    started.append("server")
+
+                def stop(self) -> None:
+                    pass
+
+            class StopAtOnce:
+                """The stop event, which answers its own wait.
+
+                ``run`` waits on this event for its whole life, and a bare CLI
+                Core has nothing that would ever set it here.  The stand-in
+                states "stop" the moment something waits for it, so the startup
+                and teardown above still run in order instead of the test
+                blocking on a process nobody asked to end.
+                """
+
+                def __init__(self) -> None:
+                    self._stopped = False
+
+                def is_set(self) -> bool:
+                    return self._stopped
+
+                def set(self) -> None:
+                    self._stopped = True
+
+                def wait(self, _timeout: object = None) -> bool:
+                    self._stopped = True
+                    return True
+
+            with (
+                mock.patch.object(core_main.os, "getppid", return_value=os.getpid()),
+                mock.patch.object(core_main.CoreStore, "with_default_domains", return_value=FakeCore()),
+                mock.patch.object(core_main, "CoreIPCServer", FakeServer),
+                mock.patch.object(core_main.signal, "signal"),
+                mock.patch.object(core_main.threading, "Event", StopAtOnce),
+            ):
+                self.assertEqual(0, core_main.run(argv))
+            return started
+
+        self.assertIn("supervisor", run_with(["--manage-service"]))
+        self.assertNotIn("supervisor", run_with([]))
+
     def test_shared_schema_matches_python_and_typescript_method_contract(self) -> None:
         schema = load_protocol_schema()
         self.assertEqual(1, schema["protocol_version"])

@@ -984,8 +984,17 @@ class CoreServiceController:
     def _configured_master_key(self) -> str:
         """The key the staged document states, for the child's environment."""
 
+        from . import host_profile
         from .domains.runtime import master_key_from_document
 
+        if host_profile.active():
+            # A host that states its own key hands *that* to the child, because
+            # it is also the key the staged document now carries.  Reading the
+            # editor document here would state a key the proxy does not accept
+            # in the instant before it loads the staged one.
+            stated = host_profile.stated_key()
+            if stated:
+                return stated
         source = _provider_config_source(self.paths)
         try:
             text = source.read_text(encoding="utf-8")
@@ -1267,6 +1276,19 @@ class CoreServiceController:
             retired = _retired_references_rewritten(staged if staged is not None else document)
             if retired is not None:
                 staged = retired
+            # A host serves a projection of this document, not the document:
+            # see ``host_profile``.  Applied here, at staging, so every path
+            # that reaches the proxy -- a pull, an Apply, a start -- loads the
+            # same answer and the editor document keeps everything.  A desktop
+            # stages the bytes it was given, comments and all, which is why this
+            # reads ``staged or document``: ``None`` above means "nothing to
+            # rewrite", not "no document".
+            from . import host_profile
+
+            if host_profile.active():
+                source_document = staged if staged is not None else document
+                if isinstance(source_document, dict):
+                    staged = host_profile.document(source_document, host_profile.stated_key())
             if staged is None:
                 payload = source.read_bytes()
             else:

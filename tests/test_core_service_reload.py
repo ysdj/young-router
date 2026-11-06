@@ -947,12 +947,12 @@ class WebDAVPullReloadTests(unittest.TestCase):
           public_model_groups: [public-chat]
         """
 
-    def _core(self, root: Path, reload_calls: list[str], staged: dict[str, str]):
+    def _core(self, root: Path, reload_calls: list[str], staged: dict[str, str], *, document: str | None = None):
         from young_router.core.domains.relay_accounts import RelayAccountsDomain
         from young_router.core.domains.webdav import WebDAVSettingsDomain
 
         config_path = root / "config.yaml"
-        config_path.write_text(textwrap.dedent(self.CONFIG).lstrip(), encoding="utf-8")
+        config_path.write_text(textwrap.dedent(document or self.CONFIG).lstrip(), encoding="utf-8")
         runtime_config = root / ".litellm-runtime" / "config.yaml"
 
         def stage_runtime_config(_operation: object = None) -> dict[str, object]:
@@ -1105,6 +1105,45 @@ class WebDAVPullReloadTests(unittest.TestCase):
         from young_router.core.domains.runtime import master_key_from_document
 
         return master_key_from_document(config_path.read_text(encoding="utf-8"))
+
+    def test_a_host_profile_owns_the_key_so_a_pull_never_replaces_the_process(self) -> None:
+        """A gateway's key is the gateway's, and the proxy never sees another.
+
+        The document a sync installs carries the key of whichever machine
+        published it.  On a host that states its own key the proxy is staged
+        from a projection in which that key already won, so a pull owes a
+        rolling reload and nothing more -- replacing the whole process for a
+        key the running proxy never reads is a drained turn for no change.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            staged: dict[str, str] = {}
+            reload_calls: list[str] = []
+            core, config_path, _webdav, _domains = self._core(root, reload_calls, staged)
+            key_file = root / "host-key"
+            key_file.write_text("sk-this-gateway\n", encoding="utf-8")
+
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "YOUNG_ROUTER_HOST_PROFILE": "gateway",
+                    "YOUNG_ROUTER_HOST_PROXY_KEY_FILE": str(key_file),
+                },
+            ):
+                self._pull(
+                    core,
+                    self.CONFIG.replace("sk-local-key", "sk-another-machine").replace(
+                        "openai/old-chat", "openai/arrived-chat"
+                    ),
+                )
+                self.assertTrue(core.wait_for_service_reload(5.0))
+
+            self.assertEqual(["reload"], reload_calls)
+            # The editor document keeps what was published; the projection is
+            # what the proxy loads, and it is built at staging time.
+            self.assertIn("sk-another-machine", config_path.read_text(encoding="utf-8"))
+            self.assertIn("openai/arrived-chat", config_path.read_text(encoding="utf-8"))
 
     def test_the_interval_loop_applies_what_it_pulled(self) -> None:
         """The unattended path owes the same reload as the button.

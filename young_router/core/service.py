@@ -3431,7 +3431,19 @@ class CoreStore:
                             webdav_core.save_sync_state(state_path, settings, local_manifest, "sync")
                             outcome = "unchanged"
 
-                master_key_moved = pulled and _document_master_key(config_path) != master_key_before
+                # A host serves a projection of the document (see
+                # ``host_profile``), and the key in it is that host's own.  The
+                # document may well have arrived stating another machine's key;
+                # the proxy never sees it, so nothing here owes a replacement.
+                from . import host_profile as host_profile_module
+
+                host_profile_owns_key = host_profile_module.active() and bool(
+                    host_profile_module.stated_key()
+                )
+                master_key_moved = (
+                    pulled and not host_profile_owns_key
+                    and _document_master_key(config_path) != master_key_before
+                )
                 if pulled:
                     reloaded: list[tuple[str, Any]] = [
                         ("providers_models", providers), ("relay_accounts", relay)
