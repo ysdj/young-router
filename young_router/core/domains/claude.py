@@ -654,7 +654,32 @@ def _names_an_anthropic_family(name: str) -> bool:
 #: changing the id it sends.  The 1M entry also carries the full
 #: low..max ladder (``xhigh_effort`` and ``max_effort``).
 _CODE_BEHAVES_AS_1M = "claude-opus-5-5"
+#: The 1M entry with the smaller output claim (64k instead of 128k).  A route
+#: between the client's 200k default and a full 1M needs a behavior model at
+#: least as wide as its own window -- otherwise the tier, not the route, is the
+#: ceiling and the session reports 200k for a 262k route -- while its output
+#: claim should stay as small as the tier allows, because ``behavesAs`` is also
+#: where the client reads a model's maximum output and nothing in
+#: ``modelSettings`` can state that per route.
+_CODE_BEHAVES_AS_LARGE = "claude-opus-4-8"
 _CODE_BEHAVES_AS_DEFAULT = "claude-sonnet-4-6"
+
+
+#: The width of the client's own small tier.  A route wider than this cannot be
+#: described by ``_CODE_BEHAVES_AS_DEFAULT``.
+_CODE_DEFAULT_TIER_WINDOW = 200_000
+
+#: The window each substitute answers for.  A stored ``behavesAs`` whose window
+#: is narrower than the route's own cannot express that route -- the tier would
+#: be the ceiling and the session would read back the tier's number instead of
+#: the route's -- so it is corrected.  A substitute at least as wide as the route
+#: is left alone, even when this app happens to write the same name: it still
+#: states the route correctly, and a person who picked it meant it.
+_CODE_BEHAVES_AS_WINDOWS = {
+    _CODE_BEHAVES_AS_1M: 1_000_000,
+    _CODE_BEHAVES_AS_LARGE: 1_000_000,
+    _CODE_BEHAVES_AS_DEFAULT: _CODE_DEFAULT_TIER_WINDOW,
+}
 
 #: Claude Code's per-model ``modelSettings.<model>.autoCompactWindow`` range.
 #: The setting is the effective context window; the client caps it at the
@@ -673,29 +698,35 @@ def _code_behaves_as(name: str, max_input_tokens: object) -> str | None:
     """The known Claude Code model an unknown public id should behave as.
 
     A real Claude id is already in the client's catalog, so it needs no
-    substitute.  A route that states 500k or more gets the 1M entry: the
-    catalog has no 500k model, and ``modelSettings.<model>.autoCompactWindow``
-    is what narrows the effective window back to the route's own number.  A
-    smaller route gets a 200k entry, which also caps any accidental larger
-    setting at its real maximum.
+    substitute.
+
+    The substitute has to be at least as wide as the route, because the client
+    caps the session at the behavior model's own window: the tier, not the
+    route, would otherwise be the ceiling, and a 262k route read back as 200k.
+    ``modelSettings.<model>.autoCompactWindow`` then narrows the effective
+    window to the route's exact number, which is the number the client displays
+    and compacts against.  So a route wider than the 200k tier gets a 1M entry,
+    and which 1M entry is a question about output: ``behavesAs`` is also where
+    the client reads a model's maximum output, nothing in ``modelSettings`` can
+    state that per route, and the smaller claim is the safer one below a full
+    1M.
 
     A resolved window counts here even when the user declared none, because the
     two ways of being wrong do not cost the same.  Too small is a *client-side*
     refusal -- measured: a 213k prompt on a route the client reads as 200k never
     reaches the router, and there is no elision pass to recover it.  Too large
-    arrives, and ``proxy.context_window`` shortens the replay.  So the window a
-    session is given follows the published number, while the ``[1m]`` *spelling*
-    (``_code_picker_id``) still needs the user's declaration.
+    arrives, and ``proxy.context_window`` shortens the replay for Codex.  So the
+    window a session is given follows the published number.
     """
 
     if claude_aliases.desktop_keeps_model_id(name):
         return None
-    if (
-        isinstance(max_input_tokens, int)
-        and not isinstance(max_input_tokens, bool)
-        and max_input_tokens >= 500_000
-    ):
+    if not isinstance(max_input_tokens, int) or isinstance(max_input_tokens, bool):
+        return _CODE_BEHAVES_AS_DEFAULT
+    if max_input_tokens >= 1_000_000:
         return _CODE_BEHAVES_AS_1M
+    if max_input_tokens > _CODE_DEFAULT_TIER_WINDOW:
+        return _CODE_BEHAVES_AS_LARGE
     return _CODE_BEHAVES_AS_DEFAULT
 
 
@@ -1548,45 +1579,43 @@ class ClaudeSettingsDomain:
     # -- the clients' model lists -------------------------------------------
 
     def _public_model_rows(self) -> list[dict[str, object]]:
-        """The local listing's rows, including each route's context hint.
+        """The routes a picker may offer, with the window each one publishes.
 
-        ``_public_models`` answers names for every picker; Claude Code also needs
-        the 1M statement so ``behavesAs`` can keep a route from falling back to
-        the client's 200k default.  A proxy that is not running is no
-        observation, not an empty list.
+        The names come from the routes document and the numbers from
+        ``ModelContextRegistry.record_for`` -- the same resolution the pane
+        shows and the discovery view states.  Neither is read from this app's
+        own ``/v1/models``: that answer is a second reading assembled by the
+        proxy (LiteLLM resolves a window there from its cost map, which is not
+        the window this app publishes), and it also means a background pass
+        cannot refresh a client document while the proxy is starting, reloading,
+        or stopped.
         """
 
-        from .. import codex_config
-
-        try:
-            key = codex_config.local_api_key(codex_config.load_yaml(self.runtime_config_path))
-            rows, available = codex_config.local_exposed_model_rows(key)
-        except Exception:
+        names = self._public_models()
+        if not names:
             return []
-        if not available:
-            return []
-        return [dict(row) for row in rows if isinstance(row, Mapping)]
+        return [{"id": name, "max_input_tokens": self._published_window(name)} for name in names]
 
     def _public_models(self) -> list[str] | None:
-        """The names this router currently publishes, or ``None`` when unknown.
+        """The public names this app's own configuration serves, or ``None``.
 
-        ``None`` and an empty list are different answers: the proxy answers
-        ``/v1/models`` while it is still loading its routes, and a worker
-        reload briefly publishes no group.  Writing that observation into a
-        client's picker would erase the models the user can actually reach, so
-        only an observed non-empty list may rewrite one.
+        ``None`` and an empty list are different answers.  An unreadable or
+        empty document is no observation and must not rewrite a client's picker,
+        while a document that lists routes is the app's own statement about what
+        it serves.  Ordering and the image-generator filter are
+        ``codex_config.configured_exposed_models``', so every picker this app
+        writes places a route in the same spot and never offers a route that
+        cannot hold a conversation.
         """
 
         from .. import codex_config
 
         try:
-            key = codex_config.local_api_key(codex_config.load_yaml(self.runtime_config_path))
-            names, available = codex_config.local_exposed_models(key)
+            document = codex_config.load_yaml(self.runtime_config_path)
         except Exception:
             return None
-        if not available or not names:
-            return None
-        return list(names)
+        names = codex_config.configured_exposed_models(document)
+        return names or None
 
     def code_model_list_names(self) -> list[str]:
         """The model IDs Claude Code's own picker currently offers.
@@ -1739,6 +1768,31 @@ class ClaudeSettingsDomain:
         # person reads is what the list is ordered by, without a sort here.
         return rows
 
+    def _published_window(self, name: str) -> int | None:
+        """The window this app publishes for one route.
+
+        ``ModelContextRegistry.record_for`` is the single resolution the pane's
+        published context and the managed Codex catalog already read, and
+        ``proxy.claude_desktop_listing`` asks it for the discovery view.  Asking
+        it here is what makes the terminal's number the same number as the one a
+        person sees in the app: the two used to differ whenever LiteLLM's
+        listing stated nothing for a route the registry had an answer for, and
+        the session then reported the client's 200k default on top of it.
+
+        At or above 1M the answer is exactly 1M -- the client has one
+        large-window spelling and its per-model setting accepts 100k..1M.
+        """
+
+        try:
+            from ..model_catalog import _image_filter_registry
+
+            window = int(_image_filter_registry().record_for(name).context_window)
+        except Exception:
+            return None
+        if window <= 0:
+            return None
+        return min(window, 1_000_000)
+
     def _code_picker_id(self, name: str, max_input_tokens: object = None) -> str:
         """The id Claude Code's picker names for one public route.
 
@@ -1807,7 +1861,10 @@ class ClaudeSettingsDomain:
         known = {str(row.get("id")): row for row in self._public_model_rows()}
         rows: list[dict[str, Any]] = []
         for name in names:
-            model_id = self._code_picker_id(name, (known.get(name) or {}).get("max_input_tokens"))
+            window = self._published_window(name)
+            if window is None:
+                window = (known.get(name) or {}).get("max_input_tokens")
+            model_id = self._code_picker_id(name, window)
             # A list written before the ids were aliases carried the public
             # name, and a field the user typed there is theirs: adopt it onto
             # the id the row names now.
@@ -1828,15 +1885,23 @@ class ClaudeSettingsDomain:
                     # second name for one model.
                     if row.get("label") in (None, "", f"{name} (Desktop)"):
                         row["label"] = name
-                behaves_as = _code_behaves_as(name, route.get("max_input_tokens"))
+                behaves_as = _code_behaves_as(name, window)
                 if behaves_as is not None:
                     current = row.get("behavesAs")
-                    # Correct the app's earlier 200k substitution when a route
-                    # turns out to state 500k or more.  A user's own target
-                    # (not one of the two this app writes) is left alone.
-                    if current is None or current == "" or (
-                        behaves_as == _CODE_BEHAVES_AS_1M
-                        and current == _CODE_BEHAVES_AS_DEFAULT
+                    # The substitute is this app's own choice of tier, and the
+                    # tier is what caps the window -- so a stored one of ours is
+                    # replaced whenever the route's window moved out from under
+                    # it (a 500k route left on the 200k tier read back as 200k).
+                    # A target none of these three names is a person's and stays.
+                    current_window = _CODE_BEHAVES_AS_WINDOWS.get(current)
+                    if (
+                        current in (None, "")
+                        or current_window is None
+                        or (
+                            isinstance(window, int)
+                            and not isinstance(window, bool)
+                            and current_window < window
+                        )
                     ):
                         row["behavesAs"] = behaves_as
             rows.append(row)
@@ -1875,9 +1940,25 @@ class ClaudeSettingsDomain:
             route = known.get(name)
             if route is None:
                 continue
-            model_id = self._code_picker_id(name, route.get("max_input_tokens"))
+            window = self._published_window(name)
+            if window is None:
+                window = route.get("max_input_tokens")
+            model_id = self._code_picker_id(name, window)
             entry = dict(settings.get(model_id) or settings.get(name) or {})
-            entry.setdefault("autoCompactWindow", _code_auto_compact_window(route.get("max_input_tokens")))
+            desired = _code_auto_compact_window(window)
+            stored = entry.get("autoCompactWindow", desired)
+            # ``auto`` is this app's marker for "nothing is known about this
+            # route's window", and it is what a pass wrote while the number came
+            # from the listing (which states nothing for a route LiteLLM's cost
+            # map does not carry).  Once the route resolves, the number replaces
+            # it -- otherwise the session keeps the client's 200k default on top
+            # of a route this app publishes at 500k.  A value that is neither
+            # ``auto`` nor the number a person would have to have typed by hand
+            # is theirs and stays.
+            if stored != desired and stored == "auto":
+                entry["autoCompactWindow"] = desired
+            else:
+                entry.setdefault("autoCompactWindow", desired)
             settings[model_id] = entry
         # A key this app wrote under a superseded spelling is not the user's
         # writing.  One route whose id moved (a public name before the ids were
@@ -1888,7 +1969,10 @@ class ClaudeSettingsDomain:
         # that differs is theirs, because nothing here knows which spelling they
         # meant.
         for name in names:
-            model_id = self._code_picker_id(name, (known.get(name) or {}).get("max_input_tokens"))
+            window = self._published_window(name)
+            if window is None:
+                window = (known.get(name) or {}).get("max_input_tokens")
+            model_id = self._code_picker_id(name, window)
             current = settings.get(model_id)
             if not isinstance(current, Mapping):
                 continue
@@ -1898,7 +1982,11 @@ class ClaudeSettingsDomain:
                     continue
                 if set(stale) - {"autoCompactWindow"}:
                     continue
-                if stale.get("autoCompactWindow") != current.get("autoCompactWindow"):
+                stale_window = stale.get("autoCompactWindow")
+                # ``auto`` is this app's marker for a window it did not know, so
+                # an entry holding only that is the app's own writing and not a
+                # second opinion about the route.
+                if stale_window != current.get("autoCompactWindow") and stale_window != "auto":
                     continue
                 settings.pop(stale_key, None)
         return settings

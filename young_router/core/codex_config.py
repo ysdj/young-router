@@ -634,6 +634,48 @@ def local_exposed_models(api_key: str) -> tuple[list[str], bool]:
     return names, True
 
 
+def configured_exposed_models(config: object) -> list[str]:
+    """The public names a picker may offer, read from the routes document.
+
+    The listing path (``local_exposed_models``) asks the running proxy, which is
+    the right question for a client whose catalog must match what that proxy
+    serves.  A *generated* client list is a different question: it has to follow
+    the configuration the app itself wrote, and it is refreshed by a background
+    pass that must not depend on an HTTP round trip to its own process -- a
+    proxy that is starting, reloading, or not running at all would otherwise
+    read as "no models" and the list would be left stale or erased.
+
+    The filters are the same ones: an enabled route, one row per public name,
+    image generators out (a generator is reached through the client's own image
+    tool, never by naming it as the model), ordered by name so every picker puts
+    a route in the same place.
+    """
+
+    providers = _get_mapping(config.get("providers")) if isinstance(config, dict) else {}
+    entries = config.get("model_list") if isinstance(config, dict) else None
+    names: list[str] = []
+    seen: set[str] = set()
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        info = _get_mapping(entry.get("model_info"))
+        provider = _get_mapping(providers.get(str(info.get("provider") or "").strip()))
+        enabled = info.get("x-young-router-model-enabled")
+        if not isinstance(enabled, bool):
+            enabled = provider.get("enabled") is not False
+        if not enabled:
+            continue
+        name = _usable_listing_name(
+            {"id": str(entry.get("model_name") or ""), "mode": str(info.get("mode") or "")}
+        )
+        if name is None or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    names.sort(key=str.casefold)
+    return names
+
+
 def local_exposed_model_rows(api_key: str) -> tuple[list[dict[str, object]], bool]:
     """The same listing, with each route's own context hint.
 

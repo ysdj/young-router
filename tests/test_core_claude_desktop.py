@@ -360,13 +360,15 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 self.assertTrue(picker["replaceBuiltInOptions"])
                 # One id space: the picker names the alias both Claude apps
                 # send, so the desktop Code tab and the terminal select the
-                # same model.
+                # same model.  The window each row states is the registry's, and
+                # these two names have no profile, so it is the published
+                # placeholder -- what the pane shows for the same route.
                 self.assertEqual(
                     [
-                        {"model": alias_claude_desktop("public-a")},
-                        {"model": alias_claude_desktop("public-b")},
+                        alias_claude_desktop("public-a"),
+                        alias_claude_desktop("public-b"),
                     ],
-                    picker["options"],
+                    [row["model"] for row in picker["options"]],
                 )
 
                 # The pass that just wrote this list finds nothing to do: an
@@ -450,9 +452,10 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 },
                 by_id[f"{alias_claude_desktop('gemini-3.8-flash')}[1m]"],
             )
-            # A 500k route gets the 1M behavior model; the exact 500k comes from
-            # its per-model autoCompactWindow below.
-            self.assertEqual("claude-opus-5-5", by_id[alias_claude_desktop("gpt-6.1-sol")]["behavesAs"])
+            # A 500k route gets a 1M behavior model, because the tier caps the
+            # window; the exact 500k comes from its per-model autoCompactWindow.
+            # The smaller-output 1M entry is the one below a full 1M.
+            self.assertEqual("claude-opus-4-8", by_id[alias_claude_desktop("gpt-6.1-sol")]["behavesAs"])
             self.assertEqual("gpt-6.1-sol", by_id[alias_claude_desktop("gpt-6.1-sol")]["label"])
             # A real Claude id is already in the client's catalog and needs no
             # substitute; the client keeps its own friendly label for it.
@@ -618,6 +621,77 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 rows,
             )
 
+    def test_a_pass_leaves_settings_it_does_not_own_alone(self) -> None:
+        # The generated document lives inside the person's own settings file.
+        # A pass rewrites the two keys it derives and nothing else: hooks, a
+        # permission list, an env entry and a key this app has never heard of
+        # are theirs, and a repair that dropped one would be a rewrite nobody
+        # asked for.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(desktop_root, {})
+            settings = {
+                "env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:4100", "MY_FLAG": "keep-me"},
+                "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo hi"}]}]},
+                "permissions": {"allow": ["Bash(git status:*)"]},
+                "myOwnKey": {"nested": [1, 2, 3]},
+                "modelPicker": {"replaceBuiltInOptions": True, "options": []},
+            }
+            (root / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with (
+                mock.patch.object(domain, "_public_models", return_value=["gpt-6.1-sol"]),
+                mock.patch.object(
+                    domain,
+                    "_public_model_rows",
+                    return_value=[{"id": "gpt-6.1-sol", "max_input_tokens": 500_000}],
+                ),
+            ):
+                self.assertTrue(domain.refresh_model_lists())
+
+            written = json.loads(domain.raw_text(include_sensitive=True))
+            for key in ("env", "hooks", "permissions", "myOwnKey"):
+                self.assertEqual(settings[key], written[key], key)
+            self.assertEqual(1, len(written["modelPicker"]["options"]))
+
+    def test_a_pass_writes_nothing_when_only_other_settings_moved(self) -> None:
+        # The reverse half: a file whose unrelated keys changed is not a reason
+        # to rewrite the generated ones.  Writing on every pass would bump the
+        # mtime of somebody else's document for no reason.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(desktop_root, {})
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with (
+                mock.patch.object(domain, "_public_models", return_value=["gpt-6.1-sol"]),
+                mock.patch.object(
+                    domain,
+                    "_public_model_rows",
+                    return_value=[{"id": "gpt-6.1-sol", "max_input_tokens": 500_000}],
+                ),
+            ):
+                domain.dispatch("claude.models.set", {"client": "claudeCode", "enabled": True})
+                domain.apply()
+                document = json.loads((root / "settings.json").read_text(encoding="utf-8"))
+                document["myOwnKey"] = "typed by a person"
+                (root / "settings.json").write_text(json.dumps(document), encoding="utf-8")
+                domain.reload()
+                self.assertFalse(domain.refresh_model_lists())
+            written = json.loads((root / "settings.json").read_text(encoding="utf-8"))
+            self.assertEqual("typed by a person", written["myOwnKey"])
+
     def test_a_superseded_public_name_entry_is_retired_not_duplicated(self) -> None:
         # Every generated entry is ours: one number for one route.  A file that
         # kept the old spelling beside the new id would describe the same model
@@ -648,9 +722,10 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
             settings = json.loads(domain.raw_text(include_sensitive=True))["modelSettings"]
             # The entry the user had under the public name follows the route to
             # the id it is named by now, and the old spelling is retired rather
-            # than left beside it describing one model twice.
+            # than left beside it describing one model twice.  ``auto`` was this
+            # app's "window unknown" marker, so the resolved number replaces it.
             self.assertEqual(
-                {f"{alias_claude_desktop('gemini-3.8-flash')}[1m]": {"autoCompactWindow": "auto"}},
+                {f"{alias_claude_desktop('gemini-3.8-flash')}[1m]": {"autoCompactWindow": 1_000_000}},
                 settings,
             )
 
