@@ -73,14 +73,6 @@ def _image_generation_tool_runtime_fallback_exception(
     return exception
 
 
-def _deployment_supports_responses_image_generation_tool(deployment: Any) -> bool:
-    if not isinstance(deployment, dict):
-        return False
-    model_info = deployment.get("model_info")
-    if not isinstance(model_info, dict):
-        return False
-    return model_info.get("supports_responses_image_generation_tool") is True
-
 def _response_has_image_generation_result(response: Any) -> bool:
     if isinstance(response, (str, bytes)):
         try:

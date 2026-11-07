@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
@@ -3246,7 +3245,6 @@ def _install_chatgpt_account_credential_patch() -> None:
     """
 
     try:
-        from litellm.llms.chatgpt.authenticator import Authenticator
         from litellm.llms.chatgpt.chat.transformation import ChatGPTConfig
         from litellm.llms.chatgpt.common_utils import ensure_chatgpt_session_id, get_chatgpt_default_headers
         from litellm.llms.openai.openai import OpenAIConfig

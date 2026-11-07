@@ -9,7 +9,6 @@ from . import image_inputs as _image_inputs_module
 from . import responses_request as _responses_request_module
 from . import request_context as _request_context_module
 from .. import api_base as _api_base_module
-from ..values import int_or_none as _int_or_none
 from . import responses_execution as _responses_execution_module
 from . import responses_surfaces as _responses_surfaces_module
 from . import state as _state_module
@@ -23,6 +22,7 @@ from .base import (
     Any,
     AsyncIterator,
     List,
+    Mapping,
     _ATTEMPT_LEASE_ID_KEY,
     Optional,
     _CHAT_TOOL_NAME_PATTERN,
@@ -37,7 +37,6 @@ from .base import (
     _CODEX_COMPACTION_CAPABILITY_UNSUPPORTED_ATTR,
     _CURRENT_EXCLUDED_DEPLOYMENT_IDS,
     _CURRENT_ATTEMPT_STARTED_AT,
-    _CURRENT_SURFACE_TARGET_DEPLOYMENT_ID,
     _CURRENT_UPSTREAM_URL_SURFACE_KEY,
     _CURRENT_SELECTED_DEPLOYMENT,
     _CURRENT_SELECTED_DEPLOYMENT_BOX,
@@ -47,7 +46,6 @@ from .base import (
     _DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED_ENV,
     _DEPLOYMENT_COOLDOWN_DEFAULT_FAILURES,
     _DEPLOYMENT_COOLDOWN_DEFAULT_SECONDS,
-    _DEPLOYMENT_COOLDOWN_FILE_ENV,
     _DEPLOYMENT_COOLDOWN_FAILURES_ENV,
     _DEPLOYMENT_COOLDOWN_FAILURE_RECORDED_ATTR,
     _DEPLOYMENT_COOLDOWN_LOCK,
@@ -146,7 +144,6 @@ from .base import (
     _HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS_ENV,
     _HEAVY_REPLAY_STREAM_START_DEFAULT_THRESHOLD_BYTES,
     _HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV,
-    _STREAM_ROUTE_EXHAUSTION_DEFAULT_RETRIES,
     _STREAM_ROUTE_EXHAUSTION_RETRY_AFTER_MAX_SECONDS,
     _SUPPORTS_RESPONSES_CLIENT_TOOLS_KEY,
     _SUPPORTS_RESPONSES_HOSTED_TOOLS_KEY,
@@ -173,18 +170,17 @@ from .base import (
     _UPSTREAM_URL_SURFACE_DEPLOYMENT_ID_KEY,
     _UPSTREAM_URL_SURFACE_KEY,
     _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
-    _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES,
     _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
     _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     _XHIGH_REASONING_EFFORT,
     _exception_text,
     _is_local_shutdown_exception,
+    # Read through this module by ``hook``'s stream teardown.
     _proxy_shutdown_in_progress,
     asyncio,
     contextvars,
     datetime,
     timedelta,
-    json,
     litellm,
     math,
     os,
@@ -908,10 +904,6 @@ def _stream_idle_timeout_seconds_for_request(request_data: Optional[dict]) -> fl
     ):
         return stall_timeout
     return max(stall_timeout, _stream_start_timeout_seconds_for_request(request_data))
-
-
-def _stream_route_exhaustion_retries() -> int:
-    return _STREAM_ROUTE_EXHAUSTION_DEFAULT_RETRIES
 
 
 def _same_deployment_retries() -> int:
@@ -4405,16 +4397,6 @@ def _deployment_cooldown_keys_from_deployment(deployment: Any) -> list[str]:
     )
 
 
-def _deployment_cooldown_keys_from_deployment_for_request(
-    deployment: Any,
-    request_kwargs: Optional[dict],
-) -> list[str]:
-    return _deployment_cooldown_keys_for_request(
-        deployment_id=_responses_request_module._deployment_id(deployment),
-        route_key=_deployment_route_key_from_deployment(deployment),
-        request_kwargs=request_kwargs,
-    )
-
 def _trace_deployment(value: Any, *, surface: str = "") -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
@@ -4428,7 +4410,6 @@ def _trace_deployment(value: Any, *, surface: str = "") -> dict[str, Any]:
     if order is None:
         order = _coerce_order(model_info.get("order"))
     model = litellm_params.get("model")
-    provider = model_info.get("provider")
     api_key_name = model_info.get("api_key_name")
     dispatched_surface = _normalized_request_surface(surface)
     return {
@@ -4938,33 +4919,6 @@ def _claim_deployment_concurrency_slot(
         with _HELD_CONCURRENCY_LEASES_LOCK:
             _HELD_CONCURRENCY_LEASES.setdefault(lease_id, set()).add(lease_key)
     return True
-
-
-def _release_deployment_concurrency_slot(request_kwargs: Optional[dict], deployment: Any) -> None:
-    """Give back this turn's slot on one deployment, if it still holds it."""
-
-    lease_key = _attempt_lease_key(request_kwargs, deployment)
-    if not lease_key:
-        return
-    _release_concurrency_lease_keys([lease_key])
-
-
-def _release_concurrency_lease_keys(lease_keys: list[str]) -> None:
-    if not lease_keys:
-        return
-    _concurrency_module.release(lease_keys)
-    _forget_held_concurrency_leases(lease_keys)
-
-
-def _forget_held_concurrency_leases(lease_keys: list[str]) -> None:
-    if not lease_keys:
-        return
-    dropped = set(lease_keys)
-    with _HELD_CONCURRENCY_LEASES_LOCK:
-        for lease_id, held in list(_HELD_CONCURRENCY_LEASES.items()):
-            held.difference_update(dropped)
-            if not held:
-                _HELD_CONCURRENCY_LEASES.pop(lease_id, None)
 
 
 def _release_request_concurrency_slots(request_kwargs: Optional[dict]) -> None:
@@ -7702,29 +7656,6 @@ def _is_priority_deployment_failover_error(exception: Exception) -> bool:
         return True
     text = _exception_text(exception)
     return any(marker in text for marker in _UPSTREAM_TEMPORARY_ERROR_MARKERS)
-
-
-def _request_duration_seconds(request_kwargs: Optional[dict]) -> Optional[float]:
-    if not isinstance(request_kwargs, dict):
-        return None
-    candidates = [
-        request_kwargs.get("duration_ms"),
-        request_kwargs.get("response_ms"),
-        request_kwargs.get("litellm_call_duration_ms"),
-    ]
-    standard = _as_dict(request_kwargs.get("standard_logging_object"))
-    candidates.extend(
-        [
-            standard.get("duration_ms"),
-            standard.get("response_ms"),
-            standard.get("litellm_call_duration_ms"),
-        ]
-    )
-    for value in candidates:
-        seconds = _safe_float(value)
-        if seconds is not None and seconds >= 0:
-            return seconds / 1000.0
-    return None
 
 
 def _exception_indicates_timeout_or_long_wait(exception: Exception) -> bool:

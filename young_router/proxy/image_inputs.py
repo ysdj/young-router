@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Optional
 
 from . import responses_output as _responses_output_module
 
@@ -316,13 +316,6 @@ def _image_bounding_suffix(value: Any) -> Any:
         default=-1,
     )
     return value[last_encrypted_index + 1 :]
-
-
-def _deployment_supports_vision(deployment: Any) -> bool:
-    if not isinstance(deployment, dict):
-        return False
-    model_info = deployment.get("model_info")
-    return isinstance(model_info, dict) and model_info.get("supports_vision") is True
 
 
 def _deployment_allows_responses_image_input(deployment: Any) -> bool:

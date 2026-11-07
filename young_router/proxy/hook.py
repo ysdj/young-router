@@ -8,7 +8,6 @@ from . import codex_contract as _codex_contract_module
 from . import context_window as _context_window_module
 from . import responses_output as _responses_output_module
 from . import responses_request as _responses_request_module
-from . import request_context as _request_context_module
 from . import codex_fast_tier as _codex_fast_tier_module
 from . import responses_execution as _responses_execution_module
 from . import responses_surfaces as _responses_surfaces_module
@@ -31,7 +30,6 @@ from .base import (
     Optional,
     _without_internal_request_keys,
     asyncio,
-    litellm,
 )
 
 

@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import contextvars
 import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import inspect
-import io
 import json
 import logging
 import math
@@ -31,7 +28,7 @@ from .. import browser_identity as _browser_identity
 from ..lifecycle import app_quit_grace_seconds
 from .. import lifecycle as _proxy_lifecycle_module
 from ..values import int_or_none as _int_or_none
-from typing import Any, AsyncIterator, Dict, List, Optional, Union
+from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Union
 import litellm
 from litellm.integrations.custom_logger import CustomLogger
 
@@ -466,7 +463,6 @@ _REASONING_PARAMETERS_COMPAT_RETRY_METADATA_KEY = (
 )
 _REASONING_PARAMETERS_COMPAT_LOCK = threading.Lock()
 _REASONING_PARAMETERS_COMPAT: dict[str, dict[str, Any]] = {}
-_STREAM_ROUTE_EXHAUSTION_DEFAULT_RETRIES = 0
 _STREAM_ROUTE_EXHAUSTION_RETRY_AFTER_MAX_SECONDS = 60.0
 _SAME_DEPLOYMENT_RETRIES_ENV = "YOUNG_ROUTER_SAME_DEPLOYMENT_RETRIES"
 _SAME_DEPLOYMENT_RETRIES_DEFAULT = 0
@@ -566,11 +562,6 @@ _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES = "openai/responses"
 _UPSTREAM_URL_SURFACE_OPENAI_CHAT = "openai/chat"
 _UPSTREAM_URL_SURFACE_ANTHROPIC = "anthropic"
 _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES = {
-    _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
-    _UPSTREAM_URL_SURFACE_ANTHROPIC,
-}
-_UPSTREAM_URL_SURFACES = {
-    _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
     _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
 }
@@ -857,11 +848,6 @@ _RESPONSES_TOOL_SEARCH_BRIDGE_PATCH_ATTR = "_responses_tool_search_bridge_patch"
 # The chat-bridge input pass that keeps a thinking upstream's replay contract.
 _RESPONSES_CHAT_BRIDGE_REASONING_PATCH_ATTR = (
     "_responses_chat_bridge_reasoning_replay_patch"
-)
-# The metadata flag a bridged request carries once that pass rewrote it, so the
-# traces can say the replay was repaired rather than sent as the client wrote it.
-_RESPONSES_CHAT_BRIDGE_REASONING_REPLAY_KEY = (
-    "responses_chat_bridge_reasoning_replay_repaired"
 )
 _RESPONSES_TOOL_ADAPTER_METADATA_KEY = (
     "responses_tool_adapter_attempted"

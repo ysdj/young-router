@@ -26,8 +26,6 @@ from .base import (
     _PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY,
     _RESTORED_REASONING_REPLAY_KEY,
     _RouteOrder,
-    _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
-    _UPSTREAM_URL_SURFACE_ANTHROPIC,
     _RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY,
     _RESPONSES_TOOL_ADAPTER_FALLBACK_REASON_KEY,
     _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
@@ -1272,30 +1270,6 @@ def _with_responses_context_truncation_fallback_stream(
     return _ResponsesContextTruncationStream(guarded_stream(), response)
 
 
-def _responses_router_function() -> Optional[Any]:
-    try:
-        from litellm.proxy.proxy_server import llm_router
-    except Exception:
-        return None
-    if llm_router is None:
-        return None
-    aresponses = getattr(llm_router, "aresponses", None)
-    if not callable(aresponses):
-        return None
-
-    async def call_router(**kwargs: Any) -> Any:
-        return await aresponses(**kwargs)
-
-    return call_router
-
-
-def _responses_bridge_original_function(request_data: dict) -> Optional[Any]:
-    original_function = request_data.get("original_generic_function")
-    if callable(original_function):
-        return original_function
-    return _responses_router_function()
-
-
 async def _execute_bridged_upstream_attempt(
     original_function: Any,
     active_bridge_kwargs: dict,
@@ -2063,38 +2037,6 @@ def _remember_request_model_group_before_deployment_update(
     request_kwargs["litellm_metadata"] = updated_metadata
 
 
-def _external_web_search_router_model_group(request_kwargs: Optional[dict]) -> Optional[str]:
-    model_info = _request_context_module._request_model_info(request_kwargs)
-    model = model_info.get("model")
-    if isinstance(model, str) and model.strip():
-        return model
-
-    litellm_params = (request_kwargs or {}).get("litellm_params")
-    if isinstance(litellm_params, dict):
-        model = litellm_params.get("model")
-        if isinstance(model, str) and model.strip():
-            return model
-
-    request_model = _request_model_group(request_kwargs)
-    if isinstance(request_model, str) and request_model.strip():
-        return request_model
-
-    metadata_model_group = _request_metadata_model_group(request_kwargs)
-    if isinstance(metadata_model_group, str) and metadata_model_group.strip():
-        return metadata_model_group
-
-    route_key = _routing_module._deployment_route_key_from_request(request_kwargs)
-    if isinstance(route_key, str) and route_key.strip():
-        route_parts = [part.strip() for part in route_key.split(" / ")]
-        for part in route_parts:
-            if part.startswith("model=") and part.removeprefix("model=").strip():
-                return part.removeprefix("model=").strip()
-        if len(route_parts) >= 2 and route_parts[1] and "=" not in route_parts[1]:
-            return route_parts[1]
-
-    return None
-
-
 def _request_selected_route_upstream_model(request_kwargs: Optional[dict]) -> Optional[str]:
     model_info = _request_context_module._request_model_info(request_kwargs)
     model = model_info.get("model")
@@ -2117,34 +2059,6 @@ def _request_selected_route_upstream_model(request_kwargs: Optional[dict]) -> Op
     if len(route_parts) >= 2 and route_parts[1] and "=" not in route_parts[1]:
         return route_parts[1]
     return None
-
-
-def _normalize_external_web_search_router_kwargs(
-    call_kwargs: dict[str, Any],
-    request_kwargs: Optional[dict],
-) -> dict[str, Any]:
-    model_group = (
-        _request_selected_deployment_model_group(request_kwargs)
-        or _request_metadata_model_group(request_kwargs)
-        or _request_model_group(request_kwargs)
-    )
-    if not (isinstance(model_group, str) and model_group.strip()):
-        model_group = _external_web_search_router_model_group(request_kwargs)
-    if isinstance(model_group, str) and model_group.strip():
-        call_kwargs["model"] = model_group
-    return call_kwargs
-
-
-def _with_failed_order_constraint(request_kwargs: dict, exception: Exception) -> None:
-    failed_order = _failed_deployment_order(exception)
-    if failed_order is not None and "_target_order" not in request_kwargs:
-        request_kwargs["_target_order"] = failed_order
-        _trace_module._request_route_trace(
-            "fallback_target_order_constraint", request_kwargs,
-            target_order=failed_order,
-            request=_trace_module._trace_request_summary(request_kwargs),
-            exception=_routing_module._trace_exception(exception),
-        )
 
 
 def _ordered_deployment_fallback_entry(

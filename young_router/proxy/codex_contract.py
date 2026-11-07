@@ -53,7 +53,6 @@ def _tool_definition_name(tool: Any) -> Optional[str]:
 
 _CODEX_DESCENDANT_CLEANUP_ENV = "YOUNG_ROUTER_CODEX_DESCENDANT_CLEANUP"
 _CODEX_COMMENTARY_DISCIPLINE_ENV = "YOUNG_ROUTER_CODEX_COMMENTARY_DISCIPLINE"
-_CODEX_TOOL_REGISTRY_ENV = "YOUNG_ROUTER_CODEX_TOOL_REGISTRY"
 
 # A call whose arguments name a tool the request never declared is answered
 # with this code so the turn ends as a stated protocol fact.

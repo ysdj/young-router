@@ -29,7 +29,6 @@ from .base import (
     _CURRENT_EXCLUDED_DEPLOYMENT_IDS,
     _CURRENT_SELECTED_DEPLOYMENT_BOX,
     _JSONStreamEvent,
-    _ROUTE_RECOVERY_POLL_METADATA_KEY,
     _RouteOrder,
     asyncio,
     time,

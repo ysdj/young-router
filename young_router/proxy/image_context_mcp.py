@@ -28,10 +28,6 @@ TOOL_NAME = "view_image_by_id"
 # replay cache, so both halves agree on which store to read.
 THREAD_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_THREAD"
 
-_INSTRUCTIONS_ZH = (
-    "按编号取回被省略的原图。编号来自占位符里的“图片 IMG-xxxx”。"
-    "取回的图只在这一次调用里提供，下一轮又会省略，需要时再取。"
-)
 _INSTRUCTIONS_EN = (
     "Fetch the original of an omitted image by its id. The id is the one in the "
     "placeholder (\"Image IMG-004\"). A fetched image is provided for this call "

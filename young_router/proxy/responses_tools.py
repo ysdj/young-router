@@ -352,8 +352,6 @@ def _responses_bridge_web_search_options(tool: Any) -> Optional[dict]:
     return options
 
 
-_ANTHROPIC_SEARCH_TOOL_TYPE = "web_search_20250305"
-_ANTHROPIC_SEARCH_TOOL_NAME = "web_search"
 # The same context-size vocabulary LiteLLM maps onto Anthropic's ``max_uses``:
 # low/medium/high is three, five and ten provider-side searches.
 _ANTHROPIC_SEARCH_CONTEXT_SIZE = "medium"
@@ -1234,88 +1232,6 @@ def _append_responses_chat_bridge_instruction(
     else:
         retry_kwargs["instructions"] = note
 
-
-def _request_input_text(request_kwargs: Optional[dict]) -> str:
-    """Flatten the request's input/messages down to the text the model saw."""
-    request_kwargs = request_kwargs or {}
-    parts: list[str] = []
-
-    def append_text(value: Any, depth: int = 0) -> None:
-        if value is None or depth > 8 or len(parts) >= 80:
-            return
-        if isinstance(value, str):
-            if value.strip():
-                parts.append(value.strip())
-            return
-        if isinstance(value, list):
-            for item in value:
-                append_text(item, depth + 1)
-            return
-        if isinstance(value, dict):
-            value_type = value.get("type")
-            if isinstance(value_type, str) and value_type in {"input_text", "output_text"}:
-                append_text(value.get("text"), depth + 1)
-                return
-            for key in ("content", "text", "input", "message"):
-                if key in value:
-                    append_text(value.get(key), depth + 1)
-
-    append_text(request_kwargs.get("input"))
-    append_text(request_kwargs.get("messages"))
-    return "\n".join(parts[-20:]).strip()
-
-
-def _request_current_time_context(
-    request_kwargs: Optional[dict],
-) -> Optional[dict[str, str]]:
-    text = _request_input_text(request_kwargs)
-    if not text:
-        return None
-
-    date_match = re.search(
-        r"<\s*current_date\s*>\s*(\d{4}-\d{2}-\d{2})\s*<\s*/\s*current_date\s*>",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if date_match is None:
-        date_match = re.search(
-            r"\bcurrent[_ -]?date\b\s*[:=]\s*(\d{4}-\d{2}-\d{2})\b",
-            text,
-            flags=re.IGNORECASE,
-        )
-    if date_match is None:
-        return None
-
-    context = {"current_date": date_match.group(1)}
-    timezone_match = re.search(
-        r"<\s*timezone\s*>\s*([^<\n\r]+?)\s*<\s*/\s*timezone\s*>",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if timezone_match is not None:
-        timezone_text = " ".join(timezone_match.group(1).split())
-        if timezone_text:
-            context["timezone"] = timezone_text
-    return context
-
-
-def _current_time_context_instruction(request_kwargs: Optional[dict]) -> str:
-    context = _request_current_time_context(request_kwargs)
-    if not context:
-        return ""
-    current_date = context["current_date"]
-    timezone_text = context.get("timezone")
-    if timezone_text:
-        date_text = f"{current_date} in timezone {timezone_text}"
-    else:
-        date_text = current_date
-    return (
-        "Authoritative request time context: current date is "
-        f"{date_text}. For relative or current-time queries such as today, "
-        "tomorrow, now, latest/current weather, news, schedules, or similar "
-        "facts, ground search queries and final answers in this date context "
-        "and do not substitute a different year."
-    )
 
 def _responses_chat_bridge_sanitize_tool_choice(
     tool_choice: Any,

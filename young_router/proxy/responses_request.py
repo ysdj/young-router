@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import json
-
 from .. import browser_identity as _browser_identity
 from . import request_context as _request_context_module
 from . import routing as _routing_module
 from . import streaming as _streaming_module
 from . import trace as _trace_module
-from . import image_inputs as _image_inputs_module
 from . import context_window as _context_window_module
 
 
@@ -1856,25 +1853,6 @@ def _codex_text_tool_output_parts(output: Any) -> Optional[list[str]]:
     return chunks
 
 
-def _item_pair_identifiers(item: Any) -> list[str]:
-    """Return every call/output pairing identifier an item carries.
-
-    The client's wire convention has varied over time: some replays carry
-    ``call_id`` on both the call and its output, some carry only ``id`` on
-    the call, and some carry both.  Collect every present identifier so the
-    pairing passes below can match either side.
-    """
-
-    if not isinstance(item, dict):
-        return []
-    identifiers: list[str] = []
-    for key in ("call_id", "id"):
-        value = item.get(key)
-        if isinstance(value, str) and value and value not in identifiers:
-            identifiers.append(value)
-    return identifiers
-
-
 def _without_replayed_reasoning_summary_text(input_items: list) -> list:
     """Read a replayed ``reasoning`` item the way its upstream reads it.
 
@@ -2550,55 +2528,6 @@ def _codex_declared_tool_names(request_kwargs: Optional[dict]) -> set[str]:
     for tool in _codex_declared_tools(request_kwargs):
         visit(tool)
     return names
-
-
-_CODEX_TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_CODEX_TOOL_PATH_PATTERN = re.compile(
-    r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$"
-)
-
-
-def _codex_declared_tool_registry(
-    request_kwargs: Optional[dict],
-) -> tuple[list[str], list[str]]:
-    """Return direct Codex tool keys and their declared namespace paths."""
-    direct_names: list[str] = []
-    qualified_names: list[str] = []
-
-    def append(target: list[str], name: Any) -> None:
-        if (
-            isinstance(name, str)
-            and (
-                _CODEX_TOOL_NAME_PATTERN.fullmatch(name)
-                or _CODEX_TOOL_PATH_PATTERN.fullmatch(name)
-            )
-            and name not in target
-        ):
-            target.append(name)
-
-    def visit(tool: Any, namespace: str = "") -> None:
-        if not isinstance(tool, dict):
-            return
-        name = _codex_tool_definition_name(tool)
-        tool_type = tool.get("type")
-        if tool_type == "namespace":
-            next_namespace = name if isinstance(name, str) else ""
-            if namespace and next_namespace:
-                next_namespace = f"{namespace}.{next_namespace}"
-            children = tool.get("tools")
-            if isinstance(children, list) and children:
-                for child in children:
-                    visit(child, next_namespace)
-                return
-        if not isinstance(name, str):
-            return
-        append(direct_names, name)
-        qualified = f"{namespace}.{name}" if namespace else name
-        append(qualified_names, qualified)
-
-    for tool in _codex_declared_tools(request_kwargs):
-        visit(tool)
-    return direct_names, qualified_names
 
 
 # The surface-level request adaptations shared by every Codex-shaped request.

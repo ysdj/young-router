@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import json
 import re
 from typing import Callable
 
@@ -2648,11 +2647,6 @@ def _responses_incomplete_terminal_summary(chunk: Any) -> dict[str, Any]:
         ),
     }
 
-def _is_responses_incomplete_stream_error(exception: Exception) -> bool:
-    if getattr(exception, "stream_incomplete", False):
-        return True
-    return "responses stream incomplete" in _routing_module._exception_text(exception)
-
 def _response_has_tool_call_activity(response: Any) -> bool:
     def walk(value: Any) -> bool:
         if value is None:
@@ -4383,34 +4377,9 @@ async def _stream_forced_image_generation_payload(payload: dict) -> AsyncIterato
         for chunk in buffer:
             yield chunk
 
-async def _yield_original_stream(
-    buffer: List[Any],
-    response: Any,
-    request_data: dict,
-    *,
-    stream_started_at: Optional[float] = None,
-    saw_visible_output: bool = False,
-) -> AsyncIterator[Any]:
-    visible_output_seen = saw_visible_output
-    is_responses_stream = _request_is_responses_stream(request_data)
-    for chunk in buffer:
-        visible_output_seen = visible_output_seen or _stream_chunk_has_visible_output(chunk) or (
-            is_responses_stream
-            and _responses_completed_chunk_has_usable_output(chunk, request_data)
-        )
-        yield chunk
-    async for chunk in _stream_with_idle_timeout(
-        response,
-        request_data,
-        stream_started_at=stream_started_at,
-        saw_visible_output=visible_output_seen,
-        initial_chunk_count=len(buffer),
-    ):
-        yield chunk
-
 async def _empty_async_iterator() -> AsyncIterator[Any]:
-    if False:
-        yield None
+    for chunk in ():
+        yield chunk
 
 def _responses_non_streaming_response_has_usable_output(
     response: Any,
@@ -4887,49 +4856,6 @@ def _codex_compaction_done_item_completed_compat(
         ),
     )
     return completed_event
-
-def _responses_stream_events_to_completed_payload(
-    events: list[Any],
-    request_data: Optional[dict],
-) -> dict[str, Any]:
-    for chunk in events:
-        if _stream_chunk_type(chunk) == "response.failed":
-            raise RuntimeError("responses stream ended with response.failed")
-    state = _ResponsesStreamCompletionState(request_data)
-    for chunk in events:
-        state.remember(chunk)
-    return state.completed_payload(request_data)
-
-async def _collect_responses_stream_completed_payload(
-    buffer: list[Any],
-    response: Any,
-    request_data: dict,
-    *,
-    stream_started_at: Optional[float],
-    saw_visible_output: bool,
-    state: Optional[_ResponsesStreamCompletionState] = None,
-) -> dict[str, Any]:
-    completion_state = state or _ResponsesStreamCompletionState(request_data)
-    if state is None:
-        for chunk in buffer:
-            completion_state.remember(chunk)
-    async for chunk in _stream_with_idle_timeout(
-        response,
-        request_data,
-        stream_started_at=stream_started_at,
-        saw_visible_output=saw_visible_output,
-        initial_chunk_count=completion_state.event_count or len(buffer),
-    ):
-        sanitized_chunk = _web_search_native_module._sanitize_web_search_stream_chunk(
-            chunk,
-            request_data,
-        )
-        if sanitized_chunk is None:
-            continue
-        completion_state.remember(sanitized_chunk)
-        if _responses_stream_chunk_is_completed(sanitized_chunk):
-            break
-    return completion_state.completed_payload(request_data)
 
 async def _close_async_iterator_safely(iterator: Any) -> None:
     aclose = getattr(iterator, "aclose", None)
@@ -6437,8 +6363,6 @@ async def _yield_start_buffered_stream_with_error_fallback(
         _routing_module._is_failed_responses_stream_response(response)
         or bool(getattr(response, "_young_router_terminal_failed_stream", False))
     ):
-        failed_exception = getattr(response, "exception", None)
-        failed_request = getattr(response, "request_data", None)
         async for chunk in response:
             yield chunk
         return

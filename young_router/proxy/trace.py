@@ -58,12 +58,6 @@ from .base import (
 )
 
 
-
-def _route_trace_bool(value: Any) -> bool:
-    value = str(value or "").strip().lower()
-    return value in {"1", "true", "yes", "on", "debug"}
-
-
 def _clean_trace_text(value: str, *, limit: int = 320) -> tuple[str, bool]:
     clean = re.sub(r"sk-[A-Za-z0-9_-]{8,}", "sk-***", str(value or ""))
     clean = re.sub(r"(?i)bearer\s+[A-Za-z0-9._-]{8,}", "Bearer ***", clean)

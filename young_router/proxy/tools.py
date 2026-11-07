@@ -1,39 +1,15 @@
 from __future__ import annotations
 
-from . import responses_request as _responses_request_module
-from . import request_context as _request_context_module
-from . import responses_surfaces as _responses_surfaces_module
 from . import responses_tools as _responses_tools_module
 
 
 from .base import (
     Any,
-    List,
     Optional,
-    os,
     _BROWSER_COMPUTER_CLIENT_FUNCTION_NAMES,
     _BROWSER_COMPUTER_CLIENT_NAMESPACE_NAMES,
-    _HOSTED_COMPUTER_TOOL_TYPES,
-    _RESPONSES_CHAT_BRIDGE_METADATA_KEY,
-    _RESPONSES_TOOL_ADAPTER_METADATA_KEY,
     _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES,
-    _WEB_SEARCH_NATIVE_EVENT_SEEN_METADATA_KEY,
 )
-
-
-def _content_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-    chunks: List[str] = []
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-        text = part.get("text") or part.get("input_text")
-        if isinstance(text, str):
-            chunks.append(text)
-    return "\n".join(chunks)
 
 
 def _tools_include_image_generation(tools: Any) -> bool:

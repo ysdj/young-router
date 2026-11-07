@@ -73,12 +73,6 @@ def _read_codex_fast_config() -> tuple[bool, Optional[str]]:
     return result
 
 
-def _reset_codex_fast_config_cache_for_tests() -> None:
-    """Reset the mtime cache for isolated tests."""
-
-    _CODEX_CONFIG_CACHE.clear()
-
-
 def _request_container_dicts(request_kwargs: Optional[dict]) -> list[dict]:
     if not isinstance(request_kwargs, dict):
         return []

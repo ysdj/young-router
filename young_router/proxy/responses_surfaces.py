@@ -15,7 +15,6 @@ from . import trace as _trace_module
 from .base import (
     Any,
     HostedToolPlan,
-    List,
     Optional,
     _RESPONSES_CHAT_BRIDGE_EMPTY_RETRY_METADATA_KEY,
     _RESPONSES_CHAT_BRIDGE_FALLBACK_REASON_KEY,
@@ -29,7 +28,6 @@ from .base import (
     _PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY,
     _SUPPORTS_RESPONSES_CLIENT_TOOLS_KEY,
     _SUPPORTS_RESPONSES_FUNCTION_TOOLS_KEY,
-    _SUPPORTS_RESPONSES_HOSTED_TOOLS_KEY,
     _SUPPORTS_RESPONSES_WEB_SEARCH_KEY,
     _SUPPORTS_WEB_SEARCH_KEY,
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
@@ -377,7 +375,6 @@ def _responses_chat_bridge_retry_kwargs(
     )
     if current_surface == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
         return None
-    plan = _responses_tools_module._responses_hosted_tool_plan(request_kwargs, outer_request_kwargs)
     if (
         _responses_tools_module._native_hosted_computer_unsupported_error(
             exception,
@@ -578,19 +575,6 @@ def _request_is_direct_openai_route(request_kwargs: Optional[dict]) -> bool:
     return host == "api.openai.com"
 
 
-def _request_supports_native_responses_hosted_tools(
-    request_kwargs: Optional[dict],
-    outer_request_kwargs: Optional[dict] = None,
-) -> bool:
-    for request in (request_kwargs, outer_request_kwargs):
-        model_info = _request_context_module._request_model_info(request)
-        if model_info.get(_SUPPORTS_RESPONSES_HOSTED_TOOLS_KEY) is True:
-            return True
-        if _request_is_direct_openai_route(request):
-            return True
-    return False
-
-
 def _request_uses_responses_endpoint(
     request_kwargs: Optional[dict],
 ) -> bool:
@@ -608,22 +592,6 @@ def _request_uses_responses_endpoint(
         if mode in _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES:
             return False
     return _responses_request_module._request_is_responses_api(request_kwargs)
-
-
-def _request_supports_native_responses_web_search(
-    request_kwargs: Optional[dict],
-    outer_request_kwargs: Optional[dict] = None,
-) -> bool:
-    if _routing_module._request_current_upstream_surface(request_kwargs):
-        support = _request_native_responses_web_search_support_decision(
-            request_kwargs
-        )
-        return support is True
-    for request in (request_kwargs, outer_request_kwargs):
-        support = _request_native_responses_web_search_support_decision(request)
-        if support is not None:
-            return support
-    return False
 
 
 def _request_native_responses_web_search_support_decision(
@@ -671,33 +639,6 @@ def _request_native_responses_web_search_support_decision_for_requests(
     return None
 
 
-def _request_web_search_support_is_unknown(request_kwargs: Optional[dict]) -> bool:
-    if not isinstance(request_kwargs, dict):
-        return False
-    if _routing_module._web_search_tool_unsupported_cached(request_kwargs):
-        return False
-    model_info = _request_context_module._request_model_info(request_kwargs)
-    return (
-        model_info.get(_SUPPORTS_RESPONSES_WEB_SEARCH_KEY) is None
-        and model_info.get(_SUPPORTS_WEB_SEARCH_KEY) is None
-    )
-
-
-def _request_should_try_unknown_native_responses_web_search(
-    request_kwargs: Optional[dict],
-    outer_request_kwargs: Optional[dict] = None,
-) -> bool:
-    if _routing_module._request_current_upstream_surface(request_kwargs):
-        return (
-            _request_web_search_support_is_unknown(request_kwargs)
-            and _request_uses_responses_endpoint(request_kwargs)
-        )
-    for request in (request_kwargs, outer_request_kwargs):
-        if _request_web_search_support_is_unknown(
-            request
-        ) and _request_uses_responses_endpoint(request):
-            return True
-    return False
 def _request_should_try_native_responses_client_tools(
     request_kwargs: Optional[dict],
     outer_request_kwargs: Optional[dict] = None,
@@ -1544,34 +1485,6 @@ def _normalized_upstream_url_surface(value: Any) -> str:
         _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
         _UPSTREAM_URL_SURFACE_ANTHROPIC,
     } else ""
-
-
-def _with_preemptive_responses_chat_bridge(request_kwargs: dict) -> Optional[dict]:
-    if not _responses_request_module._request_is_responses_api(request_kwargs):
-        return None
-    bridge_kwargs = _responses_chat_bridge_preemptive_kwargs(
-        request_kwargs,
-        include_hosted_web_search_unsupported=False,
-        include_client_tool_unsupported=False,
-    )
-    if bridge_kwargs is None:
-        return None
-    bridge_metadata = _request_context_module._request_metadata_dict(bridge_kwargs, "litellm_metadata") or {}
-    _trace_module._route_trace(
-        "responses_chat_bridge_preemptive",
-        request_id=_routing_module._trace_request_id(request_kwargs),
-        session=_routing_module._trace_session_context(request_kwargs),
-        model_group=_responses_execution_module._request_model_group(request_kwargs),
-        deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
-        route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
-        tool_types=_trace_module._trace_tool_types(bridge_kwargs.get("tools")),
-        tool_names=_trace_module._trace_tool_names(bridge_kwargs.get("tools")),
-        has_image_input=_image_inputs_module._request_has_image_input(request_kwargs),
-        reason=bridge_metadata.get(
-            "responses_chat_bridge_preemptive_reason"
-        ),
-    )
-    return bridge_kwargs
 
 
 def _request_already_attempted_responses_chat_bridge_empty_retry(

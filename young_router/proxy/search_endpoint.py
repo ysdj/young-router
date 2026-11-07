@@ -85,7 +85,6 @@ RESULT_SEPARATOR = "-" * 80
 # A local read is the fallback for a result the search backend cannot fetch
 # itself.  It is a plain HTTP GET: no browser, no scripts, no credentials, and it
 # presents the same browser identity as every other request the app makes.
-LOCAL_FETCH_TIMEOUT_SECONDS = 20.0
 LOCAL_FETCH_MAX_BYTES = 2 * 1024 * 1024
 REQUEST_TIMEOUT_SECONDS = 60.0
 PAGE_CONTENT_LIMIT = 8000
@@ -385,7 +384,6 @@ def search_queries(body: Mapping[str, Any]) -> list[str]:
 # The tool's schema declares more commands than this endpoint answers.  Naming
 # them back is what stops a model from believing a finance or screenshot call
 # silently succeeded.
-_SERVED_COMMANDS = {"search_query", "open", "find", "response_length"}
 _UNSERVED_NOTES = {
     "image_query": "图片搜索没有执行，请改用文本搜索。",
     "click": "click 没有执行（本端点不维护页面内的编号链接），请直接 open 目标 URL。",

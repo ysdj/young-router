@@ -695,7 +695,6 @@ def _decode_data_url(value: Any) -> Optional[Tuple[str, bytes]]:
         return None
 
 
-_IMAGE_PART_TYPES = ("input_image", "image_url")
 # The line the fetch tool writes before an image it returns, in either language:
 # ``[图片 IMG-004 取回的原图｜…]`` / ``[Image IMG-004 fetched original | …]``.
 # An image behind it is a *copy* of an existing occurrence, not a new one, so it
@@ -865,7 +864,6 @@ def _visible_pictures() -> int:
 def scan(
     input_items: Any,
     *,
-    turn_of_item: Optional[Dict[int, int]] = None,
     file_paths: Optional[Mapping[str, str]] = None,
 ) -> List[_Found]:
     """Every image a replay carries, in wire order, with its identity.
@@ -1282,18 +1280,6 @@ def fetched_label(
 # --------------------------------------------------------------------------
 # Rewrite
 # --------------------------------------------------------------------------
-
-
-def _suffix_start(input_items: List[Any]) -> int:
-    """First item this pass may rewrite: everything after the last signed one."""
-
-    from .base import _value_has_encrypted_content
-
-    last_signed = -1
-    for index, item in enumerate(input_items):
-        if _value_has_encrypted_content(item):
-            last_signed = index
-    return last_signed + 1
 
 
 def _has_codex_client_evidence(request_kwargs: Mapping[str, Any]) -> bool:
@@ -1965,12 +1951,3 @@ def image_for_turn(
     return resolved
 
 
-def available_ids(request_kwargs: Mapping[str, Any]) -> List[str]:
-    """Every id the current replay can answer for, oldest first."""
-
-    seen: List[str] = []
-    for image in scan(request_kwargs.get("input")):
-        image_id = image.image_id or ""
-        if image_id not in seen:
-            seen.append(image_id)
-    return seen
