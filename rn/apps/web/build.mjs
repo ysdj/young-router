@@ -91,7 +91,25 @@ const html = `<!doctype html>
          white, which is the one combination nobody can read. */
       :root { color-scheme: light; }
       html, body { height: 100%; margin: 0; }
-      body { background: #f7f7f7; }
+      /* React Native for Web sets a font on the Text it draws and on nothing
+         else: a <button>, a <select> and an <input> are the browser's own
+         elements and inherit this one.  Without it every toolbar button was
+         drawn at the browser's 13.3 px Arial while the label beside it was
+         13 px system sans, and every picker at 16 px Times; the panes then
+         read as three different type families at three different sizes.  The
+         page may not host a font file (the CSP has no font host and the export
+         ships none), so the stack is the platforms' own UI faces, and the size
+         is the shared UI's own body size so an unstyled element matches the
+         Text around it. */
+      body {
+        background: #f7f7f7;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+        font-size: 13px;
+        line-height: 1.35;
+      }
+      /* A form control does not inherit the page's face by default; it is the
+         element the browser styles itself, so it has to be told. */
+      button, input, select, textarea { font-family: inherit; font-size: inherit; }
       #root { height: 100%; display: flex; }
       /* The host's surfaces own the viewport above every pane and child layer;
          the container itself must not swallow clicks meant for the app. */

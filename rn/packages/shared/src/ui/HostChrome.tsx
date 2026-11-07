@@ -93,12 +93,15 @@ function DecisionSurface({ request }: { request: Extract<HostChromeRequest, { ki
 function PromptSurface({ request }: { request: Extract<HostChromeRequest, { kind: "prompt" }> }): React.JSX.Element {
   const [draft, setDraft] = React.useState(request.value);
   const submit = (): void => settleHostChrome(request, draft);
+  // The same rule every save surface here follows: a primary button that would
+  // hand back the value the prompt opened on has nothing to confirm.
+  const pending = draft.trim() !== "" && draft !== request.value;
   return <DialogFrame
     title={request.title}
     footer={<>
       <View style={styles.footerSpacer} />
       <NativeButton title={request.cancelLabel} compact onPress={() => settleHostChrome(request, null)} />
-      <NativeButton title={request.confirmLabel} compact primary onPress={submit} />
+      <NativeButton title={request.confirmLabel} compact primary disabled={!pending} onPress={submit} />
     </>}
   >
     <View style={styles.cardBodyContent}>
@@ -140,7 +143,9 @@ function PickerSurface({ request }: { request: Extract<HostChromeRequest, { kind
     footer={<>
       <Text numberOfLines={1} style={styles.footerStatus}>{`${request.providerName} · ${request.keyName}`}</Text>
       <NativeButton title={request.cancelLabel} compact onPress={() => settleHostChrome(request, undefined)} />
-      <NativeButton title={request.confirmLabel} compact primary onPress={() => settleHostChrome(request, selected)} />
+      {/* Both native hosts disable their Add button until something is
+          selected; an enabled one here would hand back an empty list. */}
+      <NativeButton title={request.confirmLabel} compact primary disabled={selected.length === 0} onPress={() => settleHostChrome(request, selected)} />
     </>}
   >
     <ScrollView style={styles.cardBody} contentContainerStyle={styles.pickerBody}>

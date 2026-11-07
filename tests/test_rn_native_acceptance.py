@@ -1637,7 +1637,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         )
         self.assertIn("await leaf.showReadOnlyText(title, text, closeLabel, language, html);", platform)
 
-        self.assertIn('import { CodeEditorWebView, editorMenuLabels, readOnlyCodeEditorHtml } from "./code-editor/CodeEditorWebView";', ui)
+        self.assertIn('import { CodeEditorWebView, editorMenuLabels, readOnlyCodeEditorHtml, type CodeEditorLanguage } from "./code-editor/CodeEditorWebView";', ui)
         self.assertGreaterEqual(ui.count("void native.showReadOnlyText({"), 3)
         self.assertIn('text: selected.rows.map((row) => row.original).join("\\n\\n")', ui)
         self.assertIn("text: row.original", ui)

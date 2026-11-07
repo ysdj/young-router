@@ -37,12 +37,20 @@ type Layer = {
   close: () => void;
 };
 
-const layers = new Map<AppRoute, Layer>();
+const layers = new Map<string, Layer>();
 
 export type ChildLayerOptions = {
-  route: AppRoute;
+  route: string;
   title: string;
   closeLabel: string;
+  /** The layer's own size; a sheet that is mostly a list asks for its own. */
+  size?: { width: number; height: number };
+  /**
+   * The surface's own "may I close?": a window that would drop a draft asks
+   * first, so the title bar's × and Escape go through the question instead of
+   * closing over it.  Omitted, the layer closes itself.
+   */
+  requestClose?: () => void;
   /**
    * Mount the route's own React root into `container`, and return the function
    * that unmounts it. The caller supplies this so the shared package never
@@ -68,7 +76,7 @@ export function presentChildLayer(options: ChildLayerOptions): void {
     return;
   }
 
-  const size = LAYER_SIZE[options.route] ?? DEFAULT_SIZE;
+  const size = options.size ?? LAYER_SIZE[options.route as AppRoute] ?? DEFAULT_SIZE;
 
   // Fixed to the viewport, so the pane that opened it cannot clip it — the
   // failure an in-pane overlay has on both native hosts.
@@ -171,7 +179,14 @@ export function presentChildLayer(options: ChildLayerOptions): void {
     else if (!event.shiftKey && (document.activeElement === last || !frame.contains(document.activeElement))) { event.preventDefault(); first.focus(); }
   };
   const releasePresentation = pushPresentation({ dismiss, trap });
-  close.addEventListener("click", dismiss);
+  const askClose = (): void => {
+    if (options.requestClose) {
+      options.requestClose();
+      return;
+    }
+    dismiss();
+  };
+  close.addEventListener("click", askClose);
 
   // Dragging, the gesture a native child panel accepts on its title bar. The
   // layer is centred by layout, so the drag is clamped to the room the viewport
@@ -206,13 +221,13 @@ export function presentChildLayer(options: ChildLayerOptions): void {
 }
 
 /** End one child layer; returns false when that surface was not on screen. */
-export function dismissChildLayer(route: AppRoute): boolean {
+export function dismissChildLayer(route: string): boolean {
   const layer = layers.get(route);
   if (!layer) return false;
   layer.close();
   return true;
 }
 
-export function hasChildLayer(route: AppRoute): boolean {
+export function hasChildLayer(route: string): boolean {
   return layers.has(route);
 }

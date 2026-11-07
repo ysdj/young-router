@@ -6,7 +6,7 @@ import { assistantSettingOptions, type AssistantSettingOption } from "../i18n/as
 import { runtimeCategoryLabel, runtimeFieldHelp, runtimeFieldLabel, runtimeOptionLabel, runtimeUnitLabel } from "../i18n/runtimeSettingsI18n";
 import { canonicalWindowRoute, isSettingsPaneRoute, isSettingsShellRoute, LOG_TABS, routeMenuActions, ROUTES, SETTINGS_PANES, SETTINGS_PANE_PRESENTATION } from "../routes";
 import { NativeButton, NativeBusySpinner, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeSecureTextInput, NativeSegmentedControl, NativeTable, NativeTextField, NativeToggle, WINDOWS_CONTROL, nativeControlTextWidth } from "./NativeControls";
-import { CodeEditorWebView, editorMenuLabels, readOnlyCodeEditorHtml } from "./code-editor/CodeEditorWebView";
+import { CodeEditorWebView, editorMenuLabels, readOnlyCodeEditorHtml, type CodeEditorLanguage } from "./code-editor/CodeEditorWebView";
 import { modelGroupRowKey, modelIDFromRowKey, modelRowKey } from "./modelRowKeys";
 import { groupRoutesByPublicModel, publicModelKey } from "./publicModelNames";
 import { AccountsTable } from "./AccountsTable";
@@ -130,7 +130,6 @@ type RawEditorDocument = EditorDocument;
 type DataManagementTab = "import" | "export" | "webdav";
 /** Which data-management action is running, so only its own button spins. */
 type DataManagementAction = "inspect" | "import" | "export" | "sync";
-type WebDavSyncAction = "sync" | "push" | "pull";
 /**
  * How a finished pane action reads in the window's one status strip: a fixed
  * message key, no message at all, or the key its own result picks — a probe
@@ -635,16 +634,6 @@ const DATA_PACKAGE_SECTIONS: ReadonlyArray<{ domain: ConfigDomain; labelKey: str
 const DATA_PACKAGE_DOMAINS = DATA_PACKAGE_SECTIONS.map(({ domain }) => domain);
 const DATA_MANAGEMENT_DIRTY_DOMAINS: readonly ConfigDomain[] = DATA_PACKAGE_DOMAINS;
 const WEBDAV_SYNC_DOMAINS: readonly ConfigDomain[] = ["providers_models", "relay_accounts"];
-/**
- * The three directions a WebDAV sync can take. Each names itself and its own
- * consequence, so the field where the direction is chosen is also where the
- * choice is explained.
- */
-const WEBDAV_SYNC_OPTIONS: ReadonlyArray<{ id: WebDavSyncAction; labelKey: TranslationKey; hintKey: TranslationKey }> = [
-  { id: "sync", labelKey: "dataManagement.syncSmart", hintKey: "dataManagement.syncSmartHint" },
-  { id: "push", labelKey: "dataManagement.syncPush", hintKey: "dataManagement.syncPushHint" },
-  { id: "pull", labelKey: "dataManagement.syncPull", hintKey: "dataManagement.syncPullHint" },
-];
 
 const PendingFieldContext = createContext<PendingFieldRegistry | undefined>(undefined);
 const TranslationContext = createContext<Translate | undefined>(undefined);
@@ -757,6 +746,8 @@ const ROUTE_TRACE_SCROLLBAR_MIN_THUMB_WIDTH = 32;
 // resize a list the user is reading or clicking in, so six ordinary rows (24 pt
 // header + 2 pt slack) stay put and scroll internally when a vendor has more.
 const KEYS_INLINE_EDITOR_WIDTH = 124;
+/** The inline key list before its frame has been measured once. */
+const KEYS_INLINE_LIST_WIDTH = 174;
 const KEYS_INLINE_LIST_HEIGHT = 26 + 6 * 22;
 // The settings window draws a full-height sidebar behind a transparent title
 // bar, so the shared sidebar content starts below the traffic lights while the
@@ -1396,6 +1387,7 @@ function errorMessage(reason: unknown, translate: Translate): string {
     // connection itself is fine.
     webdav_sync_incompatible: "error.webdavSyncIncompatible",
     webdav_sync_conflict: "error.webdavSyncConflict",
+    webdav_sync_unsaved: "error.webdavSyncUnsaved",
     webdav_sync_failed: "error.webdavSyncFailed",
   };
   const known = keyByCode[code];
@@ -2246,7 +2238,7 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
       </View>
     </View>;
   }
-  return <View style={styles.settingsShellFrame}>
+  return <View style={[styles.settingsShellFrame, Platform.OS === "web" && styles.webShellFrame]}>
     <View style={[styles.settingsShellHeader, isWindowsShell && styles.settingsShellHeaderWindows]}>
       <View style={[styles.settingsSidebarHeader, styles.settingsSidebarHeaderIntegrated, isWindowsShell && styles.settingsSidebarHeaderWindows]}>
         {appInfo?.icon ? <Image source={{ uri: appInfo.icon }} style={styles.settingsSidebarAppIcon} /> : null}
@@ -3079,14 +3071,27 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
         revision.current = current.revision;
         latestSnapshot.current = current;
         onSnapshot(current);
-        if (!sameDomains || !sameDiskState) throw reason;
         // The domains this Apply named are no longer staged at the newer
         // revision: the write it was racing already committed them, so the
         // outcome the user asked for exists. Report that instead of failing
         // the commit — a window whose own background Apply finished first is
         // the ordinary case here, not a change made outside the window.
+        //
+        // This case is answered first because `sameDomains` is false whenever
+        // the newer snapshot stages nothing: asking it first sent the pane's
+        // own completed commit down the refusal below, so a provider toggle
+        // whose Apply had already landed still reported 更改未生效 — the
+        // relay alignment and workbuddy reads a patch kicks off advance the
+        // shared revision inside that window, and the debounced Apply then
+        // met a Core that had nothing left to write.
         if (currentDomains.length === 0) {
+          // A revision that did not move forward names no committed write, so
+          // the draft leaving staging there is somebody else's decision and
+          // must stay visible.
+          if (!sameDiskState || current.revision < refreshed.revision) throw reason;
           result = { revision: current.revision, applied: true, status: "applied", domains: [...domains], completed_operations: 0, pending_operations: 0, issues: [] };
+        } else if (!sameDomains || !sameDiskState) {
+          throw reason;
         } else {
           result = await applyOnce(current.revision);
         }
@@ -3148,15 +3153,27 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     // Instant-apply settings show their lifecycle in the status bar: saving
     // while the debounce runs, then a brief confirmation once Core accepted
     // the staged value.
-    setResult(translate("common.saving"));
+    const savingMessage = translate("common.saving");
+    setResult(savingMessage);
+    let started = false;
     const timer = setTimeout(() => {
       if (autoAppliedKey.current === autoApplyKey) return;
+      started = true;
       autoAppliedKey.current = autoApplyKey;
       // Keep the pane interactive while the background apply runs; the
       // dispatch queue serializes any edit made in the meantime.
       void apply({ message: "common.saved" });
     }, IMMEDIATE_APPLY_DEBOUNCE_MS);
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(timer);
+      // A newer draft, a busy pane, or an unmount can cancel the debounce
+      // before it ever calls Apply.  Leaving 正在保存 up in that case is the
+      // one state that looks like a frozen window while Core is idle: the
+      // argument that set it is gone, and nothing else will clear it.
+      if (!started) {
+        setResult((current) => (current === savingMessage ? undefined : current));
+      }
+    };
   }, [autoApplyKey, busy, hasPendingFieldEdits, pendingFieldRevision, shell, translate]);
   // The shell owns the window-close path; expose one flush so it can commit a
   // focused text/secret field and apply it before the native window closes.
@@ -3242,7 +3259,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     // URL whose only problem was where it pointed.
     return result.writable === false ? "webdav.probeReadOnly" : "webdav.probeOk";
   }, true);
-  const syncWebDav = (action: WebDavSyncAction): Promise<void> => runWebDavOperation(async () => {
+  const syncWebDavOperation = (type: "sync" | "push" | "pull"): Promise<void> => runWebDavOperation(async () => {
     await flushPendingFields();
     const refreshed = await ipc.snapshot();
     revision.current = refreshed.revision;
@@ -3258,7 +3275,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
       revision.current = applied.revision;
       if (diskChanged) setKeptDiskGeneration((current) => ({ ...current, webdav: undefined }));
     }
-    const dispatched = await ipc.dispatch({ domain: "webdav", type: action, payload: { sections: [...WEBDAV_SYNC_DOMAINS] } }, revision.current);
+    const dispatched = await ipc.dispatch({ domain: "webdav", type, payload: { sections: [...WEBDAV_SYNC_DOMAINS] } }, revision.current);
     revision.current = dispatched.revision;
     return dispatched;
   }, (value) => {
@@ -3270,6 +3287,29 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     if (stringValue(adopted.name) !== "" && adopted.removed !== true) return "dataManagement.syncedLeftoverRemote";
     return "dataManagement.synced";
   });
+  const syncWebDav = (): Promise<void> => syncWebDavOperation("sync");
+  // Choosing a side in the comparison is the resolution: the same operation the
+  // sync would have run by itself, now aimed at the side the reader picked.
+  // Both write an applied state, so the next sync starts from an agreement.
+  const resolveWebDavConflict = (side: "local" | "remote"): Promise<void> => syncWebDavOperation(side === "local" ? "push" : "pull");
+  // A run that stops writes the remote side the comparison reads, and a failed
+  // run advances no revision -- so the window that offered the button has to
+  // read the snapshot anyway, or the row that opens the comparison would only
+  // appear after the window was closed and reopened.
+  const syncWebDavAndReadState = async (): Promise<void> => {
+    await syncWebDav();
+    await refresh();
+  };
+  const resolveWebDavConflictAndReadState = async (side: "local" | "remote"): Promise<void> => {
+    await resolveWebDavConflict(side);
+    await refresh();
+  };
+  // The two texts of one synced file, through the versioned editor lease: a
+  // comparison is a document read, and never travels in a snapshot.
+  const compareWebDavConflict = async (document: string): Promise<{ local: string; remote: string }> => {
+    const descriptor = await ipc.editor("webdav", document as "config" | "disabled_models" | "relay_accounts");
+    return { local: descriptor.text, remote: descriptor.baseline };
+  };
   // A WebDAV setting is what the interval loop reads, so changing one applies
   // it instead of leaving it in an open window's draft: the enable switch has
   // to reach the flag file the loop checks, or it would mean nothing.  Commits
@@ -3683,7 +3723,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { native.window.open("provider-wizard"); native.window.focus("provider-wizard"); }} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
     {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} status={result} /> : null}
-    {route === "webdav-settings" ? <WebDavSettingsPanel snapshot={snapshot} busy={busy} status={dataManagementStatuses.webdav} translate={translate} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onProbe={probeWebDavDetails} onSave={saveWebDavDetails} onSync={syncWebDav} onClose={closeRoute} /> : null}
+    {route === "webdav-settings" ? <WebDavSettingsPanel snapshot={snapshot} busy={busy} status={dataManagementStatuses.webdav} translate={translate} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onProbe={probeWebDavDetails} onSave={saveWebDavDetails} onSync={syncWebDavAndReadState} onCompareConflict={compareWebDavConflict} onResolveConflict={resolveWebDavConflictAndReadState} onSetContentSize={(width, height) => { void native.window.setContentSize?.("webdav-settings", width, height); }} onClose={closeRoute} /> : null}
     {settingsRoute ? <AssistantSettingsWorkspace busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} codexRoute={codexDesignatedRoute ? { model: stringValue(codexDesignatedRoute.model), provider: stringValue(codexDesignatedRoute.provider), deployment_id: stringValue(codexDesignatedRoute.deployment_id), label: clientRouteLabel(stringValue(codexDesignatedRoute.provider), stringValue(codexDesignatedRoute.model)) } : undefined} standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} claudeClients={{ claudeCode: asRecord(claudeClients.claudeCode), claudeDesktop: asRecord(claudeClients.claudeDesktop) }} claudeModels={claudeModelRows} onClaudeUseLocalApi={(app, selection) => dispatch("use_local_api", { ...selection, client: app }, "claude")} onClaudeUseSavedModel={(app, selection) => dispatch("use_saved_model", { ...selection, client: app }, "claude")} onToggleClaudeModelList={(app, enabled) => dispatch("claude.models.set", { client: app, enabled }, "claude")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} onStatus={setResult} /> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} onStatusBar={setStatusBarControls} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
     {route === "general-settings" ? <GeneralWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} dispatch={dispatch} dispatchServiceAction={enqueueServiceDispatch} translate={translate} onStatus={setResult} onSnapshot={onSnapshot} /> : null}
@@ -6744,6 +6784,9 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
   const pendingCustomKeyName = useRef<string | undefined>(undefined);
   const pendingCustomKeyRename = useRef<{ id: string; name: string } | undefined>(undefined);
   const [providedNameDrafts, setProvidedNameDrafts] = useState<Record<string, string>>({});
+  // The inline list's own width, measured once per layout: its one column is
+  // what the editor column beside it leaves, not a number this panel invents.
+  const [inlineKeysListWidth, setInlineKeysListWidth] = useState(KEYS_INLINE_LIST_WIDTH);
   const [formBusy, setFormBusy] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [remoteDelete, setRemoteDelete] = useState<{ account: RelayAccount; resource: RelayResource; label: string }>();
@@ -6988,9 +7031,16 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
   // (see KEYS_INLINE_LIST_HEIGHT): a fixed frame is what keeps the panel calm
   // while the user switches vendors, loads data, or works in the sections
   // below, and the list scrolls internally when the vendor has more keys.
+  // The inline list shares its row of height with the editor column beside it
+  // (KEYS_INLINE_EDITOR_WIDTH).  Its one column is the width that is actually
+  // left: a fixed 264 pt column in a 174 pt frame made the row itself the
+  // horizontal scroller, so the table slid 95 pt sideways under a heading that
+  // did not move.  The frame is measured, so a widened inspector widens the
+  // column with it.
+  const inlineKeysWidth = Math.max(40, inlineKeysListWidth - 6);
   const keysTable = <NativeTable
       columns={variant === "inline"
-        ? [{ label: translate((credentials ?? []).length > 0 ? "providers.credentials" : "providers.keys"), width: 264 }]
+        ? [{ label: translate((credentials ?? []).length > 0 ? "providers.credentials" : "providers.keys"), width: inlineKeysWidth }]
         : (credentials ?? []).length > 0
         ? [{ label: translate("providers.credentials"), width: 150 }, { label: translate("providers.authType"), width: 90 }]
         : [{ label: translate("common.name"), width: 150 }, { label: translate("providers.detail"), width: 170 }]}
@@ -7206,10 +7256,10 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
         <Text style={styles.panelTitle}>{translate((credentials ?? []).length > 0 ? "providers.credentials" : "providers.keys")}</Text>
         <View style={styles.panelActions}>{toolbar}</View>
       </View>
-      {tableRows.length > 0 ? <View style={styles.keysInlineBody}>
+      {tableRows.length > 0 ? <View style={styles.keysInlineBody} onLayout={({ nativeEvent }) => setInlineKeysListWidth(Math.max(1, nativeEvent.layout.width - KEYS_INLINE_EDITOR_WIDTH - 6))}>
         {keysTable}
         {keysEditorView}
-      </View> : <View style={styles.keysInlineBody}>
+      </View> : <View style={styles.keysInlineBody} onLayout={({ nativeEvent }) => setInlineKeysListWidth(Math.max(1, nativeEvent.layout.width - KEYS_INLINE_EDITOR_WIDTH - 6))}>
         {/* No credential to select yet: the editor column would be empty, so
             the one action that can fill this list states itself here. */}
         {credentialSignIn ? <NativeButton title={credentialSignIn.label} compact busy={credentialSignIn.busy} disabled={credentialSignIn.disabled} onPress={credentialSignIn.onPress} /> : null}
@@ -8995,10 +9045,17 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
   const [listed, setListed] = useState<ClientFile>();
   const [loadError, setLoadError] = useState<string>();
   const [saving, setSaving] = useState(false);
+  // Whether the editor's text differs from the document Core has applied.  The
+  // ref answers the close path, which asks the question after awaiting a
+  // snapshot and must not read a value from an earlier render; the state exists
+  // because 保存并关闭 has to look disabled until there is something to write --
+  // an enabled primary button that writes nothing reads as "there was a change".
   const localEditorDirtyRef = useRef(false);
+  const [editorDirty, setEditorDirty] = useState(false);
   const handleEditorDirtyChange = useCallback((dirty: boolean): void => {
     if (localEditorDirtyRef.current === dirty) return;
     localEditorDirtyRef.current = dirty;
+    setEditorDirty(dirty);
   }, []);
   // This child window states its own save result beside its footer buttons.
   const [footerStatus, setFooterStatus] = useState<string>();
@@ -9170,7 +9227,7 @@ function FileEditorWorkspace({ file, fileId, nativeAction, ipc, native, translat
           </>
           : <>
             <ActionButton title={translate("status.close")} disabled={saving} onPress={close} />
-            <ActionButton primary title={translate("status.saveAndClose")} busy={saving} disabled={saving || target === undefined} onPress={save} />
+            <ActionButton primary title={translate("status.saveAndClose")} busy={saving} disabled={saving || target === undefined || !editorDirty} onPress={save} />
           </>}
       </View>
     </View>
@@ -10727,6 +10784,7 @@ function webDavStateLabel(translate: Translate, enabled: boolean): string {
 /** The step that clears the last stopped run, keyed by the cause Core recorded. */
 function webdavFailureRemedy(code: string): TranslationKey {
   if (code === "webdav_sync_conflict") return "webdav.remedy.conflict";
+  if (code === "webdav_sync_unsaved") return "webdav.remedy.unsaved";
   if (code === "webdav_sync_incompatible") return "webdav.remedy.incompatible";
   return "webdav.remedy.disconnected";
 }
@@ -10758,11 +10816,9 @@ type WebDavDetailDraft = {
   remote_name: string;
   sync_interval: string;
   timeout: string;
-  sync_direction: WebDavSyncAction;
 };
 
 function webDavDetailDraft(state: UnknownRecord): WebDavDetailDraft {
-  const direction = stringValue(state.sync_direction);
   return {
     enabled: booleanValue(state.enabled),
     url: stringValue(state.url),
@@ -10770,7 +10826,6 @@ function webDavDetailDraft(state: UnknownRecord): WebDavDetailDraft {
     remote_name: stringValue(state.remote_name),
     sync_interval: stringValue(state.sync_interval),
     timeout: stringValue(state.timeout),
-    sync_direction: direction === "push" ? "push" : direction === "pull" ? "pull" : "sync",
   };
 }
 
@@ -10783,7 +10838,6 @@ function webDavDetailPatch(draft: WebDavDetailDraft, saved: WebDavDetailDraft): 
   if (draft.remote_name.trim() !== saved.remote_name) patch.remote_name = draft.remote_name.trim();
   if (draft.sync_interval.trim() !== saved.sync_interval) patch.sync_interval = draft.sync_interval.trim();
   if (draft.timeout.trim() !== saved.timeout) patch.timeout = draft.timeout.trim();
-  if (draft.sync_direction !== saved.sync_direction) patch.sync_direction = draft.sync_direction === "sync" ? "smart" : draft.sync_direction;
   return patch;
 }
 
@@ -10795,7 +10849,6 @@ function webDavDetailProbe(draft: WebDavDetailDraft): UnknownRecord {
     remote_name: draft.remote_name.trim(),
     sync_interval: draft.sync_interval.trim(),
     timeout: draft.timeout.trim(),
-    sync_direction: draft.sync_direction === "sync" ? "smart" : draft.sync_direction,
   };
 }
 
@@ -10810,7 +10863,138 @@ function WebDavField({ label, hint, children }: { label: string; hint?: string; 
   </View>;
 }
 
-function WebDavSettingsPanel({ snapshot, busy, status, translate, onSecretState, onFlushPendingFields, onProbe, onSave, onSync, onClose }: { snapshot?: CoreSnapshot; busy: boolean; status?: string; translate: Translate; onSecretState: (state: SecretState) => void; onFlushPendingFields: () => Promise<void>; onProbe: (values: UnknownRecord) => Promise<void>; onSave: (patch: UnknownRecord) => Promise<boolean>; onSync: (action: WebDavSyncAction) => Promise<void>; onClose: () => void }): React.JSX.Element {
+/** One synced file a stopped sync offers for comparison. */
+type WebDavConflictFile = { document: string; changed: boolean };
+
+/** The files a stopped sync left for the reader to compare, as Core names them. */
+function webDavConflictFiles(conflict: UnknownRecord): WebDavConflictFile[] {
+  const rows = Array.isArray(conflict.files) ? conflict.files : [];
+  const files: WebDavConflictFile[] = [];
+  for (const row of rows) {
+    const record = asRecord(row);
+    const document = stringValue(record.name);
+    if (document === "") continue;
+    files.push({ document, changed: record.changed === true });
+  }
+  return files;
+}
+
+/** What one synced file is called where a reader chooses among them. */
+function webDavConflictFileLabel(document: string, translate: Translate): string {
+  if (document === "disabled_models") return translate("webdav.conflict.file.disabledModels");
+  if (document === "relay_accounts") return translate("webdav.conflict.file.relayAccounts");
+  return translate("webdav.conflict.file.config");
+}
+
+/** The editor language of one synced file, so the diff is highlighted as what it is. */
+function webDavConflictFileLanguage(document: string): CodeEditorLanguage {
+  return document === "relay_accounts" ? "json" : "yaml";
+}
+
+/**
+ * Both sides of a sync that stopped, one document at a time.
+ *
+ * A real conflict is the one case no comparison of manifests can settle: two
+ * people (or two machines) edited the same files, and only the reader knows
+ * which work they meant to keep. So the two texts are drawn as the editor's own
+ * diff -- this Mac's file as the document, the remote copy the stopped run kept
+ * as its baseline, so a `+` line is one only this Mac has -- and the choice is
+ * the footer's: which side wins. Nothing is written until one of those two
+ * buttons is pressed, and pressing one is the whole resolution: the next sync
+ * starts from the side that landed.
+ */
+function WebDavConflictComparison({ conflict, translating, busy, translate, onCompare, onChoose, onBack }: { conflict: UnknownRecord; translating: boolean; busy: boolean; translate: Translate; onCompare: (document: string) => Promise<{ local: string; remote: string }>; onChoose: (side: "local" | "remote") => Promise<void>; onBack: () => void }): React.JSX.Element {
+  const files = webDavConflictFiles(conflict);
+  const changed = files.filter(({ changed: differs }) => differs);
+  const offered = changed.length > 0 ? changed : files;
+  const [selected, setSelected] = useState<string>(offered[0]?.document ?? "config");
+  const [texts, setTexts] = useState<Record<string, { local: string; remote: string }>>();
+  const [loading, setLoading] = useState(true);
+  const [choosing, setChoosing] = useState<"local" | "remote" | undefined>();
+  const [failure, setFailure] = useState<string>();
+  // A record can name the choice without carrying the texts (a bundle too large
+  // to keep aside). The buttons are the point and stay usable; only the diff is
+  // missing, and the footer says so.
+  const comparable = conflict.comparable === true;
+  const compare = useRef(onCompare);
+  compare.current = onCompare;
+  useEffect(() => {
+    if (!comparable) {
+      setLoading(false);
+      return undefined;
+    }
+    let live = true;
+    setLoading(true);
+    setFailure(undefined);
+    void Promise.all(offered.map(async ({ document }) => [document, await compare.current(document)] as const))
+      .then((entries) => { if (live) setTexts(Object.fromEntries(entries)); })
+      // A read that fails here has one meaning for a reader: the two texts are
+      // not available.  Core's own sentence names the editor lease and a
+      // document id, which is not something this window can act on.
+      .catch(() => { if (live) setFailure(translate("webdav.conflict.unavailable")); })
+      .finally(() => { if (live) setLoading(false); });
+    return () => { live = false; };
+    // The comparison is read once for the record this window opened on; a new
+    // record is a new window, and every file is read in that one pass.
+  }, []);
+  const choose = async (side: "local" | "remote"): Promise<void> => {
+    if (choosing !== undefined) return;
+    setChoosing(side);
+    setFailure(undefined);
+    try {
+      await onChoose(side);
+      onBack();
+    } catch (reason: unknown) {
+      setFailure(errorMessage(reason, translate));
+    } finally {
+      setChoosing(undefined);
+    }
+  };
+  const selectedTexts = texts?.[selected];
+  // Destructured through the property names the comparison's answer uses: the
+  // texts are one pair, and the surface that draws them reads both or neither.
+  const selectedText = selectedTexts?.local;
+  const selectedBaseline = selectedTexts?.remote;
+  const recordedAt = stringValue(conflict.at);
+  const footerStatus = loading
+    ? translate("webdav.conflict.loading")
+    : choosing !== undefined
+      ? translate("dataManagement.syncing")
+      : failure ?? (texts === undefined ? translate("webdav.conflict.unavailable") : `${translate("webdav.conflict.legend")}${recordedAt === "" ? "" : `  ·  ${translate("webdav.conflict.recorded", { time: formatActionTimestamp(recordedAt) })}`}`);
+  return <View style={styles.webdavDialogSurface} accessibilityViewIsModal>
+    <View style={styles.webdavConflictBody}>
+      {offered.length > 1 ? <NativeSegmentedControl
+        labels={offered.map(({ document }) => webDavConflictFileLabel(document, translate))}
+        selectedValue={webDavConflictFileLabel(selected, translate)}
+        disabled={translating}
+        onChange={({ nativeEvent }) => { const next = offered[nativeEvent.index]; if (next) setSelected(next.document); }}
+        style={styles.webdavConflictTabs}
+      /> : null}
+      {selectedText === undefined || selectedBaseline === undefined
+        ? <View style={styles.webdavConflictEmpty}><Text style={styles.webdavFieldHelpText}>{loading ? translate("webdav.conflict.loading") : failure ?? translate("webdav.conflict.unavailable")}</Text></View>
+        : <CodeEditorWebView
+          documentKey={`webdav-conflict:${selected}:${recordedAt}`}
+          value={selectedText}
+          baseline={selectedBaseline}
+          language={webDavConflictFileLanguage(selected)}
+          readOnly
+          showDiff
+          menuLabels={editorMenuLabels(translate)}
+          style={styles.webdavConflictEditor}
+        />}
+    </View>
+    <View style={styles.childSurfaceFooter}>
+      {footerStatus ? <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.childSurfaceFooterStatus}>{footerStatus}</Text> : <View style={styles.childSurfaceFooterSpacer} />}
+      <View style={styles.childSurfaceFooterActions}>
+        <NativeButton title={translate("webdav.conflict.back")} disabled={choosing !== undefined} onPress={onBack} />
+        <NativeButton title={translate("webdav.conflict.keepRemote")} busy={choosing === "remote"} disabled={busy || choosing !== undefined} onPress={() => { void choose("remote"); }} />
+        <NativeButton primary title={translate("webdav.conflict.keepLocal")} busy={choosing === "local"} disabled={busy || choosing !== undefined} onPress={() => { void choose("local"); }} />
+      </View>
+    </View>
+  </View>;
+}
+
+function WebDavSettingsPanel({ snapshot, busy, status, translate, onSecretState, onFlushPendingFields, onProbe, onSave, onSync, onCompareConflict, onResolveConflict, onSetContentSize, onClose }: { snapshot?: CoreSnapshot; busy: boolean; status?: string; translate: Translate; onSecretState: (state: SecretState) => void; onFlushPendingFields: () => Promise<void>; onProbe: (values: UnknownRecord) => Promise<void>; onSave: (patch: UnknownRecord) => Promise<boolean>; onSync: () => Promise<void>; onCompareConflict: (document: string) => Promise<{ local: string; remote: string }>; onResolveConflict: (side: "local" | "remote") => Promise<void>; onSetContentSize: (width: number, height: number) => void; onClose: () => void }): React.JSX.Element {
   // The pane underneath must not auto-apply this domain while the form is open:
   // its edits are one draft until 保存并关闭, and an apply from the pane would
   // commit the part of it Core has staged (the password) on its own.
@@ -10826,18 +11010,41 @@ function WebDavSettingsPanel({ snapshot, busy, status, translate, onSecretState,
   const values = draft ?? saved;
   const update = (patch: Partial<WebDavDetailDraft>): void => setDraft({ ...values, ...patch });
   const configured = snapshot?.webdav.password.present === true;
-  const syncOptions = WEBDAV_SYNC_OPTIONS.map((option) => ({ ...option, title: translate(option.labelKey) }));
-  const selectedSync = syncOptions.find(({ id }) => id === values.sync_direction) ?? syncOptions[0];
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [comparing, setComparing] = useState(false);
   const [actionError, setActionError] = useState<string>();
+  // A sync that stopped because both ends changed leaves its remote side for
+  // this window to compare. The comparison replaces the form in this same
+  // window: it is the only place a side can be chosen, so it must not become
+  // another window to find.
+  const conflict = asRecord(state.conflict);
+  const conflictChanged = webDavConflictFiles(conflict).some((file) => file.changed);
+  // The comparison needs the room a diff takes, and this is the same window:
+  // it grows while two texts are shown and returns to the form's own size when
+  // the reader goes back.  Both numbers are this route's, stated here because
+  // this is the only place that changes them.
+  useEffect(() => {
+    if (!comparing) return undefined;
+    onSetContentSize(900, 620);
+    return () => onSetContentSize(600, 470);
+  }, [comparing]);
   // The native secure field stages the password through Core as it is typed;
   // its value never enters this process. It is still part of this one draft,
   // so a save that changed nothing else must apply it (and 关闭 drops it).
+  //
+  // The ref is what the write itself reads: the field's own debounce can land
+  // while that call awaits its flush. The state is the footer's copy of the
+  // same fact, because a disabled-looking button is a render and a ref moving
+  // does not render one.
   const stagedSecret = useRef(false);
+  const [stagedSecretPresent, setStagedSecretPresent] = useState(false);
   const stageSecret = (state: SecretState): void => {
-    if (state.status === "saved") stagedSecret.current = true;
+    if (state.status === "saved") {
+      stagedSecret.current = true;
+      setStagedSecretPresent(true);
+    }
     onSecretState(state);
   };
   const test = async (): Promise<void> => {
@@ -10879,15 +11086,14 @@ function WebDavSettingsPanel({ snapshot, busy, status, translate, onSecretState,
     }
     if (written || nothingToWrite) onClose();
   };
-  // 触发一次同步 runs the direction the form shows, not the saved one: the
-  // reader is looking at this value when they press it. Its outcome belongs to
-  // this window's status line, like the probe's.
+  // 触发一次同步 runs the one sync there is: a comparison that takes the newer
+  // side. Its outcome belongs to this window's status line, like the probe's.
   const syncNow = async (): Promise<void> => {
     if (syncing || saving || !values.enabled) return;
     setSyncing(true);
     setActionError(undefined);
     try {
-      await onSync(values.sync_direction);
+      await onSync();
     } catch (reason: unknown) {
       setActionError(errorMessage(reason, translate));
     } finally {
@@ -10897,6 +11103,11 @@ function WebDavSettingsPanel({ snapshot, busy, status, translate, onSecretState,
   // A probe or a run does not freeze this form: only the write itself locks
   // the fields, and 关闭 stays available while the server is being asked.
   const waiting = busy || saving;
+  // 保存并关闭 states whether this window has anything to write, using the
+  // same comparison the write itself makes. An untouched form used to offer a
+  // live primary button that wrote nothing and closed the window, which reads
+  // as "something was changed" when nothing was.
+  const pendingWrite = stagedSecretPresent || Object.keys(webDavDetailPatch(values, saved)).length > 0;
   // The child states its own wait and its own failure beside the buttons that
   // produced them; the window underneath says nothing about this work.
   const footerStatus = testing
@@ -10906,6 +11117,17 @@ function WebDavSettingsPanel({ snapshot, busy, status, translate, onSecretState,
       : syncing
         ? translate("dataManagement.syncing")
         : actionError ?? status;
+  if (comparing && conflictChanged) {
+    return <WebDavConflictComparison
+      conflict={conflict}
+      translating={waiting}
+      busy={busy}
+      translate={translate}
+      onCompare={onCompareConflict}
+      onChoose={onResolveConflict}
+      onBack={() => setComparing(false)}
+    />;
+  }
   return <View style={styles.webdavDialogSurface} accessibilityViewIsModal>
     <PersistentScrollView style={styles.webdavDialogBody} contentContainerStyle={styles.webdavDialogBodyContent} keyboardShouldPersistTaps="handled">
       <View style={styles.webdavFieldList}>
@@ -10923,6 +11145,12 @@ function WebDavSettingsPanel({ snapshot, busy, status, translate, onSecretState,
             <NativeButton title={translate("webdav.syncNow")} busy={syncing} disabled={saving || !values.enabled} onPress={() => { void syncNow(); }} />
           </View>
         </View>
+        {/* The one row that is not a setting: a stopped sync waiting for a side.
+            It names itself and its own step, and pressing it opens the
+            comparison in this window. */}
+        {conflictChanged ? <WebDavField label={translate("webdav.conflict.title")} hint={translate("webdav.conflict.hint")}>
+          <NativeButton title={translate("webdav.conflict.compare")} disabled={saving} onPress={() => setComparing(true)} />
+        </WebDavField> : null}
         <WebDavField label={translate("webdav.url")}>
           <View style={styles.webdavFieldText}>
             <NativeTextField style={styles.input} value={values.url} editable={!waiting} onChangeText={(url) => update({ url })} autoCapitalize="none" autoCorrect={false} accessibilityLabel={translate("webdav.url")} />
@@ -10952,9 +11180,6 @@ function WebDavSettingsPanel({ snapshot, busy, status, translate, onSecretState,
           <NativeTextField style={[styles.input, styles.webdavFieldNumber]} value={values.timeout} editable={!waiting} onChangeText={(timeout) => update({ timeout })} keyboardType="numeric" autoCapitalize="none" autoCorrect={false} accessibilityLabel={translate("webdav.httpTimeout")} />
           <Text style={styles.webdavFieldUnit}>{translate("webdav.seconds")}</Text>
         </WebDavField>
-        <WebDavField label={translate("dataManagement.syncDirection")} hint={translate(selectedSync.hintKey)}>
-          <NativePicker labels={syncOptions.map(({ title }) => title)} selectedValue={selectedSync.title} disabled={waiting} accessibilityLabel={translate("dataManagement.syncDirection")} onChange={({ nativeEvent }) => { const option = syncOptions[nativeEvent.index]; if (option) update({ sync_direction: option.id }); }} style={styles.webdavFieldPicker} />
-        </WebDavField>
       </View>
     </PersistentScrollView>
     <View style={styles.childSurfaceFooter}>
@@ -10963,7 +11188,7 @@ function WebDavSettingsPanel({ snapshot, busy, status, translate, onSecretState,
       {footerStatus ? <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.childSurfaceFooterStatus}>{footerStatus}</Text> : <View style={styles.childSurfaceFooterSpacer} />}
       <View style={styles.childSurfaceFooterActions}>
         <NativeButton title={translate("status.close")} disabled={saving} onPress={onClose} />
-        <NativeButton primary title={translate("status.saveAndClose")} busy={saving} disabled={busy || saving || syncing} onPress={() => { void save(); }} />
+        <NativeButton primary title={translate("status.saveAndClose")} busy={saving} disabled={busy || saving || syncing || !pendingWrite} onPress={() => { void save(); }} />
       </View>
     </View>
   </View>;
@@ -13391,7 +13616,7 @@ const ActionButton = React.forwardRef<HostInstance, { title: string; onPress: ()
 
 function TextField({ label, value, onCommit, onDraftChange, hint, hintStyle, placeholder, secret, multiline, compactMultiline, keyboardType, stacked, labelWidth, labelAlign, controlWidth, labelVisible = true, suffix, disabled, validate, accessory, style }: { label: string; value: string; onCommit: (value: string) => void | Promise<void>; onDraftChange?: (value: string) => void; hint?: string; hintStyle?: StyleProp<TextStyle>; placeholder?: string; secret?: boolean; multiline?: boolean; compactMultiline?: boolean; keyboardType?: "default" | "numeric"; stacked?: boolean; labelWidth?: number; labelAlign?: "left" | "right"; controlWidth?: number; /** The caller renders the label itself (a stacked keys-editor row). */ labelVisible?: boolean; suffix?: string; disabled?: boolean; /** Commit-time validation: an invalid draft stays in the field with its message instead of reaching Core. */ validate?: (next: string) => string | undefined; /** A control that belongs to this row beside the field, such as its help mark. It rides the same grid level as PickerField's, so a field with an accessory and a picker with one draw the same column. */ accessory?: React.ReactNode; style?: StyleProp<ViewStyle> }): React.JSX.Element {
   const field = usePendingTextField(value, onCommit, label, onDraftChange, validate);
-  return <View style={[styles.formRow, compactStyles.formRow, (stacked || multiline) && styles.formRowStacked, style]}>{labelVisible ? <Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }, (stacked || multiline) && styles.formRowLabelStacked]}>{label}</Text> : null}<View style={[styles.formRowControl, compactStyles.formRowControl, controlWidth === undefined ? null : { width: controlWidth, flex: 0 }]}><NativeTextField style={[styles.input, compactStyles.input, multiline && styles.textArea, compactMultiline && styles.compactTextArea, field.error !== undefined && styles.inputInvalid]} value={field.draft} placeholder={placeholder} editable={!disabled} onChangeText={field.onChangeText} onBlur={() => { if (!disabled) void field.commit().catch(() => undefined); }} onSubmitEditing={multiline ? undefined : () => { if (!disabled) void field.commit().catch(() => undefined); }} multiline={multiline} secureTextEntry={secret} autoCapitalize="none" autoCorrect={false} keyboardType={keyboardType} accessibilityLabel={label} />{hint ? <Text style={[styles.fieldHint, hintStyle]}>{hint}</Text> : null}{field.error !== undefined ? <Text style={[styles.fieldError, hintStyle]} accessibilityLiveRegion="polite">{field.error}</Text> : null}</View>{accessory ?? null}{suffix ? <Text style={[styles.fieldHint, hintStyle]}>{suffix}</Text> : null}</View>;
+  return <View style={[styles.formRow, compactStyles.formRow, (stacked || multiline) && styles.formRowStacked, style]}>{labelVisible ? <Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }, (stacked || multiline) && styles.formRowLabelStacked]}>{label}</Text> : null}<View style={[styles.formRowControl, compactStyles.formRowControl, controlWidth === undefined ? null : { width: controlWidth, flexGrow: 0, flexShrink: 0, flexBasis: "auto" }]}><NativeTextField style={[styles.input, compactStyles.input, multiline && styles.textArea, compactMultiline && styles.compactTextArea, field.error !== undefined && styles.inputInvalid]} value={field.draft} placeholder={placeholder} editable={!disabled} onChangeText={field.onChangeText} onBlur={() => { if (!disabled) void field.commit().catch(() => undefined); }} onSubmitEditing={multiline ? undefined : () => { if (!disabled) void field.commit().catch(() => undefined); }} multiline={multiline} secureTextEntry={secret} autoCapitalize="none" autoCorrect={false} keyboardType={keyboardType} accessibilityLabel={label} />{hint ? <Text style={[styles.fieldHint, hintStyle]}>{hint}</Text> : null}{field.error !== undefined ? <Text style={[styles.fieldError, hintStyle]} accessibilityLiveRegion="polite">{field.error}</Text> : null}</View>{accessory ?? null}{suffix ? <Text style={[styles.fieldHint, hintStyle]}>{suffix}</Text> : null}</View>;
 }
 
 function NativeSecretInputControl({ label, hint, busy, domain, field, target, multiline = false, plainText = false, autoCommit = false, resetToken = 0, onSecretState, setTitle, setBelow, onSetReady, inputMinWidth }: { label: string; hint?: string; busy: boolean; domain: "providers_models" | "relay_accounts" | "codex" | "claude" | "runtime" | "webdav"; field: string; target?: string; multiline?: boolean; plainText?: boolean; autoCommit?: boolean; resetToken?: number; onSecretState: (state: SecretState) => void; setTitle?: string; setBelow?: boolean; onSetReady?: (requestSet: () => void, saving: boolean) => void; inputMinWidth?: number }): React.JSX.Element {
@@ -13518,7 +13743,7 @@ function PickerField({ label, value, values, onSelect, disabled, labelWidth, lab
   // The row's label is the picker's name: a pane with several pickers otherwise
   // announced a column of bare values, since neither platform derived one from
   // a sibling label.
-  return <View style={[styles.formRow, compactStyles.formRow]}><Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }]}>{label}</Text><NativePicker labels={options.map((option) => option.label)} selectedValue={selectedLabel} disabled={disabled} accessibilityLabel={label} onChange={({ nativeEvent }) => { const option = options[nativeEvent.index]; if (option) onSelect(option.value); }} style={[styles.picker, compactStyles.picker, allowShrink && styles.pickerShrink, controlWidth === undefined ? null : { width: controlWidth, flex: 0 }]} />{accessory ?? null}</View>;
+  return <View style={[styles.formRow, compactStyles.formRow]}><Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }]}>{label}</Text><NativePicker labels={options.map((option) => option.label)} selectedValue={selectedLabel} disabled={disabled} accessibilityLabel={label} onChange={({ nativeEvent }) => { const option = options[nativeEvent.index]; if (option) onSelect(option.value); }} style={[styles.picker, compactStyles.picker, allowShrink && styles.pickerShrink, controlWidth === undefined ? null : { width: controlWidth, flexGrow: 0, flexShrink: 0, flexBasis: "auto" }]} />{accessory ?? null}</View>;
 }
 
 function RawEditor({ label, domain, document, language, ipc, translate, showLabel = true, showDiff = true, codexPane = false, onConflict, onDirtyChange, deferStage = false, reloadToken = 0, baselineToken = 0, syncRevision, style }: { label: string; domain: AssistantSettingsDomain; document: RawEditorDocument; language: "toml" | "json" | "yaml"; ipc: IpcClient; translate: Translate; showLabel?: boolean; showDiff?: boolean; codexPane?: boolean; onConflict: RawEditorConflictHandler; onDirtyChange?: (dirty: boolean) => void; deferStage?: boolean; reloadToken?: number; baselineToken?: number; syncRevision?: number; style?: StyleProp<ViewStyle> }): React.JSX.Element {
@@ -14325,6 +14550,13 @@ const styles = StyleSheet.create({
   windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowSurfaceShellWindows: { backgroundColor: WINDOWS_CONTROL.fill }, windowsChildModalSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, childRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, logsContent: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   // Settings window: a native source-list sidebar next to the active pane.
   settingsShellFrame: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window },
+  // A page has no window to resize.  Left to fill the viewport, every pane that
+  // shares its width grew with it, and a 1700 pt browser turned the model list
+  // into a mostly empty column between a 120 pt provider list and a 320 pt
+  // inspector.  Past the width the desktop window opens at, the frame stops
+  // growing and centres on the page: the page is one window, and this is the
+  // widest one this layout has proportions for.
+  webShellFrame: { width: "100%", maxWidth: 1280, alignSelf: "center" },
   // The window's chrome is one L: the title bar and the sidebar draw the
   // border's own colour, so the two read as a single surface whose only edges
   // are the ones the content keeps.  A header rule would cut that surface in
@@ -14412,7 +14644,12 @@ const styles = StyleSheet.create({
   // points below it, and the sections under it keep the left column's row pitch.
   providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 12 }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerListPane: { width: 120, minWidth: 120, maxWidth: 120, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 24, width: 24, minHeight: 24, height: 24, alignItems: "center", justifyContent: "center" }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, modelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 320, minWidth: 260, maxWidth: 360, flexGrow: 0, flexShrink: 1 }, providerEditorContent: { flex: 1, minHeight: 0 }, providerEditorScrollContent: { paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }, persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }, persistentScrollHost: { position: "relative", flex: 1, minHeight: 0 }, persistentScrollFill: { flex: 1, minHeight: 0 }, persistentScrollThumb: { position: "absolute", top: 2, right: 2, width: 4, borderRadius: 2, backgroundColor: "rgba(96,96,96,0.55)" }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, // A link is also a cursor: the row shows the pointing hand over the whole
 // finding, label included, exactly like every native link in the app.
-inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspectorProbeFindingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textDecorationLine: "underline" }, inspectorEnableControl: { flexShrink: 0 }, routeEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, routeEditorField: { flexGrow: 0, width: undefined }, routeFollowControl: { flexShrink: 0 }, routeFollowHelp: { marginLeft: -8, flexShrink: 0 }, modelWindowValue: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, modelWindowText: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, modelWindowLink: { flexShrink: 0 }, protocolSettings: { gap: 4 }, helpTipAnchor: { position: "relative", zIndex: 2 }, helpTipDismiss: { position: "absolute", left: -2400, right: -2400, top: -2400, bottom: -2400 }, helpTipButton: { width: 22, height: 22, minWidth: 22, minHeight: 22, marginHorizontal: -3, marginVertical: -3 }, helpTipPopupLeft: { position: "absolute", left: 0, bottom: 25, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipPopup: { position: "absolute", right: 0, bottom: 25, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspectorProbeFindingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textDecorationLine: "underline" }, inspectorEnableControl: { flexShrink: 0 }, routeEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, // The field sits *in* the row beside its switch, so it must not claim the
+  // whole of it: a TextField's own formRow is `width: "100%"`, and inheriting
+  // that pushed 跟随倍率 78 pt past the inspector's right edge, where it was
+  // clipped and could not be clicked.  Its width is its label column plus its
+  // own control column, both fixed.
+  routeEditorField: { width: "auto", flexGrow: 0, flexShrink: 0 }, routeFollowControl: { flexShrink: 0 }, routeFollowHelp: { marginLeft: -8, flexShrink: 0 }, modelWindowValue: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, modelWindowText: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, modelWindowLink: { flexShrink: 0 }, protocolSettings: { gap: 4 }, helpTipAnchor: { position: "relative", zIndex: 2 }, helpTipDismiss: { position: "absolute", left: -2400, right: -2400, top: -2400, bottom: -2400 }, helpTipButton: { width: 22, height: 22, minWidth: 22, minHeight: 22, marginHorizontal: -3, marginVertical: -3 }, helpTipPopupLeft: { position: "absolute", left: 0, bottom: 25, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipPopup: { position: "absolute", right: 0, bottom: 25, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
   externalSettingsWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, externalSettingsFieldList: { ...SETTINGS_FIELD_LIST },
   // One rail entry can carry two apps, so each app's block keeps the grid's
   // rhythm but not the grid: a title, then that app's own fields and files.
@@ -14430,7 +14667,7 @@ inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspec
   // its label column, value column and help indent line up with 运行时 and 外部.
   // Each control takes the grid's width for what it holds: the URL and the
   // filename are text, and a number of seconds keeps only its own digits.
-  webdavDialogSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, webdavDialogBody: { flex: 1, minWidth: 0, minHeight: 0 }, webdavDialogBodyContent: { padding: SETTINGS_PANE_INSET }, webdavFieldList: { ...SETTINGS_FIELD_LIST }, webdavField: { ...SETTINGS_FIELD }, webdavFieldRow: { ...SETTINGS_FIELD_ROW_INDENTED }, webdavFieldLabel: { ...SETTINGS_FIELD_LABEL }, webdavFieldSwitch: { ...SETTINGS_FIELD_SWITCH_SLOT }, webdavFieldText: { flex: 1, minWidth: 0, maxWidth: SETTINGS_FIELD_TEXT_WIDTH }, webdavFieldShort: { width: SETTINGS_FIELD_VALUE_WIDTH, flexGrow: 0, flexShrink: 0, minWidth: 0 }, webdavFieldNumber: { width: SETTINGS_FIELD_NUMBER_WIDTH, height: 26, flexGrow: 0, flexShrink: 0 }, webdavFieldPicker: { width: SETTINGS_FIELD_VALUE_WIDTH, height: 26, flexGrow: 0, flexShrink: 0 }, webdavFieldUnit: { flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, webdavFieldHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, webdavFieldHelpText: { ...SETTINGS_FIELD_HELP_TEXT },
+  webdavDialogSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, webdavDialogBody: { flex: 1, minWidth: 0, minHeight: 0 }, webdavDialogBodyContent: { padding: SETTINGS_PANE_INSET }, webdavConflictBody: { flex: 1, minWidth: 0, minHeight: 0, padding: SETTINGS_PANE_INSET, gap: 6 }, webdavConflictTabs: { alignSelf: "flex-start" }, webdavConflictEditor: { flex: 1, minWidth: 0, minHeight: 200 }, webdavConflictEmpty: { flex: 1, minWidth: 0, justifyContent: "center" }, webdavFieldList: { ...SETTINGS_FIELD_LIST }, webdavField: { ...SETTINGS_FIELD }, webdavFieldRow: { ...SETTINGS_FIELD_ROW_INDENTED }, webdavFieldLabel: { ...SETTINGS_FIELD_LABEL }, webdavFieldSwitch: { ...SETTINGS_FIELD_SWITCH_SLOT }, webdavFieldText: { flex: 1, minWidth: 0, maxWidth: SETTINGS_FIELD_TEXT_WIDTH }, webdavFieldShort: { width: SETTINGS_FIELD_VALUE_WIDTH, flexGrow: 0, flexShrink: 0, minWidth: 0 }, webdavFieldNumber: { width: SETTINGS_FIELD_NUMBER_WIDTH, height: 26, flexGrow: 0, flexShrink: 0 }, webdavFieldUnit: { flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, webdavFieldHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, webdavFieldHelpText: { ...SETTINGS_FIELD_HELP_TEXT },
   logsWindow: { flex: 1, minHeight: 0, gap: Platform.OS === "web" ? 10 : 4 },
   logsWindowMacOS: { paddingTop: 0, paddingHorizontal: 10 },
   logsToolbar: { width: "100%", minWidth: 0, minHeight: 24, height: Platform.OS === "web" ? undefined : 24, flexDirection: "row", alignItems: "center", gap: Platform.OS === "web" ? 8 : 6, flexShrink: 0, flexWrap: Platform.OS === "web" ? "wrap" : "nowrap" },

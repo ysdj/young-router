@@ -58,7 +58,7 @@ export type LanguagePreference = "system" | "en" | "zh-Hans";
  * their own structured settings; ``clients`` owns the remaining external
  * desktop client configuration files.
  */
-export type EditorDomain = "codex" | "claude" | "clients";
+export type EditorDomain = "codex" | "claude" | "clients" | "webdav";
 
 /** Documents the authenticated raw editor can open, per owning domain. */
 export type EditorDocument =
@@ -75,7 +75,9 @@ export type EditorDocument =
   | "opencode_config"
   | "opencode_auth"
   | "codex_agents"
-  | "codex_model_catalog";
+  | "codex_model_catalog"
+  | "disabled_models"
+  | "relay_accounts";
 
 /**
  * One registered external client configuration file. ``path`` is the only
@@ -466,7 +468,7 @@ export interface IpcParams {
   logs: { tab: LogTab; revision?: number };
   editor:
     | {
-      domain: "codex" | "claude" | "clients";
+      domain: "codex" | "claude" | "clients" | "webdav";
       document:
         | "config"
         | "auth"
@@ -481,7 +483,9 @@ export interface IpcParams {
         | "opencode_config"
         | "opencode_auth"
         | "codex_agents"
-        | "codex_model_catalog";
+        | "codex_model_catalog"
+        | "disabled_models"
+        | "relay_accounts";
     }
     | { editor_token: string; text: string };
   files: Record<string, never>;
@@ -502,7 +506,7 @@ export interface IpcResults {
   disk_state: { revision: number; disk: Partial<Record<ConfigDomain, DiskState>> };
   logs: { changed: boolean; revision: number; log: LogView | null };
   editor: {
-    domain: "codex" | "claude" | "clients";
+    domain: "codex" | "claude" | "clients" | "webdav";
     document:
       | "config"
       | "auth"
@@ -517,7 +521,9 @@ export interface IpcResults {
       | "opencode_config"
       | "opencode_auth"
       | "codex_agents"
-      | "codex_model_catalog";
+      | "codex_model_catalog"
+      | "disabled_models"
+      | "relay_accounts";
     editor_token: string;
     revision: number;
     text: string;

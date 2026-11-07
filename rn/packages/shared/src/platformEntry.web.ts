@@ -26,20 +26,74 @@ import { createNativeIpcTransport, createNativeLeafBridgeAdapter } from "./platf
 import { createBrowserIpcBridge, createBrowserLeafBridge, type BrowserCoreTransport } from "./platform/browserLeaf";
 import { setBrowserSecretReader, setBrowserSecretStager } from "./platform/browserSecrets";
 import { dismissChildLayer, presentChildLayer } from "./platform/childLayers";
+import { askCloseRelayGroupSheet, closeRelayGroupSheet, relayGroupSheetState, setRelayGroupSheetSurface } from "./platform/relayGroupSheet";
 import { HostChromeHost } from "./ui/HostChrome";
+import { RelayGroupSheet } from "./ui/RelayGroupSheet";
 import { registerYoungRouter } from "./bootstrap";
-import { canonicalWindowRoute, isSettingsShellRoute, ROUTES } from "./routes";
+import { canonicalWindowRoute, DESKTOP_ROUTES, isSettingsShellRoute, ROUTES } from "./routes";
 import type { AppRoute } from "./types";
+
+/**
+ * The routes this host draws as a layer rather than as the page's pane.
+ *
+ * Declared up here because the address is read before any surface is mounted:
+ * deciding whether a fragment names a surface must not depend on the order of
+ * the declarations below it.
+ */
+const CHILD_SURFACES: readonly AppRoute[] = ["provider-wizard", "file-editor", "webdav-settings"];
+
+/**
+ * The pane this host opens on when the address names none it can draw.
+ *
+ * A native host's `home` is a windowless state — the menu bar and the hidden
+ * React host — so it is not a fallback here: a page that resolved to it drew one
+ * empty frame and nothing else.  This is the pane the shared shell presents on a
+ * windowless launch, and the one a launch address opens on.
+ */
+const DEFAULT_ROUTE: AppRoute = "providers-models";
+
+/** Whether `route` names a surface this host can actually draw. */
+function isKnownRoute(route: AppRoute): boolean {
+  return (DESKTOP_ROUTES as readonly AppRoute[]).includes(route) || CHILD_SURFACES.includes(route);
+}
 
 function routeFromHash(): AppRoute {
   // The fragment is the route and nothing else: the password is typed into the
   // page, so no credential ever reached the address bar.
   const fragment = window.location.hash.replace(/^#/, "");
   const route = fragment.startsWith("/") ? fragment.slice(1) : fragment;
-  if (!route) return "home";
-  // Every route is one document here, so a carried-over route the app no
-  // longer knows must fall back rather than render an empty surface.
-  return canonicalWindowRoute(route as AppRoute) as AppRoute;
+  if (!route) return DEFAULT_ROUTE;
+  const next = canonicalWindowRoute(route as AppRoute) as AppRoute;
+  // Every route is one document here, so a fragment that names no surface must
+  // fall back to a pane that exists.  The launch address is the case that
+  // reached users: Core prints `#launch=<token>`, the sign-in page spends it and
+  // strips the fragment, but a browser that already holds a session is served
+  // the app directly — so the token became the route, and the page drew its
+  // sidebar (or nothing at all) around a pane that does not exist.  A launch is
+  // a way in, not a place.
+  if (!isKnownRoute(next)) return DEFAULT_ROUTE;
+  return next;
+}
+
+/**
+ * Write the address the page is actually drawing.
+ *
+ * A fragment that names no pane is replaced rather than left standing, so the
+ * address bar, a reload, and Back cannot describe a surface this host never
+ * showed.  `currentRoute` is written first by `navigate`, so the hash change
+ * this causes arrives already equal and is ignored.
+ */
+function adoptRouteAddress(): void {
+  const fragment = window.location.hash.replace(/^#/, "");
+  const route = (fragment.startsWith("/") ? fragment.slice(1) : fragment) as AppRoute;
+  if (route && isKnownRoute(canonicalWindowRoute(route) as AppRoute)) return;
+  const address = new URL(window.location.href);
+  // Only the fragment moves: the path keeps whatever spelling served this
+  // document (`/ui/` carries a trailing slash for a reason -- the script is
+  // named relatively, and `/ui` would resolve `./bundle.js` against the proxy's
+  // root).
+  address.hash = `#/${DEFAULT_ROUTE}`;
+  window.history.replaceState(null, "", address.toString());
 }
 
 // Same origin: this page came from the listener that answers `/ipc`, and Core
@@ -54,6 +108,7 @@ const language = resolveLanguage("system", systemLocale);
 
 // One document per window, so a route is the address rather than a window
 // registry: opening a second tab is `window.open` and coming back is history.
+adoptRouteAddress();
 let currentRoute = routeFromHash();
 
 /**
@@ -218,9 +273,6 @@ function presentRoute(route: AppRoute): void {
   root.render(application.element);
 }
 
-/** The routes this host draws as a layer rather than as the page's pane. */
-const CHILD_SURFACES: readonly AppRoute[] = ["provider-wizard", "file-editor", "webdav-settings"];
-
 /**
  * Adopt an address this page did not write.
  *
@@ -233,6 +285,10 @@ const CHILD_SURFACES: readonly AppRoute[] = ["provider-wizard", "file-editor", "
  */
 function adoptAddress(): void {
   const next = routeFromHash();
+  // A typed fragment that names no surface falls back to the app's own pane,
+  // so the address must stop claiming to be one: otherwise the page draws that
+  // pane under an address that names another, and a reload repeats it.
+  adoptRouteAddress();
   if (next === currentRoute) return;
   currentRoute = next;
   if (CHILD_SURFACES.includes(next)) {
@@ -264,3 +320,58 @@ if (CHILD_SURFACES.includes(currentRoute)) {
 // dialog replace the pane it was asked from.
 const chromeRoot = document.getElementById("host-chrome");
 if (chromeRoot) createRoot(chromeRoot).render(React.createElement(HostChromeHost));
+
+/**
+ * 分组管理's sheet, in this page.
+ *
+ * A native host gives this sheet its own window; a page draws it as one more
+ * layer, mounted from its own React root for the same reason every child layer
+ * is: sharing the app's root would replace the pane it was opened from.  The
+ * state it reads is `platform/relayGroupSheet`'s, which is the same four calls
+ * the native sheet implements, so the pane's 分组 button needs no branch for
+ * this host.
+ */
+function groupSheetTranslate(): ReturnType<typeof createTranslator> {
+  return createTranslator(ipc.latestSnapshot()?.language ?? "system", systemLocale);
+}
+
+setRelayGroupSheetSurface({
+  present: () => {
+    const state = relayGroupSheetState();
+    if (state === undefined) return;
+    const chrome = groupSheetTranslate();
+    presentChildLayer({
+      route: "relay-group-sheet",
+      // The pane's own title for the surface, which is the words a native host
+      // puts on the window's title bar.
+      title: state.title,
+      closeLabel: chrome("status.close"),
+      // Wide enough for the key list and its detail column side by side, which
+      // is the shape this sheet is: a list plus the selected key's facts.
+      size: { width: 600, height: 460 },
+      // Its own Close asks before it drops a draft.  Only the sheet knows
+      // whether its fields hold one, so the question belongs there and the
+      // title bar's × and Escape both come through it.
+      requestClose: askCloseRelayGroupSheet,
+      mount: (container) => {
+        const body = document.createElement("div");
+        body.style.cssText = "flex:1;min-height:0;display:flex;overflow:hidden";
+        container.append(body);
+        const sheetRoot = createRoot(body);
+        sheetRoot.render(React.createElement(RelayGroupSheet, {
+          translate: chrome,
+          // The key is copied through Core's one-shot lease and stops at the
+          // clipboard: no value ever enters this tree.
+          copyKey: (accountId: string, keyID: string) => native.copySecret({
+            domain: "relay_accounts",
+            field: "api_key",
+            target: `${accountId}:${keyID}`,
+          }),
+        }));
+        return () => sheetRoot.unmount();
+      },
+      onDismiss: () => { closeRelayGroupSheet(); },
+    });
+  },
+  dismiss: () => { dismissChildLayer("relay-group-sheet"); },
+});

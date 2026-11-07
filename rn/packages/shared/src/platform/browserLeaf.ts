@@ -29,6 +29,12 @@ import type { NativeIpcBridge, NativeLeafBridge } from "./nativeBridge";
 import { isSettingsShellRoute } from "../routes";
 import { pushPresentation } from "./presentationStack";
 import { requestHostChrome } from "./hostChrome";
+import {
+  finishRelayGroupApply,
+  openRelayGroupSheet,
+  takeRelayGroupApply,
+  updateRelayGroupSheet,
+} from "./relayGroupSheet";
 
 /** One JSON-over-HTTP exchange with the local Core. */
 export type BrowserCoreTransport = {
@@ -258,6 +264,17 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
   return { send, subscribe: sharedSubscribe, hostRoute, request };
 }
 
+/** The service state in the app's words, as the title bar states it. */
+function serviceStateWord(strings: NativeLocalization | undefined, state: ServiceStatus["state"]): string {
+  switch (state) {
+    case "starting": return strings?.serviceStarting || "Starting";
+    case "running": return strings?.serviceRunning || "Running";
+    case "unhealthy": return strings?.serviceUnhealthy || "Unhealthy";
+    case "stopped": return strings?.serviceStopped || "Stopped";
+    default: return strings?.serviceUnknown || "Unknown";
+  }
+}
+
 export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
   /** The route this document is showing. */
   initialRoute: AppRoute;
@@ -424,7 +441,11 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
     // No geometry control: the page is the browser's to size.
     setMenuBarStatus: (status) => {
       routeStatus = status;
-      document.title = `${strings?.appTitle ?? "Young Router"}: ${status.state}`;
+      // Core states the service as `running`; a tab that reads the wire's own
+      // spelling beside a Chinese title was the one place in this host that
+      // spoke the protocol instead of the app.  The words are the localization
+      // table's, which is what the native hosts put in their status menu.
+      document.title = `${strings?.appTitle ?? "Young Router"}: ${serviceStateWord(strings, status.state)}`;
     },
     setMenuBarActions: (actions) => { menuActions = actions; },
     setTrayStatus: (status) => { routeStatus = status; },
@@ -549,6 +570,15 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
         return false;
       }
     },
+    // 分组管理 is a layer here instead of a window: the four calls below are the
+    // same contract the native sheets implement, and `platform/relayGroupSheet`
+    // is where their state lives.  A page that answered these with undefined
+    // (as this host used to) could only disable 分组, and it looked like a dead
+    // button rather than a surface this host cannot draw.
+    showGroupManager: (options) => openRelayGroupSheet(options),
+    awaitGroupManagerApply: () => takeRelayGroupApply(),
+    finishGroupManagerApply: async (options) => { finishRelayGroupApply(options); },
+    updateGroupManager: async (snapshot) => updateRelayGroupSheet(snapshot),
     relayLogin: async (options) => {
       // A page has no authenticated browser to put the station's login form in,
       // and a cookie minted in another tab is unreadable here. What a page can
@@ -596,9 +626,16 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
     openRelayDashboard: async (options) => { window.open(options.origin, "_blank", "noopener"); },
     clearRelayPassword: async () => undefined,
     clearRelayCredentials: async () => undefined,
-    // No `setLaunchAtLogin`: a page cannot register a login item, so the
-    // general pane states that instead of offering a switch that would answer
-    // `saved` while the system never heard of it.
+    // 开机自启动 on this host.  The desktop apps register their own login item
+    // in their own process; a page has none, but the Core behind it is that
+    // app's Core on the same machine, so it writes the OS's login item and
+    // answers whether it could.  A Core from a working tree has no installed
+    // app to point at and answers `registered: false`, which the pane reads as
+    // a failed save and hands the preference back.
+    setLaunchAtLogin: async (enabled) => {
+      const answer = await core.hostRoute("/ipc/host/autostart", { enabled }).catch(() => undefined);
+      if (answer?.registered !== true) throw new Error("The login item could not be updated");
+    },
     versionInfo: async () => ({ app: "web", litellm: "" }),
     openExternalURL: (url) => { window.open(url, "_blank", "noopener"); },
     setLocalization: (next) => { strings = next; },

@@ -306,6 +306,16 @@ type SplitViewProps = {
 };
 
 
+// The glyph face is Windows' own symbol font, which exists on Windows and
+// nowhere else.  A browser was asked for it anyway, and a font that does not
+// exist does not fall back to the page's face for a symbol: every icon button
+// in the web page was measured with a substituted font, so `+` and `−` sat a
+// pixel off their labels and the toolbar buttons beside them had three
+// different heights.  The web page draws Unicode glyphs instead
+// (`WEB_BUTTON_GLYPHS`), and a Unicode glyph belongs to the page's own text
+// face.
+const GLYPH_FONT_FAMILY = Platform.OS === "web" ? undefined : "Segoe MDL2 Assets";
+
 // The WinUI button's symbols were Segoe Fluent Icons glyphs. Keep the same
 // glyphs on the React Native leaf so an icon button does not become a word.
 const WINDOWS_BUTTON_GLYPHS: Record<NonNullable<ButtonProps["symbol"]>, string> = {
@@ -749,6 +759,56 @@ function sameTableRow(previous: { row: TableRow; index: number; columns: TableCo
     && sameColumns(previous.columns, next.columns);
 }
 
+/**
+ * The header's trailing gutter, dragged to set a column's width.
+ *
+ * It is 6 pt of hover target — the width of the gutter it lives in — so it
+ * never covers the header's own text, and it draws nothing at rest: a table
+ * that showed a grip beside every heading would read as a table that is always
+ * mid-edit.  The floor is the column's own starting width, not 0: a column
+ * dragged to nothing is a column that has been lost, and the header is where it
+ * would have been found.
+ */
+const RESIZE_CURSOR: ViewStyle = { cursor: "col-resize" } as unknown as ViewStyle;
+
+// `View`'s generated TypeScript face omits the hover events its implementation
+// declares: the page forwards `onMouseEnter`/`onMouseLeave`, and a leaf reports
+// `onHoverIn`/`onHoverOut`.  The handle asks for whichever its platform has.
+type HoverableViewProps = React.ComponentProps<typeof View> & {
+  onHoverIn?: () => void;
+  onHoverOut?: () => void;
+  onMouseEnter?: () => void;
+  onMouseLeave?: () => void;
+};
+const HoverableView = View as unknown as React.ComponentType<HoverableViewProps>;
+
+function ColumnResizeHandle({ label, width, onResize }: { label: string; width: number; onResize: (width: number) => void }): React.JSX.Element {
+  const [hovered, setHovered] = React.useState(false);
+  const start = React.useRef({ x: 0, width });
+  const current = React.useRef(width);
+  current.current = width;
+  return <HoverableView
+    onStartShouldSetResponder={() => true}
+    onResponderTerminationRequest={() => false}
+    // No other view is the responder, so this one is granted by `start` rather
+    // than by a `grant` handoff: the origin of the drag is read here.
+    onResponderStart={(event) => { start.current = { x: event.nativeEvent.pageX, width: current.current }; }}
+    onResponderMove={(event) => onResize(Math.max(24, Math.round(start.current.width + event.nativeEvent.pageX - start.current.x)))}
+    // A leaf view reports hover through `onHoverIn`; a browser <div> has no
+    // such event and only forwards the pointer ones, so the page asks for
+    // those and the hosts keep the pair they know.
+    onHoverIn={Platform.OS === "web" ? undefined : () => setHovered(true)}
+    onHoverOut={Platform.OS === "web" ? undefined : () => setHovered(false)}
+    onMouseEnter={Platform.OS === "web" ? () => setHovered(true) : undefined}
+    onMouseLeave={Platform.OS === "web" ? () => setHovered(false) : undefined}
+    role="separator"
+    accessibilityLabel={label}
+    // `cursor` is a browser style: a Windows leaf draws its own resize cursor
+    // and warns about a property it does not model, so only the page asks.
+    style={[windowsTableStyles.resizeHandle, Platform.OS === "web" ? RESIZE_CURSOR : null, hovered && windowsTableStyles.resizeHandleHovered]}
+  />;
+}
+
 // One row height for the row itself, the accent pill beside it, and the
 // virtualised offsets: three copies of `compact ? 30 : 36` were free to drift.
 function windowsRowHeight(compact: boolean): number {
@@ -773,6 +833,8 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   secondaryCellKeys,
   detail,
   selectableSpanning,
+  cellPadding,
+  firstColumnPadding,
   onSelect,
 }: {
   row: TableRow;
@@ -793,6 +855,10 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   /** The row's own second line, printed small under its text. */
   detail?: string;
   selectableSpanning: boolean;
+  /** This table's own horizontal cell inset, the same number its header uses. */
+  cellPadding: number;
+  /** The first column's inset: a source list starts its rows at the pane edge. */
+  firstColumnPadding: number;
   onSelect: (row: TableRow, index: number) => void;
 }): React.JSX.Element {
   const spanning = row.spanning === true;
@@ -805,7 +871,14 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   // the source list and the settings rail included.  The label joins every
   // cell there is, because a row's meaning is its cells taken together, and a
   // spanning group row is a heading rather than a choice.
-  const rowLabel = row.cells.filter((cell) => cell.length > 0).join(", ");
+  // A leading tab is a layout mark, not text: it is how a row says "this cell
+  // starts where its neighbour's symbol would have".  The cell itself drops it
+  // before drawing, and the name a screen reader reads has to drop it too —
+  // otherwise every model row is announced with a tab in the middle of it.
+  const rowLabel = row.cells
+    .map((cell) => cell.replace(/^\t/u, ""))
+    .filter((cell) => cell.length > 0)
+    .join(", ");
   const rowStyle = [
     windowsTableStyles.row,
     { height: rowHeight },
@@ -827,6 +900,13 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
     accessibilityRole={spanning ? "header" : "button"}
     accessibilityLabel={rowLabel}
     accessibilityState={spanning ? { disabled: disabled || !selectableSpanning } : { selected, disabled }}
+    // React Native for Web drops `accessibilityState` and reads the aria
+    // attributes themselves, so a row that only stated its selection that way
+    // was announced as an unselected, enabled button on every page: the
+    // sidebar's current pane, the selected provider and a switched-off entry
+    // all read alike.  The hosts keep the state they do honour.
+    aria-selected={spanning ? undefined : selected}
+    aria-disabled={spanning ? (disabled || !selectableSpanning) || undefined : disabled || undefined}
     style={rowStyle}
   >
     {sourceList && selected ? <View style={[windowsTableStyles.sourceSelectionIndicator, { top: rowHeight / 2 - 8 }]} /> : null}
@@ -836,14 +916,22 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
         const cellKey = `${row.key}\x1f${columnIndex}`;
         const secondary = secondaryCellKeys.has(cellKey);
         const cellColor = secondary ? WINDOWS_CONTROL.textSecondary : textColor;
-        const visibleCell = cell.replace(/^\t/u, "");
+        // A leading tab is the layout's own statement that this cell is a
+        // child of the group row above it, not a character to print.  Dropping
+        // the mark and keeping the column's inset was what put a model at the
+        // list's left edge while the key that owns it sat 12 pt in: the
+        // hierarchy read upside down.  The mark now adds the indent it stands
+        // for, on both fallback hosts.
+        const marked = cell.startsWith("\t");
+        const visibleCell = marked ? cell.slice(1) : cell;
+        const inset = tableColumnInset(columnIndex === 0 ? firstColumnPadding : cellPadding) + (marked ? TABLE_CELL_MARK_INDENT : 0);
         const sourceImage = rowImageName ? windowsSourceImage(rowImageName) : undefined;
         if (columnIndex === 0 && sourceList) {
           // A source list never scrolls sideways: the row has to fit the pane it
           // navigates.  A fixed column width here (plus the cell and row insets)
           // overflowed the sidebar, and that overflow was scrollable, so the
           // whole column slid by a different amount on every selection.
-          return <View key={`${row.key}:${columnIndex}`} style={[windowsTableStyles.cellView, sourceList ? windowsTableStyles.sourceCellViewFlex : { width: column.width }]}>
+          return <View key={`${row.key}:${columnIndex}`} style={[windowsTableStyles.cellView, sourceList ? windowsTableStyles.sourceCellViewFlex : { width: column.width, paddingHorizontal: inset }]}>
             {/* A source list's tile is the same bundled PNG on every host.
                 What must not happen on the web is the glyph fallback below: a
                 browser has no "Segoe MDL2 Assets", so a glyph character renders
@@ -858,13 +946,13 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
             </View>
           </View>;
         }
-        return <Text key={`${row.key}:${columnIndex}`} numberOfLines={1} style={[windowsTableStyles.cell, { width: column.width, color: cellColor }]}>{visibleCell}</Text>;
+        return <Text key={`${row.key}:${columnIndex}`} numberOfLines={1} style={[windowsTableStyles.cell, { width: column.width, paddingHorizontal: inset, color: cellColor }]}>{visibleCell}</Text>;
       })}
     </View>}
   </Pressable>;
 }, sameTableRow);
 
-function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, followBottom, scrollToRow, framed, sourceList, rowSymbols, rowSymbolColors, rowImageNames, disabledRowKeys, secondaryRowKeys, secondaryCellKeys, rowDetails, selectableSpanningKeys, onSelectionChange, onRowDoublePress, style, alertRowKeys }: {
+function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, followBottom, scrollToRow, framed, sourceList, rowSymbols, rowSymbolColors, rowImageNames, disabledRowKeys, secondaryRowKeys, secondaryCellKeys, rowDetails, selectableSpanningKeys, cellHorizontalPadding, firstColumnHorizontalPadding, onSelectionChange, onRowDoublePress, style, alertRowKeys }: {
   columns: TableProps["columns"];
   rows: TableProps["rows"];
   selectedKey: string;
@@ -882,6 +970,8 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   secondaryCellKeys: string[];
   rowDetails: string[];
   selectableSpanningKeys: Set<string>;
+  cellHorizontalPadding: number;
+  firstColumnHorizontalPadding: number;
   onSelectionChange?: (key: string, index: number) => void;
   onRowDoublePress?: (key: string, index: number) => void;
   style?: StyleProp<ViewStyle>;
@@ -894,7 +984,26 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   // every row grew with it.
   const twoLine = rowDetails.some((detail) => detail.length > 0);
   const rowHeight = windowsRowHeight(compact) + (twoLine ? 14 : 0);
-  const totalWidth = columns.reduce((sum, column) => sum + column.width, 0);
+  // Column widths a user dragged.  The macOS table lets a column be resized and
+  // the browser table did not at all, so a long 密钥名 could only be read by
+  // widening the whole window.  The drag is the one table behaviour that has to
+  // be the same on both hosts, so it is kept here as a per-column override on
+  // top of the caller's own widths: a table whose columns change (another
+  // provider selected, another public model expanded) drops the overrides,
+  // because a width dragged for one shape of table means nothing in another.
+  const [draggedWidths, setDraggedWidths] = React.useState<Record<string, number>>({});
+  const columnLabels = React.useMemo(() => columns.map((column) => column.label).join("\u001f"), [columns]);
+  const dragShape = React.useRef(columnLabels);
+  React.useEffect(() => {
+    if (dragShape.current === columnLabels) return;
+    dragShape.current = columnLabels;
+    setDraggedWidths({});
+  }, [columnLabels]);
+  const laidOutColumns = React.useMemo(
+    () => columns.map((column) => (draggedWidths[column.label] === undefined ? column : { ...column, width: draggedWidths[column.label] })),
+    [columns, draggedWidths],
+  );
+  const totalWidth = laidOutColumns.reduce((sum, column) => sum + column.width, 0);
   // Built once per prop change instead of once per mounted row per cell: a
   // log that appends 20 entries a second otherwise rebuilt the same lookups
   // for every visible row on every frame.
@@ -933,7 +1042,7 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
     row={item}
     index={index}
     rowHeight={rowHeight}
-    columns={columns}
+    columns={laidOutColumns}
     compact={compact}
     sourceList={sourceList}
     stripedRows={stripedRows}
@@ -947,12 +1056,24 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
     secondaryCellKeys={secondaryKeys}
     detail={rowDetails[index] || undefined}
     selectableSpanning={selectableSpanningKeys.has(item.key)}
+    cellPadding={cellHorizontalPadding}
+    firstColumnPadding={firstColumnHorizontalPadding}
     onSelect={select}
-  />, [alertKeys, columns, compact, disabledKeys, rowDetails, rowImageNames, rowSymbols, rowSymbolColors, secondaryKeys, secondaryRowKeysSet, selectableSpanningKeys, select, selectedKey, sourceList, stripedRows]);
+  />, [alertKeys, cellHorizontalPadding, laidOutColumns, compact, disabledKeys, firstColumnHorizontalPadding, rowDetails, rowImageNames, rowSymbols, rowSymbolColors, secondaryKeys, secondaryRowKeysSet, selectableSpanningKeys, select, selectedKey, sourceList, stripedRows]);
   const keyExtractor = React.useCallback((row: TableRow): string => row.key, []);
   const body = <View style={[windowsTableStyles.horizontalBody, !sourceList && { minWidth: totalWidth }]}>
     {!sourceList ? <View style={[windowsTableStyles.header, { minWidth: totalWidth }]}>
-      {columns.map((column) => <Text key={column.label} numberOfLines={1} style={[windowsTableStyles.headerText, { width: column.width }]}>{column.label}</Text>)}
+      {/* A header cell is inset by the same number its column's cells are, and
+          only by that number: the header row used to add its own 8 on top of
+          this, so every header sat 8 pt to the right of the text under it and
+          a table whose first column has no leading inset began its headings in
+          the wrong place.  The inset lives on a cell wrapper rather than on the
+          Text so the drag handle can sit on the cell's trailing edge, in the
+          gutter between this column and the next. */}
+      {laidOutColumns.map((column, columnIndex) => <View key={column.label} style={[windowsTableStyles.headerCell, { width: column.width, paddingLeft: tableColumnInset(columnIndex === 0 ? firstColumnHorizontalPadding : cellHorizontalPadding) }]}>
+        <Text numberOfLines={1} style={windowsTableStyles.headerText}>{column.label}</Text>
+        <ColumnResizeHandle label={column.label} width={column.width} onResize={(width) => setDraggedWidths((current) => ({ ...current, [column.label]: width }))} />
+      </View>)}
     </View> : null}
     <FlatList
       ref={verticalList}
@@ -1031,11 +1152,41 @@ export const WINDOWS_CONTROL = {
   sourceRowHeight: 36,
 } as const;
 
+/**
+ * The smallest inset a table column gets, on every host.
+ *
+ * The AppKit table has always clamped both paddings to 8 (`LiteLLMTableMinimumHorizontalPadding`),
+ * so a pane that asked for 0 on macOS still put 8 pt between the frame and the
+ * first character.  The two fallback hosts took the request literally, and the
+ * model list — whose first column is declared with a 0 inset — began its text
+ * on the frame's own stroke.  The clamp lives here so the three hosts agree on
+ * one number instead of on one author's intent.
+ */
+const TABLE_MIN_HORIZONTAL_PADDING = 8;
+/**
+ * The indent a leading `\t` mark stands for, in a cell that has one.
+ *
+ * The mark says "this row is filed under the group above it".  AppKit prints
+ * the character itself and the tab stop indents it; the fallback hosts dropped
+ * it, which left the child of a group at the left edge and the group heading
+ * indented — the hierarchy upside down.
+ */
+const TABLE_CELL_MARK_INDENT = 12;
+
+function tableColumnInset(requested: number): number {
+  return Math.max(TABLE_MIN_HORIZONTAL_PADDING, requested);
+}
+
 const windowsTableStyles = StyleSheet.create({
   root: { minHeight: 120, overflow: "hidden", borderWidth: 1, borderColor: WINDOWS_CONTROL.stroke, borderRadius: WINDOWS_CONTROL.radius, backgroundColor: WINDOWS_CONTROL.fill },
   borderless: { borderWidth: 0, borderRadius: 0, backgroundColor: "transparent" },
-  header: { flexDirection: "row", alignItems: "center", minHeight: 30, paddingHorizontal: 8, backgroundColor: WINDOWS_CONTROL.fillSubtle, borderBottomWidth: 1, borderBottomColor: WINDOWS_CONTROL.strokeSubtle },
-  headerText: { paddingHorizontal: 8, color: WINDOWS_CONTROL.textSecondary, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
+  header: { flexDirection: "row", alignItems: "center", minHeight: 30, backgroundColor: WINDOWS_CONTROL.fillSubtle, borderBottomWidth: 1, borderBottomColor: WINDOWS_CONTROL.strokeSubtle },
+  headerCell: { flexDirection: "row", alignItems: "center", height: "100%" },
+  headerText: { flexShrink: 1, color: WINDOWS_CONTROL.textSecondary, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
+  // The drag target is the gutter itself: 6 pt wide, full height of the header,
+  // and invisible until the pointer is over it.
+  resizeHandle: { width: 6, alignSelf: "stretch" },
+  resizeHandleHovered: { backgroundColor: WINDOWS_CONTROL.stroke },
   horizontalScroll: { flex: 1, minHeight: 0 },
   horizontalContent: { flexGrow: 1, minHeight: 0 },
   horizontalBody: { flex: 1, minHeight: 0 },
@@ -1054,16 +1205,19 @@ const windowsTableStyles = StyleSheet.create({
   rowStripe: { backgroundColor: WINDOWS_CONTROL.fillSubtle },
   rowSelected: { backgroundColor: WINDOWS_CONTROL.accentSubtle, borderLeftWidth: 3, borderLeftColor: WINDOWS_CONTROL.accent },
   rowDisabled: { opacity: 0.72 },
-  cells: { flexDirection: "row", alignItems: "center", paddingHorizontal: 8 },
+  // The cells row adds no inset of its own: a cell's inset is the table's
+    // `cellHorizontalPadding`, applied per column below, and a container that
+    // also padded pushed every cell (and the header above it) off by 8.
+  cells: { flexDirection: "row", alignItems: "center" },
   sourceCellTextColumn: { flex: 1, minWidth: 0, justifyContent: "center" },
   sourceCellDetail: { color: WINDOWS_CONTROL.textSecondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14 },
-  cellView: { flexDirection: "row", alignItems: "center", paddingHorizontal: 8, minWidth: 0 },
+  cellView: { flexDirection: "row", alignItems: "center", minWidth: 0 },
   sourceCellViewFlex: { flex: 1, minWidth: 0 },
   cellText: { flexShrink: 1, minWidth: 0, fontSize: UI_FONT_SIZE },
-  cell: { paddingHorizontal: 8, color: WINDOWS_CONTROL.text, fontSize: UI_FONT_SIZE },
+  cell: { color: WINDOWS_CONTROL.text, fontSize: UI_FONT_SIZE },
   sourceCell: { flexDirection: "row", alignItems: "center" },
   sourceImage: { width: 20, height: 20, marginRight: 8, borderRadius: 4 },
-  symbol: { width: 20, height: 20, marginRight: 8, fontFamily: "Segoe MDL2 Assets", fontSize: 16, lineHeight: 20, textAlign: "center", transform: [{ translateY: 1 }] },
+  symbol: { width: 20, height: 20, marginRight: 8, fontFamily: GLYPH_FONT_FAMILY, fontSize: 16, lineHeight: 20, textAlign: "center", transform: [{ translateY: 1 }] },
   groupText: { paddingHorizontal: 12, color: WINDOWS_CONTROL.textSecondary, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
 });
 
@@ -1093,7 +1247,13 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
     // one-line-per-row list that drops every column this app reads.  The
     // Windows leaf is already a virtualized React table, so the browser host
     // gets the same rows, columns, stripes and selection instead of a stub.
-    return <WindowsTable columns={columns} rows={rows} selectedKey={selectedKey} stripedRows={stripedRows} compact={compact} followBottom={followBottom} scrollToRow={scrollToRow} framed={framed} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} rowImageNames={rowImageNames} disabledRowKeys={disabledRowKeys} secondaryRowKeys={secondaryRowKeys} secondaryCellKeys={secondaryCellKeys} rowDetails={rowDetails} selectableSpanningKeys={selectableSpanningKeys} onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} alertRowKeys={alertRowKeys} style={[styles.table, style]} />;
+    return <WindowsTable columns={columns} rows={rows} selectedKey={selectedKey} stripedRows={stripedRows} compact={compact} followBottom={followBottom} scrollToRow={scrollToRow} framed={framed} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} rowImageNames={rowImageNames} disabledRowKeys={disabledRowKeys} secondaryRowKeys={secondaryRowKeys} secondaryCellKeys={secondaryCellKeys} rowDetails={rowDetails} selectableSpanningKeys={selectableSpanningKeys}
+      // A caller that names its own inset expects it on the web too: these two
+      // reached only the macOS table, so a list that asked for 6 or 0 was drawn
+      // at this table's fixed 8 and its header 16 — the pane's own alignment
+      // was a value the browser silently ignored.
+      cellHorizontalPadding={cellHorizontalPadding} firstColumnHorizontalPadding={firstColumnHorizontalPadding}
+      onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} alertRowKeys={alertRowKeys} style={[styles.table, style]} />;
   }
   // The macOS bridge props are built per render, and the list above them can be
   // thousands of rows: building them before the platform branch made a Windows
@@ -1337,7 +1497,7 @@ const styles = StyleSheet.create({
   windowsButtonPrimary: { borderColor: WINDOWS_CONTROL.accent, backgroundColor: WINDOWS_CONTROL.accent },
   windowsButtonDestructive: { borderColor: WINDOWS_CONTROL.danger, backgroundColor: WINDOWS_CONTROL.danger },
   windowsButtonDisabled: { opacity: 0.55 },
-  windowsButtonGlyph: { fontFamily: "Segoe MDL2 Assets", fontSize: UI_FONT_SIZE, lineHeight: 16 },
+  windowsButtonGlyph: { fontFamily: GLYPH_FONT_FAMILY, fontSize: UI_FONT_SIZE, lineHeight: 16 },
   windowsButtonTitle: { fontSize: UI_FONT_SIZE, flexShrink: 1 },
   windowsButtonLinkTitle: { textDecorationLine: "underline" },
   windowsButtonPlainLinkTitle: { textDecorationLine: "underline", fontWeight: "400" },
