@@ -3695,8 +3695,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("assistantSettingOptions(values, optionTranslator)", self.ui)
         self.assertIn('titleKey: "clients.codex"', self.ui)
         self.assertIn('{ client: "claude", titleKey: "clients.claude"', self.ui)
-        self.assertIn('{ app: "claudeCode", titleKey: "claude.codeSection" }', self.ui)
-        self.assertIn('{ app: "claudeDesktop", titleKey: "claude.desktopSection" }', self.ui)
+        # One Claude section: the terminal and the desktop Code tab read one
+        # settings document, so the pane does not draw the same client twice.
+        self.assertNotIn('titleKey: "claude.codeSection"', self.ui)
+        self.assertNotIn('titleKey: "claude.desktopSection"', self.ui)
+        self.assertIn("const claudeApps:", self.ui)
+        self.assertIn('models={claudeModels}', self.ui)
         # The external settings pane lists client files instead of structured
         # Codex/Claude fields, so it localizes display metadata only.
         self.assertNotIn("localizeCodexValidationMessage(message, translate)", self.ui)
@@ -4376,16 +4380,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # Claude documents are now file rows in the shared listing; the pane
         # never renders a structured Claude form or invents a saved default.
         for marker in (
-            # One Claude entry, two apps inside it: the rail no longer offers
-            # the same product twice, and the detail lists each app's files
-            # under its own title.
+            # One Claude entry in the rail and one set of controls in the
+            # detail: the terminal and the desktop Code tab read the same
+            # settings document, so a second block only restated the first.
             '{ client: "claude", titleKey: "clients.claude"',
-            '{ app: "claudeCode", titleKey: "claude.codeSection" }',
-            '{ app: "claudeDesktop", titleKey: "claude.desktopSection" }',
             'hintKey: "clients.claudeFilesHint"',
-            # Each app's files sit under that app's own controls, so one
-            # heading covers a block instead of a word repeated above it.
-            'const listed = clientFiles("claude").filter((file) => file.app === app);',
+            "const claudeApps:",
+            "const claudeLocalApiActive = claudeApps.every(",
+            'for (const { app } of claudeApps) await onClaudeUseLocalApi(app, selection);',
+            # Every Claude app's files under those controls.
+            'files={claudeFiles}',
             "function FileEditorWorkspace",
             'language={target.language === "yaml" ? "yaml" : target.language === "toml" ? "toml" : "json"}',
         ):

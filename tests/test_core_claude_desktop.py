@@ -334,30 +334,44 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 # The switch means "this list, alone": a lineup that only adds
                 # rows would leave Claude's own models beside the router's.
                 self.assertTrue(picker["replaceBuiltInOptions"])
+                # One id space: the picker names the alias both Claude apps
+                # send, so the desktop Code tab and the terminal select the
+                # same model.
                 self.assertEqual(
-                    [{"model": "public-a"}, {"model": "public-b"}],
+                    [
+                        {"model": alias_claude_desktop("public-a")},
+                        {"model": alias_claude_desktop("public-b")},
+                    ],
                     picker["options"],
                 )
+
+                # The pass that just wrote this list finds nothing to do: an
+                # ids-are-aliases list compared against public names would look
+                # different on every pass and rewrite the file each second.
+                self.assertFalse(domain.refresh_model_lists())
 
                 # A new public list reaches the file on the next refresh.
                 with mock.patch.object(domain, "_public_models", return_value=["public-b", "public-c"]):
                     self.assertTrue(domain.refresh_model_lists())
-                self.assertIn("public-c", domain.raw_text(include_sensitive=True))
+                    self.assertIn(alias_claude_desktop("public-c"), domain.raw_text(include_sensitive=True))
+                    # ...and then settles again.
+                    self.assertFalse(domain.refresh_model_lists())
 
                 # An observation that is merely empty is not a change.
                 with mock.patch.object(domain, "_public_models", return_value=None):
                     self.assertFalse(domain.refresh_model_lists())
-                self.assertIn("public-c", domain.raw_text(include_sensitive=True))
+                self.assertIn(alias_claude_desktop("public-c"), domain.raw_text(include_sensitive=True))
 
                 disabled = domain.dispatch("claude.models.set", {"client": "claudeCode", "enabled": False})
                 self.assertFalse(disabled["clients"]["claudeCode"]["model_list_enabled"])
                 self.assertNotIn("modelPicker", json.loads(domain.raw_text(include_sensitive=True)))
 
-    def test_claude_code_picker_keeps_public_ids_and_learns_context(self) -> None:
-        # Claude Code's modelPicker accepts the public gateway id directly, so
-        # this path needs none of Claude Desktop's aliases.  behavesAs lends
-        # the row a known model's context/effort; without it every route falls
-        # back to the client's 200k default.
+    def test_claude_code_picker_names_the_id_both_claude_apps_send(self) -> None:
+        # Claude Code's modelPicker and Claude Desktop's Code tab are one client
+        # with one settings file, and the desktop side sends the derived alias.
+        # A picker keyed by the public name would describe a model that session
+        # never asks for, and every context setting would be written twice --
+        # once per spelling -- with only one of them reaching the session.
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             desktop_root = root / "configLibrary"
@@ -383,40 +397,36 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
 
             picker = json.loads(domain.raw_text(include_sensitive=True))["modelPicker"]
             self.assertTrue(picker["replaceBuiltInOptions"])
-            # The public rows are the CLI's no-alias list; the extra bridge
-            # row is what the Desktop Code tab's alias launches with.
-            self.assertEqual(public + ["claude-mythos-dedfef"], [row["model"] for row in picker["options"]])
-            by_name = {row["model"]: row for row in picker["options"]}
+            # One row per route: no second row for the desktop spelling.
             self.assertEqual(
-                {
-                    "model": "claude-mythos-dedfef",
-                    "label": "gpt-6.1-sol (Desktop)",
-                    "description": "\u200b",
-                    "behavesAs": "claude-opus-5-5",
-                },
-                by_name["claude-mythos-dedfef"],
+                ["claude-opus-5-5", "claude-mythos-319034", "claude-mythos-dedfef"],
+                [row["model"] for row in picker["options"]],
             )
+            by_id = {row["model"]: row for row in picker["options"]}
+            gemini = by_id["claude-mythos-319034"]
             self.assertEqual(
                 {
-                    "model": "gemini-3.8-flash",
+                    "model": "claude-mythos-319034",
                     "description": "\u200b",
                     "label": "gemini-3.8-flash",
                     "behavesAs": "claude-opus-5-5",
                 },
-                by_name["gemini-3.8-flash"],
+                gemini,
             )
             # A 500k route gets the 1M behavior model; the exact 500k comes
             # from its per-model autoCompactWindow below.
-            self.assertEqual("claude-opus-5-5", by_name["gpt-6.1-sol"]["behavesAs"])
+            self.assertEqual("claude-opus-5-5", by_id["claude-mythos-dedfef"]["behavesAs"])
+            self.assertEqual("gpt-6.1-sol", by_id["claude-mythos-dedfef"]["label"])
             # A real Claude id is already in the client's catalog and needs no
             # substitute; the client keeps its own friendly label for it.
-            self.assertEqual({"model": "claude-opus-5-5", "description": "\u200b"}, by_name["claude-opus-5-5"])
+            self.assertEqual({"model": "claude-opus-5-5", "description": "\u200b"}, by_id["claude-opus-5-5"])
             settings = json.loads(domain.raw_text(include_sensitive=True))["modelSettings"]
             self.assertEqual(1_000_000, settings["claude-opus-5-5"]["autoCompactWindow"])
             # 1,048,576 is clamped to the setting's accepted maximum of 1M.
-            self.assertEqual(1_000_000, settings["gemini-3.8-flash"]["autoCompactWindow"])
-            self.assertEqual(500_000, settings["gpt-6.1-sol"]["autoCompactWindow"])
+            self.assertEqual(1_000_000, settings["claude-mythos-319034"]["autoCompactWindow"])
             self.assertEqual(500_000, settings["claude-mythos-dedfef"]["autoCompactWindow"])
+            # A public-name entry nobody wrote is not invented beside them.
+            self.assertNotIn("gpt-6.1-sol", settings)
 
     def test_claude_code_picker_keeps_a_users_own_row_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -455,6 +465,9 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 domain.apply()
 
             row = json.loads(domain.raw_text(include_sensitive=True))["modelPicker"]["options"][0]
+            # One id space: the row names the alias both Claude apps send, and a
+            # field the user typed on the old public-name row follows it there.
+            self.assertEqual("claude-mythos-319034", row["model"])
             self.assertEqual("Gemini", row["label"])
             self.assertEqual("My label", row["description"])
             self.assertEqual("claude-opus-4-8", row["behavesAs"])
@@ -494,13 +507,96 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 domain.apply()
 
             settings = json.loads(domain.raw_text(include_sensitive=True))["modelSettings"]
-            # A user's lower window and effort choice survive a regeneration;
-            # the new route gets the derived 500k.
-            self.assertEqual(500_000, settings["gemini-3.8-flash"]["autoCompactWindow"])
-            self.assertEqual("high", settings["gemini-3.8-flash"]["effortLevel"])
-            self.assertEqual(500_000, settings["gpt-6.1-sol"]["autoCompactWindow"])
+            # A user's lower window and effort choice survive a regeneration and
+            # follow the id the picker now names; the new route gets the derived
+            # 500k under the same kind of id.
+            self.assertEqual(500_000, settings["claude-mythos-319034"]["autoCompactWindow"])
+            self.assertEqual("high", settings["claude-mythos-319034"]["effortLevel"])
             self.assertEqual(500_000, settings["claude-mythos-dedfef"]["autoCompactWindow"])
+            # That entry carries a field this app never writes (the user's
+            # effort), so the older spelling stays as its own record instead of
+            # being folded into the id's.
+            self.assertEqual("high", settings["gemini-3.8-flash"]["effortLevel"])
+            # A name this app does not serve is untouched.
             self.assertEqual("auto", settings["someone-elses-model"]["autoCompactWindow"])
+
+    def test_the_background_pass_repairs_a_stale_rendering_of_the_same_routes(self) -> None:
+        # Same routes, wrong rows: a previous release wrote the public name as
+        # the id (and a second row for the desktop spelling).  Comparing only
+        # the names would call that file current and leave both apps reading a
+        # model list that no longer matches the router.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(desktop_root, {})
+            settings = {
+                "modelPicker": {
+                    "replaceBuiltInOptions": True,
+                    "options": [
+                        {"model": "gemini-3.8-flash", "description": "\u200b"},
+                        {"model": "claude-mythos-319034", "label": "gemini-3.8-flash (Desktop)"},
+                    ],
+                }
+            }
+            (root / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with (
+                mock.patch.object(domain, "_public_models", return_value=["gemini-3.8-flash"]),
+                mock.patch.object(
+                    domain,
+                    "_public_model_rows",
+                    return_value=[{"id": "gemini-3.8-flash", "max_input_tokens": 1_048_576}],
+                ),
+            ):
+                self.assertTrue(domain.refresh_model_lists())
+
+            rows = json.loads(domain.raw_text(include_sensitive=True))["modelPicker"]["options"]
+            self.assertEqual(
+                [
+                    {
+                        "model": "claude-mythos-319034",
+                        "description": "\u200b",
+                        "label": "gemini-3.8-flash",
+                        "behavesAs": "claude-opus-5-5",
+                    }
+                ],
+                rows,
+            )
+
+    def test_a_superseded_public_name_entry_is_retired_not_duplicated(self) -> None:
+        # Every generated entry is ours: one number for one route.  A file that
+        # kept the old spelling beside the new id would describe the same model
+        # twice and grow a second entry per model on every change.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(desktop_root, {})
+            settings = {"modelSettings": {"gemini-3.8-flash": {"autoCompactWindow": 1_000_000}}}
+            (root / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with (
+                mock.patch.object(domain, "_public_models", return_value=["gemini-3.8-flash"]),
+                mock.patch.object(
+                    domain,
+                    "_public_model_rows",
+                    return_value=[{"id": "gemini-3.8-flash", "max_input_tokens": 1_048_576}],
+                ),
+            ):
+                domain.dispatch("claude.models.set", {"client": "claudeCode", "enabled": True})
+                domain.apply()
+
+            settings = json.loads(domain.raw_text(include_sensitive=True))["modelSettings"]
+            self.assertEqual({"claude-mythos-319034": {"autoCompactWindow": 1_000_000}}, settings)
 
     def test_desktop_model_list_replaces_its_own_list_and_clears_to_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

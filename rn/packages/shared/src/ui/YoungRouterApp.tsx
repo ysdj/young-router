@@ -8950,12 +8950,8 @@ const CLIENT_FILE_GROUPS: ReadonlyArray<{ client: ClientFile["client"]; titleKey
   { client: "opencode", titleKey: "clients.opencode", hintKey: "clients.opencodeFilesHint" },
 ];
 
-/** The apps inside the one Claude rail entry, in the pane's display order. */
+/** The apps inside the one Claude rail entry. */
 type ClaudeClientApp = "claudeCode" | "claudeDesktop";
-const CLAUDE_APP_GROUPS: ReadonlyArray<{ app: ClaudeClientApp; titleKey: string }> = [
-  { app: "claudeCode", titleKey: "claude.codeSection" },
-  { app: "claudeDesktop", titleKey: "claude.desktopSection" },
-];
 
 /**
  * The managed model catalog row Core registers for Codex.  This app rewrites
@@ -9563,6 +9559,11 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
   }, [filesToken, ipc, translate]);
 
   const clientFiles = (client: ClientFile["client"]): ClientFile[] => (files ?? []).filter((file) => file.client === client);
+  // One Claude client, two applications' files: the settings document the
+  // terminal and the desktop Code tab share, the desktop third-party profile
+  // and its developer settings.  Listed together, because they are one
+  // product's configuration.
+  const claudeFiles = clientFiles("claude");
   // A client Core does not register (an older Core, or a client that reports
   // nothing) must not leave the detail empty while the rail shows entries.
   useEffect(() => {
@@ -9592,6 +9593,19 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
   };
   const claudeCode = asRecord(claudeClients.claudeCode);
   const claudeDesktop = asRecord(claudeClients.claudeDesktop);
+  // One Claude, two apps on one settings document.  Core generates the picker
+  // the terminal and the desktop Code tab both read, and the ids in it are the
+  // same ids the desktop side sends, so this pane carries one set of controls
+  // and one model list instead of the same block twice.  A switch reads "on"
+  // only when every app it drives is on: half a client pointed at the proxy
+  // would otherwise look like a working pane.
+  const claudeDesktopAvailable = claudeDesktop.available !== false;
+  const claudeApps: ReadonlyArray<{ app: ClaudeClientApp; state: UnknownRecord }> = claudeDesktopAvailable
+    ? [{ app: "claudeCode", state: claudeCode }, { app: "claudeDesktop", state: claudeDesktop }]
+    : [{ app: "claudeCode", state: claudeCode }];
+  const claudeLocalApiActive = claudeApps.every(({ state }) => booleanValue(state.uses_local_api));
+  const claudeRoute = asRecord(claudeCode.designated_route ?? claudeDesktop.designated_route);
+  const claudeModelListEnabled = booleanValue(claudeCode.model_list_enabled);
   // A file this app generates only stays the user's while its own switch is
   // off: with the switch on, Core rewrites that file whenever the list it came
   // from changes, so an edit needs one explicit confirmation first.
@@ -9697,55 +9711,47 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
             </View>;
           })}
         </> : null}
-        {/* Claude is one rail entry and two apps.  Each carries its own switch
-            and its own designated route; Claude Code also keeps a generated
-            model list, while Desktop discovers the proxy's alias view.  The
-            pane says which app a block belongs to instead of drawing one
-            client's state on the other's row. */}
+        {/* Claude is one rail entry and one client: the terminal and the
+            desktop Code tab read the same settings document, and the picker
+            Core generates names the id both of them send.  One set of controls
+            drives every Claude app, and the list underneath is every file they
+            keep — splitting this into "Code" and "Desktop" blocks showed the
+            same model twice and left the reader to guess which row their
+            session used. */}
         {selectedClient === "claude" && error !== undefined
           ? <Text style={assistantFileSurfaceStyles.filesStatus}>{error}</Text>
           : null}
         {selectedClient === "claude" && error === undefined && files === undefined
           ? <Text style={assistantFileSurfaceStyles.filesStatus}>{translate("common.loading")}</Text>
           : null}
-        {selectedClient === "claude" && files !== undefined ? CLAUDE_APP_GROUPS.map(({ app, titleKey }) => {
-          const state = asRecord(app === "claudeCode" ? claudeCode : claudeDesktop);
-          const available = app === "claudeCode" || claudeDesktop.available !== false;
-          const route = asRecord(state.designated_route);
-          const listed = clientFiles("claude").filter((file) => file.app === app);
-          return <View key={app} style={styles.externalSettingsAppGroup}>
-            <View style={styles.externalSettingsAppHeader}>
-              <Text style={styles.externalSettingsAppTitle}>{translate(titleKey)}</Text>
-            </View>
-            <ClientBackendFields
-              accessibilityPrefix={translate(titleKey)}
-              models={claudeModels}
-              native={native}
-              localApiActive={booleanValue(state.uses_local_api)}
-              designatedRoute={booleanValue(state.uses_local_api) ? "" : clientRouteLabel(stringValue(route.provider), stringValue(route.model))}
-              designatedSelection={route}
-              modelList={app === "claudeCode" ? { enabled: booleanValue(state.model_list_enabled), onToggle: (enabled) => onToggleClaudeModelList(app, enabled) } : undefined}
-              modelListHint={app === "claudeCode" ? translate("claude.codeModelListHint") : undefined}
-              busy={busy || !available}
-              onStatus={onStatus}
-              onUseLocalApi={(selection) => onClaudeUseLocalApi(app, selection)}
-              onUseSavedModel={(selection) => onClaudeUseSavedModel(app, selection)}
-              translate={translate}
-            />
-            {/* The app's own files sit under the app's own controls: one
-                heading above three fields and again above two file rows said
-                the same word twice and left the reader to work out which
-                block a file belonged to. */}
-            <ClientFileRows
-              files={listed}
-              revealFileLabel={revealFileLabel}
-              revealFile={native.revealFile}
-              busy={busy}
-              translate={translate}
-              onOpenFile={openClientFile}
-            />
-          </View>;
-        }) : null}
+        {selectedClient === "claude" && files !== undefined ? <>
+          <ClientBackendFields
+            models={claudeModels}
+            native={native}
+            localApiActive={claudeLocalApiActive}
+            designatedRoute={claudeLocalApiActive ? "" : clientRouteLabel(stringValue(claudeRoute.provider), stringValue(claudeRoute.model))}
+            designatedSelection={claudeRoute}
+            modelList={{ enabled: claudeModelListEnabled, onToggle: (enabled) => onToggleClaudeModelList("claudeCode", enabled) }}
+            modelListHint={translate("claude.modelListHint")}
+            busy={busy || !claudeDesktopAvailable}
+            onStatus={onStatus}
+            onUseLocalApi={async (selection) => {
+              for (const { app } of claudeApps) await onClaudeUseLocalApi(app, selection);
+            }}
+            onUseSavedModel={async (selection) => {
+              for (const { app } of claudeApps) await onClaudeUseSavedModel(app, selection);
+            }}
+            translate={translate}
+          />
+          <ClientFileRows
+            files={claudeFiles}
+            revealFileLabel={revealFileLabel}
+            revealFile={native.revealFile}
+            busy={busy}
+            translate={translate}
+            onOpenFile={openClientFile}
+          />
+        </> : null}
         {selectedClient === "claude" ? null : (error !== undefined
           ? <Text style={assistantFileSurfaceStyles.filesStatus}>{error}</Text>
           : files === undefined
@@ -14642,7 +14648,7 @@ const styles = StyleSheet.create({
   // row is the same 24 pt row and starts at the pane's top with no extra inset,
   // so 供应商: <name> reads on one line with that button instead of sitting a few
   // points below it, and the sections under it keep the left column's row pitch.
-  providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 12 }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerListPane: { width: 120, minWidth: 120, maxWidth: 120, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 24, width: 24, minHeight: 24, height: 24, alignItems: "center", justifyContent: "center" }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, modelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 320, minWidth: 260, maxWidth: 360, flexGrow: 0, flexShrink: 1 }, providerEditorContent: { flex: 1, minHeight: 0 }, providerEditorScrollContent: { paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }, persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }, persistentScrollHost: { position: "relative", flex: 1, minHeight: 0 }, persistentScrollFill: { flex: 1, minHeight: 0 }, persistentScrollThumb: { position: "absolute", top: 2, right: 2, width: 4, borderRadius: 2, backgroundColor: "rgba(96,96,96,0.55)" }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, // A link is also a cursor: the row shows the pointing hand over the whole
+  providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 12 }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, routeTableMeasure: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerListPane: { width: 120, minWidth: 120, maxWidth: 120, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 24, width: 24, minHeight: 24, height: 24, alignItems: "center", justifyContent: "center" }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, modelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 320, minWidth: 260, maxWidth: 360, flexGrow: 0, flexShrink: 1 }, providerEditorContent: { flex: 1, minHeight: 0 }, providerEditorScrollContent: { paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }, persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }, persistentScrollHost: { position: "relative", flex: 1, minHeight: 0 }, persistentScrollFill: { flex: 1, minHeight: 0 }, persistentScrollThumb: { position: "absolute", top: 2, right: 2, width: 4, borderRadius: 2, backgroundColor: "rgba(96,96,96,0.55)" }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, // A link is also a cursor: the row shows the pointing hand over the whole
 // finding, label included, exactly like every native link in the app.
 inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspectorProbeFindingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textDecorationLine: "underline" }, inspectorEnableControl: { flexShrink: 0 }, routeEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, // The field sits *in* the row beside its switch, so it must not claim the
   // whole of it: a TextField's own formRow is `width: "100%"`, and inheriting
@@ -14653,7 +14659,7 @@ inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspec
   externalSettingsWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, externalSettingsFieldList: { ...SETTINGS_FIELD_LIST },
   // One rail entry can carry two apps, so each app's block keeps the grid's
   // rhythm but not the grid: a title, then that app's own fields and files.
-  externalSettingsAppGroup: { gap: 14 }, externalSettingsAppHeader: { paddingLeft: SETTINGS_FIELD_LEAD }, externalSettingsAppTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, externalSettingsField: { ...SETTINGS_FIELD }, externalSettingsInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, externalSettingsFieldLabel: { ...SETTINGS_FIELD_LABEL }, externalSettingsFieldLabelUnavailable: { ...SETTINGS_FIELD_LABEL, color: systemColors.secondaryLabel }, externalSettingsValueSlot: { ...SETTINGS_FIELD_VALUE_SLOT }, externalSettingsBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, externalSettingsHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, externalSettingsHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, externalSettingsPane: { flex: 1, minHeight: 0 }, externalSettingsPaneContent: { paddingVertical: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, gap: 14 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 },
+externalSettingsField: { ...SETTINGS_FIELD }, externalSettingsInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, externalSettingsFieldLabel: { ...SETTINGS_FIELD_LABEL }, externalSettingsFieldLabelUnavailable: { ...SETTINGS_FIELD_LABEL, color: systemColors.secondaryLabel }, externalSettingsValueSlot: { ...SETTINGS_FIELD_VALUE_SLOT }, externalSettingsBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, externalSettingsHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, externalSettingsHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, externalSettingsPane: { flex: 1, minHeight: 0 }, externalSettingsPaneContent: { paddingVertical: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, gap: 14 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 },
   runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 6 }, runtimeWorkspaceBody: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, runtimeWorkspace: { width: "100%", padding: SETTINGS_PANE_INSET, gap: 14 }, runtimeScrollSurface: { flex: 1, minWidth: 0, backgroundColor: systemColors.textBackground }, runtimeFieldList: { ...SETTINGS_FIELD_LIST }, runtimeField: { ...SETTINGS_FIELD }, runtimeInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, runtimeModifiedBar: { position: "absolute", left: 0, top: 3, bottom: 3, width: 2, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarInline: { width: 2, alignSelf: "center", height: 16, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarActive: { backgroundColor: systemColors.blue }, runtimeFieldError: { marginLeft: SETTINGS_FIELD_HELP_INDENT, color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, runtimeValueControlInvalid: { borderWidth: 1, borderColor: systemColors.red, borderRadius: 4 }, runtimeResetButton: { minWidth: 28, width: 28, height: 22, paddingHorizontal: 0 }, runtimeFieldLabel: { ...SETTINGS_FIELD_LABEL }, runtimeValueSlot: { ...SETTINGS_FIELD_CELL }, runtimeValueCellWide: { flex: 1, minWidth: 0, maxWidth: SETTINGS_FIELD_TEXT_WIDTH, height: 26, flexDirection: "row", alignItems: "center", gap: SETTINGS_FIELD_GAP }, runtimeValueControl: { width: SETTINGS_FIELD_VALUE_WIDTH, minWidth: SETTINGS_FIELD_VALUE_WIDTH, height: 26 }, runtimeNumberControl: { width: SETTINGS_FIELD_NUMBER_WIDTH, minWidth: SETTINGS_FIELD_NUMBER_WIDTH, height: 26, flexGrow: 0, flexShrink: 0 }, runtimeTextControl: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0 }, runtimeBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, runtimeUnit: { minWidth: 0, flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, runtimeHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, runtimeMultilineField: { minWidth: 0, flexGrow: 1, flexBasis: "100%", maxWidth: "100%" }, runtimeMultilineHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, paddingLeft: SETTINGS_FIELD_LEAD }, runtimeMultilineLabel: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeMultilineHeaderActions: { flexShrink: 0, minHeight: 26, justifyContent: "center" }, runtimeMultilineEditor: { width: "100%", minWidth: 0, alignSelf: "stretch" }, runtimeMultilineHelpSlot: { paddingLeft: 0, maxWidth: "100%", minWidth: 0, paddingTop: 6, gap: 3 }, runtimeJsonDefaultHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, fontWeight: "600", minWidth: 0 },
   dataManagementWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, dataManagementPane: { flex: 1, minHeight: 0 }, dataManagementPaneScrollContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 4, gap: 10 }, dataManagementImportIntro: { width: "100%", minHeight: 72, paddingHorizontal: 12, paddingVertical: 12, justifyContent: "center" }, dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: SETTINGS_FIELD_GAP, paddingLeft: SETTINGS_FIELD_LEAD }, dataManagementImportFileLabel: { ...SETTINGS_FIELD_LABEL }, dataManagementImportFileValue: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground }, dataManagementImportFilePlaceholder: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, dataManagementSelectionBar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSelectionCount: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementToolbarButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, dataManagementSectionsField: { flex: 1, minWidth: 0, gap: 6 }, dataManagementSectionList: { gap: 4 }, dataManagementSectionItem: { minHeight: 22 }, dataManagementActionStatus: { flexShrink: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14 }, dataManagementSensitiveHint: { color: systemColors.brown, fontSize: UI_FONT_SIZE, lineHeight: 16, paddingVertical: 5, paddingHorizontal: 7, backgroundColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.08) ?? "rgba(255, 204, 0, 0.08)", default: "rgba(255, 204, 0, 0.08)" }), borderRadius: 4, borderWidth: 1, borderColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.2) ?? "rgba(255, 204, 0, 0.2)", default: "rgba(255, 204, 0, 0.2)" }) },
   // The WebDAV tab is fields of the same grid the other panes draw, so its

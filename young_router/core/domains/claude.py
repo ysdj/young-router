@@ -1581,7 +1581,11 @@ class ClaudeSettingsDomain:
         return list(names)
 
     def code_model_list_names(self) -> list[str]:
-        """The model IDs Claude Code's own picker currently offers."""
+        """The model IDs Claude Code's own picker currently offers.
+
+        These are the ids the client sends, which for a third-party route is
+        the derived alias (``_code_picker_id``), not the public name.
+        """
 
         value = self._draft.get("modelPicker")
         options = value.get("options") if isinstance(value, Mapping) else None
@@ -1593,6 +1597,22 @@ class ClaudeSettingsDomain:
             if isinstance(model, str) and model.strip():
                 names.append(model.strip())
         return names
+
+    def code_model_list_public_names(self) -> list[str]:
+        """The public routes this picker's ids name, in the picker's order.
+
+        The generated list is compared with the router's public names, and a
+        row names an alias; resolving one back is what makes that comparison a
+        comparison of routes rather than of spellings.  An id this router does
+        not serve (a route that was removed) resolves to itself, which reads as
+        a difference and regenerates the list.
+        """
+
+        public = self._public_models() or []
+        resolved: list[str] = []
+        for model_id in self.code_model_list_names():
+            resolved.append(claude_aliases.resolve_alias(model_id, public) or model_id)
+        return resolved
 
     def code_model_list_enabled(self) -> bool:
         """Whether Claude Code's picker is this app's list, not its built-in one.
@@ -1711,6 +1731,26 @@ class ClaudeSettingsDomain:
         # person reads is what the list is ordered by, without a sort here.
         return rows
 
+    @staticmethod
+    def _code_picker_id(name: str) -> str:
+        """The id Claude Code's picker names for one public route.
+
+        One id space for both Claude apps.  Claude Desktop's Code tab launches
+        this same Claude Code with the id the discovery view published -- the
+        derived alias, and a 1M route's alias with the client's ``[1m]`` suffix
+        -- so a picker keyed by the public name would describe a model the
+        desktop session never asks for, and every context setting would have to
+        be written twice (once per spelling).  Naming the alias here is what
+        makes one row, one ``modelSettings`` entry and one behavior target
+        serve both apps; the proxy resolves the alias back through
+        ``claude_aliases``, and a Claude-shaped id (already in the client's own
+        catalog) is kept as written.
+        """
+
+        if claude_aliases.desktop_keeps_model_id(name):
+            return name
+        return claude_aliases.claude_desktop_alias(name)
+
     def _code_picker(self, names: Sequence[str], existing: object = None) -> dict[str, Any]:
         """A picker lineup for one public-model list.
 
@@ -1719,11 +1759,12 @@ class ClaudeSettingsDomain:
         ``behavesAs`` the user added is theirs, and regenerating the file must
         not silently drop it.
 
-        The row names the public route directly -- no Claude Desktop-style
-        alias.  ``behavesAs`` is what gives the client the route's context
-        window and Effort ladder; ``description`` blank keeps the row from
-        showing the ``Custom model (...)`` subtitle the client would otherwise
-        add.
+        The row names the id the client sends (``_code_picker_id``) and shows
+        the public name as its label, so the terminal and the desktop Code tab
+        address one model the same way.  ``behavesAs`` is what gives the client
+        the route's context window and Effort ladder; ``description`` blank
+        keeps the row from showing the ``Custom model (...)`` subtitle the
+        client would otherwise add.
         """
 
         preserved: dict[str, dict[str, Any]] = {}
@@ -1738,13 +1779,22 @@ class ClaudeSettingsDomain:
         known = {str(row.get("id")): row for row in self._public_model_rows()}
         rows: list[dict[str, Any]] = []
         for name in names:
-            row = dict(preserved.get(name) or {})
-            row["model"] = name
+            model_id = self._code_picker_id(name)
+            # A list written before the ids were aliases carried the public
+            # name, and a field the user typed there is theirs: adopt it onto
+            # the id the row names now.
+            row = dict(preserved.get(model_id) or preserved.get(name) or {})
+            row["model"] = model_id
             route = known.get(name)
             if route is not None:
                 row.setdefault("description", _CLAUDE_CODE_BLANK_DESCRIPTION)
-                if not claude_aliases.desktop_keeps_model_id(name):
-                    row.setdefault("label", name)
+                if model_id != name:
+                    # The picker shows this; the client sends the id.  A label
+                    # this app used to add to separate the two rows is ours, not
+                    # the user's, and now that there is one row it is just a
+                    # second name for one model.
+                    if row.get("label") in (None, "", f"{name} (Desktop)"):
+                        row["label"] = name
                 behaves_as = _code_behaves_as(name, route.get("max_input_tokens"))
                 if behaves_as is not None:
                     current = row.get("behavesAs")
@@ -1757,13 +1807,6 @@ class ClaudeSettingsDomain:
                     ):
                         row["behavesAs"] = behaves_as
             rows.append(row)
-        # Claude Desktop's Code/Cowork tab launches the bundled Claude Code
-        # with the Desktop alias (`claude-mythos-<digest>`), not the public
-        # name.  A 500k route has no `[1m]` suffix, so that alias would fall
-        # back to the client's 200k default even though the public row says
-        # 500k.  A bridge row gives the alias the same behavior target; the
-        # user's public row remains the no-alias choice for the CLI.
-        rows.extend(self._desktop_code_bridge_rows(known, rows, preserved))
         lineup: dict[str, Any] = {"replaceBuiltInOptions": True, "options": rows}
         if isinstance(existing, Mapping):
             for key, value in existing.items():
@@ -1771,51 +1814,22 @@ class ClaudeSettingsDomain:
                     lineup[key] = copy.deepcopy(value)
         return lineup
 
-    @staticmethod
-    def _desktop_code_bridge_rows(
-        known: Mapping[str, Mapping[str, object]],
-        rows: Sequence[Mapping[str, Any]],
-        preserved: Mapping[str, Mapping[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Rows that give Desktop Code's 500k aliases a 1M behavior target.
-
-        The Desktop Code tab uses the alias id; without a bridge, the CLI sees
-        an unknown alias, assumes 200k, and caps the per-model auto window at
-        200k.  Only the 500k..1M band needs the bridge: 1M routes already carry
-        Desktop's ``[1m]`` suffix, and 200k routes are right by default.
-        """
-
-        present = {str(row.get("model") or "") for row in rows}
-        bridges: list[dict[str, Any]] = []
-        for name, route in known.items():
-            max_input = route.get("max_input_tokens")
-            if (
-                not isinstance(max_input, int)
-                or isinstance(max_input, bool)
-                or not (500_000 <= max_input < 1_000_000)
-            ):
-                continue
-            alias = claude_aliases.claude_desktop_alias(name)
-            if not alias or alias in present:
-                continue
-            row = dict(preserved.get(alias) or {})
-            row["model"] = alias
-            row.setdefault("label", f"{name} (Desktop)")
-            row.setdefault("description", _CLAUDE_CODE_BLANK_DESCRIPTION)
-            if row.get("behavesAs") in (None, "", _CODE_BEHAVES_AS_DEFAULT):
-                row["behavesAs"] = _CODE_BEHAVES_AS_1M
-            bridges.append(row)
-        return bridges
-
     def _code_model_settings(self, names: Sequence[str], existing: object = None) -> dict[str, Any]:
-        """Per-model settings Claude Code needs for the same public rows.
+        """Per-model settings Claude Code needs for the same rows.
 
-        ``modelPicker`` carries the public id and the behavior model; the
-        context number itself lives in ``modelSettings.<model>``.
+        ``modelPicker`` carries the id and the behavior model; the context
+        number itself lives in ``modelSettings.<model>``, keyed by the id the
+        client was launched with -- which is the alias the picker names, so one
+        entry serves the terminal and the desktop Code tab.
         ``autoCompactWindow`` is the only per-model context field in Claude
         Code, and without it a 500k route that behaves as a 1M model would show
         1M.  Existing entries and every other field (a user's own effort or
         window) are preserved.
+
+        An entry already written under the public name is kept rather than
+        moved: nothing this app generates launches with that spelling any more,
+        but a person who types it (``claude --model <name>``) still gets the
+        number they had, and an entry nobody wrote is never invented.
         """
 
         settings: dict[str, Any] = {}
@@ -1828,26 +1842,28 @@ class ClaudeSettingsDomain:
             route = known.get(name)
             if route is None:
                 continue
-            entry = dict(settings.get(name) or {})
+            model_id = self._code_picker_id(name)
+            entry = dict(settings.get(model_id) or settings.get(name) or {})
             entry.setdefault("autoCompactWindow", _code_auto_compact_window(route.get("max_input_tokens")))
-            settings[name] = entry
-        # The Desktop Code bridge alias needs the same per-model window as the
-        # public row; the CLI looks the window up by the model id it was
-        # launched with (the alias).
-        for name, route in known.items():
-            max_input = route.get("max_input_tokens")
-            if (
-                not isinstance(max_input, int)
-                or isinstance(max_input, bool)
-                or not (500_000 <= max_input < 1_000_000)
-            ):
+            settings[model_id] = entry
+        # A key this app wrote under the superseded spelling is not the user's
+        # writing.  When the id now states exactly what that entry says, keeping
+        # both leaves one route described twice -- and a file that grows a second
+        # entry per model on every change.  A value that differs is theirs and
+        # stays, because nothing here knows which spelling they meant.
+        for name in names:
+            model_id = self._code_picker_id(name)
+            if model_id == name:
                 continue
-            alias = claude_aliases.claude_desktop_alias(name)
-            if not alias:
+            stale = settings.get(name)
+            current = settings.get(model_id)
+            if not isinstance(stale, Mapping) or not isinstance(current, Mapping):
                 continue
-            entry = dict(settings.get(alias) or {})
-            entry.setdefault("autoCompactWindow", _code_auto_compact_window(max_input))
-            settings[alias] = entry
+            if set(stale) - {"autoCompactWindow"}:
+                continue
+            if stale.get("autoCompactWindow") != current.get("autoCompactWindow"):
+                continue
+            settings.pop(name, None)
         return settings
 
     def _code_model_list_apply(self, enabled: bool, names: Sequence[str] | None = None) -> dict[str, Any]:
@@ -1941,12 +1957,27 @@ class ClaudeSettingsDomain:
 
         if code_free and self.code_model_list_enabled():
             recorded = read_generated_models(self.app_state_root, "claudeCode")
-            if set(recorded) != set(names) or self.code_model_list_names() != list(names):
+            names_changed = set(recorded) != set(names) or self.code_model_list_public_names() != list(names)
+            # The document is compared with what regenerating it would produce,
+            # not only with the names: a file that differs at all -- a label a
+            # previous release added for the other Claude app, one model's
+            # window -- is one the client reads wrong until it is rewritten.
+            # Rendering alone needs the route rows (the windows) to be readable,
+            # so without them only a change of names regenerates: the rows are
+            # then kept as they are, and the pass that can read them settles the
+            # rest.
+            rows = self._public_model_rows() if not names_changed else []
+            if names_changed or rows:
                 candidate = self._code_model_list_apply(True, names)
                 if validate_settings(candidate):
                     raise ClaudeSettingsError("Claude Settings contains invalid values")
-                self._draft = candidate
-                generated["claudeCode"] = list(names)
+                stale = names_changed or any(
+                    candidate.get(key) != self._draft.get(key)
+                    for key in ("modelPicker", "modelSettings")
+                )
+                if stale:
+                    self._draft = candidate
+                    generated["claudeCode"] = list(names)
 
         if not generated:
             return False
@@ -2418,7 +2449,7 @@ class ClaudeSettingsDomain:
                 raise ClaudeSettingsError(errors[0])
             self._draft = candidate
             store_generated_models(
-                self.app_state_root, "claudeCode", self.code_model_list_names() if enabled else []
+                self.app_state_root, "claudeCode", self.code_model_list_public_names() if enabled else []
             )
             self._revision += 1
             return self.snapshot()

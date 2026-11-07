@@ -118,9 +118,10 @@ class ClientModelSyncSchedulerTests(unittest.TestCase):
         document.write_text("two\n", encoding="utf-8")
         self.assertTrue(_wait_for(lambda: len(calls) >= before + 2, seconds=6.0))
 
-    def test_the_background_pass_never_rewrites_claude(self) -> None:
-        # The loop still owns Codex's catalog and the reload it asks for; the
-        # Claude lists are discovery's and the reload's, not a timer's.
+    def test_the_background_pass_rewrites_claude_too(self) -> None:
+        # The picker it generates is the one both Claude apps read, and a reload
+        # may never come (a proxy another process started, a route this app did
+        # not write), so the file itself is what this pass has to reconcile.
         class Core:
             def __init__(self) -> None:
                 self.refreshed: list[bool] = []
@@ -136,7 +137,7 @@ class ClientModelSyncSchedulerTests(unittest.TestCase):
         scheduler.start()
         self.addCleanup(scheduler.stop)
         self.assertTrue(_wait_for(lambda: core.refreshed))
-        self.assertEqual([False], core.refreshed)
+        self.assertEqual([True], core.refreshed)
 
     def test_a_failing_pass_does_not_kill_the_loop(self) -> None:
         calls: list[int] = []
