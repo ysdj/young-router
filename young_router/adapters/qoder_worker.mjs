@@ -47,8 +47,10 @@ import { randomUUID } from 'node:crypto'
 
 import {
   OPENAPI_BY_REGION,
+  SESSION_FILE_ENV,
   desktopApp,
   readDesktopSession,
+  readSeededSession,
   refreshDesktopSession,
 } from './qoder_app_session.mjs'
 
@@ -85,6 +87,11 @@ const PAT_ENV = Object.freeze({
   cn: 'QODERCN_PERSONAL_ACCESS_TOKEN',
   global: 'QODER_PERSONAL_ACCESS_TOKEN',
 })
+
+/** What a caller is told when a region has no credential at all. */
+function signedOutMessage(region) {
+  return `Qoder is not signed in for this region: sign in to the Qoder desktop app, paste a PAT, seed a desktop session (${SESSION_FILE_ENV}), or set ${PAT_ENV[region]}`
+}
 
 /**
  * How long one read of the desktop app's sign-in answers later reads.
@@ -442,14 +449,19 @@ class RegionRuntime {
     })
   }
 
-  /** The desktop session this region is signed into, cached briefly. */
+  /** The app session this region serves with, cached briefly. */
   async _desktopSession({ refresh = false } = {}) {
     const now = Date.now()
     if (!refresh && this._desktopSessionCache !== undefined) {
       const cached = this._desktopSessionCache
       if (now - cached.at < DESKTOP_SESSION_TTL_MS) return cached.value
     }
-    let value = await readDesktopSession(this.region)
+    // A host has no app to read.  The session it serves with was exported by
+    // the machine that has one and is named by the variable the deployment
+    // sets; on a desktop the variable is absent and this answers undefined.
+    // It is consulted first because it is the operator's explicit statement.
+    let value = readSeededSession(this.region)
+    if (value === undefined) value = await readDesktopSession(this.region)
     if (value === undefined) {
       // ``undefined`` is the one answer that says "no session": caching a
       // ``null`` here made ``credential()`` read a session that was not there.
@@ -508,10 +520,11 @@ class RegionRuntime {
    * The credential this region serves with, and where it came from.
    *
    * A pasted PAT wins over everything: it is the user's explicit statement
-   * about this account.  Without one the desktop app's own sign-in is used
-   * (which is what makes adding a Qoder provider need no typing at all), and
-   * the environment variable stays as the last resort for a host that states
-   * a PAT with no window.
+   * about this account.  Without one the app's own sign-in is used (which is
+   * what makes adding a Qoder provider need no typing at all) — either the
+   * app installed on this machine, or, on a host, the session exported from
+   * it.  The environment variable stays as the last resort for a host that
+   * states a PAT with no window.
    */
   async credential() {
     const stored = readStoredPat(this.root, this.id)
@@ -634,9 +647,7 @@ class RegionRuntime {
       this.source = 'none'
       this.fetchedAtMs = 0
       this.catalogError = ''
-      throw new Error(
-        `Qoder is not signed in for this region: sign in to the Qoder desktop app, or paste a PAT (or set ${PAT_ENV[this.region]})`,
-      )
+      throw new Error(signedOutMessage(this.region))
     }
     const token = this._useCredential(credential)
     let models
@@ -738,7 +749,7 @@ class RegionRuntime {
     if (credential === undefined) {
       json(res, 401, {
         error: {
-          message: `Qoder is not signed in for this region: sign in to the Qoder desktop app, or paste a PAT (or set ${PAT_ENV[this.region]})`,
+          message: signedOutMessage(this.region),
           code: 'invalid_api_key',
           type: 'qoder_error',
         },

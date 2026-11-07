@@ -245,7 +245,8 @@ async function windowsChromiumKey(profile) {
  * an envelope that does not decrypt, and a session whose region cannot be
  * stated.  `platform`, `home`, and `keychain` are seams: the tests drive the
  * whole envelope, the region decision and the "keychain refused" answer
- * without a desktop app installed.
+ * without a desktop app installed.  A host reads the export instead — see
+ * `readSeededSessions`.
  */
 export async function readProfileSession(profile, options = {}) {
   const platform = options.platform ?? process.platform
@@ -304,6 +305,80 @@ export async function readDesktopSessions(options = {}) {
 export async function readDesktopSession(region, options = {}) {
   const sessions = await readDesktopSessions(options)
   return sessions[region]
+}
+
+/**
+ * A sign-in a host was handed, instead of one this machine's app holds.
+ *
+ * A gateway has no Qoder app: no profile directory, no keychain, no DPAPI.
+ * The machine that has the app exports the session it already holds and names
+ * the file with ``YOUNG_ROUTER_QODER_SESSION_FILE``.  The document is that
+ * export, not the app's sealed envelope:
+ *
+ *   {"version": 1, "regions": {"cn": {"token": "dt-...",
+ *     "refreshToken": "drt-...", "expiresAt": 1790000000000,
+ *     "userId": "...", "userName": "...", "userEmail": "",
+ *     "context": "[...]", "profile": "com.qodercn.app.stable"}}}
+ *
+ * ``expiresAt`` is milliseconds (an ISO string is accepted too).  Every entry
+ * is read under the region its own key names; one that states a different
+ * region is skipped, because a token filed under the wrong gateway fails as
+ * "the account is broken" rather than as "sign in".
+ */
+export const SESSION_FILE_ENV = 'YOUNG_ROUTER_QODER_SESSION_FILE'
+
+function seededSession(entry, region) {
+  if (entry === null || typeof entry !== 'object') return undefined
+  const token = typeof entry.token === 'string' ? entry.token.trim() : ''
+  const refreshToken = typeof entry.refreshToken === 'string' ? entry.refreshToken.trim() : ''
+  // The same answer a profile gives when its envelope carries neither: this is
+  // not a session, so no reader may treat it as one.
+  if (token === '' && refreshToken === '') return undefined
+  const context = typeof entry.context === 'string' ? entry.context : ''
+  const stated = typeof entry.region === 'string' && entry.region !== ''
+    ? entry.region
+    : regionOfAuthenticationContext(context)
+  if (stated !== undefined && stated !== region) return undefined
+  const expires = typeof entry.expiresAt === 'string' ? Date.parse(entry.expiresAt) : Number(entry.expiresAt)
+  return {
+    token,
+    refreshToken,
+    expiresAt: Number.isFinite(expires) && expires > 0 ? expires : 0,
+    userId: typeof entry.userId === 'string' ? entry.userId : '',
+    userName: typeof entry.userName === 'string' ? entry.userName : '',
+    userEmail: typeof entry.userEmail === 'string' ? entry.userEmail : '',
+    context,
+    region,
+    // The status document reports this as ``appProfile``, so it is always a
+    // string: a session served from a seed is still "through the app", and
+    // naming the profile it came from is the whole point of the field.
+    profile: typeof entry.profile === 'string' ? entry.profile : '',
+  }
+}
+
+/** Every region a seeded session file states, by region. */
+export function readSeededSessions(options = {}) {
+  const file = options.file ?? process.env[SESSION_FILE_ENV] ?? ''
+  if (file === '') return {}
+  let document
+  try {
+    document = JSON.parse(readFileSync(file, 'utf8'))
+  } catch {
+    return {}
+  }
+  const regions = document?.regions
+  if (regions === null || typeof regions !== 'object') return {}
+  const sessions = {}
+  for (const [region, entry] of Object.entries(regions)) {
+    const session = seededSession(entry, region)
+    if (session !== undefined) sessions[region] = session
+  }
+  return sessions
+}
+
+/** The seeded session one region states, or `undefined`. */
+export function readSeededSession(region, options = {}) {
+  return readSeededSessions(options)[region]
 }
 
 /**

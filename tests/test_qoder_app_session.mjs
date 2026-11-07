@@ -188,4 +188,88 @@ try {
   rmSync(root, { recursive: true, force: true })
 }
 
+// -- a host's exported session -------------------------------------------------
+// A gateway has no app to read, so the machine that has one exports it.  The
+// reader must answer with the same shape a profile does, refuse a session that
+// names another gateway, and treat "no credential" as no session at all.
+{
+  const dir = mkdtempSync(join(tmpdir(), 'qoder-seed-session-'))
+  try {
+    const file = join(dir, 'qoder-desktop.info')
+    writeFileSync(
+      file,
+      JSON.stringify({
+        version: 1,
+        regions: {
+          cn: {
+            token: 'dt-seeded',
+            refreshToken: 'drt-seeded',
+            expiresAt: 4102444800000,
+            userId: 'uid-seeded',
+            userName: 'Seeded User',
+            userEmail: '',
+            context: PAYLOAD.authenticationContext,
+            profile: 'com.qodercn.app.stable',
+          },
+          // States the other gateway, so it is not this file's `global`.
+          global: {
+            token: 'dt-elsewhere',
+            refreshToken: '',
+            expiresAt: 0,
+            userId: 'uid-elsewhere',
+            userName: 'Elsewhere',
+            userEmail: '',
+            context: PAYLOAD.authenticationContext,
+            profile: 'com.qoder.app.stable',
+          },
+          // Neither a token nor a refresh token: not a session.
+          empty: { token: '   ', refreshToken: '' },
+        },
+      }),
+      { mode: 0o600 },
+    )
+    const seeded = sessions.readSeededSessions({ file })
+    assert.deepEqual(Object.keys(seeded), ['cn'])
+    assert.equal(seeded.cn.token, 'dt-seeded')
+    assert.equal(seeded.cn.refreshToken, 'drt-seeded')
+    assert.equal(seeded.cn.expiresAt, 4102444800000)
+    assert.equal(seeded.cn.userName, 'Seeded User')
+    assert.equal(seeded.cn.profile, 'com.qodercn.app.stable')
+    assert.equal(seeded.cn.region, 'cn')
+    assert.equal(sessions.readSeededSession('cn', { file }).token, 'dt-seeded')
+    assert.equal(sessions.readSeededSession('global', { file }), undefined)
+
+    // The variable is how a deployment states the file; an unset or unreadable
+    // one is "this machine holds no exported session", never a throw.
+    const previous = process.env[sessions.SESSION_FILE_ENV]
+    try {
+      process.env[sessions.SESSION_FILE_ENV] = file
+      assert.equal(sessions.readSeededSession('cn').token, 'dt-seeded')
+      process.env[sessions.SESSION_FILE_ENV] = join(dir, 'missing.info')
+      assert.deepEqual(sessions.readSeededSessions(), {})
+    } finally {
+      if (previous === undefined) delete process.env[sessions.SESSION_FILE_ENV]
+      else process.env[sessions.SESSION_FILE_ENV] = previous
+    }
+
+    // An ISO expiry (a hand-written export) reads as the same instant, and an
+    // absent profile is an empty string rather than a missing field: the
+    // status document reports it as `appProfile`.
+    const isoFile = join(dir, 'iso.info')
+    writeFileSync(
+      isoFile,
+      JSON.stringify({
+        version: 1,
+        regions: { global: { token: 'dt-iso', refreshToken: '', expiresAt: '2099-01-01T00:00:00Z' } },
+      }),
+    )
+    const iso = sessions.readSeededSession('global', { file: isoFile })
+    assert.equal(iso.expiresAt, Date.parse('2099-01-01T00:00:00Z'))
+    assert.equal(iso.profile, '')
+    assert.equal(iso.region, 'global')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
 console.log('Qoder desktop session tests OK')
