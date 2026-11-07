@@ -400,9 +400,6 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
             root = pathlib.Path(directory)
             desktop_root = root / "configLibrary"
             _write_desktop_config(desktop_root, {})
-            # Only these two carry a window the *user* wrote.  ``gemini-3.8-flash``
-            # reads 1M in a public catalogue and declares nothing, which is a
-            # reading and must not become a claim.
             _write_runtime_config(
                 root / "config.yaml",
                 {"gpt-6.1-sol": 500_000, "kimi-k3.1-pro": 1_000_000},
@@ -429,32 +426,32 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
 
             picker = json.loads(domain.raw_text(include_sensitive=True))["modelPicker"]
             self.assertTrue(picker["replaceBuiltInOptions"])
-            # One row per route, and a route the user declared at 1M is named
-            # the way the desktop session names it.
+            # One row per route, and each route is named the way the desktop
+            # session names it: at or above 1M the client's own ``[1m]`` spelling.
             self.assertEqual(
                 [
                     "claude-opus-5-5",
-                    alias_claude_desktop("gemini-3.8-flash"),
+                    f"{alias_claude_desktop('gemini-3.8-flash')}[1m]",
                     alias_claude_desktop("gpt-6.1-sol"),
                     f"{alias_claude_desktop('kimi-k3.1-pro')}[1m]",
                 ],
                 [row["model"] for row in picker["options"]],
             )
             by_id = {row["model"]: row for row in picker["options"]}
-            # A route nobody declared keeps the bare alias even though a catalogue
-            # reads it at 1M: the suffix is a claim about the route, and the
-            # session's window is carried by the behavior model below instead.
+            # A route this app publishes at 1M is named as 1M, whoever wrote the
+            # number: the pane, the picker row and the discovery row state one
+            # window.
             self.assertEqual(
                 {
-                    "model": alias_claude_desktop("gemini-3.8-flash"),
+                    "model": f"{alias_claude_desktop('gemini-3.8-flash')}[1m]",
                     "description": "\u200b",
                     "label": "gemini-3.8-flash",
                     "behavesAs": "claude-opus-5-5",
                 },
-                by_id[alias_claude_desktop("gemini-3.8-flash")],
+                by_id[f"{alias_claude_desktop('gemini-3.8-flash')}[1m]"],
             )
-            # A declared 500k route gets the 1M behavior model; the exact 500k
-            # comes from its per-model autoCompactWindow below.
+            # A 500k route gets the 1M behavior model; the exact 500k comes from
+            # its per-model autoCompactWindow below.
             self.assertEqual("claude-opus-5-5", by_id[alias_claude_desktop("gpt-6.1-sol")]["behavesAs"])
             self.assertEqual("gpt-6.1-sol", by_id[alias_claude_desktop("gpt-6.1-sol")]["label"])
             # A real Claude id is already in the client's catalog and needs no
@@ -469,8 +466,10 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 1_000_000,
                 settings[f"{alias_claude_desktop('kimi-k3.1-pro')}[1m]"]["autoCompactWindow"],
             )
-            # 1,048,576 is clamped to the setting's accepted maximum.
-            self.assertEqual(1_000_000, settings[alias_claude_desktop("gemini-3.8-flash")]["autoCompactWindow"])
+            self.assertEqual(
+                1_000_000,
+                settings[f"{alias_claude_desktop('gemini-3.8-flash')}[1m]"]["autoCompactWindow"],
+            )
             # A public-name entry nobody wrote is not invented beside them.
             self.assertNotIn("gpt-6.1-sol", settings)
 
@@ -511,9 +510,10 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 domain.apply()
 
             row = json.loads(domain.raw_text(include_sensitive=True))["modelPicker"]["options"][0]
-            # One id space: the row names the alias both Claude apps send, and a
-            # field the user typed on the old public-name row follows it there.
-            self.assertEqual("claude-mythos-319034", row["model"])
+            # One id space: the row names the id both Claude apps send -- which
+            # for a route published at 1M carries the client's own spelling --
+            # and a field the user typed on the older spelling follows it there.
+            self.assertEqual(f"{alias_claude_desktop('gemini-3.8-flash')}[1m]", row["model"])
             self.assertEqual("Gemini", row["label"])
             self.assertEqual("My label", row["description"])
             self.assertEqual("claude-opus-4-8", row["behavesAs"])
@@ -553,11 +553,12 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 domain.apply()
 
             settings = json.loads(domain.raw_text(include_sensitive=True))["modelSettings"]
+            gemini = f"{alias_claude_desktop('gemini-3.8-flash')}[1m]"
             # A user's lower window and effort choice survive a regeneration and
             # follow the id the picker now names; the new route gets the derived
             # 500k under the same kind of id.
-            self.assertEqual(500_000, settings["claude-mythos-319034"]["autoCompactWindow"])
-            self.assertEqual("high", settings["claude-mythos-319034"]["effortLevel"])
+            self.assertEqual(500_000, settings[gemini]["autoCompactWindow"])
+            self.assertEqual("high", settings[gemini]["effortLevel"])
             self.assertEqual(500_000, settings["claude-mythos-dedfef"]["autoCompactWindow"])
             # That entry carries a field this app never writes (the user's
             # effort), so the older spelling stays as its own record instead of
@@ -645,18 +646,19 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 domain.apply()
 
             settings = json.loads(domain.raw_text(include_sensitive=True))["modelSettings"]
-            # The public-name entry said exactly what the id's entry says, so it
-            # is retired rather than left beside it describing one route twice.
-            self.assertEqual({"claude-mythos-319034": {"autoCompactWindow": "auto"}}, settings)
+            # The entry the user had under the public name follows the route to
+            # the id it is named by now, and the old spelling is retired rather
+            # than left beside it describing one model twice.
+            self.assertEqual(
+                {f"{alias_claude_desktop('gemini-3.8-flash')}[1m]": {"autoCompactWindow": "auto"}},
+                settings,
+            )
 
-    def test_a_resolved_one_million_window_earns_no_one_million_spelling(self) -> None:
-        # A reading is not a promise.  ``gemini-3.8-flash`` reads 1,048,576 in a
-        # public catalogue and declares nothing, and the ``[1m]`` id is a claim
-        # about the route: beside a profile that prefers 1M it hides the standard
-        # row, and a row whose alias did not resolve answered ``Invalid model
-        # name``.  The window the *session* gets is a different decision -- a
-        # window stated too small is a client-side refusal no elision can
-        # recover, so the behavior model still carries the published number.
+    def test_a_one_million_window_is_named_1m_whatever_wrote_the_number(self) -> None:
+        # One window per route, and this app publishes it: the pane, the picker
+        # row and the discovery row state the same number.  At or above 1M that
+        # statement is the client's ``[1m]`` spelling, which also keeps the
+        # picker from synthesizing a second row for the same route.
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             desktop_root = root / "configLibrary"
@@ -696,10 +698,11 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 self.assertTrue(domain.refresh_model_lists())
 
             picker = json.loads(domain.raw_text(include_sensitive=True))["modelPicker"]
+            suffixed = f"{alias_claude_desktop('gemini-3.8-flash')}[1m]"
             self.assertEqual(
                 [
                     {
-                        "model": alias_claude_desktop("gemini-3.8-flash"),
+                        "model": suffixed,
                         "description": "\u200b",
                         "label": "gemini-3.8-flash",
                         "behavesAs": "claude-opus-5-5",
@@ -707,6 +710,10 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 ],
                 picker["options"],
             )
+            # The route the user typed under the plain alias is retired onto the
+            # id, not left beside it describing one model twice.
+            settings = json.loads(domain.raw_text(include_sensitive=True))["modelSettings"]
+            self.assertEqual({suffixed: {"autoCompactWindow": 1_000_000}}, settings)
 
     def test_a_declared_one_million_route_drops_its_unsuffixed_entry(self) -> None:
         # The id moved when the declaration arrived, so the entry written under
@@ -1086,17 +1093,19 @@ general_settings:
             with mock.patch.object(domain, "desktop_uses_local_api", return_value=True), mock.patch.object(
                 domain, "_public_models", return_value=["gpt-5.4"]
             ), mock.patch.object(
-                claude_desktop_listing_module, "_declared_context_window", return_value=1_000_000
+                domain,
+                "_public_model_rows",
+                return_value=[{"id": "gpt-5.4", "max_input_tokens": 1_000_000}],
             ):
-                self.assertTrue(domain._declares_one_million_context())
+                self.assertTrue(domain._publishes_one_million_context())
                 domain._prefer_one_million_context()
             config = json.loads(domain.raw_text(document="desktop", include_sensitive=True))
             self.assertTrue(config["modelPrefer1mContext"])
 
-    def test_a_window_this_app_only_resolved_is_not_a_declaration(self) -> None:
-        # ``/v1/models`` can state a window nobody on the route declared
-        # (LiteLLM's table, a provider profile).  That is a reading, and a 1M
-        # reading is what made the picker hide rows that could run.
+    def test_the_preference_follows_the_window_this_app_publishes(self) -> None:
+        # One statement per route: the number this app publishes is the number
+        # every surface states.  A route it publishes below 1M therefore leaves
+        # the picker's 1M preference alone, because there is no 1M row for it.
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             desktop_root = root / "configLibrary"
@@ -1116,18 +1125,19 @@ general_settings:
             with mock.patch.object(domain, "desktop_uses_local_api", return_value=True), mock.patch.object(
                 domain, "_public_models", return_value=["gemini-3.8-flash"]
             ), mock.patch.object(
-                claude_desktop_listing_module, "_declared_context_window", return_value=None
+                domain,
+                "_public_model_rows",
+                return_value=[{"id": "gemini-3.8-flash", "max_input_tokens": 272_000}],
             ):
-                self.assertFalse(domain._declares_one_million_context())
+                self.assertFalse(domain._publishes_one_million_context())
                 domain._prefer_one_million_context()
             config = json.loads(domain.raw_text(document="desktop", include_sensitive=True))
             self.assertNotIn("modelPrefer1mContext", config)
 
-    def test_no_route_declaring_1m_leaves_the_preference_off(self) -> None:
+    def test_no_published_route_at_one_million_leaves_the_preference_off(self) -> None:
         # The preference is about the whole picker: it hides the standard row of
-        # every route that reads as 1M.  Setting it wherever this app's proxy
-        # merely answered made the routes whose upstream advertises a large
-        # window lose the row that could run.
+        # every route that reads as 1M.  With no route at 1M there is nothing to
+        # collapse and the profile keeps its own answer.
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             desktop_root = root / "configLibrary"
@@ -1150,9 +1160,7 @@ general_settings:
             ]
             with mock.patch.object(domain, "desktop_uses_local_api", return_value=True), mock.patch.object(
                 domain, "_public_models", return_value=["gemini-3.8-flash", "gpt-6.1-sol"]
-            ), mock.patch.object(
-                claude_desktop_listing_module, "_declared_context_window", return_value=None
-            ):
+            ), mock.patch.object(domain, "_public_model_rows", return_value=rows):
                 domain._prefer_one_million_context()
             config = json.loads(domain.raw_text(document="desktop", include_sensitive=True))
             self.assertNotIn("modelPrefer1mContext", config)

@@ -669,23 +669,6 @@ _CODE_AUTO_COMPACT_MAX = 1_000_000
 _CLAUDE_CODE_BLANK_DESCRIPTION = "\u200b"
 
 
-def _claims_one_million(declared: object) -> bool:
-    """Whether a route's own declaration lets this app name it as 1M.
-
-    Used for the *spelling* -- the client's ``[1m]`` id -- where a claim changes
-    what a picker offers, and a wrong one hides a route or offers a row that
-    answers ``Invalid model name``.  It is deliberately not used for the window
-    a session is given: that one is chosen for the cost of being wrong (see
-    ``_code_behaves_as``).
-    """
-
-    return (
-        isinstance(declared, int)
-        and not isinstance(declared, bool)
-        and declared >= 1_000_000
-    )
-
-
 def _code_behaves_as(name: str, max_input_tokens: object) -> str | None:
     """The known Claude Code model an unknown public id should behave as.
 
@@ -1756,41 +1739,7 @@ class ClaudeSettingsDomain:
         # person reads is what the list is ordered by, without a sort here.
         return rows
 
-    def _declared_context(self, name: str) -> int | None:
-        """The smallest window the user wrote on this group's routes.
-
-        This is the *declaration*, read from the routes document rather than
-        from any window this app resolved: ``_claims_one_million`` asks it, and
-        the discovery view asks the registry the same question through
-        ``_custom_contexts``.  A group takes the smallest, because a group is
-        only as usable as its narrowest route.
-        """
-
-        from .. import codex_config
-        from ...public_names import public_name_key
-
-        try:
-            document = codex_config.load_yaml(self.runtime_config_path)
-        except Exception:
-            return None
-        if not isinstance(document, Mapping):
-            return None
-        key = public_name_key(name)
-        windows: list[int] = []
-        for entry in document.get("model_list") or ():
-            if not isinstance(entry, Mapping):
-                continue
-            if public_name_key(entry.get("model_name")) != key:
-                continue
-            info = entry.get("model_info")
-            if not isinstance(info, Mapping):
-                continue
-            value = info.get("max_input_tokens")
-            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-                windows.append(value)
-        return min(windows) if windows else None
-
-    def _code_picker_id(self, name: str, declared: object = None) -> str:
+    def _code_picker_id(self, name: str, max_input_tokens: object = None) -> str:
         """The id Claude Code's picker names for one public route.
 
         One id space for both Claude apps.  Claude Desktop's Code tab launches
@@ -1804,21 +1753,29 @@ class ClaudeSettingsDomain:
         ``claude_aliases``, and a Claude-shaped id (already in the client's own
         catalog) is kept as written.
 
-        A declared 1M route carries the suffix too, because that is the id the
-        desktop session sends: one route under two spellings would split
-        ``modelSettings`` again the moment one of the two apps addressed it.
-        It also states the window by name instead of by substitute
-        (``behavesAs``), which is the only way the terminal can read a window
-        the client's own catalogue has no tier for.  The discovery view suffixes
-        the same set (``desktop_model_rows``), so the two agree by construction;
-        a Claude-shaped id is left alone in both, because the client's catalogue
+        A route this app publishes at 1M carries the suffix too, because that
+        is the id the desktop session sends: one route under two spellings would
+        split ``modelSettings`` again the moment one of the two apps addressed
+        it.  It also states the window by name instead of only by substitute
+        (``behavesAs``), and the discovery view suffixes the same set from the
+        same number (``desktop_model_rows``), so the two agree by construction.
+        A Claude-shaped id is left alone in both, because the client's catalogue
         already answers for it.
+
+        ``max_input_tokens`` is the number this app publishes for the route --
+        the one its own pane shows and its ``/v1/models`` answers.  At or above
+        1M that number *is* 1M: the client has one large-window spelling, and
+        every surface here clamps to the same ceiling.
         """
 
         if claude_aliases.desktop_keeps_model_id(name):
             return name
         base = claude_aliases.claude_desktop_alias(name)
-        if _claims_one_million(declared):
+        if (
+            isinstance(max_input_tokens, int)
+            and not isinstance(max_input_tokens, bool)
+            and max_input_tokens >= 1_000_000
+        ):
             return f"{base}{claude_aliases.CONTEXT_SUFFIX}"
         return base
 
@@ -1850,8 +1807,7 @@ class ClaudeSettingsDomain:
         known = {str(row.get("id")): row for row in self._public_model_rows()}
         rows: list[dict[str, Any]] = []
         for name in names:
-            declared = self._declared_context(name)
-            model_id = self._code_picker_id(name, declared)
+            model_id = self._code_picker_id(name, (known.get(name) or {}).get("max_input_tokens"))
             # A list written before the ids were aliases carried the public
             # name, and a field the user typed there is theirs: adopt it onto
             # the id the row names now.
@@ -1919,8 +1875,7 @@ class ClaudeSettingsDomain:
             route = known.get(name)
             if route is None:
                 continue
-            declared = self._declared_context(name)
-            model_id = self._code_picker_id(name, declared)
+            model_id = self._code_picker_id(name, route.get("max_input_tokens"))
             entry = dict(settings.get(model_id) or settings.get(name) or {})
             entry.setdefault("autoCompactWindow", _code_auto_compact_window(route.get("max_input_tokens")))
             settings[model_id] = entry
@@ -1933,7 +1888,7 @@ class ClaudeSettingsDomain:
         # that differs is theirs, because nothing here knows which spelling they
         # meant.
         for name in names:
-            model_id = self._code_picker_id(name, self._declared_context(name))
+            model_id = self._code_picker_id(name, (known.get(name) or {}).get("max_input_tokens"))
             current = settings.get(model_id)
             if not isinstance(current, Mapping):
                 continue
@@ -2192,20 +2147,20 @@ class ClaudeSettingsDomain:
         wrong number for a 1M route.  Only an absent key is set: a user who
         turned the preference off keeps it.
 
-        The preference is set only while a route *declares* 1M, because it is a
-        choice about the whole picker rather than about one row.  Setting it
-        wherever this app's proxy merely answered made every route the proxy
-        resolves as 1M collapse to a 1M row the app then could not run: a route
-        reads 1,048,576 from a provider profile or LiteLLM's table without
-        anything on the route saying so, and the row it lost was the only one
-        that answered.
+        The preference is a choice about the whole picker rather than about one
+        row, so it follows whether this app publishes a 1M route at all -- the
+        number its own pane shows.  Every 1M row this app writes is either a
+        published alias (whose id already carries the client's ``[1m]``
+        spelling, so it has no variant to collapse) or a Claude-shaped id whose
+        own catalogue entry exists, which is why the rows it keeps still
+        answer.
         """
 
         if self._desktop is None or self._desktop.is_dirty():
             return
         if not self.desktop_uses_local_api():
             return
-        if not self._declares_one_million_context():
+        if not self._publishes_one_million_context():
             return
         state = self._desktop.draft_state()
         config = state.get("config") if isinstance(state, Mapping) else None
@@ -2217,23 +2172,20 @@ class ClaudeSettingsDomain:
         except Exception:
             return
 
-    def _declares_one_million_context(self) -> bool:
-        """Whether the user declared a 1M window on any route this app serves.
+    def _publishes_one_million_context(self) -> bool:
+        """Whether this app publishes any served route at 1M.
 
-        Read from the routes' own metadata, not from ``/v1/models``.  That
-        listing also carries windows this app only resolves (LiteLLM's table for
-        an id, a provider registry's profile), and those are readings: a
-        ``gemini-3.8-flash`` route read 1,048,576 there while nothing on the
-        route said so.  The discovery view asks the same question through
-        ``claude_desktop_listing``, so the two cannot disagree.
+        The number is the one the router's own ``/v1/models`` answers, which is
+        the same number the pane shows and the same one ``_code_picker_id``
+        suffixes -- so the preference, the picker row and the discovery row all
+        follow one statement.  A route at or above 1M counts as 1M: the client
+        has a single large-window spelling, and every surface here clamps to the
+        same ceiling.
         """
 
-        from ...proxy import claude_desktop_listing as _listing
-
-        names = self._public_models() or []
-        for name in names:
-            declared = _listing._declared_context_window(name)
-            if isinstance(declared, int) and declared >= 1_000_000:
+        for row in self._public_model_rows():
+            window = row.get("max_input_tokens")
+            if isinstance(window, int) and not isinstance(window, bool) and window >= 1_000_000:
                 return True
         return False
 

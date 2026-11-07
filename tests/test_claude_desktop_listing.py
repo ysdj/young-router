@@ -129,16 +129,6 @@ class ClaudeDesktopRowsTests(unittest.TestCase):
         )
         self.addCleanup(window_patcher.stop)
         window_patcher.start()
-        # A 1M claim is a claim about the route, so it needs the window the user
-        # wrote on it; nothing here declares one unless a test says so.
-        self.declared: dict[str, int] = {}
-        declared_patcher = mock.patch.object(
-            claude_desktop_listing,
-            "_declared_context_window",
-            side_effect=lambda name: self.declared.get(name),
-        )
-        self.addCleanup(declared_patcher.stop)
-        declared_patcher.start()
 
     def test_a_third_party_route_is_published_under_its_alias(self) -> None:
         rows = claude_desktop_listing.desktop_model_rows(
@@ -163,20 +153,18 @@ class ClaudeDesktopRowsTests(unittest.TestCase):
         # The app reads max_input_tokens to know a route is 1M; dropping it made
         # every alias assume 200k.
         self.windows["gemini-3.8-flash"] = 1_000_000
-        self.declared["gemini-3.8-flash"] = 1_000_000
         response = _response("gemini-3.8-flash")
         response["data"][0]["max_input_tokens"] = 200_000
         rows = claude_desktop_listing.desktop_model_rows(response)["data"]
         self.assertEqual(1_000_000, rows[0]["max_input_tokens"])
 
-    def test_a_declared_one_million_route_is_published_as_one_suffixed_row(self) -> None:
+    def test_a_one_million_route_is_published_as_one_suffixed_row(self) -> None:
         # A row whose max_input_tokens reads 1M becomes two picker entries in
         # Claude Desktop ("<name>" and "<name> 1M"), and the standard one
         # reports the client's 200k default.  The client's own suffix states the
         # same fact in the name: one row, resolved at 1M, and this app already
         # strips the suffix back to the public route when a turn names it.
         self.windows["kimi-k3.1-pro"] = 1_000_000
-        self.declared["kimi-k3.1-pro"] = 1_000_000
         rows = claude_desktop_listing.desktop_model_rows(_response("kimi-k3.1-pro"))["data"]
         self.assertEqual(1, len(rows))
         self.assertEqual(f"{claude_desktop_alias('kimi-k3.1-pro')}[1m]", rows[0]["id"])
@@ -184,25 +172,19 @@ class ClaudeDesktopRowsTests(unittest.TestCase):
 
     def test_a_window_below_one_million_keeps_the_bare_alias(self) -> None:
         self.windows["gpt-6.1-sol"] = 500_000
-        self.declared["gpt-6.1-sol"] = 500_000
         rows = claude_desktop_listing.desktop_model_rows(_response("gpt-6.1-sol"))["data"]
         self.assertEqual(claude_desktop_alias("gpt-6.1-sol"), rows[0]["id"])
 
-    def test_a_resolved_one_million_window_gets_no_suffix(self) -> None:
-        # Only the user's own declaration is a 1M claim; a window the registry
-        # merely resolved must not turn the row into a 1M route.
+    def test_a_window_above_the_ceiling_is_published_as_one_million(self) -> None:
+        # The client has one large-window spelling and its per-model setting
+        # accepts 100k..1M, so 1,048,576 is stated as exactly 1M: a second way to
+        # spell the same ceiling would only move the number the picker reports.
         self.windows["gemini-3.8-flash"] = 1_048_576
         rows = claude_desktop_listing.desktop_model_rows(_response("gemini-3.8-flash"))["data"]
-        self.assertEqual(claude_desktop_alias("gemini-3.8-flash"), rows[0]["id"])
-
-    def test_an_undeclared_one_million_window_is_not_a_1m_claim(self) -> None:
-        # The registry's published number can itself carry an upstream
-        # catalogue's reading, and the app reads any 1M row as "offers 1M" and
-        # hides the standard row.  Only the user's own declaration says a route
-        # can run at 1M.
-        self.windows["gemini-3.8-flash"] = 1_048_576
-        rows = claude_desktop_listing.desktop_model_rows(_response("gemini-3.8-flash"))["data"]
-        self.assertIsNone(rows[0]["max_input_tokens"])
+        self.assertEqual(1_000_000, rows[0]["max_input_tokens"])
+        self.assertEqual(
+            f"{claude_desktop_alias('gemini-3.8-flash')}[1m]", rows[0]["id"]
+        )
 
     def test_the_listings_advertised_window_is_never_the_published_one(self) -> None:
         # The listing's own number is the upstream's reading.  Stating it here
@@ -216,15 +198,14 @@ class ClaudeDesktopRowsTests(unittest.TestCase):
                 rows = claude_desktop_listing.desktop_model_rows(response)["data"]
                 self.assertIsNone(rows[0]["max_input_tokens"])
 
-    def test_a_declared_window_below_one_million_is_published_as_declared(self) -> None:
+    def test_a_window_below_one_million_is_published_as_it_is(self) -> None:
         self.windows["gpt-6.1-sol"] = 500_000
-        self.declared["gpt-6.1-sol"] = 500_000
         rows = claude_desktop_listing.desktop_model_rows(_response("gpt-6.1-sol"))["data"]
         self.assertEqual(500_000, rows[0]["max_input_tokens"])
 
-    def test_a_published_window_below_one_million_is_stated_without_a_declaration(self) -> None:
+    def test_a_small_window_is_stated_as_it_is(self) -> None:
         # Below 1M the number is what the picker reports, and the app offers no
-        # 1M variant from it, so it needs no declaration.
+        # 1M variant from it.
         self.windows["gpt-5.4"] = 272_000
         rows = claude_desktop_listing.desktop_model_rows(_response("gpt-5.4"))["data"]
         self.assertEqual(272_000, rows[0]["max_input_tokens"])
@@ -233,7 +214,6 @@ class ClaudeDesktopRowsTests(unittest.TestCase):
         rows = claude_desktop_listing.desktop_model_rows(
             _response("gemini-3.8-flash"),
             public_window=lambda name: 1_000_000,
-            declared_window=lambda name: 1_000_000,
         )["data"]
         self.assertEqual(1_000_000, rows[0]["max_input_tokens"])
 
@@ -291,7 +271,6 @@ class ClaudeDesktopListingPatchTests(unittest.TestCase):
         # machine's cache is not part of the test.
         for attribute, value in (
             ("_public_context_window", lambda name: None),
-            ("_declared_context_window", lambda name: None),
         ):
             patcher = mock.patch.object(claude_desktop_listing, attribute, side_effect=value)
             self.addCleanup(patcher.stop)
