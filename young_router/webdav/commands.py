@@ -13,7 +13,6 @@ from .core import (
     SyncError,
     WebDAVClient,
     WebDAVHTTPError,
-    _validate_bundle_header,
     _redact_url,
     _settings_from_raw,
     baseline_manifest,

@@ -541,23 +541,6 @@ def _control_api_root(api_base: str) -> str | None:
     return root if path.endswith("/api") else f"{root}/api"
 
 
-def _endpoint_candidates(api_base: str) -> list[tuple[str, str, str]]:
-    control_root = _control_api_root(api_base)
-    root = service_root(api_base)
-    if control_root is None or root is None:
-        return []
-    return [
-        # New API's key-scoped log feed is explicitly read-only and accepts a
-        # normal gateway key.  It is the appropriate source for a Menu route,
-        # which stores gateway credentials rather than dashboard sessions.
-        ("newapi", f"{control_root}/log/token", "bearer"),
-        # Sub2API's compatible usage document lives on the API root, not under
-        # its control-plane prefix: one answered per model and is stamped with
-        # the moment of the read, so it is a summary and never the log feed.
-        ("sub2api", f"{root}/v1/usage", "bearer"),
-    ]
-
-
 # The per-request ledger a Sub2API dashboard keeps, read with the account's own
 # session rather than a gateway key: the gateway key is scoped to the traffic it
 # served, while the dashboard answers the login's whole history.
@@ -569,10 +552,6 @@ _SUB2API_PAGE_SIZE = 200
 # page at a time and the station caps its own size, so this only bounds a
 # request; it is never used to walk the history in a single read.
 _SUB2API_MAX_PAGE_SIZE = 1_000
-# A New API log page shorter than this is the account's whole history, not a
-# page of it, so the reader does not follow pagination that cannot exist.
-_NEWAPI_MIN_PAGE = 50
-_NEWAPI_MAX_PAGES = 100
 
 # The dashboard's own token exchange.  A Sub2API station mints a short-lived
 # access token and rotates the refresh token every time it is used; both facts
@@ -1039,72 +1018,6 @@ def _sub2api_ledger_rows(
     return [item for item in items if isinstance(item, dict)], False, total_rows, applied_rows
 
 
-def _fetch_json(
-    url: str,
-    api_key: str,
-    timeout: float,
-    authorization_scheme: str,
-) -> tuple[str, dict[str, Any] | None]:
-    authorization = api_key if authorization_scheme == "raw" else f"Bearer {api_key}"
-    request = urllib.request.Request(
-        url,
-        headers={
-            **browser_request_headers(),
-            "Authorization": authorization,
-        },
-        method="GET",
-    )
-    try:
-        with isolated_http_opener().open(request, timeout=timeout) as response:
-            status = int(getattr(response, "status", None) or response.getcode())
-            body = response.read(MAX_RESPONSE_BYTES + 1)
-    except urllib.error.HTTPError as exc:
-        # A refusal is not the same fact as a missing route: 401/403 says the
-        # endpoint exists and this credential may not read it, while 404 says
-        # the station does not install it.  The difference decides whether the
-        # next credential is worth trying.
-        if exc.code in {401, 403}:
-            return "refused", None
-        return "unsupported", None
-    except (socket.timeout, TimeoutError):
-        return "timeout", None
-    except (urllib.error.URLError, OSError):
-        return "network", None
-    if not 200 <= status < 300 or len(body) > MAX_RESPONSE_BYTES:
-        return "unsupported", None
-    try:
-        payload = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return "unsupported", None
-    if not isinstance(payload, dict):
-        return "unsupported", None
-    if payload.get("success") is False:
-        return "unsupported", None
-    code = payload.get("code")
-    if isinstance(code, int) and not isinstance(code, bool) and code != 0:
-        return "unsupported", None
-    return "ok", payload
-
-
-def _items(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
-    """Return a recognized paginated item list, including an empty one.
-
-    Empty usage history is a valid response.  Keeping it distinct from an
-    unrecognized JSON object lets the UI say that a relay has no recent rows
-    instead of falsely claiming that no supported endpoint exists.
-    """
-
-    for container in (payload.get("data"), payload):
-        if isinstance(container, dict):
-            for key in ("items", "data", "list", "logs"):
-                value = container.get(key)
-                if isinstance(value, list):
-                    return [item for item in value if isinstance(item, dict)]
-        elif isinstance(container, list):
-            return [item for item in container if isinstance(item, dict)]
-    return None
-
-
 def _named_text(value: Any, limit: int = 64) -> str:
     """The name a station states for something, whether it is a string or an object.
 
@@ -1207,40 +1120,6 @@ def _total_tokens(row: dict[str, Any]) -> str:
         total += number
         found = True
     return _safe_number(total) if found else ""
-
-
-def _summary_rows(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
-    """Project a credential-scoped usage summary into safe model rows."""
-
-    raw_models: Any = payload.get("model_stats")
-    if not isinstance(raw_models, list):
-        data = payload.get("data")
-        raw_models = data.get("model_stats") if isinstance(data, dict) else None
-    if not isinstance(raw_models, list):
-        return None
-    rows: list[dict[str, Any]] = []
-    for raw_model in raw_models:
-        if not isinstance(raw_model, dict):
-            continue
-        model = _safe_text(raw_model.get("model") or raw_model.get("model_name"), 96)
-        if not model:
-            continue
-        row: dict[str, Any] = {"model": model}
-        for key in (
-            "total_tokens",
-            "token_count",
-            "tokens",
-            "input_tokens",
-            "output_tokens",
-            "prompt_tokens",
-            "completion_tokens",
-            "cache_creation_tokens",
-            "cache_read_tokens",
-        ):
-            if key in raw_model:
-                row[key] = raw_model[key]
-        rows.append(row)
-    return rows
 
 
 def _duration_milliseconds(row: Mapping[str, Any]) -> str:
@@ -1469,68 +1348,6 @@ def fetch_target(
     if not target.session_headers:
         return "", [], USAGE_REASON_NO_CREDENTIAL, 0, 0
     return "", [], "", 0, 0
-
-
-def _fetch_key(
-    api_key: str,
-    probe: tuple[str, str, str],
-    timeout: float,
-    kind: str,
-) -> tuple[str, dict[str, Any] | None, list[dict[str, Any]] | None]:
-    """Read one key's page: its result, the payload, and the recognized rows.
-
-    New API's log feed is paginated and the first page is a single page, not the
-    account's history: reading only that page reported the busiest account's
-    rows as the few hundred a default page happens to carry.  The remaining
-    pages are read while the station says more exist.
-    """
-
-    _kind, endpoint, authorization_scheme = probe
-    result, payload = _fetch_json(endpoint, api_key, timeout, authorization_scheme)
-    if result != "ok" or payload is None:
-        return result, payload, None
-    rows = _items(payload)
-    if rows is None and kind == "sub2api":
-        rows = _summary_rows(payload)
-    if rows is None:
-        return result, payload, None
-    if kind == "newapi":
-        rows = _newapi_all_pages(rows, endpoint, payload, api_key, timeout, authorization_scheme)
-    return result, payload, rows
-
-
-def _newapi_all_pages(
-    first_rows: list[dict[str, Any]],
-    endpoint: str,
-    payload: dict[str, Any],
-    api_key: str,
-    timeout: float,
-    authorization_scheme: str,
-) -> list[dict[str, Any]]:
-    """Follow a New API log feed's own pagination up to the reader's bound."""
-
-    rows = list(first_rows)
-    page_size = len(first_rows)
-    if page_size < _NEWAPI_MIN_PAGE or len(rows) >= MAX_ROWS_PER_TARGET:
-        return rows
-    # New API answers ``p`` as a zero-based page and ``page_size`` as the page's
-    # own length; reuse the length the station just returned rather than
-    # guessing a size it may reject.
-    for page in range(1, _NEWAPI_MAX_PAGES + 1):
-        if len(rows) >= MAX_ROWS_PER_TARGET:
-            break
-        separator = "&" if "?" in endpoint else "?"
-        url = f"{endpoint}{separator}p={page}&page_size={page_size}"
-        result, more = _fetch_json(url, api_key, timeout, authorization_scheme)
-        if result != "ok" or more is None:
-            break
-        page_rows = _items(more)
-        if not page_rows:
-            break
-        rows.extend(page_rows)
-        if len(page_rows) < page_size:
-            break
-    return rows
 
 
 def _records_from(

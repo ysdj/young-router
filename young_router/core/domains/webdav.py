@@ -278,7 +278,7 @@ class WebDAVSettingsDomain:
                 continue
             try:
                 return path.read_text(encoding="utf-8") if path.exists() else ""
-            except OSError as exc:
+            except OSError:
                 raise DomainError("The requested document is unavailable") from None
         raise DomainError("The requested document is unavailable")
 

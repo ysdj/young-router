@@ -12,7 +12,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import ctypes
 import copy
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -46,18 +45,10 @@ from .persistence import (
     read_json,
     read_text,
 )
-from .security import REDACT_TEXT, safe_exception_message
+from .security import REDACT_TEXT
 from .domains.logs import active_cooldown_states, active_recovery_states
 
 
-MAX_OPERATION_OUTPUT_BYTES = 128 * 1024
-# How many usage rows one refresh may carry. The log view itself is bounded by
-# MAX_VIEW_BYTES and trims the oldest rows when the encoded view would exceed
-# it, so a cap well above that budget would read history the pane can never be
-# shown: the station would pay for pages whose rows are then dropped on the way
-# out. A row is ~400 bytes, which keeps this under the view budget with room for
-# the metadata the view also carries.
-MAX_USAGE_ROWS = 6_000
 # How long one page read may take.  A page is what the pane waits for, so this
 # is the bound on the wait indicator rather than on the history.
 USAGE_PAGE_TIMEOUT_SECONDS = 90.0
@@ -150,7 +141,7 @@ def _provider_config_source(paths: "RuntimePaths") -> Path:
     itself uses.  This function used to reconstruct a preference order over two
     paths — the editor's and the older root-level default — which made a stale
     root-level file a *candidate* for what the proxy should load.  The order is
-    gone: a retired document is reported by ``retire_stale_document`` and never
+    gone: a retired document is reported by ``stale_document`` and never
     read, because a file that nothing writes must not be able to steer the
     document everything reads.
     """
@@ -288,16 +279,6 @@ def _retired_references_rewritten(document: object) -> object | None:
         if changed:
             staged["model_list"] = restated_models
     return staged if changed else None
-
-
-def _safe_object(value: object, *, limit: int = 64) -> dict[str, Any]:
-    if not isinstance(value, Mapping):
-        return {}
-    result: dict[str, Any] = {}
-    for key, item in list(value.items())[:limit]:
-        if isinstance(item, (str, bool, int, float)) or item is None:
-            result[str(key)[:80]] = _bounded_text(item) if isinstance(item, str) else item
-    return result
 
 
 @dataclass(frozen=True)

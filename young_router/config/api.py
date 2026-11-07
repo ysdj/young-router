@@ -16,7 +16,6 @@ from .load import (
     CONFIG_DOCUMENT_DISABLED_KEY,
     config_document_from_path,
     load_config,
-    load_config_document,
     normalize_config_document,
 )
 from .schema import (
@@ -397,7 +396,6 @@ def save_config(
         _dump_providers_section,
         _dump_section,
         _entry_from_editor,
-        _group_references_restated,
         _replace_top_level_sections,
         _unique_model_groups,
         _write_atomic,

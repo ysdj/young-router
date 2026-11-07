@@ -26,6 +26,7 @@ import urllib.error
 import urllib.request
 import uuid
 
+from ...api_base import _NoRedirect
 from ...browser_identity import browser_request_headers
 from ...public_names import imported_public_name
 from ..persistence import AtomicJSONStore, PersistenceError, read_bytes
@@ -1036,12 +1037,10 @@ class RelayHTTPClient:
     ):
         self._optional_paths = optional_paths
         if opener is None:
-            class NoRedirect(urllib.request.HTTPRedirectHandler):
-                def redirect_request(self, req: object, fp: object, code: int, msg: str, headers: object, newurl: str) -> None:
-                    return None
-
             context = ssl.create_default_context()
-            opener = urllib.request.build_opener(NoRedirect(), urllib.request.HTTPSHandler(context=context))
+            opener = urllib.request.build_opener(
+                _NoRedirect(), urllib.request.HTTPSHandler(context=context)
+            )
         self._opener = opener
 
     def _request_json(
@@ -6272,9 +6271,6 @@ class RelayAccountsDomain:
         *,
         refresh: bool = False,
         slot_credentials: object | None = None,
-        # Retained for the caller's own vocabulary (a dependency-only Apply).
-        # Whether the station is read follows from ``slot_credentials`` alone.
-        local_only: bool = False,
     ) -> dict[str, Any]:
         """Resolve private relay binding material for the Core Apply coordinator.
 
@@ -6293,12 +6289,8 @@ class RelayAccountsDomain:
         account refresh plus one gateway catalog per key is what an edit used to
         spend inside the store lock, once per linked key in the whole document.
         A source the slots do not cover still reads the station, because a key
-        only it could reveal has to come from somewhere.
-
-        ``local_only`` names the dependency-only Apply and is kept for its
-        caller's vocabulary; it no longer decides whether the station is read.
-        That follows from whether the slots cover the sources, so the relay's
-        own Apply gets the same answer a model edit does.
+        only it could reveal has to come from somewhere.  The same answer
+        therefore serves a dependency-only Apply and a model edit.
 
         This method is intentionally *not* used by ``snapshot`` or generic
         actions. Its return value can contain ``api_key`` and must remain

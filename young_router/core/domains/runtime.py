@@ -146,7 +146,6 @@ DEFAULT_MASTER_KEY = "sk-young-router"
 _MASTER_KEY_VALUE = re.compile(r"[A-Za-z0-9._~+/=:@!*(),;-]{1,256}")
 #: The first top-level ``general_settings:`` block a document holds.
 _MASTER_KEY_BLOCK = re.compile(r"^general_settings:[^\n]*\n(?:[ \t]+[^\n]*\n)*", re.MULTILINE)
-_MASTER_KEY_LINE = re.compile(r"^(?P<lead>[ \t]+)master_key[ \t]*:[ \t]*(?P<rest>.*)$", re.MULTILINE)
 
 
 def master_key_is_valid(key: object) -> bool:

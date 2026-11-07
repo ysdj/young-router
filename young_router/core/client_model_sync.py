@@ -46,7 +46,6 @@ pass that lands.
 
 from __future__ import annotations
 
-import os
 import pathlib
 import threading
 import time

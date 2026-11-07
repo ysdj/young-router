@@ -174,12 +174,6 @@ def _provider_key_anchor(provider_name: str, key_name: str) -> str:
     return _make_anchor_name(provider_name, f"api_key_{key_name}")
 
 
-def _slug(value: str) -> str:
-    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip())
-    slug = re.sub(r"-+", "-", slug).strip("-")
-    return slug
-
-
 def _deployment_route_key(
     *,
     model_name: str = "",
@@ -308,13 +302,6 @@ def _normalized_api_keys(provider: dict[str, Any]) -> list[dict[str, Any]]:
         item["anchor"] = _unique_anchor(_provider_key_anchor(provider_name, item["name"]), seen_anchors)
 
     return keys
-
-
-def _primary_api_key(keys: list[dict[str, Any]]) -> dict[str, Any] | None:
-    for item in keys:
-        if item["name"] == DEFAULT_API_KEY_NAME:
-            return item
-    return keys[0] if keys else None
 
 
 def _api_key_by_name(provider: dict[str, Any], key_name: str) -> dict[str, Any] | None:
@@ -756,37 +743,6 @@ def _dump_section(key: str, value: Any) -> str:
         sort_keys=False,
         width=1000,
     ).rstrip() + "\n"
-
-
-def _find_top_level_section(text: str, key: str) -> tuple[int, int] | None:
-    document = yaml.compose(text, Loader=_YAML_LOADER)
-    if not isinstance(document, yaml.nodes.MappingNode):
-        return None
-
-    entries = document.value
-    for index, (key_node, _value_node) in enumerate(entries):
-        if not isinstance(key_node, yaml.nodes.ScalarNode) or key_node.value != key:
-            continue
-        end = (
-            entries[index + 1][0].start_mark.index
-            if index + 1 < len(entries)
-            else len(text)
-        )
-        return key_node.start_mark.index, end
-    return None
-
-
-def _replace_top_level_section(text: str, key: str, block: str) -> str:
-    section = _find_top_level_section(text, key)
-    if section is None:
-        suffix = "" if text.endswith("\n") else "\n"
-        return f"{text}{suffix}\n{block}\n"
-    start, end = section
-    before = text[:start].rstrip()
-    after = text[end:].lstrip("\n")
-    prefix = f"{before}\n\n" if before else ""
-    suffix = f"\n{after}" if after else ""
-    return f"{prefix}{block.rstrip()}\n{suffix}"
 
 
 def _replace_top_level_sections(text: str, blocks: dict[str, str]) -> str:

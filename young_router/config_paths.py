@@ -15,10 +15,9 @@ layout is:
 - ``<root>/.litellm-runtime/config.yaml`` — the document the provider editor
   writes and the managed proxy loads.  This is *the* configuration.
 - ``<root>/config.yaml`` — never written, never read.  A file that exists there
-  belongs to a layout this module no longer produces; ``retire_stale_document``
-  refuses to serve it and reports it so the caller can move it aside.  Refusing
-  is the point: silently preferring one of two documents is how an edit landed
-  in a file nothing read.
+  belongs to a layout this module no longer produces; ``stale_document``
+  reports it so the caller can name it.  Refusing is the point: silently
+  preferring one of two documents is how an edit landed in a file nothing read.
 
 An explicit ``LITELLM_CONFIG_FILE`` still wins, because a packaged preview
 profile names its own document.  That setting is one path for the whole process,
@@ -79,15 +78,3 @@ def stale_document(root: Path | str | None = None) -> Path | None:
         return None
     legacy = legacy_provider_config_path(root)
     return legacy if legacy.is_file() else None
-
-
-def retired_document_path(root: Path | str | None = None) -> Path:
-    """Where ``retire_stale_document`` moves a retired copy.
-
-    Beside the live document rather than beside the dead one: one directory
-    holds this installation's configuration, so the record of what it used to
-    contain is not a second candidate document in the root.
-    """
-
-    live = provider_config_path(root)
-    return live.with_name(f"{live.stem}.retired{live.suffix}")

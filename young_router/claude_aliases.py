@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 #: Brand tokens Claude Desktop refuses inside a model id, even behind a
 #: ``claude-`` prefix.  Observed one id at a time: each of these was removed

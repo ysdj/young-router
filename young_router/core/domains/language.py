@@ -14,7 +14,6 @@ from ...atomic_io import atomic_write_text
 
 DOMAIN_NAME = "language"
 LANGUAGE_OPTIONS = ("system", "en", "zh-Hans")
-RESOLVED_LANGUAGES = ("en", "zh-Hans")
 
 
 class LanguageSettingsError(ValueError):

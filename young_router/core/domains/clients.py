@@ -16,7 +16,6 @@ import json
 import os
 import stat
 from pathlib import Path
-from collections.abc import Mapping
 from typing import Any
 
 from ..model_catalog import CATALOG_FILE_NAME, managed_catalog_path

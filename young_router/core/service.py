@@ -36,7 +36,6 @@ from .security import REDACTED, _key_text, redact, safe_exception_message, safe_
 
 
 CORE_METADATA_VERSION = 1
-STATE_FILE_NAME = "core-state.json"
 PACKAGE_FORMAT = "young-router-core-package"
 PACKAGE_VERSION = 1
 DOMAIN_FILE_FORMAT = "young-router-domain-settings"
@@ -5184,13 +5183,12 @@ class CoreStore:
                 and operation.get("kind") != "api_key_delete"
                 and operation.get("state", operation.get("status", "staged")) == "staged"
             ]
-            non_destructive_result: object = {"issues": []}
             if non_destructive:
                 # We cross the remote boundary immediately before invoking the
                 # helper because a timeout is ambiguous: it may have applied
                 # the remote mutation even when no response was received.
                 remote_boundary_crossed = True
-                non_destructive_result = execute(prepared, phase="non_destructive")
+                execute(prepared, phase="non_destructive")
 
             if not relay_dependency_only:
                 reconciled = reconcile(prepared, phase="non_destructive")
@@ -5322,7 +5320,6 @@ class CoreStore:
                         {"resources": sources},
                         refresh=True,
                         slot_credentials=slot_credentials,
-                        local_only=relay_dependency_only,
                     )
                     materialized = materialize(materials, scope=binding_scope)
                     # Whatever this resolution said becomes the pane's own map
@@ -5403,12 +5400,11 @@ class CoreStore:
                 and operation.get("kind") == "api_key_delete"
                 and operation.get("state", operation.get("status", "staged")) == "staged"
             ]
-            destructive_result: object = {"issues": []}
             if destructive:
                 # Local configuration is now independent of every key marked
                 # for removal; a failed deletion remains journaled for retry.
                 remote_boundary_crossed = True
-                destructive_result = execute(prepared, phase="destructive")
+                execute(prepared, phase="destructive")
             if relay_dependency_only:
                 # This edit carries no relay work of its own, so the journal's
                 # remaining phases are not part of its result: every pending
@@ -6156,7 +6152,6 @@ class CoreStore:
         *,
         source_token: str,
         revision: int | None = None,
-        remove_source: bool = False,
     ) -> PreparedImport:
         """Consume a picker capability and prepare a non-mutating import plan."""
 

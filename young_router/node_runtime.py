@@ -8,7 +8,6 @@ resolution here means one adapter cannot drift from the other.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 import os
 from pathlib import Path
 import shutil

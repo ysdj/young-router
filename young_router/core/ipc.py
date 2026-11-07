@@ -457,7 +457,9 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, _format: str, *_args: object) -> None:
         # HTTP's default stderr logger includes request paths and would make a
         # credential-bearing query/body easy to correlate.  The Core has no
-        # request logger at this boundary.
+        # request logger at this boundary: the host reports its own failures,
+        # and a line per request would both leak settings traffic onto stderr
+        # and cost more than the request itself.
         return
 
     def _authorization(self) -> str:
@@ -522,12 +524,6 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                 self.close_connection = True
                 return
             remaining -= len(chunk)
-
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib signature
-        # Loopback IPC: the host reports its own failures, and a log line per
-        # request would both leak settings traffic onto stderr and cost more
-        # than the request itself.
-        return
 
     def _browser_session_cookie_header(self, session_token: str) -> str:
         # No ``Max-Age``: the session ends when the browser does, exactly like
@@ -2121,7 +2117,6 @@ class CoreIPCServer:
                 prepared = self.core.prepare_import(
                     source_token=source,
                     revision=params["revision"],
-                    remove_source=source in self._browser_files,
                 )
                 self.discard_browser_file(source)
                 result = {

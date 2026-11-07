@@ -29,6 +29,8 @@ from .. import atomic_io as _atomic_io
 from ..api_base import _NoRedirect
 from ..browser_identity import browser_request_headers
 
+# The parse seam: tests patch ``codex_config.yaml.safe_load`` to prove a read
+# path parses nothing, so the module keeps the name.
 import yaml
 
 
@@ -358,13 +360,6 @@ def load_yaml(path: pathlib.Path) -> dict[str, Any]:
     """
 
     return copy.deepcopy(_load_yaml_text(_read_yaml_text(path)))
-
-
-#: A document larger than this is parsed on every read rather than retained, so
-#: a pathological file cannot pin memory for the process lifetime.  The parse
-#: itself is shared through ``config.schema``'s cache, which is the one every
-#: reader of this document already goes through.
-_YAML_CACHE_MAX_BYTES = 8 * 1024 * 1024
 
 
 def _read_yaml_text(path: pathlib.Path) -> tuple[str, None]:

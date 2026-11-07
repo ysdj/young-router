@@ -9,7 +9,6 @@ never leave this module through a snapshot or ordinary dispatch result.
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -61,12 +60,6 @@ def _validated_ref(value: object) -> str:
     if not _REF_RE.fullmatch(ref):
         raise ValueError("Provider credential reference is invalid")
     return ref
-
-
-def credential_env_name(credential_ref: str) -> str:
-    ref = _validated_ref(credential_ref)
-    digest = hashlib.sha256(ref.encode("utf-8")).hexdigest()[:32].upper()
-    return f"YOUNG_ROUTER_AUTH_{digest}"
 
 
 def _safe_error(value: object) -> str:

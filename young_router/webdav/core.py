@@ -10,7 +10,6 @@ import os
 import pathlib
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.error
@@ -1083,12 +1082,6 @@ def create_bundle(config_path: pathlib.Path) -> tuple[bytes, dict[str, Any]]:
         "files": files,
     }
     return json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"), manifest
-
-
-def write_config_bundle(config_path: pathlib.Path, output_path: pathlib.Path) -> dict[str, Any]:
-    bundle_data, manifest = create_bundle(config_path)
-    _atomic_write(output_path, bundle_data)
-    return manifest
 
 
 def _expected_bundle_files() -> dict[str, tuple[bool, str]]:

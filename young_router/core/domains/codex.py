@@ -44,7 +44,6 @@ from ._shared import (
     _action_name,
     _app_state_root,
     _default_provider_config_path,
-    _default_runtime_root,
     _default_runtime_settings_path,
     _mapping,
     _safe_problem,
@@ -1640,8 +1639,6 @@ class CodexSettingsDomain:
         return {"valid": not bool(errors), "errors": list(errors) if isinstance(errors, list) else ["Codex settings are invalid"]}
 
     def apply(self, payload: object | None = None) -> dict[str, Any]:
-        from .. import codex_config
-
         if payload is not None:
             data = _mapping(payload)
             if "config_text" in data or "auth_text" in data:
