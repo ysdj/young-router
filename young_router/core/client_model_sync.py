@@ -9,7 +9,8 @@ sends -- the alias, which the desktop Code tab sends too -- so a route that was
 added, removed or renamed has to reach that file whether the user works in the
 terminal or in the desktop app.
 
-Three things can make those names change, and each has its own trigger:
+Three things can make a generated file out of date, and each has its own
+trigger:
 
 * **An edit in this app.**  Saving a provider rewrites the router's document and
   reloads the proxy, and every reload regenerates the lists.  That path is
@@ -18,15 +19,22 @@ Three things can make those names change, and each has its own trigger:
   backup, a model toggled by another tool, a file replaced while the app was
   closed.  This loop covers it by watching the document's own timestamp, so the
   lists follow within a second rather than on a clock.
-* **A window that is open anyway** re-derives the catalog on its snapshot,
-  which costs nothing extra.
+* **A row that says something else about the same route.**  Neither of the
+  triggers above fires for this one, because no name moved and no document
+  moved with it: a window the context registry re-measured, a ``behavesAs`` or
+  ``label`` an older release wrote for the same route, an id spelling this
+  release changed.  A reload announces a new roster, never a new reading of an
+  old one.
+
+That last case is why this loop also asks on its own clock: every pass compares
+the file with what would be written now, so a release that only re-reads the
+same routes heals without a reload, and a number that changed under a name the
+picker already holds still reaches the picker.  A reload path could not cover
+it -- reloads regenerate the lists, but nothing tells them a row went stale.
 
 The refresh is idempotent -- every generator compares the document on disk with
 what the router serves and writes only a difference -- so watching rather than
-polling is safe: a pass that finds nothing new writes nothing.  Both lists are
-asked for on every pass, including the settle ladder and the slow fallback: a
-reload may never come (a proxy another process started, a route this app did
-not write), and the file itself is what is out of date.
+polling is safe: a pass that finds nothing new writes nothing.
 
 Why a settle window: the router serves ``/v1/models`` from its *running* process,
 and LiteLLM reloads its workers on its own schedule after the document changes.

@@ -3270,12 +3270,14 @@ class CoreStore:
         A provider Apply calls this with the default so the Claude picker
         follows the routes it just changed.  The background watcher passes the
         same default: the picker it generates is the one Claude Code *and* the
-        desktop Code tab read, so a route that changed while no window was open
-        has to reach that file from the watcher's own pass -- a reload may
-        never come.  Claude Desktop's own model list is still not written here;
-        it discovers ``/v1/models``.  Idempotent: each generator compares the
-        document on disk with what the router serves and writes only a
-        difference.
+        desktop Code tab read, and a row of it can be out of date without the
+        roster moving at all -- a window the context registry re-measured, a
+        shape an older release wrote.  No reload announces that, so the pass
+        that compares the file with what would be written has to be the
+        watcher's, not a reload's.  Claude Desktop's own model list is still not
+        written here; it discovers ``/v1/models``.  Idempotent: each generator
+        compares the document on disk with what the router serves and writes
+        only a difference.
         """
 
         codex_domain = self._domains.get("codex")
