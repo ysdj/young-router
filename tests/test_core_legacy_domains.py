@@ -3733,8 +3733,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
 
             endpoint["result"] = ([], True)
             for _ in range(2):
-                codex._catalog_source_checked_at = 0.0
-                core.snapshot()
+                core.refresh_client_model_lists(include_claude=False)
 
             # The file Codex loads is unchanged, so the client still starts with
             # a usable model list of its own.
@@ -3764,8 +3763,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             )
             endpoint["result"] = (["default-chat", "extra-chat"], True)
             for _ in range(3):
-                codex._catalog_source_checked_at = 0.0
-                core.snapshot()
+                core.refresh_client_model_lists(include_claude=False)
             catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 ["default-chat", "extra-chat"],
@@ -3794,6 +3792,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             catalog["models"][0]["description"] = "stale metadata"
             catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
 
+            core.refresh_client_model_lists(include_claude=False)
             snapshot = core.snapshot()["domains"]["codex"]["model_catalog"]
 
             self.assertEqual(["default-chat"], snapshot["public_models"])
@@ -3819,6 +3818,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
             catalog_path = home / "model-catalog.json"
             catalog_path.unlink()
 
+            core.refresh_client_model_lists(include_claude=False)
             snapshot = core.snapshot()["domains"]["codex"]["model_catalog"]
 
             self.assertTrue(catalog_is_current(catalog_path, ["default-chat"], registry=codex._context_registry))
@@ -3948,13 +3948,12 @@ class CodexSettingsDomainTests(unittest.TestCase):
 
             # The first post-apply observation is not stable yet: the catalog
             # still carries the previously written name.
-            codex._catalog_source_checked_at = 0.0
-            core.snapshot()["domains"]["codex"]["model_catalog"]
+            core.refresh_client_model_lists(include_claude=False)
             catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))
             self.assertEqual(["default-chat"], [model["slug"] for model in catalog["models"]])
 
             # A second fresh observation completes the repair.
-            codex._catalog_source_checked_at = 0.0
+            core.refresh_client_model_lists(include_claude=False)
             repaired = core.snapshot()["domains"]["codex"]["model_catalog"]
             self.assertEqual(["deepseek-v4-flash"], repaired["public_models"])
             catalog = json.loads((home / "model-catalog.json").read_text(encoding="utf-8"))

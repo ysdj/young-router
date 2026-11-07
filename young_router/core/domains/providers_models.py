@@ -1252,9 +1252,13 @@ class ProvidersModelsDomain:
         if not likely_image_ids:
             return {}
         try:
+            # A projection reads what the registry already holds.  The public
+            # context sources are refreshed on Core's background lane — a
+            # snapshot is polled by every window and must not wait out an
+            # eight-second remote ceiling because an image route is present.
             return self._public_model_context_registry().image_metadata_for_model_ids(
                 likely_image_ids,
-                refresh=True,
+                refresh=False,
             )
         except Exception:
             return {}

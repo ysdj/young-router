@@ -117,55 +117,193 @@ class WebDAVRemoteRenameTests(unittest.TestCase):
         self.assertEqual("my-own-config.json", settings.remote_name)
 
 
-class WebDAVSyncDirectionTests(unittest.TestCase):
-    """The direction is a saved setting, so the interval loop obeys it too."""
+class WebDAVSmartSyncPlanTests(unittest.TestCase):
+    """One comparison decides every sync, and it never stops to ask."""
 
-    def _path(self, directory: Path) -> Path:
-        return directory / "webdav.json"
+    @staticmethod
+    def _manifest(digest: str, modified_at: str, created_at: str) -> dict[str, object]:
+        return {
+            "app": webdav_core.APP_NAME,
+            "version": webdav_core.ARCHIVE_VERSION,
+            "format": webdav_core.CONFIG_BUNDLE_FORMAT,
+            "created_at": created_at,
+            "summary": {"providers": 1, "active_models": 1, "disabled_models": 0},
+            "files": [
+                {
+                    "path": "config.yaml",
+                    "present": True,
+                    "bytes": 1,
+                    "sha256": digest,
+                    "mode": 0o600,
+                    "modified_at": modified_at,
+                },
+                {"path": "config.disabled-models.yaml", "present": False},
+                {"path": "relay-accounts.json", "present": False},
+            ],
+        }
 
-    def test_the_direction_round_trips_and_defaults_to_smart(self) -> None:
+    def test_a_remote_that_already_matches_writes_nothing(self) -> None:
+        local = self._manifest("same", "2026-09-25T10:00:00Z", "2026-09-25T10:00:00Z")
+        remote = self._manifest("same", "2026-09-25T09:00:00Z", "2026-09-25T09:00:00Z")
+        self.assertEqual("unchanged", webdav_core.smart_sync_plan(local, remote, None))
+
+    def test_the_side_that_moved_alone_is_the_side_taken(self) -> None:
+        base = self._manifest("base", "2026-09-25T09:00:00Z", "2026-09-25T09:00:00Z")
+        local = self._manifest("local", "2026-09-25T10:00:00Z", "2026-09-25T10:00:00Z")
+        remote = self._manifest("remote", "2026-09-25T11:00:00Z", "2026-09-25T11:00:00Z")
+        self.assertEqual("push", webdav_core.smart_sync_plan(local, base, base))
+        self.assertEqual("pull", webdav_core.smart_sync_plan(base, remote, base))
+
+    def test_two_sides_that_both_moved_stop_for_a_choice(self) -> None:
+        """A real conflict is the reader's to settle, never a coin toss."""
+
+        base = self._manifest("base", "2026-09-25T09:00:00Z", "2026-09-25T09:00:00Z")
+        older = self._manifest("older", "2026-09-25T10:00:00Z", "2026-09-25T10:00:00Z")
+        newer = self._manifest("newer", "2026-09-25T12:00:00Z", "2026-09-25T12:00:00Z")
+        self.assertEqual("conflict", webdav_core.smart_sync_plan(newer, older, base))
+        self.assertEqual("conflict", webdav_core.smart_sync_plan(older, newer, base))
+
+    def test_without_a_baseline_the_newer_snapshot_still_decides(self) -> None:
+        """A lost sync state is not a question for the reader either."""
+
+        local = self._manifest("local", "2026-09-25T12:00:00Z", "2026-09-25T12:00:00Z")
+        remote = self._manifest("remote", "2026-09-25T10:00:00Z", "2026-09-25T10:00:00Z")
+        self.assertEqual("push", webdav_core.smart_sync_plan(local, remote, None))
+        self.assertEqual("pull", webdav_core.smart_sync_plan(remote, local, None))
+
+    def test_a_tie_or_an_unreadable_stamp_takes_the_copy_that_keeps_a_backup(self) -> None:
+        """With no baseline, the newer side wins -- and a tie pulls.
+
+        Nothing says either side moved, so this is a first sync between two
+        machines rather than a conflict.  A pull is the answer for a tie and for
+        a stamp that cannot be read: installing the remote copy backs up what it
+        replaces, while a push leaves the remote's version nowhere.
+        """
+
+        local = self._manifest("local", "2026-09-25T10:00:00Z", "2026-09-25T10:00:00Z")
+        same_moment = self._manifest("remote", "2026-09-25T10:00:00Z", "2026-09-25T10:00:00Z")
+        unreadable = dict(same_moment, created_at="not a timestamp")
+        self.assertEqual("pull", webdav_core.smart_sync_plan(local, same_moment, None))
+        self.assertEqual("pull", webdav_core.smart_sync_plan(local, unreadable, None))
+
+    def test_an_absent_remote_snapshot_is_a_push(self) -> None:
+        self.assertEqual(
+            "push",
+            webdav_core.smart_sync_plan(self._manifest("local", "2026-09-25T10:00:00Z", "2026-09-25T10:00:00Z"), None, None),
+        )
+
+    def test_a_direction_an_earlier_version_stored_is_not_carried_forward(self) -> None:
+        """The setting is gone; the file that still has it reads and rewrites clean."""
+
         with tempfile.TemporaryDirectory() as directory:
-            path = self._path(Path(directory))
-            settings = webdav_core.load_settings(path)
-            self.assertEqual("smart", settings.sync_direction)
-            self.assertEqual("smart", settings.sanitized()["sync_direction"])
-
-            saved = webdav_core.Settings(url="https://webdav.example.test/config/", sync_direction="pull")
-            webdav_core.save_settings(path, saved)
-            self.assertEqual("pull", webdav_core.load_settings(path).sync_direction)
-            self.assertEqual("pull", json.loads(path.read_text(encoding="utf-8"))["sync_direction"])
-
-    def test_the_ipc_spelling_and_legacy_keys_still_read_as_smart(self) -> None:
-        cases = {"sync": "smart", "auto": "smart", "SMART": "smart", "": "smart", "sideways": "smart", "push": "push"}
-        for stored, expected in cases.items():
-            with self.subTest(stored):
-                with tempfile.TemporaryDirectory() as directory:
-                    path = self._path(Path(directory))
-                    path.write_text(
-                        json.dumps({"url": "https://webdav.example.test/config/", "sync_direction": stored}),
-                        encoding="utf-8",
-                    )
-                    self.assertEqual(expected, webdav_core.load_settings(path).sync_direction)
-
-    def test_a_direction_alias_from_an_older_file_is_honored(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = self._path(Path(directory))
+            path = Path(directory) / "webdav.json"
             path.write_text(
-                json.dumps({"url": "https://webdav.example.test/config/", "direction": "push"}),
+                json.dumps({"url": "https://webdav.example.test/config/", "sync_direction": "pull", "direction": "push"}),
                 encoding="utf-8",
             )
-            self.assertEqual("push", webdav_core.load_settings(path).sync_direction)
+            settings = webdav_core.load_settings(path)
+            self.assertNotIn("sync_direction", settings.sanitized())
+            webdav_core.save_settings(path, settings)
+            self.assertNotIn("sync_direction", json.loads(path.read_text(encoding="utf-8")))
 
-    def test_the_commands_layer_writes_the_direction_through(self) -> None:
+    def test_the_commands_layer_accepts_a_payload_from_that_version_too(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = self._path(Path(directory))
+            path = Path(directory) / "webdav.json"
             existing = webdav_core.load_settings(path)
             updated = webdav_commands._settings_from_payload({"sync_direction": "pull"}, existing)
-            self.assertEqual("pull", updated.sync_direction)
-            # A payload that says nothing about the direction keeps the one the
-            # settings file already has.
-            self.assertEqual("pull", webdav_commands._settings_from_payload({}, updated).sync_direction)
-            self.assertEqual("smart", webdav_commands._settings_from_payload({}, existing).sync_direction)
+            self.assertEqual(existing.url, updated.url)
+            self.assertFalse(hasattr(updated, "sync_direction"))
+
+
+class WebDAVConflictRecordTests(unittest.TestCase):
+    """A stopped sync keeps the side the pane has to compare, and nothing else."""
+
+    def test_the_remote_side_round_trips_and_is_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "webdav-conflict.json"
+            webdav_core.save_conflict_record(
+                path,
+                {
+                    "config.yaml": "providers: {}\n".encode("utf-8"),
+                    # A binary or non-UTF-8 member is not text, so it is not
+                    # offered for a text comparison.
+                    "config.disabled-models.yaml": b"\xff\xfe",
+                },
+                "2026-09-25T09:59:00Z",
+            )
+            record = webdav_core.read_conflict_record(path)
+            self.assertIsNotNone(record)
+            self.assertEqual({"config.yaml": "providers: {}\n"}, record["files"])
+            self.assertEqual("2026-09-25T09:59:00Z", record["remote_created_at"])
+
+            webdav_core.clear_conflict_record(path)
+            self.assertIsNone(webdav_core.read_conflict_record(path))
+            # Clearing a record that is already gone is not an error: the next
+            # successful sync clears it whether or not a conflict preceded it.
+            webdav_core.clear_conflict_record(path)
+
+    def test_a_record_this_app_did_not_write_is_not_a_comparison(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "webdav-conflict.json"
+            path.write_text("not json", encoding="utf-8")
+            self.assertIsNone(webdav_core.read_conflict_record(path))
+
+            path.write_text(
+                json.dumps({"version": 1, "recorded_at": "x", "files": {"config.yaml": "y"}}) + " " * 1024,
+                encoding="utf-8",
+            )
+            self.assertEqual({"config.yaml": "y"}, webdav_core.read_conflict_record(path)["files"])
+
+            # A file larger than the writer's own cap is refused whole, so a
+            # damaged or hand-made record cannot be parsed into memory.
+            path.write_bytes(b"{" + b" " * (webdav_core.CONFIG_BUNDLE_MAX_BYTES * 2 + 4096))
+            self.assertIsNone(webdav_core.read_conflict_record(path))
+
+    def test_the_command_line_keeps_the_comparison_and_names_the_choice(self) -> None:
+        """The CLI has no reader to compare two sides, so it stops and says so."""
+
+        import argparse
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+            settings_path = root / "webdav.json"
+            settings_path.write_text(json.dumps({"url": "https://webdav.example.test/config/"}), encoding="utf-8")
+            base = {"files": [{"path": "config.yaml", "present": True, "sha256": "base"}]}
+            local = {"files": [{"path": "config.yaml", "present": True, "sha256": "local"}]}
+            remote = {"files": [{"path": "config.yaml", "present": True, "sha256": "remote"}]}
+            kept: list[Path] = []
+
+            args = argparse.Namespace(
+                config=config,
+                settings=settings_path,
+                state=root / "state.json",
+                status=root / "status.json",
+                command="sync",
+            )
+            with patch("young_router.webdav.core.WebDAVClient", return_value=object()), patch(
+                "young_router.webdav.commands.build_manifest", return_value=local
+            ), patch("young_router.webdav.commands.read_remote_manifest", return_value=remote), patch(
+                "young_router.webdav.commands.baseline_manifest", return_value=base
+            ), patch(
+                "young_router.webdav.commands.default_conflict_file", return_value=root / "conflict.json"
+            ), patch(
+                "young_router.webdav.commands.remember_remote_bundle",
+                side_effect=lambda _client, _settings, path: kept.append(path),
+            ), patch(
+                "young_router.webdav.commands.push_bundle"
+            ) as pushed, patch(
+                "young_router.webdav.commands.pull_bundle"
+            ) as pulled:
+                with self.assertRaises(webdav_core.SyncError) as raised:
+                    webdav_commands.command_sync(args)
+
+            self.assertEqual("webdav_sync_conflict", raised.exception.code)
+            self.assertIn("both ends changed", str(raised.exception))
+            self.assertEqual([root / "conflict.json"], kept)
+            pushed.assert_not_called()
+            pulled.assert_not_called()
 
 
 class WebDAVArchiveTests(unittest.TestCase):

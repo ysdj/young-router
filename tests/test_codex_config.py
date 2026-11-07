@@ -20,6 +20,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CodexConfigTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Several tests below substitute the transport; the listing memo is
+        # process-wide so a previous test's answer must not answer this one.
+        codex_config.clear_local_model_listing_cache()
+        self.addCleanup(codex_config.clear_local_model_listing_cache)
+
     class _Response:
         def __init__(self, payload: object, status: int = 200):
             self.status = status
@@ -152,6 +158,43 @@ class CodexConfigTests(unittest.TestCase):
             ],
             rows,
         )
+
+    def test_one_observation_answers_every_reader_in_a_refresh(self) -> None:
+        """The editor and both client lists share one ``/v1/models`` read.
+
+        While the proxy replaces its workers the port is bound but silent, so
+        each reader that asked again spent the endpoint timeout under the Core
+        lock.  One short-lived observation per refresh is enough; a failure is
+        remembered too, because it is the expensive answer.
+        """
+
+        opener = mock.Mock()
+        opener.open.return_value = self._Response({"data": [{"id": "model-a"}]})
+        with mock.patch.object(
+            codex_config, "local_base_url", return_value="http://127.0.0.1:4999/v1"
+        ), mock.patch.object(
+            codex_config.urllib.request, "build_opener", return_value=opener
+        ):
+            first = codex_config.local_exposed_models("sk-cache-test")
+            second = codex_config.local_exposed_models("sk-cache-test")
+
+        self.assertEqual(first, second)
+        self.assertEqual(1, opener.open.call_count)
+
+        codex_config.clear_local_model_listing_cache()
+        failing = mock.Mock()
+        failing.open.side_effect = urllib.error.URLError("offline")
+        with mock.patch.object(
+            codex_config, "local_base_url", return_value="http://127.0.0.1:4999/v1"
+        ), mock.patch.object(
+            codex_config.urllib.request, "build_opener", return_value=failing
+        ):
+            first_miss = codex_config.local_exposed_models("sk-cache-miss")
+            second_miss = codex_config.local_exposed_models("sk-cache-miss")
+
+        self.assertEqual(([], False), first_miss)
+        self.assertEqual(first_miss, second_miss)
+        self.assertEqual(1, failing.open.call_count)
 
     def test_local_exposed_models_returns_none_when_menu_is_unavailable(self) -> None:
         opener = mock.Mock()

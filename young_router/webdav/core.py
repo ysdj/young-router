@@ -65,8 +65,6 @@ SENSITIVE_QUERY_KEYS = {"x-vercel-protection-bypass"}
 SYNC_STATE_VERSION = 1
 DEFAULT_SYNC_INTERVAL_MINUTES = 30
 DEFAULT_TIMEOUT_SECONDS = 30.0
-SYNC_DIRECTIONS = ("smart", "push", "pull")
-DEFAULT_SYNC_DIRECTION = "smart"
 WEBDAV_REQUEST_RETRY_ATTEMPTS = 3
 WEBDAV_REQUEST_RETRY_DELAY_SECONDS = 1.0
 
@@ -218,7 +216,6 @@ class Settings:
     remote_name: str = DEFAULT_REMOTE_NAME
     sync_interval_minutes: int = DEFAULT_SYNC_INTERVAL_MINUTES
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
-    sync_direction: str = DEFAULT_SYNC_DIRECTION
 
     @property
     def configured(self) -> bool:
@@ -231,7 +228,6 @@ class Settings:
             "remote_name": self.remote_name,
             "sync_interval_minutes": self.sync_interval_minutes,
             "timeout_seconds": self.timeout_seconds,
-            "sync_direction": self.sync_direction,
             "has_password": bool(self.password),
         }
 
@@ -419,18 +415,6 @@ def _normalize_sync_interval_minutes(value: Any) -> int:
     return min(minutes, 24 * 60)
 
 
-def _normalize_sync_direction(value: Any) -> str:
-    if value is None or value == "":
-        return DEFAULT_SYNC_DIRECTION
-    text = str(value).strip().lower()
-    if text in {"sync", "auto", "automatic"}:
-        # The pane and the IPC action call the comparing mode "sync".
-        return DEFAULT_SYNC_DIRECTION
-    if text not in SYNC_DIRECTIONS:
-        return DEFAULT_SYNC_DIRECTION
-    return text
-
-
 def _normalize_timeout_seconds(value: Any) -> float:
     if value is None or value == "":
         return DEFAULT_TIMEOUT_SECONDS
@@ -456,9 +440,6 @@ def _settings_from_raw(raw: dict[str, Any]) -> Settings:
     timeout_seconds = _normalize_timeout_seconds(
         raw.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
     )
-    sync_direction = _normalize_sync_direction(
-        raw.get("sync_direction", raw.get("direction", DEFAULT_SYNC_DIRECTION))
-    )
     if "/" in remote_name or remote_name in {".", ".."}:
         raise SyncError("remote_name must be a file name, not a path")
     if not remote_name.lower().endswith(".json"):
@@ -473,7 +454,6 @@ def _settings_from_raw(raw: dict[str, Any]) -> Settings:
         remote_name=remote_name,
         sync_interval_minutes=sync_interval_minutes,
         timeout_seconds=timeout_seconds,
-        sync_direction=sync_direction,
     )
 
 
@@ -511,7 +491,6 @@ def save_settings(path: pathlib.Path, settings: Settings) -> None:
             "remote_name": settings.remote_name,
             "sync_interval_minutes": settings.sync_interval_minutes,
             "timeout_seconds": settings.timeout_seconds,
-            "sync_direction": settings.sync_direction,
         },
         ensure_ascii=False,
         indent=2,
@@ -853,6 +832,78 @@ def manifests_match(left: dict[str, Any] | None, right: dict[str, Any] | None) -
     return _manifest_fingerprints(left) == _manifest_fingerprints(right)
 
 
+def _newest_modified_epoch(manifest: dict[str, Any] | None) -> float | None:
+    """The moment the newest file a snapshot holds was written."""
+
+    if not isinstance(manifest, dict):
+        return None
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        return None
+    stamps = [
+        stamp
+        for entry in files
+        if isinstance(entry, dict) and entry.get("present")
+        for stamp in (timestamp_epoch(entry.get("modified_at")),)
+        if stamp is not None
+    ]
+    return max(stamps) if stamps else None
+
+
+def newest_snapshot(
+    local_manifest: dict[str, Any] | None,
+    remote_manifest: dict[str, Any] | None,
+) -> str:
+    """Which side of a compared pair was written last: ``local`` or ``remote``.
+
+    A remote manifest carries the moment the outbound side built it, which is
+    the upload that produced the file; a local manifest carries each file's own
+    mtime.  That compares two machines' clocks, so it decides only where no
+    baseline exists -- a first sync between two machines, where nothing says
+    either side moved.  An unreadable or equal stamp answers ``remote``:
+    installing the remote copy backs up what it replaces, while a push leaves
+    the remote's version nowhere.
+    """
+
+    local_stamp = _newest_modified_epoch(local_manifest)
+    remote_stamp = timestamp_epoch(remote_manifest.get("created_at")) if isinstance(remote_manifest, dict) else None
+    if local_stamp is None or remote_stamp is None:
+        return "remote"
+    return "local" if local_stamp > remote_stamp else "remote"
+
+
+def smart_sync_plan(
+    local_manifest: dict[str, Any] | None,
+    remote_manifest: dict[str, Any] | None,
+    base_manifest: dict[str, Any] | None,
+) -> str:
+    """What a smart sync does with these snapshots: push, pull, unchanged, or conflict.
+
+    Every caller -- the interval loop, the pane's button, the CLI -- asks this
+    one question, and there is no direction to consult.  A side that moved alone
+    is the side to take, because that snapshot is the one change this sync is
+    meant to carry.  Both sides moving is a real conflict: nothing here can know
+    which of the two edits the reader meant to keep, so the run stops and the
+    pane shows both sides.  Without a baseline nothing says either side moved;
+    the later snapshot wins there, so a first sync between two machines still
+    finishes.
+    """
+
+    if not isinstance(remote_manifest, dict):
+        return "push"
+    if manifests_match(local_manifest, remote_manifest):
+        return "unchanged"
+    if base_manifest is None:
+        return "pull" if newest_snapshot(local_manifest, remote_manifest) == "remote" else "push"
+    local_changed = not manifests_match(local_manifest, base_manifest)
+    remote_changed = not manifests_match(remote_manifest, base_manifest)
+    if local_changed and not remote_changed:
+        return "push"
+    if remote_changed and not local_changed:
+        return "pull"
+    return "conflict"
+
+
 def load_sync_state(path: pathlib.Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -908,6 +959,112 @@ def baseline_manifest(path: pathlib.Path) -> dict[str, Any] | None:
     state = load_sync_state(path)
     manifest = state.get("manifest")
     return manifest if isinstance(manifest, dict) else None
+
+
+def default_conflict_file() -> pathlib.Path:
+    """Where a stopped sync keeps the remote side for the pane to compare."""
+
+    configured = os.environ.get("LITELLM_WEBDAV_CONFLICT_FILE", "").strip()
+    if configured:
+        return pathlib.Path(configured).expanduser()
+    return default_root() / ".litellm-runtime" / "webdav-conflict.json"
+
+
+def save_conflict_record(
+    path: pathlib.Path,
+    files: dict[str, bytes],
+    remote_created_at: str | None,
+) -> None:
+    """Keep the remote side of a diverged sync until somebody chooses.
+
+    The comparison needs both texts, and only the local one is on disk: the
+    remote copy is gone from memory the moment the run ends, and the pane that
+    shows the diff usually opens later than the automatic run that stopped.  So
+    the remote files are written beside the sync state -- private, one record,
+    replaced by the next conflict and removed by the next successful sync.  The
+    local side is never copied here; it stays the file the reader can already
+    open.
+    """
+
+    texts: dict[str, str] = {}
+    for name, data in files.items():
+        try:
+            texts[name] = data.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+    record = json.dumps(
+        {
+            "version": SYNC_STATE_VERSION,
+            "recorded_at": _utc_now(),
+            "remote_created_at": remote_created_at,
+            "files": texts,
+        },
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(record) > CONFIG_BUNDLE_MAX_BYTES * 2:
+        # A comparison too large to keep is not a reason to stop offering the
+        # choice: the pane can still say which file differs and which side to
+        # keep, so the record carries what it can and no texts at all.
+        record = json.dumps(
+            {
+                "version": SYNC_STATE_VERSION,
+                "recorded_at": _utc_now(),
+                "remote_created_at": remote_created_at,
+                "files": {},
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8")
+    _atomic_write(path, record)
+
+
+def read_conflict_record(path: pathlib.Path) -> dict[str, Any] | None:
+    """The kept-aside remote side, or ``None`` when there is no comparison.
+
+    An unreadable or expired record is "nothing to compare", never an error:
+    the pane opens on a window that may have been left open across a repair by
+    hand, and a missing record must only mean the diff is unavailable.
+    """
+
+    try:
+        if path.stat().st_size > CONFIG_BUNDLE_MAX_BYTES * 2 + 4096:
+            # A record this app did not write never reaches a reader: the cap is
+            # the one ``save_conflict_record`` uses, so a hand-made or damaged
+            # file reads as "nothing to compare" instead of being parsed into
+            # memory under Core's lock.
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    files = data.get("files")
+    texts: dict[str, str] = {}
+    if isinstance(files, dict):
+        for name, text in files.items():
+            if isinstance(name, str) and isinstance(text, str):
+                texts[name] = text
+    recorded_at = data.get("recorded_at")
+    remote_created_at = data.get("remote_created_at")
+    return {
+        "recorded_at": recorded_at if isinstance(recorded_at, str) else "",
+        "remote_created_at": remote_created_at if isinstance(remote_created_at, str) else "",
+        "files": texts,
+    }
+
+
+def clear_conflict_record(path: pathlib.Path) -> None:
+    """Drop the kept-aside remote side once the two ends agree again."""
+
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
 
 
 def create_bundle(config_path: pathlib.Path) -> tuple[bytes, dict[str, Any]]:

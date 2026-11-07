@@ -632,6 +632,11 @@ class CodexSettingsDomain:
         self._catalog_repair_observed_signature: tuple[bool, tuple[str, ...]] | None = None
         self._catalog_repair_observation_count = 0
         self._catalog_source_checked_at = 0.0
+        # Inputs of the last catalog the comparison found current.  Rebuilding
+        # the expected 1.2 MB payload to compare it again costs hundreds of
+        # milliseconds under Core's lock; a stat plus these identities answers
+        # "nothing that shapes the file moved" without touching the body.
+        self._catalog_current_signature: tuple[Any, ...] | None = None
         self._raw: dict[str, Any] = {}
         self._draft: dict[str, Any] = {}
         self._baseline: tuple[str, str] = ("", "{}\n")
@@ -1033,6 +1038,9 @@ class CodexSettingsDomain:
 
         if not names:
             return
+        # A writer other than the comparison below changes the file identity;
+        # never reuse an answer about the body that was just replaced.
+        self._catalog_current_signature = None
         write_catalog(
             self.model_catalog_path,
             names,
@@ -1057,6 +1065,36 @@ class CodexSettingsDomain:
                 path.unlink()
             except OSError:
                 pass
+
+    def _catalog_candidate_signature(
+        self,
+        names: Sequence[str],
+        native_models: Sequence[Mapping[str, Any]],
+        base_slug: str | None,
+    ) -> tuple[Any, ...]:
+        """The inputs whose change requires rebuilding the managed catalog."""
+
+        try:
+            details = self.model_catalog_path.stat()
+            file_key: tuple[int, int] | None = (details.st_mtime_ns, details.st_size)
+        except OSError:
+            file_key = None
+        native_key = tuple(
+            (
+                str(item.get("slug", "")),
+                int(item.get("priority") or 0),
+                profile_has_instructions(item),
+            )
+            for item in native_models
+            if isinstance(item, Mapping)
+        )
+        return (
+            file_key,
+            tuple(names),
+            base_slug or "",
+            native_key,
+            id(self._context_registry._records),
+        )
 
     def _ensure_model_catalog_current(
         self,
@@ -1098,7 +1136,6 @@ class CodexSettingsDomain:
                 if self._repair_catalog_pointer(None):
                     self.revision += 1
             return False
-        self._context_registry.refresh_if_due()
         model_ids_changed = self._catalog_model_ids_changed(names)
         if require_stable_repair and model_ids_changed:
             if not source_refreshed:
@@ -1123,6 +1160,10 @@ class CodexSettingsDomain:
             self._reset_catalog_repair_observation()
             return False
         base_slug = self._catalog_base_profile(native_models)
+        signature = self._catalog_candidate_signature(names, native_models, base_slug)
+        if signature == self._catalog_current_signature:
+            self._remove_retired_catalog_copies()
+            return False
         catalog_current = catalog_is_current(
             self.model_catalog_path,
             names,
@@ -1132,6 +1173,7 @@ class CodexSettingsDomain:
         )
         migrated = pointer != self.model_catalog_path
         if catalog_current and not migrated:
+            self._catalog_current_signature = signature
             self._remove_retired_catalog_copies()
             return False
         if not catalog_current:
@@ -1143,20 +1185,39 @@ class CodexSettingsDomain:
                 self._remove_retired_catalog_copies()
         else:
             self._remove_retired_catalog_copies()
+        self._catalog_current_signature = self._catalog_candidate_signature(
+            names, native_models, base_slug
+        )
         self.revision += 1
         return True
 
-    def refresh_model_catalog(self) -> bool:
+    def refresh_model_contexts_if_due(self) -> bool:
+        """Refresh public model metadata on the background lane.
+
+        The fetch is a remote round trip and can outlast any window's poll; it
+        must run before the caller takes Core's store lock, never inside a
+        projection.  A reader keeps using the registry's previous records until
+        the new map is swapped in.
+        """
+
+        return self._context_registry.refresh_if_due(sync_cache=False)
+
+    def refresh_model_catalog(self, *, force_source_refresh: bool = True) -> bool:
         """Refresh the enabled catalog after LiteLLM reloads its routes.
 
         Worker reloads briefly alternate between adjacent ``/v1/models``
-        views.  Use the same two-observation stability gate as the snapshot
-        path so a provider apply that did not change the exposed model set
-        cannot rewrite the catalog from a transient partial view.
+        views.  Keep the two-observation stability gate so a provider apply
+        that did not change the exposed model set cannot rewrite the catalog
+        from a transient partial view.
+
+        ``force_source_refresh`` is the caller's statement about the moment:
+        a proxy replacement or an explicit client-list refresh asks again,
+        while an observation taken by the background lane's own cadence
+        respects the endpoint probe's rate limit.
         """
 
         return self._ensure_model_catalog_current(
-            force_source_refresh=True,
+            force_source_refresh=force_source_refresh,
             require_stable_repair=True,
         )
 
@@ -1290,29 +1351,19 @@ class CodexSettingsDomain:
         }
 
     def snapshot(self) -> dict[str, Any]:
-        self._ensure_model_catalog_current(require_stable_repair=True)
-        return self._safe_snapshot(self._draft, self.revision)
+        """Project the staged document without touching the live proxy.
 
-    def refresh_live_state(self) -> bool:
-        """Take the endpoint observation a snapshot represents, without projecting.
-
-        ``CoreStore.snapshot`` memoizes every domain projection on the shared
-        revision, which is right: a projection is a function of the domains'
-        state.  A *read of the outside world* is not, and this one used to live
-        inside ``snapshot()``, so it ran once per revision instead of once per
-        read.  The stability gate that keeps a worker reload from rewriting the
-        client's model list needs two *consecutive observations*, and the second
-        one never happened while nothing else moved the revision -- so an enabled
-        catalog quietly stopped following the proxy's model set.
-
-        ``snapshot`` keeps its own call: a caller that holds a domain directly
-        still observes.  It is idempotent within the probe's own rate limit, so
-        the two calls made for one Core read count once.
+        A projection is read by every window poll and rebuilt whenever the
+        shared revision moves.  The managed catalog's refresh asks the local
+        proxy for ``/v1/models``, and while that proxy replaces its workers the
+        port is bound but silent: doing it here charged the endpoint timeout to
+        the window's own refresh, once per revision, and the native host's
+        one-second polls queued behind it.  ``refresh_model_catalog`` owns that
+        observation on the background client-model lane, and it publishes what
+        it learns like any other mutation.
         """
 
-        before = self.revision
-        self._ensure_model_catalog_current(require_stable_repair=True)
-        return self.revision != before
+        return self._safe_snapshot(self._draft, self.revision)
 
     def draft_state(self) -> object:
         # Live model-catalog metadata is refreshed from LiteLLM while the
@@ -1617,7 +1668,9 @@ class CodexSettingsDomain:
                 catalog_models = self._catalog_model_names(self._draft)
                 if not was_enabled and not catalog_models:
                     raise DomainError("Young Router is not running or exposes no models")
-                self._context_registry.refresh_if_due()
+                # The public context sources are fetched on Core's background
+                # lane before this action takes the store lock; this Apply is
+                # not allowed to wait for the internet.
                 native_models = self._catalog_native_models()
                 if native_models is not None:
                     base_slug = self._catalog_base_profile(native_models)
@@ -1669,7 +1722,9 @@ class CodexSettingsDomain:
                 catalog_models = self._catalog_model_names(self._raw)
                 if not was_enabled and not catalog_models:
                     raise DomainError("Young Router is not running or exposes no models")
-                self._context_registry.refresh_if_due()
+                # The public context sources are fetched on Core's background
+                # lane before this action takes the store lock; this Apply is
+                # not allowed to wait for the internet.
                 native_models = self._catalog_native_models()
                 if native_models is not None:
                     base_slug = self._catalog_base_profile(native_models)

@@ -378,6 +378,42 @@ class BrowserPageTests(unittest.TestCase):
         self.assertEqual("", self.server.web_host_url.split("/")[-1])
 
 
+class BrowserPageAddressTests(unittest.TestCase):
+    """The address a person lands on is a pane, and the tab says what Core says.
+
+    Two failures this pins, both seen in a browser:
+
+    - A launch address is `#launch=<token>`.  The sign-in page spends the token
+      and strips the fragment, but a browser that already holds a session is
+      served the app directly, so the token became the *route*: the shell drew
+      its sidebar over a pane that does not exist.
+    - The tab title read `${app}: running` — the protocol's own spelling of the
+      service state, beside a Chinese app title.
+    """
+
+    def setUp(self) -> None:
+        self.shared = Path(__file__).resolve().parents[1] / "rn/packages/shared/src"
+
+    def test_a_fragment_that_names_no_pane_is_not_a_route(self) -> None:
+        entry = (self.shared / "platformEntry.web.ts").read_text(encoding="utf-8")
+        # The launch token is not a place: it resolves to the pane the app opens
+        # on, and the address is rewritten to name that pane so a reload or Back
+        # cannot return to the token.  `home` is not that pane -- on this host it
+        # is the windowless state a native menu-bar app has, and a page that
+        # resolved to it drew one empty frame.
+        self.assertIn("const DEFAULT_ROUTE: AppRoute = \"providers-models\";", entry)
+        self.assertIn("if (!isKnownRoute(next)) return DEFAULT_ROUTE;", entry)
+        self.assertIn("function adoptRouteAddress(): void {", entry)
+        self.assertIn("adoptRouteAddress();\nlet currentRoute = routeFromHash();", entry)
+        self.assertIn("isKnownRoute(canonicalWindowRoute(route) as AppRoute)", entry)
+
+    def test_the_tab_title_uses_the_localized_service_word(self) -> None:
+        leaf = (self.shared / "platform/browserLeaf.ts").read_text(encoding="utf-8")
+        self.assertIn("serviceStateWord(strings, status.state)", leaf)
+        for word in ("serviceStarting", "serviceRunning", "serviceUnhealthy", "serviceStopped", "serviceUnknown"):
+            self.assertIn(f"strings?.{word}", leaf)
+
+
 class WebLaunchURLTests(unittest.TestCase):
     """Opening the page from the app lands signed in, without the key.
 
@@ -432,6 +468,24 @@ class WebLaunchURLTests(unittest.TestCase):
         self.server.enable_web_host(self.root, password="s3cret-word")
         self.assertNotIn("#launch=", self.server.web_host_url)
         self.assertIn("#launch=", self.server.web_launch_url)
+
+    def test_the_address_is_the_port_the_page_is_published_on(self) -> None:
+        """The page lives on the proxy's port, so that is the number it prints.
+
+        Core's own listener is a random port nobody is told about: `web_launch_url`
+        used to publish it, so a click on the address in General opened a page on
+        a second, unrelated port while the row beside it still said 12390.
+        """
+
+        self.server.enable_web_host(self.root, password="s3cret-word")
+        # A running proxy owns the published port; the page is forwarded there.
+        self.core._service = {"state": "running", "port": 12390}
+        self.assertEqual("http://127.0.0.1:12390/ui/", self.server.web_host_url)
+        self.assertIn("http://127.0.0.1:12390/ui/#launch=", self.server.web_launch_url)
+        # A stopped proxy publishes no port, so the page stays on the listener
+        # that actually answers -- there is nowhere else for it to be.
+        self.core._service = {"state": "stopped"}
+        self.assertEqual(f"http://127.0.0.1:{self.server.port}/ui/", self.server.web_host_url)
 
     def test_a_core_with_no_page_answers_no_address(self) -> None:
         status, answer = self._call()
@@ -573,6 +627,108 @@ class BrowserFileCapabilityTests(unittest.TestCase):
         status, answer = self._post("/ipc/host/file-download", {"token": token}, session=other)
         self.assertIn(status, (400, 401))
         self.assertIn(answer["error"]["code"], ("invalid_file_capability", "unauthorized"))
+
+
+class BrowserLoginItemTests(unittest.TestCase):
+    """开机自启动 from the page: Core writes the login item the app owns.
+
+    The desktop hosts register theirs in their own process, so their Core only
+    records the preference.  A page has no such process behind it even though
+    the app is installed on the same machine, and disabling the switch there
+    told a person on a Mac with a working login item that the feature did not
+    exist.  What must stay true: a host that cannot name an installed app
+    answers "not registered" instead of writing a login item nobody can run,
+    and the preference itself remains the panes' own dispatch.
+    """
+
+    def setUp(self) -> None:
+        self.core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
+        self.server = CoreIPCServer(self.core)
+        self.server.start()
+        self.addCleanup(self.server.stop)
+        self.bundle = tempfile.TemporaryDirectory()
+        self.addCleanup(self.bundle.cleanup)
+        root = Path(self.bundle.name)
+        (root / "index.html").write_text("<!doctype html><title>Young Router</title>\n", encoding="utf-8")
+        self.server.enable_web_host(root, password="login-item-password")
+        self.cookie = _login(self.server, "login-item-password")
+
+    def _post(self, path: str, body: dict[str, object]) -> tuple[int, dict[str, object]]:
+        endpoint = self.server.endpoint
+        connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=5)
+        try:
+            connection.request(
+                "POST",
+                path,
+                body=json.dumps(body),
+                headers={"Content-Type": "application/json", "Cookie": self.cookie},
+            )
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            connection.close()
+
+    def test_the_route_needs_a_session(self) -> None:
+        endpoint = self.server.endpoint
+        connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=5)
+        try:
+            connection.request("POST", "/ipc/host/autostart", body=json.dumps({"enabled": True}), headers={"Content-Type": "application/json"})
+            self.assertEqual(401, connection.getresponse().status)
+        finally:
+            connection.close()
+
+    def test_a_core_outside_an_install_registers_nothing(self) -> None:
+        # This checkout is not inside an app bundle, so there is no login item
+        # to write.  The answer says so, and the pane hands its preference back
+        # instead of reporting 已保存 over a switch the system never heard of.
+        status, answer = self._post("/ipc/host/autostart", {"enabled": True})
+        self.assertEqual(200, status)
+        self.assertIs(answer["registered"], False)
+        self.assertIs(answer["available"], False)
+
+    def test_the_body_is_the_only_shape_it_accepts(self) -> None:
+        status, answer = self._post("/ipc/host/autostart", {"enabled": "yes"})
+        self.assertEqual(400, status)
+        self.assertEqual("invalid_login_item", answer["error"]["code"])
+        status, answer = self._post("/ipc/host/autostart", {"enable": True})
+        self.assertEqual(400, status)
+        self.assertEqual("invalid_login_item", answer["error"]["code"])
+
+
+class BrowserGroupManagerTests(unittest.TestCase):
+    """分组 had no surface in a page, so the pane disabled it.
+
+    The browser host now answers the same four leaf capabilities the native
+    sheets implement; what this pins is that the page is *not* the host that
+    leaves them undefined — a 分组 button that reads 分组 and does nothing is
+    exactly the failure this replaces.
+    """
+
+    def test_the_browser_leaf_serves_the_group_manager(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "rn/packages/shared/src/platform/browserLeaf.ts").read_text(encoding="utf-8")
+        for capability in (
+            "showGroupManager: (options) => openRelayGroupSheet(options)",
+            "awaitGroupManagerApply: () => takeRelayGroupApply()",
+            "finishGroupManagerApply: async (options) => { finishRelayGroupApply(options); }",
+            "updateGroupManager: async (snapshot) => updateRelayGroupSheet(snapshot)",
+        ):
+            self.assertIn(capability, source)
+
+    def test_the_page_mounts_the_sheet_as_its_own_layer(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "rn/packages/shared/src/platformEntry.web.ts").read_text(encoding="utf-8")
+        self.assertIn("setRelayGroupSheetSurface({", source)
+        self.assertIn('route: "relay-group-sheet"', source)
+        self.assertIn("React.createElement(RelayGroupSheet", source)
+        # The sheet's Close asks before it drops a draft, exactly as the native
+        # window's does; Escape and the title bar's × go through the same call.
+        self.assertIn("requestClose: askCloseRelayGroupSheet", source)
+
+    def test_a_key_value_never_reaches_react(self) -> None:
+        sheet = (Path(__file__).resolve().parents[1] / "rn/packages/shared/src/ui/RelayGroupSheet.tsx").read_text(encoding="utf-8")
+        # The copy goes through Core's one-shot lease and stops at the
+        # clipboard: this tree only ever holds Core's presence sentinel.
+        self.assertIn("copyKey(state.accountId, selected.id)", sheet)
+        self.assertIn("selected.hint !== \"\" ? \"••••••••\"", sheet)
 
 
 def _get(server: CoreIPCServer, path: str, *, cookie: str | None = None) -> tuple[int, dict[str, str], bytes]:

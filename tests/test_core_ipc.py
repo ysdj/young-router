@@ -1123,6 +1123,66 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             with self.assertRaises(Exception):
                 client.call("editor", {"editor_token": editor["editor_token"], "text": "{}\n"})
 
+    def test_a_webdav_comparison_reads_both_sides_and_stages_nothing(self) -> None:
+        """A stopped sync's two texts open as one document, read-only.
+
+        The comparison is a document read, so it uses the same versioned lease
+        every raw editor does -- but there is nothing to write back: a config
+        file that arrived through this surface would skip the sync's own
+        bundle validation, so a stage attempt is refused.
+        """
+
+        from young_router.core.domains.webdav import WebDAVSettingsDomain
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+            webdav = WebDAVSettingsDomain(
+                root / "webdav.json",
+                enabled_path=root / "webdav.enabled",
+                status_path=root / "webdav-status.json",
+                config_path=config,
+                state_path=root / "webdav-state.json",
+                conflict_path=root / "webdav-conflict.json",
+            )
+            webdav.stage_secret("password", None, "webdav-secret")
+            webdav.dispatch("patch", {"url": "https://webdav.example.test/config/"})
+            webdav.apply()
+            (root / "webdav-conflict.json").write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "recorded_at": "2026-09-25T10:00:00Z",
+                        "remote_created_at": "2026-09-25T09:59:00Z",
+                        "files": {"config.yaml": "providers: {}\nmodel_list:\n  - model_name: remote\n"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            core = CoreStore(domains=[webdav])
+            server = CoreIPCServer(core)
+            endpoint = server.start()
+            self.addCleanup(server.stop)
+            client = CoreIPCClient(endpoint, server.bootstrap_token)
+            self.addCleanup(client.close)
+
+            editor = client.call("editor", {"domain": "webdav", "document": "config"})
+            self.assertEqual("webdav", editor["domain"])
+            self.assertEqual("providers: {}\nmodel_list: []\n", editor["text"])
+            self.assertIn("model_name: remote", editor["baseline"])
+
+            with self.assertRaises(Exception) as refused:
+                client.call("editor", {"editor_token": editor["editor_token"], "text": "providers: {}\n"})
+            self.assertIn("editor is unavailable", str(refused.exception))
+            # A document this domain does not own is not readable either: the
+            # pane cannot reach another domain's file by naming it here.
+            with self.assertRaises(Exception) as unknown:
+                client.call("editor", {"domain": "webdav", "document": "settings"})
+            self.assertIn("editor is unavailable", str(unknown.exception))
+            self.assertEqual("providers: {}\nmodel_list: []\n", config.read_text(encoding="utf-8"))
+
     def test_editor_diff_baseline_keeps_structured_staged_changes_visible(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings = Path(directory) / "settings.json"

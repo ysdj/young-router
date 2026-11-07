@@ -1156,9 +1156,22 @@ class WebDAVPullReloadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             staged: dict[str, str] = {}
             reload_calls: list[str] = []
-            core, _config_path, webdav, _domains = self._core(Path(directory), reload_calls, staged)
-            webdav.dispatch("patch", {"enabled": True, "sync_direction": "pull"})
+            root = Path(directory)
+            core, config_path, webdav, _domains = self._core(root, reload_calls, staged)
+            webdav.dispatch("patch", {"enabled": True})
             webdav.apply()
+
+            from young_router.webdav import core as webdav_core
+
+            # The baseline is what this Mac last synced, and the remote has
+            # moved since: the comparison owes a pull, and the loop runs it
+            # without being told a direction.
+            baseline = webdav_core.build_manifest(config_path)
+            webdav_core.save_sync_state(root / "webdav-state.json", webdav.sync_settings(), baseline, "sync")
+            remote_manifest = json.loads(json.dumps(baseline))
+            for entry in remote_manifest["files"]:
+                if entry.get("path") == "config.yaml":
+                    entry["sha256"] = "0" * 64
 
             remote = textwrap.dedent(self.CONFIG.replace("openai/old-chat", "openai/arrived-chat")).lstrip()
 
@@ -1166,8 +1179,8 @@ class WebDAVPullReloadTests(unittest.TestCase):
                 config_path.write_text(remote, encoding="utf-8")
 
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
-                "young_router.webdav.operations.pull_bundle", side_effect=install
-            ):
+                "young_router.webdav.operations.read_remote_manifest", return_value=remote_manifest
+            ), mock.patch("young_router.webdav.operations.pull_bundle", side_effect=install):
                 core.run_automatic_webdav_sync()
 
             self.assertTrue(core.wait_for_service_reload(5.0))

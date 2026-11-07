@@ -1677,46 +1677,11 @@ class CoreStore:
             # already described the reload, so a window saw the file's new
             # generation beside the values that file replaced.
             self._refresh_external_disk_state()
-            # A domain that reads the outside world on this path takes that read
-            # here, for the same reason: the memo is a function of the shared
-            # revision, and an observation of a proxy that changed on its own is
-            # not.  Bumping the revision is what invalidates the memo below.
-            self._refresh_live_domain_state()
             cached = self._snapshot_cache
             if cached is None or cached[0] != self._revision:
                 cached = (self._revision, self._project_domains())
                 self._snapshot_cache = cached
             return self._assemble_snapshot(cached[1])
-
-    def _refresh_live_domain_state(self) -> None:
-        """Let each domain take the outside read its projection represents.
-
-        A projection is memoized on the shared revision, so anything a domain
-        reads from *outside* this process must run before the memo is consulted
-        or it runs once per revision instead of once per window read.  The
-        managed Codex catalog is the case that matters: its repair needs two
-        consecutive endpoint observations, and a memoized observation is a
-        single one forever.  The caller holds ``self._lock``.
-        """
-
-        for name, adapter in self._domains.items():
-            observe = getattr(adapter, "refresh_live_state", None)
-            if not callable(observe):
-                continue
-            try:
-                changed = bool(observe())
-            except Exception:
-                # A live read is a projection input, never a reason to fail the
-                # snapshot a window is waiting on.  The domain answers with
-                # whatever its last observation established.
-                continue
-            if changed:
-                self._revision += 1
-                self._snapshot_cache = None
-                try:
-                    self._persist_metadata()
-                except PersistenceError:
-                    pass
 
     def _service_row_is_live(self) -> None:
         """Project the controller's live answer into this read.
@@ -1952,6 +1917,13 @@ class CoreStore:
             documents = getattr(adapter, "documents", ())
             if document not in documents:
                 raise CoreError("invalid_editor", "The requested editor is unavailable")
+        elif name == "webdav":
+            # A stopped sync shows its two sides here: the synced files are the
+            # only documents this domain has, and there is nothing to type into
+            # them -- the reader compares and then chooses a side.
+            documents = getattr(adapter, "review_documents", ()) if adapter is not None else ()
+            if document not in documents:
+                raise CoreError("invalid_editor", "The requested editor is unavailable")
         else:
             raise CoreError("invalid_editor", "The requested editor is unavailable")
         if adapter is None:
@@ -2030,6 +2002,11 @@ class CoreStore:
             elif name == "clients":
                 reader = getattr(adapter, "raw_text", None)
                 text = reader(document) if callable(reader) else None
+            elif name == "webdav":
+                # The local side of the comparison: the file as it is on disk,
+                # which is the state the stopped sync compared.
+                reader = getattr(adapter, "review_document", None)
+                text = reader(document) if callable(reader) else None
             else:
                 raw_text = getattr(adapter, "raw_text", None)
                 text = raw_text(include_sensitive=True, document=document) if callable(raw_text) else None
@@ -2062,6 +2039,12 @@ class CoreStore:
                 text = state.get(key)
             elif name == "clients":
                 reader = getattr(_adapter, "baseline_text", None)
+                text = reader(document) if callable(reader) else None
+            elif name == "webdav":
+                # What the local side is compared against: the remote copy the
+                # stopped run kept aside, so the diff is the same two texts the
+                # sync itself saw.
+                reader = getattr(_adapter, "review_baseline", None)
                 text = reader(document) if callable(reader) else None
             else:
                 if not isinstance(state, Mapping):
@@ -2117,6 +2100,11 @@ class CoreStore:
             raise CoreError("editor_too_large", "The editor document exceeds the size limit")
         with self._lock:
             name, _adapter = self._editor_adapter(domain, document)
+            if name == "webdav":
+                # The comparison is a read of two documents, not an editor: a
+                # staged text would have to become a config file without the
+                # sync's own validation, so this surface refuses every write.
+                raise CoreError("invalid_editor", "The requested editor is unavailable")
             # Global Core revisions also advance for unrelated operations such
             # as status/menu telemetry. A raw editor must not turn one of
             # those into a false "changed outside this window" conflict. When
@@ -2225,6 +2213,28 @@ class CoreStore:
             "revision": self._revision,
             "present": bool(value.strip()),
         }, value
+
+    def published_page_port(self) -> int:
+        """The local port the browser page is actually reachable on.
+
+        The page and the API share one address: `/ui` and `/ipc` are answered on
+        the proxy's published port, which Core reaches only as the child it
+        supervises -- so Core's own listener port is the wrong number to publish
+        and is never one a person should be told to open.  A proxy that is not
+        running (a stopped service, or a host whose page is served by Core
+        alone) leaves the page on Core's own listener, which is where the
+        terminal launch puts it.
+
+        A projection, never a probe: it reads the status this store last
+        published, exactly like every pane's own port row.
+        """
+
+        with self._lock:
+            service = self._service
+            port = service.get("port") if isinstance(service, Mapping) else None
+            if str(service.get("state", "")) == "running" and isinstance(port, int) and port > 0:
+                return port
+        return 0
 
     def trusted_secret_descriptor(self, domain: str, field: str, target: object | None = None) -> dict[str, Any]:
         """Validate one explicitly plaintext-native credential field.
@@ -2979,8 +2989,83 @@ class CoreStore:
         if base_revision is not None:
             record["base_revision"] = base_revision
 
+    def _dispatch_worker_status(
+        self,
+        action_type: str,
+        normalized_action: str,
+        payload: object,
+        expected_revision: object | None,
+    ) -> dict[str, Any]:
+        """Read a local worker's account state without holding the store lock.
+
+        Starting WorkBuddy or Our Free Model and asking it for the desktop
+        credential is a local round trip with a twenty- or thirty-second
+        ceiling.  The pane that asks is explicitly allowed to wait -- its other
+        controls stay usable -- but Core's store lock is shared by every window:
+        holding it across that wait froze snapshots and queued a debounced
+        Apply behind a worker that was still booting.  The read mutates only the
+        adapter's own observation caches and ``_last_operation`` (assigned as a
+        whole), so it runs outside the lock; the bookkeeping that publishes it
+        is taken under the lock afterwards.
+        """
+
+        name = "providers_models"
+        with self._lock:
+            self._check_revision(expected_revision)
+            adapter = self._domains.get(name)
+            if adapter is None:
+                raise DomainNotFound(name)
+            before = self._adapter_draft_state(name)
+        try:
+            result = adapter.dispatch(action_type, payload)
+        except CoreError:
+            raise
+        except Exception as exc:
+            domain_code = getattr(exc, "code", "")
+            if isinstance(domain_code, str) and domain_code.strip():
+                raise CoreError(domain_code.strip(), safe_exception_message(exc)) from None
+            raise CoreError("domain_error", safe_exception_message(exc)) from None
+        with self._lock:
+            after = self._adapter_draft_state(name)
+            action_summary: dict[str, Any] | None = None
+            if isinstance(result, Mapping):
+                safe_result = _safe_public(result)
+                if isinstance(safe_result, Mapping):
+                    self._last_actions[name] = dict(safe_result)
+                    summary = safe_result.get("operation_summary")
+                    if (
+                        isinstance(summary, Mapping)
+                        and summary.get("operation") == normalized_action
+                    ):
+                        action_summary = dict(summary)
+            # A live read stages nothing; if one somehow moved the draft, mark
+            # it like every other dispatch rather than hiding the change.
+            if after != before:
+                self._revision += 1
+                self._mark_domain(
+                    name,
+                    dirty=after != self._baselines.get(name),
+                    base_revision=self._revision,
+                )
+                self._persist_metadata()
+                self._emit()
+            response: dict[str, Any] = {"revision": self._revision}
+            if action_summary is not None:
+                response["action_summary"] = action_summary
+            return response
+
     def _dispatch_codex_model_catalog_toggle(self, enabled: bool, expected_revision: object | None) -> dict[str, Any]:
         name = "codex"
+        # A due public-context refresh is a remote round trip.  Do it before
+        # the store lock, the same way the background client-model lane does,
+        # so the toggle cannot freeze every other window while it waits.
+        codex = self._domains.get(name)
+        refresh_contexts = getattr(codex, "refresh_model_contexts_if_due", None)
+        if callable(refresh_contexts):
+            try:
+                refresh_contexts()
+            except Exception:
+                pass
         with self._lock:
             self._refresh_external_disk_state()
             self._check_revision(expected_revision)
@@ -3082,24 +3167,20 @@ class CoreStore:
             "enabled": enabled,
             "configured": settings.configured,
             "sync_interval_minutes": settings.sync_interval_minutes,
-            "sync_direction": settings.sync_direction,
             "last_sync_at": last_sync_at if isinstance(last_sync_at, str) else None,
         }
 
     def run_automatic_webdav_sync(self) -> None:
-        """Run one sync for the interval loop, in the saved direction.
+        """Run one smart sync for the interval loop.
 
         This goes straight to the sync rather than through ``dispatch``: only
         the Core decides to run it, so no IPC action can ask for the unattended
-        behaviour.
+        behaviour.  There is one sync, not a direction to read first: every run
+        compares both sides and takes the newer one.
         """
 
-        state = self.webdav_auto_sync_state()
-        direction = state.get("sync_direction")
-        # "smart" compares both sides; the IPC action for it is "sync".
-        operation = direction if direction in {"push", "pull"} else "sync"
         self._dispatch_webdav_sync(
-            operation,
+            "sync",
             {"sections": ["providers_models", "relay_accounts"]},
             None,
             automatic=True,
@@ -3178,7 +3259,12 @@ class CoreStore:
 
         self._schedule_service_reload_after_apply()
 
-    def refresh_client_model_lists(self, *, include_claude: bool = True) -> None:
+    def refresh_client_model_lists(
+        self,
+        *,
+        include_claude: bool = True,
+        refresh_contexts: bool = True,
+    ) -> None:
         """Regenerate the client model documents this app still generates.
 
         A provider Apply calls this with the default so Claude Code's picker
@@ -3190,7 +3276,20 @@ class CoreStore:
         writes only a difference.
         """
 
+        codex_domain = self._domains.get("codex")
+        if refresh_contexts:
+            refresh_contexts_now = getattr(codex_domain, "refresh_model_contexts_if_due", None)
+            if callable(refresh_contexts_now):
+                try:
+                    refresh_contexts_now()
+                except Exception:
+                    pass
         with self._lock:
+            live_domains = ("claude", "codex") if include_claude else ("codex",)
+            revisions_before = {
+                name: getattr(self._domains.get(name), "revision", None)
+                for name in live_domains
+            }
             if include_claude:
                 claude = self._domains.get("claude")
                 refresh = getattr(claude, "refresh_model_lists", None)
@@ -3206,6 +3305,24 @@ class CoreStore:
                     refresh_catalog()
                 except Exception:
                     pass
+            # The live read belongs to this lane, not to ``snapshot``.  A
+            # window polls the projection many times a second while the proxy
+            # reloads, and a read taken there both blocks every other request on
+            # the store lock and pays the endpoint timeout once per poll.  When
+            # the observation lands, publish it like any other mutation so the
+            # memoized projection is rebuilt on the next read.
+            revisions_after = {
+                name: getattr(self._domains.get(name), "revision", None)
+                for name in live_domains
+            }
+            if revisions_after != revisions_before:
+                self._revision += 1
+                self._snapshot_cache = None
+                try:
+                    self._persist_metadata()
+                except PersistenceError:
+                    pass
+                self._emit()
 
     def service_supervisor(self, *, initial_delay: float | None = None) -> Any:
         """The loop that restores the proxy without a person's click.
@@ -3315,9 +3432,9 @@ class CoreStore:
                 raise CoreError("webdav_sync_failed", "WebDAV sync sources are unavailable")
             if not automatic:
                 if any(self._drafts.get(name, {}).get("dirty") for name in ("webdav", *sections)):
-                    raise CoreError("webdav_sync_conflict", "Save or discard pending changes before WebDAV sync")
+                    raise CoreError("webdav_sync_unsaved", "Save or discard pending changes before WebDAV sync")
                 if any(self._disk.get(name, {}).get("changed") for name in ("webdav", *sections)):
-                    raise CoreError("webdav_sync_conflict", "Reload changed local files before WebDAV sync")
+                    raise CoreError("webdav_sync_unsaved", "Reload changed local files before WebDAV sync")
 
             settings_getter = getattr(webdav, "sync_settings", None)
             if not callable(settings_getter):
@@ -3330,12 +3447,14 @@ class CoreStore:
             relay_value = getattr(relay, "storage_path", None)
             state_value = getattr(webdav, "state_path", None)
             status_value = getattr(webdav, "status_path", None)
-            if not all(isinstance(value, (str, Path)) for value in (config_value, relay_value, state_value, status_value)):
+            conflict_value = getattr(webdav, "conflict_path", None)
+            if not all(isinstance(value, (str, Path)) for value in (config_value, relay_value, state_value, status_value, conflict_value)):
                 raise CoreError("webdav_sync_failed", "WebDAV sync sources are unavailable")
             config_path = Path(config_value).expanduser()
             relay_path = Path(relay_value).expanduser()
             state_path = Path(state_value).expanduser()
             status_path = Path(status_value).expanduser()
+            conflict_path = Path(conflict_value).expanduser()
             if not _same_path(relay_path, webdav_core.relay_accounts_path(config_path)):
                 raise CoreError("webdav_sync_failed", "WebDAV sync sources are unavailable")
 
@@ -3403,43 +3522,54 @@ class CoreStore:
                             raise
                         # Smart sync decides by comparing, and a bundle from
                         # another app identity or archive version cannot be
-                        # compared.  Rather than asking the reader to switch to
-                        # 推送到远端, the sync keeps that file under a dated
-                        # sibling name and pushes this Mac's state over it: the
-                        # file the guard refuses to read is never lost, and the
-                        # user asked for a sync, not for a setting to change.
+                        # compared.  Rather than stopping to ask for a choice
+                        # nothing can inform, the sync keeps that file under a
+                        # dated sibling name and pushes this Mac's state over
+                        # it: the file the guard refuses to read is never lost,
+                        # and the user asked for a sync, not for a decision.
                         archived_remote = webdav_operations.archive_remote_bundle(client, settings)
                         remote_manifest = None
                     base_manifest = webdav_core.baseline_manifest(state_path)
-                    if remote_manifest is None:
-                        webdav_operations.push_bundle(client, settings, config_path, state_path, "sync-push")
-                        outcome = "push"
-                    elif webdav_core.manifests_match(local_manifest, remote_manifest):
+                    # One comparison decides every sync, including the
+                    # unattended one: a side that moved alone is the side to
+                    # take.  Two sides that both moved are a real conflict --
+                    # the pane shows both texts and the reader keeps one -- and
+                    # no branch asks for a saved direction, because there is no
+                    # such setting any more.
+                    plan = webdav_core.smart_sync_plan(local_manifest, remote_manifest, base_manifest)
+                    if plan == "unchanged":
                         webdav_core.save_sync_state(state_path, settings, local_manifest, "sync")
                         outcome = "unchanged"
-                    elif base_manifest is None:
-                        raise webdav_core.SyncError("WebDAV sync conflict", "webdav_sync_conflict")
+                    elif plan == "push":
+                        webdav_operations.push_bundle(client, settings, config_path, state_path, "sync-push")
+                        outcome = "push"
+                    elif plan == "conflict":
+                        # Both ends moved, so neither is a version of the other:
+                        # the run writes nothing, keeps the remote side beside
+                        # the sync state, and stops.  The pane compares the two
+                        # and sends back the side the reader picks.
+                        try:
+                            webdav_operations.remember_remote_bundle(client, settings, conflict_path)
+                        except Exception:
+                            # Failing to keep the comparison is not the cause the
+                            # reader has to act on: the conflict is, and the
+                            # pane can still state it with the choice and no
+                            # diff.
+                            webdav_core.clear_conflict_record(conflict_path)
+                        raise webdav_core.SyncError(
+                            "WebDAV sync stopped because both ends changed",
+                            "webdav_sync_conflict",
+                        )
                     else:
-                        local_changed = not webdav_core.manifests_match(local_manifest, base_manifest)
-                        remote_changed = not webdav_core.manifests_match(remote_manifest, base_manifest)
-                        if local_changed and not remote_changed:
-                            webdav_operations.push_bundle(client, settings, config_path, state_path, "sync-push")
-                            outcome = "push"
-                        elif remote_changed and not local_changed:
-                            # The comparison above already read the manifest; a
-                            # second one would only restate what this branch
-                            # knows, so accept the remote bundle directly.
-                            webdav_operations.pull_bundle(
-                                client, settings, config_path, state_path, "sync-pull",
-                                skip_when_unchanged=False,
-                            )
-                            pulled = True
-                            outcome = "pull"
-                        elif local_changed and remote_changed:
-                            raise webdav_core.SyncError("WebDAV sync conflict", "webdav_sync_conflict")
-                        else:
-                            webdav_core.save_sync_state(state_path, settings, local_manifest, "sync")
-                            outcome = "unchanged"
+                        # The comparison above already read both manifests; a
+                        # second one would only restate what this branch
+                        # knows, so accept the remote bundle directly.
+                        webdav_operations.pull_bundle(
+                            client, settings, config_path, state_path, "sync-pull",
+                            skip_when_unchanged=False,
+                        )
+                        pulled = True
+                        outcome = "pull"
 
                 # A host serves a projection of the document (see
                 # ``host_profile``), and the key in it is that host's own.  The
@@ -3484,6 +3614,11 @@ class CoreStore:
                             base_revision=self._revision + 1,
                         )
                 webdav_core.save_sync_status(status_path, operation, True)
+                # The two ends agree after a push, a pull, or a run that had
+                # nothing to do, so the kept-aside remote side has served its
+                # purpose.  Leaving it would offer a comparison of a conflict
+                # that no longer exists.
+                webdav_core.clear_conflict_record(conflict_path)
                 self._last_actions["webdav"] = {
                     "action": operation,
                     "ok": True,
@@ -3529,6 +3664,16 @@ class CoreStore:
                 self._disk = core_checkpoint["disk"]
                 self._disk_identities = core_checkpoint["disk_identities"]
                 self._service = core_checkpoint["service"]
+                # A run that stopped leaves the documents untouched, so the
+                # revision it rolled back to is correct -- but it did write the
+                # status file and, when both ends changed, the comparison this
+                # window has to offer.  Neither is part of that revision, and
+                # the projection is memoized on it, so the pane would keep
+                # reading the state from before the run: the outcome and the
+                # row that opens the comparison would appear only after some
+                # unrelated action moved the revision.  Drop the memo; the next
+                # read rebuilds it at the same revision.
+                self._snapshot_cache = None
                 # A sync error names its own cause (an incompatible remote
                 # bundle, a conflict); anything else is a plain failure.  The
                 # cause keeps its name even when the rollback itself failed:
@@ -3621,6 +3766,17 @@ class CoreStore:
                     data.get("payload"),
                     expected_revision if expected_revision is not None else data.get("expected_revision"),
                 )
+        if (
+            domain_value is not None
+            and _canonical_domain(domain_value) == "providers_models"
+            and normalized_action in {"workbuddy_status", "our_free_model_status"}
+        ):
+            return self._dispatch_worker_status(
+                action_type,
+                normalized_action,
+                data.get("payload"),
+                expected_revision if expected_revision is not None else data.get("expected_revision"),
+            )
         if domain_value is None and action_type.startswith("service.") and action_type.removeprefix("service.") in SERVICE_PROXY_OPERATIONS:
             # A proxy operation runs the controller's own replacement, so it
             # never runs under this store's lock: see ``_dispatch_service``.
@@ -4097,7 +4253,7 @@ class CoreStore:
                     # The proxy's port or key may have just changed; a Codex
                     # client that already uses the proxy has to follow it.
                     self._follow_codex_local_api()
-                    self.refresh_client_model_lists()
+                    self.refresh_client_model_lists(refresh_contexts=False)
                     # A start or restart is also where the image-context switch
                     # and the client's fetch-server entry are reconciled: the
                     # pass reads its switch from the proxy's environment, which
@@ -4460,12 +4616,23 @@ class CoreStore:
                 codex = self._domains.get("codex")
                 refresh_catalog = getattr(codex, "refresh_model_catalog", None)
                 if callable(refresh_catalog):
+                    catalog_revision_before = getattr(codex, "revision", None)
                     try:
                         refresh_catalog()
                     except Exception:
                         pass
+                    if getattr(codex, "revision", None) != catalog_revision_before:
+                        # A snapshot is memoized on Core's revision; a domain
+                        # observation that changed the catalog must invalidate
+                        # that memo even though no draft moved.
+                        self._revision += 1
+                        self._snapshot_cache = None
+                        try:
+                            self._persist_metadata()
+                        except PersistenceError:
+                            pass
                 self._follow_codex_local_api(codex)
-                self.refresh_client_model_lists()
+                self.refresh_client_model_lists(refresh_contexts=False)
                 # The image-context switch lives in the runtime settings and the
                 # fetch server in the client's document.  Reconciling here as
                 # well as on Apply is what makes the two agree after a start:
@@ -4664,7 +4831,7 @@ class CoreStore:
                         # a client that points at this proxy follows a port change.
                         self._service_reload_replace_process = False
                         self._follow_codex_local_api()
-                        self.refresh_client_model_lists()
+                        self.refresh_client_model_lists(refresh_contexts=False)
                         self._sync_codex_image_context_mcp(["codex"])
                     else:
                         self._service_supervision_attempts += 1

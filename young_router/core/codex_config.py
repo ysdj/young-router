@@ -18,6 +18,8 @@ import pathlib
 import re
 import stat
 import sys
+import threading
+import time
 import tomllib
 from typing import Any
 import urllib.error
@@ -31,8 +33,19 @@ import yaml
 
 
 DEFAULT_PORT = "12390"
-LOCAL_MODEL_LIST_TIMEOUT_SECONDS = 1.0
+#: The local proxy answers ``/v1/models`` in tens of milliseconds (measured
+#: 19-41 ms on a live installation).  The listing is an observation, not a
+#: request whose failure the caller must wait out: while the proxy replaces its
+#: workers the port is bound but silent, and a one-second ceiling spent inside
+#: the Core lock let every polling window fall behind by the same second.  A
+#: miss keeps the last verified names and the next pass asks again.
+LOCAL_MODEL_LIST_TIMEOUT_SECONDS = 0.25
 LOCAL_MODEL_LIST_MAX_BYTES = 512 * 1024
+#: One observation is read by the Codex editor and both generated client
+#: lists, often inside the same background refresh.  Reuse it for a moment so a
+#: proxy that is replacing its workers charges one endpoint timeout to that
+#: refresh instead of one per reader; the next pass still observes afresh.
+LOCAL_MODEL_LIST_CACHE_SECONDS = 0.5
 LITELLM_CODEX_PROVIDER_ID = "young-router"
 LITELLM_CODEX_PROVIDER_NAME = "Young Router"
 # Codex 0.153.x decides whether compaction requests are remote/encrypted from
@@ -479,6 +492,33 @@ def _public_catalog_is_image_model(name: str) -> bool:
         return False
 
 
+_LISTING_CACHE_LOCK = threading.Lock()
+_LISTING_CACHE: dict[tuple[str, str], tuple[float, list[Any] | None]] = {}
+
+
+def _cached_listing(key: tuple[str, str]) -> tuple[bool, list[Any] | None]:
+    now = time.monotonic()
+    with _LISTING_CACHE_LOCK:
+        cached = _LISTING_CACHE.get(key)
+        if cached is None or now - cached[0] >= LOCAL_MODEL_LIST_CACHE_SECONDS:
+            _LISTING_CACHE.pop(key, None)
+            return False, None
+        return True, copy.deepcopy(cached[1])
+
+
+def _remember_listing(key: tuple[str, str], data: list[Any] | None) -> list[Any] | None:
+    with _LISTING_CACHE_LOCK:
+        _LISTING_CACHE[key] = (time.monotonic(), copy.deepcopy(data))
+    return data
+
+
+def clear_local_model_listing_cache() -> None:
+    """Forget the short-lived listing memo (tests that substitute the transport)."""
+
+    with _LISTING_CACHE_LOCK:
+        _LISTING_CACHE.clear()
+
+
 def _local_model_listing(api_key: str) -> list[Any] | None:
     """The ``data`` list from this machine's authenticated ``/models`` answer.
 
@@ -489,8 +529,13 @@ def _local_model_listing(api_key: str) -> list[Any] | None:
 
     if not isinstance(api_key, str) or not api_key.strip():
         return None
+    url = f"{local_base_url().rstrip('/')}/models"
+    key = (url, hashlib.sha256(api_key.encode("utf-8")).hexdigest())
+    hit, cached = _cached_listing(key)
+    if hit:
+        return cached
     request = urllib.request.Request(
-        f"{local_base_url().rstrip('/')}/models",
+        url,
         headers={
             **browser_request_headers(),
             "Authorization": f"Bearer {api_key}",
@@ -508,21 +553,21 @@ def _local_model_listing(api_key: str) -> list[Any] | None:
                 status = response.getcode()
             body = response.read(LOCAL_MODEL_LIST_MAX_BYTES + 1)
     except (OSError, urllib.error.URLError, urllib.error.HTTPError):
-        return None
+        return _remember_listing(key, None)
     except Exception:
-        return None
+        return _remember_listing(key, None)
 
     if not isinstance(status, int) or status < 200 or status >= 300:
-        return None
+        return _remember_listing(key, None)
     if len(body) > LOCAL_MODEL_LIST_MAX_BYTES:
-        return None
+        return _remember_listing(key, None)
     try:
         payload = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
+        return _remember_listing(key, None)
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-        return None
-    return payload["data"]
+        return _remember_listing(key, None)
+    return _remember_listing(key, payload["data"])
 
 
 def _usable_listing_name(item: object) -> str | None:

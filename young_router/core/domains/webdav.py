@@ -30,14 +30,25 @@ _SETTINGS_FIELDS = (
     "remote_name",
     "sync_interval_minutes",
     "timeout_seconds",
-    "sync_direction",
 )
 _SETTINGS_ALIASES = {
     "sync_interval": "sync_interval_minutes",
     "timeout": "timeout_seconds",
-    "direction": "sync_direction",
 }
+#: A direction an earlier version stored, or a package it exported.  Smart sync
+#: is the only behaviour now, so the key is dropped instead of refused: an
+#: imported package from that version must not fail over a field nothing reads.
+_SETTINGS_RETIRED = ("sync_direction", "direction")
 _RETAINED_PASSWORD = "__YOUNG_ROUTER_RETAIN_EXISTING__"
+
+#: The documents a stopped sync can offer for comparison, one per synced file.
+#: The pane names a document id, never a path; Core maps it back to the file its
+#: own sync targets already own.
+REVIEW_DOCUMENTS = {
+    "config": "config.yaml",
+    "disabled_models": "config.disabled-models.yaml",
+    "relay_accounts": "relay-accounts.json",
+}
 
 
 def _settings_updates(data: Mapping[str, Any]) -> dict[str, Any]:
@@ -50,6 +61,8 @@ def _settings_updates(data: Mapping[str, Any]) -> dict[str, Any]:
     source = data.get("settings", data.get("values", data))
     updates = _mapping(source, "WebDAV settings")
     updates = {_SETTINGS_ALIASES.get(key, key): value for key, value in updates.items()}
+    for key in _SETTINGS_RETIRED:
+        updates.pop(key, None)
     unknown = set(updates).difference(set(_SETTINGS_FIELDS) | {"enabled", "keep_password", "clear_password"})
     if unknown:
         raise DomainError("WebDAV settings contain an unsupported field")
@@ -60,6 +73,8 @@ class WebDAVSettingsDomain:
     """Staged WebDAV settings using the existing WebDAV core client."""
 
     name = "webdav"
+    #: The documents this domain can show for a side-by-side comparison.
+    review_documents = tuple(REVIEW_DOCUMENTS)
 
     def __init__(
         self,
@@ -69,6 +84,7 @@ class WebDAVSettingsDomain:
         status_path: Path | str | None = None,
         config_path: Path | str | None = None,
         state_path: Path | str | None = None,
+        conflict_path: Path | str | None = None,
     ):
         from ...webdav import core as webdav_core
 
@@ -77,6 +93,7 @@ class WebDAVSettingsDomain:
         self.status_path = Path(status_path).expanduser() if status_path else _default_webdav_status_path(self.settings_path)
         self.config_path = Path(config_path).expanduser() if config_path else _default_provider_config_path()
         self.state_path = Path(state_path).expanduser() if state_path else webdav_core.default_state_file()
+        self.conflict_path = Path(conflict_path).expanduser() if conflict_path else webdav_core.default_conflict_file()
         self._raw_settings: dict[str, Any] = {}
         self._draft_settings: dict[str, Any] = {}
         self._raw_enabled = False
@@ -84,6 +101,8 @@ class WebDAVSettingsDomain:
         self._baseline_settings: bytes | None = None
         self._baseline_enabled: bool = False
         self._last_probe = "unknown"
+        self._conflict_cache: dict[str, Any] | None = None
+        self._conflict_cache_identity: object = object()
         self.revision = 0
         self.reload()
 
@@ -96,7 +115,6 @@ class WebDAVSettingsDomain:
             "remote_name": str(getattr(settings, "remote_name", "")),
             "sync_interval_minutes": getattr(settings, "sync_interval_minutes", 30),
             "timeout_seconds": getattr(settings, "timeout_seconds", 30),
-            "sync_direction": getattr(settings, "sync_direction", "smart"),
         }
 
     def _enabled(self) -> bool:
@@ -158,7 +176,6 @@ class WebDAVSettingsDomain:
             "sync_interval": sanitized["sync_interval_minutes"],
             "timeout_seconds": sanitized["timeout_seconds"],
             "timeout": sanitized["timeout_seconds"],
-            "sync_direction": sanitized["sync_direction"],
             # The Core projection redacts this field again; its only purpose
             # is to give the summary a presence bit without carrying a value.
             "password": REDACTED if password_present else "",
@@ -172,7 +189,106 @@ class WebDAVSettingsDomain:
             # A window that opens after a failed automatic sync has no result
             # of its own, so the pane reads this to say why the stamp stopped.
             "last_result": self._last_result(),
+            # The remote side of a sync that stopped because both ends changed.
+            # The pane offers the comparison from this, and reads the two texts
+            # through the versioned editor channel -- never through a snapshot.
+            "conflict": self.conflict_summary(),
         }
+
+    def conflict_summary(self) -> dict[str, Any] | None:
+        """What is waiting to be compared and chosen, or ``None``.
+
+        Only metadata travels here: which file differs, whether each side has
+        it at all, and when the remote side was recorded.  The texts stay
+        behind the editor lease.
+
+        A snapshot is read many times a second, so the answer is computed once
+        per change on disk: the record's identity plus every synced file's,
+        never on the poll itself.  Reading three documents per poll would put
+        the configuration's own size on the window's refresh path.
+        """
+
+        from ...webdav import core as webdav_core
+
+        targets = webdav_core.sync_targets(self.config_path)
+        identity = (
+            self._disk_identity_of(self.conflict_path),
+            tuple(self._disk_identity_of(path) for _name, path, _required, _required_key in targets),
+        )
+        if self._conflict_cache_identity == identity:
+            return self._conflict_cache
+        record = webdav_core.read_conflict_record(self.conflict_path)
+        summary: dict[str, Any] | None = None
+        if record is not None:
+            local_paths = {name: path for name, path, _required, _required_key in targets}
+            files: list[dict[str, Any]] = []
+            for document, name in REVIEW_DOCUMENTS.items():
+                local_bytes = _file_bytes(local_paths[name]) if name in local_paths else None
+                remote_text = record["files"].get(name)
+                remote_bytes = remote_text.encode("utf-8") if isinstance(remote_text, str) else None
+                files.append(
+                    {
+                        "name": document,
+                        "changed": local_bytes != remote_bytes,
+                        "local_present": local_bytes is not None,
+                        "remote_present": remote_bytes is not None,
+                    }
+                )
+            summary = {
+                "at": record["recorded_at"],
+                "remote_at": record["remote_created_at"],
+                # A record written without texts (a bundle too large to keep)
+                # still names the choice, but there is nothing to draw: the
+                # pane states that instead of a diff against an empty side.
+                "comparable": bool(record["files"]),
+                "files": files,
+            }
+        self._conflict_cache_identity = identity
+        self._conflict_cache = summary
+        return summary
+
+    @staticmethod
+    def _disk_identity_of(path: Path) -> tuple[int, int] | None:
+        """A file's cheap identity: enough to notice a change, never a read."""
+
+        try:
+            details = path.stat()
+        except OSError:
+            return None
+        return (details.st_mtime_ns, details.st_size)
+
+    def _conflict_files(self) -> dict[str, str]:
+        from ...webdav import core as webdav_core
+
+        record = webdav_core.read_conflict_record(self.conflict_path)
+        if record is None:
+            raise DomainError("There is no stopped sync to compare")
+        return record["files"]
+
+    def review_document(self, document: str) -> str:
+        """This Mac's copy of one synced file, for the conflict comparison."""
+
+        from ...webdav import core as webdav_core
+
+        name = REVIEW_DOCUMENTS.get(document)
+        if name is None:
+            raise DomainError("The requested document is unavailable")
+        for archive_name, path, _required, _required_key in webdav_core.sync_targets(self.config_path):
+            if archive_name != name:
+                continue
+            try:
+                return path.read_text(encoding="utf-8") if path.exists() else ""
+            except OSError as exc:
+                raise DomainError("The requested document is unavailable") from None
+        raise DomainError("The requested document is unavailable")
+
+    def review_baseline(self, document: str) -> str:
+        """The remote copy of the same file, kept aside when the sync stopped."""
+
+        name = REVIEW_DOCUMENTS.get(document)
+        if name is None:
+            raise DomainError("The requested document is unavailable")
+        return self._conflict_files().get(name, "")
 
     def _last_result(self) -> dict[str, Any] | None:
         """The status file's last run: action, outcome, and when it checked."""
@@ -268,7 +384,6 @@ class WebDAVSettingsDomain:
                 "remote_name": "young-router-config.json",
                 "sync_interval_minutes": 30,
                 "timeout_seconds": 30,
-                "sync_direction": "smart",
             }
             self._draft_enabled = False
         elif name in {"reset", "cancel", "reload"}:

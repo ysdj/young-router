@@ -14,6 +14,7 @@ from collections import Counter
 from dataclasses import dataclass
 import hashlib
 import re
+import threading
 import time
 from pathlib import Path
 from collections.abc import Callable, Mapping, Sequence
@@ -1000,6 +1001,12 @@ def _installed_litellm_version() -> str | None:
     return version_value
 
 
+#: Serializes remote context-source refreshes across registries.  The fetch
+#: runs without Core's store lock, so this is what keeps two background lanes
+#: from spending the same eight-second ceiling twice.
+_CONTEXT_REFRESH_LOCK = threading.Lock()
+
+
 class ModelContextRegistry:
     """Resolve model context policy and periodically refresh its metadata."""
 
@@ -1072,6 +1079,11 @@ class ModelContextRegistry:
         # same routes does not import the runtime to repeat itself.
         self._provider_lookups: dict[str, dict[str, Any] | None] = {}
         self._last_refresh_attempt: float | None = None
+        # Remote sources are fetched outside the Core lock.  The refresh lock
+        # lives at module scope so it is not part of the instance state that a
+        # transaction checkpoint deep-copies; it only keeps two refresh lanes
+        # from doing the same fetch twice.  Readers never take it: the completed
+        # records are swapped in as one assignment.
         self._runtime_values_key: tuple[int, int] | None = None
         self._runtime_values_cache: tuple[int, int] | None = None
 
@@ -1595,8 +1607,21 @@ class ModelContextRegistry:
                 result.append(normalized_id)
         return result
 
-    def refresh_if_due(self, *, force: bool = False) -> bool:
-        self._sync_cache()
+    def refresh_if_due(self, *, force: bool = False, sync_cache: bool = True) -> bool:
+        """Refresh the public context sources, without holding a reader's lock.
+
+        The fetch is a network round trip to public metadata (up to eight
+        seconds per source).  It used to run under Core's store lock, so the
+        first window refresh after the cache aged out waited for the internet.
+        The new records are merged into a private copy and swapped in with one
+        assignment: a reader sees the old map or the new one, never a half-merged
+        one, and never waits for the fetch.  ``sync_cache`` is for a caller that
+        already holds Core's lock and therefore cannot adopt the cache file
+        here; the background lane calls this outside the lock.
+        """
+
+        if sync_cache:
+            self._sync_cache()
         if not self.refresh_enabled:
             return False
         _, refresh_hours = self._runtime_values()
@@ -1607,24 +1632,32 @@ class ModelContextRegistry:
             return False
         if not force and self._last_refresh_attempt is not None and now - self._last_refresh_attempt < 300:
             return False
-        self._last_refresh_attempt = now
-        refreshed = False
-        for source in MODEL_CONTEXT_SOURCES:
-            priority = _SOURCE_PRIORITIES[source]
-            try:
-                payload = self._fetcher(source)
-                incoming = _source_records(payload, source=source, priority=priority)
-            except Exception:
-                continue
-            if incoming:
-                _merge_records(self._records, incoming)
-                self._records.invalidate_tail_index()
-                refreshed = True
-        if not refreshed:
-            return False
-        self._cache_fetched_at = now
-        self._write_cache()
-        return True
+        with _CONTEXT_REFRESH_LOCK:
+            # A second lane may have finished while this one waited.
+            now = float(self._clock())
+            if not force and self._cache_fetched_at is not None and now - self._cache_fetched_at < refresh_hours * 3600:
+                return False
+            self._last_refresh_attempt = now
+            incoming_all: dict[str, dict[str, Any]] = {}
+            for source in MODEL_CONTEXT_SOURCES:
+                priority = _SOURCE_PRIORITIES[source]
+                try:
+                    payload = self._fetcher(source)
+                    incoming = _source_records(payload, source=source, priority=priority)
+                except Exception:
+                    continue
+                if incoming:
+                    _merge_records(incoming_all, incoming)
+            if not incoming_all:
+                return False
+            merged = RecordLookupIndex(
+                {key: dict(value) for key, value in self._records.items()}
+            )
+            _merge_records(merged, incoming_all)
+            self._records = merged
+            self._cache_fetched_at = now
+            self._write_cache()
+            return True
 
     @staticmethod
     def _deployment_context(deployment: Mapping[str, Any]) -> int | None:

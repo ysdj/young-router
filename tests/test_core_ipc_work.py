@@ -23,6 +23,7 @@ from unittest import mock
 from ipc_work_ledger import (
     CATALOG_ROUTE_INDEX,
     CODEX_LOAD_EDITOR,
+    LOCAL_MODEL_LIST,
     EMIT_EVENT,
     OPERATION_BUDGETS,
     PARSE_YAML,
@@ -117,6 +118,15 @@ class OperationWorkTests(unittest.TestCase):
         self.settings_path.write_text("", encoding="utf-8")
         self.codex_home = root / "codex"
         self.codex_home.mkdir()
+        # A real installation points Codex at this app's managed catalog, which
+        # is what made every window refresh take the live-model path.  An empty
+        # Codex home silently skipped it, so the budget below never saw the read
+        # that froze the window.
+        catalog_path = self.codex_home / "model-catalog.json"
+        catalog_path.write_text('{"models": []}\n', encoding="utf-8")
+        (self.codex_home / "config.toml").write_text(
+            f'model_catalog_json = "{catalog_path}"\n', encoding="utf-8"
+        )
         self.root = root
         # The listing read is a live proxy's answer; these tests are about this
         # process's own work, so it answers the same way every time.
@@ -182,9 +192,15 @@ class OperationWorkTests(unittest.TestCase):
     def test_a_window_refresh_derives_no_domain_state(self) -> None:
         """The most-called method must be the cheapest one."""
 
+        # The setUp refresh already observed the live listing, and the
+        # observation is rate-limited.  Move that window aside so this snapshot
+        # is the one that would take the live path.
+        self.core._domains["codex"]._catalog_source_checked_at = 0.0
         ledger, _ = self._measure("snapshot", self.core.snapshot)
         self.assertEqual(0, ledger.total(PROJECT_DOMAINS))
         self.assertEqual(0, ledger.total(PARSE_YAML))
+        self.assertEqual(0, ledger.total(CODEX_LOAD_EDITOR))
+        self.assertEqual(0, ledger.total(LOCAL_MODEL_LIST))
 
     def test_a_commit_with_no_window_open_projects_nothing_for_the_event(self) -> None:
         """A background launch has nobody to publish to.

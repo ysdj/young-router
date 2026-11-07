@@ -713,6 +713,37 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             self._send(200, {"protocol_version": PROTOCOL_VERSION, "token": capability})
             return
+        if route == "/ipc/host/autostart":
+            token = self._session_authorization()
+            if not self._owner._valid_session(token):
+                self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
+                return
+            # The browser host's login item.  The desktop hosts register theirs
+            # in their own process (`SMAppService`, the Windows Run key their
+            # leaf writes); a page has no such process behind it, so its Core —
+            # which is that app's Core, on that same machine — writes it.  The
+            # preference itself is still Core's, written by the panes' own
+            # service dispatch, so this answers only whether the login item now
+            # exists.
+            from . import login_item
+
+            try:
+                data = decode_message(self._read_body())
+                if set(data) != {"enabled"} or not isinstance(data.get("enabled"), bool):
+                    raise CoreError("invalid_login_item", "The login item could not be updated")
+                registered = login_item.set_login_item(bool(data["enabled"]))
+            except (CoreError, ProtocolError) as exc:
+                self._send_error(400, code=exc.code, message=exc.message)
+                return
+            except Exception:
+                self._send_error(400, code="invalid_login_item", message="The login item could not be updated")
+                return
+            self._send(200, {
+                "protocol_version": PROTOCOL_VERSION,
+                "registered": registered,
+                "available": login_item.available(),
+            })
+            return
         if route == "/ipc/host/file-capability":
             token = self._session_authorization()
             if not self._owner._valid_session(token):
@@ -1252,7 +1283,7 @@ class CoreIPCServer:
         with self._lock:
             if self._web_root is None or self._web_password_value() == "":
                 return ""
-            port = self.port
+            port = self._web_page_port()
             launch = self._web_launch_token if self._web_auto_login else ""
         if not port:
             return ""
@@ -1274,11 +1305,32 @@ class CoreIPCServer:
         with self._lock:
             if self._web_root is None or self._web_password_value() == "":
                 return ""
-            port = self.port
+            port = self._web_page_port()
             launch = self._web_launch_token
         if not port:
             return ""
         return f"http://{self.address}:{port}{WEB_UI_PREFIX}/#launch={launch}" if launch else ""
+
+    def _web_page_port(self) -> int:
+        """The port the page is published on, which is not this listener's.
+
+        A running proxy answers `/ui` and `/ipc` on the address every client
+        already points at, so the page a person opens is that number -- the one
+        the General pane prints.  Publishing this listener's own ephemeral port
+        instead sent a click on that address to a second, random port: same
+        app, different address, and nothing on screen said why the number had
+        changed.  A host with no proxy keeps the listener's port, because that
+        is then the only place the page is.
+        """
+
+        published = 0
+        reader = getattr(self.core, "published_page_port", None)
+        if callable(reader):
+            try:
+                published = int(reader() or 0)
+            except Exception:
+                published = 0
+        return published or self.port
 
     def register_editor_capability(self, domain: str, document: str, *, session_token: str) -> dict[str, Any]:
         descriptor = self.core.editor_document(domain, document)

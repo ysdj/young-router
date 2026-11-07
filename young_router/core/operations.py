@@ -1399,9 +1399,14 @@ class CoreServiceController:
             state = "running"
         elif pid is not None:
             state = "starting" if self._recorded_proxy_within_startup_grace() else "unhealthy"
-        elif self._recorded_proxy_is_orphaned() is not None:
+        elif force and self._recorded_proxy_is_orphaned() is not None:
             # A verified child of a dead Core is recoverable by normal start;
             # it is not an unrelated listener occupying the configured port.
+            # A window's poll (``force=False``) must not run the process-table
+            # scan that verifies it: during a replacement that scan waits on
+            # ``ps``, and every window's one-second poll queued behind it.  A
+            # start or stop reads the real ownership; a projection answers
+            # "stopped" until that action repairs it.
             state = "stopped"
         elif healthy:
             # A listener without this Core process's private ownership record

@@ -138,7 +138,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
                     expected_revision=core.revision,
                 )
 
-    def test_single_snapshot_model_change_does_not_rewrite(self) -> None:
+    def test_single_observation_model_change_does_not_rewrite(self) -> None:
         endpoint = {"models": ["public-a"]}
 
         def exposed_models(_api_key: str):
@@ -157,7 +157,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
 
             endpoint["models"] = ["public-a", "public-b"]
             self._force_catalog_observation(domain)
-            domain.snapshot()
+            domain.refresh_model_catalog()
 
             self.assertEqual(["public-a"], catalog_model_names(catalog_path))
 
@@ -189,7 +189,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
             endpoint["models"] = ["public-a", "public-b"]
             for _ in range(3):
                 self._force_catalog_observation(domain)
-                domain.snapshot()
+                domain.refresh_model_catalog()
                 self.assertEqual(["public-a"], catalog_model_names(catalog_path))
 
     def test_unconfigured_route_drop_repairs_the_catalog_silently(self) -> None:
@@ -220,9 +220,9 @@ class CodexCatalogRepairTests(unittest.TestCase):
             write_catalog(catalog_path, ["public-a", "phantom-route"], registry=domain._context_registry)
 
             self._force_catalog_observation(domain)
-            domain.snapshot()
+            domain.refresh_model_catalog()
             self._force_catalog_observation(domain)
-            domain.snapshot()
+            domain.refresh_model_catalog()
 
             self.assertEqual(["public-a"], catalog_model_names(catalog_path))
 
@@ -257,13 +257,13 @@ class CodexCatalogRepairTests(unittest.TestCase):
 
             endpoint["models"] = ["public-a"]
             self._force_catalog_observation(domain)
-            domain.snapshot()
+            domain.refresh_model_catalog()
             self._force_catalog_observation(domain)
-            domain.snapshot()
+            domain.refresh_model_catalog()
 
             self.assertEqual(["public-a"], catalog_model_names(catalog_path))
 
-    def test_two_consecutive_snapshot_observations_repair_the_catalog(self) -> None:
+    def test_two_consecutive_observations_repair_the_catalog(self) -> None:
         """A configured public model entering the live exposure is adopted."""
 
         endpoint = {"models": ["public-a"]}
@@ -291,22 +291,22 @@ class CodexCatalogRepairTests(unittest.TestCase):
             )
             endpoint["models"] = ["public-a", "public-b"]
             self._force_catalog_observation(domain)
-            domain.snapshot()
+            domain.refresh_model_catalog()
             self.assertEqual(["public-a"], catalog_model_names(catalog_path))
 
-            # A second UI snapshot while the endpoint probe is still cached
+            # A second observation while the endpoint probe is still cached
             # is not a second observation and must not complete the repair.
             domain._catalog_source_checked_at = time.monotonic()
-            domain.snapshot()
+            domain.refresh_model_catalog(force_source_refresh=False)
             self.assertEqual(["public-a"], catalog_model_names(catalog_path))
 
             # Once a fresh identical endpoint observation arrives, the repair
             # becomes stable and may update the catalog.
             self._force_catalog_observation(domain)
-            domain.snapshot()
+            domain.refresh_model_catalog()
             self.assertEqual(["public-a", "public-b"], catalog_model_names(catalog_path))
 
-    def test_catalog_ignores_9_10_snapshot_jitter(self) -> None:
+    def test_catalog_ignores_9_10_observation_jitter(self) -> None:
         stable_models = [f"public-{index}" for index in range(10)]
         endpoint = {"models": list(stable_models)}
 
@@ -340,14 +340,14 @@ class CodexCatalogRepairTests(unittest.TestCase):
                 # The config document is what allowlists the exposure, so the
                 # test has to write the same set it claims the endpoint serves.
                 config.write_text(self._config_with_models(list(names)), encoding="utf-8")
-                domain.snapshot()
+                domain.refresh_model_catalog()
 
             self.assertEqual(stable_models, catalog_model_names(catalog_path))
 
     def test_single_post_apply_refresh_observation_does_not_rewrite(self) -> None:
         """A provider apply that changed no exposure must not rewrite anything.
 
-        The post-reload refresh sees the same endpoint jitter as snapshots.
+        The post-reload refresh sees the same endpoint jitter as the live view.
         One observation of a changed view is not stable, so it must not rewrite
         the catalog.  Names the endpoint exposes outside the configured model
         list are ignored entirely.
@@ -418,7 +418,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
             endpoint["models"] = []
             for _ in range(3):
                 self._force_catalog_observation(domain)
-                domain.snapshot()
+                domain.refresh_model_catalog()
 
             self.assertEqual(before, catalog_path.read_text(encoding="utf-8"))
             self.assertEqual(["public-a"], catalog_model_names(catalog_path))
@@ -427,7 +427,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
             # can load: nothing had to be rebuilt from the empty view.
             endpoint["models"] = ["public-a"]
             self._force_catalog_observation(domain)
-            domain.snapshot()
+            domain.refresh_model_catalog()
             self.assertEqual(["public-a"], catalog_model_names(catalog_path))
 
     def test_an_empty_live_view_drops_a_dangling_pointer_instead_of_writing_it(self) -> None:
@@ -463,7 +463,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
             endpoint["models"] = []
             for _ in range(2):
                 self._force_catalog_observation(domain)
-                domain.snapshot()
+                domain.refresh_model_catalog()
 
             self.assertFalse(catalog_path.exists())
             self.assertNotIn(

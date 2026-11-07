@@ -13,28 +13,32 @@ from .core import (
     SyncError,
     WebDAVClient,
     WebDAVHTTPError,
+    _validate_bundle_header,
     _redact_url,
     _settings_from_raw,
     baseline_manifest,
     build_manifest,
     bundle_url,
+    clear_conflict_record,
     collection_url,
     default_config_yaml,
+    default_conflict_file,
     default_settings_file,
     default_state_file,
     default_status_file,
     load_settings,
     manifest_url,
-    manifests_match,
     save_settings,
     save_sync_status,
     save_sync_state,
+    smart_sync_plan,
 )
 from .operations import (
     print_manifest_summary,
     pull_bundle,
     push_bundle,
     read_remote_manifest,
+    remember_remote_bundle,
 )
 
 def command_settings(args: argparse.Namespace) -> int:
@@ -50,7 +54,6 @@ def _settings_from_payload(payload: dict[str, Any], existing: Settings) -> Setti
         "remote_name": payload.get("remote_name", existing.remote_name),
         "sync_interval_minutes": payload.get("sync_interval_minutes", existing.sync_interval_minutes),
         "timeout_seconds": payload.get("timeout_seconds", existing.timeout_seconds),
-        "sync_direction": payload.get("sync_direction", existing.sync_direction),
     }
     # An absent password keeps the stored one.  A payload that names it owns the
     # value, empty string included -- that is how a form clears a password it no
@@ -150,47 +153,46 @@ def command_sync(args: argparse.Namespace) -> int:
         return 0
 
     print_manifest_summary("Remote snapshot", remote_manifest)
-    if manifests_match(local_manifest, remote_manifest):
+    plan = smart_sync_plan(local_manifest, remote_manifest, base_manifest)
+    if plan == "unchanged":
         save_sync_state(args.state, settings, local_manifest, "sync")
+        clear_conflict_record(default_conflict_file())
         print("WebDAV sync: already up to date")
         return 0
 
-    if base_manifest is None:
-        raise SyncError(
-            "WebDAV sync conflict: remote config exists and no previous sync baseline is recorded. "
-            "Use webdav-pull to accept remote, or webdav-push to overwrite remote."
-        )
-
-    local_changed = not manifests_match(local_manifest, base_manifest)
-    remote_changed = not manifests_match(remote_manifest, base_manifest)
-
-    if local_changed and not remote_changed:
+    if plan == "push":
         bundle_size, pushed_manifest = push_bundle(client, settings, config_path, args.state, "sync-push")
-        print(f"WebDAV sync: local changed; pushed to {_redact_url(bundle_url(settings))}")
+        print(f"WebDAV sync: took this machine's newer snapshot; pushed to {_redact_url(bundle_url(settings))}")
         print(f"Bundle bytes: {bundle_size}")
         print_manifest_summary("Synced snapshot", pushed_manifest)
+        clear_conflict_record(default_conflict_file())
         return 0
 
-    if remote_changed and not local_changed:
-        result = pull_bundle(client, settings, config_path, args.state, "sync-pull")
-        print(f"WebDAV sync: remote changed; pulled from {_redact_url(bundle_url(settings))}")
-        print_manifest_summary("Synced snapshot", result["manifest"])
-        for path in result["installed"]:
-            print(f"Installed: {path}")
-        for path in result["removed"]:
-            print(f"Removed: {path}")
-        for path in result["backups"]:
-            print(f"Backup: {path}")
-        return 0
-
-    if local_changed and remote_changed:
+    if plan == "conflict":
+        # Two sides that both moved cannot be settled here: the CLI has no reader
+        # to compare them.  Keep the remote side for the pane that does, and name
+        # the choice the reader has to make.
+        conflict_path = default_conflict_file()
+        try:
+            remember_remote_bundle(client, settings, conflict_path)
+        except Exception:
+            clear_conflict_record(conflict_path)
         raise SyncError(
-            "WebDAV sync conflict: local and remote configs both changed since the last successful sync. "
-            "Use webdav-status to inspect, then webdav-pull or webdav-push to choose a side."
+            "WebDAV sync stopped because both ends changed; compare them in the app "
+            "and keep one side",
+            "webdav_sync_conflict",
         )
 
-    save_sync_state(args.state, settings, local_manifest, "sync")
-    print("WebDAV sync: refreshed baseline")
+    result = pull_bundle(client, settings, config_path, args.state, "sync-pull", skip_when_unchanged=False)
+    print(f"WebDAV sync: took the remote's newer snapshot; pulled from {_redact_url(bundle_url(settings))}")
+    print_manifest_summary("Synced snapshot", result["manifest"])
+    for path in result["installed"]:
+        print(f"Installed: {path}")
+    for path in result["removed"]:
+        print(f"Removed: {path}")
+    for path in result["backups"]:
+        print(f"Backup: {path}")
+    clear_conflict_record(default_conflict_file())
     return 0
 
 
@@ -233,13 +235,9 @@ def command_status(args: argparse.Namespace) -> int:
         else:
             print_manifest_summary("Sync baseline", base)
             if local_manifest is not None and remote_manifest is not None:
-                local_changed = not manifests_match(local_manifest, base)
-                remote_changed = not manifests_match(remote_manifest, base)
-                print(
-                    "Sync state: "
-                    f"local_changed={'yes' if local_changed else 'no'} "
-                    f"remote_changed={'yes' if remote_changed else 'no'}"
-                )
+                # What a sync would do with these three snapshots: the same one
+                # comparison the unattended loop asks.
+                print(f"Sync plan: {smart_sync_plan(local_manifest, remote_manifest, base)}")
     except Exception as exc:
         print(f"Sync baseline: could not read state: {exc}")
 

@@ -25,6 +25,7 @@ from .core import (
     manifests_match,
     read_config_bundle,
     remote_sibling_url,
+    save_conflict_record,
     save_sync_state,
 )
 
@@ -134,6 +135,30 @@ def _remote_file_exists(client: WebDAVClient, url: str) -> bool:
         if exc.code == 404:
             return False
         raise
+
+
+def remember_remote_bundle(
+    client: WebDAVClient,
+    settings: Settings,
+    conflict_path: pathlib.Path,
+) -> None:
+    """Keep the remote side of a stopped sync for the reader to compare.
+
+    The run that detects a conflict has only compared manifests; the texts the
+    comparison shows are inside the bundle, and the window that shows them
+    usually opens after that run is over.  Reading the bundle once here -- while
+    the run already holds the connection -- is what lets the pane answer
+    later without touching the server again.
+    """
+
+    bundle_data = client.get(bundle_url(settings), max_bytes=CONFIG_BUNDLE_MAX_BYTES)
+    manifest, files = read_config_bundle(bundle_data)
+    created_at = manifest.get("created_at")
+    save_conflict_record(
+        conflict_path,
+        files,
+        created_at if isinstance(created_at, str) else None,
+    )
 
 
 def archive_remote_bundle(client: WebDAVClient, settings: Settings) -> str:

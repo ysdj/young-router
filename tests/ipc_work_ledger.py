@@ -45,6 +45,7 @@ CATALOG_ROUTE_INDEX = "catalog.route_index"
 CATALOG_IMAGE_LOOKUP = "catalog.image_lookup"
 HEALTH_PROBE = "service.health_probe"
 CODEX_LOAD_EDITOR = "codex.load_editor"
+LOCAL_MODEL_LIST = "codex.local_model_list"
 
 #: The text of the one document a settings operation repeatedly derives from.
 #: Keying by content is what makes "parsed twice" mean "these same bytes were
@@ -196,6 +197,12 @@ def work_ledger() -> Iterator[WorkLedger]:
         ledger.wrap(CATALOG_IMAGE_LOOKUP, ModelContextRegistry, "image_metadata_for_model_id")
         ledger.wrap(HEALTH_PROBE, CoreServiceController, "_health")
         ledger.wrap(CODEX_LOAD_EDITOR, codex_config, "load_editor")
+        # The live proxy's model listing is the one read that runs while the
+        # proxy replaces its workers: the port is bound but silent, so it costs
+        # the endpoint timeout.  It belongs to the background lane, never to a
+        # window's projection.
+        ledger.wrap(LOCAL_MODEL_LIST, codex_config, "local_exposed_models")
+        ledger.wrap(LOCAL_MODEL_LIST, codex_config, "local_exposed_model_rows")
         yield ledger
     finally:
         for patch in reversed(ledger._patches):
@@ -226,6 +233,14 @@ OPERATION_BUDGETS: Mapping[str, Mapping[str, int]] = {
         PROJECT_DOMAINS: 0,
         PROVIDER_SNAPSHOT: 0,
         CATALOG_ROUTE_INDEX: 0,
+        # A window refresh is the most frequent call in the app and must stay a
+        # projection.  The managed catalog is refreshed on the background
+        # client-model lane and after a proxy replacement, not while every open
+        # window polls: a `/v1/models` read here made each poll pay the endpoint
+        # timeout while the proxy was booting, and the native host's one-second
+        # polls queued behind it into a ten-second window.
+        CODEX_LOAD_EDITOR: 0,
+        LOCAL_MODEL_LIST: 0,
     },
     # Staging one edit republishes the staged draft for the windows, which is
     # one projection and the provider domain's own snapshot in it.

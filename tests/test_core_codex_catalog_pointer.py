@@ -60,6 +60,18 @@ EXPOSED = (["default-chat"], True)
 class CodexCatalogPointerTests(unittest.TestCase):
     """Keep a broken-pointer Codex config from surviving any app path."""
 
+    @staticmethod
+    def _refresh_and_snapshot(domain: CodexSettingsDomain) -> dict[str, Any]:
+        """Take the live observation on its background lane, then project.
+
+        ``snapshot`` is a projection and must not read the proxy; the managed
+        catalog is repaired by ``refresh_model_catalog``, which the client-model
+        loop and every proxy replacement call.
+        """
+
+        domain.refresh_model_catalog()
+        return domain.snapshot()
+
     def _fixture(self, root: Path, pointer: str) -> tuple[Path, Path]:
         runtime = root / "config.yaml"
         runtime.write_text(CONFIG, encoding="utf-8")
@@ -138,7 +150,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
             )
 
             domain = CodexSettingsDomain(runtime, codex_home=home)
-            snapshot = domain.snapshot()
+            snapshot = self._refresh_and_snapshot(domain)
 
             self.assertTrue(snapshot["model_catalog"]["enabled"])
             self.assertTrue(managed_catalog_path(home).exists())
@@ -158,7 +170,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
             )
 
             domain = CodexSettingsDomain(runtime, codex_home=home)
-            snapshot = domain.snapshot()
+            snapshot = self._refresh_and_snapshot(domain)
 
             current = managed_catalog_path(home)
             self.assertTrue(current.exists())
@@ -184,7 +196,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
             )
 
             domain = CodexSettingsDomain(runtime, codex_home=home)
-            snapshot = domain.snapshot()
+            snapshot = self._refresh_and_snapshot(domain)
 
             current = managed_catalog_path(home)
             self.assertTrue(current.exists())
@@ -226,7 +238,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
                     codex_home=home,
                     runtime_settings_path=root / "runtime-settings.env",
                 )
-                domain.snapshot()
+                domain.refresh_model_catalog()
             catalog = managed_catalog_path(home)
             pinned_text = catalog.read_text(encoding="utf-8")
             self.assertIn("Astra instructions", pinned_text)
@@ -238,7 +250,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
                 "young_router.core.model_catalog.load_native_catalog",
                 return_value=[orbit, astra],
             ):
-                domain.snapshot()
+                domain.refresh_model_catalog()
             self.assertEqual(pinned_text, catalog.read_text(encoding="utf-8"))
 
             # Once the client drops the pinned profile the mapping is re-resolved.
@@ -246,7 +258,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
                 "young_router.core.model_catalog.load_native_catalog",
                 return_value=[orbit],
             ):
-                domain.snapshot()
+                domain.refresh_model_catalog()
             refreshed = catalog.read_text(encoding="utf-8")
             self.assertIn("GPT-7 instructions", refreshed)
             self.assertNotIn("Astra instructions", refreshed)
@@ -272,7 +284,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
                 return_value=[native_profile],
             ):
                 domain = CodexSettingsDomain(runtime, codex_home=home)
-                domain.snapshot()
+                domain.refresh_model_catalog()
             catalog = managed_catalog_path(home)
             before = catalog.read_text(encoding="utf-8")
             self.assertIn("Native client instructions", before)
@@ -283,7 +295,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
                 "young_router.core.model_catalog.load_native_catalog",
                 return_value=[],
             ):
-                domain.snapshot()
+                domain.refresh_model_catalog()
             self.assertEqual(before, catalog.read_text(encoding="utf-8"))
 
     def test_missing_managed_catalog_file_is_rebuilt_before_codex_loads(self) -> None:
@@ -298,7 +310,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
             self.assertFalse(catalog.exists())
 
             domain = CodexSettingsDomain(runtime, codex_home=home)
-            snapshot = domain.snapshot()
+            snapshot = self._refresh_and_snapshot(domain)
 
             self.assertTrue(catalog.exists())
             self.assertEqual(["default-chat"], self._catalog_models(catalog))
@@ -317,7 +329,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
             runtime, home = self._fixture(root, str(managed_catalog_path(home)))
 
             domain = CodexSettingsDomain(runtime, codex_home=home)
-            snapshot = domain.snapshot()
+            snapshot = self._refresh_and_snapshot(domain)
 
             text = (home / "config.toml").read_text(encoding="utf-8")
             self.assertNotIn("model_catalog_json", text)
@@ -336,7 +348,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
             before = (home / "config.toml").read_text(encoding="utf-8")
 
             domain = CodexSettingsDomain(runtime, codex_home=home)
-            snapshot = domain.snapshot()
+            snapshot = self._refresh_and_snapshot(domain)
 
             self.assertEqual(before, (home / "config.toml").read_text(encoding="utf-8"))
             self.assertFalse(foreign.exists())
@@ -357,7 +369,7 @@ class CodexCatalogPointerTests(unittest.TestCase):
             domain = CodexSettingsDomain(runtime, codex_home=home)
             domain.dispatch("patch", {"model_reasoning_effort": "high"})
 
-            snapshot = domain.snapshot()
+            snapshot = self._refresh_and_snapshot(domain)
 
             current = managed_catalog_path(home)
             self.assertTrue(current.exists())

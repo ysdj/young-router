@@ -136,6 +136,7 @@ class CoreOperationsTests(unittest.TestCase):
             status_path=root / "webdav-status.json",
             config_path=config,
             state_path=root / "webdav-state.json",
+            conflict_path=root / "webdav-conflict.json",
         )
         domain.stage_secret("password", None, "replace-webdav-password")
         domain.dispatch(
@@ -148,6 +149,35 @@ class CoreOperationsTests(unittest.TestCase):
         )
         domain.apply()
         return domain
+
+    def test_a_window_status_never_scans_process_groups(self) -> None:
+        """A snapshot's service row is a projection, not an ownership audit.
+
+        Verifying an orphan runs ``ps`` and waits on its own two-second bound.
+        During a proxy replacement the recorded pid is briefly absent, so a
+        poll taken then ran that scan every second and queued every later
+        request behind it.
+        """
+
+        controller = CoreServiceController("/tmp/unused-runtime")
+        with mock.patch.object(controller, "_pid", return_value=None), mock.patch.object(
+            controller, "_health", return_value=False
+        ), mock.patch.object(
+            controller,
+            "_recorded_proxy_is_orphaned",
+            side_effect=AssertionError("a snapshot scanned the process table"),
+        ):
+            projected = controller.status(force=False)
+        self.assertEqual("stopped", projected["state"])
+
+        # An explicit operation still asks the real ownership question.
+        with mock.patch.object(controller, "_pid", return_value=None), mock.patch.object(
+            controller, "_health", return_value=False
+        ), mock.patch.object(
+            controller, "_recorded_proxy_is_orphaned", return_value=None
+        ) as orphaned:
+            controller.status(force=True)
+        orphaned.assert_called_once_with()
 
     def test_reload_rolls_the_workers_instead_of_interrupting_the_service(self) -> None:
         controller = CoreServiceController("/tmp/unused-runtime")
@@ -1721,14 +1751,13 @@ class CoreOperationsTests(unittest.TestCase):
             webdav = self._configured_webdav_domain(root, config)
             core = CoreStore(domains=[webdav])
 
-            webdav.dispatch("patch", {"enabled": True, "sync_interval_minutes": 15, "sync_direction": "push"})
+            webdav.dispatch("patch", {"enabled": True, "sync_interval_minutes": 15})
             webdav.apply()
             self.assertEqual(
                 {
                     "enabled": True,
                     "configured": True,
                     "sync_interval_minutes": 15,
-                    "sync_direction": "push",
                     "last_sync_at": None,
                 },
                 core.webdav_auto_sync_state(),
@@ -1741,8 +1770,8 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertTrue(state["enabled"])
             self.assertEqual(15, state["sync_interval_minutes"])
 
-    def test_an_automatic_run_uses_the_saved_direction(self) -> None:
-        """智能同步 means the comparing action; the other two mean themselves."""
+    def test_an_automatic_run_is_always_the_comparing_sync(self) -> None:
+        """There is no direction to read: every unattended run compares both sides."""
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1750,7 +1779,7 @@ class CoreOperationsTests(unittest.TestCase):
             config.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
             webdav = self._configured_webdav_domain(root, config)
             core = CoreStore(domains=[webdav])
-            webdav.dispatch("patch", {"enabled": True, "sync_direction": "push"})
+            webdav.dispatch("patch", {"enabled": True})
             webdav.apply()
 
             recorded: list[tuple[tuple[object, ...], dict[str, object]]] = []
@@ -1761,20 +1790,10 @@ class CoreOperationsTests(unittest.TestCase):
             ):
                 core.run_automatic_webdav_sync()
             (operation, payload, _revision), flags = recorded[-1]
-            self.assertEqual("push", operation)
+            self.assertEqual("sync", operation)
             self.assertEqual({"sections": ["providers_models", "relay_accounts"]}, payload)
             # Only the Core's own loop may ask for the unattended behaviour.
             self.assertEqual({"automatic": True}, flags)
-
-            webdav.dispatch("patch", {"sync_direction": "smart"})
-            webdav.apply()
-            with mock.patch.object(
-                core,
-                "_dispatch_webdav_sync",
-                side_effect=lambda *args, **kwargs: recorded.append((args, kwargs)),
-            ):
-                core.run_automatic_webdav_sync()
-            self.assertEqual("sync", recorded[-1][0][0])
 
     def test_an_automatic_sync_is_not_stopped_by_an_open_draft(self) -> None:
         """A background sync reads the files; a pane's draft is the pane's.
@@ -1813,7 +1832,7 @@ class CoreOperationsTests(unittest.TestCase):
                     {"domain": "webdav", "type": "sync", "payload": {"sections": ["providers_models", "relay_accounts"]}},
                     expected_revision=core.revision,
                 )
-            self.assertEqual("webdav_sync_conflict", raised.exception.code)
+            self.assertEqual("webdav_sync_unsaved", raised.exception.code)
 
     def test_changing_webdav_settings_wakes_the_interval_loop(self) -> None:
         """A saved setting takes effect at once, not at the next wake."""
@@ -1921,6 +1940,119 @@ class CoreOperationsTests(unittest.TestCase):
                 {key: result["action_summary"][key] for key in ("outcome", "archived_remote")},
             )
 
+    def test_a_diverged_sync_keeps_both_sides_and_writes_nothing(self) -> None:
+        """Both ends changed: the run stops, and the comparison survives it.
+
+        The pane that shows the diff usually opens after this run is over, so
+        the remote side has to land somewhere durable.  What must not happen is
+        either file being replaced: a conflict is a question, not a merge.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            original = textwrap.dedent(PROVIDER_CONFIG).lstrip()
+            config.write_text(original, encoding="utf-8")
+            providers = ProvidersModelsDomain(config)
+            relay = RelayAccountsDomain(storage_path=root / ".litellm-runtime" / "relay-accounts.json")
+            webdav = self._configured_webdav_domain(root, config)
+            core = CoreStore(domains=[providers, relay, webdav])
+
+            base = {"files": [{"path": "config.yaml", "present": True, "sha256": "base"}]}
+            local = {"files": [{"path": "config.yaml", "present": True, "sha256": "local"}]}
+            remote = {"files": [{"path": "config.yaml", "present": True, "sha256": "remote"}]}
+            remote_text = original.replace("replace-me-secret", "another-machine-secret")
+            remembered: list[Path] = []
+
+            def remember(_client: object, _settings: object, path: Path) -> None:
+                remembered.append(path)
+                path.write_text(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "recorded_at": "2026-09-25T10:00:00Z",
+                            "remote_created_at": "2026-09-25T09:59:00Z",
+                            "files": {"config.yaml": remote_text},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            # A window has already read this state: the projection is memoized
+            # on the revision, and a stopped run does not move it.
+            core.snapshot()
+            webdav_core.save_sync_state(root / "webdav-state.json", webdav.sync_settings(), base, "sync")
+            with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
+                "young_router.webdav.core.build_manifest", return_value=local
+            ), mock.patch("young_router.webdav.operations.read_remote_manifest", return_value=remote), mock.patch(
+                "young_router.webdav.operations.remember_remote_bundle", side_effect=remember
+            ), mock.patch("young_router.webdav.operations.push_bundle") as pushed, mock.patch(
+                "young_router.webdav.operations.pull_bundle"
+            ) as pulled:
+                with self.assertRaises(CoreError) as raised:
+                    core.dispatch(
+                        {"domain": "webdav", "type": "sync", "payload": {"sections": ["providers_models", "relay_accounts"]}},
+                        expected_revision=core.revision,
+                    )
+
+            self.assertEqual("webdav_sync_conflict", raised.exception.code)
+            pushed.assert_not_called()
+            pulled.assert_not_called()
+            self.assertEqual(original, config.read_text(encoding="utf-8"))
+            self.assertEqual([root / "webdav-conflict.json"], remembered)
+            status = json.loads((root / "webdav-status.json").read_text(encoding="utf-8"))
+            self.assertEqual("webdav_sync_conflict", status["code"])
+
+            # The pane reads what is waiting to be compared, and the two texts
+            # through the versioned editor lease: the local file against the
+            # kept-aside remote copy.
+            conflict = webdav.snapshot()["conflict"]
+            # The Core projection is what the pane actually reads.
+            self.assertEqual(conflict, core.snapshot()["domains"]["webdav"]["conflict"])
+            self.assertEqual("2026-09-25T10:00:00Z", conflict["at"])
+            self.assertEqual(
+                [{"name": "config", "changed": True, "local_present": True, "remote_present": True}],
+                [row for row in conflict["files"] if row["name"] == "config"],
+            )
+            self.assertTrue(conflict["comparable"])
+            descriptor = core.editor_document("webdav", "config")
+            self.assertEqual(original, descriptor["text"])
+            self.assertEqual(remote_text, descriptor["baseline"])
+
+            # A comparison is a read: staging over a config file would bypass
+            # the sync's own validation, so the surface refuses every write.
+            with self.assertRaises(CoreError):
+                core.stage_editor_text("webdav", "config", local, revision=core.revision)
+
+    def test_a_sync_that_lands_clears_the_kept_aside_comparison(self) -> None:
+        """Once the two ends agree there is no conflict left to show."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            providers = ProvidersModelsDomain(config)
+            relay = RelayAccountsDomain(storage_path=root / ".litellm-runtime" / "relay-accounts.json")
+            webdav = self._configured_webdav_domain(root, config)
+            core = CoreStore(domains=[providers, relay, webdav])
+            record = root / "webdav-conflict.json"
+            record.write_text(
+                json.dumps({"version": 1, "recorded_at": "2026-09-25T10:00:00Z", "files": {}}),
+                encoding="utf-8",
+            )
+            self.assertIsNotNone(webdav.snapshot()["conflict"])
+
+            with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
+                "young_router.webdav.operations.push_bundle", return_value=(32, {"files": []})
+            ):
+                core.dispatch(
+                    {"domain": "webdav", "type": "push", "payload": {"sections": ["providers_models", "relay_accounts"]}},
+                    expected_revision=core.revision,
+                )
+
+            self.assertFalse(record.exists())
+            self.assertIsNone(webdav.snapshot()["conflict"])
+
     def test_manual_webdav_sync_rejects_partial_sections_and_dirty_sources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1955,7 +2087,7 @@ class CoreOperationsTests(unittest.TestCase):
                     {"domain": "webdav", "type": "push", "payload": {}},
                     expected_revision=core.revision,
                 )
-            self.assertEqual("webdav_sync_conflict", dirty_webdav.exception.code)
+            self.assertEqual("webdav_sync_unsaved", dirty_webdav.exception.code)
 
             core.reload("webdav", revision=core.revision)
             core.dispatch(
@@ -1971,7 +2103,7 @@ class CoreOperationsTests(unittest.TestCase):
                     {"domain": "webdav", "type": "pull", "payload": {}},
                     expected_revision=core.revision,
                 )
-            self.assertEqual("webdav_sync_conflict", dirty_providers.exception.code)
+            self.assertEqual("webdav_sync_unsaved", dirty_providers.exception.code)
 
     def test_manual_webdav_failure_records_failed_status_without_leaking_details(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

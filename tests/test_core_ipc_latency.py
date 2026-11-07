@@ -20,7 +20,9 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import statistics
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -143,27 +145,32 @@ class IpcLatencyTests(unittest.TestCase):
         self.core.snapshot()
 
     def _timed(self, operation, *, repeat: int = 5) -> float:
-        """The slowest CPU time of ``repeat`` calls, in milliseconds.
+        """The median CPU time of ``repeat`` calls, in milliseconds.
 
-        Wall time is asserted beside it only against ``WALL_CEILING_MS``: it is
-        there to catch a call waiting on a socket, never to fail on scheduling.
+        One call can lose its slice to the CPU next door: the same operation
+        measured 150 ms alone and 240 ms in an eight-shard run without doing
+        any more work.  A repeated derivation adds to every call, so the median
+        names it while an outlier from frequency scaling does not.  Wall time is
+        still the worst sample and only asserted against ``WALL_CEILING_MS``: it
+        is there to catch a call waiting on a socket, never to fail on
+        scheduling.
         """
 
         operation()
-        worst_cpu = 0.0
+        cpu_samples: list[float] = []
         worst_wall = 0.0
         for _ in range(repeat):
             wall_started = time.perf_counter()
-            cpu_started = time.process_time()
+            cpu_started = time.thread_time()
             operation()
-            worst_cpu = max(worst_cpu, (time.process_time() - cpu_started) * 1000.0)
+            cpu_samples.append((time.thread_time() - cpu_started) * 1000.0)
             worst_wall = max(worst_wall, (time.perf_counter() - wall_started) * 1000.0)
         self.assertLess(
             worst_wall,
             WALL_CEILING_MS,
             f"an operation waited {worst_wall:.0f} ms of wall time; it is blocked",
         )
-        return worst_cpu
+        return statistics.median(cpu_samples)
 
     def test_a_snapshot_never_parses_the_provider_document(self) -> None:
         """The most-called method must not read the configuration at all.
@@ -224,6 +231,156 @@ class IpcLatencyTests(unittest.TestCase):
 
         self.assertLess(worst_validate, IPC_BUDGET_MS, "validate exceeded the IPC budget")
         self.assertLess(worst_disk, IPC_BUDGET_MS, "disk_state exceeded the IPC budget")
+
+    def test_a_slow_live_model_listing_never_delays_a_window_refresh(self) -> None:
+        """A window refresh must not wait on the proxy's model listing.
+
+        The native host polls a snapshot about once a second.  While the proxy
+        replaces its workers the port is bound but silent, so a listing taken
+        inside that poll costs the endpoint timeout and every later poll queues
+        behind it: the measured queue grew from 200 ms to 16 s.  The observation
+        belongs to the background client-model lane; a snapshot is a projection.
+        """
+
+        from young_router.core import codex_config
+
+        # Point Codex at the managed catalog exactly as an installation does.
+        # Without the pointer the live-model path returns before its read, so
+        # this test would pass without exercising the defect.
+        catalog_path = self.codex_home / "model-catalog.json"
+        catalog_path.write_text('{"models": []}\n', encoding="utf-8")
+        (self.codex_home / "config.toml").write_text(
+            f'model_catalog_json = "{catalog_path}"\n', encoding="utf-8"
+        )
+        codex = self.core._domains["codex"]
+        codex.reload()
+        # setUp's own refresh already took the observation; move its rate-limit
+        # window aside so this snapshot is the one that would take the live path.
+        codex._catalog_source_checked_at = 0.0
+
+        def slow_listing(_key: str) -> tuple[list[str], bool]:
+            time.sleep(1.0)
+            return [], False
+
+        started = time.perf_counter()
+        with mock.patch.object(
+            codex_config, "local_exposed_models", side_effect=slow_listing
+        ) as listing:
+            self.core.snapshot()
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+        self.assertEqual(0, listing.call_count, "a window refresh read the live model listing")
+        self.assertLess(
+            elapsed_ms,
+            IPC_BUDGET_MS,
+            f"a window refresh waited {elapsed_ms:.0f} ms on the live model listing",
+        )
+
+    def test_a_worker_status_read_never_holds_the_store_lock(self) -> None:
+        """A booting worker waits on its pane, not on every window.
+
+        WorkBuddy and Our Free Model answer their account status from a local
+        worker with a twenty- or thirty-second ceiling.  The read used to run
+        inside ``dispatch``'s store lock, so a window that entered a WorkBuddy
+        provider while the worker booted froze every snapshot and queued the
+        debounced Apply behind it.
+        """
+
+        providers = self.core._domains["providers_models"]
+        entered = threading.Event()
+        release = threading.Event()
+        original = providers.dispatch
+
+        def slow_dispatch(action: str, payload: object | None = None):
+            if action == "workbuddy_status":
+                entered.set()
+                release.wait(5.0)
+                return {
+                    "domain": "providers_models",
+                    "operation_summary": {
+                        "operation": "workbuddy_status",
+                        "providers": {},
+                    },
+                }
+            return original(action, payload)
+
+        providers.dispatch = slow_dispatch
+        worker = threading.Thread(
+            target=lambda: self.core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "workbuddy_status",
+                    "payload": {},
+                }
+            ),
+            name="test-worker-status",
+            daemon=True,
+        )
+        worker.start()
+        self.assertTrue(entered.wait(2.0), "the worker status read never started")
+        try:
+            started = time.perf_counter()
+            self.core.snapshot()
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+        finally:
+            release.set()
+            worker.join(5.0)
+
+        self.assertLess(
+            elapsed_ms,
+            IPC_BUDGET_MS,
+            f"a window refresh waited {elapsed_ms:.0f} ms on a worker status read",
+        )
+
+    def test_a_due_context_refresh_never_holds_the_store_lock(self) -> None:
+        """The remote context fetch belongs to the background lane.
+
+        ``ModelContextRegistry.refresh_if_due`` asks public metadata over the
+        network with an eight-second ceiling per source.  It used to run inside
+        the catalog refresh under the store lock, so the first window read after
+        the cache aged out waited for the internet while every other request
+        queued behind it.
+        """
+
+        codex = self.core._domains["codex"]
+        # The catalog pointer is what makes the refresh path take the context
+        # observation; an empty Codex home would skip it.
+        catalog_path = self.codex_home / "model-catalog.json"
+        catalog_path.write_text('{"models": []}\n', encoding="utf-8")
+        (self.codex_home / "config.toml").write_text(
+            f'model_catalog_json = "{catalog_path}"\n', encoding="utf-8"
+        )
+        codex.reload()
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow_context_refresh(*, force: bool = False, sync_cache: bool = True) -> bool:
+            entered.set()
+            release.wait(5.0)
+            return False
+
+        codex._context_registry.refresh_if_due = slow_context_refresh
+        worker = threading.Thread(
+            target=lambda: self.core.refresh_client_model_lists(include_claude=False),
+            name="test-context-refresh",
+            daemon=True,
+        )
+        worker.start()
+        self.assertTrue(entered.wait(2.0), "the background lane never reached the context refresh")
+        try:
+            started = time.perf_counter()
+            self.core.snapshot()
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+        finally:
+            release.set()
+            worker.join(5.0)
+
+        self.assertLess(
+            elapsed_ms,
+            IPC_BUDGET_MS,
+            f"a window refresh waited {elapsed_ms:.0f} ms on the remote context fetch",
+        )
 
     def test_a_staged_edit_commits_inside_the_ipc_budget(self) -> None:
         """The debounced auto-apply is the path every keystroke ends on."""
