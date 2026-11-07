@@ -669,6 +669,23 @@ _CODE_AUTO_COMPACT_MAX = 1_000_000
 _CLAUDE_CODE_BLANK_DESCRIPTION = "\u200b"
 
 
+def _claims_one_million(declared: object) -> bool:
+    """Whether a route's own declaration lets this app name it as 1M.
+
+    Used for the *spelling* -- the client's ``[1m]`` id -- where a claim changes
+    what a picker offers, and a wrong one hides a route or offers a row that
+    answers ``Invalid model name``.  It is deliberately not used for the window
+    a session is given: that one is chosen for the cost of being wrong (see
+    ``_code_behaves_as``).
+    """
+
+    return (
+        isinstance(declared, int)
+        and not isinstance(declared, bool)
+        and declared >= 1_000_000
+    )
+
+
 def _code_behaves_as(name: str, max_input_tokens: object) -> str | None:
     """The known Claude Code model an unknown public id should behave as.
 
@@ -678,6 +695,14 @@ def _code_behaves_as(name: str, max_input_tokens: object) -> str | None:
     is what narrows the effective window back to the route's own number.  A
     smaller route gets a 200k entry, which also caps any accidental larger
     setting at its real maximum.
+
+    A resolved window counts here even when the user declared none, because the
+    two ways of being wrong do not cost the same.  Too small is a *client-side*
+    refusal -- measured: a 213k prompt on a route the client reads as 200k never
+    reaches the router, and there is no elision pass to recover it.  Too large
+    arrives, and ``proxy.context_window`` shortens the replay.  So the window a
+    session is given follows the published number, while the ``[1m]`` *spelling*
+    (``_code_picker_id``) still needs the user's declaration.
     """
 
     if claude_aliases.desktop_keeps_model_id(name):
@@ -1731,8 +1756,41 @@ class ClaudeSettingsDomain:
         # person reads is what the list is ordered by, without a sort here.
         return rows
 
-    @staticmethod
-    def _code_picker_id(name: str) -> str:
+    def _declared_context(self, name: str) -> int | None:
+        """The smallest window the user wrote on this group's routes.
+
+        This is the *declaration*, read from the routes document rather than
+        from any window this app resolved: ``_claims_one_million`` asks it, and
+        the discovery view asks the registry the same question through
+        ``_custom_contexts``.  A group takes the smallest, because a group is
+        only as usable as its narrowest route.
+        """
+
+        from .. import codex_config
+        from ...public_names import public_name_key
+
+        try:
+            document = codex_config.load_yaml(self.runtime_config_path)
+        except Exception:
+            return None
+        if not isinstance(document, Mapping):
+            return None
+        key = public_name_key(name)
+        windows: list[int] = []
+        for entry in document.get("model_list") or ():
+            if not isinstance(entry, Mapping):
+                continue
+            if public_name_key(entry.get("model_name")) != key:
+                continue
+            info = entry.get("model_info")
+            if not isinstance(info, Mapping):
+                continue
+            value = info.get("max_input_tokens")
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                windows.append(value)
+        return min(windows) if windows else None
+
+    def _code_picker_id(self, name: str, declared: object = None) -> str:
         """The id Claude Code's picker names for one public route.
 
         One id space for both Claude apps.  Claude Desktop's Code tab launches
@@ -1745,11 +1803,24 @@ class ClaudeSettingsDomain:
         serve both apps; the proxy resolves the alias back through
         ``claude_aliases``, and a Claude-shaped id (already in the client's own
         catalog) is kept as written.
+
+        A declared 1M route carries the suffix too, because that is the id the
+        desktop session sends: one route under two spellings would split
+        ``modelSettings`` again the moment one of the two apps addressed it.
+        It also states the window by name instead of by substitute
+        (``behavesAs``), which is the only way the terminal can read a window
+        the client's own catalogue has no tier for.  The discovery view suffixes
+        the same set (``desktop_model_rows``), so the two agree by construction;
+        a Claude-shaped id is left alone in both, because the client's catalogue
+        already answers for it.
         """
 
         if claude_aliases.desktop_keeps_model_id(name):
             return name
-        return claude_aliases.claude_desktop_alias(name)
+        base = claude_aliases.claude_desktop_alias(name)
+        if _claims_one_million(declared):
+            return f"{base}{claude_aliases.CONTEXT_SUFFIX}"
+        return base
 
     def _code_picker(self, names: Sequence[str], existing: object = None) -> dict[str, Any]:
         """A picker lineup for one public-model list.
@@ -1779,11 +1850,17 @@ class ClaudeSettingsDomain:
         known = {str(row.get("id")): row for row in self._public_model_rows()}
         rows: list[dict[str, Any]] = []
         for name in names:
-            model_id = self._code_picker_id(name)
+            declared = self._declared_context(name)
+            model_id = self._code_picker_id(name, declared)
             # A list written before the ids were aliases carried the public
             # name, and a field the user typed there is theirs: adopt it onto
             # the id the row names now.
-            row = dict(preserved.get(model_id) or preserved.get(name) or {})
+            row = dict(
+                preserved.get(model_id)
+                or preserved.get(name)
+                or preserved.get(self._code_picker_id(name))
+                or {}
+            )
             row["model"] = model_id
             route = known.get(name)
             if route is not None:
@@ -1842,28 +1919,33 @@ class ClaudeSettingsDomain:
             route = known.get(name)
             if route is None:
                 continue
-            model_id = self._code_picker_id(name)
+            declared = self._declared_context(name)
+            model_id = self._code_picker_id(name, declared)
             entry = dict(settings.get(model_id) or settings.get(name) or {})
             entry.setdefault("autoCompactWindow", _code_auto_compact_window(route.get("max_input_tokens")))
             settings[model_id] = entry
-        # A key this app wrote under the superseded spelling is not the user's
-        # writing.  When the id now states exactly what that entry says, keeping
-        # both leaves one route described twice -- and a file that grows a second
-        # entry per model on every change.  A value that differs is theirs and
-        # stays, because nothing here knows which spelling they meant.
+        # A key this app wrote under a superseded spelling is not the user's
+        # writing.  One route whose id moved (a public name before the ids were
+        # aliases; an alias before a declared 1M route carried the client's
+        # suffix) would otherwise be described twice, and the file would grow an
+        # entry per model on every change.  Only an entry holding nothing but the
+        # number this app writes is retired, and only when it now agrees: a value
+        # that differs is theirs, because nothing here knows which spelling they
+        # meant.
         for name in names:
-            model_id = self._code_picker_id(name)
-            if model_id == name:
-                continue
-            stale = settings.get(name)
+            model_id = self._code_picker_id(name, self._declared_context(name))
             current = settings.get(model_id)
-            if not isinstance(stale, Mapping) or not isinstance(current, Mapping):
+            if not isinstance(current, Mapping):
                 continue
-            if set(stale) - {"autoCompactWindow"}:
-                continue
-            if stale.get("autoCompactWindow") != current.get("autoCompactWindow"):
-                continue
-            settings.pop(name, None)
+            for stale_key in {name, self._code_picker_id(name)} - {model_id}:
+                stale = settings.get(stale_key)
+                if not isinstance(stale, Mapping):
+                    continue
+                if set(stale) - {"autoCompactWindow"}:
+                    continue
+                if stale.get("autoCompactWindow") != current.get("autoCompactWindow"):
+                    continue
+                settings.pop(stale_key, None)
         return settings
 
     def _code_model_list_apply(self, enabled: bool, names: Sequence[str] | None = None) -> dict[str, Any]:

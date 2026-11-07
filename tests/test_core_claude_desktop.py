@@ -18,6 +18,30 @@ from young_router.core.domains.claude import ClaudeSettingsDomain
 from young_router.proxy import claude_desktop_listing as claude_desktop_listing_module
 
 
+def _write_runtime_config(path: pathlib.Path, declarations: dict[str, int]) -> pathlib.Path:
+    """A routes document that declares a window on the named routes.
+
+    JSON is valid YAML, which is all ``codex_config.load_yaml`` needs.  What
+    matters is that the number is *on the route*: that is the only statement
+    that may turn a route into a 1M claim.  A window this app resolved from a
+    profile or an upstream catalogue is not on any route and therefore never
+    reaches this fixture.
+    """
+
+    path.write_text(
+        json.dumps(
+            {
+                "model_list": [
+                    {"model_name": name, "model_info": {"max_input_tokens": window}}
+                    for name, window in declarations.items()
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def _write_desktop_config(root: pathlib.Path, config: dict[str, object]) -> pathlib.Path:
     config_id = "synthetic-config"
     root.mkdir(parents=True)
@@ -376,17 +400,25 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
             root = pathlib.Path(directory)
             desktop_root = root / "configLibrary"
             _write_desktop_config(desktop_root, {})
+            # Only these two carry a window the *user* wrote.  ``gemini-3.8-flash``
+            # reads 1M in a public catalogue and declares nothing, which is a
+            # reading and must not become a claim.
+            _write_runtime_config(
+                root / "config.yaml",
+                {"gpt-6.1-sol": 500_000, "kimi-k3.1-pro": 1_000_000},
+            )
             domain = ClaudeSettingsDomain(
                 root / "settings.json",
                 desktop_config_library_path=desktop_root,
                 runtime_config_path=root / "config.yaml",
                 runtime_root=root,
             )
-            public = ["claude-opus-5-5", "gemini-3.8-flash", "gpt-6.1-sol"]
+            public = ["claude-opus-5-5", "gemini-3.8-flash", "gpt-6.1-sol", "kimi-k3.1-pro"]
             rows = [
                 {"id": "claude-opus-5-5", "max_input_tokens": 1_000_000},
                 {"id": "gemini-3.8-flash", "max_input_tokens": 1_048_576},
                 {"id": "gpt-6.1-sol", "max_input_tokens": 500_000},
+                {"id": "kimi-k3.1-pro", "max_input_tokens": 1_000_000},
             ]
             with (
                 mock.patch.object(domain, "_public_models", return_value=public),
@@ -397,34 +429,48 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
 
             picker = json.loads(domain.raw_text(include_sensitive=True))["modelPicker"]
             self.assertTrue(picker["replaceBuiltInOptions"])
-            # One row per route: no second row for the desktop spelling.
+            # One row per route, and a route the user declared at 1M is named
+            # the way the desktop session names it.
             self.assertEqual(
-                ["claude-opus-5-5", "claude-mythos-319034", "claude-mythos-dedfef"],
+                [
+                    "claude-opus-5-5",
+                    alias_claude_desktop("gemini-3.8-flash"),
+                    alias_claude_desktop("gpt-6.1-sol"),
+                    f"{alias_claude_desktop('kimi-k3.1-pro')}[1m]",
+                ],
                 [row["model"] for row in picker["options"]],
             )
             by_id = {row["model"]: row for row in picker["options"]}
-            gemini = by_id["claude-mythos-319034"]
+            # A route nobody declared keeps the bare alias even though a catalogue
+            # reads it at 1M: the suffix is a claim about the route, and the
+            # session's window is carried by the behavior model below instead.
             self.assertEqual(
                 {
-                    "model": "claude-mythos-319034",
+                    "model": alias_claude_desktop("gemini-3.8-flash"),
                     "description": "\u200b",
                     "label": "gemini-3.8-flash",
                     "behavesAs": "claude-opus-5-5",
                 },
-                gemini,
+                by_id[alias_claude_desktop("gemini-3.8-flash")],
             )
-            # A 500k route gets the 1M behavior model; the exact 500k comes
-            # from its per-model autoCompactWindow below.
-            self.assertEqual("claude-opus-5-5", by_id["claude-mythos-dedfef"]["behavesAs"])
-            self.assertEqual("gpt-6.1-sol", by_id["claude-mythos-dedfef"]["label"])
+            # A declared 500k route gets the 1M behavior model; the exact 500k
+            # comes from its per-model autoCompactWindow below.
+            self.assertEqual("claude-opus-5-5", by_id[alias_claude_desktop("gpt-6.1-sol")]["behavesAs"])
+            self.assertEqual("gpt-6.1-sol", by_id[alias_claude_desktop("gpt-6.1-sol")]["label"])
             # A real Claude id is already in the client's catalog and needs no
             # substitute; the client keeps its own friendly label for it.
             self.assertEqual({"model": "claude-opus-5-5", "description": "\u200b"}, by_id["claude-opus-5-5"])
             settings = json.loads(domain.raw_text(include_sensitive=True))["modelSettings"]
+            # A Claude-shaped 1M route keeps the number it states: the catalogue
+            # applies it to the model the id names.
             self.assertEqual(1_000_000, settings["claude-opus-5-5"]["autoCompactWindow"])
-            # 1,048,576 is clamped to the setting's accepted maximum of 1M.
-            self.assertEqual(1_000_000, settings["claude-mythos-319034"]["autoCompactWindow"])
-            self.assertEqual(500_000, settings["claude-mythos-dedfef"]["autoCompactWindow"])
+            self.assertEqual(500_000, settings[alias_claude_desktop("gpt-6.1-sol")]["autoCompactWindow"])
+            self.assertEqual(
+                1_000_000,
+                settings[f"{alias_claude_desktop('kimi-k3.1-pro')}[1m]"]["autoCompactWindow"],
+            )
+            # 1,048,576 is clamped to the setting's accepted maximum.
+            self.assertEqual(1_000_000, settings[alias_claude_desktop("gemini-3.8-flash")]["autoCompactWindow"])
             # A public-name entry nobody wrote is not invented beside them.
             self.assertNotIn("gpt-6.1-sol", settings)
 
@@ -539,6 +585,7 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 }
             }
             (root / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+            _write_runtime_config(root / "config.yaml", {"gemini-3.8-flash": 1_048_576})
             domain = ClaudeSettingsDomain(
                 root / "settings.json",
                 desktop_config_library_path=desktop_root,
@@ -556,10 +603,12 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 self.assertTrue(domain.refresh_model_lists())
 
             rows = json.loads(domain.raw_text(include_sensitive=True))["modelPicker"]["options"]
+            # The declared 1M route is named the way the desktop session names
+            # it, so one row serves both apps.
             self.assertEqual(
                 [
                     {
-                        "model": "claude-mythos-319034",
+                        "model": f"{alias_claude_desktop('gemini-3.8-flash')}[1m]",
                         "description": "\u200b",
                         "label": "gemini-3.8-flash",
                         "behavesAs": "claude-opus-5-5",
@@ -576,7 +625,7 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
             root = pathlib.Path(directory)
             desktop_root = root / "configLibrary"
             _write_desktop_config(desktop_root, {})
-            settings = {"modelSettings": {"gemini-3.8-flash": {"autoCompactWindow": 1_000_000}}}
+            settings = {"modelSettings": {"gemini-3.8-flash": {"autoCompactWindow": "auto"}}}
             (root / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
             domain = ClaudeSettingsDomain(
                 root / "settings.json",
@@ -596,7 +645,106 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 domain.apply()
 
             settings = json.loads(domain.raw_text(include_sensitive=True))["modelSettings"]
-            self.assertEqual({"claude-mythos-319034": {"autoCompactWindow": 1_000_000}}, settings)
+            # The public-name entry said exactly what the id's entry says, so it
+            # is retired rather than left beside it describing one route twice.
+            self.assertEqual({"claude-mythos-319034": {"autoCompactWindow": "auto"}}, settings)
+
+    def test_a_resolved_one_million_window_earns_no_one_million_spelling(self) -> None:
+        # A reading is not a promise.  ``gemini-3.8-flash`` reads 1,048,576 in a
+        # public catalogue and declares nothing, and the ``[1m]`` id is a claim
+        # about the route: beside a profile that prefers 1M it hides the standard
+        # row, and a row whose alias did not resolve answered ``Invalid model
+        # name``.  The window the *session* gets is a different decision -- a
+        # window stated too small is a client-side refusal no elision can
+        # recover, so the behavior model still carries the published number.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(desktop_root, {})
+            settings = {
+                "modelPicker": {
+                    "replaceBuiltInOptions": True,
+                    "options": [
+                        {
+                            "model": f"{alias_claude_desktop('gemini-3.8-flash')}[1m]",
+                            "description": "\u200b",
+                            "behavesAs": "claude-opus-5-5",
+                        }
+                    ],
+                }
+            }
+            (root / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+            # A routes document with the group present and no window on it.
+            (root / "config.yaml").write_text(
+                json.dumps({"model_list": [{"model_name": "gemini-3.8-flash"}]}),
+                encoding="utf-8",
+            )
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with (
+                mock.patch.object(domain, "_public_models", return_value=["gemini-3.8-flash"]),
+                mock.patch.object(
+                    domain,
+                    "_public_model_rows",
+                    return_value=[{"id": "gemini-3.8-flash", "max_input_tokens": 1_048_576}],
+                ),
+            ):
+                self.assertTrue(domain.refresh_model_lists())
+
+            picker = json.loads(domain.raw_text(include_sensitive=True))["modelPicker"]
+            self.assertEqual(
+                [
+                    {
+                        "model": alias_claude_desktop("gemini-3.8-flash"),
+                        "description": "\u200b",
+                        "label": "gemini-3.8-flash",
+                        "behavesAs": "claude-opus-5-5",
+                    }
+                ],
+                picker["options"],
+            )
+
+    def test_a_declared_one_million_route_drops_its_unsuffixed_entry(self) -> None:
+        # The id moved when the declaration arrived, so the entry written under
+        # the old spelling is retired -- otherwise one route is described twice,
+        # which is what the suffix was meant to end.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(desktop_root, {})
+            settings = {
+                "modelSettings": {
+                    # Exactly what the previous release wrote for this route: it
+                    # read 1M from the published number, under the unsuffixed id.
+                    alias_claude_desktop("kimi-k3.1-pro"): {"autoCompactWindow": 1_000_000},
+                }
+            }
+            (root / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+            _write_runtime_config(root / "config.yaml", {"kimi-k3.1-pro": 1_000_000})
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with (
+                mock.patch.object(domain, "_public_models", return_value=["kimi-k3.1-pro"]),
+                mock.patch.object(
+                    domain,
+                    "_public_model_rows",
+                    return_value=[{"id": "kimi-k3.1-pro", "max_input_tokens": 1_000_000}],
+                ),
+            ):
+                domain.dispatch("claude.models.set", {"client": "claudeCode", "enabled": True})
+                domain.apply()
+
+            suffixed = f"{alias_claude_desktop('kimi-k3.1-pro')}[1m]"
+            settings = json.loads(domain.raw_text(include_sensitive=True))["modelSettings"]
+            self.assertEqual({suffixed: {"autoCompactWindow": 1_000_000}}, settings)
 
     def test_desktop_model_list_replaces_its_own_list_and_clears_to_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
