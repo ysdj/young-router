@@ -3524,14 +3524,25 @@ class ProvidersModelsDomain:
         except ValueError:
             raise DomainError("Provider authentication is invalid") from None
 
-    def _managed_catalog_models(self, auth_kind: str) -> list[dict[str, Any]]:
+    def _managed_catalog_models(
+        self,
+        auth_kind: str,
+        *,
+        selected: Sequence[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Import one managed account's live roster as this account's models.
 
         The integration owns its credential and its catalog, so a roster arrives
         as the upstream states it -- not as a list this build happened to ship
-        with.  This is what a caller that omits ``models`` from the create gets;
-        the wizard never does, because it adds a provider and lets the user pick
-        the roster in 获取模型 (``model.import_service_catalog``) afterwards.
+        with.  This is what a caller that omits ``models`` from the create gets.
+
+        A caller that names entries instead -- the wizard's model step, whose
+        list is painted by this same catalog -- passes those selectors.  They
+        are resolved here, by the adapter's own entry: the catalog's ``id`` is
+        the upstream key and its ``publicName`` is the label people read, so a
+        caller that rebuilt that mapping itself would be a second source for a
+        fact only the adapter owns.  A picked roster is read once more without
+        forcing a refresh: the picker was just painted by the same document.
         """
 
         module = self._managed_account_module({"kind": auth_kind})
@@ -3540,7 +3551,9 @@ class ProvidersModelsDomain:
         provider_id = module.AUTH_KIND_TO_PROVIDER[auth_kind]
         display = module.DISPLAY_NAMES[provider_id]
         try:
-            document = self._managed_account_runtime(module).models(provider_id, refresh=True)
+            document = self._managed_account_runtime(module).models(
+                provider_id, refresh=selected is None
+            )
         except Exception:
             raise DomainError(f"The {display} model list is unavailable") from None
         # Adding the account just answered the account question, so the state
@@ -3558,14 +3571,32 @@ class ProvidersModelsDomain:
         # the account's 国际版 models reported nothing at all right after the
         # one read that had the numbers in hand.
         self._remember_published_windows(provider_id, document.get("models"))
+        entries = [
+            entry
+            for entry in document.get("models") or []
+            if isinstance(entry, Mapping) and str(entry.get("id", "")).strip()
+        ]
+        if selected is not None:
+            by_id = {str(entry.get("id", "")).strip(): entry for entry in entries}
+            wanted: set[str] = set()
+            for selector in selected:
+                entry = ProvidersModelsDomain._catalog_entry_for_selector(
+                    by_id, str(selector).strip()
+                )
+                if entry is None:
+                    raise DomainError(
+                        "The service catalog no longer lists a selected model"
+                    )
+                wanted.add(str(entry.get("id", "")).strip())
+            # The pick list is the catalog's order, not the order a picker
+            # happened to report its ticks in: one roster files one way.
+            entries = [
+                entry for entry in entries if str(entry.get("id", "")).strip() in wanted
+            ]
         models: list[dict[str, Any]] = []
         taken_names: set[str] = set()
-        for entry in document.get("models") or []:
-            if not isinstance(entry, Mapping):
-                continue
+        for entry in entries:
             model_id = str(entry.get("id", "")).strip()
-            if not model_id:
-                continue
             # Two entries stating one public name would be two routes a client
             # cannot tell apart, so the second is disambiguated exactly as a
             # pick from the chooser is (the ``(2)`` suffix of ``_unique_lane_name``).
@@ -3592,7 +3623,7 @@ class ProvidersModelsDomain:
                 "order": IMPORTED_MODEL_ORDER,
             }
             models.append(model)
-        if not models:
+        if not models and selected is None:
             raise DomainError(f"The {display} account reported no models")
         return models
 
@@ -5588,14 +5619,45 @@ class ProvidersModelsDomain:
         # knows what it may call) is created empty, and its first models arrive
         # through 获取模型, which asks that account.
         raw_models = supplied.get("models")
-        if raw_models is None and (
+        # The wizard's model step lists the account's own catalog, so its 完成
+        # names the entries the picker showed rather than rows it built itself.
+        # A selector is not a row: the adapter that published the catalog owns
+        # each entry's upstream id and the public name it is filed under, and
+        # the step lists those public names in the spelling the row will carry.
+        # Strings therefore mean "these entries of your catalog"; a mapping is
+        # still a row the caller stated, as the lane's create states its ids.
+        catalog_picks: list[str] | None = None
+        if isinstance(raw_models, Sequence) and not isinstance(
+            raw_models, (str, bytes, bytearray)
+        ):
+            if raw_models and all(isinstance(item, str) for item in raw_models):
+                catalog_picks = [str(item).strip() for item in raw_models]
+                catalog_picks = [item for item in catalog_picks if item]
+                raw_models = None
+            elif any(isinstance(item, str) for item in raw_models):
+                raise DomainError("Service provider models must be objects")
+        if catalog_picks is not None and not (
+            kind in workbuddy_module.WORKBUDDY_AUTH_KINDS
+            or kind in qoder_module.QODER_AUTH_KINDS
+        ):
+            raise DomainError("The selected provider publishes no catalog of its own")
+        if catalog_picks is not None:
+            # An empty pick states none, exactly as an empty row list does: the
+            # wizard refuses its own create before this, and Core keeps the
+            # same meaning for a caller that does not.
+            raw_models = (
+                self._managed_catalog_models(kind, selected=catalog_picks)
+                if catalog_picks
+                else []
+            )
+        elif raw_models is None and (
             kind in workbuddy_module.WORKBUDDY_AUTH_KINDS
             or kind in qoder_module.QODER_AUTH_KINDS
         ):
             # A managed account owns no free-text roster: its integration's
             # live catalog is the source of truth.  A create that states its
-            # models (the wizard states an empty list) lists exactly those; one
-            # that omits the field asks for the account's whole roster.
+            # models lists exactly those; one that omits the field asks for the
+            # account's whole roster.
             raw_models = self._managed_catalog_models(kind)
         if raw_models is None and kind in our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS:
             # The lane serves two channels behind one login, and each is a

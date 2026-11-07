@@ -41,8 +41,34 @@ without a flag. Without a bundle, Core serves no page at all.
 
     node rn/apps/web/build.mjs                       # → rn/apps/web/dist
 
-The output is a directory Core can serve as-is: `index.html`, one script, and
-the shared sidebar tiles.
+The output is a directory Core can serve as-is: `index.html`, one script, the
+editor page it frames with the editor's own script beside it, and the shared
+sidebar tiles inlined into the shell.
+
+Everything in that directory is what a browser on the other end of a link
+downloads, so the build spends its effort on size without changing what runs:
+
+- **One script, and no editor in it.** `bundle.<digest>.js` is the whole app,
+  addressed by its own bytes because Core answers it `immutable`.
+  `ui/code-editor/CodeEditorWebBundle` is half a megabyte of Ace that the two
+  native hosts inline into the page they hand a WebView; this host frames the
+  page Core serves instead, so `CodeEditorWebBundle.web.ts` answers that import
+  with an empty string and esbuild resolves it first (`resolveExtensions`).
+  Metro never picks it: `web` is not in either native app's platform list.
+- **The editor is a file, not an inlined string.** `editor.html` is a few KB and
+  names `editor.<digest>.js`; the native hosts keep the inline copy because a
+  WebView has no origin to fetch from. `editor.html` is answered `no-store`, so
+  an inlined editor was fetched again on every open of the raw editor.
+- **Every text asset ships precompressed.** Beside each `.js`/`.html` are `.br`
+  (brotli, quality 11) and `.gz` siblings, and Core answers the one the
+  browser's `Accept-Encoding` admits with `Content-Encoding` + `Vary`. Doing
+  this here rather than in Core keeps a worker thread off the first page load
+  of every browser, and the sibling cannot go stale: it is named after the file
+  it was built from. The publisher's `MANIFEST.json` names the page by what it
+  decodes to, not by its encoding.
+
+The last two matter most on the host this page exists for: a headless machine
+serving it over a link nobody sized for it.
 
 ## What is deliberately not the same
 

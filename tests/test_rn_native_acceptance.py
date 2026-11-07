@@ -324,15 +324,25 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("statusMenu", mac)
         self.assertNotIn('"webdav-status", "webdav-toggle"', mac)
 
-    def test_native_trays_keep_language_controls_reachable_and_hide_auxiliary_lifecycle_actions(self) -> None:
+    def test_native_trays_carry_no_second_language_chooser(self) -> None:
+        # The language preference has one surface: the General pane's row.  A
+        # tray submenu was a second place to change the same three choices, and
+        # the two could disagree about which one was checked.
         mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+        ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
 
         self.assertNotIn("statusMenu", mac)
-        self.assertIn('"toggle-autostart"', (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8"))
+        self.assertIn('"toggle-autostart"', ui)
         self.assertIn('action.id != L"service-start"', windows)
-        self.assertIn('HMENU language_menu = CreatePopupMenu();', windows)
-        self.assertIn('if (is_language_choice) {', windows)
+        for source in (mac, windows, ui):
+            self.assertNotIn("language-picker", source)
+            self.assertNotIn("set-language-", source)
+            self.assertNotIn("language_menu", source)
+        # The General pane is where the choice lives, and it is applied by its
+        # own domain dispatch rather than a menu action.
+        self.assertIn('translate("general.language")', ui)
+        self.assertIn('dispatch({ domain: "language", type: "set_language"', ui)
 
     def test_windows_uses_app_sdk_single_instance_and_hot_protocol_routing(self) -> None:
         source = (WIN_PROJECT / "YoungRouter.cpp").read_text(encoding="utf-8")
@@ -1142,10 +1152,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             self.assertIn(f'{{ id: "{action}",', ui)
 
         # Native leaves retain generic bridge routing. macOS has no status menu
-        # left to carry them, so its language submenu is the only application
-        # menu entry that reaches this path.
+        # left to carry them, and no language submenu either: the preference is
+        # a field in General, so the application menu carries only the app's own
+        # entries.
         self.assertNotIn("statusMenu", mac)
-        self.assertIn("private func installLanguageMenu(in applicationMenu: NSMenu)", mac)
+        self.assertNotIn("installLanguageMenu", mac)
+        self.assertIn("private func updateApplicationMenuTitles()", mac)
 
         # WinUI dispatch remains generic for retained menu actions.
         self.assertIn("DispatchAction(WideToUtf8(item.id));", windows)
@@ -1441,22 +1453,29 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("replyToApplicationShouldTerminate:YES", app_delegate)
         self.assertNotIn("applicationWillTerminate", app_delegate)
 
-    def test_language_is_a_state_backed_native_menu_submenu_not_a_route(self) -> None:
+    def test_language_is_a_general_field_with_no_second_surface(self) -> None:
+        # One preference, one control.  It is a settings field (auto / 中文 /
+        # English) drawn in General, not a route, not a menu, and not a window
+        # title; the two native hosts draw the same shared pane, so neither has
+        # language UI of its own.
         ui = (SHARED / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
         mac = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
-        types = (SHARED / "types.ts").read_text(encoding="utf-8")
         core_service = (ROOT / "young_router/core/service.py").read_text(encoding="utf-8")
 
-        for source in (ui, mac, windows):
-            self.assertIn("language-picker", source)
-            self.assertIn("set-language-system", source)
-            self.assertIn("set-language-en", source)
-            self.assertIn("set-language-zh-Hans", source)
-            self.assertNotIn("open-language-settings", source)
-        self.assertIn("checked?: boolean", types)
-        self.assertIn("item.state = choice?.checked == true ? .on : .off", mac)
-        self.assertIn("CreatePopupMenu", windows)
+        self.assertIn('const LANGUAGE_PREFERENCES: readonly LanguagePreference[] = ["system", "en", "zh-Hans"];', ui)
+        self.assertIn('translate("general.language")', ui)
+        # The row is a label and a picker: no caption under either one.
+        self.assertNotIn("general.languageHint", ui)
+        self.assertIn('await ipc.apply("language", staged.revision);', ui)
+        # The menu-bar copy is gone from the shared action list and from both
+        # hosts' own menu code.
+        for source in (mac, windows):
+            self.assertNotIn("language-picker", source)
+            self.assertNotIn("installLanguageMenu", source)
+            self.assertNotIn("language_menu", source)
+        self.assertNotIn('"status.language"', ui)
+        self.assertNotIn("open-language-settings", ui)
         self.assertNotIn('"language-settings"', core_service)
         self.assertNotIn('"language_settings"', core_service)
 

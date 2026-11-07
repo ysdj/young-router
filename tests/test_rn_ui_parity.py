@@ -550,7 +550,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const settingsRoute = isAssistantSettingsRoute(route);',
             'const domain = settingsRoute ? undefined : domainForRoute(route);',
             '<AssistantSettingsWorkspace',
-            'externalSettingsWorkspace',
+            'SETTINGS_RAIL_BODY',
             '<SettingsRail',
             'await flushPendingFields();',
             "assistantFileSurfaceStyles.fileRow",
@@ -979,7 +979,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             '"providers.probe": "探测"',
             '"providers.deepTest": "探测"',
-            '"providers.deepTestHint": "先验可用性，再跑 veridrop quick 真伪核验"',
+            '"providers.deepTestHint": "先验可用性，再用 Veridrop 做快速真伪核验"',
             '"providers.degradationUnavailable": "核验不可用"',
             '"providers.degradationError": "核验失败"',
         ):
@@ -1594,10 +1594,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('const nameCase = await importNameCaseAnswer(native, translate, selectedModels);')
         self.assert_ui_has('const nameCase = await importNameCaseAnswer(native, translate, chosen);')
         self.assert_ui_has('const importNameCase = await importNameCaseAnswer(native, translate, selectedImportNames);')
-        # 完成 never imports the account's catalog: both account kinds state an
-        # empty list, so the rows can only come from the chooser.
+        # The wizard's 完成 creates the account-backed entries with the picks
+        # its model step listed, so the catalog and the add are one act; the
+        # pane's 获取模型 still asks the case question for its own import.
         self.assert_ui_has('const next = await dispatchWithOutcome("service_provider.add", {')
-        self.assert_ui_has('models: [],')
+        self.assert_ui_has('models: kept,')
         self.assert_ui_not_has('createdCatalog')
         self.assert_ui_not_has('public_name_case: createdNameCase')
         # The answer travels with the pick that asked it.
@@ -1608,9 +1609,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         domain = (ROOT / "young_router/core/domains/providers_models.py").read_text(encoding="utf-8")
         self.assertIn('name_case=model.pop("imported_name_case", "lower"),', domain)
         self.assertIn('name_case = import_name_case(data.get("public_name_case"))', domain)
-        # A create that states no list still imports the account's roster; the
-        # wizard always states one, so its add cannot turn into an import.
+        # A create that omits the list still imports the account's whole
+        # roster; the wizard's picks are resolved by the adapter's own entries,
+        # and an explicit empty list still creates an entry with no routes.
         self.assertIn('raw_models = self._managed_catalog_models(kind)', domain)
+        self.assertIn('self._managed_catalog_models(kind, selected=catalog_picks)', domain)
         public_names = (ROOT / "young_router/public_names.py").read_text(encoding="utf-8")
         self.assertIn('IMPORTED_NAME_CASES = ("lower", "original")', public_names)
         self.assertIn('return "original" if str(value or "").strip().lower() == "original" else "lower"', public_names)
@@ -2093,7 +2096,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('translate("dataManagement.lastSync", { time: formatActionTimestamp(lastSyncAt) })')
         self.assert_ui_has('function formatActionTimestamp(value: string): string {')
         self.assert_ui_has('{translate("webdav.serverLabel")}{host === "" ? translate("webdav.notSet") : host}')
-        self.assert_ui_has('style={[styles.webdavSectionFact, lastFailed && styles.webdavSectionFactFailed]}')
+        self.assert_ui_has('style={[SETTINGS_FIELD_HELP_TEXT, lastFailed ? styles.webdavFactFailed : null]}')
         self.assert_ui_has('{lastFailed ? ` ${translate("webdav.failedSuffix")}` : ""}')
         self.assert_ui_has('function webdavHost(url: string): string {')
         self.assert_ui_has('const lastFailed = lastResult.ok === false && ["sync", "push", "pull"].includes(stringValue(lastResult.action));')
@@ -2238,20 +2241,23 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('const dataManagementPolishStyles = StyleSheet.create({')
         # Every pane body starts from the one settings inset and every field
         # row from the one label column, so the three panes line up.
-        self.assert_ui_has('paneScrollContent: { flexGrow: 1, paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: SETTINGS_PANE_INSET, gap: 14 }')
+        self.assert_ui_has('paneScrollContent: { flexGrow: 1, paddingTop: 0, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: SETTINGS_PANE_INSET, gap: 14 }')
         self.assertNotIn('importLandingContent', self.ui)
         self.assert_ui_has('importIntro: { minHeight: 0, paddingHorizontal: 12, paddingVertical: 0, gap: 10 }')
         self.assert_ui_has('paneHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }')
         # A sync category keeps the one pane inset and reports in captions over
         # values; the form it opens is fields of the same grid the panes draw.
         for marker in (
-            'webdavSection: { gap: 6 }',
-            'webdavSectionSummary: { flexDirection: "row", alignItems: "center", gap: 12 }',
-            'webdavSectionFact: { flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 17 }',
-            'webdavSectionFactFailed: { color: systemColors.red }',
+            'webdavFactsRow: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 12 }',
+            'webdavFactFailed: { color: systemColors.red }',
             'webdavDialogBodyContent: { padding: SETTINGS_PANE_INSET }',
         ):
             self.assert_ui_has(marker)
+        # The category draws no caption band of its own: it is a row of the grid,
+        # so its name is a row label (regular weight) beside a value, an action,
+        # and the facts under that same control column.
+        for gone in ("webdavSection:", "webdavSectionHeader:", "webdavSectionTitle:", "webdavSectionState:", "webdavSectionSpacer:", "webdavSectionSummary:", "webdavSectionFact:", "webdavSectionStatus:"):
+            self.assertNotIn(gone, self.ui)
         self.assertIn('webdavFieldList: { ...SETTINGS_FIELD_LIST }', self.ui)
         self.assertNotIn('compactText:', self.ui)
         self.assertNotIn('webDavFormRows:', self.ui)
@@ -2260,9 +2266,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('const SETTINGS_FIELD_ROW_INDENTED: ViewStyle = { ...SETTINGS_FIELD_ROW, paddingLeft: SETTINGS_FIELD_LEAD };')
         # The runtime row carries the lead as padding like the others; its
         # marker bar is positioned in that lead instead of pushing the label.
-        self.assert_ui_has('runtimeInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }')
         self.assert_ui_has('runtimeModifiedBar: { position: "absolute", left: 0, top: 3, bottom: 3, width: 2, borderRadius: 1, backgroundColor: "transparent" }')
-        self.assert_ui_has('externalSettingsInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }')
         # One width scale for every control in the grid, chosen by what the
         # control holds: a switch takes its own slot, a number keeps only its
         # digits beside its unit, a short value takes the value column, and a
@@ -2271,43 +2275,81 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "const SETTINGS_FIELD_VALUE_WIDTH = 160;",
             "const SETTINGS_FIELD_NUMBER_WIDTH = 84;",
             "const SETTINGS_FIELD_TEXT_WIDTH = 420;",
+            "const SETTINGS_FIELD_CELL_WIDE: ViewStyle = { flex: 1, minWidth: 0, maxWidth: SETTINGS_FIELD_TEXT_WIDTH",
             "runtimeNumberControl: { width: SETTINGS_FIELD_NUMBER_WIDTH",
             "runtimeTextControl: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0 }",
-            "runtimeValueCellWide: { flex: 1, minWidth: 0, maxWidth: SETTINGS_FIELD_TEXT_WIDTH",
-            "runtimeValueSlot: { ...SETTINGS_FIELD_CELL }",
-            "externalSettingsValueSlot: { ...SETTINGS_FIELD_VALUE_SLOT }",
-            "generalValueCellWide: { flex: 1, minWidth: 0, maxWidth: SETTINGS_FIELD_TEXT_WIDTH",
             'width="number" value={portValue}',
         ):
             self.assert_ui_has(marker)
         # No pane keeps a control column of its own beside the value column.
         self.assertNotIn("SETTINGS_FIELD_ROUTE", self.ui)
-        # The General pane is a settings pane too, so its labelled rows spread
-        # the same grid instead of restating the label width, the tip indent,
-        # and a pane inset of its own.
+        # A settings pane uses the grid; it does not copy it.  Every pane-local
+        # alias that only re-spread a shared constant is gone -- the extra layer
+        # restated the same geometry under a second name, and the two panes had
+        # already drifted apart on the one number nobody aliased (the pane inset).
         general = self.ui.split("function GeneralWorkspace(", 1)[1].split("function RuntimeWorkspace(", 1)[0]
-        for marker in (
-            "generalRow: { ...SETTINGS_FIELD_ROW_INDENTED }",
-            "generalRowLabel: { ...SETTINGS_FIELD_LABEL }",
-            "generalFieldList: { ...SETTINGS_FIELD_LIST }",
-            "generalField: { ...SETTINGS_FIELD }",
-            "generalValueSlot: { ...SETTINGS_FIELD_CELL }",
-            "generalToggle: { ...SETTINGS_FIELD_SWITCH_SLOT }",
-            "generalHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }",
-            "generalHelpText: { ...SETTINGS_FIELD_HELP_TEXT }",
+        # Each name is checked as a style definition (`name: {`), so the i18n
+        # helper `runtimeFieldLabel(...)` beside it is not mistaken for one.
+        for alias in (
+            "generalField", "generalFieldList", "generalRow", "generalRowLabel", "generalRowValue",
+            "generalValueSlot", "generalPicker", "generalValueCellWide", "generalToggle", "generalHelpSlot",
+            "generalHelpText", "generalSection", "generalSectionTitle", "generalContent",
+            "runtimeField", "runtimeInputRow", "runtimeFieldLabel", "runtimeValueSlot", "runtimeValueCellWide",
+            "runtimeBooleanControl", "runtimeUnit", "runtimeHelpSlot", "runtimeHelpText", "runtimeWorkspace",
         ):
-            self.assert_ui_has(marker)
-        # A tip belongs to the field above it, so the two are one block and the
-        # blocks are a list -- the same 2-and-10 rhythm every other settings
-        # pane has.  A row and a tip left as siblings of the section is what
-        # made this pane's help lines sit as far from their own field as from
-        # the next one.
-        self.assertIn("<View style={styles.generalFieldList}>", general)
-        self.assertIn("<View style={styles.generalField}>", general)
-        self.assertIn('generalContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET', self.ui)
-        self.assertIn("<View style={styles.generalHelpSlot}>", general)
-        for restated in ("generalRowLabel: { width: 128", "generalRowHint:", "generalToggle: { width: 44", 'textAlign: "right"'):
-            self.assertNotIn(restated, general)
+            self.assertNotIn(f"{alias}: {{", self.ui, f"{alias} is a second name for a shared grid constant")
+        # ... and the pane states the grid directly, section caption included.
+        for marker in (
+            "<View style={SETTINGS_SECTION}>",
+            "<Text style={SETTINGS_SECTION_TITLE}>",
+            "<View style={SETTINGS_FIELD_LIST}>",
+            "<View style={SETTINGS_FIELD}>",
+            "<View style={SETTINGS_FIELD_ROW_INDENTED}>",
+            "<Text style={SETTINGS_FIELD_LABEL}>",
+            "<View style={SETTINGS_FIELD_HELP_SLOT}>",
+            "<Text style={SETTINGS_FIELD_HELP_TEXT}>",
+            "contentContainerStyle={SETTINGS_SECTION_LIST}",
+            # A tip belongs to the field above it, so the two are one block and
+            # the blocks are a list -- the same 2-and-10 rhythm every other
+            # settings pane has.
+            "<View style={SETTINGS_FIELD_ROW_INDENTED}>",
+        ):
+            self.assertIn(marker, general)
+        # One name for "this pane owns its inset", shared with the runtime and
+        # backup panes instead of three identical style objects.
+        self.assertIn("const SETTINGS_PANE_ROUTE: ViewStyle = { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 };", self.ui)
+        self.assertIn('(settingsRoute || route === "runtime-settings" || route === "data-management" || route === "general-settings") && SETTINGS_PANE_ROUTE', self.ui)
+        self.assertIn("const SETTINGS_PANE_CONTENT: ViewStyle = { width: \"100%\", padding: SETTINGS_PANE_INSET, gap: 14 };", self.ui)
+        # A caption sits the same distance above the fields it names as the
+        # runtime pane's detail header leaves to its first row, and further from
+        # the block above it: a caption belongs to the fields below, not above.
+        self.assertIn("const SETTINGS_SECTION: ViewStyle = { minWidth: 0, alignSelf: \"stretch\", gap: SETTINGS_HEADER_GAP };", self.ui)
+        self.assertIn("const SETTINGS_SECTION_GAP = SETTINGS_PANE_INSET;", self.ui)
+        self.assertIn("const SETTINGS_SECTION_LIST: ViewStyle = { ...SETTINGS_PANE_CONTENT, gap: SETTINGS_SECTION_GAP };", self.ui)
+        # The body and the pane's own title start from the same x.  A body that
+        # began left of its title read as part of the sidebar beside it, which is
+        # exactly how the General pane looked: its caption at 14 while 常规 sat at 20.
+        self.assertIn("const SETTINGS_PANE_INSET = 24;", self.ui)
+        self.assertIn("paddingHorizontal: SETTINGS_PANE_INSET, paddingTop: 10, paddingBottom: 8", self.ui)
+        self.assertNotIn("settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20", self.ui)
+        self.assertNotIn("const SETTINGS_PANE_INSET = 14;", self.ui)
+        self.assertNotIn("const SETTINGS_PANE_INSET = 20;", self.ui)
+        # A section caption starts at the pane inset -- the same x as a detail
+        # header's title -- and a labelled row starts one lead further in.  The
+        # header therefore states the inset instead of restating its number.
+        self.assertIn("const SETTINGS_SECTION_TITLE: TextStyle = { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: \"600\" };", self.ui)
+        self.assertIn("paddingHorizontal: SETTINGS_PANE_INSET, paddingTop: SETTINGS_HEADER_LEAD, paddingBottom: SETTINGS_HEADER_GAP, backgroundColor: systemColors.window", self.ui)
+        self.assertNotIn("paddingHorizontal: 14, paddingVertical: 8", self.ui)
+        # One heading-to-form distance, stated once and read by both panes: a
+        # section caption's gap and the body under a detail header (which adds
+        # none of its own).  Adding a band's air to a full top inset is what made
+        # a category title sit three times as far from its first row.
+        self.assertIn("const SETTINGS_HEADER_GAP = 8;", self.ui)
+        self.assertIn("const SETTINGS_HEADER_LEAD = 16;", self.ui)
+        self.assertIn("const SETTINGS_PANE_BODY: ViewStyle = { ...SETTINGS_PANE_CONTENT, paddingTop: 0 };", self.ui)
+        self.assertIn("contentContainerStyle={SETTINGS_PANE_BODY}", self.ui)
+        self.assertNotIn("settingsRailDetailHeader: { minHeight: 50", self.ui)
+        self.assertNotIn("paddingVertical: 8, backgroundColor: systemColors.window", self.ui)
         self.assertNotIn('dataManagementWarningPanel:', self.ui)
         self.assertNotIn('dataManagementImportEmpty:', self.ui)
         self.assertNotIn('setContentSize?.("data-management", Platform.OS === "windows" ? 740 : 720', self.ui)
@@ -2357,7 +2399,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertNotIn(header_tip, workspace)
         self.assert_ui_has('dataManagementSectionList: { gap: 4 }')
-        self.assert_ui_has('paneScrollContent: { flexGrow: 1, paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: SETTINGS_PANE_INSET, gap: 14 }')
+        self.assert_ui_has('paneScrollContent: { flexGrow: 1, paddingTop: 0, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: SETTINGS_PANE_INSET, gap: 14 }')
 
     def test_data_management_uses_native_preference_groups_not_web_cards(self) -> None:
         workspace = self.ui.split("function DataManagementWorkspace(", 1)[1].split(
@@ -2376,13 +2418,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # values, the one switch, and the command it exists for. The form it
         # opens draws the same grid every pane does, including the label column.
         for marker in (
-            '<View style={styles.webdavSection}>',
-            'style={styles.webdavSectionState}',
-            'style={styles.webdavSectionFact}',
+            '<View style={SETTINGS_FIELD}>',
+            '<View style={SETTINGS_FIELD_ROW_INDENTED}>',
+            '<Text numberOfLines={1} style={SETTINGS_FIELD_LABEL}>',
+            '<View style={[SETTINGS_FIELD_HELP_SLOT, styles.webdavFactsRow]}>',
             '{translate("webdav.serverLabel")}{host === "" ? translate("webdav.notSet") : host}',
             '<ActionButton title={translate("webdav.details")}',
         ):
             self.assertIn(marker, webdav)
+        # A row label is regular weight, like every other row's: a bold caption
+        # over a value read as a section heading in a list of rows.
+        self.assertNotIn("fontWeight", webdav)
         self.assertNotIn("<NativeToggle", webdav)
         for marker in (
             '<PersistentScrollView style={styles.webdavDialogBody} contentContainerStyle={styles.webdavDialogBodyContent}',
@@ -2733,7 +2779,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             {"UI_FONT_SIZE", "UI_TIP_FONT_SIZE", "12", "16", "9"},
             {value.strip() for value in re.findall(r"fontSize:\s*([^,}\n]+)", self.native_controls)},
         )
-        self.assertIn("runtimeHelpText: { ...SETTINGS_FIELD_HELP_TEXT }", self.ui)
+        self.assertIn("const SETTINGS_FIELD_HELP_TEXT: TextStyle = { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE", self.ui)
         self.assertIn("fieldHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE", self.ui)
 
         self.assertIn("constexpr CGFloat LiteLLMUIFontSize = 13.0;", macos_controls)
@@ -3231,11 +3277,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("return Math.ceil(nativeCheckboxLeadingWidth() + Math.max(24, textWidth));", self.native_controls)
         self.assertNotIn("Math.ceil(26 + Math.max(24, textWidth))", self.native_controls)
         self.assertIn('<NativeToggle value={booleanValue(item.value)} disabled={busy} accessibilityLabel={label}', self.ui)
-        self.assertIn('<TooltipText numberOfLines={1} tooltip={label} style={styles.runtimeFieldLabel}', self.ui)
+        self.assertIn('<TooltipText numberOfLines={1} tooltip={label} style={SETTINGS_FIELD_LABEL}', self.ui)
         self.assertIn('styles.runtimeMultilineEditor', self.ui)
         # The compact AppKit switch is 44 x 20 pt, so the slot that centres it
         # has to reserve that width or the control overflows the row.
-        self.assertIn('runtimeBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }', self.ui)
+        self.assertIn('const SETTINGS_FIELD_SWITCH_SLOT: ViewStyle = { width: 44, minWidth: 44, height: 24, alignSelf: "flex-start" };', self.ui)
         self.assertNotIn("runtimeBooleanSlot", self.ui)
         self.assertNotIn("runtimeBooleanHelpSlot", self.ui)
 
@@ -3362,10 +3408,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_settings_workspaces_keep_their_legacy_layout_roots(self) -> None:
         expected_components = {
-            "AssistantSettingsWorkspace": ("externalSettingsWorkspace:", "externalSettingsPane:"),
-            "RuntimeWorkspace": ("runtimeWorkspace:", "runtimeScrollSurface:"),
+            "AssistantSettingsWorkspace": ("SETTINGS_RAIL_BODY", "externalSettingsPane:"),
+            # The pane's body is the shared `SETTINGS_PANE_CONTENT`; what it keeps
+            # of its own is the frame, the rail body and the scroll surface.
+            "RuntimeWorkspace": ("runtimeWorkspaceFrame:", "SETTINGS_RAIL_BODY", "runtimeScrollSurface:"),
             "DataManagementWorkspace": ("dataManagementWorkspace:", "dataManagementPane:"),
-            "WebDavSyncSection": ("webdavSection:", "webdavSectionHeader:"),
+            "WebDavSyncSection": ("webdavFactsRow:", "webdavFactFailed:"),
             "WebDavSettingsPanel": ("webdavDialogSurface:", "webdavDialogBody:", "webdavDialogBodyContent:"),
             "LogsWorkspace": (
                 "logsWindow:",
@@ -3396,7 +3444,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_assistant_settings_have_one_outer_scroll_surface_without_tabs(self) -> None:
         for marker in (
             '<PersistentScrollView style={styles.externalSettingsPane}',
-            "externalSettingsPaneContent",
+            "contentContainerStyle={SETTINGS_PANE_BODY}",
             "<SettingsDetailHeader",
             "<SettingsRail",
         ):
@@ -3483,8 +3531,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # rightmost column is the shared header band's own divider. A rule per
         # switch and per file (plus a trailing one) turned the pane into a
         # stack of separators.
-        self.assertIn('externalSettingsField: { ...SETTINGS_FIELD },', self.ui)
-        self.assertIn('externalSettingsFieldList: { ...SETTINGS_FIELD_LIST },', self.ui)
+        self.assertIn('const SETTINGS_FIELD: ViewStyle = { minWidth: 0, alignSelf: "stretch", gap: 2 };', self.ui)
+        self.assertIn('const SETTINGS_FIELD_LIST: ViewStyle = { gap: 10 };', self.ui)
         # The client files below the fields start on the fields' own label x.
         self.assertIn('fileRow: { minHeight: 36, flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 4, paddingLeft: SETTINGS_FIELD_LEAD },', self.ui)
         self.assertNotIn("borderBottomWidth", pane)
@@ -3524,11 +3572,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "proxyOnly={localApiActive}",
             "disabled={busy || !proxyOnly}",
             'translate("settings.useLocalApiRequired")',
-            "styles.externalSettingsFieldLabelUnavailable",
-            "styles.externalSettingsFieldLabel",
-            "styles.externalSettingsValueSlot",
-            "styles.externalSettingsHelpSlot",
-            "styles.externalSettingsBooleanControl",
+            "SETTINGS_FIELD_LABEL_UNAVAILABLE",
+            "SETTINGS_FIELD_LABEL",
+            "SETTINGS_FIELD_VALUE_SLOT",
+            "SETTINGS_FIELD_HELP_SLOT",
+            "SETTINGS_FIELD_SWITCH_SLOT",
             'codexModelCatalogEnabled={codexModelCatalogEnabled}',
             'booleanValue(codexModelCatalogState(snapshot).enabled)',
             'onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")}',
@@ -3552,10 +3600,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # the control that names the designated provider and model share
             # one label column and one control column.
             '{selectedClient === "codex" ? <>',
-            "styles.externalSettingsInputRow",
-            "styles.externalSettingsFieldLabel",
-            "styles.externalSettingsValueSlot",
-            "styles.externalSettingsHelpSlot",
+            "SETTINGS_FIELD_ROW_INDENTED",
+            "SETTINGS_FIELD_LABEL",
+            "SETTINGS_FIELD_VALUE_SLOT",
+            "SETTINGS_FIELD_HELP_SLOT",
             # One on/off setting is a switch, never a checkbox.
             "<NativeToggle",
             "void onUseLocalApi(designatedSelection ?? {}).finally(() => setClientActionBusy(false));",
@@ -3641,11 +3689,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # renders label/input structured editing for any client.
         for removed in ("TextField", "PickerField", "NativeSecretField", "settings.structured", "assistantQuickGrid"):
             self.assertNotIn(removed, pane)
-        self.assertIn("externalSettingsWorkspace", self.ui)
+        self.assertIn("SETTINGS_RAIL_BODY", self.ui)
         # The pane aligns its rail exactly like the backup & sync pane: the
         # route body contributes no horizontal padding of its own.
-        self.assertIn("settingsRoute && styles.assistantSettingsContent", self.ui)
-        self.assertIn("assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }", self.ui)
+        self.assertIn("(settingsRoute || route === \"runtime-settings\" || route === \"data-management\" || route === \"general-settings\") && SETTINGS_PANE_ROUTE", self.ui)
+        self.assertIn("const SETTINGS_PANE_ROUTE: ViewStyle = { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 };", self.ui)
         # The pane's rail is the settings window's shared subordinate rail, so it
         # needs no caption, width, or striping of its own.
         self.assertNotIn("externalSettingsRailTitle", self.ui)
@@ -3655,9 +3703,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # detail width like a section divider over nothing; the header keeps
         # its own height, ink and window background.
         self.assertIn(
-            'settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", '
-            'alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, '
-            'backgroundColor: systemColors.window }',
+            'settingsRailDetailHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", '
+            'gap: 12, paddingHorizontal: SETTINGS_PANE_INSET, paddingTop: SETTINGS_HEADER_LEAD, '
+            'paddingBottom: SETTINGS_HEADER_GAP, backgroundColor: systemColors.window }',
             self.ui,
         )
         self.assertIn('horizontal={false}', self.ui)
@@ -3799,6 +3847,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
             if key == "YOUNG_ROUTER_OUR_FREE_MODEL_SOURCE_DIR":
                 continue
             self.assertIn(f"  {key}: {{ label:", localized)
+        # A unit is a word the pane prints beside the number, so it has to be in
+        # the same language as the label it sits under.  `minutes` was the one
+        # the schema stated and this table did not have: 目录刷新间隔 read 分钟's
+        # neighbours in Chinese and 15 minutes in English.
+        units = sorted(set(re.findall(r"'unit': '([^']+)'", schema)))
+        self.assertEqual(len(units), len(set(units)))
+        for unit in units:
+            self.assertIn(f"\n  {unit}: \"", localized)
         # The Relay and Computer Facade categories disappeared with their only
         # settings; retired dead controls must not stay translated in the pane.
         for category in ("Timeouts", "Recovery", "Web Search", "Vision Router", "Model Context", "Fallback", "MCP", "Logs", "Network", "Service", "Our Free Model"):
@@ -4114,7 +4170,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "logs.onlineUsageDetail",
             "logs.promptTokens",
             "logs.completionTokens",
-            "logs.cacheTokens",
+            "logs.cacheRead",
+            "logs.cacheWrite",
             "logs.channel",
             "logs.group",
             "logs.cost",
@@ -4154,6 +4211,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('[translate("logs.account"), account],', renderer)
         self.assertIn("const family = compactLogValue(value.source_family);", renderer)
         self.assertIn("[translate(\"logs.type\"), family],", renderer)
+        # The cached read and the cache write are two counts from one prompt,
+        # under the same spellings the requests tab reads; the share the column
+        # shows is drawn from the read against the whole prompt.
+        self.assertIn("const cacheReadTokens = compactLogValue(value.cache_read_tokens ?? value.cache_tokens);", renderer)
+        self.assertIn("const cacheWriteTokens = compactLogValue(value.cache_write_tokens);", renderer)
+        self.assertIn('[translate("logs.cacheRead"), cacheReadTokens],', renderer)
+        self.assertIn('[translate("logs.cacheWrite"), cacheWriteTokens],', renderer)
+        self.assertIn("cacheHit: formatLogCacheHit(cacheReadTokens, compactLogValue(value.prompt_tokens)),", renderer)
         self.assertNotIn('value.source_label) || compactLogValue(value.source)', renderer)
         self.assertIn('if (tab === "online-usage") return renderOnlineUsageRecord(record, value, translate);', self.ui)
         columns = self.ui.split('if (tab === "online-usage") return [', 1)[1].split("];", 1)[0]
@@ -4199,14 +4264,20 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '...(hasCache ? [{ label: translate("logs.cacheHit"), width: LOG_CACHE_COLUMN_WIDTH, value: (row: RenderedLogRecord) => row.cacheHit }] : []),',
             columns,
         )
-        # The set must total less than the pane's own width, so a row is read
-        # without scrolling sideways. The timestamp is the widest fixed column,
-        # and only the relay column absorbs what is left over.
-        widths = [168, 164, 140, 104, 62]
-        # The account column is only there when the relay has more than one
-        # login, and it must still fit inside the pane at its narrowest: the
-        # other fixed columns plus the relay's floor leave it room.
-        self.assertLess(sum(widths) + 118 + 96, 860)
+        # The money the row was charged is a column of its own, and it is drawn
+        # under the same rule the share is: a station that stated no money
+        # leaves it out rather than filling it with a credit count.
+        self.assertIn(
+            '...(hasCost ? [{ label: translate("logs.cost"), width: LOG_COST_COLUMN_WIDTH, value: (row: RenderedLogRecord) => row.cost }] : []),',
+            columns,
+        )
+        # A page of one relay — the case this tab is read in — draws the
+        # timestamp, the model, the grouping, the token pair, the cache share,
+        # the price and the duration: 732 pt at their own ceilings, inside the
+        # narrowest pane.  The relay and account columns belong to a page that
+        # mixes stations or logins, and that page is the one the scroller is
+        # for; no column is dropped or squeezed to avoid it.
+        self.assertLess(120 + 164 + 96 + 140 + 68 + 78 + 66, 860)
         # Every declared width has to hold the longest value that column can
         # carry at the table's 13 pt face: a width under the measured text is
         # what put an ellipsis in the token pair.
@@ -4217,6 +4288,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             (82, 51.7, "Sub2API"),
             (164, 127.5, "gemini-3.1-flash-lite"),
             (140, 111.3, "令牌 输入 / 输出(k)"),
+            (78, 60.0, "$0.00439"),
             (62, 40.0, "1234.5"),
         ):
             self.assertGreaterEqual(declared, measured + 16, f"{value} needs {measured + 16} pt")
@@ -4254,7 +4326,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The grouping is a per-row fact — it is what priced the request — so it
         # is drawn whenever the rows carry one, unlike the constant relay name.
         self.assertIn(
-            "  hasGroup = false,\n  hasCache = true,\n): LogColumn[] {",
+            "  hasGroup = false,\n  hasCache = true,\n  hasCost = true,\n): LogColumn[] {",
             self.ui,
         )
         self.assertIn(
@@ -4597,14 +4669,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_runtime_form_rows_keep_labels_and_controls_aligned_when_reflowed(self) -> None:
         for marker in (
-            "runtimeInputRow:",
-            "runtimeFieldLabel:",
+            "SETTINGS_FIELD_ROW_INDENTED",
+            "SETTINGS_FIELD_LABEL",
             # One shared grid with the external pane: the label column, the
             # control column, and the tip indent come from the same numbers.
-            'runtimeFieldLabel: { ...SETTINGS_FIELD_LABEL }',
-            'runtimeHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }',
             'const SETTINGS_FIELD_LABEL: TextStyle = { width: SETTINGS_FIELD_LABEL_WIDTH, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" };',
-            "runtimeValueSlot:",
+            'const SETTINGS_FIELD_HELP_SLOT: ViewStyle = { paddingLeft: SETTINGS_FIELD_HELP_INDENT, paddingTop: 1, minWidth: 0, alignSelf: "stretch" };',
+            "runtimeJsonField:",
             "runtimeMultilineField:",
             "runtimeMultilineHeader:",
             "runtimeMultilineEditor:",
@@ -4615,24 +4686,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # was reopened.
             "<RuntimeJsonField label={label}",
             "runtimeJsonField:",
-            "runtimeUnit:",
-            "runtimeActionSlot:",
+            "SETTINGS_FIELD_ACTION_SLOT",
             # A number and its unit share the one value cell, so the unit and
             # the row's action land on the grid instead of drifting with the
             # old full-width field.
-            '<View style={textValue ? styles.runtimeValueCellWide : styles.runtimeValueSlot}>',
+            '<View style={textValue ? SETTINGS_FIELD_CELL_WIDE : SETTINGS_FIELD_CELL}>',
             'width={numericKind ? "number" : "text"}',
-            "runtimeHelpSlot:",
-            "runtimeWorkspaceBody:",
+            "SETTINGS_RAIL_BODY",
             "<SettingsRail rows={tocRows}",
-            "runtimeFieldList:",
             "runtimeModifiedBar:",
             "runtimeModifiedBarActive:",
             "runtimeFieldError:",
             "runtimeValueControlInvalid:",
             "runtimeResetButton:",
-            "runtimeField: { ...SETTINGS_FIELD },",
-            "runtimeHelpText:",
             "runtimeJsonDefaultHint:",
             "<NativePicker labels={optionLabels}",
             "<RuntimeValueField label={label}",
@@ -5138,13 +5204,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '  "qoder_logout",',
             '  "qoder_open_app",',
             '    || normalized.startsWith("qoder_")',
-            # The wizard creates only the service entry, and 完成 is what
-            # creates it — with no models: the account's roster is the user's
-            # pick in 获取模型, never something the add imports.
+            # The wizard's model step states the account beside the roster it
+            # makes readable, and 完成 creates the entry with the entries the
+            # user picked — never a second visit to the pane.
             'kind: isQoderType ? qoderAuthKind : workbuddyAuthKind,',
-            'models: [],',
+            'models: kept,',
+            'const kept = modelCandidates.filter((model) => selectedModels.includes(model));',
             'translate("providers.wizard.serviceUrlFixed")',
-            'translate("providers.wizard.workbuddyAssociationHint")',
+            '"providers.wizard.workbuddyAssociationHint"',
             'translate("providers.wizard.authPath")',
             'translate("providers.wizard.pathWebLogin")',
             'translate("providers.wizard.pathCustomKey")',
@@ -5209,11 +5276,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'if (busyRuns.current === 0) setBusy(false);',
         ):
             self.assert_ui_has(marker)
-        # The wizard's keys step never asks a WorkBuddy user for a secret.
+        # The account is stated on the model step, beside the roster it makes
+        # readable; the WorkBuddy branch asks for no WorkBuddy secret.
         wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
-        workbuddy_keys = wizard.split('isWorkBuddyType ? <>', 1)[1].split('</> : <>', 1)[0]
-        self.assertNotIn("NativeSecureTextInput", workbuddy_keys)
-        self.assertNotIn("NativePicker", workbuddy_keys)
+        workbuddy_model = wizard.split('</> : isWorkBuddyType ? <>', 1)[1].split('</> : null}', 1)[0]
+        self.assertNotIn("NativeSecureTextInput", workbuddy_model)
+        self.assertNotIn("NativePicker", workbuddy_model)
         # Both products and both service labels are named for the user.
         for text in (self.en, self.zh):
             self.assertIn('"providers.type.workbuddy": "WorkBuddy"', text)
@@ -5221,9 +5289,67 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn('"providers.wizard.workbuddyCredits":', text)
             self.assertIn('"providers.serviceLinks":', text)
         self.assertIn('"providers.wizard.workbuddySignInRequired": "Sign in to the WorkBuddy desktop app first."', self.en)
-        self.assertIn('"providers.wizard.workbuddySignInRequired": "请先在 WorkBuddy 桌面 App 中登录。"', self.zh)
+        self.assertIn('"providers.wizard.workbuddySignInRequired": "请先在 WorkBuddy 桌面应用中登录。"', self.zh)
         self.assertIn('"providers.serviceLinks": "服务商关联"', self.zh)
         self.assertIn('"providers.wizard.pathCustomKey": "自定义 API 密钥"', self.zh)
+
+    def test_a_catalog_service_walks_two_steps_and_creates_with_its_picks(self) -> None:
+        """Qoder, WorkBuddy and the free lane share one model step.
+
+        The three publish their own catalogs, so none of them has a 密钥 step:
+        the rail is 供应商 → 模型, and the pick is part of the create instead of
+        a second visit to 获取模型.  The step lists the public name the row will
+        serve (`Qwen3.8-Max` as `qwen3.8-max`) while the pick itself stays the
+        catalog id, because the adapter owns that mapping.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        for marker in (
+            'const isServiceCatalogType = isOurFreeModelType || isQoderType || isWorkBuddyType;',
+            # No 密钥 step for a keyless service: the walk is 供应商 → 模型.
+            'const needsKeyStep = !isServiceCatalogType;',
+            'const serviceCatalogRequest = serviceType === undefined || !isServiceCatalogType',
+            # One branch draws the model step for all three types.
+            'isServiceCatalogType ? <View style={styles.providerWizardModelPane}>',
+            'const fetchServiceCatalogModels = async (): Promise<void> => {',
+            'else if (isServiceCatalogType) void fetchServiceCatalogModels();',
+            'onPress={() => { void fetchServiceCatalogModels(); }}',
+            # The label is the spelling the created row will serve, in lower
+            # case; the pick that travels back is the catalog id.
+            'function serviceCatalogModelLabel(entry: UnknownRecord, lane: boolean): string {',
+            'return (stringValue(entry.publicName).trim() || modelID).toLowerCase();',
+            # 完成 creates the entry with the entries the user ticked.
+            'kind: isQoderType ? qoderAuthKind : workbuddyAuthKind,',
+            'models: kept,',
+        ):
+            self.assert_ui_has(marker)
+        # The account strip has no refresh of its own: 重新获取模型 is the one
+        # read that re-states the account and lists the roster again.
+        self.assertNotIn("providers.wizard.qoderRefresh", wizard)
+        self.assertNotIn("providers.wizard.workbuddyRefresh", wizard)
+        # No token input exists anywhere: both accounts are the desktop apps'
+        # own sign-ins, so the step states the account and offers the app —
+        # never a field for a credential of this app's own.
+        self.assertNotIn("qoderPat", wizard)
+        self.assertNotIn("qoder_pat", wizard)
+        self.assertNotIn("qoderSignIn\"", wizard)
+        self.assertNotIn("qoderSignOut", wizard)
+        self.assertNotIn("NativeSecureTextInput", wizard.split("isQoderType ? <>", 1)[1].split("</> : isWorkBuddyType ? <>", 1)[0])
+        self.assertNotIn("NativeSecureTextInput", wizard.split("isWorkBuddyType ? <>", 1)[1].split("</> : null}", 1)[0])
+        self.assert_ui_has('translate("providers.wizard.qoderOpenApp")')
+        self.assert_ui_has('translate("providers.wizard.workbuddyOpenApp")')
+        # ...and no product wording offers one, in either language.
+        for text in (self.en, self.zh):
+            for banned in ("Personal Access Token", "PAT", "个人访问令牌"):
+                self.assertNotIn(banned, text)
+        domain = (ROOT / "young_router/core/domains/providers_models.py").read_text(encoding="utf-8")
+        for marker in (
+            "selected: Sequence[str] | None = None,",
+            "provider_id, refresh=selected is None",
+            "self._managed_catalog_models(kind, selected=catalog_picks)",
+            "The service catalog no longer lists a selected model",
+        ):
+            self.assertIn(marker, domain, marker)
 
     def test_a_fetched_roster_checks_nothing_by_default(self) -> None:
         """A listing offers its models; it does not choose them.
@@ -5258,12 +5384,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_the_opencode_free_lane_is_offered_without_an_account_step(self) -> None:
         """Our Free Model has no sign-in, so the wizard asks nothing.
 
-        The lane authenticates itself and its free roster is imported by the
-        create, so the type appears in the picker, the keys step only states
-        that, and 完成 mints the entry from the name alone.  Its name carries
-        the "Free" qualifier, because the same endpoint refuses a paid model
-        under the anonymous credential — an unqualified name would read as an
-        account for Zen's paid catalog.
+        The lane authenticates itself, so the type appears in the picker and
+        its walk is 供应商 → 模型: the model step lists the lane's own roster,
+        and 完成 creates the entry and the picked rows together.  Its name
+        carries the "Free" qualifier, because the same endpoint refuses a paid
+        model under the anonymous credential — an unqualified name would read
+        as an account for Zen's paid catalog.
         """
 
         for marker in (
@@ -5276,9 +5402,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '"our_free_model_models",',
             # The model step lists the lane's own free roster, so the user picks
             # what the entry carries instead of being handed the whole catalog.
-            'const fetchOurFreeModelModels = async (providerID = ourFreeModelProviderID): Promise<void> => {',
-            'void (isOurFreeModelType ? fetchOurFreeModelModels(ourFreeModelProviderID) : fetchWizardModels());',
-            'void fetchOurFreeModelModels(ourFreeModelProviderID);',
+            # The same read and the same step serve Qoder and WorkBuddy: their
+            # own catalogs answer through `serviceCatalogRead`.
+            'const isServiceCatalogType = isOurFreeModelType || isQoderType || isWorkBuddyType;',
+            'const serviceCatalogRequest = serviceType === undefined || !isServiceCatalogType',
+            'const fetchServiceCatalogModels = async (): Promise<void> => {',
+            'else if (isServiceCatalogType) void fetchServiceCatalogModels();',
+            'onPress={() => { void fetchServiceCatalogModels(); }}',
             # One entry per channel this bridge can fetch: adding a channel adds
             # that channel, so the picker offers each of them and Core reads the
             # stored tag to know which.  The upstream's co-paid channel has no
@@ -5295,10 +5425,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'channel: OUR_FREE_MODEL_CHANNEL[providerType]?.tag ?? "",',
             'ourFreeModel: { providerId: "our-free-model", tag: "", name: "Our Free Model · OpenCode" },',
             ': channelName ? nextServiceProviderName(providers, "our_free_model_login", channelName)',
-            'const OUR_FREE_MODEL_KEY_NAME = "our-free-model-local";',
-            # The 密钥 step names the one slot the entry carries, never the
-            # provider name where a key name belongs.
-            '{isOurFreeModelType ? OUR_FREE_MODEL_KEY_NAME : selectedProviderName}',
+            # A keyless service has no 密钥 step to walk through: its next step
+            # is 模型, where the catalog it publishes is listed.
+            'const needsKeyStep = !isServiceCatalogType;',
             # 完成 creates with the models the user kept.
             'const kept = modelCandidates.filter((name) => selectedModels.includes(name));',
             # The list carries the same two tools the model chooser offers:
@@ -5330,11 +5459,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const action = isLoginProviderKind(kind)',
         ):
             self.assert_ui_has(marker)
-        # The keys step states the lane and asks for no secret or picker.
+        # The one service-catalog branch is the model step for all three
+        # keyless services, and it is the only branch that lists their rosters.
         wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
-        lane_keys = wizard.split("isOurFreeModelType ? <>", 1)[1].split("</> : isQoderType ? <>", 1)[0]
-        self.assertNotIn("NativeSecureTextInput", lane_keys)
-        self.assertNotIn("NativePicker", lane_keys)
+        self.assertIn("isServiceCatalogType ? <View style={styles.providerWizardModelPane}>", wizard)
+        self.assertIn("isOurFreeModelType ? <>", wizard)
+        self.assertIn('translate(isOurFreeModelType ? "providers.wizard.ourFreeModelHint" : isQoderType ? "providers.wizard.qoderModelsHint" : "providers.wizard.workbuddyAssociationHint")', wizard)
+        self.assertNotIn("fetchOurFreeModelModels", wizard)
         # Both languages name the type for the user, not for the integration:
         # the picker and the entry's own name are "Our Free Model" and the
         # adapter that serves it is `our_free_model` on disk.
@@ -5746,31 +5877,102 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("return Promise.reject(missingDomain);", dispatch)
         self.assertIn("const action = actionDomain === undefined ? { type, payload } : { domain: actionDomain, type, payload };", dispatch)
 
-    def test_background_launch_switch_ships_every_locale(self) -> None:
-        """A new settings row is one label and one explanation, in every locale.
+    def test_background_launch_switch_is_one_label_and_states_no_consequence(self) -> None:
+        """A two-state switch is the whole statement; the caption under it was not.
 
-        The General pane's 启动 section is the only place a launch promise is
-        stated, so a missing translation would leave the switch reading as a
-        raw key in one language. The label stays a short non-sentence
-        (ASCII colon-free), and the explanation is a full sentence in each
-        locale, the same shape the autostart hint beside it already uses.
+        The 启动 row used to carry a sentence explaining what each side of the
+        switch does -- a second telling of the control beside it, which is the
+        shape a settings field may not take. A switch whose label already says
+        what it is on (`启动后在后台运行` / `Run in background at startup`) needs
+        no caption, so the key is gone rather than emptied: a leftover key is a
+        row that can come back.
         """
 
         types = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
         english = (ROOT / "rn/packages/shared/src/i18n/en.ts").read_text(encoding="utf-8")
         chinese = (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8")
-        for name in ("general.runInBackground", "general.runInBackgroundHint"):
+        for name in ("general.runInBackground",):
             self.assertIn(f'| "{name}"', types)
             self.assertIn(f'"{name}":', english)
             self.assertIn(f'"{name}":', chinese)
         self.assertIn('"general.runInBackground": "启动后在后台运行"', chinese)
         self.assertIn('"general.runInBackground": "Run in background at startup"', english)
-        # The explanation names both sides of the switch, so a user reading
-        # only the hint knows what turning it off returns to.
-        self.assertIn("每次启动都不显示窗口", chinese)
-        self.assertIn("启动会直接打开供应商与模型", chinese)
-        self.assertIn("every launch shows no window", english)
-        self.assertIn("a launch opens Providers & Models directly", english)
+        for stale, table in (
+            ("general.runInBackgroundHint", types),
+            ("general.runInBackgroundHint", english),
+            ("general.runInBackgroundHint", chinese),
+            ('<Text style={SETTINGS_FIELD_HELP_TEXT}>{translate("general.runInBackgroundHint")}</Text>', self.ui),
+        ):
+            self.assertNotIn(stale, table)
+
+    def test_language_row_states_auto_and_names_each_language_in_itself(self) -> None:
+        """One choice, three values, and no second copy of the list.
+
+        The preference is drawn in General beside the service it renames:
+        自动 / English / 简体中文.  A language name is the same string in both
+        tables -- a reader looking for 中文 should not have to recognise 英文 --
+        and 自动 is a preference rather than the noun "system" it is stored as.
+        """
+
+        types = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
+        english = (ROOT / "rn/packages/shared/src/i18n/en.ts").read_text(encoding="utf-8")
+        chinese = (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8")
+        for name in ("general.interface", "general.language", "language.auto"):
+            self.assertIn(f'| "{name}"', types)
+            self.assertIn(f'"{name}":', english)
+            self.assertIn(f'"{name}":', chinese)
+        # The language's own name, identical on both sides.
+        for table in (english, chinese):
+            self.assertIn('"language.english": "English",', table)
+            self.assertIn('"language.simplified_chinese": "简体中文",', table)
+        self.assertIn('"language.auto": "自动"', chinese)
+        self.assertIn('"language.auto": "Auto"', english)
+        # The old menu wording is gone with the menu.
+        for stale in ('"language.system"', '"status.language"', "language-picker", "set-language-"):
+            self.assertNotIn(stale, self.ui)
+            self.assertNotIn(stale, english)
+            self.assertNotIn(stale, chinese)
+        # No caption under the picker: the three values are the whole statement,
+        # and 自动 is not the same platform on the two hosts, which a sentence
+        # under the control could only try to restate.  The key is gone in both
+        # tables for the same reason the background switch lost its own.
+        for table in (types, english, chinese, self.ui):
+            self.assertNotIn("general.languageHint", table)
+
+    def test_no_user_facing_table_mixes_the_other_language_in(self) -> None:
+        """A sentence is in one language, not one language with the other inside.
+
+        Two shapes were shipped: an English sentence wearing Chinese corner
+        brackets around an English phrase, and Chinese sentences keeping English
+        nouns that have Chinese words in the very same table (桌面 App beside
+        本应用, Web 页面, API Key).  A language name is the one deliberate
+        exception -- it states itself -- and so are product names, config keys,
+        placeholders and file extensions.
+        """
+
+        import re
+
+        english = (ROOT / "rn/packages/shared/src/i18n/en.ts").read_text(encoding="utf-8")
+        chinese = (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8")
+
+        def values(text: str) -> list[tuple[int, str, str]]:
+            rows = []
+            for index, line in enumerate(text.splitlines(), 1):
+                match = re.match(r'\s*"([^"]+)": "(.*)",$', line)
+                if match:
+                    rows.append((index, match.group(1), match.group(2)))
+            return rows
+
+        cjk = re.compile(r"[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
+        for index, key, value in values(english):
+            # The language's own name is the one CJK string an English table
+            # states; everything else is the other language leaking in.
+            if key in {"language.english", "language.simplified_chinese"}:
+                continue
+            self.assertIsNone(cjk.search(value), f"en.ts:{index} {key} carries CJK: {value}")
+        for index, key, value in values(chinese):
+            for phrase in ("桌面 App", "App 未登录", "Web 页面", "Web 密钥", "API Key", "Young Router"):
+                self.assertNotIn(phrase, value, f"zh-Hans.ts:{index} {key} keeps {phrase!r}: {value}")
 
     def test_general_pane_offers_a_start_control_and_launch_start_retries(self) -> None:
         """A launch-time start that lost its race stays recoverable.
@@ -5913,7 +6115,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('await dispatchServiceAction(enabled ? "service.launch_background_enable" : "service.launch_background_disable");', general)
         self.assertIn('onStatus(translate("common.saved"));', general)
         self.assertIn("onStatus(errorMessage(reason, translate));", general)
-        self.assertIn('<Text style={styles.generalRowLabel}>{translate("general.runInBackground")}</Text>', general)
+        self.assertIn('<Text style={SETTINGS_FIELD_LABEL}>{translate("general.runInBackground")}</Text>', general)
         self.assertIn("<NativeToggle value={backgroundValue}", general)
         # The preference is stored before anything moves on screen: a promise
         # the host acts on must never outlive a failed Core write.
@@ -5943,7 +6145,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # graying out while the service restarts.
         self.assertIn("busy={serviceBusy} disabled={snapshot === undefined || (busy && !serviceBusy)}", general)
         self.assertIn("{serviceActionAvailable ? <NativeButton", general)
-        self.assertIn("generalActionSlot: { width: 72", self.ui)
+        # The row keeps the grid's action column, shared with the runtime pane,
+        # so its button sits on the same x as every other row's action.
+        self.assertIn("const SETTINGS_FIELD_ACTION_SLOT: ViewStyle = { width: 72, minHeight: 26, flexShrink: 0, justifyContent: \"center\" };", self.ui)
         # The control is part of the 服务 row inside the pane, never of the
         # window's bottom action bar (which stays Close/Apply only).
         service_row = general.split('translate("general.serviceState")', 1)[1].split('translate("general.port")', 1)[0]
@@ -6051,6 +6255,43 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_not_has("`${rate} · ${count}`")
         # With the count gone the header is the widest thing the column holds.
         self.assert_ui_has("const LOG_CACHE_COLUMN_WIDTH = 68;")
+
+    def test_the_relay_log_states_what_a_request_cost(self) -> None:
+        """A relay bills a request in fractions of a cent.
+
+        Two decimals — the unit the balance beside it is written in — would
+        print every ordinary turn as `$0.00`, so the cell keeps three
+        significant digits, states a bound rather than rounding a real charge
+        down to nothing, and stays empty when the station stated no money at
+        all.  The money is computed by Core (a Sub2API row states it, a New API
+        row states credits) and the pane only decides how it reads.
+        """
+
+        self.assert_ui_has("function formatLogCost(value: string): string {")
+        self.assert_ui_has('if (amount < 0.0001) return "<$0.0001";')
+        self.assert_ui_has("const decimals = amount >= 100 ? 0")
+        # The cell holds `$0.00439` and `<$0.0001` whole: 60 pt plus the cell's
+        # 8 pt padding on each side, and the header is narrower than both.
+        self.assert_ui_has("const LOG_COST_COLUMN_WIDTH = 78;")
+        self.assertGreaterEqual(78, 60 + 16)
+        # The row's own money, not a credit count re-formatted: the pane formats
+        # the number of dollars Core stated, in the field the detail reuses.
+        self.assert_ui_has("const cost = formatLogCost(compactLogValue(value.cost));")
+        self.assert_ui_has('[translate("logs.cost"), cost],')
+        self.assert_ui_has("rows.some((row) => Boolean(row.cost)),")
+        # The money follows the share that decided it and precedes the duration,
+        # so a row reads size, share, price, time.
+        columns = self.ui.split('if (tab === "online-usage") return [', 1)[1].split("];", 1)[0]
+        self.assertLess(
+            columns.index("...(hasCache ? [{ label: translate(\"logs.cacheHit\")"),
+            columns.index("...(hasCost ? [{ label: translate(\"logs.cost\")"),
+        )
+        self.assertLess(
+            columns.index("...(hasCost ? [{ label: translate(\"logs.cost\")"),
+            columns.index("{ label: translate(\"logs.duration\")"),
+        )
+        self.assertIn('"logs.cost": "消耗"', self.zh)
+        self.assertIn('"logs.cost": "COST"', self.en)
 
     def test_the_model_columns_hold_a_real_model_name(self) -> None:
         """Both model columns hold `deepseek-v4.1-flash` whole.
@@ -6326,7 +6567,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "return upstreamStatusReasonLabel(normalized, translate) ?? (key ? translate(key) : normalized);",
             '"open-providers-models": "status.providers",',
             '"service-restart": "service.restart",',
-            '"set-language-zh-Hans": "language.simplified_chinese",',
             '"no-available-deployment": "logs.noAvailableRoute",',
             '"model-not-configured": "logs.modelNotConfigured",',
             '"local-gateway-auth-rejected": "logs.routeTrace.reasonGatewayAuth",',
@@ -7802,7 +8042,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("if (processing || stepRef.current !== step) return;", wizard)
         # A type that carries no secret of its own has no 密钥 step to walk
         # through: its next step after 供应商 is 模型.
-        self.assertIn("const needsKeyStep = !isOurFreeModelType && !isWorkBuddyType;", wizard)
+        self.assertIn("const needsKeyStep = !isServiceCatalogType;", wizard)
         self.assertIn('stepRef.current = step === "provider" ? (needsKeyStep ? "keys" : "model") : "model";', wizard)
         self.assertIn("const advanceFromProviderStep = (): void => {", wizard)
         self.assertIn('...(needsKeyStep ? [{ id: "keys" as WizardStep, title: translate("providers.wizard.stepKeys") }] : []),', wizard)
@@ -8085,14 +8325,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '{webDavStateLabel(translate, enabled)}',
             # The category names itself and carries its own 设置: that button
             # belongs to WebDAV 同步, not to the 同步 tab that lists categories.
-            '<Text numberOfLines={1} style={styles.webdavSectionTitle}>{translate("webdav.sectionTitle")}</Text>',
+            '<Text numberOfLines={1} style={SETTINGS_FIELD_LABEL}>{translate("webdav.sectionTitle")}</Text>',
             '<ActionButton title={translate("webdav.details")} onPress={onOpenSettings} />',
             # The category is two lines: the title with its state and 设置, then
             # the server it syncs to with the last run's outcome.
-            '<View style={styles.webdavSectionHeader}>',
-            '<View style={styles.webdavSectionSummary}>',
-            '<Text numberOfLines={1} style={styles.webdavSectionFact}>{translate("webdav.serverLabel")}{host === "" ? translate("webdav.notSet") : host}</Text>',
-            '<Text numberOfLines={1} style={[styles.webdavSectionFact, lastFailed && styles.webdavSectionFactFailed]}>{translate("dataManagement.lastSync", { time: formatActionTimestamp(lastSyncAt) })}{lastFailed ? ` ${translate("webdav.failedSuffix")}` : ""}</Text>',
+            # One grid row: row label, value cell, action column, and the facts
+            # under the same control column as every other pane's tip.
+            '<View style={SETTINGS_FIELD}>',
+            '<View style={SETTINGS_FIELD_ROW_INDENTED}>',
+            '<Text numberOfLines={1} style={SETTINGS_FIELD_LABEL}>{translate("webdav.sectionTitle")}</Text>',
+            '<View style={[SETTINGS_FIELD_HELP_SLOT, styles.webdavFactsRow]}>',
+            '<Text numberOfLines={1} style={SETTINGS_FIELD_HELP_TEXT}>{translate("webdav.serverLabel")}{host === "" ? translate("webdav.notSet") : host}</Text>',
+            '<Text numberOfLines={1} style={[SETTINGS_FIELD_HELP_TEXT, lastFailed ? styles.webdavFactFailed : null]}>{translate("dataManagement.lastSync", { time: formatActionTimestamp(lastSyncAt) })}{lastFailed ? ` ${translate("webdav.failedSuffix")}` : ""}</Text>',
             # The form it opens is fields of the shared settings grid.
             '<View style={styles.webdavFieldList}>',
             '<WebDavField label={translate("webdav.url")}>',
@@ -8111,9 +8355,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.ui,
         )
         self.assertEqual(1, workspace.count("<WebDavSyncSection "))
-        # The category reports in captions; the dialog's labelled rows are the
-        # grid's, so one edit to the grid moves 运行时, 外部 and this form together.
-        self.assertNotIn("SETTINGS_FIELD_LABEL", section)
+        # ... and the sync list adds nothing above it: the tab's own header names
+        # 同步, so a second bold caption over one row was a heading about a heading.
+        self.assertNotIn("webdavSectionTitle", self.ui)
+        # The category is a row of the grid (label, value, action, facts under the
+        # control column), and the dialog's labelled rows are the same grid, so one
+        # edit moves 运行时, 外部, 备份与同步 and this form together.  Neither
+        # states a label width, a weight, or a help indent of its own.
+        self.assertIn("<Text numberOfLines={1} style={SETTINGS_FIELD_LABEL}>{translate(\"webdav.sectionTitle\")}</Text>", section)
+        self.assertNotIn("fontWeight", section)
+        self.assertNotIn("webdavSection", section)
         self.assertIn("webdavFieldRow: { ...SETTINGS_FIELD_ROW_INDENTED }", self.ui)
         self.assertIn("webdavFieldLabel: { ...SETTINGS_FIELD_LABEL }", self.ui)
         # The display states the state; the switch itself is the form's.
@@ -8960,19 +9211,37 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('windowRoute == "webdav-settings"', self.macos_leaf)
         self.assertIn('native.window.open("webdav-settings")', self.ui)
 
-    def test_language_uses_the_native_application_menu_without_a_dedicated_screen(self) -> None:
+    def test_language_is_one_setting_in_the_general_pane(self) -> None:
+        """One control for one preference, in the pane that owns preferences.
+
+        The three choices used to exist twice: a menu-bar submenu on each host
+        and (from this change) a settings row.  Two surfaces for one stored
+        value is two places to disagree, and the menu copy also carried a second
+        localization table of its own.  The row is the surface now; both hosts
+        draw it because it is the shared pane.
+        """
         for marker in (
-            '{ id: "language-picker", title: translate("status.language"), enabled: true }',
-            'id: "set-language-system"',
-            'id: "set-language-en"',
-            'id: "set-language-zh-Hans"',
+            'const LANGUAGE_PREFERENCES: readonly LanguagePreference[] = ["system", "en", "zh-Hans"];',
+            '<Text style={SETTINGS_FIELD_LABEL}>{translate("general.language")}</Text>',
+            '{ domain: "language", type: "set_language", payload: { language: next } }',
             'await ipc.apply("language", staged.revision)',
+            # The pane owns the domain it writes, so the shell's debounced Apply
+            # flushes a staged language choice like every other field.
+            'return (["runtime", "language"] as const).filter((name) => currentSnapshot?.drafts[name]?.dirty);',
         ):
             self.assert_ui_has(marker)
-        self.assertNotIn("language-settings", self.ui)
-        self.assertNotIn("function LanguageScreen", self.ui)
-        self.assertIn("private func installLanguageMenu(in applicationMenu: NSMenu)", self.macos_leaf)
-        self.assertIn("item.state = choice?.checked == true ? .on : .off", self.macos_leaf)
+        for absent in (
+            "language-picker",
+            "set-language-system",
+            "set-language-en",
+            "set-language-zh-Hans",
+            "installLanguageMenu",
+            "language-settings",
+            "function LanguageScreen",
+        ):
+            self.assertNotIn(absent, self.ui)
+            self.assertNotIn(absent, self.macos_leaf)
+        self.assertNotIn("language_menu", self.windows_leaf)
 
     def test_service_lifecycle_stays_in_the_shared_menu_surface(self) -> None:
         """Lifecycle labels and state-specific enablement are shared by AppKit and WinUI."""

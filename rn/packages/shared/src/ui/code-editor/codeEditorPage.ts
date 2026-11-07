@@ -89,18 +89,48 @@ function aceEditorFont(platform: EditorPlatform): string {
   return platform === "windows" ? "16px/1.45" : "12px/1.55";
 }
 
+// The editor's own script, either as the page's one inline element or as the
+// file the browser host serves beside it.  A native host hands this document to
+// a WebView with nothing to fetch from, so there the script is inline.  A page
+// served by Core can name it instead, which is what makes the ~480 KB editor a
+// cacheable asset of its own: the framed document is then a few KB, and a
+// second open of the raw editor reads the script out of the browser's own
+// cache rather than fetching it again (`editor.html` is answered `no-store`).
+function inlineEditorScript(scriptSrc: string | undefined): string {
+  if (scriptSrc) {
+    const quoted = scriptSrc.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+    return `<script src="${quoted}"></script>`;
+  }
+  return `<script>${CODE_EDITOR_WEB_BUNDLE.replace(/<\/script/gi, "<\\/script")}</script>`;
+}
+
+/**
+ * The editor's script as its own bytes, for a host that serves it as a file.
+ *
+ * Exported rather than duplicated: the inline page and the file have to be the
+ * same program, and there is exactly one build of it -- `rn/scripts/`
+ * `build-code-editor.mjs` writes `CodeEditorWebBundle.ts`.
+ */
+export { CODE_EDITOR_WEB_BUNDLE } from "./CodeEditorWebBundle";
+
 export function codeEditorPageHtml(options: {
   platform: EditorPlatform;
   command?: InitialEditorCommand;
   labels?: CodeEditorMenuLabels;
+  /**
+   * Address of the editor's script, when the host serves it as a file instead
+   * of inlining it.  Only the browser host can: the native hosts' WebView has
+   * no origin to fetch from.
+   */
+  scriptSrc?: string;
 }): string {
-  const { platform, command, labels } = options;
+  const { platform, command, labels, scriptSrc } = options;
   return `<!doctype html>
 <html>
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src ${scriptSrc ? "'self' " : ""}'unsafe-inline'">
     <style>
       :root {
         color-scheme: ${platform === "web" ? "light" : "light dark"};
@@ -425,7 +455,7 @@ export function codeEditorPageHtml(options: {
     ${inlinePlatform(platform)}
     ${inlineCommand(command)}
     ${inlineMenuLabels(labels)}
-    <script>${CODE_EDITOR_WEB_BUNDLE.replace(/<\/script/gi, "<\\/script")}</script>
+    ${inlineEditorScript(scriptSrc)}
   </body>
 </html>`;
 }

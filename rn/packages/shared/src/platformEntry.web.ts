@@ -103,7 +103,10 @@ const transport: BrowserCoreTransport = {
   baseURL: "",
 };
 
-const systemLocale = navigator.language || "en";
+// The browser's own language list, most-preferred first. `navigator.language`
+// is only its head: a browser whose interface is Chinese behind an English
+// regional preference states that order itself, and the page follows it.
+const systemLocale = navigator.languages?.[0] || navigator.language || "en";
 const language = resolveLanguage("system", systemLocale);
 
 // One document per window, so a route is the address rather than a window

@@ -36,6 +36,9 @@ def resolve_language(choice: str | None, system_locale: str | None = None) -> st
     raise LanguageSettingsError("Unsupported language")
 
 
+# The words a surface outside the React tree may need.  A language name is
+# stated in itself in both tables (English / 简体中文) and only 自动 follows the
+# table: that is what keeps a language list from mixing two scripts.
 MESSAGES: dict[str, dict[str, str]] = {
     "en": {
         "app.title": "Young Router",
@@ -55,7 +58,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "status.autoStart": "Auto Start at Login",
         "status.quit": "Quit Young Router",
         "language.title": "Language Settings",
-        "language.system": "System",
+        "language.auto": "Auto",
         "language.english": "English",
         "language.simplified_chinese": "简体中文",
         "claude.title": "Claude Settings",
@@ -118,7 +121,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "status.autoStart": "登录时自动启动",
         "status.quit": "退出漾路由",
         "language.title": "语言设置",
-        "language.system": "系统",
+        "language.auto": "自动",
         "language.english": "English",
         "language.simplified_chinese": "简体中文",
         "claude.title": "Claude 设置",

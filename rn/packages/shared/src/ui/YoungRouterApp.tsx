@@ -51,6 +51,7 @@ import type {
   DiskState,
   IpcClient,
   IpcResults,
+  LanguagePreference,
   LogTab,
   LogView,
   NativeLeafAdapter,
@@ -182,18 +183,6 @@ function providerKind(provider: UnknownRecord | undefined): ProviderKind {
  * as a service link rather than a relay station link.
  */
 type ServiceID = "openai" | "workbuddy" | "workbuddyGlobal" | "qoder" | "qoderGlobal" | "ourFreeModel";
-
-/**
- * The key slot every Our Free Model entry carries.
- *
- * The lane needs no credential of the user's, but LiteLLM still requires a
- * non-empty key for an OpenAI-compatible route, so Core mints one loopback
- * slot.  Its name is stated here so the 密钥 step can name the slot the entry
- * will have instead of printing the provider name where a key name belongs;
- * it must stay identical to `API_KEY_NAME` in `young_router/adapters/our_free_model.py`.
- */
-const OUR_FREE_MODEL_KEY_NAME = "our-free-model-local";
-
 /**
  * The auth kinds that own the key slot their provider mints.
  *
@@ -235,6 +224,24 @@ function managedServiceForSlot(managed: boolean, authKind: ProviderAuthKind): Se
  */
 function publicModelNameForLane(modelID: string): string {
   return modelID;
+}
+
+/**
+ * The public name one catalog entry will be filed under, as the step lists it.
+ *
+ * A service catalog states the label people read (`publicName`: Qoder's menu
+ * says `Qwen3.8-Max`) apart from the key the wire is called by (`qmodel_38max`),
+ * and a route's public name is that label in lower case — a client types one
+ * spelling, and the spellings this app files are the ones every other import
+ * lands on (`public_names.imported_public_name`).  The step lists the spelling
+ * the created row will serve, so what the user picks is what their client gets;
+ * the pick itself stays the catalog id, because only the adapter owns the
+ * mapping.  The lane's ids are already their public names.
+ */
+function serviceCatalogModelLabel(entry: UnknownRecord, lane: boolean): string {
+  const modelID = stringValue(entry.id).trim();
+  if (lane) return publicModelNameForLane(modelID);
+  return (stringValue(entry.publicName).trim() || modelID).toLowerCase();
 }
 
 /**
@@ -480,16 +487,19 @@ function serviceCatalogRates(models: UnknownRecord[]): Record<string, string> {
 /**
  * Where a Qoder region's sign-in comes from, as the pane states it.
  *
- * The two are different facts and only one of them self-heals: an app session
- * follows the desktop app (a new sign-in there is picked up on the next read),
- * while a pasted PAT stays until someone replaces or forgets it.  Naming the
- * source is what tells the user which of those they are looking at.
+ * The account this app offers is the desktop app's own session, which follows
+ * that app: a new sign-in there is picked up on the next read.  A host may also
+ * state the region's credential in its environment, and naming that source is
+ * how the pane says which of the two it is looking at; anything else is a
+ * credential this window neither placed nor manages, so the region's gateway is
+ * what it reports rather than a source it cannot account for.
  */
 function qoderCredentialSourceLabel(account: UnknownRecord | undefined, translate: Translate): string {
   const source = stringValue(account?.signInSource);
-  if (source === "stored") return translate("providers.wizard.qoderSourcePat");
   if (source === "app") return translate("providers.wizard.qoderSourceApp");
   if (source === "env") return translate("providers.wizard.qoderSourceEnv");
+  // Anything else is a credential this window did not place and cannot manage:
+  // the region's own gateway is what it states rather than naming a token.
   return stringValue(account?.domain) || translate("common.notAvailable");
 }
 
@@ -629,15 +639,16 @@ function progressText(busy: boolean, translate: Translate): string | undefined {
  *
  * The keys come from the Codex app's own `cua_repl` server
  * (`CUA_REPL_ENABLED_SURFACES`, one `<surface>_use` flag per entry), so this
- * app cannot know the set — only shape a name out of whatever it is handed:
- * `web_search_use` reads "Web search", `image_generation_use` reads "Image
- * generation".  Returns `undefined` for a key with no surface part, so the
- * caller keeps the generic caption rather than drawing an empty label.
+ * app cannot know the set.  The surfaces it has words for are translated; the
+ * rest are named by their own key, which is a config switch the help line under
+ * the row already spells.  Shaping an English name out of the key instead
+ * (`web_search_use` -> "Web search") put English inside a Chinese row.
  */
-function codexSurfaceName(feature: string): string | undefined {
+function codexSurfaceName(feature: string, translate: Translate): string | undefined {
   const surface = feature.endsWith("_use") ? feature.slice(0, -"_use".length) : feature;
-  const words = surface.split(/[_\-\s]+/).filter((word) => word.length > 0);
-  return words.length === 0 ? undefined : words.map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(" ");
+  const known: Record<string, TranslationKey> = { web_search: "codex.surface.webSearch", image_generation: "codex.surface.imageGeneration" };
+  const key = known[surface];
+  return key ? translate(key) : undefined;
 }
 
 function providerKindLabel(kind: ProviderKind, translate: Translate): string {
@@ -677,6 +688,8 @@ const DATA_PACKAGE_SECTIONS: ReadonlyArray<{ domain: ConfigDomain; labelKey: str
 const DATA_PACKAGE_DOMAINS = DATA_PACKAGE_SECTIONS.map(({ domain }) => domain);
 const DATA_MANAGEMENT_DIRTY_DOMAINS: readonly ConfigDomain[] = DATA_PACKAGE_DOMAINS;
 const WEBDAV_SYNC_DOMAINS: readonly ConfigDomain[] = ["providers_models", "relay_accounts"];
+/** The language preference's wire values, in the order its picker lists them. */
+const LANGUAGE_PREFERENCES: readonly LanguagePreference[] = ["system", "en", "zh-Hans"];
 
 const PendingFieldContext = createContext<PendingFieldRegistry | undefined>(undefined);
 const TranslationContext = createContext<Translate | undefined>(undefined);
@@ -1552,10 +1565,9 @@ function isRevisionRetryableAction(type: string): boolean {
     || normalized === "fetch_models"
     || normalized === "provider_fetch_relay_resource_models"
     // A managed account's own action carries no draft value to invalidate: it
-    // reads or replaces the credential its worker owns, addressed by region.
-    // Staging a PAT advances Core's shared revision, so the sign-in dispatch
-    // that follows it in the same press would otherwise lose the race and
-    // report 更改未生效 for an account it never touched.
+    // reads the account and catalog its worker owns, addressed by region, and
+    // every one of them advances Core's shared revision without touching the
+    // draft.
     || normalized.startsWith("qoder_")
     || normalized.startsWith("workbuddy_")
     || normalized.startsWith("our_free_model_")
@@ -1775,8 +1787,6 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       serviceRunningOnPort: translate("service.runningOnPort", { port: "{port}" }),
       serviceUnhealthy: translate("service.unhealthy"), serviceStopped: translate("service.stopped"),
       serviceUnknown: translate("service.unknown"),
-      languageMenu: translate("status.language"), languageSystem: translate("language.system"),
-      languageEnglish: translate("language.english"), languageSimplifiedChinese: translate("language.simplified_chinese"),
       cancel: translate("status.cancel"), set: translate("common.set"), clear: translate("common.clear"), stage: translate("common.stageRaw"), find: translate("common.find"),
       findNext: translate("common.findNext"), edit: translate("common.edit"), undo: translate("common.undo"),
       redo: translate("common.redo"), cut: translate("common.cut"), copy: translate("common.copy"),
@@ -2067,20 +2077,6 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
           setError(hostTranslate("error.coreUnavailable"));
         }
       })();
-    } else if (action.startsWith("set-language-") && snapshot) {
-      const language = action.slice("set-language-".length);
-      if (language !== "system" && language !== "en" && language !== "zh-Hans") return;
-      handledNativeActions.current.add(actionKey);
-      void (async () => {
-        try {
-          const staged = await ipc.dispatch({ domain: "language", type: "set_language", payload: { language } }, snapshot.revision);
-          await ipc.apply("language", staged.revision);
-          receiveSnapshot(await ipc.snapshot());
-          await recordMenuAction(action);
-        } catch {
-          setError(hostTranslate("error.coreUnavailable"));
-        }
-      })();
     }
   }, [hostTranslate, ipc, isPrimaryHost, nativeAction, receiveSnapshot, recordMenuAction, runServiceOperation, snapshot]);
 
@@ -2109,10 +2105,6 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       { id: "service-restart", title: translate("service.restart"), enabled: serviceRestartAvailable },
       { id: "service-reload", title: translate("service.reload"), enabled: serviceReloadAvailable },
       { id: "service-health", title: translate("service.health"), enabled: !serviceOperationPending },
-      { id: "language-picker", title: translate("status.language"), enabled: true },
-      { id: "set-language-system", title: translate("language.system"), enabled: true, checked: snapshot.language === "system" },
-      { id: "set-language-en", title: translate("language.english"), enabled: true, checked: snapshot.language === "en" },
-      { id: "set-language-zh-Hans", title: translate("language.simplified_chinese"), enabled: true, checked: snapshot.language === "zh-Hans" },
       { id: "show-version", title: translate("status.version"), enabled: true },
       { id: "quit", title: translate("status.quit"), enabled: true },
     ];
@@ -2393,8 +2385,16 @@ const SETTINGS_FIELD_NUMBER_WIDTH = 84;
 const SETTINGS_FIELD_TEXT_WIDTH = 420;
 /** Where the control column and the tips under it start, inside one row. */
 const SETTINGS_FIELD_HELP_INDENT = SETTINGS_FIELD_LEAD + SETTINGS_FIELD_LABEL_WIDTH + SETTINGS_FIELD_GAP;
-/** The one content inset every settings pane body starts from. */
-const SETTINGS_PANE_INSET = 14;
+/**
+ * The one content inset every settings pane body starts from -- and the x the
+ * pane's own title starts from, because a body that begins left of its title
+ * reads as though it belongs to the sidebar beside it rather than to the pane.
+ *
+ * It is one number, stated once: the title (`settingsPaneHeader`), a detail
+ * header's title, and every pane body all read it, so the column cannot drift
+ * apart one pane at a time.
+ */
+const SETTINGS_PANE_INSET = 24;
 
 function SettingsRail({ rows, selectedKey, onSelectionChange, details, style }: {
   rows: { key: string; cells: string[] }[];
@@ -2545,6 +2545,13 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
     }
     if (route === "data-management") {
       return DATA_MANAGEMENT_DIRTY_DOMAINS.filter((name) => currentSnapshot?.drafts[name]?.dirty);
+    }
+    // The General pane owns two domains: the service's runtime settings, and the
+    // language the whole window is drawn in.  Both are staged there and both
+    // have to reach Apply, or the language choice sits in a draft nothing
+    // flushes and the pane reads as if the picker did nothing.
+    if (route === "general-settings") {
+      return (["runtime", "language"] as const).filter((name) => currentSnapshot?.drafts[name]?.dirty);
     }
     // The unified provider workspace stages relay account metadata and the
     // provider/model draft as one coordinated Apply.
@@ -3775,7 +3782,7 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
 
   return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={[styles.windowSurface, shell && isWindowsShell && styles.windowSurfaceShellWindows]}>
     {!shell && route !== "providers-models" && route !== "logs" && route !== "provider-wizard" && route !== "file-editor" && route !== "data-management" && route !== "webdav-settings" ? <WindowTitle title={windowTitle} /> : null}
-    {route === "providers-models" || route === "provider-wizard" || route === "file-editor" || route === "webdav-settings" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, (route === "provider-wizard" || route === "webdav-settings") && styles.childRouteContent, settingsRoute && styles.assistantSettingsContent, route === "logs" && styles.logsContent, route === "runtime-settings" && styles.runtimeContent, route === "data-management" && styles.dataManagementContent]}>
+    {route === "providers-models" || route === "provider-wizard" || route === "file-editor" || route === "webdav-settings" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, (route === "provider-wizard" || route === "webdav-settings") && styles.childRouteContent, (settingsRoute || route === "runtime-settings" || route === "data-management" || route === "general-settings") && SETTINGS_PANE_ROUTE, route === "logs" && styles.logsContent]}>
     {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { native.window.open("provider-wizard"); native.window.focus("provider-wizard"); }} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
     {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} status={result} /> : null}
@@ -3939,6 +3946,16 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const [modelName, setModelName] = useState("");
   const [upstreamModel, setUpstreamModel] = useState("");
   const [fetchedModelCandidates, setFetchedModelCandidates] = useState<string[]>([]);
+  // The name each catalog row is listed under, by the selector the pick sends
+  // back.  A service catalog publishes the label for people (`publicName`,
+  // `Qwen3.8-Max`) apart from the key the wire is called by (`qmodel_38max`),
+  // and the row this app files is the label in lower case; the step therefore
+  // lists the spelling the created route will serve, not the wire key.  The
+  // lane's ids are already their public names, so its rows list themselves.
+  const [fetchedModelLabels, setFetchedModelLabels] = useState<Record<string, string>>({});
+  // The reason a catalog read answered no roster, when it stated one.  The
+  // account-backed steps show it beside the sign-in controls they offer.
+  const [modelFetchDetail, setModelFetchDetail] = useState("");
   // The picker groups the lane published with its roster, as route -> model
   // ids.  The upstream decides this split, so the wizard groups by what it
   // said instead of by a rule of its own.
@@ -3969,14 +3986,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // its live catalog, so the wizard reads both instead of asking for a secret.
   const [workbuddyAccount, setWorkbuddyAccount] = useState<UnknownRecord | undefined>(undefined);
   const [workbuddyBusy, setWorkbuddyBusy] = useState(false);
-  // Qoder: the account signs in with a PAT, and the wizard reads its state
-  // before it creates the entry so a signed-out paste is refused here.
+  // Qoder: the account is the Qoder desktop app's own sign-in, so the wizard
+  // reads its state and never asks for a credential of its own.
   const [qoderAccount, setQoderAccount] = useState<UnknownRecord | undefined>(undefined);
   const [qoderBusy, setQoderBusy] = useState(false);
-  const [qoderPatCommit, setQoderPatCommit] = useState(0);
-  const qoderPatWaiter = useRef<((present: boolean) => void) | undefined>(undefined);
-  const qoderPatState = useRef<{ status: string; present: boolean }>({ status: "ready", present: false });
-  const qoderPatCommitRequest = useRef(0);
   // The wizard's one status line: its own validation or feedback, and the wait
   // while the embedded sign-in page is up.  No step body repeats it.
   const wizardStatus = validation || loginFeedback.current || (loginPhase === "sign-in" ? translate("relay.loginWorking") : "");
@@ -3994,12 +4007,12 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const isOfficialLoginType = providerType === "openai";
   const isWorkBuddyType = providerType === "workbuddy" || providerType === "workbuddyGlobal";
   const isQoderType = providerType === "qoder" || providerType === "qoderGlobal";
-  // Our Free Model has no sign-in and no user secret at all: its provider is
-  // created straight from the provider step, so it shares neither the key
-  // step's fields nor the official services' web login.
-  // Every lane channel is its own entry, so every one of them is "this type"
-  // for the steps that differ from a key entry: no account, a minted key slot,
-  // and a catalog read instead of a typed model list.
+  // Our Free Model has no sign-in and no user secret at all: the lane signs
+  // itself in, so this type shares neither the key step's fields nor the
+  // official services' web login.  Every lane channel is its own entry, so
+  // every one of them is "this type" for the steps that differ from a key
+  // entry: no account, a minted key slot, and a catalog read instead of a
+  // typed model list.
   const isOurFreeModelType = providerType === "ourFreeModel" || providerType === "ourFreeModelKilo";
   /** The service this entry belongs to; both channels are one service. */
   const serviceType: ServiceID | undefined = providerType === "api"
@@ -4007,6 +4020,20 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     : isOurFreeModelType ? "ourFreeModel" : providerType;
   /** The provider this entry creates; the wizard names it. */
   const ourFreeModelProviderID = ourFreeModelProviderIDFor(providerType);
+  // The three keyless services list their own catalog on the model step: a
+  // lane, Qoder and WorkBuddy all publish their roster, so none of them has a
+  // key of the user's to type and all three walk 供应商 → 模型.
+  const isServiceCatalogType = isOurFreeModelType || isQoderType || isWorkBuddyType;
+  /** The read one service catalog answers through, when this type has one. */
+  const serviceCatalogRequest = serviceType === undefined || !isServiceCatalogType
+    ? undefined
+    : serviceCatalogRead(serviceType, isOurFreeModelType ? ourFreeModelProviderID : undefined);
+  // The account-backed model steps state why no roster came back beside the
+  // account they belong to: a signed-out desktop app is not a failed read, so
+  // the list area stays quiet then and the strip above says what to do.
+  const serviceCatalogAccountSignedIn = isQoderType
+    ? stringValue(qoderAccount?.state) === "signed-in"
+    : isWorkBuddyType ? stringValue(workbuddyAccount?.state) === "signed-in" : true;
   const isLoginType = isOfficialLoginType || isWorkBuddyType || isQoderType || isOurFreeModelType;
   const workbuddyProvider = providerType === "workbuddyGlobal" ? "workbuddy-global" : "workbuddy";
   const workbuddyAuthKind: ServiceProviderKind = providerType === "workbuddyGlobal" ? "workbuddy_global_login" : "workbuddy_login";
@@ -4145,18 +4172,18 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     : SERVICE_BASE_URLS[serviceType] || translate("common.notAvailable");
   const selectedServiceLabel = servicePickerItems.find((item) => item.type === providerType)?.label ?? servicePickerLabels[0] ?? "";
   // The wizard asks for 基础 URL only where the user can state one.  A service
-  // whose address belongs to Core (Our Free Model) or to a desktop app
-  // (WorkBuddy) has no value to print, and a required field reading 「不适用」
-  // asks for something that cannot be given.
+  // whose address belongs to Core (Our Free Model, Qoder, WorkBuddy) has no
+  // value to print, and a required field reading 「不适用」 asks for something
+  // that cannot be given.
   const wizardEditsBaseURL = !isWorkBuddyType && !isQoderType && !isOurFreeModelType;
-  // The free lane and WorkBuddy carry no secret of their own — the lane imports
-  // its roster on create, and the desktop app owns WorkBuddy's sign-in — so 密钥
-  // is not a step of theirs at all.  A step that only says "nothing to type
-  // here" is a page the user walks through for no reason; both the rail and the
-  // walk between 供应商 and 模型 reflect that.
-  // Qoder's PAT is typed on the keys step, so that step stays.  WorkBuddy and
-  // Our Free Model have no secret of the user's to type, so theirs goes.
-  const needsKeyStep = !isOurFreeModelType && !isWorkBuddyType;
+  // A service that publishes its own catalog has no secret of the user's to
+  // type: the lane signs itself in, and Qoder/WorkBuddy borrow their desktop
+  // app's sign-in, so 密钥 is not a step of theirs at all.  Their walk is
+  // 供应商 → 模型, exactly like Our Free Model's, and the model step states
+  // (and, for Qoder, offers) that sign-in beside the catalog it lists.  A step
+  // that only says "nothing to type here" is a page walked through for no
+  // reason; the rail reflects the two steps that exist.
+  const needsKeyStep = !isServiceCatalogType;
   const stepItems: Array<{ id: WizardStep; title: string }> = [
     { id: "provider", title: translate("providers.wizard.stepProvider") },
     ...(needsKeyStep ? [{ id: "keys" as WizardStep, title: translate("providers.wizard.stepKeys") }] : []),
@@ -4196,101 +4223,46 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     }
   };
   /**
-   * Wait for the PAT field to reach Core.
+   * Hand a signed-out region to the desktop app that owns its sign-in.
    *
-   * The native secure field stages on blur, and the press that runs sign-in is
-   * the same press that blurred it.  The value therefore travels through the
-   * secret capability — never through React state or the action payload — and
-   * this wait is what tells the dispatch whether anything arrived.
+   * The sign-in happens there, not here, so this is the one action the wizard
+   * can take on its behalf; the read afterwards is what sees the result.  It
+   * is the same hand-off for both products, which is why one function names
+   * the action and the account it re-reads rather than two copies of it.
    */
-  const flushQoderPat = (): Promise<boolean> => {
-    if (qoderPatState.current.status !== "dirty" && qoderPatState.current.status !== "saving") {
-      return Promise.resolve(qoderPatState.current.present);
-    }
-    return new Promise<boolean>((resolve) => {
-      qoderPatWaiter.current = resolve;
-      qoderPatCommitRequest.current += 1;
-      setQoderPatCommit(qoderPatCommitRequest.current);
-    });
-  };
-  const handleQoderPatState = (state: SecretState): void => {
-    qoderPatState.current = { status: state.status, present: state.present };
-    if (state.status === "saved" || state.status === "ready" || state.status === "error") {
-      const waiter = qoderPatWaiter.current;
-      qoderPatWaiter.current = undefined;
-      waiter?.(state.present);
-    }
-  };
-  const signInQoder = async (): Promise<void> => {
+  const openServiceDesktopApp = async (): Promise<void> => {
+    const setBusy = isQoderType ? setQoderBusy : setWorkbuddyBusy;
+    setBusy(true);
     setValidation("");
-    if (!(await flushQoderPat())) {
-      setValidation(translate("providers.wizard.required"));
-      return;
-    }
-    setQoderBusy(true);
     try {
-      // The target is the region, not a value: the staged PAT never leaves the
-      // native secret store, and Core hands that exact target to the worker.
       const next = await dispatchWithOutcome(
-        "qoder_login",
-        { provider: qoderProviderId, secret_target: qoderProviderId },
+        isQoderType ? "qoder_open_app" : "workbuddy_login",
+        { provider: isQoderType ? qoderProviderId : workbuddyProvider },
         "providers_models",
         true,
       );
-      if (!next) return;
-      const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
-      const status = asRecord(summary.status);
-      setQoderAccount(status);
-      if (stringValue(status.state) !== "signed-in") {
-        setValidation(stringValue(status.reason) || translate("providers.authStatusSignedOut"));
-      }
-    } catch (reason: unknown) {
-      setValidation(errorMessage(reason, translate));
-    } finally {
-      setQoderBusy(false);
-    }
-  };
-  /**
-   * Hand a signed-out region to the Qoder desktop app.
-   *
-   * The sign-in happens there, not here, so this is the one action the wizard
-   * can take on its behalf; the read afterwards is what sees the result.
-   */
-  const openQoderApp = async (): Promise<void> => {
-    setQoderBusy(true);
-    try {
-      const next = await dispatchWithOutcome("qoder_open_app", { provider: qoderProviderId }, "providers_models", true);
       const summary = asRecord(asRecord(next?.action_summaries?.providers_models).operation_summary);
       if (summary.installed === false) {
-        setValidation(translate("providers.wizard.qoderAppMissing"));
+        setValidation(translate(isQoderType ? "providers.wizard.qoderAppMissing" : "providers.wizard.workbuddyAppMissing"));
         return;
       }
-      await loadQoderAccount(true);
+      const account = isQoderType ? await loadQoderAccount(true) : await loadWorkBuddyAccount(true);
+      // The app may have completed the sign-in while it was in front; that is
+      // exactly the case this button exists for, so the roster is re-read then.
+      if (stringValue(account?.state) === "signed-in") setModelFetchTicket((current) => current + 1);
     } catch (reason: unknown) {
       setValidation(errorMessage(reason, translate));
     } finally {
-      setQoderBusy(false);
-    }
-  };
-  const signOutQoder = async (): Promise<void> => {
-    setQoderBusy(true);
-    try {
-      const next = await dispatchWithOutcome("qoder_logout", { provider: qoderProviderId }, "providers_models", true);
-      if (!next) return;
-      const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
-      setQoderAccount(asRecord(summary.status));
-      qoderPatState.current = { status: "ready", present: false };
-    } finally {
-      setQoderBusy(false);
+      setBusy(false);
     }
   };
   useEffect(() => {
-    // Reaching the keys step asks the account question; it does not force a
+    // Reaching the model step asks the account question; it does not force a
     // new one.  Core's own window answers it from the read this pane just made
     // (运行时 adjusts the window), so walking back and forth through the wizard
     // costs no worker round trip and never repaints the account.
-    if (step === "keys" && isWorkBuddyType) void loadWorkBuddyAccount(false);
-    if (step === "keys" && isQoderType) void loadQoderAccount(false);
+    if (step === "model" && isWorkBuddyType) void loadWorkBuddyAccount(false);
+    if (step === "model" && isQoderType) void loadQoderAccount(false);
     // The selected type and the reached step are the only triggers: a reload
     // on every render would fight the refresh button beside the account.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -4395,6 +4367,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     setModelName("");
     setUpstreamModel("");
     setFetchedModelCandidates([]);
+    setFetchedModelLabels({});
+    setModelFetchDetail("");
     setFetchedModelCapabilities({});
     setSelectedModels([]);
     setManualModels([]);
@@ -4442,6 +4416,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     setWorkbuddyAccount(undefined);
     setQoderAccount(undefined);
     setSelectedModels([]);
+    setFetchedModelLabels({});
+    setModelFetchDetail("");
     setModelFetchState("idle");
   };
   useEffect(() => {
@@ -4621,57 +4597,91 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     setModelFetchTicket((current) => current + 1);
   };
   /**
-   * List the lane's own free roster for the model step.
+   * List one service's own catalog for the model step.
    *
-   * This lane has no key to fetch with and no address to probe, so its roster
-   * comes from the staged adapter through ``our_free_model_models``.  The answer
-   * is the same pick the generic path offers: the user chooses which free
-   * models this entry carries, and 刷新 asks again.
+   * A lane, Qoder and WorkBuddy each publish the roster their routes answer
+   * from, so none of them has a key to fetch with or an address this app could
+   * probe: the read is the staged adapter's own document.  The answer is the
+   * same pick the generic path offers — the user chooses which entries this
+   * entry carries, and 刷新 asks again — so all three types walk the one model
+   * step below.
+   *
+   * The row a pick creates is the catalog's public name in lower case
+   * (``Qwen3.8-Max`` is listed and filed as ``qwen3.8-max`` while the upstream
+   * keeps ``qmodel_38max``), and the step lists that spelling because it is the
+   * name the entry will serve.  The pick itself is the catalog id: the adapter
+   * that stated the entry is what resolves it, so no label is ever matched
+   * against a second rule here.
    */
-  const fetchOurFreeModelModels = async (providerID = ourFreeModelProviderID): Promise<void> => {
+  const fetchServiceCatalogModels = async (): Promise<void> => {
+    if (!serviceCatalogRequest) {
+      setModelFetchState("unavailable");
+      return;
+    }
     if (modelFetchInFlight.current) return;
     const request = ++modelFetchRequest.current;
     modelFetchInFlight.current = true;
     setModelFetchState("loading");
+    setModelFetchDetail("");
     try {
-      // The channel is what Core filters by: one worker serves both, so
-      // the id in the request decides which slice of the roster comes back.
-      const next = await dispatchWithOutcome("our_free_model_models", { provider: providerID, refresh: true }, "providers_models", true);
+      // The id in the request decides which slice of a shared worker's roster
+      // comes back, so it travels with the read rather than being fixed to the
+      // lane's anonymous channel.
+      const next = await dispatchWithOutcome(serviceCatalogRequest.action, { provider: serviceCatalogRequest.providerId, refresh: true }, "providers_models", true);
       if (request !== modelFetchRequest.current) return;
       const summary = asRecord(asRecord(next?.action_summaries?.providers_models).operation_summary);
-      if (stringValue(summary.operation) !== "our_free_model_models" || summary.available !== true) {
+      const answered = stringValue(summary.operation) === serviceCatalogRequest.action;
+      // The catalog read answers the account question too, so the step's one
+      // refresh is this read: it re-states where the account stands before it
+      // says whether a roster came back.
+      const accountStatus = asRecord(summary.status);
+      if (answered && stringValue(accountStatus.state)) {
+        if (isQoderType) setQoderAccount(accountStatus);
+        else if (isWorkBuddyType) setWorkbuddyAccount(accountStatus);
+      }
+      if (!answered || summary.available !== true) {
+        setModelFetchDetail(stringValue(summary.detail));
         setModelFetchState("unavailable");
         return;
       }
-      const candidates = asRecords(summary.models)
-        .map((entry) => stringValue(entry.id).trim())
-        .filter((value, index, all) => Boolean(value) && all.indexOf(value) === index);
+      const entries = asRecords(summary.models)
+        .map((entry) => ({ id: stringValue(entry.id).trim(), label: serviceCatalogModelLabel(entry, isOurFreeModelType) }))
+        .filter((entry) => Boolean(entry.id));
+      const candidates = entries.map((entry) => entry.id).filter((value, index, all) => all.indexOf(value) === index);
       if (candidates.length === 0) {
         setModelFetchState("empty");
         return;
       }
+      // A label two entries share cannot tell them apart, so it borrows the id
+      // the way the pane's chooser does; the pick behind it is still the id.
+      const labels: Record<string, string> = {};
+      const counts = entries.reduce<Record<string, number>>((all, entry) => {
+        all[entry.label] = (all[entry.label] ?? 0) + 1;
+        return all;
+      }, {});
+      for (const entry of entries) labels[entry.id] = counts[entry.label] > 1 ? `${entry.label} (${entry.id})` : entry.label;
       setFetchedModelCandidates(candidates);
-      // The groups this roster came with.  A read that states none leaves the
-      // list ungrouped rather than inventing a split.
+      setFetchedModelLabels(labels);
+      // The lane groups its roster by where each row is served from; a region
+      // catalog is one list, so its groups stay empty rather than invented.
       const routes: Record<string, string[]> = {};
       for (const [route, ids] of Object.entries(asRecord(summary.routes))) {
         const names = stringList(ids).filter((name) => candidates.includes(name));
         if (names.length > 0) routes[route] = names;
       }
       setLaneRoutes(routes);
-      // The source each row is served from.  A read that states none leaves the
-      // roster under the lane's own heading rather than inventing producers.
       const channels: Record<string, string> = {};
       for (const [name, channel] of Object.entries(asRecord(summary.channels))) {
         if (candidates.includes(name)) channels[name] = stringValue(channel);
       }
       setLaneChannels(channels);
       // Nothing is checked until the user chooses.  A roster this long is not a
-      // shortlist: pre-selecting every free model would hand the entry a set
-      // nobody picked, and the same rule already governs every other service
-      // (a WorkBuddy entry is created with no models at all).
+      // shortlist: pre-selecting every model would hand the entry a set nobody
+      // picked, and the same rule governs every service's listing.
       setSelectedModels((current) => current.filter((name) => candidates.includes(name)));
       setModelFetchState("ready");
+    } catch {
+      if (request === modelFetchRequest.current) setModelFetchState("unavailable");
     } finally {
       if (request === modelFetchRequest.current) modelFetchInFlight.current = false;
     }
@@ -4797,11 +4807,12 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     // This sits after the listing's own declaration so calling it here is not
     // a temporal-dead-zone reference.
     if (modelFetchTicket === 0 || step !== "model") return;
-    // An official login lists the account's own roster; a lane lists the staged
-    // adapter's; every other provider lists from the key/address its keys step
-    // staged.
+    // An official login lists the account's own roster; a lane, Qoder and
+    // WorkBuddy list the catalog their adapter publishes; every other provider
+    // lists from the key/address its keys step staged.
     if (isOfficialLoginType && keyPath === "login") void fetchOfficialAccountModels();
-    else void (isOurFreeModelType ? fetchOurFreeModelModels(ourFreeModelProviderID) : fetchWizardModels());
+    else if (isServiceCatalogType) void fetchServiceCatalogModels();
+    else void fetchWizardModels();
     // The ticket is the trigger; the listing's own inputs are read from this
     // render, which is the model step's.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -4809,26 +4820,32 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   /**
    * The wizard's one create — 完成 is what mints the provider.
    *
-   * Its own steps staged the name, the address, and (for a custom key) the
-   * key value, so 下一步 never creates anything and a wizard the user closes
-   * reserves nothing.  The key value is adopted here through the token the
-   * wizard filed it under; the models are added by the caller right after.
+   * Its own steps staged the name, the address, the models, and (for a custom
+   * key) the key value, so 下一步 never creates anything and a wizard the user
+   * closes reserves nothing.  The key value is adopted here through the token
+   * the wizard filed it under; a service catalog's picks are carried by the
+   * create itself, because the model step is where the user chose them.
    */
   const commitWizardProvider = async (): Promise<string | undefined> => {
     const name = providerName.trim();
     if (!name || !providerStepValid()) return undefined;
     if (isWorkBuddyType || isQoderType) {
-      // The service entry is created empty, and it says so: an add mints a
-      // provider, never a roster.  Both accounts are the same shape here — the
-      // integration owns the sign-in, and which of its models this app serves is
-      // the user's pick in 获取模型 (选择要添加的模型), the one place a catalog
-      // becomes rows.  Omitting the list would ask Core to import the account's
-      // whole catalog with the create, which is exactly the behaviour this
-      // wizard must not have.
+      // The account publishes the roster this step listed, and the pick is the
+      // entries the user ticked.  The create names those entries rather than
+      // rebuilding their rows: the adapter owns each entry's upstream key and
+      // public label, and Core files each picked row under that label in lower
+      // case (Qoder's `Qwen3.8-Max` becomes `qwen3.8-max`, the wire keeps
+      // `qmodel_38max`) — exactly the spelling this step showed.  An empty pick
+      // is refused here, because 完成 is the only place these models enter.
+      const kept = modelCandidates.filter((model) => selectedModels.includes(model));
+      if (kept.length === 0) {
+        setValidation(translate("providers.wizard.selectAtLeastOneModel"));
+        return undefined;
+      }
       const next = await dispatchWithOutcome("service_provider.add", {
         kind: isQoderType ? qoderAuthKind : workbuddyAuthKind,
         name,
-        models: [],
+        models: kept,
       });
       if (!next) return undefined;
       const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
@@ -5101,9 +5118,11 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       stepRef.current = "keys";
       return;
     }
-    if (isOurFreeModelType || (isOfficialLoginType && keyPath === "login")) setModelFetchState("loading");
+    // A keyless service's model step is the first thing that reads its own
+    // catalog, so the wait and the listing's ticket are raised with the step.
+    if (isServiceCatalogType || (isOfficialLoginType && keyPath === "login")) setModelFetchState("loading");
     advanceStepToModel();
-    if (isOurFreeModelType || (isOfficialLoginType && keyPath === "login")) setModelFetchTicket((current) => current + 1);
+    if (isServiceCatalogType || (isOfficialLoginType && keyPath === "login")) setModelFetchTicket((current) => current + 1);
   };
   const goNext = async (): Promise<void> => {
     // The primary button keeps reporting its own progress, so the guard that
@@ -5138,34 +5157,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       return;
     }
     if (step === "keys") {
-      if (isQoderType) {
-        // A signed-out region has no catalog to import, so the step must not
-        // walk on.  The check re-reads once: the desktop app may have been
-        // signed in since this step was entered.
-        const account = stringValue(qoderAccount?.state) === "signed-in"
-          ? qoderAccount
-          : await loadQoderAccount(true);
-        if (stringValue(account?.state) !== "signed-in") {
-          setValidation(translate("providers.wizard.qoderSignInRequired"));
-          return;
-        }
-        advanceStepToModel();
-        return;
-      }
-      if (isWorkBuddyType) {
-        // Nothing is typed here: the desktop app owns the sign-in, and the
-        // account is associated in the provider's 「服务商关联」 section.
-        advanceStepToModel();
-        return;
-      }
-      if (isOurFreeModelType) {
-        // Nothing is typed here either: the lane signs itself in.  The roster
-        // is listed on the model step, where the user picks what to carry.
-        setModelFetchState("loading");
-        advanceStepToModel();
-        setModelFetchTicket((current) => current + 1);
-        return;
-      }
       if (creatingProvider) {
         // The provider does not exist yet, so this step states the field its
         // own create will carry: a custom key that is staged, or the provided
@@ -5299,28 +5290,27 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       }
       return;
     }
-    // WorkBuddy imported nothing here: its models arrive with the account in
-    // the provider's own association section, and 完成 is what creates its
-    // service entry.
-    if (isWorkBuddyType || isQoderType) {
+    // A keyless service files its picks with the create, or — when this wizard
+    // is editing an entry that already exists — with the catalog import the
+    // pane's 获取模型 uses.  The step is the one place these rows enter, so an
+    // add never has to be followed by a second visit to the pane.
+    if (isServiceCatalogType) {
       setProcessing(true);
       try {
-        const created = providerID || await commitWizardProvider();
-        if (!created) return;
-        onStatus(translate("providers.wizard.complete"));
-        onClose();
-      } finally {
-        setProcessing(false);
-      }
-      return;
-    }
-    // Our Free Model imported its roster with the create too, so 完成 only has
-    // to mint the entry; nothing is selected or typed on this step.
-    if (isOurFreeModelType) {
-      setProcessing(true);
-      try {
-        const created = providerID || await commitWizardProvider();
-        if (!created) return;
+        const picked = modelCandidates.filter((model) => selectedModels.includes(model));
+        if (providerID) {
+          if (picked.length > 0) {
+            const next = await dispatchWithOutcome("model.import_service_catalog", { provider_id: providerID, models: picked });
+            if (!next) return;
+          }
+        } else {
+          if (picked.length === 0) {
+            setValidation(translate("providers.wizard.selectAtLeastOneModel"));
+            return;
+          }
+          const created = await commitWizardProvider();
+          if (!created) return;
+        }
         onStatus(translate("providers.wizard.complete"));
         onClose();
       } finally {
@@ -5466,11 +5456,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           {providerMode === "existing" && selectedProvider ? <Text numberOfLines={1} style={styles.providerWizardHint}>{activeProviderBaseURL || translate("common.notAvailable")}</Text> : null}
         </View> : null}
         {step === "keys" ? <View style={styles.providerWizardFormSection}>
-          {/* The hint names what this step is about: the key, not the provider.
-              This lane has no key of the user's to choose — its one slot is the
-              loopback bearer — so the step states that instead of printing the
-              provider name where a key name belongs. */}
-          <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.stepKeys")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{isOurFreeModelType ? OUR_FREE_MODEL_KEY_NAME : selectedProviderName}</Text></View>
+          {/* The hint names what this step is about: the key, not the provider. */}
+          <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.stepKeys")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{selectedProviderName}</Text></View>
           {isOfficialLoginType && keyPath === "login" ? <>
             <Text style={styles.providerWizardHint}>{translate("providers.wizard.loginKeyHint")}</Text>
             <View style={styles.providerWizardAuthRow}>
@@ -5481,58 +5468,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                   ? <NativeButton title={translate("relay.officialProviderCancel")} compact disabled={wizardBusy} onPress={() => { void cancelOfficialLogin(); }} />
                   : <NativeButton title={translate("relay.officialProviderLogin")} primary compact disabled={wizardBusy} onPress={() => { void startOfficialLogin(); }} />}
             </View>
-          </> : isOurFreeModelType ? <>
-            {/* The lane signs itself in and its free roster is imported by the
-                create, so this step states that and asks for nothing. */}
-            <Text style={styles.providerWizardHint}>{translate("providers.wizard.ourFreeModelHint")}</Text>
-          </> : isQoderType ? <>
-            {/* The account is the one the Qoder desktop app is signed into:
-                the worker reads that app's own session, so this step asks for
-                nothing and only states what it found.  A PAT is the override
-                for a machine whose app is not signed in (or for a host with no
-                window); it is typed into the native secure field and staged
-                through Core's secret capability, so it never enters React
-                state, the action payload, or config.yaml. */}
-            <Text style={styles.providerWizardHint}>{translate("providers.wizard.qoderKeyHint")}</Text>
-            <View style={styles.providerWizardAuthRow}>
-              <Text style={styles.providerWizardAuthStatus}>{stringValue(qoderAccount?.state) === "signed-in" ? translate("providers.authStatusSignedIn") : progressText(qoderBusy, translate) ?? translate("providers.authStatusSignedOut")}</Text>
-              <NativeButton title={translate("providers.wizard.qoderRefresh")} compact busy={qoderBusy} disabled={busy && !qoderBusy} onPress={() => { void loadQoderAccount(true); }} />
-              {/* Only a pasted PAT is this app's to forget: the app's own
-                  sign-in belongs to the app, and a button that cannot end it
-                  would be stating something it cannot make true. */}
-              {stringValue(qoderAccount?.signInSource) === "stored"
-                ? <NativeButton title={translate("providers.wizard.qoderSignOut")} compact busy={qoderBusy} disabled={busy && !qoderBusy} onPress={() => { void signOutQoder(); }} />
-                : null}
-            </View>
-            {stringValue(qoderAccount?.state) === "signed-in" ? <>
-              <Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.qoderAccount")}: {stringValue(qoderAccount?.nickname) || translate("common.notAvailable")} · {qoderCredentialSourceLabel(qoderAccount, translate)}</Text>
-              {workbuddyCreditsText(qoderAccount, translate) ? <Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.qoderCredits")}: {workbuddyCreditsText(qoderAccount, translate)}</Text> : null}
-            </> : <>
-              <Text style={styles.providerWizardHint}>{translate("providers.wizard.qoderSignInRequired")}</Text>
-              <View style={styles.providerWizardAuthRow}>
-                <Text style={styles.providerWizardAuthStatus}>{progressText(qoderBusy, translate) ?? ""}</Text>
-                <NativeButton title={translate("providers.wizard.qoderOpenApp")} compact busy={qoderBusy} disabled={busy && !qoderBusy} onPress={() => { void openQoderApp(); }} />
-              </View>
-              <NativeFormRow label={translate("providers.wizard.qoderPat")}><NativeSecureTextInput key={`qoder-pat:${qoderProviderId}`} label={translate("providers.wizard.qoderPat")} domain="providers_models" field="qoder_pat" target={qoderProviderId} plainText autoCommit disabled={wizardBusy} commitRequest={qoderPatCommit} onSecretState={handleQoderPatState} style={styles.providerWizardSecretInput} /></NativeFormRow>
-              <Text style={styles.providerWizardHint}>{translate("providers.wizard.qoderPatHint")}</Text>
-              <View style={styles.providerWizardAuthRow}>
-                <Text style={styles.providerWizardAuthStatus}>{progressText(qoderBusy, translate) ?? ""}</Text>
-                <NativeButton title={translate("providers.wizard.qoderSignIn")} primary compact busy={qoderBusy} disabled={busy && !qoderBusy} onPress={() => { void signInQoder(); }} />
-              </View>
-            </>}
-          </> : isWorkBuddyType ? <>
-            {/* The account is associated in the provider's own 「服务商关联」
-                section, so this step only states the desktop app's sign-in and
-                never asks for a WorkBuddy secret. */}
-            <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyKeyHint")}</Text>
-            <View style={styles.providerWizardAuthRow}>
-              <Text style={styles.providerWizardAuthStatus}>{stringValue(workbuddyAccount?.state) === "signed-in" ? translate("providers.authStatusSignedIn") : progressText(workbuddyBusy, translate) ?? translate("providers.authStatusSignedOut")}</Text>
-              <NativeButton title={translate("providers.wizard.workbuddyRefresh")} compact busy={workbuddyBusy} disabled={busy && !workbuddyBusy} onPress={() => { void loadWorkBuddyAccount(true); }} />
-            </View>
-            {stringValue(workbuddyAccount?.state) === "signed-in" ? <>
-              <Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyAccount")}: {stringValue(workbuddyAccount?.nickname) || translate("common.notAvailable")} · {stringValue(workbuddyAccount?.domain)}</Text>
-              {workbuddyCreditsText(workbuddyAccount, translate) ? <Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyCredits")}: {workbuddyCreditsText(workbuddyAccount, translate)}</Text> : null}
-            </> : <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddySignInRequired")}</Text>}
           </> : <>
             {providerType === "api" ? <NativeFormRow label={translate("providers.wizard.keyPath")}>
               <NativeSegmentedControl labels={[translate("providers.wizard.pathManual"), translate("providers.wizard.pathLogin")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathLogin") : translate("providers.wizard.pathManual")} disabled={wizardBusy} onChange={({ nativeEvent }) => { setKeyPath(nativeEvent.index === 1 ? "login" : "manual"); setValidation(""); }} style={styles.providerWizardModeControl} />
@@ -5595,15 +5530,34 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
             {modelFetchState === "empty" ? <Text style={styles.providerWizardHint}>{translate("providers.fetchEmpty")}</Text> : null}
             {modelFetchState === "unavailable" ? <Text style={styles.providerWizardHint}>{validation || translate("providers.wizard.loginFirstHint")}</Text> : null}
           </PersistentScrollView></View>
-        </View> : isWorkBuddyType ? <View style={styles.providerWizardFormSection}>
-          <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.providerName")}: {selectedProviderName}</Text></View>
-          <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyAssociationHint")}</Text>
-        </View> : isQoderType ? <View style={styles.providerWizardFormSection}>
-          <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.providerName")}: {selectedProviderName}</Text></View>
-          <Text style={styles.providerWizardHint}>{translate("providers.wizard.qoderModelsHint")}</Text>
-        </View> : isOurFreeModelType ? <View style={styles.providerWizardModelPane}>
+        </View> : isServiceCatalogType ? <View style={styles.providerWizardModelPane}>
           <View style={styles.providerWizardModelFormSection}>
             <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.providerName")}: {selectedProviderName}</Text></View>
+            {/* Qoder and WorkBuddy sign in through their own desktop apps, so
+                the account is stated here rather than walked through as a step
+                of its own: the account *is* that app's session, and the only
+                thing this window can do about a signed-out one is hand the user
+                to the app and read again afterwards. */}
+            {isQoderType ? <>
+              <View style={styles.providerWizardAuthRow}>
+                <Text style={styles.providerWizardAuthStatus}>{stringValue(qoderAccount?.state) === "signed-in" ? translate("providers.authStatusSignedIn") : progressText(qoderBusy, translate) ?? translate("providers.authStatusSignedOut")}</Text>
+                <NativeButton title={translate("providers.wizard.qoderOpenApp")} compact busy={qoderBusy} disabled={busy && !qoderBusy} onPress={() => { void openServiceDesktopApp(); }} />
+              </View>
+              {stringValue(qoderAccount?.state) === "signed-in" ? <>
+                <Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.qoderAccount")}: {stringValue(qoderAccount?.nickname) || translate("common.notAvailable")} · {qoderCredentialSourceLabel(qoderAccount, translate)}</Text>
+                {workbuddyCreditsText(qoderAccount, translate) ? <Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.qoderCredits")}: {workbuddyCreditsText(qoderAccount, translate)}</Text> : null}
+              </> : <Text style={styles.providerWizardHint}>{translate("providers.wizard.qoderSignInRequired")}</Text>}
+            </> : isWorkBuddyType ? <>
+              <View style={styles.providerWizardAuthRow}>
+                <Text style={styles.providerWizardAuthStatus}>{stringValue(workbuddyAccount?.state) === "signed-in" ? translate("providers.authStatusSignedIn") : progressText(workbuddyBusy, translate) ?? translate("providers.authStatusSignedOut")}</Text>
+                <NativeButton title={translate("providers.wizard.workbuddyOpenApp")} compact busy={workbuddyBusy} disabled={busy && !workbuddyBusy} onPress={() => { void openServiceDesktopApp(); }} />
+              </View>
+              {stringValue(workbuddyAccount?.state) === "signed-in" ? <>
+                <Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyAccount")}: {stringValue(workbuddyAccount?.nickname) || translate("common.notAvailable")} · {stringValue(workbuddyAccount?.domain)}</Text>
+                {workbuddyCreditsText(workbuddyAccount, translate) ? <Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyCredits")}: {workbuddyCreditsText(workbuddyAccount, translate)}</Text> : null}
+              </> : <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddySignInRequired")}</Text>}
+            </> : null}
+            <Text style={styles.providerWizardHint}>{translate(isOurFreeModelType ? "providers.wizard.ourFreeModelHint" : isQoderType ? "providers.wizard.qoderModelsHint" : "providers.wizard.workbuddyAssociationHint")}</Text>
             {/* The toolbar is the roster's controls and nothing else: 全选, 反选,
                 and 重新获取模型.  How many models came back and how many are
                 picked are both visible from the list below, so a sentence
@@ -5616,56 +5570,60 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                   <NativeButton title={translate(selectedModels.length === modelCandidates.length ? "dataManagement.deselectAll" : "dataManagement.selectAll")} compact link disabled={wizardBusy} onPress={() => { setSelectedModels(selectedModels.length === modelCandidates.length ? [] : [...modelCandidates]); setValidation(""); }} />
                   <NativeButton title={translate("modelChooser.invert")} compact link disabled={wizardBusy} onPress={() => { setSelectedModels((current) => modelCandidates.filter((name) => !current.includes(name))); setValidation(""); }} />
                 </> : null}
-                <NativeButton title={translate("providers.wizard.refreshModels")} compact link disabled={wizardBusy} onPress={() => { void fetchOurFreeModelModels(ourFreeModelProviderID); }} />
+                <NativeButton title={translate("providers.wizard.refreshModels")} compact link disabled={wizardBusy} onPress={() => { void fetchServiceCatalogModels(); }} />
               </>}
             </View>
             {modelCandidates.length > 0 ? <View style={styles.providerWizardModelGroup}>
-              {/* One block per producer, because the roster is not one list:
-                  these models are served from different upstreams, and a flat
-                  list read as one source.  The producer is the upstream
-                  catalog's own `channel` tag — an id does not identify it, and
-                  a rule of this pane's would file rows under a source they do
-                  not come from.
-
-                  Inside a producer the availability split still applies: what
-                  this egress can use, and what its regional gate refuses.  Both
-                  splits are the upstream's; neither is inferred here. */}
               <View style={styles.providerWizardModelListFrame}><PersistentScrollView style={styles.providerWizardModelListScroll} contentContainerStyle={styles.providerWizardModelList} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">
-                {laneChannelOrder(Array.from(new Set(Object.values(laneChannels)))).map((channel) => {
-                  const names = modelCandidates.filter((name) => (laneChannels[name] ?? LANE_CHANNEL_FREE) === channel);
-                  if (names.length === 0) return null;
-                  const routes = laneRouteOrder(Object.keys(laneRoutes));
-                  // The producer heading already names this group, so an
-                  // availability heading that repeats it inside is not a
-                  // second fact: a producer serving everything this egress can
-                  // reach needs no inner heading at all.  Only a producer that
-                  // also carries region-refused rows splits, and then the inner
-                  // heading says which half the rows belong to.
-                  const splitRoutes = routes.filter((route) => route === LANE_ROUTE_REGION || (laneRoutes[route] ?? []).some((name) => names.includes(name)))
-                    .filter((route) => route === LANE_ROUTE_REGION || (laneRoutes[route] ?? []).filter((name) => names.includes(name)).length > 0);
-                  const showRouteHeadings = splitRoutes.length > 1
-                    || splitRoutes.some((route) => route === LANE_ROUTE_REGION);
-                  return <View key={`lane-channel:${channel}`} style={styles.providerWizardModelSourceGroup}>
-                    <Text numberOfLines={1} style={styles.providerWizardModelSourceHeading}>{laneChannelLabel(channel, translate)} ({names.length})</Text>
-                    {showRouteHeadings ? routes.map((route) => {
-                      const routeNames = (laneRoutes[route] ?? []).filter((name) => names.includes(name));
-                      if (routeNames.length === 0) return null;
-                      return <View key={`lane-channel:${channel}:route:${route}`} style={styles.providerWizardModelSourceGroup}>
-                        <Text numberOfLines={1} style={styles.providerWizardHint}>{translate(route === LANE_ROUTE_REGION ? "providers.laneRoute.region" : "providers.laneRoute.main")} ({routeNames.length})</Text>
-                        {routeNames.map((name) => <NativeCheckbox key={`lane:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
-                      </View>;
-                    }) : names.map((name) => <NativeCheckbox key={`lane:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
-                    {/* A producer whose rows the availability split did not
-                        mention is still a producer: its rows are listed under
-                        it rather than dropped from the picker. */}
-                    {names.filter((name) => !routes.some((route) => (laneRoutes[route] ?? []).includes(name))).map((name) => <NativeCheckbox key={`lane:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
-                  </View>;
-                })}
-                {/* A roster the upstream stated no producer for is still a
-                    roster: it is listed whole rather than hidden. */}
-                {modelCandidates.every((name) => !(name in laneChannels)) ? modelCandidates.map((name) => <NativeCheckbox key={`lane:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />) : null}
+                {isOurFreeModelType ? <>
+                  {/* One block per producer, because the roster is not one list:
+                      these models are served from different upstreams, and a flat
+                      list read as one source.  The producer is the upstream
+                      catalog's own `channel` tag — an id does not identify it, and
+                      a rule of this pane's would file rows under a source they do
+                      not come from.
+
+                      Inside a producer the availability split still applies: what
+                      this egress can use, and what its regional gate refuses.  Both
+                      splits are the upstream's; neither is inferred here. */}
+                  {laneChannelOrder(Array.from(new Set(Object.values(laneChannels)))).map((channel) => {
+                    const names = modelCandidates.filter((name) => (laneChannels[name] ?? LANE_CHANNEL_FREE) === channel);
+                    if (names.length === 0) return null;
+                    const routes = laneRouteOrder(Object.keys(laneRoutes));
+                    // The producer heading already names this group, so an
+                    // availability heading that repeats it inside is not a
+                    // second fact: a producer serving everything this egress can
+                    // reach needs no inner heading at all.  Only a producer that
+                    // also carries region-refused rows splits, and then the inner
+                    // heading says which half the rows belong to.
+                    const splitRoutes = routes.filter((route) => route === LANE_ROUTE_REGION || (laneRoutes[route] ?? []).some((name) => names.includes(name)))
+                      .filter((route) => route === LANE_ROUTE_REGION || (laneRoutes[route] ?? []).filter((name) => names.includes(name)).length > 0);
+                    const showRouteHeadings = splitRoutes.length > 1
+                      || splitRoutes.some((route) => route === LANE_ROUTE_REGION);
+                    return <View key={`lane-channel:${channel}`} style={styles.providerWizardModelSourceGroup}>
+                      <Text numberOfLines={1} style={styles.providerWizardModelSourceHeading}>{laneChannelLabel(channel, translate)} ({names.length})</Text>
+                      {showRouteHeadings ? routes.map((route) => {
+                        const routeNames = (laneRoutes[route] ?? []).filter((name) => names.includes(name));
+                        if (routeNames.length === 0) return null;
+                        return <View key={`lane-channel:${channel}:route:${route}`} style={styles.providerWizardModelSourceGroup}>
+                          <Text numberOfLines={1} style={styles.providerWizardHint}>{translate(route === LANE_ROUTE_REGION ? "providers.laneRoute.region" : "providers.laneRoute.main")} ({routeNames.length})</Text>
+                          {routeNames.map((name) => <NativeCheckbox key={`lane:${name}`} label={fetchedModelLabels[name] ?? name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
+                        </View>;
+                      }) : names.map((name) => <NativeCheckbox key={`lane:${name}`} label={fetchedModelLabels[name] ?? name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
+                      {/* A producer whose rows the availability split did not
+                          mention is still a producer: its rows are listed under
+                          it rather than dropped from the picker. */}
+                      {names.filter((name) => !routes.some((route) => (laneRoutes[route] ?? []).includes(name))).map((name) => <NativeCheckbox key={`lane:${name}`} label={fetchedModelLabels[name] ?? name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
+                    </View>;
+                  })}
+                  {/* A roster the upstream stated no producer for is still a
+                      roster: it is listed whole rather than hidden. */}
+                  {modelCandidates.every((name) => !(name in laneChannels)) ? modelCandidates.map((name) => <NativeCheckbox key={`lane:${name}`} label={fetchedModelLabels[name] ?? name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />) : null}
+                </> : modelCandidates.map((name) => <NativeCheckbox key={`catalog:${name}`} label={fetchedModelLabels[name] ?? name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
+                {modelFetchState === "empty" ? <Text style={styles.providerWizardHint}>{translate("providers.fetchEmpty")}</Text> : null}
+                {modelFetchState === "unavailable" && serviceCatalogAccountSignedIn ? <Text style={styles.providerWizardHint}>{modelFetchDetail || translate("providers.fetchEmpty")}</Text> : null}
               </PersistentScrollView></View>
-            </View> : null}
+            </View> : modelFetchState === "empty" ? <Text style={styles.providerWizardHint}>{translate("providers.fetchEmpty")}</Text> : modelFetchState === "unavailable" && serviceCatalogAccountSignedIn ? <Text style={styles.providerWizardHint}>{modelFetchDetail || translate("providers.fetchEmpty")}</Text> : null}
           </View>
         </View> : <View style={styles.providerWizardModelPane}>
           <View style={styles.providerWizardModelFormSection}>
@@ -8981,10 +8939,10 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     // state instead of calling the worker (a cold start here once froze every
     // window). The mount read below fills it in moments after the pane opens.
     || stringValue(asRecord(provider.auth_observed).state) === "signed-in";
-  // A Qoder account is read through the same Core-owned worker that owns the
-  // PAT.  Unlike WorkBuddy, this block never starts a sign-in: the PAT is typed
-  // into the wizard's native secret field, because this pane is not allowed to
-  // put a credential into an action payload either.
+  // A Qoder account is read through the same Core-owned worker WorkBuddy uses.
+  // This block never starts a sign-in: the account is the desktop app's own
+  // session, so all it can do is re-read what that app holds and hand the user
+  // to it when it is signed out.
   const [qoderStatusBusy, setQoderStatusBusy] = useState(false);
   const [qoderAccount, setQoderAccount] = useState<UnknownRecord | undefined>(undefined);
   const loadQoderAccount = async (refresh: boolean): Promise<UnknownRecord | undefined> => {
@@ -9329,7 +9287,6 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
           <Text style={styles.providerAuthStatusLabel}>{translate("providers.wizard.qoderCredits")}</Text>
           <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{workbuddyCreditsText(qoderFacts, translate) || progressText(qoderStatusBusy, translate) || translate("providers.workbuddyCreditUnavailable")}</Text>
         </View> : null}
-        <Text style={styles.keysHint}>{translate("providers.qoderAccountHint")}</Text>
       </> : null}
       {providerService(provider) && !isWorkBuddyAccount && !isQoderAccount ? <Text style={styles.keysHint}>{translate("providers.serviceKeyHint")}</Text> : null}
     </View> : null}
@@ -9777,27 +9734,27 @@ function ClientBackendFields({ accessibilityPrefix, models, native, localApiActi
     onStatus?.(translate("settings.useLocalApiOffPrompt"));
     openSavedModelMenu(designateButtonRef.current);
   };
-  return <View style={styles.externalSettingsFieldList}>
-    <View style={styles.externalSettingsField}>
-      <View style={styles.externalSettingsInputRow}>
-        <TooltipText numberOfLines={1} tooltip={translate("settings.useLocalApi")} style={styles.externalSettingsFieldLabel} accessibilityLabel={labelled("settings.useLocalApi")}>{translate("settings.useLocalApi")}</TooltipText>
-        <View style={styles.externalSettingsValueSlot}>
+  return <View style={SETTINGS_FIELD_LIST}>
+    <View style={SETTINGS_FIELD}>
+      <View style={SETTINGS_FIELD_ROW_INDENTED}>
+        <TooltipText numberOfLines={1} tooltip={translate("settings.useLocalApi")} style={SETTINGS_FIELD_LABEL} accessibilityLabel={labelled("settings.useLocalApi")}>{translate("settings.useLocalApi")}</TooltipText>
+        <View style={SETTINGS_FIELD_VALUE_SLOT}>
           <NativeToggle
             key={`use-local-api-${switchGeneration}`}
             accessibilityLabel={labelled("settings.useLocalApi")}
             value={localApiActive}
             disabled={(busy && !(clientActionBusy || designateBusy)) || clientActionBusy || designateBusy}
             onValueChange={toggleLocalApi}
-            style={styles.externalSettingsBooleanControl}
+            style={SETTINGS_FIELD_SWITCH_SLOT}
           />
         </View>
       </View>
-      <View style={styles.externalSettingsHelpSlot}><Text style={styles.externalSettingsHelpText}>{translate("settings.useLocalApiHint")}</Text></View>
+      <View style={SETTINGS_FIELD_HELP_SLOT}><Text style={SETTINGS_FIELD_HELP_TEXT}>{translate("settings.useLocalApiHint")}</Text></View>
     </View>
-    <View style={styles.externalSettingsField}>
-      <View style={styles.externalSettingsInputRow}>
-        <TooltipText numberOfLines={1} tooltip={translate("settings.designateAs")} style={styles.externalSettingsFieldLabel} accessibilityLabel={labelled("settings.designateAs")}>{translate("settings.designateAs")}</TooltipText>
-        <View style={styles.externalSettingsValueSlot}>
+    <View style={SETTINGS_FIELD}>
+      <View style={SETTINGS_FIELD_ROW_INDENTED}>
+        <TooltipText numberOfLines={1} tooltip={translate("settings.designateAs")} style={SETTINGS_FIELD_LABEL} accessibilityLabel={labelled("settings.designateAs")}>{translate("settings.designateAs")}</TooltipText>
+        <View style={SETTINGS_FIELD_VALUE_SLOT}>
           <NativeButton
             ref={designateButtonRef}
             title={designatedRoute}
@@ -9857,20 +9814,20 @@ function ProxyScopedToggleField({ label, accessibilityLabel, value, proxyOnly, b
   hint?: string;
   translate: Translate;
 }): React.JSX.Element {
-  return <View style={styles.externalSettingsField}>
-    <View style={styles.externalSettingsInputRow}>
-      <TooltipText numberOfLines={1} tooltip={label} style={proxyOnly ? styles.externalSettingsFieldLabel : styles.externalSettingsFieldLabelUnavailable} accessibilityLabel={accessibilityLabel}>{label}</TooltipText>
-      <View style={styles.externalSettingsValueSlot}>
+  return <View style={SETTINGS_FIELD}>
+    <View style={SETTINGS_FIELD_ROW_INDENTED}>
+      <TooltipText numberOfLines={1} tooltip={label} style={proxyOnly ? SETTINGS_FIELD_LABEL : SETTINGS_FIELD_LABEL_UNAVAILABLE} accessibilityLabel={accessibilityLabel}>{label}</TooltipText>
+      <View style={SETTINGS_FIELD_VALUE_SLOT}>
         <NativeToggle
           accessibilityLabel={accessibilityLabel}
           value={value}
           disabled={busy || !proxyOnly}
           onValueChange={onValueChange}
-          style={styles.externalSettingsBooleanControl}
+          style={SETTINGS_FIELD_SWITCH_SLOT}
         />
       </View>
     </View>
-    <View style={styles.externalSettingsHelpSlot}>{proxyOnly ? (hint ? <Text style={styles.externalSettingsHelpText}>{hint}</Text> : null) : <Text style={styles.externalSettingsHelpText}>{translate("settings.useLocalApiRequired")}</Text>}</View>
+    <View style={SETTINGS_FIELD_HELP_SLOT}>{proxyOnly ? (hint ? <Text style={SETTINGS_FIELD_HELP_TEXT}>{hint}</Text> : null) : <Text style={SETTINGS_FIELD_HELP_TEXT}>{translate("settings.useLocalApiRequired")}</Text>}</View>
   </View>;
 }
 
@@ -10057,7 +10014,7 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
   const codexFeatureRows = featureKeys
     .filter((feature) => !codexHandedOverSurfaces.has(feature))
     .sort();
-  return <View style={styles.externalSettingsWorkspace}>
+  return <View style={SETTINGS_RAIL_BODY}>
     <SettingsRail
       rows={railRows}
       selectedKey={selectedClient}
@@ -10068,7 +10025,7 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
         title={translate(selectedGroup.titleKey)}
         hint={translate(selectedGroup.hintKey)}
       />
-      <PersistentScrollView style={styles.externalSettingsPane} contentContainerStyle={styles.externalSettingsPaneContent} horizontal={false} showsVerticalScrollIndicator>
+      <PersistentScrollView style={styles.externalSettingsPane} contentContainerStyle={SETTINGS_PANE_BODY} horizontal={false} showsVerticalScrollIndicator>
         {/* A client's controls are fields of the same grid the runtime pane's
             settings use — one left-aligned label column, one control column,
             and the tip wrapped underneath that column — so both detail panes
@@ -10103,27 +10060,29 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
             translate={translate}
           />
           {codexFeatureRows.map((feature) => {
-            const surface = codexSurfaceName(feature);
+            const surface = codexSurfaceName(feature, translate);
             // Each row names its own surface.  Every row used to print the one
             // static "Desktop surface" caption, so a set of them read as a
             // column of identical switches — indistinguishable by sight, and
-            // one repeated name to a screen reader.
-            const label = surface ? surface : translate("codex.surfaceFeature");
+            // one repeated name to a screen reader.  A surface this app has no
+            // words for is named by its key: that is data, not a half-translated
+            // sentence, and the help line below already spells that switch.
+            const label = surface ?? feature;
             const fullLabel = surface ? `${label} — ${translate("codex.surfaceFeature")}` : label;
-            return <View key={feature} style={styles.externalSettingsField}>
-              <View style={styles.externalSettingsInputRow}>
-                <TooltipText numberOfLines={1} tooltip={fullLabel} style={styles.externalSettingsFieldLabel} accessibilityLabel={fullLabel}>{label}</TooltipText>
-                <View style={styles.externalSettingsValueSlot}>
+            return <View key={feature} style={SETTINGS_FIELD}>
+              <View style={SETTINGS_FIELD_ROW_INDENTED}>
+                <TooltipText numberOfLines={1} tooltip={fullLabel} style={SETTINGS_FIELD_LABEL} accessibilityLabel={fullLabel}>{label}</TooltipText>
+                <View style={SETTINGS_FIELD_VALUE_SLOT}>
                   <NativeToggle
                     accessibilityLabel={fullLabel}
                     value={codexFeatures?.[feature] === true}
                     disabled={busy}
                     onValueChange={(enabled) => void onToggleCodexFeature(feature, enabled)}
-                    style={styles.externalSettingsBooleanControl}
+                    style={SETTINGS_FIELD_SWITCH_SLOT}
                   />
                 </View>
               </View>
-              <View style={styles.externalSettingsHelpSlot}><Text style={styles.externalSettingsHelpText}>{translate("codex.surfaceFeatureHint", { key: feature })}</Text></View>
+              <View style={SETTINGS_FIELD_HELP_SLOT}><Text style={SETTINGS_FIELD_HELP_TEXT}>{translate("codex.surfaceFeatureHint", { key: feature })}</Text></View>
             </View>;
           })}
         </> : null}
@@ -10216,6 +10175,7 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
   };
   const [autoStartBusy, setAutoStartBusy] = useState(false);
   const [serviceBusy, setServiceBusy] = useState(false);
+  const [languageBusy, setLanguageBusy] = useState(false);
   const [requestedAutoStart, setRequestedAutoStart] = useState<boolean>();
   const [requestedBackground, setRequestedBackground] = useState<boolean>();
   const [backgroundBusy, setBackgroundBusy] = useState(false);
@@ -10234,6 +10194,18 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
     if (requestedBackground !== undefined && requestedBackground === backgroundEnabled) setRequestedBackground(undefined);
   }, [backgroundEnabled, requestedBackground]);
   const serviceState = snapshot?.service.state ?? "unknown";
+  // The window's language is one decision with one surface: this row.  The menu
+  // bar and the tray used to carry a second copy of the same three choices --
+  // two places to change one setting, and two places to disagree about it.
+  //
+  // `system` keeps its stored spelling (a preference written by an older build
+  // says exactly that) and reads as 自动 / Auto: on a native host it follows the
+  // system language, and on the browser page it follows the browser's own
+  // (`navigator.languages`).  A language name states itself in its own language,
+  // which is why English and 简体中文 are the same two strings in both tables.
+  const languageChoice: LanguagePreference = snapshot?.language ?? "system";
+  const languageLabels = [translate("language.auto"), translate("language.english"), translate("language.simplified_chinese")];
+  const languageIndex = Math.max(0, LANGUAGE_PREFERENCES.indexOf(languageChoice));
   const runtimeSettings = asRecords(domainState(snapshot, "runtime").settings);
   const portItem = runtimeSettings.find((item) => identifier(item) === "LITELLM_PORT");
   const portValue = stringValue(portItem?.value, "");
@@ -10357,6 +10329,31 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
   // all, and the only way out was the status menu's Stop.
   const serviceRestart = serviceState === "unhealthy" || serviceState === "starting";
   const serviceActionAvailable = serviceState === "stopped" || serviceRestart;
+  const setLanguagePreference = async (next: LanguagePreference): Promise<void> => {
+    if (!snapshot || languageBusy || next === languageChoice) return;
+    setLanguageBusy(true);
+    onStatus(undefined);
+    try {
+      // One write, applied at once: a preference that renames every label in
+      // the window has no draft worth holding.  A staged language change would
+      // draw the pane in one language while its own draft said another, and the
+      // debounced Apply would then relabel the window under a result message it
+      // had already composed.  The revision is read at the click: this pane's
+      // projection can be a poll behind, and the write is against the document
+      // as it stands.
+      const current = await ipc.snapshot();
+      const staged = await ipc.dispatch({ domain: "language", type: "set_language", payload: { language: next } }, current.revision);
+      await ipc.apply("language", staged.revision);
+      // No "saved" line: the picker and every label around it are the report.
+      // The strip is left for failures, which is the one thing here the window
+      // cannot show by itself.
+      onSnapshot(await ipc.snapshot());
+    } catch (reason: unknown) {
+      onStatus(errorMessage(reason, translate));
+    } finally {
+      setLanguageBusy(false);
+    }
+  };
   const runServiceAction = async (): Promise<void> => {
     if (!snapshot || serviceBusy) return;
     setServiceBusy(true);
@@ -10445,91 +10442,100 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
       setBackgroundBusy(false);
     }
   };
-  return <PersistentScrollView style={styles.generalScroll} contentContainerStyle={styles.generalContent}>
-    <View style={styles.generalSection}>
-      <Text style={styles.generalSectionTitle}>{translate("general.startup")}</Text>
-      <View style={styles.generalFieldList}>
-        <View style={styles.generalField}>
-          <View style={styles.generalRow}>
-            <Text style={styles.generalRowLabel}>{translate("general.autoStart")}</Text>
-            <View style={styles.generalValueSlot}>
-              <NativeToggle value={autoStartValue} disabled={autoStartBusy || busy || snapshot === undefined || !native.setLaunchAtLogin} accessibilityLabel={translate("general.autoStart")} onValueChange={(next) => { void setAutoStart(next); }} style={styles.generalToggle} />
+  return <PersistentScrollView style={styles.generalScroll} contentContainerStyle={SETTINGS_SECTION_LIST}>
+    <View style={SETTINGS_SECTION}>
+      <Text style={SETTINGS_SECTION_TITLE}>{translate("general.interface")}</Text>
+      <View style={SETTINGS_FIELD_LIST}>
+        <View style={SETTINGS_FIELD}>
+          <View style={SETTINGS_FIELD_ROW_INDENTED}>
+            <Text style={SETTINGS_FIELD_LABEL}>{translate("general.language")}</Text>
+            <View style={SETTINGS_FIELD_CELL}>
+              <NativePicker labels={languageLabels} selectedValue={languageLabels[languageIndex]} disabled={languageBusy || busy || snapshot === undefined} accessibilityLabel={translate("general.language")} onChange={({ nativeEvent }) => { const next = LANGUAGE_PREFERENCES[nativeEvent.index]; if (next) void setLanguagePreference(next); }} style={SETTINGS_FIELD_VALUE_SLOT} />
+            </View>
+          </View>
+        </View>
+      </View>
+    </View>
+    <View style={SETTINGS_SECTION}>
+      <Text style={SETTINGS_SECTION_TITLE}>{translate("general.startup")}</Text>
+      <View style={SETTINGS_FIELD_LIST}>
+        <View style={SETTINGS_FIELD}>
+          <View style={SETTINGS_FIELD_ROW_INDENTED}>
+            <Text style={SETTINGS_FIELD_LABEL}>{translate("general.autoStart")}</Text>
+            <View style={SETTINGS_FIELD_CELL}>
+              <NativeToggle value={autoStartValue} disabled={autoStartBusy || busy || snapshot === undefined || !native.setLaunchAtLogin} accessibilityLabel={translate("general.autoStart")} onValueChange={(next) => { void setAutoStart(next); }} style={SETTINGS_FIELD_SWITCH_SLOT} />
             </View>
           </View>
           {/* A page has no login item to register. Saying so is the difference
               between a limitation and a switch that looks on and does nothing. */}
-          {native.setLaunchAtLogin ? null : <View style={styles.generalHelpSlot}><Text style={styles.generalHelpText}>{translate("general.autoStartUnavailable")}</Text></View>}
+          {native.setLaunchAtLogin ? null : <View style={SETTINGS_FIELD_HELP_SLOT}><Text style={SETTINGS_FIELD_HELP_TEXT}>{translate("general.autoStartUnavailable")}</Text></View>}
         </View>
-        {/* The help belongs to the field above it, so the two travel as one
-            block: a row and its tip are 2 apart, and one field is 10 from the
-            next, exactly like every other settings pane. */}
-        <View style={styles.generalField}>
-          <View style={styles.generalRow}>
-            <Text style={styles.generalRowLabel}>{translate("general.runInBackground")}</Text>
-            <View style={styles.generalValueSlot}>
-              <NativeToggle value={backgroundValue} disabled={backgroundBusy || busy || snapshot === undefined} accessibilityLabel={translate("general.runInBackground")} onValueChange={(next) => { void setRunInBackground(next); }} style={styles.generalToggle} />
+        <View style={SETTINGS_FIELD}>
+          <View style={SETTINGS_FIELD_ROW_INDENTED}>
+            <Text style={SETTINGS_FIELD_LABEL}>{translate("general.runInBackground")}</Text>
+            <View style={SETTINGS_FIELD_CELL}>
+              <NativeToggle value={backgroundValue} disabled={backgroundBusy || busy || snapshot === undefined} accessibilityLabel={translate("general.runInBackground")} onValueChange={(next) => { void setRunInBackground(next); }} style={SETTINGS_FIELD_SWITCH_SLOT} />
             </View>
           </View>
-          <View style={styles.generalHelpSlot}><Text style={styles.generalHelpText}>{translate("general.runInBackgroundHint")}</Text></View>
         </View>
       </View>
     </View>
-    <View style={styles.generalSection}>
-      <Text style={styles.generalSectionTitle}>{translate("general.service")}</Text>
-      <View style={styles.generalFieldList}>
-        <View style={styles.generalField}>
-          <View style={styles.generalRow}>
-            <Text style={styles.generalRowLabel}>{translate("general.serviceState")}</Text>
-            <View style={styles.generalValueCellWide}><Text numberOfLines={1} style={styles.generalRowValue}>{serviceLabel}</Text></View>
+    <View style={SETTINGS_SECTION}>
+      <Text style={SETTINGS_SECTION_TITLE}>{translate("general.service")}</Text>
+      <View style={SETTINGS_FIELD_LIST}>
+        <View style={SETTINGS_FIELD}>
+          <View style={SETTINGS_FIELD_ROW_INDENTED}>
+            <Text style={SETTINGS_FIELD_LABEL}>{translate("general.serviceState")}</Text>
+            <View style={SETTINGS_FIELD_CELL_WIDE}><Text numberOfLines={1} style={SETTINGS_FIELD_VALUE_TEXT}>{serviceLabel}</Text></View>
             {/* The action keeps the grid's action column so a row's buttons line
                 up with every other row's, instead of sitting wherever its own
                 text happens to end. */}
-            <View style={styles.generalActionSlot}>{serviceActionAvailable ? <NativeButton compact primary={!serviceRestart} busy={serviceBusy} disabled={snapshot === undefined || (busy && !serviceBusy)} title={serviceRestart ? translate("service.restart") : translate("service.start")} accessibilityLabel={serviceRestart ? translate("service.restart") : translate("service.start")} onPress={() => { void runServiceAction(); }} style={styles.generalServiceAction} /> : null}</View>
+            <View style={SETTINGS_FIELD_ACTION_SLOT}>{serviceActionAvailable ? <NativeButton compact primary={!serviceRestart} busy={serviceBusy} disabled={snapshot === undefined || (busy && !serviceBusy)} title={serviceRestart ? translate("service.restart") : translate("service.start")} accessibilityLabel={serviceRestart ? translate("service.restart") : translate("service.start")} onPress={() => { void runServiceAction(); }} style={styles.generalServiceAction} /> : null}</View>
           </View>
         </View>
-        <View style={styles.generalField}>
-          <View style={styles.generalRow}>
-            <Text style={styles.generalRowLabel}>{translate("general.port")}</Text>
-            <View style={styles.generalValueSlot}>
+        <View style={SETTINGS_FIELD}>
+          <View style={SETTINGS_FIELD_ROW_INDENTED}>
+            <Text style={SETTINGS_FIELD_LABEL}>{translate("general.port")}</Text>
+            <View style={SETTINGS_FIELD_CELL}>
               <RuntimeValueField label={translate("general.port")} width="number" value={portValue} keyboardType="numeric" editable={!portStated} validate={validatePort} onCommit={(next) => dispatch("set_setting", { key: "LITELLM_PORT", value: next }, "runtime")} />
             </View>
           </View>
-          <View style={styles.generalHelpSlot}><Text style={styles.generalHelpText}>{portStated ? translate("general.portHostStated") : translate("general.portHint", { default: portDefault })}</Text></View>
+          <View style={SETTINGS_FIELD_HELP_SLOT}><Text style={SETTINGS_FIELD_HELP_TEXT}>{portStated ? translate("general.portHostStated") : translate("general.portHint", { default: portDefault })}</Text></View>
         </View>
-        <View style={styles.generalField}>
-          <View style={styles.generalRow}>
-            <Text style={styles.generalRowLabel}>{translate("general.apiKey")}</Text>
+        <View style={SETTINGS_FIELD}>
+          <View style={SETTINGS_FIELD_ROW_INDENTED}>
+            <Text style={SETTINGS_FIELD_LABEL}>{translate("general.apiKey")}</Text>
             {/* The plaintext credential field: the key is drawn so it can be
                 copied into a client, and the value arrives over the native read
                 lease rather than through a Core snapshot. */}
-            <View style={styles.generalValueCellWide}>{masterKeyField}</View>
+            <View style={SETTINGS_FIELD_CELL_WIDE}>{masterKeyField}</View>
           </View>
         </View>
       </View>
     </View>
-    <View style={styles.generalSection}>
-      <Text style={styles.generalSectionTitle}>{translate("general.webPage")}</Text>
-      <View style={styles.generalFieldList}>
-        <View style={styles.generalField}>
-          <View style={styles.generalRow}>
-            <Text style={styles.generalRowLabel}>{translate("general.webKey")}</Text>
+    <View style={SETTINGS_SECTION}>
+      <Text style={SETTINGS_SECTION_TITLE}>{translate("general.webPage")}</Text>
+      <View style={SETTINGS_FIELD_LIST}>
+        <View style={SETTINGS_FIELD}>
+          <View style={SETTINGS_FIELD_ROW_INDENTED}>
+            <Text style={SETTINGS_FIELD_LABEL}>{translate("general.webKey")}</Text>
             {/* The page's key, drawn in the clear for the same reason the proxy
                 key above is: it is a lock somebody reads and types into another
                 browser, and dots cannot be copied. */}
-            <View style={styles.generalValueCellWide}>
+            <View style={SETTINGS_FIELD_CELL_WIDE}>
               {Platform.OS === "windows"
                 ? <RuntimeValueField label={translate("general.webKey")} width="text" value={webKeyValue} onCommit={commitWebKey} />
                 : <NativeSecretInputControl label={translate("general.webKey")} busy={snapshot === undefined} domain="runtime" field="setting" target="YOUNG_ROUTER_WEB_PASSWORD" plainText autoCommit onSecretState={(state) => { if (state.status === "error" && state.error !== "") onStatus(state.error); }} />}
             </View>
           </View>
         </View>
-        <View style={styles.generalField}>
-          <View style={styles.generalRow}>
-            <Text style={styles.generalRowLabel}>{translate("general.webAddress")}</Text>
+        <View style={SETTINGS_FIELD}>
+          <View style={SETTINGS_FIELD_ROW_INDENTED}>
+            <Text style={SETTINGS_FIELD_LABEL}>{translate("general.webAddress")}</Text>
             {/* A link, not a label: clicking it from this window is the host
                 opening a page it has already proved itself to, so the browser
                 lands signed in and the key never has to be typed or copied. */}
-            <View style={styles.generalValueCellWide}>
+            <View style={SETTINGS_FIELD_CELL_WIDE}>
               <Pressable
                 accessibilityRole="link"
                 accessibilityLabel={translate("general.webPage")}
@@ -10537,11 +10543,11 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
                 onPress={() => { void openWebPage(); }}
                 style={styles.generalWebAddress}
               >
-                <Text numberOfLines={1} style={[styles.generalRowValue, styles.generalWebAddressText]}>{webPageAddress}</Text>
+                <Text numberOfLines={1} style={[SETTINGS_FIELD_VALUE_TEXT, styles.generalWebAddressText]}>{webPageAddress}</Text>
               </Pressable>
             </View>
           </View>
-          <View style={styles.generalHelpSlot}><Text style={styles.generalHelpText}>{translate("general.webPageHint")}</Text></View>
+          <View style={SETTINGS_FIELD_HELP_SLOT}><Text style={SETTINGS_FIELD_HELP_TEXT}>{translate("general.webPageHint")}</Text></View>
         </View>
       </View>
     </View>
@@ -10571,14 +10577,14 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
     setActiveCategory(name);
   };
   return <View style={styles.runtimeWorkspaceFrame}>
-    <View style={styles.runtimeWorkspaceBody}>
+    <View style={SETTINGS_RAIL_BODY}>
       <SettingsRail rows={tocRows} selectedKey={selectedCategory} onSelectionChange={selectCategory} />
       <View style={[styles.settingsRailDetail, isWindowsShell && styles.settingsRailDetailWindows]}>
         {selectedCategory === "" ? null : <SettingsDetailHeader title={runtimeCategoryLabel(selectedCategory, translate)} />}
         {/* The surface is keyed by its category, so a switch starts at the top of
             the new category instead of inheriting the previous scroll offset. */}
-        <PersistentScrollView key={selectedCategory} style={styles.runtimeScrollSurface} contentContainerStyle={styles.runtimeWorkspace}>
-          {selectedCategory === "" ? <EmptyState translate={translate} /> : <View style={styles.runtimeFieldList}>{(groups[selectedCategory] ?? []).map((item) => <RuntimeField key={identifier(item)} item={item} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} dshSyncToken={dshSyncToken} native={native} onStatus={onStatus} />)}</View>}
+        <PersistentScrollView key={selectedCategory} style={styles.runtimeScrollSurface} contentContainerStyle={SETTINGS_PANE_BODY}>
+          {selectedCategory === "" ? <EmptyState translate={translate} /> : <View style={SETTINGS_FIELD_LIST}>{(groups[selectedCategory] ?? []).map((item) => <RuntimeField key={identifier(item)} item={item} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} dshSyncToken={dshSyncToken} native={native} onStatus={onStatus} />)}</View>}
         </PersistentScrollView>
       </View>
     </View>
@@ -10806,7 +10812,7 @@ function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSec
   let control: React.ReactNode;
   let action: React.ReactNode;
   if (isBoolean) {
-    control = <NativeToggle value={booleanValue(item.value)} disabled={busy} accessibilityLabel={label} onValueChange={(next) => dispatch("set_setting", { key, value: kind === "bool_auto" ? (next ? "auto" : "off") : next })} style={styles.runtimeBooleanControl} />;
+    control = <NativeToggle value={booleanValue(item.value)} disabled={busy} accessibilityLabel={label} onValueChange={(next) => dispatch("set_setting", { key, value: kind === "bool_auto" ? (next ? "auto" : "off") : next })} style={SETTINGS_FIELD_SWITCH_SLOT} />;
   } else if (isSelect) {
     const optionValues = stringList(item.options);
     const visibleOptionValues = optionValues.filter((option) => !(DSH_VISION_ROUTER_QUICK_KEYS.some((quickKey) => quickKey === key) && option === "inherit"));
@@ -10846,7 +10852,7 @@ function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSec
   // value column so its unit and its action land on the grid.
   const textValue = !isBoolean && !isSelect && !isMultiline && item.secret !== true && !numericKind;
   if (isMultiline) {
-    return <View style={[styles.runtimeField, styles.runtimeMultilineField]}>
+    return <View style={[SETTINGS_FIELD, styles.runtimeMultilineField]}>
       <View style={styles.runtimeMultilineHeader}>
         <View style={[styles.runtimeModifiedBarInline, modified && styles.runtimeModifiedBarActive]} />
         <Text style={styles.runtimeMultilineLabel} accessibilityLabel={label}>{label}</Text>
@@ -10860,15 +10866,15 @@ function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSec
       <RuntimeFieldMeta item={item} translate={translate} multiline />
     </View>;
   }
-  return <View style={styles.runtimeField}>
-    <View style={styles.runtimeInputRow}>
+  return <View style={SETTINGS_FIELD}>
+    <View style={SETTINGS_FIELD_ROW_INDENTED}>
       <View style={[styles.runtimeModifiedBar, modified && styles.runtimeModifiedBarActive]} />
-      <TooltipText numberOfLines={1} tooltip={label} style={styles.runtimeFieldLabel} accessibilityLabel={label}>{label}</TooltipText>
-      <View style={textValue ? styles.runtimeValueCellWide : styles.runtimeValueSlot}>
+      <TooltipText numberOfLines={1} tooltip={label} style={SETTINGS_FIELD_LABEL} accessibilityLabel={label}>{label}</TooltipText>
+      <View style={textValue ? SETTINGS_FIELD_CELL_WIDE : SETTINGS_FIELD_CELL}>
         {control}
-        {!isBoolean && unit ? <Text numberOfLines={1} style={styles.runtimeUnit}>{unit}</Text> : null}
+        {!isBoolean && unit ? <Text numberOfLines={1} style={SETTINGS_FIELD_VALUE_TEXT}>{unit}</Text> : null}
       </View>
-      <View style={styles.runtimeActionSlot}>{action ?? resetAction}</View>
+      <View style={SETTINGS_FIELD_ACTION_SLOT}>{action ?? resetAction}</View>
     </View>
     {valueError ? <Text style={styles.runtimeFieldError}>{valueError}</Text> : null}
     <RuntimeFieldMeta item={item} translate={translate} />
@@ -10992,15 +10998,15 @@ function RuntimeFieldMeta({ item, translate, multiline = false }: { item: Unknow
     // shared help slot indents to the value column with `paddingLeft`, so the
     // multiline variant has to cancel that padding rather than add a margin
     // it never overrode.
-    return <View style={[styles.runtimeHelpSlot, styles.runtimeMultilineHelpSlot]}>
+    return <View style={[SETTINGS_FIELD_HELP_SLOT, styles.runtimeMultilineHelpSlot]}>
       <Text style={styles.runtimeJsonDefaultHint}>{translate("runtime.jsonDefaultHint")}</Text>
-      {help ? <Text style={styles.runtimeHelpText}>{help}</Text> : null}
+      {help ? <Text style={SETTINGS_FIELD_HELP_TEXT}>{help}</Text> : null}
     </View>;
   }
   // The full tip is always visible: it wraps under the row instead of being
   // clipped into a tooltip-only single line.
   const meta = `${translate("common.default")}: ${defaultValue}${help ? ` · ${help}` : ""}`;
-  return <View style={styles.runtimeHelpSlot}><Text style={styles.runtimeHelpText}>{meta}</Text></View>;
+  return <View style={SETTINGS_FIELD_HELP_SLOT}><Text style={SETTINGS_FIELD_HELP_TEXT}>{meta}</Text></View>;
 }
 
 type PendingTextFieldState = {
@@ -11186,22 +11192,24 @@ function WebDavSyncSection({ snapshot, onOpenSettings, status, translate }: { sn
   // clears it: only a conflict asks the reader to pick a side.
   const failureRemedy = webdavFailureRemedy(stringValue(lastResult.code));
   const host = webdavHost(stringValue(state.url));
-  return <View style={styles.webdavSection}>
-    {/* The category, whether it is on, and the way into the form that owns
-        its switch. */}
-    <View style={styles.webdavSectionHeader}>
-      <Text numberOfLines={1} style={styles.webdavSectionTitle}>{translate("webdav.sectionTitle")}</Text>
-      <Text style={styles.webdavSectionState}>{webDavStateLabel(translate, enabled)}</Text>
-      <View style={styles.webdavSectionSpacer} />
-      <ActionButton title={translate("webdav.details")} onPress={onOpenSettings} />
+  // A category in the sync list is a field of the same grid every other pane
+  // draws: one label column (the category's own name), one control column (what
+  // it is set to), one action column (the way into its form), and the facts it
+  // reports underneath that control column -- no band of its own above them, and
+  // no bold caption standing in for a row label.
+  return <View style={SETTINGS_FIELD}>
+    <View style={SETTINGS_FIELD_ROW_INDENTED}>
+      <Text numberOfLines={1} style={SETTINGS_FIELD_LABEL}>{translate("webdav.sectionTitle")}</Text>
+      <View style={SETTINGS_FIELD_CELL}><Text numberOfLines={1} style={SETTINGS_FIELD_VALUE_TEXT}>{webDavStateLabel(translate, enabled)}</Text></View>
+      <View style={SETTINGS_FIELD_ACTION_SLOT}><ActionButton title={translate("webdav.details")} onPress={onOpenSettings} /></View>
     </View>
     {/* Where it syncs and when it last did: one item each, and a failed run
         reddens its whole stamp so the line reads at a glance. */}
-    <View style={styles.webdavSectionSummary}>
-      <Text numberOfLines={1} style={styles.webdavSectionFact}>{translate("webdav.serverLabel")}{host === "" ? translate("webdav.notSet") : host}</Text>
-      {lastSyncAt === "" ? null : <Text numberOfLines={1} style={[styles.webdavSectionFact, lastFailed && styles.webdavSectionFactFailed]}>{translate("dataManagement.lastSync", { time: formatActionTimestamp(lastSyncAt) })}{lastFailed ? ` ${translate("webdav.failedSuffix")}` : ""}</Text>}
-      {lastFailed && lastSyncAt !== "" ? <Text numberOfLines={1} style={styles.webdavSectionStatus}>{translate(failureRemedy)}</Text> : null}
-      {status === undefined ? null : <Text numberOfLines={1} style={styles.webdavSectionStatus}>{status}</Text>}
+    <View style={[SETTINGS_FIELD_HELP_SLOT, styles.webdavFactsRow]}>
+      <Text numberOfLines={1} style={SETTINGS_FIELD_HELP_TEXT}>{translate("webdav.serverLabel")}{host === "" ? translate("webdav.notSet") : host}</Text>
+      {lastSyncAt === "" ? null : <Text numberOfLines={1} style={[SETTINGS_FIELD_HELP_TEXT, lastFailed ? styles.webdavFactFailed : null]}>{translate("dataManagement.lastSync", { time: formatActionTimestamp(lastSyncAt) })}{lastFailed ? ` ${translate("webdav.failedSuffix")}` : ""}</Text>}
+      {lastFailed && lastSyncAt !== "" ? <Text numberOfLines={1} style={SETTINGS_FIELD_HELP_TEXT}>{translate(failureRemedy)}</Text> : null}
+      {status === undefined ? null : <Text numberOfLines={1} style={SETTINGS_FIELD_HELP_TEXT}>{status}</Text>}
     </View>
   </View>;
 }
@@ -11680,9 +11688,8 @@ type RenderedLogRecord = {
   duration: string;
   tokens: string;
   /**
-   * The share of this turn's input the upstream served from cache, as
-   * `62% · 5.3` (rate · cached count in k).  Empty when the upstream reported
-   * no cache count at all.
+   * The share of this turn's input the upstream served from cache, as `62%`.
+   * Empty when the upstream reported no cache count at all.
    *
    * Only the *read* is stated on the row: the cache a turn wrote, which a
    * 5-minute cache bills at 1.25x, is a separate count with no column of its
@@ -11690,6 +11697,8 @@ type RenderedLogRecord = {
    * being folded into a rate it is not part of.
    */
   cacheHit: string;
+  /** The money this row was charged, formatted; empty when none was stated. */
+  cost: string;
   /** The relay's control plane (NewAPI / Sub2API), kept apart from its name. */
   family: string;
   /** Which login of the relay the row belongs to, when the station has more than one. */
@@ -11809,10 +11818,11 @@ function formatLogTokens(value: string): string {
  *
  * The count alone does not say whether a step was cheap: 12k cached tokens is
  * a nearly cold replay of a 100k prompt and a perfectly warm one of 13k.  The
- * ratio is therefore what the column states, and the count is written beside
- * it so a reader checking one specific step still sees the number the rate was
- * computed from.  A row that reported no cache at all leaves the cell empty:
- * "0%" would claim a measured miss for a turn whose upstream never answered.
+ * cell therefore states the share and nothing else — `62%` is the fact a
+ * reader compares across rows, and the counts it came from (cached read, cache
+ * write, prompt) are what the row's double-click states.  A row that reported
+ * no cache at all leaves the cell empty: "0%" would claim a measured miss for
+ * a turn whose upstream never answered.
  */
 function formatLogCacheHit(cached: string, input: string): string {
   const cachedTokens = Number(cached);
@@ -11830,10 +11840,32 @@ function formatLogCacheHit(cached: string, input: string): string {
     return "";
   }
   const share = Math.max(0, Math.min(1, cachedTokens / inputTokens));
-  // A rate carries its own unit: `100%` says what `100` cannot, and the cached
-  // token count beside it was a second number for a fact the rate already
-  // states.  The column is now as wide as its header.
+  // A rate carries its own unit: `100%` says what `100` cannot.
   return `${Math.round(share * 100)}%`;
+}
+
+/**
+ * The money one row was charged, in the unit its station bills in.
+ *
+ * A relay bills a request in fractions of a cent, so the two decimals the
+ * balance beside it is written in would print every ordinary turn as `$0.00`.
+ * The cell keeps three significant digits instead — `$0.0115`, `$0.00439` —
+ * which is what tells a cheap step from an expensive one without spending a
+ * model column's width on digits nobody compares.  A charge too small for that
+ * resolution is stated as a bound rather than rounded down to nothing, and a
+ * row whose station stated no money at all leaves the cell empty.
+ */
+function formatLogCost(value: string): string {
+  if (!value) return "";
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return "";
+  if (amount <= 0) return "$0";
+  if (amount < 0.0001) return "<$0.0001";
+  const decimals = amount >= 100 ? 0
+    : amount >= 10 ? 1
+    : Math.min(6, Math.ceil(-Math.log10(amount)) + 2);
+  const fixed = amount.toFixed(decimals);
+  return `$${fixed.includes(".") ? fixed.replace(/0+$/, "").replace(/\.$/, "") : fixed}`;
 }
 
 function routeTraceEventLabel(value: string, translate: Translate): string {
@@ -12074,9 +12106,6 @@ function menuActionLabel(value: string, translate: Translate): string {
     "service-restart": "service.restart",
     "service-reload": "service.reload",
     "service-health": "service.health",
-    "set-language-system": "language.system",
-    "set-language-en": "language.english",
-    "set-language-zh-Hans": "language.simplified_chinese",
   };
   const key = labels[normalized] ?? (normalized.startsWith("open-logs?tab=") ? "status.logs" : undefined);
   return key ? translate(key) : normalized;
@@ -12392,6 +12421,9 @@ function parseTextLogRecord(record: string, tab: LogTab, _index: number, transla
     duration: "",
     tokens,
     cacheHit: "",
+    // A plain-text line states no money: the column is only ever filled by a
+    // relay's own record, and a blank cell is what this row has to say.
+    cost: "",
     family: "",
     account: "",
     // A plain-text row states no grouping of its own; the record shape is the
@@ -12461,7 +12493,12 @@ function renderOnlineUsageRecord(record: unknown, value: UnknownRecord, translat
   const rawStatus = compactLogValue(value.status);
   const status = rawStatus ? requestStatusLabel(rawStatus, translate) : "";
   const tokens = logTokenPair(value);
-  const cacheReadTokens = compactLogValue(value.cache_tokens);
+  const cacheReadTokens = compactLogValue(value.cache_read_tokens ?? value.cache_tokens);
+  const cacheWriteTokens = compactLogValue(value.cache_write_tokens);
+  // The station states its charge in money (a Sub2API ledger) or in its own
+  // credits, which Core already divided by the site's display unit; the pane
+  // only decides how that number reads, never what it is.
+  const cost = formatLogCost(compactLogValue(value.cost));
   const detailFields: Array<[string, string]> = [
     [translate("logs.source"), source],
     [translate("logs.account"), account],
@@ -12471,12 +12508,13 @@ function renderOnlineUsageRecord(record: unknown, value: UnknownRecord, translat
     [translate("logs.tokenCount"), tokens],
     [translate("logs.promptTokens"), compactLogValue(value.prompt_tokens)],
     [translate("logs.completionTokens"), compactLogValue(value.completion_tokens)],
-    [translate("logs.cacheTokens"), cacheReadTokens],
+    [translate("logs.cacheRead"), cacheReadTokens],
+    [translate("logs.cacheWrite"), cacheWriteTokens],
     [translate("logs.channel"), compactLogValue(value.channel)],
     [translate("logs.group"), compactLogValue(value.group)],
     [translate("logs.apiKeyName"), compactLogValue(value.key_name)],
     [translate("logs.duration"), compactLogValue(value.duration)],
-    [translate("logs.cost"), compactLogValue(value.cost)],
+    [translate("logs.cost"), cost],
   ];
   const details = detailFields.flatMap(([label, field]) => (field ? [`${label}: ${field}`] : []));
   const directDetail = compactLogValue(value.detail);
@@ -12506,8 +12544,9 @@ function renderOnlineUsageRecord(record: unknown, value: UnknownRecord, translat
     duration: formatLogDuration(compactLogValue(value.duration)),
     tokens,
     // The relay states the cached count beside the prompt it was cached from,
-    // so this tab reads the same rate-and-count cell the requests tab does.
+    // so this tab reads the same rate cell the requests tab does.
     cacheHit: formatLogCacheHit(cacheReadTokens, compactLogValue(value.prompt_tokens)),
+    cost,
     detail: details.join(" | "),
     // The double-click detail is the same labelled fields, one per line, so
     // opening a row states the whole report without re-reading the record's
@@ -12663,6 +12702,7 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
     duration,
     tokens,
     cacheHit,
+    cost: "",
     family: "",
     account: "",
     group: compactLogValue(value.group),
@@ -12827,6 +12867,12 @@ const LOG_PROTOCOL_COLUMN_SIZE = 56;
 // and cost 50 pt of a narrow frame to do it.  The two tabs that show a cache
 // share declare the same width so the fact does not change size between them.
 const LOG_CACHE_COLUMN_WIDTH = 68;
+// `$0.00439` and `<$0.0001` are the widest money a row reports: eight
+// characters, 60 pt in the table's 13 pt face, so 78 is that plus the cell's
+// 8 pt padding on each side.  The header (`消耗`, or `COST` at 36 pt semibold)
+// is narrower than the charge, so the charge decides.  Four decimals rather
+// than the balance's two are what keep an ordinary turn from reading `$0.00`.
+const LOG_COST_COLUMN_WIDTH = 78;
 // `1183.4 / 12.5`: 80.3 pt in the table's 13 pt face plus the cell's 8 pt
 // padding on each side, and the estimator this pane sizes with reads the same
 // pair as 90.5, so 108 is the ceiling that holds the widest pair either way.
@@ -12857,6 +12903,7 @@ function logColumns(
   hasSource = true,
   hasGroup = false,
   hasCache = true,
+  hasCost = true,
 ): LogColumn[] {
   const time = { label: translate("logs.localTime"), width: LOG_TIME_COLUMN_WIDTH, value: (row: RenderedLogRecord) => row.time };
   const status = { label: translate("common.status"), width: 68, value: (row: RenderedLogRecord) => row.status };
@@ -12975,6 +13022,13 @@ function logColumns(
     // on two tabs should not have to learn two spellings of it. A station that
     // reports no cache leaves the column out entirely.
     ...(hasCache ? [{ label: translate("logs.cacheHit"), width: LOG_CACHE_COLUMN_WIDTH, value: (row: RenderedLogRecord) => row.cacheHit }] : []),
+    // What the request cost, after the share it came out of: the token pair is
+    // the size of the turn, the cache share is how much of it was cheap, and
+    // the money is both of those multiplied by the rate the grouping states.
+    // Reading them in that order is what lets a row answer "was this step
+    // expensive, and why" without opening it.  A station that states no money
+    // leaves the column out instead of filling it with a credit count.
+    ...(hasCost ? [{ label: translate("logs.cost"), width: LOG_COST_COLUMN_WIDTH, value: (row: RenderedLogRecord) => row.cost }] : []),
     // The same header as the requests tab's duration column, so the same 66:
     // `耗时(s)` needs 48.5 pt and the widest cell `34113.8` needs 63, and 62
     // ellipsized the header of a column that is only four characters wide.
@@ -13462,10 +13516,14 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
         // The relay's grouping is a per-row fact (it prices the request), so it
         // is drawn whenever the rows carry one.
         rows.some((row) => Boolean(row.group)),
-        // 缓存命中 is drawn only when this page has a cache count to state. A
+        // 缓存命中 is drawn only when this page has a cache share to state. A
         // log tail written before the runtime recorded one would otherwise
-        // spend 96 pt of the frame on empty cells.
+        // spend 68 pt of the frame on empty cells.
         rows.some((row) => Boolean(row.cacheHit)),
+        // The money follows the same rule: a station that states its charge
+        // gets the column, and one whose credits cannot be priced does not get
+        // a strip of empty cells.
+        rows.some((row) => Boolean(row.cost)),
       )),
       tableWidth,
     ),
@@ -14873,12 +14931,65 @@ const SETTINGS_FIELD_HELP_TEXT: TextStyle = { color: systemColors.secondaryLabel
  * action button on the same grid: an inset switch reads as a broken column.
  */
 const SETTINGS_FIELD_SWITCH_SLOT: ViewStyle = { width: 44, minWidth: 44, height: 24, alignSelf: "flex-start" };
+/** A settings pane that puts a rail beside its detail: the rail, a gutter, the detail. */
+const SETTINGS_RAIL_BODY: ViewStyle = { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 };
+/** A labelled row whose value is not available: the same label in secondary ink. */
+const SETTINGS_FIELD_LABEL_UNAVAILABLE: TextStyle = { ...SETTINGS_FIELD_LABEL, color: systemColors.secondaryLabel };
+/** A value wider than the value column -- text by nature, so it takes the wide column. */
+const SETTINGS_FIELD_CELL_WIDE: ViewStyle = { flex: 1, minWidth: 0, maxWidth: SETTINGS_FIELD_TEXT_WIDTH, height: 26, flexDirection: "row", alignItems: "center", gap: SETTINGS_FIELD_GAP };
+/** A value the pane only states, in secondary ink: a unit, a service's state, a unit label. */
+const SETTINGS_FIELD_VALUE_TEXT: TextStyle = { minWidth: 0, flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE };
+/**
+ * One settings pane's scrolled body: the pane's own inset on every side, and the
+ * gap between the blocks it stacks.  A pane never adds an inset of its own on
+ * top -- `SETTINGS_PANE_ROUTE` already removed the window chrome's padding.
+ */
+const SETTINGS_PANE_CONTENT: ViewStyle = { width: "100%", padding: SETTINGS_PANE_INSET, gap: 14 };
+/**
+ * One settings pane's body when a heading sits directly above it: the heading
+ * owns the lead (``SETTINGS_HEADER_GAP``), so the body contributes none.  The
+ * two used to be added together -- a 50 pt band's own air *plus* a full pane
+ * inset of top padding -- which is why a category's title sat three times as far
+ * from its first row as a section caption sat from its.
+ */
+const SETTINGS_PANE_BODY: ViewStyle = { ...SETTINGS_PANE_CONTENT, paddingTop: 0 };
+/**
+ * The one distance from a heading's ink to the first row it names.  A section
+ * caption and a detail header are the same block in two panes, so they state the
+ * same gap -- and the body under a header states it as its own zero, not again.
+ */
+const SETTINGS_HEADER_GAP = 8;
+/**
+ * The air above a heading's ink, inside its own band.  A detail header opens a
+ * pane, so it keeps a band's worth of lead over its title; a section caption
+ * sits inside a body that already started, and takes none.
+ */
+const SETTINGS_HEADER_LEAD = 16;
+/** A captioned section: its caption, that gap, then its fields. */
+const SETTINGS_SECTION: ViewStyle = { minWidth: 0, alignSelf: "stretch", gap: SETTINGS_HEADER_GAP };
+/**
+ * The space between one captioned block and the next: the pane's own inset,
+ * because a caption belongs to the fields *below* it and equal gaps would leave
+ * every heading floating between two groups.
+ */
+const SETTINGS_SECTION_GAP = SETTINGS_PANE_INSET;
+/** A pane body whose blocks are captioned sections, rather than bare fields. */
+const SETTINGS_SECTION_LIST: ViewStyle = { ...SETTINGS_PANE_CONTENT, gap: SETTINGS_SECTION_GAP };
+/**
+ * The caption itself: flush with the pane inset, exactly like a detail header's
+ * title, so every pane's headings and labels line up with every other pane's.
+ */
+const SETTINGS_SECTION_TITLE: TextStyle = { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" };
+/** The action column: a row's buttons land on one x, whatever its value is. */
+const SETTINGS_FIELD_ACTION_SLOT: ViewStyle = { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" };
+/** A settings route owns its own inset: the wrapper contributes none. */
+const SETTINGS_PANE_ROUTE: ViewStyle = { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 };
 
 // Data-management is a utility window, but its active pane still needs a
 // readable rhythm. Keep these adjustments together so the three panes share
 // the same inset, helper-copy treatment, and native-preference spacing.
 const dataManagementPolishStyles = StyleSheet.create({
-  paneScrollContent: { flexGrow: 1, paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: SETTINGS_PANE_INSET, gap: 14 },
+  paneScrollContent: { flexGrow: 1, paddingTop: 0, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: SETTINGS_PANE_INSET, gap: 14 },
   paneHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 },
   importIntro: { minHeight: 0, paddingHorizontal: 12, paddingVertical: 0, gap: 10 },
 });
@@ -14953,7 +15064,7 @@ const styles = StyleSheet.create({
   routeTraceOutcomeFallback: { color: systemColors.brown },
   routeTraceOutcomeFailed: { color: systemColors.red },
   routeTraceDetailPane: { flex: 1, minWidth: 0, minHeight: 0, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground },
-  routeTraceDetailHeader: { minHeight: 54, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: systemColors.separator, backgroundColor: systemColors.window },
+  routeTraceDetailHeader: { minHeight: 54, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: SETTINGS_PANE_INSET, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: systemColors.separator, backgroundColor: systemColors.window },
   routeTraceDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 },
   routeTraceDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   routeTraceDetailMeta: { color: systemColors.label, fontSize: UI_TIP_FONT_SIZE },
@@ -15010,7 +15121,7 @@ const styles = StyleSheet.create({
   root: { flex: 1, minWidth: 420 },
   menuBarHost: { flex: 1 }, error: { margin: 20, color: systemColors.red, fontSize: UI_FONT_SIZE },
   startupLoading: { flex: 1, alignItems: "center", justifyContent: "center" }, startupLoadingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
-  windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowSurfaceShellWindows: { backgroundColor: WINDOWS_CONTROL.fill }, windowsChildModalSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, childRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, logsContent: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 0 }, runtimeContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, dataManagementContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, assistantSettingsContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
+  windowSurface: { flex: 1, position: "relative", backgroundColor: systemColors.window }, windowSurfaceShellWindows: { backgroundColor: WINDOWS_CONTROL.fill }, windowsChildModalSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, windowContent: { flexGrow: 1, paddingHorizontal: 16, paddingTop: 12, paddingBottom: 6, gap: 8 }, windowContentFixed: { flex: 1, minHeight: 0 }, fileEditorRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providersContent: { paddingBottom: 6, gap: 6 }, childRouteContent: { paddingHorizontal: 0, paddingTop: 0, paddingBottom: 0, gap: 0 }, providerWizardSurface: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window }, logsContent: { paddingHorizontal: 12, paddingTop: 12, paddingBottom: 0 }, windowTitleBlock: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 3, gap: 3 }, windowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   // Settings window: a native source-list sidebar next to the active pane.
   settingsShellFrame: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.window },
   // A page has no window to resize.  Left to fill the viewport, every pane that
@@ -15048,7 +15159,7 @@ const styles = StyleSheet.create({
   compactWebNav: { flexShrink: 0, paddingHorizontal: 12, paddingBottom: 8 },
   compactWebTabs: { width: "100%" },
   compactWebDetail: { flex: 1, minWidth: 0, minHeight: 0 },
-  settingsShellHeader: { flexShrink: 0, flexDirection: "row", minWidth: 0, backgroundColor: systemColors.separator }, settingsShellHeaderWindows: { backgroundColor: systemColors.window, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, minWidth: 0, flexShrink: 0, minHeight: 0, backgroundColor: systemColors.separator }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderIntegrated: { width: 200, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsSidebarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderRightWidth: 1, borderRightColor: WINDOWS_CONTROL.strokeSubtle }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { height: 8, flexShrink: 0 }, settingsSidebarList: { flex: 1, minWidth: 0, minHeight: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: 20, paddingTop: 10, paddingBottom: 8 }, settingsPaneHeaderIntegrated: { flex: 1, minWidth: 0, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailIntegrated: { paddingTop: 0 }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailHeader: { minHeight: 50, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 14, paddingVertical: 8, backgroundColor: systemColors.window }, settingsRailDetailHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
+  settingsShellHeader: { flexShrink: 0, flexDirection: "row", minWidth: 0, backgroundColor: systemColors.separator }, settingsShellHeaderWindows: { backgroundColor: systemColors.window, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, minWidth: 0, flexShrink: 0, minHeight: 0, backgroundColor: systemColors.separator }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderIntegrated: { width: 200, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsSidebarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderRightWidth: 1, borderRightColor: WINDOWS_CONTROL.strokeSubtle }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { height: 8, flexShrink: 0 }, settingsSidebarList: { flex: 1, minWidth: 0, minHeight: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: SETTINGS_PANE_INSET, paddingTop: 10, paddingBottom: 8 }, settingsPaneHeaderIntegrated: { flex: 1, minWidth: 0, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailIntegrated: { paddingTop: 0 }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: SETTINGS_PANE_INSET, paddingTop: SETTINGS_HEADER_LEAD, paddingBottom: SETTINGS_HEADER_GAP, backgroundColor: systemColors.window }, settingsRailDetailHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
   routeStatusBar: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, justifyContent: "space-between", paddingHorizontal: 16, paddingVertical: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusBarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderTopColor: WINDOWS_CONTROL.strokeSubtle }, routeStatusTextWindows: { color: WINDOWS_CONTROL.textSecondary }, routeStatusLead: { minWidth: 0, flex: 1, flexDirection: "row", alignItems: "center", gap: 6 },
   // The usage pager is the window's status bar on this tab: the row count stays
   // on the left where every other route states its status, and the page controls
@@ -15058,7 +15169,10 @@ const styles = StyleSheet.create({
   // row and its tip (2 apart), one list is fields 10 apart, and the pane's own
   // gap is the pane inset.  Restating any of those numbers here is what made
   // this pane's rhythm differ from every other settings surface.
-  generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 16, gap: 14 }, generalSection: { minWidth: 0, alignSelf: "stretch" }, generalSectionTitle: { paddingLeft: SETTINGS_FIELD_LEAD, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600", marginBottom: SETTINGS_FIELD_GAP }, generalFieldList: { ...SETTINGS_FIELD_LIST }, generalField: { ...SETTINGS_FIELD }, generalRow: { ...SETTINGS_FIELD_ROW_INDENTED }, generalRowLabel: { ...SETTINGS_FIELD_LABEL }, generalRowValue: { minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, generalValueSlot: { ...SETTINGS_FIELD_CELL }, generalValueCellWide: { flex: 1, minWidth: 0, maxWidth: SETTINGS_FIELD_TEXT_WIDTH, height: 26, flexDirection: "row", alignItems: "center", gap: SETTINGS_FIELD_GAP }, generalActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, generalToggle: { ...SETTINGS_FIELD_SWITCH_SLOT }, generalHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, generalHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, generalServiceAction: { minWidth: 72 }, generalWebAddress: { flex: 1, minWidth: 0 }, generalWebAddressText: { color: systemColors.link }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, toolbarSpacer: { flex: 1 }, windowTabsRow: { flex: 1, minWidth: 0, height: 28, flexDirection: "row", alignItems: "center", gap: 8 }, windowTabsToolbarRow: { flex: 1, minWidth: 0, width: "100%", height: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6, overflow: "hidden" }, windowTabs: { width: 224, height: 24 }, windowTabsWithActions: { flexShrink: 1 }, windowTabsActions: { flex: 1, minWidth: 0, maxWidth: 400, marginLeft: "auto", flexShrink: 0 },
+  // Only what General states itself: the scroll surface, the one action column
+  // its service row keeps aligned with every other row's, and the page address
+  // as a link.  Every field, label, slot and tip is the shared grid above.
+  generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalServiceAction: { minWidth: 72 }, generalWebAddress: { flex: 1, minWidth: 0 }, generalWebAddressText: { color: systemColors.link }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, toolbarSpacer: { flex: 1 }, windowTabsRow: { flex: 1, minWidth: 0, height: 28, flexDirection: "row", alignItems: "center", gap: 8 }, windowTabsToolbarRow: { flex: 1, minWidth: 0, width: "100%", height: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6, overflow: "hidden" }, windowTabs: { width: 224, height: 24 }, windowTabsWithActions: { flexShrink: 1 }, windowTabsActions: { flex: 1, minWidth: 0, maxWidth: 400, marginLeft: "auto", flexShrink: 0 },
   providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceModel: { flex: 1, minHeight: 0 }, providerWizardSignInPanel: { width: "100%", minHeight: 160, justifyContent: "center", gap: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, backgroundColor: systemColors.control, paddingHorizontal: 16, paddingVertical: 18 }, providerWizardAuthRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAuthStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   providerMiddlePane: { flex: 1, minWidth: 0, gap: 6 }, // The empty pane reads as the top of a list that has no rows yet, not as a
   // poster centred in a large window: it keeps the column's width and the
@@ -15137,19 +15251,19 @@ inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspec
   // points are taken back — the amount that puts both rings the same distance
   // from their control's ink on this host.
   routeFollowHelp: { flexShrink: 0, marginLeft: Platform.OS === "macos" ? -3 : 0 }, modelWindowValue: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, modelWindowText: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, modelWindowLink: { flexShrink: 0 }, protocolSettings: { gap: 4 }, helpTipAnchor: { position: "relative", zIndex: 2 }, helpTipDismiss: { position: "absolute", left: -2400, right: -2400, top: -2400, bottom: -2400 }, helpTipButton: { width: 22, height: 22, minWidth: 22, minHeight: 22, marginVertical: -3 }, helpTipPopupLeft: { position: "absolute", left: 0, bottom: 25, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipPopup: { position: "absolute", right: 0, bottom: 25, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
-  externalSettingsWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, externalSettingsFieldList: { ...SETTINGS_FIELD_LIST },
+  
   // One rail entry can carry two apps, so each app's block keeps the grid's
   // rhythm but not the grid: a title, then that app's own fields and files.
-externalSettingsField: { ...SETTINGS_FIELD }, externalSettingsInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, externalSettingsFieldLabel: { ...SETTINGS_FIELD_LABEL }, externalSettingsFieldLabelUnavailable: { ...SETTINGS_FIELD_LABEL, color: systemColors.secondaryLabel }, externalSettingsValueSlot: { ...SETTINGS_FIELD_VALUE_SLOT }, externalSettingsBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, externalSettingsHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, externalSettingsHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, externalSettingsPane: { flex: 1, minHeight: 0 }, externalSettingsPaneContent: { paddingVertical: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, gap: 14 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 },
-  runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 6 }, runtimeWorkspaceBody: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, runtimeWorkspace: { width: "100%", padding: SETTINGS_PANE_INSET, gap: 14 }, runtimeScrollSurface: { flex: 1, minWidth: 0, backgroundColor: systemColors.textBackground }, runtimeFieldList: { ...SETTINGS_FIELD_LIST }, runtimeField: { ...SETTINGS_FIELD }, runtimeInputRow: { ...SETTINGS_FIELD_ROW_INDENTED }, runtimeModifiedBar: { position: "absolute", left: 0, top: 3, bottom: 3, width: 2, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarInline: { width: 2, alignSelf: "center", height: 16, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarActive: { backgroundColor: systemColors.blue }, runtimeFieldError: { marginLeft: SETTINGS_FIELD_HELP_INDENT, color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, runtimeValueControlInvalid: { borderWidth: 1, borderColor: systemColors.red, borderRadius: 4 }, runtimeResetButton: { minWidth: 28, width: 28, height: 22, paddingHorizontal: 0 }, runtimeFieldLabel: { ...SETTINGS_FIELD_LABEL }, runtimeValueSlot: { ...SETTINGS_FIELD_CELL }, runtimeValueCellWide: { flex: 1, minWidth: 0, maxWidth: SETTINGS_FIELD_TEXT_WIDTH, height: 26, flexDirection: "row", alignItems: "center", gap: SETTINGS_FIELD_GAP }, runtimeValueControl: { width: SETTINGS_FIELD_VALUE_WIDTH, minWidth: SETTINGS_FIELD_VALUE_WIDTH, height: 26 }, runtimeNumberControl: { width: SETTINGS_FIELD_NUMBER_WIDTH, minWidth: SETTINGS_FIELD_NUMBER_WIDTH, height: 26, flexGrow: 0, flexShrink: 0 }, runtimeTextControl: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0 }, runtimeBooleanControl: { ...SETTINGS_FIELD_SWITCH_SLOT }, runtimeUnit: { minWidth: 0, flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, runtimeActionSlot: { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" }, runtimeHelpSlot: { ...SETTINGS_FIELD_HELP_SLOT }, runtimeHelpText: { ...SETTINGS_FIELD_HELP_TEXT }, runtimeMultilineField: { minWidth: 0, flexGrow: 1, flexBasis: "100%", maxWidth: "100%" }, runtimeMultilineHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, paddingLeft: SETTINGS_FIELD_LEAD }, runtimeMultilineLabel: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeMultilineHeaderActions: { flexShrink: 0, minHeight: 26, justifyContent: "center" }, runtimeMultilineEditor: { width: "100%", minWidth: 0, alignSelf: "stretch" }, runtimeMultilineHelpSlot: { paddingLeft: 0, maxWidth: "100%", minWidth: 0, paddingTop: 6, gap: 3 }, runtimeJsonDefaultHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, fontWeight: "600", minWidth: 0 },
-  dataManagementWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, dataManagementPane: { flex: 1, minHeight: 0 }, dataManagementPaneScrollContent: { paddingTop: SETTINGS_PANE_INSET, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 4, gap: 10 }, dataManagementImportIntro: { width: "100%", minHeight: 72, paddingHorizontal: 12, paddingVertical: 12, justifyContent: "center" }, dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: SETTINGS_FIELD_GAP, paddingLeft: SETTINGS_FIELD_LEAD }, dataManagementImportFileLabel: { ...SETTINGS_FIELD_LABEL }, dataManagementImportFileValue: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground }, dataManagementImportFilePlaceholder: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, dataManagementSelectionBar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSelectionCount: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementToolbarButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, dataManagementSectionsField: { flex: 1, minWidth: 0, gap: 6 }, dataManagementSectionList: { gap: 4 }, dataManagementSectionItem: { minHeight: 22 }, dataManagementActionStatus: { flexShrink: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14 }, dataManagementSensitiveHint: { color: systemColors.brown, fontSize: UI_FONT_SIZE, lineHeight: 16, paddingVertical: 5, paddingHorizontal: 7, backgroundColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.08) ?? "rgba(255, 204, 0, 0.08)", default: "rgba(255, 204, 0, 0.08)" }), borderRadius: 4, borderWidth: 1, borderColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.2) ?? "rgba(255, 204, 0, 0.2)", default: "rgba(255, 204, 0, 0.2)" }) },
+  externalSettingsPane: { flex: 1, minHeight: 0 }, codexRawEditorBase: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0, minHeight: 0, gap: 5 }, codexRawEditorHeader: { minHeight: 18 }, codexRawEditorLabel: { fontFamily: Platform.select({ macos: "Menlo", windows: "Cascadia Mono", default: "monospace" }), fontWeight: "600" }, codexRawNativeEditor: { minHeight: 0 }, codexRawEditorLoading: { minHeight: 0 },
+  runtimeWorkspaceFrame: { flex: 1, minHeight: 0, gap: 6 }, runtimeScrollSurface: { flex: 1, minWidth: 0, backgroundColor: systemColors.textBackground }, runtimeModifiedBar: { position: "absolute", left: 0, top: 3, bottom: 3, width: 2, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarInline: { width: 2, alignSelf: "center", height: 16, borderRadius: 1, backgroundColor: "transparent" }, runtimeModifiedBarActive: { backgroundColor: systemColors.blue }, runtimeFieldError: { marginLeft: SETTINGS_FIELD_HELP_INDENT, color: systemColors.red, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, runtimeValueControlInvalid: { borderWidth: 1, borderColor: systemColors.red, borderRadius: 4 }, runtimeResetButton: { minWidth: 28, width: 28, height: 22, paddingHorizontal: 0 }, runtimeValueControl: { width: SETTINGS_FIELD_VALUE_WIDTH, minWidth: SETTINGS_FIELD_VALUE_WIDTH, height: 26 }, runtimeNumberControl: { width: SETTINGS_FIELD_NUMBER_WIDTH, minWidth: SETTINGS_FIELD_NUMBER_WIDTH, height: 26, flexGrow: 0, flexShrink: 0 }, runtimeTextControl: { flexGrow: 1, flexShrink: 1, flexBasis: 0, minWidth: 0 }, runtimeMultilineField: { minWidth: 0, flexGrow: 1, flexBasis: "100%", maxWidth: "100%" }, runtimeMultilineHeader: { minHeight: 26, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, paddingLeft: SETTINGS_FIELD_LEAD }, runtimeMultilineLabel: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, runtimeMultilineHeaderActions: { flexShrink: 0, minHeight: 26, justifyContent: "center" }, runtimeMultilineEditor: { width: "100%", minWidth: 0, alignSelf: "stretch" }, runtimeMultilineHelpSlot: { paddingLeft: 0, maxWidth: "100%", minWidth: 0, paddingTop: 6, gap: 3 }, runtimeJsonDefaultHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, fontWeight: "600", minWidth: 0 },
+  dataManagementWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, dataManagementPane: { flex: 1, minHeight: 0 }, dataManagementPaneScrollContent: { paddingTop: 0, paddingHorizontal: SETTINGS_PANE_INSET, paddingBottom: 4, gap: 10 }, dataManagementImportIntro: { width: "100%", minHeight: 72, paddingHorizontal: 12, paddingVertical: 12, justifyContent: "center" }, dataManagementImportFileRow: { width: "100%", minHeight: 28, flexDirection: "row", alignItems: "center", gap: SETTINGS_FIELD_GAP, paddingLeft: SETTINGS_FIELD_LEAD }, dataManagementImportFileLabel: { ...SETTINGS_FIELD_LABEL }, dataManagementImportFileValue: { flex: 1, minWidth: 0, minHeight: 26, justifyContent: "center", paddingHorizontal: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 4, backgroundColor: systemColors.textBackground }, dataManagementImportFilePlaceholder: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, dataManagementSelectionBar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 8 }, dataManagementSelectionCount: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 16 }, dataManagementToolbarButtons: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, dataManagementSectionsField: { flex: 1, minWidth: 0, gap: 6 }, dataManagementSectionList: { gap: 4 }, dataManagementSectionItem: { minHeight: 22 }, dataManagementActionStatus: { flexShrink: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14 }, dataManagementSensitiveHint: { color: systemColors.brown, fontSize: UI_FONT_SIZE, lineHeight: 16, paddingVertical: 5, paddingHorizontal: 7, backgroundColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.08) ?? "rgba(255, 204, 0, 0.08)", default: "rgba(255, 204, 0, 0.08)" }), borderRadius: 4, borderWidth: 1, borderColor: Platform.select({ macos: (PlatformColor("systemYellow") as unknown as { withAlphaComponent?: (alpha: number) => string })?.withAlphaComponent?.(0.2) ?? "rgba(255, 204, 0, 0.2)", default: "rgba(255, 204, 0, 0.2)" }) },
   // The WebDAV tab is fields of the same grid the other panes draw, so its
   // list is the shared list rather than a form of its own.
   // A sync category reports: captions over values, its one switch, and the
   // command it exists for. Not the settings form's label column.
   // A sync category is three lines: its header, its server, its command. The
   // form behind 详情设置 carries everything else.
-  webdavSection: { gap: 6 }, webdavSectionHeader: { flexDirection: "row", alignItems: "center", gap: 8 }, webdavSectionTitle: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600", lineHeight: 17 }, webdavSectionState: { flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 }, webdavSectionSpacer: { flex: 1 }, webdavSectionSummary: { flexDirection: "row", alignItems: "center", gap: 12 }, webdavSectionFact: { flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 17 }, webdavSectionFactFailed: { color: systemColors.red }, webdavSectionStatus: { flexShrink: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 17 },
+  webdavFactsRow: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 12 }, webdavFactFailed: { color: systemColors.red },
   // The category's own form is fields of the same grid every pane draws, so
   // its label column, value column and help indent line up with 运行时 and 外部.
   // Each control takes the grid's width for what it holds: the URL and the

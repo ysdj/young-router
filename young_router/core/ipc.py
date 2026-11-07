@@ -115,6 +115,14 @@ WEB_UI_PREFIX = "/ui"
 # The one document the shell frames: the raw editor's own page. See
 # `serve_web_host` for why it must be a document of its own.
 WEB_EDITOR_PAGE = "editor.html"
+#: Transport encodings the page's text assets ship beside themselves, best
+#: first.  The builder writes one sibling per codec (`bundle.<hash>.js.br`),
+#: because the alternative -- deflating 1.2 MB of JavaScript inside this
+#: listener -- spends a worker thread on the first page load of every browser,
+#: and a build already has the bytes and a deterministic answer.  A sibling
+#: cannot drift from its source: the script's name is its own digest, and the
+#: page names the editor's script by its own.
+WEB_ENCODINGS = (("br", ".br"), ("gzip", ".gz"))
 # The browser host is one built bundle of static files: the page, its script,
 # and whatever the script imports.  Anything else the listener would have to
 # guess, so it answers 404 instead.
@@ -131,6 +139,67 @@ _WEB_CONTENT_TYPES = {
     ".woff2": "font/woff2",
     ".ico": "image/x-icon",
 }
+
+
+def _accepts_encoding(header: str, codec: str) -> bool:
+    """Whether an ``Accept-Encoding`` header admits ``codec``.
+
+    q values are honoured -- ``br;q=0`` is a refusal, not an absence -- and
+    ``*`` stands for every codec the client did not name.  A header that states
+    nothing is HTTP's default of identity only, so the file itself is answered,
+    which every browser reads.
+    """
+
+    stated: dict[str, float] = {}
+    for part in header.split(","):
+        token, _separator, parameters = part.partition(";")
+        token = token.strip().lower()
+        if not token:
+            continue
+        quality = 1.0
+        parameters = parameters.strip()
+        if parameters[:2].lower() == "q=":
+            try:
+                quality = float(parameters[2:])
+            except ValueError:
+                continue
+        stated[token] = quality
+    if codec in stated:
+        return stated[codec] > 0
+    return stated.get("*", 0.0) > 0
+
+
+def _web_asset(candidate: Path, accept_encoding: str) -> tuple[str, bytes, bool]:
+    """One page asset, in the encoding the browser can read.
+
+    Returns the codec that was used (empty for the file itself), its bytes, and
+    whether any precompressed sibling exists.  The last value is what makes this
+    answer depend on ``Accept-Encoding``, so it is also what decides whether
+    ``Vary`` has to be stated.
+
+    The list is ordered best-first and that order decides, because both
+    encodings decode to the same asset: the client's job is to say what it
+    accepts, and a stated refusal (``q=0``) is the one thing that rules a codec
+    out.  Weighing q values instead would hand a browser the larger copy over a
+    preference it expressed about a courier.
+    """
+
+    varied = False
+    for codec, suffix in WEB_ENCODINGS:
+        sibling = candidate.with_name(candidate.name + suffix)
+        if not sibling.is_file():
+            continue
+        varied = True
+        if not _accepts_encoding(accept_encoding, codec):
+            continue
+        try:
+            return codec, sibling.read_bytes(), True
+        except OSError:
+            continue
+    try:
+        return "", candidate.read_bytes(), varied
+    except OSError:
+        return "", b"", varied
 
 # The gate a browser meets before the app itself is served.
 #
@@ -292,6 +361,43 @@ _WEB_LOGIN_TEMPLATE = """<!doctype html>
 </body>
 </html>
 """
+
+
+def _accepted_language(header: str) -> str:
+    """The app's language from a browser's ``Accept-Language``.
+
+    Read only when the preference is 自动, and read as the browser states it:
+    the page follows ``navigator.languages``, and the gate is the same document
+    from the same reader's point of view.  Tags are ranked by their own ``q``
+    values, because a header's order is not its preference; the first tag this
+    app is translated into wins, and a browser that asks for neither language
+    the app speaks (or for ``*``) answers ``""`` so the caller can fall back to
+    the machine's own resolution.
+    """
+
+    best = ""
+    best_quality = 0.0
+    for entry in header.split(","):
+        parts = entry.split(";")
+        tag = parts[0].strip().lower().replace("_", "-")
+        if not tag or tag == "*":
+            continue
+        quality = 1.0
+        for parameter in parts[1:]:
+            name, _, value = parameter.partition("=")
+            if name.strip().lower() == "q":
+                try:
+                    quality = float(value)
+                except ValueError:
+                    quality = 0.0
+        if quality <= 0 or quality <= best_quality:
+            continue
+        supported = "zh-Hans" if tag == "zh" or tag.startswith("zh-") else "en" if tag == "en" or tag.startswith("en-") else ""
+        if not supported:
+            continue
+        best = supported
+        best_quality = quality
+    return best
 
 
 def _web_login_page(language: str) -> bytes:
@@ -987,7 +1093,7 @@ class CoreIPCServer:
         # The language the gate is drawn in, resolved by the app's own
         # language domain.  Read per request for the same reason the key is:
         # changing it must not need a restart.
-        self._web_locale_provider: Callable[[], str] | None = None
+        self._web_locale_provider: Callable[[], object] | None = None
         # The credential a terminal launch puts in the printed address.  Empty
         # for a Core started by a native host or by a plain CLI run.
         self._web_launch_token = ""
@@ -1118,9 +1224,12 @@ class CoreIPCServer:
         content_type = _WEB_CONTENT_TYPES.get(candidate.suffix.lower())
         if content_type is None or not candidate.is_file():
             return False
-        try:
-            body = candidate.read_bytes()
-        except OSError:
+        # A text asset is answered in whichever encoding the builder wrote
+        # beside it and the browser says it reads; the sibling is never an
+        # asset of its own (`.br` is not in `_WEB_CONTENT_TYPES`, so asking for
+        # it by name is a 404 rather than a second copy of the bundle).
+        encoding, body, varied = _web_asset(candidate, handler.headers.get("Accept-Encoding", ""))
+        if not body:
             return False
         # The app's own shell is only handed to a page that has signed in.
         # Everything else -- the bundle, the login page itself -- is public,
@@ -1141,14 +1250,33 @@ class CoreIPCServer:
                         expires_at=time.monotonic() + self.session_ttl_seconds,
                     )
             else:
-                body = _web_login_page(self._web_language())
+                body = _web_login_page(self._web_language(handler))
                 content_type = "text/html; charset=utf-8"
                 relative = "login.html"
+                # The gate is drawn per request and carries no asset of its
+                # own, so it is stated uncompressed: it has no sibling, and
+                # `varied` would only make a cache key on a header nothing
+                # here decides.
+                encoding = ""
+                varied = False
         handler.send_response(200)
         handler.send_header("Content-Type", content_type)
         handler.send_header("Content-Length", str(len(body)))
+        if encoding:
+            handler.send_header("Content-Encoding", encoding)
+        # Stated whenever a sibling exists, not only when this answer used one:
+        # a cache that stored the brotli bytes must not hand them to a browser
+        # that asked for neither, and one that stored the raw bytes must not be
+        # read as the whole answer to a browser that would have taken brotli.
+        if varied:
+            handler.send_header("Vary", "Accept-Encoding")
         if local_session:
             handler.send_header("Set-Cookie", handler._browser_session_cookie_header(local_session))
+        # The shell is never cached; every asset beside it is immutable for a
+        # year, which is only true because the script is named after its own
+        # bytes (`bundle.<hash>.js`) -- a fixed `bundle.js` under this header is
+        # a browser frozen on the build it happened to load first, which is how
+        # a fixed string stayed on screen for a day.
         handler.send_header(
             "Cache-Control",
             "no-store" if candidate.suffix.lower() == ".html" else "public, max-age=31536000, immutable",
@@ -1229,7 +1357,7 @@ class CoreIPCServer:
         *,
         password: str = "",
         password_provider: Callable[[], str] | None = None,
-        locale_provider: Callable[[], str] | None = None,
+        locale_provider: Callable[[], object] | None = None,
         auto_login: bool = False,
     ) -> None:
         """Serve one built bundle from this listener, behind one key.
@@ -1245,7 +1373,9 @@ class CoreIPCServer:
         here.  ``password`` remains for a caller that states one directly (a
         terminal, a test).  ``locale_provider`` is the same lease for the
         gate's language: the person's choice is read per request, so changing
-        it never needs the listener replaced.
+        it never needs the listener replaced.  It returns the language
+        domain's own ``snapshot()`` (``choice`` plus ``resolved``) or a plain
+        resolved string; see ``_web_language`` for what each half decides.
 
         ``auto_login`` is for a caller that is *already* the proof: a terminal
         that started this process, or the app's own window opening its page.
@@ -1273,23 +1403,46 @@ class CoreIPCServer:
             self._web_launch_token = secrets.token_urlsafe(32)
             self._web_auto_login = bool(auto_login)
 
-    def _web_language(self) -> str:
+    def _web_language(self, handler: "_CoreRequestHandler") -> str:
         """The language the gate is drawn in right now.
 
-        The app's language domain is the one authority for this; a Core started
-        without one (a test, a probe) answers in English rather than guessing
-        from the request's headers, because the window and the gate must not
-        disagree about what language the person chose.
+        The app's language domain is the one authority for the preference, and
+        the gate has to agree with the page behind it:
+
+        - a stated preference (``en`` / ``zh-Hans``) is the answer, whatever the
+          browser asks for;
+        - ``system`` -- 自动 in General -- follows the platform, and on the page
+          the platform is the browser.  The page reads ``navigator.languages``
+          for exactly this, so the one document a browser meets before the app
+          must read the same list rather than the language this *machine* is
+          configured in: a Chinese browser in front of a host whose ``LANG`` is
+          C.UTF-8 used to meet an English gate and then a Chinese app;
+        - a Core with no language domain at all (a test, a probe) answers in
+          English instead of guessing.
+
+        ``locale_provider`` therefore states both halves -- the domain's own
+        ``snapshot()`` is the intended value -- and a plain string is read as
+        the resolved language, which is what a caller that has already decided
+        can honestly say.
         """
 
         provider = self._web_locale_provider
         if provider is None:
             return "en"
         try:
-            return str(provider() or "en")
+            value = provider()
         except Exception:
             # An unreadable preference is not a reason to fail the gate.
             return "en"
+        if not isinstance(value, Mapping):
+            # A caller that states one language has already decided which it is;
+            # there is no choice left for the browser to make.
+            return str(value or "en")
+        if str(value.get("choice") or "system") == "system":
+            accepted = _accepted_language(handler.headers.get("Accept-Language", ""))
+            if accepted:
+                return accepted
+        return str(value.get("resolved") or "en")
 
     def set_web_password(self, password: str) -> None:
         """Take an edited password, without a restart of the listener.

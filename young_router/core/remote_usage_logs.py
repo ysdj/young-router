@@ -541,6 +541,32 @@ def _control_api_root(api_base: str) -> str | None:
     return root if path.endswith("/api") else f"{root}/api"
 
 
+def _quota_per_unit(origin: str) -> float:
+    """How many of a station's credits make one unit of its money.
+
+    A New API row states what it charged as ``quota``, a count of the site's own
+    credits, and the station's dashboard divides that by the display unit it
+    publishes in ``/api/status``.  Applying it is the difference between stating
+    the money a row cost and printing a credit count under a currency sign.
+
+    The relay-account store already reads and caches that unit for the balance
+    it shows, so the answer is asked of it rather than read a second time here:
+    two readers of one site configuration is how a balance and a log row end up
+    in different dollars.  A host with no store — the module's own CLI — leaves
+    the price of a New API row empty instead of assuming New API's default.
+    """
+
+    reader = _QUOTA_UNIT_READER
+    if not callable(reader):
+        return 0.0
+    try:
+        unit = reader(origin)
+    except Exception:
+        return 0.0
+    number = _number(unit)
+    return number if number is not None and number > 0 else 0.0
+
+
 # The per-request ledger a Sub2API dashboard keeps, read with the account's own
 # session rather than a gateway key: the gateway key is scoped to the traffic it
 # served, while the dashboard answers the login's whole history.
@@ -594,6 +620,11 @@ _REFRESH_CACHE: dict[str, str] = {}
 # again.  This module stays free of the relay-account store, so the owner of that
 # store installs the sink and decides how a rotated credential is kept.
 _ROTATED_REFRESH_SINK: Any = None
+# Called with a station's origin when a New API row's credits have to become
+# money.  The relay-account store owns that display unit because it already
+# divides a balance by it; this module stays free of that store, so the owner
+# installs the reader the same way it installs the sink above.
+_QUOTA_UNIT_READER: Any = None
 
 
 def set_rotated_refresh_sink(sink: Any) -> None:
@@ -601,6 +632,13 @@ def set_rotated_refresh_sink(sink: Any) -> None:
 
     global _ROTATED_REFRESH_SINK
     _ROTATED_REFRESH_SINK = sink
+
+
+def set_quota_unit_reader(reader: Any) -> None:
+    """Let the relay-account store answer what one station credit is worth."""
+
+    global _QUOTA_UNIT_READER
+    _QUOTA_UNIT_READER = reader
 
 
 def _monotonic() -> float:
@@ -1043,14 +1081,25 @@ def _safe_text(value: Any, limit: int = 120) -> str:
     return text[:limit]
 
 
-def _safe_number(value: Any) -> str:
+def _number(value: Any) -> float | None:
+    """One number a station stated, or None when it stated none.
+
+    Third-party rows spell their figures as JSON numbers; a string, a bool, or
+    a NaN is not a count and is treated as the station saying nothing.
+    """
+
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return ""
+        return None
     try:
         number = float(value)
     except (TypeError, ValueError):
-        return ""
-    if not math.isfinite(number):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _safe_number(value: Any) -> str:
+    number = _number(value)
+    if number is None:
         return ""
     return str(int(number)) if number.is_integer() else f"{number:.4g}"
 
@@ -1094,32 +1143,26 @@ def _safe_timestamp(value: Any) -> str:
     )
 
 
-def _total_tokens(row: dict[str, Any]) -> str:
+def _total_tokens(
+    row: Mapping[str, Any],
+    prompt: float | None,
+    completion: float | None,
+) -> str:
+    """How many tokens the request was billed for, in one count.
+
+    A station that states its own total is taken at its word; the rest are
+    summed from the two halves the row does state.  The halves are already the
+    normalized ones, so adding the cache counts again here would bill a cached
+    prompt twice.
+    """
+
     for key in ("total_tokens", "token_count", "tokens"):
         value = _safe_number(row.get(key))
         if value:
             return value
-
-    parts = (
-        "prompt_tokens",
-        "completion_tokens",
-        "input_tokens",
-        "output_tokens",
-        "cache_creation_tokens",
-        "cache_read_tokens",
-    )
-    total = 0.0
-    found = False
-    for key in parts:
-        value = row.get(key)
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            continue
-        number = float(value)
-        if not math.isfinite(number):
-            continue
-        total += number
-        found = True
-    return _safe_number(total) if found else ""
+    if prompt is None and completion is None:
+        return ""
+    return _safe_number((prompt or 0.0) + (completion or 0.0))
 
 
 def _duration_milliseconds(row: Mapping[str, Any]) -> str:
@@ -1145,7 +1188,92 @@ def _duration_milliseconds(row: Mapping[str, Any]) -> str:
     return _safe_number(round(float(seconds) * 1000))
 
 
-def _row_details(row: dict[str, Any]) -> dict[str, str]:
+def _usage_envelope(row: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The extra fields a station nests in its row's own ``other`` document.
+
+    A New API log row states the cached part of the prompt inside ``other``, a
+    JSON string beside its billing ratios, rather than as a column of its own.
+    Reading only the top-level keys left the pane's 缓存命中 column empty on a
+    station whose own dashboard states those cached tokens plainly.
+    """
+
+    other = row.get("other")
+    if isinstance(other, str):
+        try:
+            other = json.loads(other)
+        except (ValueError, TypeError):
+            return {}
+    return other if isinstance(other, Mapping) else {}
+
+
+def _cache_counts(
+    row: Mapping[str, Any],
+    envelope: Mapping[str, Any],
+) -> tuple[float | None, float | None]:
+    """The prompt the upstream served from its cache, and the prompt it wrote.
+
+    Two families spell these differently and only one of them is a subset of
+    the prompt: an OpenAI-shaped row counts its cached tokens *inside*
+    ``prompt_tokens``, while an Anthropic-shaped one states the cached read, the
+    cache write and the uncached remainder as three separate figures.  They are
+    kept apart here and summed once, in `_prompt_count`, so the share the pane
+    draws has one denominator.
+    """
+
+    read = _number(
+        row.get("cache_read_tokens")
+        or row.get("cached_tokens")
+        or envelope.get("cache_tokens")
+    )
+    write = _number(row.get("cache_creation_tokens") or row.get("cache_write_tokens"))
+    return read, write
+
+
+def _prompt_count(
+    row: Mapping[str, Any],
+    cache_read: float | None,
+    cache_write: float | None,
+) -> float | None:
+    """The whole prompt the model read, whichever way the row states it.
+
+    A row that says ``prompt_tokens`` has already said it, because that figure
+    includes the cached part.  A row that says ``input_tokens`` has stated only
+    the uncached remainder, and a 117 000-token cached prompt read as `2` in the
+    令牌 column — a number the row never claimed.  The three parts are therefore
+    summed back into the prompt they were cut from.
+    """
+
+    stated = _number(row.get("prompt_tokens"))
+    if stated is not None:
+        return stated
+    parts = [_number(row.get("input_tokens")), cache_read, cache_write]
+    if all(part is None for part in parts):
+        return None
+    return sum(part or 0.0 for part in parts)
+
+
+def _row_cost(row: Mapping[str, Any], quota_unit: float) -> str:
+    """The money one request was charged, in the unit its station bills in.
+
+    A Sub2API ledger states the charge itself: ``actual_cost`` is what the
+    request cost after its group's multiplier, and ``total_cost`` is the same
+    request at the list price.  A New API row states ``quota`` instead, a count
+    of the station's own credits, which is money only once the site's display
+    unit is applied — a credit count printed under a currency sign would be a
+    different number of dollars than the station's own dashboard shows.
+    """
+
+    for key in ("actual_cost", "total_cost"):
+        stated = _safe_number(row.get(key))
+        if stated:
+            return stated
+    quota = _number(row.get("quota"))
+    if quota is not None and quota_unit > 0:
+        return _safe_number(quota / quota_unit)
+    return _safe_number(row.get("cost") or row.get("amount"))
+
+
+def _row_details(row: dict[str, Any], quota_unit: float = 0.0) -> dict[str, str]:
     """Project one usage row into the fields the log view renders.
 
     Only documented, presentational keys survive: a relay's response is
@@ -1153,6 +1281,13 @@ def _row_details(row: dict[str, Any]) -> dict[str, str]:
     path, or anything else the station happened to include.  Every value is a
     string so the record is the same shape whichever endpoint answered.
     """
+
+    envelope = _usage_envelope(row)
+    cache_read, cache_write = _cache_counts(row, envelope)
+    prompt_tokens = _prompt_count(row, cache_read, cache_write)
+    completion_tokens = _number(
+        row.get("completion_tokens") or row.get("output_tokens")
+    )
 
     fields = {
         "model": _safe_text(
@@ -1174,15 +1309,15 @@ def _row_details(row: dict[str, Any]) -> dict[str, str]:
             row.get("token_name") or row.get("key_name") or row.get("api_key"), 64
         ),
         "duration": _duration_milliseconds(row),
-        "prompt_tokens": _safe_number(row.get("prompt_tokens") or row.get("input_tokens")),
-        "completion_tokens": _safe_number(
-            row.get("completion_tokens") or row.get("output_tokens")
-        ),
-        "cache_tokens": _safe_number(
-            row.get("cache_read_tokens") or row.get("cache_creation_tokens")
-        ),
-        "total_tokens": _total_tokens(row),
-        "cost": _safe_number(row.get("quota") or row.get("cost") or row.get("amount")),
+        "prompt_tokens": _safe_number(prompt_tokens),
+        "completion_tokens": _safe_number(completion_tokens),
+        # The same spellings the requests tab reads: a cached read is the share
+        # the pane draws, and a cache write is a separate count with no rate of
+        # its own, so the two travel as two fields rather than one number.
+        "cache_read_tokens": _safe_number(cache_read),
+        "cache_write_tokens": _safe_number(cache_write),
+        "total_tokens": _total_tokens(row, prompt_tokens, completion_tokens),
+        "cost": _row_cost(row, quota_unit),
     }
     return {key: value for key, value in fields.items() if value}
 
@@ -1205,6 +1340,7 @@ def _row_record(
     target: UsageTarget,
     family: str,
     fallback_timestamp: str,
+    quota_unit: float = 0.0,
 ) -> dict[str, Any] | None:
     """Build one usage record carrying its relay's own name and its fields.
 
@@ -1216,7 +1352,7 @@ def _row_record(
     timestamp = _safe_timestamp(
         raw.get("created_at", raw.get("createdAt", raw.get("timestamp")))
     ) or fallback_timestamp
-    details = _row_details(raw)
+    details = _row_details(raw, quota_unit=quota_unit)
     if not details.get("model") and not details.get("total_tokens"):
         # A row that names neither a model nor a token count is the station's
         # own placeholder; rendering it would be a blank line with a relay name.
@@ -1336,7 +1472,15 @@ def fetch_target(
             return (
                 "newapi",
                 _deduplicated_records(
-                    _records_from(rows, target, "newapi", fallback_timestamp)
+                    _records_from(
+                        rows,
+                        target,
+                        "newapi",
+                        fallback_timestamp,
+                        # The row states its charge in the station's own credit,
+                        # so the site's display unit is what turns it into money.
+                        _quota_per_unit(target.origin),
+                    )
                 ),
                 "",
                 station_total,
@@ -1355,11 +1499,12 @@ def _records_from(
     target: UsageTarget,
     kind: str,
     fallback_timestamp: str,
+    quota_unit: float = 0.0,
 ) -> list[dict[str, Any]]:
     return [
         record
         for record in (
-            _row_record(row, target, kind, fallback_timestamp)
+            _row_record(row, target, kind, fallback_timestamp, quota_unit)
             for row in rows[:MAX_ROWS_PER_TARGET]
         )
         if record

@@ -232,8 +232,13 @@ class WorkBuddyProviderTests(unittest.TestCase):
                 provider["models"][0]["upstream_context_window"],
             )
 
-    def test_a_wizard_created_entry_starts_without_models(self) -> None:
-        """The wizard creates the service entry; the editor links the account."""
+    def test_an_empty_model_list_creates_an_entry_without_models(self) -> None:
+        """An empty list is a statement, and stays one.
+
+        The wizard's model step now names the entries it picked; a caller that
+        states an empty list still gets the service entry with no routes, so
+        the editor can link the account and read its catalog afterwards.
+        """
 
         directory, domain, _config = self._domain()
         with directory:
@@ -261,6 +266,27 @@ class WorkBuddyProviderTests(unittest.TestCase):
             )["providers"][0]
             self.assertEqual([model["model_name"] for model in added["models"]], ["glm-5.3", "hy3"])
             self.assertTrue(all(model["upstream_protocol_mode"] == "fixed" for model in added["models"]))
+
+    def test_a_wizard_pick_imports_the_entries_the_step_listed(self) -> None:
+        """The model step's picks become the entry's routes in one create.
+
+        A WorkBuddy catalog names its rows by id, so a pick is that id; the
+        adapter is what says which entry it is, and the create files each row
+        from the catalog rather than from a listing this caller rebuilt.
+        """
+
+        directory, domain, _config = self._domain()
+        with directory:
+            provider = domain.dispatch(
+                "service_provider.add",
+                {"kind": "workbuddy_login", "name": "WorkBuddy", "models": ["hy3"]},
+            )["providers"][0]
+            self.assertEqual(
+                [(model["name"], model["upstream_model"]) for model in provider["models"]],
+                [("hy3", "hy3")],
+            )
+            self.assertEqual(provider["models"][0]["api_key_name"], workbuddy.API_KEY_NAME)
+            self.assertTrue(domain.validate()["valid"])
 
     def test_a_route_the_user_re_protocolled_survives_the_next_model_add(self) -> None:
         """Growing the roster never rewrites a route's own protocol choice.

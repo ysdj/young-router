@@ -34,6 +34,7 @@ const units: Record<string, string> = {
   rows: "行",
   tokens: "标记",
   hours: "小时",
+  minutes: "分钟",
   bytes: "字节",
   images: "张图",
   segments: "段",

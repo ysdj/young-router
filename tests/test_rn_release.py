@@ -668,6 +668,87 @@ class ReactNativeReleaseTests(unittest.TestCase):
             self.assertNotIn('test -f "$CORE/web/bundle.js"', script)
             self.assertNotIn('&& -f "$CORE/web/bundle.js"', script)
 
+    def test_the_browser_page_is_published_per_commit_and_names_its_script(self) -> None:
+        """A headless host installs the page by commit, so a page is published by commit.
+
+        The host with no window cannot build the page: it asks for
+        `releases/download/web/web-<commit>.tar.gz`, and a commit whose page was
+        never published leaves it serving the previous one.  On 2026-11-08 that
+        was a page built for 3153fa3 in front of a Core running 15ca916 -- a
+        provider list with no Qoder row, and a tab title the page had already
+        stopped saying.  Publishing is one command, and it builds from a clean
+        checkout of the commit rather than from a working tree, because the
+        asset's name is the commit.
+        """
+
+        publisher = (ROOT / "scripts" / "publish-web-page.sh").read_text(encoding="utf-8")
+        builder = (ROOT / "rn" / "apps" / "web" / "build.mjs").read_text(encoding="utf-8")
+
+        # Built from the named commit, never from the tree that happens to be
+        # checked out.
+        self.assertIn('git -C "$ROOT" worktree add --detach "$tree" "$commit"', publisher)
+        self.assertIn('git -C "$ROOT" rev-parse --verify --quiet "$commit_ref^{commit}"', publisher)
+        # The page's one script is content-addressed, and a fixed name is a
+        # browser frozen on whichever build it first saw.
+        self.assertIn("await rm(resolve(outdir, \"bundle.js\"));", builder)
+        self.assertIn('const bundleName = `bundle.${digest}.js`;', builder)
+        self.assertIn('<script type="module" src="./${bundleName}"></script>', builder)
+        self.assertIn('[[ ! -e "$dist/bundle.js" ]]', publisher)
+        self.assertIn('[[ "$bundle_name" =~ ^bundle\\.[0-9a-f]{16}\\.js$ ]]', publisher)
+        self.assertIn('grep -q "src=', publisher)
+        self.assertIn('"$dist/index.html" || {', publisher)
+        # The asset's name is the commit, and the manifest states it: that is
+        # what the host compares before it restarts onto a commit.
+        self.assertIn('asset="web-$commit.tar.gz"', publisher)
+        self.assertIn('{ built_from: process.argv[3], files }', publisher)
+        self.assertIn('MANIFEST.json', publisher)
+        # Uploading twice would silently change what "that commit's page" means.
+        self.assertIn('gh release download "$TAG" --repo "$REPOSITORY" --pattern "$asset"', publisher)
+        self.assertIn("the same commit must build the same page; nothing was uploaded", publisher)
+        self.assertIn('gh release upload "$TAG" "$work/$asset" --repo "$REPOSITORY"', publisher)
+
+    def test_the_page_travels_precompressed_and_without_the_editors_inline_copy(self) -> None:
+        """The page is the one thing every browser on a remote host downloads.
+
+        Two halves keep it small, and both are decided at build time because
+        doing either in Core would cost a worker thread per first load:
+
+        - the shell's own script does not carry the editor.  `CodeEditorWebBundle`
+          is the whole of Ace inlined for the two native hosts' WebView, and this
+          host frames the editor page Core serves instead -- so its copy was
+          half a megabyte of JavaScript nothing on this host reads, resolved
+          through the platform extension Metro uses (`.web.ts`).
+        - every text asset ships beside `.br` and `.gz` siblings, which Core
+          picks from by `Accept-Encoding` and states in `Vary`.  They are
+          derived bytes, so the published manifest identifies a page by what it
+          decodes to: a different brotli library must not read as a different
+          page.
+        """
+
+        better = (ROOT / "rn" / "apps" / "web" / "build.mjs").read_text(encoding="utf-8")
+        publisher = (ROOT / "scripts" / "publish-web-page.sh").read_text(encoding="utf-8")
+        web_only = ROOT / "rn/packages/shared/src/ui/code-editor/CodeEditorWebBundle.web.ts"
+
+        # The editor's script is the only file the shell's script may not have:
+        # Metro resolves `.web.ts` for the browser and for neither native host.
+        self.assertTrue(web_only.is_file())
+        self.assertIn('export const CODE_EDITOR_WEB_BUNDLE = "";', web_only.read_text(encoding="utf-8"))
+        self.assertIn('resolveExtensions: [".web.tsx", ".web.ts", ".web.js"', better)
+        self.assertIn("await writeFile(resolve(outdir, editorName), editorScript);", better)
+        self.assertIn('codeEditorPageHtml({ platform: "web", scriptSrc: `./${editorName}` })', better)
+
+        # One sibling per codec, named after the file it was built from, so
+        # Core never has to compress anything and a sibling cannot go stale.
+        self.assertIn('["br", ".br", (bytes) => brotliCompressSync(', better)
+        self.assertIn('["gzip", ".gz", (bytes) => gzipSync(bytes, { level: 9 })]', better)
+        self.assertIn("await writeFile(resolve(outdir, `${name}${suffix}`), encoded);", better)
+
+        # A page shipped without them costs every browser the whole file, so
+        # the publisher refuses it -- and does not call the encoding content.
+        self.assertIn('[[ -s "$dist/$name.$codec" ]]', publisher)
+        self.assertIn('if (name.endsWith(".br") || name.endsWith(".gz")) continue;', publisher)
+        self.assertIn(r'grep -q "src=\"\./$editor_name\"" "$dist/editor.html"', publisher)
+
     def test_the_portable_smoke_relocates_instead_of_copying_a_gigabyte(self) -> None:
         # The smoke exists to prove the bundle works from somewhere other than
         # where it was built, which is what the installed app does. Copying the

@@ -128,10 +128,27 @@ class _Recorder(http.server.BaseHTTPRequestHandler):
         return
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.path == "/ui/precompressed.js":
+            # A precompressed page asset.  Core answers the script with the
+            # two headers that name its encoding, and they have to survive
+            # this hop: without the first the browser reads brotli bytes as
+            # JavaScript.
+            payload = b"\x0b\x02\x80precompressed"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/javascript; charset=utf-8")
+            self.send_header("Content-Encoding", "br")
+            self.send_header("Vary", "Accept-Encoding")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         body = json.dumps({
             "path": self.path,
             "host": self.headers.get("Host", ""),
             "page_host": self.headers.get(web_forward.PUBLISHED_HOST_HEADER, ""),
+            # What the browser said it reads.  End-to-end, so it is the
+            # browser's own list rather than this hop's.
+            "accept_encoding": self.headers.get("Accept-Encoding", ""),
             # Every value, not just the first: a header stated twice is how a
             # smuggled copy would arrive.
             "page_host_values": self.headers.get_all(web_forward.PUBLISHED_HOST_HEADER) or [],
@@ -228,6 +245,30 @@ class ForwardingTests(unittest.TestCase):
         # The hop's own server header is not replayed: its value cannot even be
         # serialised by this listener's protocol.
         self.assertNotIn("youngroutercore/1", json.dumps(headers).lower())
+
+    def test_a_precompressed_asset_keeps_its_encoding_across_the_hop(self) -> None:
+        """The page's script is carried compressed, and says so on both ends.
+
+        Core answers a built script with `Content-Encoding` and `Vary`, and the
+        browser states what it reads in `Accept-Encoding`.  All three are
+        end-to-end headers, so none may be dropped by this hop: without the
+        first the browser reads brotli bytes as JavaScript, and without the
+        second a shared cache replays one browser's encoding to the next.
+        """
+
+        status, headers, body = _call(
+            self.middleware, "GET", "/ui/precompressed.js", b"", [(b"accept-encoding", b"gzip, br")]
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("br", headers["content-encoding"])
+        self.assertEqual("Accept-Encoding", headers["vary"])
+        self.assertEqual(len(body), int(headers["content-length"]))
+        # And the browser's own list reached Core, which is what picks the
+        # sibling to answer with.
+        recorded = json.loads(
+            _call(self.middleware, "GET", "/ui/", b"", [(b"accept-encoding", b"br, gzip")])[2]
+        )
+        self.assertEqual("br, gzip", recorded["accept_encoding"])
 
     def test_the_name_the_browser_used_travels_with_the_request(self) -> None:
         """Core cannot see it otherwise: this hop is loopback either way.

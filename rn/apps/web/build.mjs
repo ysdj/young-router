@@ -20,6 +20,7 @@ import { createHash } from "node:crypto";
 import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { brotliCompressSync, constants, gzipSync } from "node:zlib";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const app = resolve(root, "apps/web");
@@ -44,6 +45,14 @@ await build({
   // the six sidebar tiles keeps the build a single directory with no manifest.
   loader: { ".png": "dataurl" },
   define: { "process.env.NODE_ENV": '"production"' },
+  // A source only one host can use comes in a platform-specific file, the way
+  // Metro spells it. `ui/code-editor/CodeEditorWebBundle.web.ts` is the one that
+  // matters: the whole Ace bundle is inlined into the editor page the native
+  // hosts hand their WebView, and this page never inlines that document -- it
+  // frames it from Core (`editor.html`), so its own script would carry half a
+  // megabyte of JavaScript nothing here ever runs. Metro never resolves a
+  // `.web.ts` for a macOS or Windows bundle: `web` is not in its platform list.
+  resolveExtensions: [".web.tsx", ".web.ts", ".web.js", ".tsx", ".ts", ".jsx", ".js", ".css", ".json"],
   alias: {
     "react-native": resolve(app, "shim.js"),
     // The web app's own copies: the shared UI must be compiled against the
@@ -138,9 +147,9 @@ await writeFile(resolve(outdir, "index.html"), html);
 // The raw editor page. Every host renders the same document: the native hosts
 // hand it to their WebView, and this host serves it as its own same-origin file
 // for the editor to frame. It must be a real document, not `srcdoc` or a blob:
-// both inherit this page's `script-src 'self'`, which refuses the Ace bundle the
-// editor inlines. The page is built from the shared module so the three hosts
-// cannot drift; esbuild is only the way to run that TypeScript here in Node.
+// both inherit this page's `script-src 'self'`, which refuses the editor's own
+// script. The page is built from the shared module so the three hosts cannot
+// drift; esbuild is only the way to run that TypeScript here in Node.
 const editorPageModule = await build({
   entryPoints: [resolve(shared, "ui/code-editor/codeEditorPage.ts")],
   bundle: true,
@@ -151,13 +160,51 @@ const editorPageModule = await build({
 });
 const editorPagePath = resolve(outdir, ".editor-page.mjs");
 await writeFile(editorPagePath, editorPageModule.outputFiles[0].text);
+let editorName = "";
 try {
-  const { codeEditorPageHtml } = await import(pathToFileURL(editorPagePath).href);
-  await writeFile(resolve(outdir, "editor.html"), codeEditorPageHtml({ platform: "web" }));
+  const { codeEditorPageHtml, CODE_EDITOR_WEB_BUNDLE } = await import(pathToFileURL(editorPagePath).href);
+  // The editor is a script of its own here, addressed by content so Core's
+  // `immutable` header is true of it. The framed document is then a few KB
+  // instead of half a megabyte of inlined Ace, and opening the raw editor a
+  // second time reads this file out of the browser's cache: `editor.html`
+  // itself is answered `no-store`, so an inline editor was fetched again on
+  // every open. The native hosts keep the inline copy -- their WebView has no
+  // origin to fetch from -- and both copies are the one bundle this repository
+  // builds (`rn/scripts/build-code-editor.mjs` writes `CodeEditorWebBundle.ts`).
+  const editorScript = Buffer.from(CODE_EDITOR_WEB_BUNDLE, "utf8");
+  editorName = `editor.${createHash("sha256").update(editorScript).digest("hex").slice(0, 16)}.js`;
+  await writeFile(resolve(outdir, editorName), editorScript);
+  await writeFile(resolve(outdir, "editor.html"), codeEditorPageHtml({ platform: "web", scriptSrc: `./${editorName}` }));
 } finally {
   await rm(editorPagePath, { force: true });
 }
 
 await cp(resolve(app, "shim.js"), resolve(outdir, "shim.js")).catch(() => undefined);
 
-console.log(`browser host built: ${outdir} (${bundleName} ${Math.round(bundle.length / 1024)} KB)`);
+// Precompressed siblings: the page's own script is 1.2 MB, and the wire can
+// carry it at a fifth of that. The encoding is decided here rather than in
+// Core because compressing this bundle inside the listener would spend a
+// worker thread on the first page load of every browser, and a deterministic,
+// offline answer already exists at build time. Core answers a sibling only for
+// the file it was built beside (`bundle.<hash>.js.br` under a request for
+// `bundle.<hash>.js`), so it cannot go stale: the script's name is its own
+// digest. The `.br` and `.gz` bytes are derived, not content -- the publisher's
+// manifest identifies the page by what it decodes to, and a different brotli
+// library must not read as a different page.
+const CODECS = [
+  ["br", ".br", (bytes) => brotliCompressSync(bytes, { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } })],
+  ["gzip", ".gz", (bytes) => gzipSync(bytes, { level: 9 })],
+];
+const wire = [];
+for (const name of ["index.html", "editor.html", bundleName, editorName].filter(Boolean)) {
+  const bytes = await readFile(resolve(outdir, name));
+  const sizes = [];
+  for (const [codec, suffix, compress] of CODECS) {
+    const encoded = compress(bytes);
+    await writeFile(resolve(outdir, `${name}${suffix}`), encoded);
+    sizes.push(`${codec} ${Math.round(encoded.length / 1024)} KB`);
+  }
+  wire.push(`${name} ${Math.round(bytes.length / 1024)} KB (${sizes.join(", ")})`);
+}
+
+console.log(`browser host built: ${outdir}\n  ${wire.join("\n  ")}`);

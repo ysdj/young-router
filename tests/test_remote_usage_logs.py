@@ -44,9 +44,11 @@ class RemoteUsageLogsTests(unittest.TestCase):
         remote_usage_logs._TOKEN_CACHE.clear()
         remote_usage_logs._REFRESH_CACHE.clear()
         remote_usage_logs.set_rotated_refresh_sink(None)
+        remote_usage_logs.set_quota_unit_reader(None)
         self.addCleanup(remote_usage_logs._TOKEN_CACHE.clear)
         self.addCleanup(remote_usage_logs._REFRESH_CACHE.clear)
         self.addCleanup(remote_usage_logs.set_rotated_refresh_sink, None)
+        self.addCleanup(remote_usage_logs.set_quota_unit_reader, None)
 
     @staticmethod
     def write_relay_station(path: Path, origin: str, station_type: str = "newapi", account_id: str = "") -> None:
@@ -400,10 +402,103 @@ class RemoteUsageLogsTests(unittest.TestCase):
         # `use_time` is seconds; the record carries milliseconds so every family
         # lands on one unit and the column's own `(s)` label is applied once.
         self.assertEqual("1850", record["duration"])
-        self.assertEqual("1234", record["cost"])
+        # A New API row states its charge as `quota`, a count of the station's own
+        # credits, so there is no money in it until the store that owns the
+        # display unit answers — the price is a fact the relay pane's balance
+        # and this row share, not one the reader may assume.
+        self.assertNotIn("cost", record)
         # The record is exactly the fields the log view renders.
         self.assertNotIn("203.0.113.9", str(record))
         self.assertNotIn("SECRET_RESPONSE_TEXT", str(record))
+
+    def test_a_newapi_row_is_priced_in_the_stations_own_display_unit(self) -> None:
+        """`quota` is a credit count; money is that count over the site's unit.
+
+        The relay pane's balance and this row are the same number of credits, so
+        they have to land on the same dollars: a reader that assumed New API's
+        default unit would print a price the station's own dashboard does not
+        show.
+        """
+
+        asked: list[str] = []
+        remote_usage_logs.set_quota_unit_reader(
+            lambda origin: asked.append(origin) or 500_000
+        )
+        path = self.write_signed_in_config()
+        target = next(
+            t for t in remote_usage_logs.active_usage_targets(path) if t.session_headers
+        )
+
+        def opener(request, timeout):
+            return FakeResponse(
+                {
+                    "success": True,
+                    "data": {"items": [{"model_name": "row-model", "quota": 1234}]},
+                }
+            )
+
+        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
+            opener_factory.return_value.open.side_effect = opener
+            _kind, records, _status, _total, _applied = remote_usage_logs.fetch_target(target, 1)
+
+        # 1234 credits at 500 000 per unit is a fifth of a cent, and the site it
+        # was asked about is the station, not the API base that routes point at.
+        self.assertEqual("0.002468", records[0]["cost"])
+        self.assertEqual(["https://relay.example.test"], asked)
+
+    def test_a_newapi_row_reports_the_cached_prompt_it_nested_in_other(self) -> None:
+        """A New API row keeps its cache count inside `other`, as JSON text.
+
+        Reading only the top-level keys left the pane's 缓存命中 column empty on
+        a station whose own dashboard states those cached tokens plainly.
+        """
+
+        details = remote_usage_logs._row_details(
+            {
+                "model_name": "row-model",
+                "prompt_tokens": 1000,
+                "completion_tokens": 200,
+                "other": json.dumps({"cache_tokens": 880, "cache_ratio": 0.02}),
+            }
+        )
+
+        # `prompt_tokens` already includes the cached part on this shape, so the
+        # prompt is stated as given and the share is 880 of 1000.
+        self.assertEqual("1000", details["prompt_tokens"])
+        self.assertEqual("880", details["cache_read_tokens"])
+        self.assertEqual("1200", details["total_tokens"])
+        self.assertNotIn("cache_write_tokens", details)
+
+    def test_a_sub2api_ledger_row_rebuilds_the_prompt_it_states_in_pieces(self) -> None:
+        """An Anthropic-shaped row states one prompt as three separate counts.
+
+        `input_tokens` is only the uncached remainder, so a 117 000-token cached
+        prompt read as `2` in the 令牌 column: a number the row never claimed,
+        and a cache share computed against a denominator the cache was not part
+        of.
+        """
+
+        details = remote_usage_logs._row_details(
+            {
+                "model": "claude-opus-5-5",
+                # The first row this reader met on a real station.
+                "input_tokens": 2,
+                "output_tokens": 305,
+                "cache_read_tokens": 31,
+                "cache_creation_tokens": 690,
+                "total_cost": 0.0095642,
+                "actual_cost": 0.01147704,
+            }
+        )
+
+        self.assertEqual("723", details["prompt_tokens"])
+        self.assertEqual("305", details["completion_tokens"])
+        self.assertEqual("31", details["cache_read_tokens"])
+        self.assertEqual("690", details["cache_write_tokens"])
+        self.assertEqual("1028", details["total_tokens"])
+        # The wallet pays `actual_cost` — the same request after the group's
+        # multiplier — so that is the figure the price column states.
+        self.assertEqual("0.01148", details["cost"])
 
     def test_a_scoped_collect_reads_only_the_named_relay(self) -> None:
         path = self.write_signed_in_config()

@@ -275,11 +275,17 @@ def run(argv: list[str] | None = None) -> int:
             # The gate speaks the language the window speaks, and reads it per
             # request for the same reason the key is read per sign-in: an edit
             # in Language changes the form without replacing the listener.
+            # The domain's own snapshot states both halves of the preference --
+            # the choice, and what it resolved to on this machine -- because
+            # 自动 follows the browser on the page and a resolved string alone
+            # cannot say whether the reader's own language list should win.
             language = core.settings_domain("language")
 
-            def locale() -> str:
+            def locale() -> object:
+                if language is None:
+                    return "en"
                 try:
-                    return str(language.snapshot().get("resolved") or "en") if language is not None else "en"
+                    return language.snapshot()
                 except Exception:
                     return "en"
 

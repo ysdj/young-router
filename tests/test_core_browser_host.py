@@ -144,10 +144,12 @@ class BrowserPageTests(unittest.TestCase):
         (self.root / "editor.html").write_text("<!doctype html><title>Editor</title>\n", encoding="utf-8")
         (self.root.parent / "outside.txt").write_text("not part of the bundle\n", encoding="utf-8")
 
-    def _get(self, path: str, *, host: str | None = None, cookie: str | None = None, page_host: str | None = None) -> tuple[int, dict[str, str], bytes]:
+    def _get(self, path: str, *, host: str | None = None, cookie: str | None = None, page_host: str | None = None, accept_encoding: str | None = None) -> tuple[int, dict[str, str], bytes]:
         endpoint = self.server.endpoint
         connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=5)
         headers: dict[str, str] = {"Host": host} if host is not None else {}
+        if accept_encoding is not None:
+            headers["Accept-Encoding"] = accept_encoding
         # The name the browser typed, which the proxy forwards.  Stating a real
         # hostname is what makes this request a published page rather than the
         # owner's own: the loopback page is served without a key.
@@ -185,6 +187,91 @@ class BrowserPageTests(unittest.TestCase):
         self.assertEqual(200, script_status)
         self.assertIn("javascript", script_headers["content-type"])
         self.assertIn("immutable", script_headers["cache-control"])
+
+    def test_a_script_travels_in_whichever_encoding_both_ends_know(self) -> None:
+        """The bundle is 1.2 MB of text, so the wire carries a fifth of it.
+
+        The encoding is decided at build time and shipped as a sibling of the
+        asset it was built from, so Core only ever has to pick: brotli when the
+        browser reads it, gzip otherwise, and the file itself when the browser
+        says neither.  Three things have to hold for that to be safe on a
+        cacheable script -- the body, the header that names its codec, and
+        `Vary`, which is what keeps a cache from handing one browser's
+        encoding to the next.
+        """
+
+        import gzip
+        import zlib
+
+        source = "export {};\n" * 400
+        (self.root / "bundle.js").write_text(source, encoding="utf-8")
+        brotli = zlib.compress(source.encode("utf-8"))
+        geed = gzip.compress(source.encode("utf-8"))
+        (self.root / "bundle.js.br").write_bytes(brotli)
+        (self.root / "bundle.js.gz").write_bytes(geed)
+        self.server.enable_web_host(self.root, password="s3cret-word")
+
+        status, headers, body = self._get("/bundle.js", accept_encoding="gzip, deflate, br")
+        self.assertEqual(200, status)
+        self.assertEqual("br", headers["content-encoding"])
+        self.assertEqual("Accept-Encoding", headers["vary"])
+        self.assertEqual(brotli, body)
+        self.assertEqual(str(len(brotli)), headers["content-length"])
+        # Brotli wins even when the browser lists gzip first: it is the smaller
+        # of the two for this bundle, and the order of the header is a client's
+        # preference among equals, not a mandate.
+        status, headers, body = self._get("/bundle.js", accept_encoding="gzip, br")
+        self.assertEqual(("br", brotli), (headers["content-encoding"], body))
+
+        status, headers, body = self._get("/bundle.js", accept_encoding="gzip, deflate")
+        self.assertEqual((200, "gzip", geed), (status, headers["content-encoding"], body))
+
+        # A browser that accepts no encoding is served the file, and the answer
+        # still varies on the header -- the cache in front of it has to know
+        # this URL has more than one shape.
+        status, headers, body = self._get("/bundle.js")
+        self.assertEqual(200, status)
+        self.assertNotIn("content-encoding", headers)
+        self.assertEqual("Accept-Encoding", headers["vary"])
+        self.assertEqual(source.encode("utf-8"), body)
+
+        # A stated refusal is a refusal: `br;q=0` asks for the other codec.
+        _status, headers, _body = self._get("/bundle.js", accept_encoding="br;q=0, gzip")
+        self.assertEqual("gzip", headers["content-encoding"])
+        _status, headers, _body = self._get("/bundle.js", accept_encoding="*")
+        self.assertEqual("br", headers["content-encoding"])
+
+    def test_a_precompressed_sibling_is_not_an_asset_of_its_own(self) -> None:
+        """`bundle.js.br` is not a URL, it is an encoding of another one.
+
+        Nothing in the bundle's own list of content types names it, so asking
+        for it by name is the same 404 as asking for any other file this host
+        does not serve -- instead of a second copy of the script under a name
+        no cache header was written for.
+        """
+
+        import zlib
+
+        (self.root / "bundle.js.br").write_bytes(zlib.compress(b"export {};\n"))
+        self.server.enable_web_host(self.root, password="s3cret-word")
+        status, _headers, _body = self._get("/bundle.js.br")
+        self.assertEqual(404, status)
+
+    def test_a_page_with_no_sibling_is_answered_as_stored(self) -> None:
+        """A bundle staged before this build has no siblings, and still serves.
+
+        The desktop install copies whatever `dist` holds, and a host that
+        installed a page from a release may be one build behind the encoding.
+        Nothing here may read as missing: no sibling means the file itself,
+        and no `Vary` either, because the answer does not depend on the header.
+        """
+
+        self.server.enable_web_host(self.root, password="s3cret-word")
+        status, headers, body = self._get("/bundle.js", accept_encoding="br, gzip")
+        self.assertEqual(200, status)
+        self.assertNotIn("content-encoding", headers)
+        self.assertNotIn("vary", headers)
+        self.assertEqual(b"export {};\n", body)
 
     def test_only_the_editor_page_may_be_framed_and_only_by_this_origin(self) -> None:
         """The shell frames exactly one document, and no other origin may.
@@ -260,6 +347,60 @@ class BrowserPageTests(unittest.TestCase):
         self.assertIn('lang="en"', text)
         self.assertIn("Enter the access key to continue.", text)
         self.assertNotIn("Young Router", text)
+
+    def test_the_gate_follows_the_browser_only_when_the_preference_is_auto(self) -> None:
+        """自动 means the platform, and on the page the platform is the browser.
+
+        The page reads ``navigator.languages`` for exactly this, so the one
+        document a browser meets before the app must read the same list.  A
+        host whose own ``LANG`` is C.UTF-8 used to hand a Chinese browser an
+        English form and then the Chinese app; a stated preference still wins
+        over whatever the browser asks for, because that is the point of
+        stating it.
+        """
+
+        preference = {"choice": "system", "resolved": "en"}
+        self.server.enable_web_host(
+            self.root,
+            password="s3cret-word",
+            locale_provider=lambda: preference,
+        )
+        # The browser's list, ranked by its own q values, not by header order.
+        text = _get(
+            self.server,
+            "/",
+            page_host="router.example.com",
+            accept_language="fr-FR,zh-CN;q=0.9,en;q=0.4",
+        )[2].decode("utf-8")
+        self.assertIn('lang="zh-Hans"', text)
+        self.assertIn("输入访问密钥以继续。", text)
+        # A browser that asks for neither of the app's languages falls back to
+        # the machine's own resolution, which this provider states as en.
+        text = _get(self.server, "/", page_host="router.example.com", accept_language="fr-FR")[2].decode("utf-8")
+        self.assertIn('lang="en"', text)
+        # ... and the Chinese half of the same pair.
+        preference["resolved"] = "zh-Hans"
+        text = _get(self.server, "/", page_host="router.example.com", accept_language="en-US")[2].decode("utf-8")
+        self.assertIn('lang="en"', text)
+        text = _get(self.server, "/", page_host="router.example.com")[2].decode("utf-8")
+        self.assertIn('lang="zh-Hans"', text)
+
+        # A stated choice is the answer even when the browser says otherwise:
+        # the person chose it, and the gate is not a place to overrule them.
+        self.server.enable_web_host(
+            self.root,
+            password="s3cret-word",
+            locale_provider=lambda: {"choice": "zh-Hans", "resolved": "zh-Hans"},
+        )
+        text = _get(self.server, "/", page_host="router.example.com", accept_language="en-US,en;q=0.9")[2].decode("utf-8")
+        self.assertIn('lang="zh-Hans"', text)
+        self.server.enable_web_host(
+            self.root,
+            password="s3cret-word",
+            locale_provider=lambda: {"choice": "en", "resolved": "en"},
+        )
+        text = _get(self.server, "/", page_host="router.example.com", accept_language="zh-CN,zh;q=0.9")[2].decode("utf-8")
+        self.assertIn('lang="en"', text)
 
     def test_the_published_url_carries_no_credential(self) -> None:
         self.server.enable_web_host(self.root, password="s3cret-word")
@@ -879,7 +1020,14 @@ class BrowserModelChooserTests(unittest.TestCase):
             self.assertIn(f"strings?.{key} ??", leaf)
 
 
-def _get(server: CoreIPCServer, path: str, *, cookie: str | None = None, page_host: str | None = None) -> tuple[int, dict[str, str], bytes]:
+def _get(
+    server: CoreIPCServer,
+    path: str,
+    *,
+    cookie: str | None = None,
+    page_host: str | None = None,
+    accept_language: str | None = None,
+) -> tuple[int, dict[str, str], bytes]:
     endpoint = server.endpoint
     connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=5)
     headers = {"Host": f"127.0.0.1:{endpoint.port}"}
@@ -887,6 +1035,8 @@ def _get(server: CoreIPCServer, path: str, *, cookie: str | None = None, page_ho
         headers["X-Young-Router-Page-Host"] = page_host
     if cookie is not None:
         headers["Cookie"] = cookie
+    if accept_language is not None:
+        headers["Accept-Language"] = accept_language
     try:
         connection.request("GET", path, headers=headers)
         response = connection.getresponse()

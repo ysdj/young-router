@@ -201,7 +201,6 @@ private enum NativeRelayOriginPolicy {
         "paste": "Paste", "selectAll": "Select All", "settings": "Settings...",
         "reload": "Reload", "closeWindow": "Close Window", "version": "Version",
         "build": "build", "ok": "OK", "invalidText": "The document contains invalid text.",
-        "languageMenu": "Language", "languageSystem": "System", "languageEnglish": "English", "languageSimplifiedChinese": "简体中文",
         "menuQuit": "Quit Young Router",
         "routeHome": "Young Router", "routeProvidersModels": "Providers & Models",
         "routeProviderWizard": "Add Provider",
@@ -301,7 +300,6 @@ private enum NativeRelayOriginPolicy {
             return
         }
         menuActions = nextActions
-        installLanguageMenuIfAvailable()
     }
 
     func open(route: String, title: String, initialLogTab: String? = nil, warmOnly: Bool = false) {
@@ -2427,7 +2425,6 @@ private enum NativeRelayOriginPolicy {
             quitItem.target = self
             quitItem.representedObject = "native-quit"
         }
-        installLanguageMenu(in: applicationMenu)
     }
 
     public func setLaunchAtLogin(_ enabled: Bool) -> Bool {
@@ -2599,36 +2596,6 @@ private enum NativeRelayOriginPolicy {
             default: break
             }
         }
-        installLanguageMenu(in: applicationMenu)
-    }
-
-    private func installLanguageMenuIfAvailable() {
-        guard let applicationMenu = NSApp.mainMenu?.items.first?.submenu else { return }
-        installLanguageMenu(in: applicationMenu)
-    }
-
-    private func installLanguageMenu(in applicationMenu: NSMenu) {
-        applicationMenu.items
-            .filter { $0.representedObject as? String == "native-language-picker" }
-            .forEach(applicationMenu.removeItem)
-        let root = NSMenuItem(title: localized("languageMenu", fallback: "Language"), action: nil, keyEquivalent: "")
-        root.representedObject = "native-language-picker"
-        let submenu = NSMenu(title: root.title)
-        for (id, key, fallback) in [
-            ("set-language-system", "languageSystem", "System"),
-            ("set-language-en", "languageEnglish", "English"),
-            ("set-language-zh-Hans", "languageSimplifiedChinese", "简体中文"),
-        ] {
-            let choice = menuActions.first(where: { $0.id == id })
-            let item = NSMenuItem(title: localized(key, fallback: fallback), action: #selector(menuAction(_:)), keyEquivalent: "")
-            item.representedObject = id
-            item.target = self
-            item.isEnabled = choice?.enabled ?? false
-            item.state = choice?.checked == true ? .on : .off
-            submenu.addItem(item)
-        }
-        root.submenu = submenu
-        applicationMenu.addItem(root)
     }
 
     private func openNamedRoute(_ route: String) {

@@ -1965,14 +1965,22 @@ class OnlineUsageReader:
         # a rotated credential survive a restart.
         self.accounts = accounts
 
-    def _install_rotated_refresh_sink(self) -> None:
+    def _install_store_readers(self) -> None:
+        """Hand the usage reader the two facts only the account store owns.
+
+        Both are the store's own documentary reads, not a second copy kept for
+        the logs tab: the rotated refresh token it must persist, and the display
+        unit that turns a New API row's credits into the same money its balance
+        is stated in.
+        """
+
         from . import remote_usage_logs
 
         store = self.accounts
-        keeper = getattr(store, "store_rotated_refresh_token", None)
-        if not callable(keeper):
-            return
-        remote_usage_logs.set_rotated_refresh_sink(keeper)
+        remote_usage_logs.set_rotated_refresh_sink(
+            getattr(store, "store_rotated_refresh_token", None)
+        )
+        remote_usage_logs.set_quota_unit_reader(getattr(store, "quota_unit", None))
 
     def _relogin(self, account_id: str) -> bool:
         """Sign one relay account in again from its remembered password.
@@ -2025,7 +2033,7 @@ class OnlineUsageReader:
 
         from . import remote_usage_logs
 
-        self._install_rotated_refresh_sink()
+        self._install_store_readers()
         try:
             records, reason, total, page_rows = remote_usage_logs.collect(
                 self.config_path,

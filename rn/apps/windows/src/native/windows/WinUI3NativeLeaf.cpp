@@ -3083,21 +3083,13 @@ void WinUI3NativeLeaf::ShowTrayMenu() {
     if (needs_separator) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     needs_separator = false;
   };
-  HMENU language_menu = CreatePopupMenu();
+  // The tray carries the app's own actions and nothing else: the language
+  // preference lives in General, and a second copy of the same three choices
+  // here was a second place to change one setting.
   for (size_t index = 0; index < actions_.size(); ++index) {
     auto const& action = actions_[index];
-    const bool is_language_choice = action.id == L"set-language-system" ||
-        action.id == L"set-language-en" || action.id == L"set-language-zh-Hans";
-    if (action.id == L"language-picker") continue;
     UINT flags = MF_STRING | (action.enabled ? MF_ENABLED : MF_GRAYED);
     if (action.checked) flags |= MF_CHECKED;
-    if (is_language_choice) {
-      if (language_menu != nullptr) {
-        AppendMenuW(language_menu, flags,
-            kTrayMenuFirstCommand + static_cast<UINT>(index), action.title.c_str());
-      }
-      continue;
-    }
     if (action.id == L"open-general-settings" || action.id == L"open-providers-models" ||
         action.id == L"webdav-status" || action.id == L"open-data-management" ||
         action.id == L"open-logs" || action.id == L"show-version") {
@@ -3109,16 +3101,6 @@ void WinUI3NativeLeaf::ShowTrayMenu() {
         action.id == L"open-data-management" || action.id == L"open-logs") {
       needs_separator = true;
     }
-  }
-  if (language_menu != nullptr && GetMenuItemCount(language_menu) > 0) {
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    auto label = std::find_if(actions_.begin(), actions_.end(), [](auto const& action) {
-      return action.id == L"language-picker";
-    });
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(language_menu),
-        label == actions_.end() ? L"Language" : label->title.c_str());
-  } else if (language_menu != nullptr) {
-    DestroyMenu(language_menu);
   }
   POINT tray_point{};
   GetCursorPos(&tray_point);

@@ -158,13 +158,13 @@ class QoderProviderTests(unittest.TestCase):
         )
         return directory, domain, config
 
-    def test_the_wizard_create_adds_no_models(self) -> None:
-        """An add is a provider, never a roster: the wizard states an empty list.
+    def test_an_empty_model_list_creates_an_entry_without_models(self) -> None:
+        """An empty list is a statement, and stays one.
 
-        The wizard's 完成 sends ``models: []`` for both account kinds, so the
-        account's catalog cannot arrive with the entry.  Which models this app
-        serves is the user's pick in 获取模型 (选择要添加的模型), the one place a
-        catalog becomes rows.
+        The wizard's model step now names the entries it picked; a caller that
+        states an empty list (the editor's own path, or a surface that lets the
+        user start empty) still gets an entry with no routes.  Omitting the
+        field remains the different statement below.
         """
 
         directory, domain, _config = self._domain()
@@ -177,6 +177,49 @@ class QoderProviderTests(unittest.TestCase):
             # The slot still exists and is managed: the pick needs it.
             self.assertEqual(provider["key_states"][0]["name"], qoder.API_KEY_NAME)
             self.assertTrue(provider["key_states"][0]["managed"])
+
+    def test_a_wizard_pick_files_the_catalog_label_in_lower_case(self) -> None:
+        """The model step lists labels, and 完成 names the entries it picked.
+
+        A pick is a selector, not a row: the adapter owns the wire key it is
+        called by and the label Qoder's own menu shows.  Core resolves the pick
+        back to that entry and files the public name in lower case, so a client
+        never has to type the label's capitalisation while the upstream keeps
+        the key the wire uses.
+        """
+
+        runtime = StubRuntime()
+        runtime.catalog = [
+            {
+                "id": "qmodel_38max",
+                "name": "Qwen3.8-Max",
+                "publicName": "Qwen3.8-Max",
+                "contextWindow": 200_000,
+                "maxTokens": 32_000,
+                "rate": 0.5,
+            }
+        ]
+        directory, domain, _config = self._domain(runtime)
+        with directory:
+            provider = domain.dispatch(
+                "service_provider.add",
+                {"kind": "qoder_login", "name": "Qoder", "models": ["qmodel_38max"]},
+            )["providers"][0]
+            self.assertEqual(
+                [(model["name"], model["upstream_model"]) for model in provider["models"]],
+                [("qwen3.8-max", "qmodel_38max")],
+            )
+            # A selector the catalog no longer lists is refused rather than
+            # guessed: a wrong match would add a route the user did not pick.
+            with self.assertRaisesRegex(DomainError, "no longer lists"):
+                domain.dispatch(
+                    "service_provider.add",
+                    {
+                        "kind": "qoder_login",
+                        "name": "Qoder Two",
+                        "models": ["qwen3.8-gone"],
+                    },
+                )
 
     def test_a_create_that_omits_the_list_still_imports_the_catalog(self) -> None:
         """Omission is a different statement from an empty list, and stays one.

@@ -1349,7 +1349,7 @@ class RelayAccountsDomain:
         # answering; see ``BALANCE_REUSE_SECONDS``.
         self._balance_observations: dict[str, tuple[float, float]] = {}
         # The display unit the station reports, per origin; see
-        # ``_quota_per_unit``.
+        # ``quota_unit``.
         self._quota_units: dict[str, tuple[float, float]] = {}
         # Raw API keys remain process-local. They are populated from an
         # authenticated refresh/read and never enter snapshots or storage.
@@ -4727,12 +4727,12 @@ class RelayAccountsDomain:
         amount = _balance(quota)
         if amount is None:
             raise RelayAccountsError("Relay account balance is unavailable")
-        unit = self._quota_per_unit(str(account["origin"]))
+        unit = self.quota_unit(str(account["origin"]))
         if unit is None:
             raise RelayAccountsError("Relay account balance is unavailable")
         return amount / unit
 
-    def _quota_per_unit(self, origin: str) -> float | None:
+    def quota_unit(self, origin: str) -> float | None:
         """The station's display unit, read once per origin per process.
 
         ``/api/status`` is public site configuration, not something about this
@@ -4740,6 +4740,10 @@ class RelayAccountsDomain:
         that does not change.  A station this process could not read answers
         ``None`` and is asked again next time, so a momentary failure costs one
         balance rather than five minutes of them.
+
+        The usage log reads it too, because a New API log row states its charge
+        in the same credits a balance does; one reader of one number is what
+        keeps a log row and the balance above it in the same dollars.
         """
 
         now = time.monotonic()

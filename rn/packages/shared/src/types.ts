@@ -713,10 +713,6 @@ export interface NativeLocalization {
   serviceUnhealthy: string;
   serviceStopped: string;
   serviceUnknown: string;
-  languageMenu: string;
-  languageSystem: string;
-  languageEnglish: string;
-  languageSimplifiedChinese: string;
   cancel: string;
   set: string;
   clear: string;
