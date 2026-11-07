@@ -144,10 +144,15 @@ class BrowserPageTests(unittest.TestCase):
         (self.root / "editor.html").write_text("<!doctype html><title>Editor</title>\n", encoding="utf-8")
         (self.root.parent / "outside.txt").write_text("not part of the bundle\n", encoding="utf-8")
 
-    def _get(self, path: str, *, host: str | None = None, cookie: str | None = None) -> tuple[int, dict[str, str], bytes]:
+    def _get(self, path: str, *, host: str | None = None, cookie: str | None = None, page_host: str | None = None) -> tuple[int, dict[str, str], bytes]:
         endpoint = self.server.endpoint
         connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=5)
         headers: dict[str, str] = {"Host": host} if host is not None else {}
+        # The name the browser typed, which the proxy forwards.  Stating a real
+        # hostname is what makes this request a published page rather than the
+        # owner's own: the loopback page is served without a key.
+        if page_host is not None:
+            headers["X-Young-Router-Page-Host"] = page_host
         if cookie is not None:
             headers["Cookie"] = cookie
         try:
@@ -241,7 +246,7 @@ class BrowserPageTests(unittest.TestCase):
             password="s3cret-word",
             locale_provider=lambda: chosen[0],
         )
-        status, _headers, body = self._get("/")
+        status, _headers, body = self._get("/", page_host="router.example.com")
         text = body.decode("utf-8")
         self.assertEqual(200, status)
         self.assertIn('lang="zh-Hans"', text)
@@ -251,7 +256,7 @@ class BrowserPageTests(unittest.TestCase):
             self.assertNotIn(leak, text)
         # The same page in the app's other language, without a restart.
         chosen[0] = "en"
-        text = self._get("/")[2].decode("utf-8")
+        text = self._get("/", page_host="router.example.com")[2].decode("utf-8")
         self.assertIn('lang="en"', text)
         self.assertIn("Enter the access key to continue.", text)
         self.assertNotIn("Young Router", text)
@@ -265,11 +270,12 @@ class BrowserPageTests(unittest.TestCase):
         self.assertNotIn("password", url)
         self.assertNotIn("bootstrap", url)
 
-    def test_a_page_with_no_password_is_served_no_page(self) -> None:
-        # A web host nobody locked is not an unlocked web host: it is closed.
+    def test_a_page_with_no_password_is_served_no_page_to_a_published_visitor(self) -> None:
+        # A page published under a real hostname with no key is a closed page:
+        # the form is served and nothing can pass it.
         self.server.enable_web_host(self.root, password="")
         self.assertEqual("", self.server.web_host_url)
-        status, _headers, _body = _get(self.server, "/")
+        status, _headers, _body = _get(self.server, "/", page_host="router.example.com")
         self.assertEqual(200, status)
         body = _body.decode("utf-8")
         self.assertIn('type="password"', body)
@@ -277,11 +283,45 @@ class BrowserPageTests(unittest.TestCase):
 
     def test_the_login_page_is_served_instead_of_the_app_before_signing_in(self) -> None:
         self.server.enable_web_host(self.root, password="s3cret-word")
-        status, _headers, body = _get(self.server, "/")
+        status, _headers, body = _get(self.server, "/", page_host="router.example.com")
         self.assertEqual(200, status)
         self.assertIn('id="password"', body.decode("utf-8"))
         # The app's shell is not handed out yet, so nothing in it can run.
         self.assertNotIn("bundle.js", body.decode("utf-8"))
+
+    def test_the_page_on_this_machine_needs_no_key(self) -> None:
+        """127.0.0.1 is the owner's own door.
+
+        A key on a loopback page asks the person who runs this machine to
+        prove it to themselves, and the address in General -- the one the app
+        opens -- becomes a form rather than the settings.  The gate exists for
+        a page published behind a reverse proxy; a page nobody can reach but
+        the owner is served the app, with the session cookie its `/ipc` calls
+        need.
+        """
+
+        self.server.enable_web_host(self.root, password="s3cret-word")
+        for host in ("127.0.0.1", "localhost", "[::1]"):
+            status, headers, body = _get(self.server, "/", page_host=f"{host}:12390")
+            self.assertEqual(200, status)
+            text = body.decode("utf-8")
+            self.assertIn("bundle.js", text)
+            self.assertNotIn('type="password"', text)
+            # The pane reads Core over `/ipc` with this cookie: without it the
+            # page would draw its shell and then every pane would be empty.
+            cookie = headers.get("set-cookie", "")
+            self.assertIn("yr-core-session=", cookie)
+            token = cookie.split("yr-core-session=", 1)[1].split(";", 1)[0]
+            self.assertTrue(self.server._valid_session(token), "the page's cookie is a live session")
+
+    def test_a_proxied_loopback_name_is_still_the_owner(self) -> None:
+        """No forwarded name at all is a direct hit, which is loopback too."""
+
+        self.server.enable_web_host(self.root, password="s3cret-word")
+        status, headers, body = _get(self.server, "/")
+        self.assertEqual(200, status)
+        self.assertIn("bundle.js", body.decode("utf-8"))
+        self.assertIn("yr-core-session=", headers.get("set-cookie", ""))
 
     def test_the_password_opens_a_session_and_then_the_app_is_served(self) -> None:
         self.server.enable_web_host(self.root, password="s3cret-word")
@@ -340,7 +380,7 @@ class BrowserPageTests(unittest.TestCase):
         # The launch credential is one address's, not the port's: a second
         # visitor gets the form, and a wrong launch token opens nothing.
         self.server.enable_web_host(self.root, password="s3cret-word", auto_login=True)
-        self.assertIn('type="password"', self._get("/")[2].decode("utf-8"))
+        self.assertIn('type="password"', self._get("/", page_host="router.example.com")[2].decode("utf-8"))
         self.assertEqual(401, _launch_response(self.server, "not-the-token")[0])
 
     def test_a_native_install_has_no_launch_credential(self) -> None:
@@ -731,10 +771,120 @@ class BrowserGroupManagerTests(unittest.TestCase):
         self.assertIn("selected.hint !== \"\" ? \"••••••••\"", sheet)
 
 
-def _get(server: CoreIPCServer, path: str, *, cookie: str | None = None) -> tuple[int, dict[str, str], bytes]:
+class BrowserWindowEdgeTests(unittest.TestCase):
+    """The page's app window has to end somewhere.
+
+    The shell frame's fill and the page's own backdrop were the same literal
+    (`#f7f7f7`, `windowBackgroundColor`), so a centred frame dissolved into the
+    page: there was no edge, no rule, and nothing that said where the app
+    stopped.  A native host gets that line from its window server.
+    """
+
+    shared = Path(__file__).resolve().parents[1] / "rn/packages/shared/src"
+    web = Path(__file__).resolve().parents[1] / "rn/apps/web"
+
+    def test_the_shell_draws_its_own_edge(self) -> None:
+        ui = (self.shared / "ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
+        frame = ui.split("webShellFrame: {", 1)[1].split("},", 1)[0]
+        self.assertIn("borderWidth: 1", frame)
+        self.assertIn('borderColor: "#b8b8c0"', frame)
+        self.assertIn("shadowOpacity", frame)
+        # Both shell layouts: a narrow window is still a window.
+        self.assertEqual(2, ui.count("Platform.OS === \"web\" && styles.webShellFrame"))
+
+    def test_the_page_is_its_own_surface(self) -> None:
+        build = (self.web / "build.mjs").read_text(encoding="utf-8")
+        # Not `#f7f7f7`: that is `windowBackgroundColor`, the app's own fill.
+        self.assertIn("background: #e3e3e8;", build)
+        self.assertNotIn("background: #f7f7f7;", build)
+
+
+class BrowserAddressTests(unittest.TestCase):
+    """The address in General is the address this page was opened at.
+
+    A Core that derives it from its own port prints the loopback address even
+    to a window opened through a reverse proxy, where `127.0.0.1` names the
+    reader's own machine and opens nothing.  The page can read its own origin,
+    so on this host it states that.
+    """
+
+    ui = (Path(__file__).resolve().parents[1] / "rn/packages/shared/src/ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
+
+    def test_the_page_states_the_origin_it_was_opened_at(self) -> None:
+        panel = self.ui.split("const webPageAddress = (() => {", 1)[1].split("})();", 1)[0]
+        self.assertIn('if (Platform.OS === "web" && typeof window !== "undefined"', panel)
+        self.assertIn("return `${window.location.origin}/ui`;", panel)
+        # The native hosts have no address bar: they keep the derivation.
+        self.assertIn('return port ? `http://127.0.0.1:${port}/ui` : "";', panel)
+
+    def test_the_proxy_states_the_name_the_browser_used(self) -> None:
+        forward = (Path(__file__).resolve().parents[1] / "young_router/proxy/web_forward.py").read_text(encoding="utf-8")
+        # Core sees a loopback `Host` on every forwarded request, so the name
+        # the person typed has to travel beside it.
+        self.assertIn('PUBLISHED_HOST_HEADER = "X-Young-Router-Page-Host"', forward)
+        self.assertIn("outbound.append((PUBLISHED_HOST_HEADER, page_host))", forward)
+
+
+class BrowserModelChooserTests(unittest.TestCase):
+    """选择要添加的模型 is a surface, not a list in a box.
+
+    The two native hosts build it with a heading, the provider and key it is
+    choosing for, a search field, 全选 and 反选 over the rows the search left,
+    and a count that follows both.  The page drew the checkboxes and a footer,
+    so a station offering ninety models could only be browsed by scrolling.
+    """
+
+    shared = Path(__file__).resolve().parents[1] / "rn/packages/shared/src"
+
+    def test_the_page_offers_the_same_four_controls(self) -> None:
+        chrome = (self.shared / "ui/HostChrome.tsx").read_text(encoding="utf-8")
+        self.assertIn('const labels = request.labels;', chrome)
+        self.assertIn('<NativeTextField\n        value={query}', chrome)
+        self.assertIn('title={labels.selectAll}', chrome)
+        self.assertIn('title={labels.invert}', chrome)
+        self.assertIn('request.models.length === 0 ? labels.empty : labels.noMatches', chrome)
+
+    def test_the_chooser_opens_with_nothing_ticked(self) -> None:
+        chrome = (self.shared / "ui/HostChrome.tsx").read_text(encoding="utf-8")
+        # It used to open with the whole list selected, so 添加已选模型 added
+        # every model the station offered without anyone ticking one.
+        self.assertIn("const [selected, setSelected] = React.useState<string[]>([]);", chrome)
+
+    def test_the_filter_folds_the_way_the_appkit_list_does(self) -> None:
+        chrome = (self.shared / "ui/HostChrome.tsx").read_text(encoding="utf-8")
+        # A search for `flash` has to find `GLM-5.3-FLASH-FREE`, and a full-width
+        # name typed in half-width has to find itself.
+        self.assertIn('model.normalize("NFKC").toLocaleLowerCase()', chrome)
+        self.assertIn('query.trim().normalize("NFKC").toLocaleLowerCase()', chrome)
+
+    def test_select_all_and_invert_act_on_the_visible_rows(self) -> None:
+        chrome = (self.shared / "ui/HostChrome.tsx").read_text(encoding="utf-8")
+        # 全选当前可见模型 is what the tooltip promises: ticking the ninety rows
+        # the filter hid would be a different promise, and an inverting one that
+        # also flipped hidden rows would drop a selection nobody touched.
+        self.assertIn('const selectAllVisible = (): void => setSelected((current) => [...current, ...visible.filter((model) => !current.includes(model))]);', chrome)
+        self.assertIn('const hidden = current.filter((model) => !visible.includes(model));', chrome)
+
+    def test_the_words_come_from_the_apps_localization(self) -> None:
+        leaf = (self.shared / "platform/browserLeaf.ts").read_text(encoding="utf-8")
+        # `modelChooserHeading` is not in this list on purpose: the card's own
+        # title row states it (a card has no window chrome to repeat it in).
+        for key in (
+            "modelChooserProvider", "modelChooserKey",
+            "modelChooserSearch", "modelChooserAll", "modelChooserSelectAllVisible",
+            "modelChooserInvert", "modelChooserInvertVisible", "modelChooserCount",
+            "modelChooserCountFiltered", "modelChooserCountSelected",
+            "modelChooserEmpty", "modelChooserNoMatches",
+        ):
+            self.assertIn(f"strings?.{key} ??", leaf)
+
+
+def _get(server: CoreIPCServer, path: str, *, cookie: str | None = None, page_host: str | None = None) -> tuple[int, dict[str, str], bytes]:
     endpoint = server.endpoint
     connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=5)
     headers = {"Host": f"127.0.0.1:{endpoint.port}"}
+    if page_host is not None:
+        headers["X-Young-Router-Page-Host"] = page_host
     if cookie is not None:
         headers["Cookie"] = cookie
     try:

@@ -45,6 +45,12 @@ SUBSCRIPTION_QUEUE_LIMIT = 32
 
 _SECRET_FIELDS: dict[tuple[str, str], bool] = {
     ("providers_models", "api_key"): True,
+    # A Qoder PAT is a real upstream credential, but it belongs to the Qoder
+    # worker's own store rather than to the provider key editor: the wizard
+    # stages it under this field, the sign-in action hands it to the worker,
+    # and the worker writes it to its 0600 file.  Keying the slot by region
+    # means one window's paste can never answer for the other region.
+    ("providers_models", "qoder_pat"): True,
     ("codex", "api_key"): False,
     ("claude", "deployment_token"): False,
     ("claude", "desktop_gateway_api_key"): False,
@@ -1025,6 +1031,7 @@ class CoreStore:
         file_capabilities: FileCapabilityRegistry | None = None,
         service_handlers: Mapping[str, Callable[[str], object]] | None = None,
         workbuddy_runtime: object | None = None,
+        qoder_runtime: object | None = None,
         our_free_model_runtime: object | None = None,
     ) -> None:
         self._lock = threading.RLock()
@@ -1035,6 +1042,9 @@ class CoreStore:
         # The WorkBuddy worker is Core-owned: it must not outlive the process
         # that keeps its credential copy and its loopback bearer.
         self._workbuddy_runtime = workbuddy_runtime
+        # The Qoder worker is Core-owned for the same reason: it stores the
+        # region's PAT and holds the loopback bearer every Qoder route uses.
+        self._qoder_runtime = qoder_runtime
         # The Our Free Model worker is Core-owned for the same reason: it must
         # not outlive the process that holds its loopback bearer.
         self._our_free_model_runtime = our_free_model_runtime
@@ -1162,6 +1172,7 @@ class CoreStore:
         from .operations import CoreServiceController
         from .provider_auth import ProviderAuthManager
         from ..adapters.workbuddy import WorkBuddyRuntime
+        from ..adapters.qoder import QoderRuntime
         from ..adapters.our_free_model import OurFreeModelRuntime
 
         controller = CoreServiceController(runtime_root)
@@ -1182,6 +1193,11 @@ class CoreStore:
         # so the proxy child receives the very base URLs it is serving.
         workbuddy_runtime = WorkBuddyRuntime(resolved_runtime_root)
         controller.attach_workbuddy(workbuddy_runtime)
+        # One worker per Core process serves both Qoder regions; the service
+        # controller and the provider domain share that instance so the proxy
+        # child receives the very base URLs it is serving.
+        qoder_runtime = QoderRuntime(resolved_runtime_root)
+        controller.attach_qoder(qoder_runtime)
         # One worker per Core process serves every Our Free Model route; the
         # service controller and the provider domain share that instance so the
         # proxy child receives the very base URL it is serving.
@@ -1258,6 +1274,7 @@ class CoreStore:
                     resolved_config_path,
                     auth_manager=provider_auth,
                     workbuddy=workbuddy_runtime,
+                    qoder=qoder_runtime,
                     our_free_model=our_free_model_runtime,
                 ),
             ),
@@ -1362,6 +1379,7 @@ class CoreStore:
             domains=adapters,
             service_handlers=service_handlers,
             workbuddy_runtime=workbuddy_runtime,
+            qoder_runtime=qoder_runtime,
             our_free_model_runtime=our_free_model_runtime,
         )
         if isinstance(initial_service, Mapping):
@@ -1428,7 +1446,7 @@ class CoreStore:
     def _stop_managed_workers(self) -> None:
         """Stop every Core-owned worker; never fail Core shutdown."""
 
-        for runtime in (self._workbuddy_runtime, self._our_free_model_runtime):
+        for runtime in (self._workbuddy_runtime, self._qoder_runtime, self._our_free_model_runtime):
             if runtime is None:
                 continue
             try:
@@ -3773,7 +3791,15 @@ class CoreStore:
         if (
             domain_value is not None
             and _canonical_domain(domain_value) == "providers_models"
-            and normalized_action in {"workbuddy_status", "our_free_model_status"}
+            and normalized_action in {
+                "workbuddy_status",
+                "qoder_status",
+                "qoder_models",
+                "qoder_login",
+                "qoder_logout",
+                "qoder_open_app",
+                "our_free_model_status",
+            }
         ):
             return self._dispatch_worker_status(
                 action_type,
@@ -4064,6 +4090,10 @@ class CoreStore:
                             "workbuddy_status": "workbuddy_status",
                             "workbuddy_models": "workbuddy_models",
                             "workbuddy_login": "workbuddy_login",
+                            "qoder_status": "qoder_status",
+                            "qoder_models": "qoder_models",
+                            "qoder_login": "qoder_login",
+                            "qoder_logout": "qoder_logout",
                             "our_free_model_status": "our_free_model_status",
                             "our_free_model_models": "our_free_model_models",
                             "model_import_service_catalog": "model_import_service_catalog",

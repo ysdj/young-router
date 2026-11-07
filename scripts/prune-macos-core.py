@@ -84,7 +84,7 @@ def deduplicate_node_assets(adapters: Path) -> tuple[int, int]:
     """
 
     candidates: list[Path] = []
-    for package in ("connect-workbuddy", "dsh-vision-router"):
+    for package in ("connect-workbuddy", "connect-qoder", "dsh-vision-router"):
         dependency_root = adapters / package / "node_modules"
         if dependency_root.is_dir():
             candidates.extend(
@@ -122,11 +122,12 @@ def deduplicate_node_assets(adapters: Path) -> tuple[int, int]:
 
 def prune_core(core: Path) -> None:
     adapters = core / "young_router" / "adapters"
-    for package in ("connect-workbuddy", "dsh-vision-router"):
+    for package in ("connect-workbuddy", "connect-qoder", "dsh-vision-router"):
         prune_tree(adapters / package, node=True)
 
     for node_modules in (
         adapters / "connect-workbuddy" / "node_modules",
+        adapters / "connect-qoder" / "node_modules",
         adapters / "dsh-vision-router" / "node_modules",
     ):
         # Package-manager bookkeeping is useful only while staging; Node's

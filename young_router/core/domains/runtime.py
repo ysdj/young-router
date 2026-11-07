@@ -16,6 +16,7 @@ from typing import Any
 
 import yaml
 
+from .. import host_profile
 from ..persistence import PersistenceError, atomic_write_text
 from ..security import REDACTED, safe_exception_message
 from ._shared import (
@@ -128,6 +129,13 @@ def _dsh_set_json_value(payload: dict[str, Any], key: str, value: str) -> None:
 #: than becoming a second setting Core owns: the provider editor, the Codex
 #: editor, the staged runtime copy and any hand edit already read it there.
 MASTER_KEY_SETTING = "YOUNG_ROUTER_MASTER_KEY"
+#: The one setting a host may state instead of storing.
+#:
+#: The port the proxy listens on is published in a reverse proxy and a health
+#: probe, both of which name a number; a host that serves other people's clients
+#: states it in its own environment rather than letting a document that travelled
+#: over WebDAV choose one (see ``host_profile.stated_port``).
+PORT_SETTING = "LITELLM_PORT"
 #: The value a document that states no key is read as, and the one a restore
 #: writes. ``config.example.yaml`` publishes the same default.
 DEFAULT_MASTER_KEY = "sk-young-router"
@@ -368,6 +376,13 @@ class RuntimeSettingsDomain:
         # marker (``inherit``/empty), so the field metadata has the same
         # meaning as the displayed value.
         display_default = _DSH_VISION_ROUTER_DEFAULTS.get(key, default)
+        # A host publishes its port in a reverse proxy and a health probe; the
+        # document cannot choose another one (see host_profile.stated_port).
+        # Reporting the stored-or-default number here would state a port this
+        # machine will never listen on.
+        stated_port = host_profile.stated_port() if key == PORT_SETTING else None
+        if stated_port is not None:
+            value = str(stated_port)
         metadata = self._metadata.get(key, {})
         is_secret = key in self._SECRET_KEYS or metadata.get("secret") is True
         configured = value != display_default
@@ -409,6 +424,11 @@ class RuntimeSettingsDomain:
             "secret": is_secret,
             "hidden": bool(metadata.get("hidden", False)),
             "retain_existing": str(metadata.get("retain_existing", "")),
+            # The page draws a stated value without offering to replace it: a
+            # port this host publishes is not a preference of the document.
+            # Stated only when this machine states one, so a desktop pane is
+            # unchanged.
+            "host_stated": stated_port is not None,
         }
 
     def _is_secret_setting(self, key: str) -> bool:
@@ -553,6 +573,11 @@ class RuntimeSettingsDomain:
         key = data.get("key")
         if not isinstance(key, str) or key not in self.specs:
             raise DomainError("Runtime settings contain an unsupported field")
+        if key == PORT_SETTING and host_profile.stated_port() is not None:
+            # A stored value would sit inert in the document and read as a
+            # change that never happened: the host states this port in its
+            # unit, its reverse proxy and its health probe.
+            raise DomainError("This host states its port; the port is not a document setting")
         value = data.get("value")
         if isinstance(value, bool):
             if self.specs[key].kind == "bool_auto":

@@ -846,14 +846,12 @@ def _served_spellings(renames: Mapping[str, str], served: set[str]) -> dict[str,
     """Every name a stored reference may mean, by identity.
 
     ``renames`` reads an old public name as the one that replaced it, and
-    ``served`` is what the document now serves.  Both sides are indexed by
-    identity rather than by spelling, so a reference that states another case of
-    a served group resolves to the group instead of being dropped as unknown.
+    ``served`` is what the document now serves.  Both sides are matched by the
+    name itself: an import states the spelling a model is filed under, so a
+    reference that states another case of it does not name that group.
     """
 
-    spellings: dict[str, str] = {}
-    for name in served:
-        spellings.setdefault(public_name_key(name), name)
+    spellings: dict[str, str] = {public_name_key(name): name for name in served}
     for old, new in renames.items():
         target = spellings.get(public_name_key(new)) or (new if new in served else "")
         if target:
@@ -895,13 +893,14 @@ def _group_references_restated(
     """Restate every group reference in one ``router_settings`` map.
 
     ``renames`` reads an old public name as the one that replaced it, and
-    ``served`` is the set of names the configuration now serves.  Both are
-    matched by identity, not by spelling (``_served_spellings``): a reference
-    the user wrote in another case names the group the document serves, and is
-    restated to that group's own spelling.  A reference to a name that is in
-    neither is dropped, and named in the second return value: the Router would
-    never look such a group up, so keeping it only makes the group's own
-    failover list read as one hop longer than it is.
+    ``served`` is the set of names the configuration now serves.  A reference is
+    resolved by the name it states (``_served_spellings``) and restated to that
+    group's own spelling.  A reference to a name that is in neither is dropped,
+    and named in the second return value: the Router would never look such a
+    group up, so keeping it only makes the group's own failover list read as one
+    hop longer than it is.  A differently-cased reference is one of those -- the
+    spelling is the identity, and an import already settled it -- so a document
+    that states a group in another case must say the same case here.
 
     Returns the rewritten map (a plain dict, so a caller can dump it) and the
     dropped names in document order.  The map is the input object itself when no
@@ -971,60 +970,36 @@ def _group_references_restated(
 
 
 def _unique_model_groups(active_entries: list[dict[str, Any]], existing_groups: list[Any] | None = None) -> list[str]:
-    """The public names this document serves, once each per identity.
+    """The public names this document serves, once each.
 
-    A group is one *identity*, not one spelling (``public_names.public_name_key``):
-    ``minimax-m3.1-flash`` and ``MiniMax-M3.1-Flash`` are one name a client
-    asks in two cases, and listing both published a group table that promised a
-    second group for rows the Router keeps in the first one's deployment set.
+    A name is the identity (``public_names.public_name_key``): the import states
+    which spelling a model is filed under, and two spellings of one name are two
+    groups in the Router's deployment table, so the group table lists each one
+    the document actually carries.
 
     Order is the existing table's, then the routes': a save never reorders a
-    group table the user did not touch.  The *spelling* is the group's own
-    (``_preferred_public_spelling``), so one group is one entry whatever case
-    its rows state.
+    group table the user did not touch.  A stored entry the document no longer
+    serves is dropped, because no route would answer it.
     """
 
     active_names: list[str] = []
-    active_by_key: dict[str, list[str]] = {}
     for entry in active_entries:
-        name = str(entry.get("model_name", "")).strip()
-        key = public_name_key(name)
-        if not key:
-            continue
-        spellings = active_by_key.setdefault(key, [])
-        if not spellings:
-            active_names.append(key)
-        if name not in spellings:
-            spellings.append(name)
+        name = public_name_key(entry.get("model_name", ""))
+        if name and name not in active_names:
+            active_names.append(name)
 
-    preferred = {key: _preferred_public_spelling(names) for key, names in active_by_key.items()}
     groups: list[str] = []
     seen: set[str] = set()
     for group in existing_groups or []:
-        key = public_name_key(group)
-        if key in active_by_key and key not in seen:
-            groups.append(preferred[key])
-            seen.add(key)
-    for key in active_names:
-        if key not in seen:
-            groups.append(preferred[key])
-            seen.add(key)
+        name = public_name_key(group)
+        if name in active_names and name not in seen:
+            groups.append(name)
+            seen.add(name)
+    for name in active_names:
+        if name not in seen:
+            groups.append(name)
+            seen.add(name)
     return groups
-
-
-def _preferred_public_spelling(spellings: list[str]) -> str:
-    """The one spelling a group publishes, out of the cases its rows state.
-
-    A lower-case spelling wins: it is the one a client is most likely to send,
-    and the one the other rows can always be folded onto.  With no lower-case
-    spelling among them the first one stands, so the group is named by a row the
-    document already carries rather than by one this writer invented.  The pane
-    applies the same rule (``publicModelNames.preferredPublicSpelling``), so the
-    settings field and the saved group table name the group the same way.
-    """
-
-    folded = [name for name in spellings if name == name.casefold()]
-    return folded[0] if folded else spellings[0]
 
 
 def _write_atomic(path: pathlib.Path, text: str) -> None:

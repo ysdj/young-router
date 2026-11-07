@@ -527,6 +527,25 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
       keyName,
       confirmLabel: strings?.modelChooserAddSelected ?? "",
       cancelLabel: strings?.cancel ?? "",
+      // The chooser is a surface, not a sentence: the native hosts build it with
+      // a heading, a provider/key line, a search field, 全选/反选 and a count,
+      // and this host drew only the checkboxes and the two buttons.  Every word
+      // below is the same string the native leaves read from their table, so the
+      // three hosts offer the same chooser.
+      labels: {
+        providerLabel: strings?.modelChooserProvider ?? "",
+        keyLabel: strings?.modelChooserKey ?? "",
+        search: strings?.modelChooserSearch ?? "",
+        selectAll: strings?.modelChooserAll ?? "",
+        selectAllToolTip: strings?.modelChooserSelectAllVisible ?? "",
+        invert: strings?.modelChooserInvert ?? "",
+        invertToolTip: strings?.modelChooserInvertVisible ?? "",
+        count: strings?.modelChooserCount ?? "",
+        countFiltered: strings?.modelChooserCountFiltered ?? "",
+        countSelected: strings?.modelChooserCountSelected ?? "",
+        empty: strings?.modelChooserEmpty ?? "",
+        noMatches: strings?.modelChooserNoMatches ?? "",
+      },
     }),
     editSecret: async () => undefined,
     clearSecret: async (domain, field, target) => {

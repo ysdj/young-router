@@ -130,7 +130,7 @@ def prune_vendored_repository_data(adapters: Path) -> None:
 
 def prune_core(core: Path) -> None:
     adapters = core / "young_router" / "adapters"
-    for package in ("connect-workbuddy", "dsh-vision-router", "our-free-model"):
+    for package in ("connect-workbuddy", "connect-qoder", "dsh-vision-router", "our-free-model"):
         prune_node_tree(adapters / package)
     prune_vendored_repository_data(adapters)
     prune_python_runtime(core / "runtime" / "bin")

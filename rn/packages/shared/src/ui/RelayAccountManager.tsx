@@ -696,12 +696,13 @@ export function StationAccountsPanel({
   const [stationBusy, setStationBusy] = useState(false);
   const accountsRef = useRef(stationAccounts);
   accountsRef.current = stationAccounts;
-  // The account list owns the selection: an explicitly cleared one (a click
-  // below the rows) leaves the editor and its − empty instead of acting on an
-  // account the list no longer highlights, while the first account still
-  // opens the pane on load.
+  // The account list owns the selection, and it always names an account: a row
+  // the station no longer lists (nothing chosen yet, or the account was removed)
+  // falls back to the first one.  An empty selection is not a state this window
+  // has — it would leave the editor and its − standing on nothing, with no row
+  // highlighted to say why.
   const selected = stationAccounts.find((account) => account.id === selectedID)
-    ?? (selectedID === undefined ? stationAccounts[0] : undefined);
+    ?? stationAccounts[0];
   // The window's own busy flag describes work another surface started — an
   // Apply of the pane the user just left, an official sign-in, a data-management
   // read.  Every control here acts on this station account and stages through
@@ -790,7 +791,6 @@ export function StationAccountsPanel({
     return Boolean(state?.session || state?.checking || state?.resources);
   };
   useEffect(() => {
-    if (selectedID === "") return;
     if (selected && selected.id === selectedID) return;
     setSelectedID(selected?.id);
   }, [selected, selectedID]);

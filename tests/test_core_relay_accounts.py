@@ -3086,7 +3086,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
 
     def test_newapi_import_stages_provider_models_and_keeps_key_private(self) -> None:
         responses = {
-            "/api/user/models": {"success": True, "data": ["chat-a", "chat-b", "chat-a"]},
+            "/api/user/models": {"success": True, "data": ["chat-a", "Chat-B", "chat-a"]},
             "/api/token/?p=1&size=100": {
                 "success": True,
                 "data": {"items": [{"id": 7, "status": 1, "key": "masked"}]},
@@ -3119,11 +3119,15 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertEqual(2, result["model_count"])
             public = providers.snapshot()["providers"][0]
             self.assertTrue(public["api_key_configured"])
+            # The station spelled one model in title case, and the independent
+            # import files the name a client types in lower case while the wire
+            # keeps the station's own id.
             self.assertEqual(["chat-a", "chat-b"], [model["model_name"] for model in public["models"]])
             self.assertNotIn("replace-relay-key", json.dumps(result))
             private = providers.export(include_sensitive=True)["providers"][0]
             self.assertEqual("sk-replace-relay-key", private["api_key"])
             self.assertEqual("openai/chat-a", private["models"][0]["litellm_model"])
+            self.assertEqual("openai/Chat-B", private["models"][1]["litellm_model"])
             self.assertEqual(["/api/token/7/key"], [path for _, path, _ in fake.post_requests])
             self.assertTrue(all(headers["Authorization"] == "Bearer replace-dashboard-token" for _, _, headers in fake.requests))
             self.assertTrue(all(headers["Cookie"] == "session=replace-cookie" for _, _, headers in fake.requests))

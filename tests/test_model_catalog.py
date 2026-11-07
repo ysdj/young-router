@@ -636,6 +636,40 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual(95, model["effective_context_window_percent"])
         self.assertEqual(950_000, model["context_window"] * model["effective_context_window_percent"] // 100)
 
+    def test_declared_policy_answers_for_the_prefixed_deployment_spelling(self) -> None:
+        """A declared name must reach the ids a deployment actually states.
+
+        ``glm-5.3-flash`` lives behind relays, so every deployment of the group
+        spells its model with an upstream prefix (``openai/glm-5.3-flash``).
+        A provider-qualified id is never suffix-matched on purpose -- picking
+        whichever catalogue entry ends in the same name is how a relay route was
+        handed a third party's reasoning ladder -- but a record this app
+        declares for the model itself is not that guess.  Without this rule the
+        listing answered through the bare name while the request path answered
+        nothing at all, so the published ladder was decoration.
+        """
+
+        with mock.patch("litellm.model_cost", {}):
+            prefixed = ModelContextRegistry(
+                refresh_enabled=False
+            ).reasoning_for_model_id("sisct2/openai/glm-5.3-flash")
+            openai_prefixed = ModelContextRegistry(
+                refresh_enabled=False
+            ).reasoning_for_model_id("openai/glm-5.3-flash")
+
+        self.assertIsNotNone(prefixed)
+        assert prefixed is not None
+        self.assertEqual(("low", "high", "max"), prefixed.supported_levels)
+        # The relay only thinks at the top of its dial, and the declaration
+        # states that instead of forwarding a tier that produces nothing.
+        self.assertIsNotNone(prefixed.thinking_level_map)
+        assert prefixed.thinking_level_map is not None
+        self.assertEqual("max", prefixed.thinking_level_map["high"])
+        self.assertEqual("low", prefixed.thinking_level_map["low"])
+        self.assertIsNotNone(openai_prefixed)
+        assert openai_prefixed is not None
+        self.assertEqual(prefixed.thinking_level_map, openai_prefixed.thinking_level_map)
+
     def test_suffix_lookup_keeps_safest_window_when_provider_copies_differ(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             cache = Path(directory) / "contexts.json"

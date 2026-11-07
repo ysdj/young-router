@@ -27,6 +27,7 @@ import urllib.request
 import uuid
 
 from ...browser_identity import browser_request_headers
+from ...public_names import imported_public_name
 from ..persistence import AtomicJSONStore, PersistenceError, read_bytes
 from ..security import safe_exception_message
 
@@ -6637,9 +6638,14 @@ class RelayAccountsDomain:
             api_keys.append({"name": key_name, "value": key})
             models = [item for item in models if str(item.get("api_key_name", "")) != key_name]
             for model in resource["models"]:
+                # Independent mode writes the rows itself, so it states the one
+                # spelling an import files (``public_names.imported_public_name``)
+                # beside the station's own id.  The linked path reaches the same
+                # rule through ``stage_relay_import``; a roster spelled in title
+                # case must not become the name a client has to match case for.
                 models.append(
                     {
-                        "model_name": model,
+                        "model_name": imported_public_name(model),
                         "litellm_model": f"openai/{model}",
                         "provider": provider_id,
                         "api_base": resource["api_base"],

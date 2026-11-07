@@ -1488,6 +1488,93 @@ class CoreOperationsTests(unittest.TestCase):
         ), mock.patch.object(controller, "_recorded_proxy_is_orphaned", return_value=4242):
             self.assertEqual("stopped", controller.status()["state"])
 
+    def test_a_host_port_outranks_a_document_that_states_another_one(self) -> None:
+        """The vhost and the health probe name a number; the document cannot.
+
+        A gateway publishes its port in its reverse proxy and its probe, so a
+        stored value (or one that arrived over WebDAV) must not move the
+        listener those two already point at.  The pane states the same number
+        for the same reason, and refuses to store a competing one: a value that
+        sits inert in the document reads as a change that happened.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text("general_settings:\n  master_key: sk-young-router\n", encoding="utf-8")
+            (root / "runtime-settings.env").write_text("LITELLM_PORT=12390\n", encoding="utf-8")
+
+            with mock.patch.dict(
+                "os.environ", {"YOUNG_ROUTER_HOST_PROFILE": "gateway", "LITELLM_PORT": "4401"}
+            ):
+                environment = CoreServiceController(root)._runtime_env()
+                self.assertEqual("4401", environment["LITELLM_PORT"])
+                domain = RuntimeSettingsDomain(root / "runtime-settings.env", config_path=config)
+                field = next(item for item in domain.snapshot()["fields"] if item["id"] == "LITELLM_PORT")
+                self.assertEqual("4401", field["value"])
+                self.assertTrue(field["host_stated"])
+                with self.assertRaisesRegex(DomainError, "host states its port"):
+                    domain.dispatch("set_setting", {"key": "LITELLM_PORT", "value": "5000"})
+
+            # A desktop publishes nothing, so there the setting is the only
+            # writer and the pane keeps offering it.
+            with mock.patch.dict("os.environ", {}, clear=False):
+                os.environ.pop("YOUNG_ROUTER_HOST_PROFILE", None)
+                self.assertEqual("12390", CoreServiceController(root)._runtime_env()["LITELLM_PORT"])
+                desktop = RuntimeSettingsDomain(root / "runtime-settings.env", config_path=config)
+                field = next(item for item in desktop.snapshot()["fields"] if item["id"] == "LITELLM_PORT")
+                self.assertEqual("12390", field["value"])
+                self.assertFalse(field["host_stated"])
+                desktop.dispatch("set_setting", {"key": "LITELLM_PORT", "value": "5000"})
+
+    def test_a_host_refuses_an_occupied_port_instead_of_stepping_forward(self) -> None:
+        """Landing on the next free port is a 502 that every pane calls running."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(directory)
+            with mock.patch.object(controller, "status", return_value={"state": "stopped"}), mock.patch.object(
+                controller, "_stage_runtime_config"
+            ), mock.patch.object(
+                controller, "_runtime_env", return_value={"LITELLM_PORT": "4401", "LITELLM_HEALTH_WAIT_SECONDS": "1"}
+            ), mock.patch.dict(
+                "os.environ", {"YOUNG_ROUTER_HOST_PROFILE": "gateway", "LITELLM_PORT": "4401"}
+            ), mock.patch.object(
+                controller, "_port_available", return_value=False
+            ), mock.patch.object(controller, "_first_free_port") as stepped, mock.patch(
+                "young_router.core.operations.subprocess.Popen"
+            ) as popen:
+                with self.assertRaisesRegex(RuntimeError, "occupied: 4401"):
+                    controller.start()
+            popen.assert_not_called()
+            stepped.assert_not_called()
+
+    def test_a_host_launches_on_the_port_it_states(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            controller = CoreServiceController(directory)
+            process = mock.Mock()
+            process.pid = 4242
+            process.poll.return_value = None
+            with mock.patch.object(
+                controller, "status", side_effect=[{"state": "stopped"}, {"state": "running", "port": 4401}]
+            ), mock.patch.object(controller, "_stage_runtime_config"), mock.patch.object(
+                controller, "_runtime_env", return_value={"LITELLM_PORT": "12390", "LITELLM_HEALTH_WAIT_SECONDS": "1"}
+            ), mock.patch.dict(
+                "os.environ", {"YOUNG_ROUTER_HOST_PROFILE": "gateway", "LITELLM_PORT": "4401"}
+            ), mock.patch.object(
+                controller, "_port_available", return_value=True
+            ), mock.patch.object(controller, "_first_free_port") as stepped, mock.patch.object(
+                controller, "_write_owner_record"
+            ), mock.patch.object(
+                controller, "_health", return_value=True
+            ), mock.patch(
+                "young_router.core.operations.subprocess.Popen", return_value=process
+            ) as popen:
+                controller.start()
+            stepped.assert_not_called()
+            command = popen.call_args[0][0]
+            self.assertEqual("4401", command[command.index("--port") + 1])
+            self.assertEqual("4401", popen.call_args[1]["env"]["LITELLM_PORT"])
+
     def test_unhealthy_start_cleans_the_owned_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller = CoreServiceController(directory)

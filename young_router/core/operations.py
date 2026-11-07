@@ -31,7 +31,6 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from ..browser_identity import browser_request_headers
-from .. import adapters as managed_adapters
 from .. import config_paths
 from ..dsh_config_keys import (
     DSH_VISION_ROUTER_CONFIG_KEY as _DSH_VISION_ROUTER_CONFIG_KEY,
@@ -387,6 +386,8 @@ class CoreServiceController:
         # Set by ``attach_workbuddy`` when Core owns a WorkBuddy worker; a
         # bare controller (tests, CLI probes) simply has none.
         self._workbuddy: object | None = None
+        # Set by ``attach_qoder`` when Core owns a Qoder worker.
+        self._qoder: object | None = None
         # Set by ``attach_our_free_model`` when Core owns the Our Free Model
         # worker; a bare controller (tests, CLI probes) simply has none.
         self._our_free_model: object | None = None
@@ -400,6 +401,11 @@ class CoreServiceController:
         """Share the Core-owned WorkBuddy worker with this controller."""
 
         self._workbuddy = runtime
+
+    def attach_qoder(self, runtime: object | None) -> None:
+        """Share the Core-owned Qoder worker with this controller."""
+
+        self._qoder = runtime
 
     def set_web_endpoint(self, address: str, port: int) -> None:
         """State where the page and its API are answered.
@@ -418,16 +424,24 @@ class CoreServiceController:
 
         self._our_free_model = runtime
 
-    def _runtime_config_references_workbuddy(self) -> bool:
-        """Whether the staged config routes anything through a managed worker.
+    def _runtime_config_references(self, module: object) -> bool:
+        """Whether the staged config routes anything through one worker.
 
         The dumper writes a managed route's base URL as the ``os.environ/``
         reference Core publishes for its worker, so the reference itself — not
-        the product — is what a config is asked about.  Any worker that
-        publishes one is covered by the same question.
+        the product — is what a config is asked about.  Asking for *one*
+        module's references is what keeps a WorkBuddy-only config from starting
+        the Qoder worker (and handing the proxy a port nothing routes to).
         """
 
-        references = managed_adapters.managed_base_references()
+        names = getattr(module, "API_BASE_ENV", None)
+        if not isinstance(names, Mapping):
+            return False
+        references = {
+            f"os.environ/{name}"
+            for name in names.values()
+            if isinstance(name, str) and name.strip()
+        }
         if not references:
             return False
         try:
@@ -449,7 +463,9 @@ class CoreServiceController:
             return {}
         try:
             if autostart:
-                if self._runtime_config_references_workbuddy():
+                from ..adapters import workbuddy as workbuddy_module
+
+                if self._runtime_config_references(workbuddy_module):
                     return runtime.environment(autostart=True)
                 # Removing every WorkBuddy route releases the worker instead of
                 # leaving a credential-holding process behind an unused port.
@@ -459,6 +475,28 @@ class CoreServiceController:
         except Exception:
             # A missing Node runtime or an unstaged package leaves the
             # WorkBuddy routes unusable; every other provider must still start.
+            return {}
+
+    def _qoder_environment(self, *, autostart: bool) -> dict[str, str]:
+        """The Qoder worker's loopback base URLs and bearer."""
+
+        runtime = self._qoder
+        if runtime is None:
+            return {}
+        try:
+            if autostart:
+                from ..adapters import qoder as qoder_module
+
+                if self._runtime_config_references(qoder_module):
+                    return runtime.environment(autostart=True)
+                # Removing every Qoder route releases the worker instead of
+                # leaving a PAT-holding process behind an unused port.
+                runtime.stop()
+                return {}
+            return runtime.environment_values()
+        except Exception:
+            # A missing Node runtime or an unstaged package leaves the Qoder
+            # routes unusable; every other provider must still start.
             return {}
 
     def _our_free_model_environment(self, *, autostart: bool) -> dict[str, str]:
@@ -499,11 +537,16 @@ class CoreServiceController:
         worker rather than both.
         """
 
-        workers = (self._workbuddy_environment, self._our_free_model_environment)
+        workers = (
+            self._workbuddy_environment,
+            self._qoder_environment,
+            self._our_free_model_environment,
+        )
         if not autostart:
             # Nothing waits on this path: each fragment is a recorded value or
             # empty, so the threads would only add overhead to a status read.
             environment = self._workbuddy_environment(autostart=False)
+            environment.update(self._qoder_environment(autostart=False))
             environment.update(self._our_free_model_environment(autostart=False))
             return environment
 
@@ -914,6 +957,16 @@ class CoreServiceController:
         env.update(configured)
         if forced_port is not None:
             env["LITELLM_PORT"] = forced_port
+        # The last writer is the host itself.  A value that arrived in the
+        # document, or one the setting pane stores, must not move the listener
+        # the reverse proxy and the health probe already name -- the same
+        # reasoning as the key above.  A desktop states no port (see
+        # host_profile.stated_port), so there the setting stays the only one.
+        from . import host_profile
+
+        stated_port = host_profile.stated_port()
+        if stated_port is not None:
+            env["LITELLM_PORT"] = str(stated_port)
         env["LITELLM_RUNTIME_ROOT"] = str(self.paths.root)
         # CPython reads these before ``sitecustomize`` can run. The wrapper keeps
         # its own imports out of the signed bundle; imports made after this
@@ -1506,7 +1559,22 @@ class CoreServiceController:
         # An occupied configured port steps forward to the next free port; the
         # effective port is recorded beside the owner record so health checks
         # and the status projection follow the listener that actually started.
-        port = self._first_free_port(self._configured_port(environment))
+        # A host is the exception: it publishes its port in a reverse proxy and
+        # a health probe, so landing on the next free one answers every client
+        # with 502 while every status line still says "running".  There an
+        # occupied port is the failure, stated before the child is spawned.
+        from . import host_profile as _host_profile
+
+        configured_port = self._configured_port(environment)
+        stated_port = _host_profile.stated_port()
+        if stated_port is not None:
+            if not self._port_available(stated_port):
+                raise RuntimeError(
+                    "The port this host publishes is occupied: %d" % stated_port
+                )
+            port = stated_port
+        else:
+            port = self._first_free_port(configured_port)
         environment["LITELLM_PORT"] = str(port)
         workers = environment.get("LITELLM_NUM_WORKERS", MACOS_DEFAULT_WORKERS if sys.platform == "darwin" else "16")
         launcher = [self.litellm_bin]

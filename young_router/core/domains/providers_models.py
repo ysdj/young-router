@@ -15,6 +15,7 @@ import re
 import socket
 import ssl
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -52,10 +53,11 @@ from ...config.schema import (
 
 from ...adapters import veridrop
 from ...adapters import our_free_model as our_free_model_module
+from ...adapters import qoder as qoder_module
 from ...adapters import workbuddy as workbuddy_module
 from ... import adapters as managed_adapters
 from ...browser_identity import browser_request_headers
-from ...public_names import public_name_key
+from ...public_names import import_name_case, imported_public_name, public_name_key
 from ...values import explicit_bool
 from ...values import int_or_none as _int_or_none
 from ...api_base import api_base_for_surface, isolated_http_opener, service_root
@@ -88,8 +90,14 @@ from ._shared import (
 # catalog's own enumeration into a routing decision nobody made.
 IMPORTED_MODEL_ORDER = 0
 
-def _public_name_for_lane_id(model_id: str) -> str:
-    """The public name an imported lane id starts on: the upstream's own id.
+# The managed account integrations this domain projects.  A module declares its
+# auth kinds and the provider id each one serves; everything below that reasons
+# about "an account whose own worker owns the credential" reads this list
+# instead of naming a product.
+_MANAGED_ACCOUNT_MODULES = (workbuddy_module, qoder_module)
+
+def _public_name_for_lane_id(model_id: str, name_case: object = "lower") -> str:
+    """The public name an imported lane id starts on: the id, as an import files it.
 
     This used to strip the free lane's ``-free`` suffix, on the theory that the
     suffix states the lane rather than the model.  That reasoning does not hold
@@ -97,10 +105,11 @@ def _public_name_for_lane_id(model_id: str) -> str:
     ``openrouter/free`` are the names clients call, and rewriting them invented
     a second spelling that no upstream document contains.  Renaming a model is
     the user's decision, made in the pane that lists them, so an import carries
-    the id unchanged and leaves the naming to them.
+    the id and files it under the spelling the import settled
+    (``public_names.imported_public_name``); the upstream keeps its own.
     """
 
-    return model_id
+    return imported_public_name(model_id, name_case=name_case)
 
 
 def _route_key_renamed(route_key: str, public_model: str) -> str:
@@ -277,7 +286,7 @@ def _environment_reference(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if value:
         return value
-    for module in (workbuddy_module, our_free_model_module):
+    for module in (workbuddy_module, qoder_module, our_free_model_module):
         published = str(module.published_environment().get(name, "")).strip()
         if published:
             return published
@@ -391,11 +400,13 @@ class ProvidersModelsDomain:
         *,
         auth_manager: object | None = None,
         workbuddy: object | None = None,
+        qoder: object | None = None,
         our_free_model: object | None = None,
     ):
         self.config_path = Path(config_path).expanduser() if config_path else _default_provider_config_path()
         self.auth_manager = auth_manager
         self.workbuddy = workbuddy
+        self.qoder = qoder
         self.our_free_model = our_free_model
         self._raw: dict[str, Any] = {}
         self._draft: dict[str, Any] = {}
@@ -413,6 +424,13 @@ class ProvidersModelsDomain:
         self._cosmetic_binding = False
         # Key values staged by a wizard for a provider it has not created yet.
         self._pending_provider_keys: dict[str, dict[str, str]] = {}
+        # Qoder PATs staged by the wizard's sign-in field, keyed by region.
+        # The value is moved to the worker's own store on sign-in and dropped
+        # from here on success.  The lock is separate from the store's because
+        # a sign-in runs outside that lock (it waits on a worker) while the
+        # staging and the snapshot read stay under it.
+        self._pending_qoder_pats: dict[str, str] = {}
+        self._qoder_pat_lock = threading.Lock()
         # Why the last relay-bound Apply refused, as secret-free rows the pane
         # can mark: a binding failure is a property of one relay key or one
         # linked route, and the pane must point at it instead of only stating
@@ -429,10 +447,10 @@ class ProvidersModelsDomain:
         # the whole provider document; `_validate` answers from here while the
         # digest is unchanged and every draft replacement drops it.
         self._validation_cache: tuple[str, dict[str, Any]] | None = None
-        # What the last live WorkBuddy read observed, per region.  A snapshot
-        # projects this instead of calling the worker: see
-        # `_workbuddy_projection_status`.
-        self._workbuddy_observed: dict[str, dict[str, Any]] = {}
+        # What the last live read reported for a managed account, per provider
+        # id.  A snapshot projects this instead of calling the worker: see
+        # `_managed_projection_status`.
+        self._managed_accounts_observed: dict[str, dict[str, Any]] = {}
         # The per-model rate each managed account last published, per variant.
         # Keys are model ids, and the values are the numbers themselves: a
         # route set to follow its rate reads this at Apply time instead of
@@ -478,6 +496,15 @@ class ProvidersModelsDomain:
             self.workbuddy = WorkBuddyRuntime(_runtime_root_for_config(self.config_path))
         return self.workbuddy
 
+    def _qoder(self):
+        """The Qoder worker owner; created on demand for a bare domain."""
+
+        if self.qoder is None:
+            from ...adapters.qoder import QoderRuntime
+
+            self.qoder = QoderRuntime(_runtime_root_for_config(self.config_path))
+        return self.qoder
+
     def _our_free_model_runtime(self):
         """The Our Free Model worker owner; created on demand for a bare domain."""
 
@@ -489,17 +516,45 @@ class ProvidersModelsDomain:
             )
         return self.our_free_model
 
-    def _workbuddy_remember(self, document: Mapping[str, Any]) -> None:
-        """Record what one live WorkBuddy read reported, per region."""
+    @staticmethod
+    def _managed_account_module(auth: Mapping[str, Any]) -> Any:
+        """The adapter module that owns one auth kind, or ``None``."""
+
+        kind = str(auth.get("kind", ""))
+        for module in _MANAGED_ACCOUNT_MODULES:
+            if kind in getattr(module, "AUTH_KIND_TO_PROVIDER", {}):
+                return module
+        return None
+
+    @staticmethod
+    def _managed_account_module_for_provider(provider_id: str) -> Any:
+        """The adapter module that owns one provider id, or ``None``."""
+
+        for module in _MANAGED_ACCOUNT_MODULES:
+            if provider_id in getattr(module, "PROVIDER_TO_AUTH_KIND", {}):
+                return module
+        return None
+
+    def _managed_account_runtime(self, module: Any) -> Any:
+        """The runtime that owns one adapter module's worker."""
+
+        name = getattr(module, "__name__", "")
+        if name.endswith(".qoder"):
+            return self._qoder()
+        return self._workbuddy()
+
+    def _managed_account_remember(self, document: Mapping[str, Any]) -> None:
+        """Record what one live managed-account read reported, per region."""
 
         providers = document.get("providers")
         if not isinstance(providers, Mapping):
             return
         for provider_id, entry in providers.items():
-            if provider_id not in workbuddy_module.WORKBUDDY_PROVIDERS or not isinstance(entry, Mapping):
+            module = self._managed_account_module_for_provider(str(provider_id))
+            if module is None or not isinstance(entry, Mapping):
                 continue
-            auth = {"kind": workbuddy_module.PROVIDER_TO_AUTH_KIND.get(str(provider_id), "")}
-            self._workbuddy_observe(auth, entry)
+            auth = {"kind": getattr(module, "PROVIDER_TO_AUTH_KIND", {}).get(str(provider_id), "")}
+            self._managed_account_observe(auth, entry)
 
     @staticmethod
     def _empty_document() -> dict[str, str | None]:
@@ -721,9 +776,10 @@ class ProvidersModelsDomain:
         auth_kind = ProvidersModelsDomain._provider_auth_state(provider)["kind"]
         if auth_kind == "openai_login":
             return "openai/responses", "fixed"
-        if auth_kind in workbuddy_module.WORKBUDDY_AUTH_KINDS:
-            # The WorkBuddy worker mounts Chat Completions alone, so a route on
-            # this account never probes a Responses endpoint that cannot exist.
+        if auth_kind in workbuddy_module.WORKBUDDY_AUTH_KINDS or auth_kind in qoder_module.QODER_AUTH_KINDS:
+            # Both workers mount Chat Completions alone, so a route on one of
+            # these accounts never probes a Responses endpoint that cannot
+            # exist.
             return "openai/chat", "fixed"
         if auth_kind in our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS:
             # The gateway serves both surfaces but each *row* answers on the one
@@ -1083,10 +1139,10 @@ class ProvidersModelsDomain:
             "auth_configured": self._provider_auth_configured(provider, provider_auth),
             # The last state a live read observed, so a projection can show the
             # account and its credit without paying for another worker call.
-            "auth_observed": self._workbuddy_observed_account(provider_auth),
+            "auth_observed": self._managed_observed_account(provider_auth),
             # How long ago that observation was made, so the pane applies Core's
             # own account window before it asks for a read.
-            "auth_observed_seconds_ago": self._workbuddy_observed_age_seconds(provider_auth),
+            "auth_observed_seconds_ago": self._managed_observed_age_seconds(provider_auth),
             "auth_active": self._provider_auth_active(provider_auth),
             # One row per account this provider owns: the pane lists them the
             # way a station lists its accounts, and each one answers, acts, and
@@ -1271,15 +1327,14 @@ class ProvidersModelsDomain:
         registry cannot resolve still reports the unknown-window default rather
         than disappearing from the pane.
 
-        One public model is one key whatever case its routes state
-        (``public_name_key``): the pane looks the window up by the group it
-        draws, and the group's declaration reaches every route that serves the
-        name.  A projection that keyed on the spelling published the same
-        group twice, once per case, and whichever half the pane read decided
-        the number it showed.
+        One public model is one key (``public_name_key``): the pane looks the
+        window up by the group it draws, and the group's declaration reaches
+        every route that serves the name.  The key is the name the document
+        states -- the import settled its case once -- so the pane's field and
+        the saved group table name the group the same way.
         """
 
-        names: dict[str, list[str]] = {}
+        names: list[str] = []
         for provider in self._draft.get("providers", []):
             if not isinstance(provider, Mapping):
                 continue
@@ -1289,13 +1344,9 @@ class ProvidersModelsDomain:
             for model in models:
                 if not isinstance(model, Mapping):
                     continue
-                name = str(model.get("model_name", "")).strip()
-                key = public_name_key(name)
-                if not key:
-                    continue
-                spellings = names.setdefault(key, [])
-                if name not in spellings:
-                    spellings.append(name)
+                name = public_name_key(model.get("model_name", ""))
+                if name and name not in names:
+                    names.append(name)
         if not names:
             return {}
         try:
@@ -1305,13 +1356,7 @@ class ProvidersModelsDomain:
             # take the whole providers workspace down with it.
             return {}
         projection: dict[str, Any] = {}
-        # One spelling per group, the same one the saved group table states
-        # (``config.dump._preferred_public_spelling``), so the pane's field and
-        # the document name the group with one spelling.
-        from ...config.dump import _preferred_public_spelling
-
-        for spellings in names.values():
-            name = _preferred_public_spelling(spellings)
+        for name in names:
             try:
                 # Two numbers, two questions, so both are published rather than
                 # one standing in for the other.  ``context_window`` is what this
@@ -1345,10 +1390,13 @@ class ProvidersModelsDomain:
         """
 
         has_last_operation = hasattr(self, "_last_operation")
+        with self._qoder_pat_lock:
+            pending_qoder_pats = copy.deepcopy(self._pending_qoder_pats)
         return {
             "raw": copy.deepcopy(self._raw),
             "draft": copy.deepcopy(self._draft),
             "pending_provider_keys": copy.deepcopy(self._pending_provider_keys),
+            "pending_qoder_pats": pending_qoder_pats,
             "probe_overlay": copy.deepcopy(self._probe_overlay),
             "disk_revision": copy.deepcopy(self._disk_revision),
             "exists": self._exists,
@@ -1368,6 +1416,8 @@ class ProvidersModelsDomain:
         self._raw = copy.deepcopy(checkpoint["raw"])
         self._draft = copy.deepcopy(checkpoint["draft"])
         self._pending_provider_keys = copy.deepcopy(checkpoint.get("pending_provider_keys", {}))
+        with self._qoder_pat_lock:
+            self._pending_qoder_pats = copy.deepcopy(checkpoint.get("pending_qoder_pats", {}))
         self._probe_overlay = copy.deepcopy(checkpoint["probe_overlay"])
         self._disk_revision = copy.deepcopy(checkpoint["disk_revision"])
         self._exists = bool(checkpoint["exists"])
@@ -3474,21 +3524,34 @@ class ProvidersModelsDomain:
         except ValueError:
             raise DomainError("Provider authentication is invalid") from None
 
-    def _workbuddy_catalog_models(self, auth_kind: str) -> list[dict[str, Any]]:
-        """Import the desktop app's live roster as this account's models."""
+    def _managed_catalog_models(self, auth_kind: str) -> list[dict[str, Any]]:
+        """Import one managed account's live roster as this account's models.
 
-        provider_id = workbuddy_module.AUTH_KIND_TO_PROVIDER[auth_kind]
+        The integration owns its credential and its catalog, so a roster arrives
+        as the upstream states it -- not as a list this build happened to ship
+        with.  This is what a caller that omits ``models`` from the create gets;
+        the wizard never does, because it adds a provider and lets the user pick
+        the roster in 获取模型 (``model.import_service_catalog``) afterwards.
+        """
+
+        module = self._managed_account_module({"kind": auth_kind})
+        if module is None:
+            return []
+        provider_id = module.AUTH_KIND_TO_PROVIDER[auth_kind]
+        display = module.DISPLAY_NAMES[provider_id]
         try:
-            document = self._workbuddy().models(provider_id, refresh=True)
+            document = self._managed_account_runtime(module).models(provider_id, refresh=True)
         except Exception:
-            raise DomainError("The WorkBuddy model list is unavailable") from None
+            raise DomainError(f"The {display} model list is unavailable") from None
         # Adding the account just answered the account question, so the state
         # the worker reported becomes what later projections project.
-        self._workbuddy_remember({"providers": {provider_id: document.get("status")}})
+        self._managed_account_remember({"providers": {provider_id: document.get("status")}})
         if document.get("available") is not True:
-            raise DomainError(
-                "Sign in to the WorkBuddy desktop app before adding this account"
-            )
+            # An unstaged package is a different problem from a signed-out
+            # account: the first asks for a build, the second for a sign-in.
+            if str(document.get("detail", "")) == "integration_unstaged":
+                raise DomainError(f"The {display} integration is unavailable")
+            raise DomainError(f"Sign in to {display} before adding this account")
         # The import just read the account's own catalog, so the windows it
         # states are known before the provider exists.  Without this the row
         # stayed empty until some later pane read happened to refill it, and
@@ -3496,14 +3559,31 @@ class ProvidersModelsDomain:
         # one read that had the numbers in hand.
         self._remember_published_windows(provider_id, document.get("models"))
         models: list[dict[str, Any]] = []
+        taken_names: set[str] = set()
         for entry in document.get("models") or []:
             if not isinstance(entry, Mapping):
                 continue
             model_id = str(entry.get("id", "")).strip()
             if not model_id:
                 continue
+            # Two entries stating one public name would be two routes a client
+            # cannot tell apart, so the second is disambiguated exactly as a
+            # pick from the chooser is (the ``(2)`` suffix of ``_unique_lane_name``).
+            name = ProvidersModelsDomain._unique_lane_name(
+                model_id,
+                {},
+                taken_names,
+                preferred=str(entry.get("publicName") or ""),
+            )
+            taken_names.add(public_name_key(name))
             model: dict[str, Any] = {
-                "name": model_id,
+                # The catalog's own public name when it states one that differs
+                # from the id it is called by, filed under the import spelling.
+                # Qoder's roster is exactly that shape: `qmodel_38max` is the
+                # wire key, `Qwen3.8-Max` is the label the catalog shows — so the
+                # row is `qwen3.8-max`, the upstream keeps `qmodel_38max`, and a
+                # client types the one spelling every route of the model shares.
+                "name": name,
                 "upstream_model": model_id,
                 "enabled": True,
                 # An imported roster is a set of peers, not a ranked list: every
@@ -3513,7 +3593,7 @@ class ProvidersModelsDomain:
             }
             models.append(model)
         if not models:
-            raise DomainError("The WorkBuddy account reported no models")
+            raise DomainError(f"The {display} account reported no models")
         return models
 
     def _our_free_model_catalog_models(
@@ -3651,7 +3731,7 @@ class ProvidersModelsDomain:
                 providers = document.get("providers")
                 # The pane asked the account question directly, so what came
                 # back becomes the state every later projection reports.
-                self._workbuddy_remember(document)
+                self._managed_account_remember(document)
                 self._last_operation = {
                     "operation": action,
                     "available": document.get("available") is True,
@@ -3670,13 +3750,132 @@ class ProvidersModelsDomain:
             raise DomainError("The WorkBuddy integration is unavailable") from None
         # A catalog read answers the account question too, and the worker's own
         # status rides that response.
-        self._workbuddy_remember({"providers": {provider_id: document.get("status")}})
+        self._managed_account_remember({"providers": {provider_id: document.get("status")}})
         self._remember_published_rates(provider_id, document.get("models"))
         self._remember_published_windows(provider_id, document.get("models"))
         self._last_operation = {
             "operation": action,
             "provider": provider_id,
             "display_name": workbuddy_module.WORKBUDDY_DISPLAY_NAMES[provider_id],
+            **document,
+        }
+
+    def _qoder_operation(self, action: str, data: Mapping[str, Any]) -> None:
+        """Answer the wizard's Qoder account and catalog questions.
+
+        A Qoder region is served by the account the Qoder desktop app is signed
+        into — the worker reads that app's own session, so adding the provider
+        asks for nothing.  A pasted PAT is the *override*: it wins over the
+        app's session, is verified against the region's gateway before it is
+        stored, and a wrong paste is refused here rather than on the first chat
+        turn.  The rest of the actions are reads.
+        """
+
+        try:
+            provider_id = qoder_module.validated_provider(
+                data.get("provider", qoder_module.QODER_PROVIDER)
+            )
+        except ValueError:
+            raise DomainError("The requested Qoder provider is unavailable") from None
+        runtime = self._qoder()
+        if action == "qoder_open_app":
+            # The sign-in happens in the Qoder desktop app; this hand-off is
+            # all this app can do for a region that app is not signed into.
+            try:
+                document = runtime.open_desktop_app(provider_id)
+            except Exception:
+                raise DomainError("The Qoder desktop app could not be opened") from None
+            self._last_operation = {
+                "operation": action,
+                "provider": provider_id,
+                "display_name": qoder_module.QODER_DISPLAY_NAMES[provider_id],
+                "app_name": document.get("app_name", ""),
+                "app_path": document.get("app_path", ""),
+                "installed": document.get("installed") is True,
+                "opened": document.get("opened") is True,
+            }
+            return
+        if action in {"qoder_login", "qoder_logout"}:
+            try:
+                if action == "qoder_login":
+                    secret_target = str(data.get("secret_target", "")).strip()
+                    if secret_target and secret_target != provider_id:
+                        # A PAT staged for one region must never sign in the
+                        # other: the two gateways keep separate accounts.
+                        raise DomainError("The Qoder PAT target does not match the provider")
+                    with self._qoder_pat_lock:
+                        pat = (
+                            self._pending_qoder_pats.get(secret_target, "")
+                            if secret_target
+                            else str(data.get("pat", ""))
+                        )
+                    document = runtime.login(provider_id, pat)
+                    # The worker keeps the PAT; this draft copy has no second
+                    # use after a successful sign-in.  A refused one stays so
+                    # the field's retry still has a value to hand over — the
+                    # native field is not re-staged by a second press.
+                    if secret_target:
+                        with self._qoder_pat_lock:
+                            self._pending_qoder_pats.pop(secret_target, None)
+                else:
+                    document = runtime.logout(provider_id)
+            except Exception as exc:
+                raise DomainError(
+                    f"The Qoder account could not be changed: {safe_exception_message(exc)}"
+                ) from None
+            status = document.get("status")
+            if isinstance(status, Mapping):
+                self._managed_account_remember({"providers": {provider_id: status}})
+            self._last_operation = {
+                "operation": action,
+                "provider": provider_id,
+                "display_name": qoder_module.QODER_DISPLAY_NAMES[provider_id],
+                "available": document.get("available") is not False,
+                "status": dict(status) if isinstance(status, Mapping) else {},
+            }
+            if action == "qoder_logout":
+                # What is left after forgetting the pasted PAT: the desktop
+                # app's own sign-in, which this app cannot end.
+                self._last_operation["removed"] = document.get("removed") is True
+                self._last_operation["app_session"] = document.get("app_session") is True
+            return
+        try:
+            if action == "qoder_status":
+                # The worker starts, exchanges a jobToken and reads the credit,
+                # so a window that already covers this account answers from the
+                # observation instead; the section's own 刷新 always reads.
+                refresh = bool(data.get("refresh"))
+                if not refresh:
+                    remembered = self._workbuddy_recent_status(provider_id)
+                    if remembered is not None:
+                        self._last_operation = {
+                            "operation": action,
+                            "available": True,
+                            "detail": "",
+                            "providers": dict(remembered["providers"]),
+                            "remembered": True,
+                        }
+                        return
+                document = runtime.status(refresh=refresh)
+                providers = document.get("providers")
+                self._managed_account_remember(document)
+                self._last_operation = {
+                    "operation": action,
+                    "available": document.get("available") is True,
+                    "detail": str(document.get("detail", "")),
+                    "providers": dict(providers) if isinstance(providers, Mapping) else {},
+                }
+                return
+            document = runtime.models(provider_id, refresh=bool(data.get("refresh", False)))
+        except Exception:
+            raise DomainError("The Qoder integration is unavailable") from None
+        self._managed_account_remember({"providers": {provider_id: document.get("status")}})
+        self._remember_published_rates(provider_id, document.get("models"))
+        self._remember_published_windows(provider_id, document.get("models"))
+        self._last_operation = {
+            "operation": action,
+            "provider": provider_id,
+            "display_name": qoder_module.QODER_DISPLAY_NAMES[provider_id],
             **document,
         }
 
@@ -3693,23 +3892,25 @@ class ProvidersModelsDomain:
         provider_id = requested_provider.strip()
         if not provider_id:
             raise DomainError("The requested service provider is unavailable")
-        workbuddy_ids = tuple(workbuddy_module.WORKBUDDY_DISPLAY_NAMES)
-        if provider_id in workbuddy_ids:
+        module = self._managed_account_module_for_provider(provider_id)
+        if module is not None:
             try:
-                document = self._workbuddy().models(
-                    workbuddy_module.validated_provider(provider_id), refresh=refresh
+                document = self._managed_account_runtime(module).models(
+                    module.validated_provider(provider_id), refresh=refresh
                 )
             except ValueError:
-                raise DomainError("The requested WorkBuddy provider is unavailable") from None
+                raise DomainError("The requested service provider is unavailable") from None
             except Exception:
-                raise DomainError("The WorkBuddy integration is unavailable") from None
-            self._workbuddy_remember({"providers": {provider_id: document.get("status")}})
+                raise DomainError(
+                    f"The {module.DISPLAY_NAMES[provider_id]} integration is unavailable"
+                ) from None
+            self._managed_account_remember({"providers": {provider_id: document.get("status")}})
             self._remember_published_rates(provider_id, document.get("models"))
             self._remember_published_windows(provider_id, document.get("models"))
             self._last_operation = {
-                "operation": "workbuddy_models",
+                "operation": module.MODELS_OPERATION,
                 "provider": provider_id,
-                "display_name": workbuddy_module.WORKBUDDY_DISPLAY_NAMES[provider_id],
+                "display_name": module.DISPLAY_NAMES[provider_id],
                 **document,
             }
             return
@@ -3819,7 +4020,7 @@ class ProvidersModelsDomain:
         window = self._workbuddy_recheck_seconds()
         if window <= 0:
             return None
-        observed = self._workbuddy_observed.get(provider_id)
+        observed = self._managed_accounts_observed.get(provider_id)
         if not isinstance(observed, Mapping) or not str(observed.get("state", "")):
             return None
         stamped = observed.get("observed_at")
@@ -3837,7 +4038,7 @@ class ProvidersModelsDomain:
 
         Called only from an explicit edit that asks a route to follow a rate.
         A snapshot, a load, and a projection must never reach this: it may
-        start a worker and read the desktop credential, so it belongs to a
+        start a worker and read the account's catalog, so it belongs to a
         user's own action, never to rendering one.
 
         Answers whether this account's rates are known afterwards.  A kind that
@@ -3850,6 +4051,9 @@ class ProvidersModelsDomain:
         auth_kind = self._provider_auth_state(provider)["kind"]
         if auth_kind not in managed_adapters.rate_publishing_auth_kinds():
             return True
+        module = self._managed_account_module({"kind": auth_kind})
+        if module is None:
+            return True
         provider_id = managed_adapters.rate_provider_id(auth_kind)
         if not provider_id:
             return True
@@ -3859,7 +4063,7 @@ class ProvidersModelsDomain:
             # which is the same place the 倍率 column comes from.
             return True
         try:
-            document = self._workbuddy().models(provider_id, refresh=False)
+            document = self._managed_account_runtime(module).models(provider_id, refresh=False)
         except Exception:
             return False
         self._remember_published_rates(provider_id, document.get("models"))
@@ -4130,33 +4334,36 @@ class ProvidersModelsDomain:
         # to relay_multiplier mode).
         return self._published_rate(provider, model)
 
-    def _workbuddy_login_status(self, auth: Mapping[str, Any]) -> dict[str, Any]:
-        """The worker's account record for one WorkBuddy login provider.
+    def _managed_account_login_status(self, auth: Mapping[str, Any]) -> dict[str, Any]:
+        """The worker's account record for one managed account provider.
 
-        This is a live read: it may start the worker, read the desktop app's
-        credential and ask the upstream for the account's credit.  A snapshot
-        must never pay for it — see :meth:`_workbuddy_projection_status` for
-        the value a projection projects instead.
+        This is a live read: it may start the worker, resolve the credential
+        and ask the upstream for the account's credit.  A snapshot must never
+        pay for it — see :meth:`_managed_projection_status` for the value a
+        projection projects instead.
         """
 
+        module = self._managed_account_module(auth)
+        if module is None:
+            return {}
         try:
-            provider = workbuddy_module.AUTH_KIND_TO_PROVIDER[str(auth.get("kind", ""))]
+            provider = module.AUTH_KIND_TO_PROVIDER[str(auth.get("kind", ""))]
         except KeyError:
             return {}
         try:
-            entry = self._workbuddy().provider_status(provider)
+            entry = self._managed_account_runtime(module).provider_status(provider)
         except Exception:
             return {}
         return dict(entry) if isinstance(entry, Mapping) else {}
 
-    def _workbuddy_projection_status(
+    def _managed_projection_status(
         self, auth: Mapping[str, Any], *, allow_live: bool
     ) -> tuple[str, bool]:
-        """Resolve ``(auth_status, configured)`` for a WorkBuddy login.
+        """Resolve ``(auth_status, configured)`` for a managed account login.
 
         ``allow_live`` is true only for an action that actually answered the
-        account question — the explicit ``workbuddy_status`` read, a sign-in,
-        or a create.  Every other caller is a *projection*: the provider table,
+        account question — the explicit status read, a sign-in, or a create.
+        Every other caller is a *projection*: the provider table,
         ``provider.patch``, a validation, a draft compare.  Those run on the
         path that serves ``CoreStore.snapshot()``, and the store holds its
         lock for the whole call, so one cold worker (a 45 s start, an upstream
@@ -4167,24 +4374,27 @@ class ProvidersModelsDomain:
         never disable the rest of the app.
         """
 
+        module = self._managed_account_module(auth)
+        if module is None:
+            return "", False
         if allow_live:
-            entry = self._workbuddy_login_status(auth)
-            self._workbuddy_observe(auth, entry)
-            return self._workbuddy_auth_status(str(entry.get("state", ""))), str(entry.get("state", "")) == "signed-in"
-        provider_id = workbuddy_module.AUTH_KIND_TO_PROVIDER.get(str(auth.get("kind", "")))
+            entry = self._managed_account_login_status(auth)
+            self._managed_account_observe(auth, entry)
+            return self._managed_account_auth_status(str(entry.get("state", ""))), str(entry.get("state", "")) == "signed-in"
+        provider_id = module.AUTH_KIND_TO_PROVIDER.get(str(auth.get("kind", "")))
         if provider_id is None:
             return "", False
-        observed = self._workbuddy_observed.get(provider_id, {})
+        observed = self._managed_accounts_observed.get(provider_id, {})
         state = str(observed.get("state", ""))
-        return self._workbuddy_auth_status(state), state == "signed-in"
+        return self._managed_account_auth_status(state), state == "signed-in"
 
     @staticmethod
-    def _workbuddy_auth_status(state: str) -> str:
+    def _managed_account_auth_status(state: str) -> str:
         """The worker's own vocabulary, mapped onto the auth status set.
 
-        The desktop app reports ``signed-in``/``signed-out``; the IPC contract
-        reports ``signed_in``/``signed_out``.  The mapping is this domain's
-        alone so both spellings resolve to one value everywhere it is read.
+        A worker reports ``signed-in``/``signed-out``; the IPC contract reports
+        ``signed_in``/``signed_out``.  The mapping is this domain's alone so
+        both spellings resolve to one value everywhere it is read.
         """
 
         normalized = state.replace("-", "_").strip()
@@ -4192,33 +4402,63 @@ class ProvidersModelsDomain:
             return normalized
         return ""
 
-    def _workbuddy_observed_account(self, auth: Mapping[str, Any]) -> dict[str, Any]:
+    def _managed_observed_account(self, auth: Mapping[str, Any]) -> dict[str, Any]:
         """The secret-free account facts a live read last observed."""
 
-        provider_id = workbuddy_module.AUTH_KIND_TO_PROVIDER.get(str(auth.get("kind", "")))
+        module = self._managed_account_module(auth)
+        if module is None:
+            return {}
+        provider_id = module.AUTH_KIND_TO_PROVIDER.get(str(auth.get("kind", "")))
         if provider_id is None:
             return {}
-        observed = self._workbuddy_observed.get(provider_id)
+        observed = self._managed_accounts_observed.get(provider_id)
         return copy.deepcopy(observed) if isinstance(observed, Mapping) else {}
 
-    def _workbuddy_observe(self, auth: Mapping[str, Any], entry: Mapping[str, Any]) -> None:
-        """Remember what a live WorkBuddy read just reported."""
+    def _managed_account_observe(self, auth: Mapping[str, Any], entry: Mapping[str, Any]) -> None:
+        """Remember what a live managed-account read just reported."""
 
-        provider_id = workbuddy_module.AUTH_KIND_TO_PROVIDER.get(str(auth.get("kind", "")))
-        if provider_id is None or not isinstance(entry, Mapping):
+        module = self._managed_account_module(auth)
+        if module is None or not isinstance(entry, Mapping):
+            return
+        provider_id = module.AUTH_KIND_TO_PROVIDER.get(str(auth.get("kind", "")))
+        if provider_id is None:
             return
         state = str(entry.get("state", ""))
         if not state:
             return
-        self._workbuddy_observed[provider_id] = {
+        previous = self._managed_accounts_observed.get(provider_id)
+        previous = previous if isinstance(previous, Mapping) else {}
+        stated_credits = entry.get("credits")
+        # A catalog read answers the account question too, but not every worker
+        # states the credit there, and a failed usage read reports the absence
+        # without a ``total``.  An unstated credit is not a zero: keep the
+        # number the last read that did state one observed, or the pane would
+        # blank the balance every time its model list refreshed.
+        credits_are_stated = isinstance(stated_credits, Mapping) and (
+            "total" in stated_credits or stated_credits.get("unlimited") is True
+        )
+        credits = (
+            dict(stated_credits)
+            if credits_are_stated
+            else dict(previous.get("credits", {}))
+            if isinstance(previous.get("credits"), Mapping)
+            else {}
+        )
+        self._managed_accounts_observed[provider_id] = {
             "state": state,
             "nickname": str(entry.get("nickname", "")),
             "domain": str(entry.get("domain", "")),
-            "credits": dict(entry.get("credits", {})) if isinstance(entry.get("credits"), Mapping) else {},
+            # Where the credential came from is a fact a pane states: "the
+            # desktop app is signed in" and "a token was pasted here" differ in
+            # who keeps it current, and a remembered read must not lose which
+            # one it saw.
+            "signInSource": str(entry.get("signInSource", "")),
+            "appProfile": str(entry.get("appProfile", "")),
+            "credits": credits,
             "observed_at": time.time(),
         }
 
-    def _workbuddy_observed_age_seconds(self, auth: Mapping[str, Any]) -> float | None:
+    def _managed_observed_age_seconds(self, auth: Mapping[str, Any]) -> float | None:
         """How long ago one provider's account was last read, or ``None``.
 
         The pane reads this to apply Core's own account window before it asks,
@@ -4227,10 +4467,13 @@ class ProvidersModelsDomain:
         re-entry needs a worker round trip.
         """
 
-        provider_id = workbuddy_module.AUTH_KIND_TO_PROVIDER.get(str(auth.get("kind", "")))
+        module = self._managed_account_module(auth)
+        if module is None:
+            return None
+        provider_id = module.AUTH_KIND_TO_PROVIDER.get(str(auth.get("kind", "")))
         if provider_id is None:
             return None
-        observed = self._workbuddy_observed.get(provider_id)
+        observed = self._managed_accounts_observed.get(provider_id)
         if not isinstance(observed, Mapping):
             return None
         stamped = observed.get("observed_at")
@@ -4241,8 +4484,8 @@ class ProvidersModelsDomain:
     def _provider_auth_configured(
         self, provider: Mapping[str, Any], auth: Mapping[str, Any], *, allow_live: bool = False
     ) -> bool:
-        if auth.get("kind") in workbuddy_module.WORKBUDDY_AUTH_KINDS:
-            return self._workbuddy_projection_status(auth, allow_live=allow_live)[1]
+        if auth.get("kind") in workbuddy_module.WORKBUDDY_AUTH_KINDS or auth.get("kind") in qoder_module.QODER_AUTH_KINDS:
+            return self._managed_projection_status(auth, allow_live=allow_live)[1]
         if auth.get("kind") in our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS:
             # This lane authenticates itself: there is no credential of the
             # user's to be configured, so the lane is ready exactly when its
@@ -4268,11 +4511,13 @@ class ProvidersModelsDomain:
         self, provider: Mapping[str, Any], auth: Mapping[str, Any], *, allow_live: bool = False
     ) -> str:
         kind = str(auth.get("kind", "api_key"))
-        if kind in workbuddy_module.WORKBUDDY_AUTH_KINDS:
-            # The credential belongs to the desktop app, so there is no login
-            # this app can start or end: only its observed state is reported.
-            return self._workbuddy_projection_status(auth, allow_live=allow_live)[0] or (
-                "signed_out" if workbuddy_module.available() else "unsupported"
+        module = self._managed_account_module(auth)
+        if module is not None:
+            # The credential belongs to the integration's own worker: there is
+            # no provider-auth manager session this app can start or end, only
+            # the state its last read observed.
+            return self._managed_projection_status(auth, allow_live=allow_live)[0] or (
+                "signed_out" if module.available() else "unsupported"
             )
         if kind in our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS:
             # No sign-in exists for this lane, so there is no login this app can
@@ -4518,21 +4763,26 @@ class ProvidersModelsDomain:
                     cls._provider_accounts(provider)
                     or [{"ref": credential_ref, "label": ""}],
                 )
-        elif auth_kind in workbuddy_module.WORKBUDDY_AUTH_KINDS:
+        elif auth_kind in workbuddy_module.WORKBUDDY_AUTH_KINDS or auth_kind in qoder_module.QODER_AUTH_KINDS:
             # The provider points at this Core's own loopback worker, never at
-            # the WorkBuddy upstream: the worker owns the desktop credential,
-            # the request fingerprint, and every wire quirk.  Both the base URL
-            # and the key stay environment references, so the worker port and
-            # its bearer never enter config.yaml.
-            provider_id = workbuddy_module.AUTH_KIND_TO_PROVIDER[auth_kind]
-            provider["api_base"] = workbuddy_module.api_base_reference(provider_id)
+            # the product's upstream: the worker owns the credential, the
+            # request fingerprint, and every wire quirk.  Both the base URL and
+            # the key stay environment references, so the worker port and its
+            # bearer never enter config.yaml.
+            module = (
+                qoder_module
+                if auth_kind in qoder_module.QODER_AUTH_KINDS
+                else workbuddy_module
+            )
+            provider_id = module.AUTH_KIND_TO_PROVIDER[auth_kind]
+            provider["api_base"] = module.api_base_reference(provider_id)
             cls._sync_primary_api_key(
                 provider,
                 [
                     {
                         "id": cls._new_provider_key_id(),
-                        "name": workbuddy_module.API_KEY_NAME,
-                        "value": workbuddy_module.api_key_reference(provider_id),
+                        "name": module.API_KEY_NAME,
+                        "value": module.api_key_reference(provider_id),
                         "source": {"kind": "independent"},
                     }
                 ],
@@ -4568,6 +4818,7 @@ class ProvidersModelsDomain:
             keys[0]
             if auth_kind in {
                 *workbuddy_module.WORKBUDDY_AUTH_KINDS,
+                *qoder_module.QODER_AUTH_KINDS,
                 *our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS,
             } and keys
             else None
@@ -5203,6 +5454,7 @@ class ProvidersModelsDomain:
         {
             "openai_login",
             *workbuddy_module.WORKBUDDY_AUTH_KINDS,
+            *qoder_module.QODER_AUTH_KINDS,
             *our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS,
         }
     )
@@ -5223,6 +5475,14 @@ class ProvidersModelsDomain:
         },
         workbuddy_module.WORKBUDDY_GLOBAL_AUTH_KIND: {
             "name": workbuddy_module.WORKBUDDY_DISPLAY_NAMES[workbuddy_module.WORKBUDDY_GLOBAL_PROVIDER],
+        },
+        # Qoder carries no default model either: its account's own catalog is
+        # the roster, and the PAT is what the row's routes bill through.
+        qoder_module.QODER_AUTH_KIND: {
+            "name": qoder_module.QODER_DISPLAY_NAMES[qoder_module.QODER_PROVIDER],
+        },
+        qoder_module.QODER_GLOBAL_AUTH_KIND: {
+            "name": qoder_module.QODER_DISPLAY_NAMES[qoder_module.QODER_GLOBAL_PROVIDER],
         },
         # Our Free Model carries no default model: the staged adapter's own
         # catalog is the roster, so a newly added lane imports exactly what the
@@ -5328,11 +5588,15 @@ class ProvidersModelsDomain:
         # knows what it may call) is created empty, and its first models arrive
         # through 获取模型, which asks that account.
         raw_models = supplied.get("models")
-        if raw_models is None and kind in workbuddy_module.WORKBUDDY_AUTH_KINDS:
-            # A WorkBuddy account owns no free-text roster: the desktop app's
-            # live catalog is the source of truth, and importing it is the
-            # whole point of adding the account.
-            raw_models = self._workbuddy_catalog_models(kind)
+        if raw_models is None and (
+            kind in workbuddy_module.WORKBUDDY_AUTH_KINDS
+            or kind in qoder_module.QODER_AUTH_KINDS
+        ):
+            # A managed account owns no free-text roster: its integration's
+            # live catalog is the source of truth.  A create that states its
+            # models (the wizard states an empty list) lists exactly those; one
+            # that omits the field asks for the account's whole roster.
+            raw_models = self._managed_catalog_models(kind)
         if raw_models is None and kind in our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS:
             # The lane serves two channels behind one login, and each is a
             # provider of its own.  Which one this add creates is the caller's,
@@ -5962,12 +6226,21 @@ class ProvidersModelsDomain:
         """Add picked models from one managed service's own catalog.
 
         A service that publishes a catalog owns its routes' upstream names, its
-        public names (which are the catalog's own ids), and the credential each
-        route answers with — the slot Core minted for the account.  A pane that
-        rebuilt those three from a listing it read would drift from the
-        adapter that owns them, so the pick arrives here and the catalog is
-        read once more, by the adapter, and every row is built from its own
-        entry.
+        public names (the catalog's ``publicName``, else its id), and the
+        credential each route answers with — the slot Core minted for the
+        account.  A pane that rebuilt those three from a listing it read would
+        drift from the adapter that owns them, so the pick arrives here and the
+        catalog is read once more, by the adapter, and every row is built from
+        its own entry.
+
+        A pick is named by whatever the chooser showed: the catalog id, or the
+        display label the same entry states.  Both resolve to that one entry
+        here, so a surface that lists readable names cannot add a second route
+        for a model it already has.  The label is for people: the row it
+        creates states the import spelling (``public_names.imported_public_name``)
+        and keeps the catalog's own id as the upstream.  ``public_name_case`` is
+        one answer for the whole pick — the case question is asked once per
+        import, not once per row.
         """
 
         provider_index = self._provider_index(data)
@@ -6004,9 +6277,18 @@ class ProvidersModelsDomain:
             for entry in (catalog if isinstance(catalog, Sequence) and not isinstance(catalog, (str, bytes, bytearray)) else [])
             if isinstance(entry, Mapping) and str(entry.get("id", "")).strip()
         }
-        unknown = [model_id for model_id in requested if model_id not in entries]
+        resolved = {
+            model_id: ProvidersModelsDomain._catalog_entry_for_selector(entries, model_id)
+            for model_id in requested
+        }
+        unknown = [model_id for model_id, entry in resolved.items() if entry is None]
         if unknown:
             raise DomainError("The service catalog no longer lists a selected model")
+        requested = [
+            str(entry.get("id", "")).strip()
+            for entry in resolved.values()
+            if isinstance(entry, Mapping)
+        ]
         # A route the provider already carries is not added twice: a refresh
         # that lists what is already there changes nothing and says so.  The
         # document names an upstream with its adapter prefix, so the identity a
@@ -6041,6 +6323,10 @@ class ProvidersModelsDomain:
             if isinstance(model, Mapping) and str(model.get("model_name", "")).strip()
         }
         channels = self._lane_channels(edited)
+        # One spelling decision for the whole pick: the pane asks once when the
+        # labels it is about to import contain upper case, and the answer is
+        # stated here rather than derived from each label.
+        name_case = import_name_case(data.get("public_name_case"))
         added = 0
         for model_id in requested:
             if model_id in existing:
@@ -6049,7 +6335,13 @@ class ProvidersModelsDomain:
             row = self._new_model(
                 edited,
                 {
-                    "name": self._unique_lane_name(model_id, channels, taken_names),
+                    "name": self._unique_lane_name(
+                        model_id,
+                        channels,
+                        taken_names,
+                        preferred=str(entry.get("publicName") or ""),
+                        name_case=name_case,
+                    ),
                     "upstream_model": model_id,
                     "enabled": True,
                     "order": IMPORTED_MODEL_ORDER,
@@ -6069,6 +6361,41 @@ class ProvidersModelsDomain:
             "imported": added,
         }
 
+    @staticmethod
+    def _catalog_entry_for_selector(
+        entries: Mapping[str, Mapping[str, Any]], selector: str
+    ) -> Mapping[str, Any] | None:
+        """The one catalog entry a pick named, by id or by its display label.
+
+        A chooser shows readable names, so the pick that comes back is the label
+        the same catalog stated.  Resolution is exact and unique: an id always
+        wins, a label answers only when exactly one entry states it, and the
+        ``Name (id)`` form the pane builds for a colliding label resolves to
+        that id.  An ambiguous label is therefore a refusal, not a guess — two
+        rows sharing a name is a group a client cannot tell apart.
+        """
+
+        entry = entries.get(selector)
+        if entry is not None:
+            return entry
+        matches = [
+            candidate
+            for candidate in entries.values()
+            if str(candidate.get("publicName") or "").strip() == selector
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        suffix = " ("
+        if selector.endswith(")") and suffix in selector:
+            label, _, model_id = selector.rpartition(suffix)
+            candidate = entries.get(model_id[:-1].strip())
+            if (
+                candidate is not None
+                and str(candidate.get("publicName") or "").strip() == label.strip()
+            ):
+                return candidate
+        return None
+
     def _lane_channels(self, provider: Mapping[str, Any]) -> dict[str, str]:
         """The producer the lane's catalog stated for each model id, if any."""
 
@@ -6083,34 +6410,39 @@ class ProvidersModelsDomain:
         model_id: str,
         channels: Mapping[str, str],
         taken: set[str],
+        preferred: str = "",
+        name_case: object = "lower",
     ) -> str:
-        """The public name a new rows starts on: its own id unless one is taken.
+        """The public name a new row starts on: the catalog's own, as an import files it.
 
         Renaming on import is the user's decision, so a name that does not
-        collide is left exactly as the catalog spells it.  A name that *would*
-        collide is disambiguated by the producer's own tag, because a second
-        route sharing a public name is not something the user can fix from the
-        picker — the pane showed two identical rows and no way to tell them
-        apart.
+        collide is the one the catalog states — its `publicName` when it has
+        one, otherwise its id — filed under the import spelling
+        (``public_names.imported_public_name``): the label is for people, and
+        ``name_case`` is the answer the pane got when it asked whether to keep
+        the catalog's own case or use lower case.  A name that *would* collide is
+        disambiguated by the producer's own tag, because a second route sharing
+        a public name is not something the user can fix from the picker — the
+        pane showed two identical rows and no way to tell them apart.
         """
 
-        name = _public_name_for_lane_id(model_id)
-        if public_name_key(name) not in taken:
+        name = imported_public_name(preferred or _public_name_for_lane_id(model_id), name_case=name_case)
+        if name not in taken:
             return name
         channel = str(channels.get(model_id, "") or "").strip()
         if channel:
-            candidate = f"{name} ({channel})"
-            if public_name_key(candidate) not in taken:
+            candidate = imported_public_name(f"{name} ({channel})", name_case=name_case)
+            if candidate not in taken:
                 return candidate
         # No producer tag to borrow, or that tag is taken too.  Returning the id
         # is not a fallback here: when the name collided because two rows share
         # an id, the id is exactly what was taken.  The suffix is what makes the
-        # second row distinguishable at all.  A name collides when its identity
-        # does, so a lane roster that spells one id in two cases is one row.
+        # second row distinguishable at all.  A name collides when it is the
+        # same name, so two imports of one id are one row.
         suffix = 2
-        while public_name_key(f"{model_id} ({suffix})") in taken:
+        while imported_public_name(f"{name} ({suffix})", name_case=name_case) in taken:
             suffix += 1
-        return f"{model_id} ({suffix})"
+        return imported_public_name(f"{name} ({suffix})", name_case=name_case)
 
     def _append_model_row(
         self,
@@ -6190,6 +6522,19 @@ class ProvidersModelsDomain:
                 model.pop(capability_key, None)
         if "name" in model and "model_name" not in model:
             model["model_name"] = model.pop("name")
+        if explicit_bool(model.pop("imported", None)):
+            # A row picked from a catalog listing states the name the picker
+            # showed, which is a label until the import files it.  The import
+            # spelling is lower case unless the pane asked and the user kept the
+            # catalog's own case (``public_names.imported_public_name``), and the
+            # upstream keeps the id it is called by, so one model is one name a
+            # client can type.  Both flags are the row's source, not its state:
+            # neither reaches the document, and a rename afterwards is the user's
+            # and keeps whatever case they wrote.
+            model["model_name"] = imported_public_name(
+                model.get("model_name", ""),
+                name_case=model.pop("imported_name_case", "lower"),
+            )
         if "upstream_model" in model:
             # ``upstream_model`` is the public IPC alias for LiteLLM's
             # canonical ``litellm_model`` field.  Resolve it even when a
@@ -6644,6 +6989,12 @@ class ProvidersModelsDomain:
             else:
                 effective_order = manual_order
             for source_model in self._relay_import_models(raw_source):
+                # The station's id is what its own wire answers; the row's public
+                # name is the import spelling of it, so the list a station spells
+                # in title case does not become a group a client has to match
+                # that case for.  A row the user renamed is a different public
+                # model on purpose, so re-importing leaves it alone.
+                public_model = imported_public_name(source_model)
                 existing = next(
                     (
                         model
@@ -6651,7 +7002,7 @@ class ProvidersModelsDomain:
                         if isinstance(model, Mapping)
                         and str(model.get("provider_key_id", "")).strip() == key["id"]
                         and self._wire_model_name(model) == source_model
-                        and str(model.get("model_name", "")).strip() == source_model
+                        and public_name_key(model.get("model_name", "")) == public_model
                     ),
                     None,
                 )
@@ -6659,7 +7010,7 @@ class ProvidersModelsDomain:
                     model = self._new_model(
                         provider,
                         {
-                            "model_name": source_model,
+                            "model_name": public_model,
                             "litellm_model": f"openai/{source_model}",
                             "provider": provider_name,
                             "api_base": "",
@@ -8202,8 +8553,9 @@ class ProvidersModelsDomain:
                     )
                     if value
                 ]
-                # The group is the name's identity: one public model is one
-                # group however its routes capitalise it.
+                # The group is the name itself: an import stated the one
+                # spelling its routes carry, and a route that states another
+                # case serves another group.
                 if not identities or public_name_key(model_name) != public_name_key(public_model):
                     continue
                 if str(model.get("order_mode", "manual")).strip() == "relay_multiplier":
@@ -8401,10 +8753,10 @@ class ProvidersModelsDomain:
                     matched.append((provider_index, model_index))
         if not matched:
             raise DomainError("The selected public model is unavailable")
-        # A rename is a change of *identity*, so another group is only in the
-        # way when it holds the same identity under another spelling.  One
-        # group's own rows disagreeing about case are this group, and the
-        # rename is how the user settles that.
+        # A rename is a change of name, so another group is only in the way when
+        # it states the new name.  The import settled the case of every group's
+        # own spelling; a rename is the user stating it, and one public model is
+        # not another group's second spelling.
         if public_name_key(next_name) != public_name_key(public_model):
             matched_set = set(matched)
             for provider_index, provider in enumerate(self._draft["providers"]):
@@ -8495,6 +8847,8 @@ class ProvidersModelsDomain:
             # A discarded draft takes the wizard keys staged for it: nothing
             # is reserved for a provider that will never be created.
             self._pending_provider_keys.clear()
+            with self._qoder_pat_lock:
+                self._pending_qoder_pats.clear()
             # ...and it takes the relay-binding marks that described it.  Those
             # marks name the key or route a failed write refused, and a
             # discarded draft has no such write left to explain: keeping them
@@ -8509,6 +8863,8 @@ class ProvidersModelsDomain:
             self._delete_public_model(data)
         elif name in {"workbuddy_status", "workbuddy_models", "workbuddy_login"}:
             self._workbuddy_operation(name, data)
+        elif name in {"qoder_status", "qoder_models", "qoder_login", "qoder_logout", "qoder_open_app"}:
+            self._qoder_operation(name, data)
         elif name in {"our_free_model_status", "our_free_model_models"}:
             self._our_free_model_operation(name, data)
         elif name in {"provider_auth_start", "provider_auth_cancel", "provider_auth_logout", "provider_auth_status"}:
@@ -8544,6 +8900,11 @@ class ProvidersModelsDomain:
     def secret_present(self, field: str, target: str | None = None) -> bool:
         if field == "import_link" and target is None:
             return False
+        if field == "qoder_pat":
+            if not isinstance(target, str):
+                raise DomainError("The requested secret field is unavailable")
+            with self._qoder_pat_lock:
+                return bool(self._pending_qoder_pats.get(target, "").strip())
         if field != "api_key" or not isinstance(target, str):
             raise DomainError("The requested secret field is unavailable")
         pending = self._pending_secret_target(target)
@@ -8594,6 +8955,16 @@ class ProvidersModelsDomain:
             if not value:
                 raise DomainError("The provider import link is unavailable")
             self._import_link(value)
+            self.revision += 1
+            return
+        if field == "qoder_pat":
+            if not isinstance(target, str) or target not in qoder_module.QODER_PROVIDERS:
+                raise DomainError("The requested secret field is unavailable")
+            with self._qoder_pat_lock:
+                if value.strip():
+                    self._pending_qoder_pats[target] = value
+                else:
+                    self._pending_qoder_pats.pop(target, None)
             self.revision += 1
             return
         if field != "api_key" or not isinstance(target, str):

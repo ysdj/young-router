@@ -571,7 +571,7 @@ class WorkBuddyProviderTests(unittest.TestCase):
     def test_service_provider_add_refuses_a_signed_out_desktop_app(self) -> None:
         directory, domain, _config = self._domain(StubRuntime(state="signed-out"))
         with directory:
-            with self.assertRaisesRegex(DomainError, "WorkBuddy desktop app"):
+            with self.assertRaisesRegex(DomainError, "WorkBuddy"):
                 domain.dispatch("service_provider.add", {"kind": "workbuddy_login"})
 
     def test_provider_status_reports_an_unstaged_integration_as_unsupported(self) -> None:
@@ -816,7 +816,7 @@ class WorkBuddyProviderTests(unittest.TestCase):
             self.assertLess(provider["auth_observed_seconds_ago"], 5.0)
             # A provider that was never read states no age, so the pane cannot
             # mistake "nothing observed" for "observed just now".
-            domain._workbuddy_observed.clear()
+            domain._managed_accounts_observed.clear()
             self.assertIsNone(domain.snapshot()["providers"][0]["auth_observed_seconds_ago"])
 
     def test_a_snapshot_never_calls_the_live_worker(self) -> None:
@@ -879,7 +879,7 @@ class WorkBuddyProviderTests(unittest.TestCase):
             # A replacement Core, a rollback, or a worker that has never been
             # reached: nothing has observed the account, so the projection says
             # so rather than inventing a success or reaching for the worker.
-            domain._workbuddy_observed.clear()
+            domain._managed_accounts_observed.clear()
             safe = domain.snapshot()["providers"][0]
             # An answer nobody observed is never reported as a success, and it
             # never reaches for the worker to invent one.
@@ -1307,9 +1307,11 @@ class WorkBuddyModuleTests(unittest.TestCase):
         # Every bundled worker that serves a model endpoint publishes its own
         # reference, and the registry is their union -- naming one product here
         # would be exactly the coupling this rule exists to prevent.
+        from young_router.adapters import qoder as qoder_module
+
         expected = frozenset(
             f"os.environ/{name}"
-            for module in (workbuddy_module, our_free_model_module)
+            for module in (workbuddy_module, qoder_module, our_free_model_module)
             for name in module.API_BASE_ENV.values()
         )
         self.assertEqual(adapters.managed_base_references(), expected)

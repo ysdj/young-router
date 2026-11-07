@@ -114,9 +114,16 @@ export function presentChildLayer(options: ChildLayerOptions): void {
     // sits in the corner. Absolute offsets do not depend on that.
     "position:absolute", "left:50%", "top:50%",
     "display:flex", "flex-direction:column", "overflow:hidden",
-    "border-radius:8px", "border:1px solid var(--yr-separator, #d4d4d8)",
+    "border-radius:8px",
     "background:var(--yr-control, #ffffff)",
-    "box-shadow:0 12px 32px rgba(0,0,0,0.28)",
+    // The edge, not just the fill.  A white sheet over a dimmed white page is
+    // two light rectangles, and a 1 pt #d4d4d8 separator under the scrim's wash
+    // reads as a colour change with no boundary.  The outline is therefore
+    // stated by a solid 1 pt stroke that is darker than any pane rule, and the
+    // shadow — a tight ring plus a wide falloff — says which rectangle is in
+    // front of the other.
+    "border:1px solid #a9a9b0",
+    "box-shadow:0 0 0 1px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.18), 0 18px 44px rgba(0,0,0,0.34)",
     // The one placement that must survive any stylesheet: dead centre.
     "transform:translate(-50%,-50%)!important",
   ].join(";");

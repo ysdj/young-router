@@ -467,6 +467,7 @@ fi
 NODE_RUNTIME_WORK="$RUNTIME_WORK/node"
 mkdir -p "$STAGING_CACHE"
 CONNECT_WORKBUDDY_WORK="$STAGING_CACHE/connect-workbuddy"
+CONNECT_QODER_WORK="$STAGING_CACHE/connect-qoder"
 VERIDROP_WORK="$STAGING_CACHE/veridrop"
 OUR_FREE_MODEL_WORK="$STAGING_CACHE/our-free-model"
 DSH_VISION_ROUTER_WORK="$STAGING_CACHE/dsh-vision-router"
@@ -479,6 +480,9 @@ CONTEXT_ATTACHMENT_MANAGER_WORK="$STAGING_CACHE/context-attachment-manager"
 # shell that has to wait for it and its output would corrupt the captured pid.
 "${STAGE_PYTHON[@]}" "$PROJECT_ROOT/scripts/update_connect_workbuddy.py" \
   --output "$CONNECT_WORKBUDDY_WORK" &
+STAGING_PIDS+=("$!")
+"${STAGE_PYTHON[@]}" "$PROJECT_ROOT/scripts/update_connect_qoder.py" \
+  --output "$CONNECT_QODER_WORK" &
 STAGING_PIDS+=("$!")
 "${STAGE_PYTHON[@]}" "$PROJECT_ROOT/scripts/update_veridrop.py" \
   --output "$VERIDROP_WORK" &
@@ -813,6 +817,7 @@ start_copy() {
 start_copy copy_tree "$PROJECT_ROOT/rn/apps/web/dist" "$CORE/web"
 start_copy copy_tree "$VERIDROP_WORK" "$CORE/young_router/adapters/veridrop"
 start_copy copy_tree "$CONNECT_WORKBUDDY_WORK" "$CORE/young_router/adapters/connect-workbuddy"
+start_copy copy_tree "$CONNECT_QODER_WORK" "$CORE/young_router/adapters/connect-qoder"
 start_copy copy_tree "$DSH_VISION_ROUTER_WORK" "$CORE/young_router/adapters/dsh-vision-router"
 start_copy copy_tree "$OUR_FREE_MODEL_WORK" "$CORE/young_router/adapters/our-free-model"
 
@@ -1022,6 +1027,14 @@ fi
   echo "The bundled dsh-connect-workbuddy package is missing." >&2
   exit 5
 }
+[[ -f "$CORE/young_router/adapters/connect-qoder/lib/index.js" ]] || {
+  echo "The bundled dsh-connect-qoder package is missing." >&2
+  exit 5
+}
+[[ -f "$CORE/young_router/adapters/qoder_worker.mjs" ]] || {
+  echo "The macOS build output does not contain young_router/adapters/qoder_worker.mjs." >&2
+  exit 5
+}
 [[ -f "$CORE/young_router/adapters/dsh-vision-router/lib/core-primitives.js" ]] || {
   echo "The bundled dsh-vision-router package is missing." >&2
   exit 5
@@ -1119,6 +1132,15 @@ Promise.all([import(entry)]).then(async ([library]) => {
 }).catch((e) => { process.stderr.write(String((e && e.message) || e) + '\n'); process.exit(1) })
 " "$CORE/young_router/adapters/connect-workbuddy/lib/index.js"; then
   echo "The bundled dsh-connect-workbuddy package no longer exports the surface the worker uses." >&2
+  exit 5
+fi
+# Qoder ships the cosy protocol and the two gateways' clients inside one shared
+# bundle chunk, so the surface this app depends on is a *shape*, not a stable
+# export name.  The verifier runs the same discovery the worker does; a release
+# that moved the client fails here, not on the first request.
+if ! "$CORE/runtime/bin/node" "$PROJECT_ROOT/scripts/verify_connect_qoder.mjs" \
+  "$CORE/young_router/adapters/connect-qoder/lib/index.js"; then
+  echo "The bundled dsh-connect-qoder package no longer exports the surface the worker uses." >&2
   exit 5
 fi
 # The staged program is imported into the Core's own interpreter, so the bundle

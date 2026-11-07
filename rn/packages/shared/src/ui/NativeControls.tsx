@@ -162,9 +162,25 @@ function nativeButtonBusyMinimumWidth(title: string, reservation: number, plainL
   return Math.max(reservation, Math.ceil(nativeControlTextWidth(title)) + BUSY_SPINNER_SLOT);
 }
 
+/**
+ * The width a checkbox draws before its label, on this host.
+ *
+ * It is a control metric, not an estimate: AppKit's small checkbox draws a
+ * 14.5 pt box and a 4.5 pt gap before the title, while the Windows and page
+ * checkboxes draw a 16 pt box and a 6 pt gap.  The reservation used to keep a
+ * flat 26 pt here, and the extra 4–7 pt of padding was invisible until another
+ * control sat beside a checkbox — the 并发上限 row's help mark then read 10 pt
+ * farther from 跟随全局 than the same mark reads from the edge of every other
+ * control in the pane.  The label is what needs the cushion (see below), and
+ * `nativeControlTextWidth` still gives it.
+ */
+function nativeCheckboxLeadingWidth(): number {
+  return Platform.OS === "macos" ? 19 : 22;
+}
+
 function nativeCheckboxMinimumWidth(label: string): number {
   const textWidth = nativeControlTextWidth(label);
-  return Math.ceil(26 + Math.max(24, textWidth));
+  return Math.ceil(nativeCheckboxLeadingWidth() + Math.max(24, textWidth));
 }
 
 function StaticBooleanIndicator({ value }: { value: boolean }): React.JSX.Element {
@@ -348,9 +364,23 @@ const WEB_BUTTON_GLYPHS: Record<NonNullable<ButtonProps["symbol"]>, string> = {
   "chevron-up": "⌃", "chevron-down": "⌄", "chevron-up-down": "↕",
 };
 
+// The two symbols that are a mark inside a ring: macOS draws `questionmark.circle`
+// and `info.circle`, and Segoe's help and info glyphs are circled too.  The page
+// printed the bare character, so a help tip beside a field read as a question
+// mark in the sentence instead of the icon the other two hosts draw.  The ring
+// is drawn rather than typed: no circled question mark is in every system face,
+// and the ones that are spelled in Unicode arrive as colour emoji.
+const WEB_RINGED_GLYPHS: Partial<Record<NonNullable<ButtonProps["symbol"]>, string>> = { help: "?", info: "i" };
+
+/** One button symbol, drawn the way this host's face can draw it. */
+function ButtonGlyph({ symbol, ink }: { symbol: NonNullable<ButtonProps["symbol"]>; ink: string }): React.JSX.Element {
+  const mark = Platform.OS === "web" ? WEB_RINGED_GLYPHS[symbol] : undefined;
+  if (mark !== undefined) return <View style={[styles.windowsButtonRing, { borderColor: ink }]}><Text style={[styles.windowsButtonRingMark, { color: ink }]}>{mark}</Text></View>;
+  return <Text style={[styles.windowsButtonGlyph, { color: ink }]}>{(Platform.OS === "web" ? WEB_BUTTON_GLYPHS : WINDOWS_BUTTON_GLYPHS)[symbol]}</Text>;
+}
+
 function WindowsButton({ title, symbol, symbolWithTitle, symbolTrailing, toolTip, accessibilityLabel, disabled, busy, primary, destructive, compact, link, plainLink, titleWidth: _titleWidth, onPress, style, ref }: ButtonProps & { ref?: React.Ref<any> }): React.JSX.Element {
   const showsTitle = symbolWithTitle === true || !symbol;
-  const glyph = symbol ? (Platform.OS === "web" ? WEB_BUTTON_GLYPHS : WINDOWS_BUTTON_GLYPHS)[symbol] : undefined;
   // A destructive (and a primary) button fills its bezel with that colour, so
   // the label has to be the on-accent ink: reading in `danger` on a `danger`
   // fill is red on red — the one button the user must be able to read.
@@ -367,9 +397,9 @@ function WindowsButton({ title, symbol, symbolWithTitle, symbolTrailing, toolTip
     style={[styles.windowsButton, compact && styles.windowsButtonCompact, link && styles.windowsButtonLink, plainLink && styles.windowsButtonPlainLink, primary && styles.windowsButtonPrimary, destructive && styles.windowsButtonDestructive, disabled && styles.windowsButtonDisabled, busy && styles.buttonBusy, style]}
   >
     {busy === true ? <ActivityIndicator size="small" color={ink} style={styles.buttonBusyIndicator} /> : null}
-    {glyph && !symbolTrailing ? <Text style={[styles.windowsButtonGlyph, { color: ink }]}>{glyph}</Text> : null}
+    {symbol && !symbolTrailing ? <ButtonGlyph symbol={symbol} ink={ink} /> : null}
     {showsTitle ? <Text numberOfLines={1} style={[styles.windowsButtonTitle, (link || plainLink) && styles.windowsButtonLinkTitle, { color: ink }, plainLink && styles.windowsButtonPlainLinkTitle]}>{title}</Text> : null}
-    {glyph && symbolTrailing ? <Text style={[styles.windowsButtonGlyph, { color: ink }]}>{glyph}</Text> : null}
+    {symbol && symbolTrailing ? <ButtonGlyph symbol={symbol} ink={ink} /> : null}
   </Pressable>;
 }
 
@@ -931,7 +961,17 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
           // navigates.  A fixed column width here (plus the cell and row insets)
           // overflowed the sidebar, and that overflow was scrollable, so the
           // whole column slid by a different amount on every selection.
-          return <View key={`${row.key}:${columnIndex}`} style={[windowsTableStyles.cellView, sourceList ? windowsTableStyles.sourceCellViewFlex : { width: column.width, paddingHorizontal: inset }]}>
+          //
+          // It does keep its inset, though.  This branch used to drop it along
+          // with the width, so every source-list row — the sidebar and the
+          // settings rail — began its text on the row's own leading edge, 4 pt
+          // from the pane's border: 视觉路由 read as if it were struck through
+          // by the rail's edge.  AppKit insets these cells (`badge` at 8, a
+          // text-only rail row at the column's own padding), and the fallback
+          // hosts now do the same: 8 pt beside a tile, the column's inset for a
+          // row that is only text.
+          const leadingInset = sourceImage !== undefined || rowSymbol ? TABLE_MIN_HORIZONTAL_PADDING : inset;
+          return <View key={`${row.key}:${columnIndex}`} style={[windowsTableStyles.cellView, windowsTableStyles.sourceCellViewFlex, { paddingLeft: leadingInset, paddingRight: TABLE_MIN_HORIZONTAL_PADDING }]}>
             {/* A source list's tile is the same bundled PNG on every host.
                 What must not happen on the web is the glyph fallback below: a
                 browser has no "Segoe MDL2 Assets", so a glyph character renders
@@ -1038,6 +1078,31 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
     lastPress.current = { key: row.key, at: now };
     onSelectionChange?.(row.key, index);
   }, [onRowDoublePress, onSelectionChange]);
+  // The vertical thumb, the same 4 pt capsule `PersistentScrollView` draws:
+  // the FlatList's overflow is the browser's own `overflow: auto`, and macOS
+  // Chrome paints that as an overlay bar that only appears mid-scroll — a list
+  // with more rows than it shows had no affordance at all saying so. The
+  // metrics are read off the list node: RNW's `onScroll` fires, but the
+  // content/viewport pair is cheaper here and stays right when rows resize.
+  const listNode = React.useRef<HTMLElement | null>(null);
+  const [scrollMetrics, setScrollMetrics] = React.useState({ overflow: false, height: 0, offset: 0 });
+  const readScrollMetrics = React.useCallback(() => {
+    const node = listNode.current;
+    if (!node) return;
+    const overflow = node.scrollHeight > node.clientHeight + 1;
+    const height = overflow ? Math.max(24, (node.clientHeight * node.clientHeight) / node.scrollHeight) : 0;
+    const range = Math.max(1, node.scrollHeight - node.clientHeight);
+    const travel = Math.max(0, node.clientHeight - height - 4);
+    setScrollMetrics({ overflow, height, offset: Math.min(travel, (node.scrollTop / range) * travel) });
+  }, []);
+  React.useEffect(() => {
+    readScrollMetrics();
+    // Rows arriving, resizing, or the pane changing height all move the ratio.
+    if (!listNode.current || typeof ResizeObserver === "undefined") return undefined;
+    const observer = new ResizeObserver(readScrollMetrics);
+    observer.observe(listNode.current);
+    return () => observer.disconnect();
+  }, [readScrollMetrics, rows.length]);
   const renderRow = React.useCallback(({ item, index }: { item: TableRow; index: number }): React.JSX.Element => <WindowsTableRow
     row={item}
     index={index}
@@ -1076,7 +1141,16 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
       </View>)}
     </View> : null}
     <FlatList
-      ref={verticalList}
+      ref={(instance) => {
+        verticalList.current = instance;
+        // The ref is the VirtualizedList, not a node: its scroll component (the
+        // RNW ScrollView) answers `getScrollableNode`, which is the element the
+        // browser's own `overflow: auto` lives on.  On the native leaves this
+        // host never renders, so a node that has none simply leaves the thumb
+        // unassembled.
+        const scrollable = (instance as unknown as { getScrollableNode?: () => unknown } | null)?.getScrollableNode?.();
+        listNode.current = scrollable instanceof HTMLElement ? scrollable : null;
+      }}
       data={rows}
       renderItem={renderRow}
       keyExtractor={keyExtractor}
@@ -1087,11 +1161,14 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
       maxToRenderPerBatch={24}
       windowSize={7}
       getItemLayout={(_data, index) => ({ length: rowHeight, offset: rowHeight * index, index })}
+      scrollEventThrottle={16}
+      onScroll={readScrollMetrics}
       // A target that scrolls out of range while the list is still laying
       // out is dropped instead of thrown: `scrollToIndex` fails loudly by
       // design, and a thrown error here escapes into the host process.
       onScrollToIndexFailed={() => undefined}
     />
+    {scrollMetrics.overflow && scrollMetrics.height > 0 ? <View pointerEvents="none" style={[windowsTableStyles.tableScrollThumb, { height: scrollMetrics.height, transform: [{ translateY: scrollMetrics.offset }] }]} /> : null}
   </View>;
   return <View style={[windowsTableStyles.root, !framed && windowsTableStyles.borderless, style]}>
     {/* A source list is a navigation pane, so it lays its rows out at the pane's
@@ -1130,8 +1207,17 @@ export const WINDOWS_CONTROL = {
   fillHover: "#ececec",
   /** TextFillColorPrimary. */
   text: "#1b1b1b",
-  /** TextFillColorSecondary. */
-  textSecondary: "#5d5d5d",
+  /**
+   * The secondary ink: a row that is set aside, a column heading, a hint.
+   *
+   * It was `#5d5d5d` — 36% ink beside 89% ink — and a pane whose rows say
+   * "nothing switched on" and rows that say nothing of the kind became the same
+   * block of near-black at 13 pt.  The AppKit table has always drawn this state
+   * in `NSColor.secondaryLabelColor`, which is 50% black in the light
+   * appearance; that is the value here, so one list reads the same on all three
+   * hosts and grey is visibly not black.
+   */
+  textSecondary: "#808080",
   /** TextFillColorTertiary: glyphs beside a label. */
   textTertiary: "#8a8a8a",
   /** TextFillColorDisabled. */
@@ -1191,6 +1277,11 @@ const windowsTableStyles = StyleSheet.create({
   horizontalContent: { flexGrow: 1, minHeight: 0 },
   horizontalBody: { flex: 1, minHeight: 0 },
   verticalList: { flex: 1, minHeight: 0 },
+  // The table's persistent 4 pt capsule, over the rows' trailing edge.  A
+  // browser's own `overflow: auto` bar is an overlay that shows itself only
+  // mid-scroll, so a list with more rows than it shows read as a list that
+  // ended — the keys list in the provider inspector, four rows of nine.
+  tableScrollThumb: { position: "absolute", top: 2, right: 2, width: 4, borderRadius: 2, backgroundColor: "rgba(96,96,96,0.55)" },
   body: { flexGrow: 1 },
   row: { minWidth: "100%", borderBottomWidth: 1, borderBottomColor: WINDOWS_CONTROL.strokeSubtle, justifyContent: "center" },
   // A source list is a navigation surface, not a data table: no row rules,
@@ -1498,6 +1589,11 @@ const styles = StyleSheet.create({
   windowsButtonDestructive: { borderColor: WINDOWS_CONTROL.danger, backgroundColor: WINDOWS_CONTROL.danger },
   windowsButtonDisabled: { opacity: 0.55 },
   windowsButtonGlyph: { fontFamily: GLYPH_FONT_FAMILY, fontSize: UI_FONT_SIZE, lineHeight: 16 },
+  // A ringed mark, sized to the glyph it replaces: 13 pt of circle beside a
+  // label, with the character centred inside it by its own line height rather
+  // than by the 16 pt the plain glyph uses.
+  windowsButtonRing: { width: 13, height: 13, borderRadius: 6.5, borderWidth: 1, alignItems: "center", justifyContent: "center" },
+  windowsButtonRingMark: { fontSize: 9, lineHeight: 11, fontWeight: "600" },
   windowsButtonTitle: { fontSize: UI_FONT_SIZE, flexShrink: 1 },
   windowsButtonLinkTitle: { textDecorationLine: "underline" },
   windowsButtonPlainLinkTitle: { textDecorationLine: "underline", fontWeight: "400" },

@@ -424,6 +424,37 @@ class RelayModelBindingTests(unittest.TestCase):
             self.assertEqual([], rematerialized["issues"])
             self.assertNotIn("replace-rematerialized-credential", json.dumps(rematerialized))
 
+    def test_a_station_roster_is_filed_under_the_import_spelling(self) -> None:
+        """A station's id stays on the wire; the public name is the import spelling.
+
+        A roster that spells a model in title case (``MiniMax-M3.1-Flash``)
+        would otherwise become the name a client has to type, and the same model
+        listed again in another case would be a second group with one route each.
+        The import files the name in lower case, keeps ``litellm_model`` exactly
+        as the station spells it, and a re-import finds the row it already made.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = ProvidersModelsDomain(Path(directory) / "config.yaml")
+            source = relay_source(models=["MiniMax-M3.1-Flash"])
+
+            imported = domain.stage_relay_import([source])
+            self.assertEqual(1, imported["operation_summary"]["model_count"])
+            model = imported["providers"][0]["models"][0]
+            self.assertEqual("minimax-m3.1-flash", model["model_name"])
+            self.assertEqual("openai/MiniMax-M3.1-Flash", model["litellm_model"])
+            self.assertEqual("MiniMax-M3.1-Flash", model["upstream_model"])
+
+            # The same station listed again is the row it already imported, not
+            # a second route under another case.
+            again = domain.stage_relay_import([source])
+            self.assertEqual(0, again["operation_summary"]["model_count"])
+            self.assertEqual(1, again["operation_summary"]["updated_model_count"])
+            self.assertEqual(
+                ["minimax-m3.1-flash"],
+                [row["model_name"] for row in again["providers"][0]["models"]],
+            )
+
     def test_a_key_the_station_no_longer_serves_is_refused_instead_of_riding_its_stored_value(self) -> None:
         """A key that is gone upstream is not revived by the value left on its slot.
 

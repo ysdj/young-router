@@ -111,6 +111,52 @@ class HookReasoningMappingTests(HookTestCase):
         self.assertEqual("disabled", mapped["reasoning"]["effort"])
         self.assertEqual("maximum", mapped["extra_body"]["reasoning"]["effort"])
 
+    def test_glm_flash_relay_route_sends_the_only_tier_that_thinks(self) -> None:
+        """A relay route's own ladder must not be another provider's.
+
+        ``glm-5.3-flash`` has no provider-qualified record of its own, so the
+        registry used to answer its capability from a suffix match against
+        other providers' ``.../glm-5.3-flash`` entries and advertise ``high``
+        as a tier that thinks.  On the relays this app actually serves, a
+        turn at ``high`` came back with ``reasoning_tokens: 0`` -- the model
+        answered without thinking, so a client that picked the middle of the
+        dial saw no thinking at all.  The bundled profile states the tiers the
+        route really has, and the request path folds every thinking tier onto
+        ``max``.  ``off`` must still land on the one tier that does not think:
+        upgrading a request that asked to turn thinking off is the same bug in
+        the other direction.
+        """
+
+        hooks, _ = load_hook_module()
+        root = Path(self.create_temp_dir())
+        self.set_env("LITELLM_RUNTIME_ROOT", str(root))
+        self.set_env("LITELLM_CONFIG_FILE", str(root / "config.yaml"))
+
+        def effort(level: str) -> str:
+            # The shape the deployment hook actually receives: the model is
+            # already spelled with the upstream's prefix, and the provider is
+            # the relay's own name, so nothing here reaches the bare id the
+            # declaration is keyed by on its own.
+            request = {
+                "model": "openai/glm-5.3-flash",
+                "litellm_params": {
+                    "model": "openai/glm-5.3-flash",
+                    "custom_llm_provider": "sisct2",
+                },
+                "model_info": {"provider": "sisct2"},
+                "reasoning": {"effort": level, "summary": "auto"},
+            }
+            mapped = hooks._with_model_reasoning_mapping(request)
+            return (mapped or request)["reasoning"]["effort"]
+
+        self.assertEqual("max", effort("high"))
+        self.assertEqual("max", effort("max"))
+        self.assertEqual("max", effort("xhigh"))
+        # The dial keeps its shape: the tiers below ``high`` are where a
+        # request that wants no thinking goes.
+        self.assertEqual("low", effort("low"))
+        self.assertEqual("low", effort("off"))
+
     def test_request_uses_exact_provider_route_and_leaves_unknown_effort_untouched(self) -> None:
         hooks, _ = load_hook_module()
         root = Path(self.create_temp_dir())

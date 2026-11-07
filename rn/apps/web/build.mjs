@@ -102,7 +102,13 @@ const html = `<!doctype html>
          is the shared UI's own body size so an unstyled element matches the
          Text around it. */
       body {
-        background: #f7f7f7;
+        /* The page is the desktop the app's window sits on, not the app's own
+           surface.  It was 247,247,247 -- the same literal as the shell's own
+           fill (windowBackgroundColor), so a centred shell ended in the middle
+           of the page with no boundary at all: the window's edge and the page
+           behind it were one colour.  A step darker states that there are two
+           surfaces; the shell's own border draws the line between them. */
+        background: #e3e3e8;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
         font-size: 13px;
         line-height: 1.35;

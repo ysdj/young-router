@@ -128,7 +128,14 @@ class _Recorder(http.server.BaseHTTPRequestHandler):
         return
 
     def do_GET(self) -> None:  # noqa: N802
-        body = json.dumps({"path": self.path, "host": self.headers.get("Host", "")}).encode()
+        body = json.dumps({
+            "path": self.path,
+            "host": self.headers.get("Host", ""),
+            "page_host": self.headers.get(web_forward.PUBLISHED_HOST_HEADER, ""),
+            # Every value, not just the first: a header stated twice is how a
+            # smuggled copy would arrive.
+            "page_host_values": self.headers.get_all(web_forward.PUBLISHED_HOST_HEADER) or [],
+        }).encode()
         # Core answers through stdlib's ``BaseHTTPRequestHandler``, whose own
         # ``Server`` header has a trailing space.  h11 refuses to send that
         # value, so the replay must never copy it -- the middleware's answer
@@ -221,6 +228,38 @@ class ForwardingTests(unittest.TestCase):
         # The hop's own server header is not replayed: its value cannot even be
         # serialised by this listener's protocol.
         self.assertNotIn("youngroutercore/1", json.dumps(headers).lower())
+
+    def test_the_name_the_browser_used_travels_with_the_request(self) -> None:
+        """Core cannot see it otherwise: this hop is loopback either way.
+
+        The page is gated on the name a person reached it by, so the proxy
+        states the browser's own `Host` in a header of this app's, next to the
+        loopback `Host` Core insists on.
+        """
+
+        status, _headers, body = _call(
+            self.middleware, "GET", "/ui/", headers=[(b"host", b"router.example.com")]
+        )
+        self.assertEqual(200, status)
+        recorded = json.loads(body)
+        self.assertEqual("router.example.com", recorded["page_host"])
+        self.assertEqual(f"{self.address}:{self.port}", recorded["host"])
+
+    def test_a_client_cannot_state_the_page_name_itself(self) -> None:
+        # The header decides whether Core gates the page, so a copy arriving
+        # from the browser is dropped: only this hop says what the page is.
+        status, _headers, body = _call(
+            self.middleware,
+            "GET",
+            "/ui/",
+            headers=[
+                (b"host", b"router.example.com"),
+                (web_forward.PUBLISHED_HOST_HEADER.lower().encode(), b"127.0.0.1"),
+            ],
+        )
+        self.assertEqual(200, status)
+        recorded = json.loads(body)
+        self.assertEqual(["router.example.com"], recorded["page_host_values"])
 
     def test_a_settings_call_keeps_its_method_and_body(self) -> None:
         payload = json.dumps({"protocol_version": 1, "request_id": "t", "method": "snapshot", "params": {}}).encode()

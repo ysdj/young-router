@@ -120,8 +120,33 @@ class HostProfileProjectionTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {}, clear=True):
             self.assertFalse(host_profile.active())
             self.assertEqual("", host_profile.stated_key())
+            self.assertIsNone(host_profile.stated_port())
         with mock.patch.dict("os.environ", {host_profile.PROFILE_ENV: "gateway"}, clear=True):
             self.assertTrue(host_profile.active())
+
+    def test_a_desktop_states_no_port_even_when_its_environment_names_one(self) -> None:
+        """A desktop's port is the setting's; an inherited variable is not a statement."""
+
+        with mock.patch.dict("os.environ", {"LITELLM_PORT": "4401"}, clear=True):
+            self.assertIsNone(host_profile.stated_port())
+
+    def test_a_host_states_its_port_under_either_name(self) -> None:
+        """The unit names ``LV_PORT``; the launcher hands the proxy ``LITELLM_PORT``."""
+
+        with mock.patch.dict(
+            "os.environ", {host_profile.PROFILE_ENV: "gateway", "LITELLM_PORT": "4401"}, clear=True
+        ):
+            self.assertEqual(4401, host_profile.stated_port())
+        with mock.patch.dict(
+            "os.environ", {host_profile.PROFILE_ENV: "gateway", "LV_PORT": "4401"}, clear=True
+        ):
+            self.assertEqual(4401, host_profile.stated_port())
+        # A range violation is not a statement either: the pane and the launch
+        # path fall back to the setting instead of binding something imaginary.
+        with mock.patch.dict(
+            "os.environ", {host_profile.PROFILE_ENV: "gateway", "LITELLM_PORT": "70000"}, clear=True
+        ):
+            self.assertIsNone(host_profile.stated_port())
 
     def test_a_stated_key_is_read_from_the_file_the_unit_names(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

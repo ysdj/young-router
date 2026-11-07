@@ -60,6 +60,7 @@ New-Item -ItemType Directory -Force -Path $StagingCache | Out-Null
 $NodeRuntime = Join-Path $StagingCache "node-runtime"
 $VeridropWork = Join-Path $StagingCache "veridrop"
 $ConnectWorkBuddyWork = Join-Path $StagingCache "connect-workbuddy"
+$ConnectQoderWork = Join-Path $StagingCache "connect-qoder"
 $OurFreeModelWork = Join-Path $StagingCache "our-free-model"
 $DshVisionRouterWork = Join-Path $StagingCache "dsh-vision-router"
 $ContextAttachmentManagerWork = Join-Path $StagingCache "context-attachment-manager"
@@ -112,6 +113,11 @@ try {
   $ConnectWorkBuddyUpdater = Join-Path $ProjectRoot "scripts\update_connect_workbuddy.py"
   & uv run --no-project --python 3.12 $ConnectWorkBuddyUpdater --output $ConnectWorkBuddyWork
   if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled dsh-connect-workbuddy package." }
+  # Qoder access is driven through the published third-party package, so every
+  # artifact build re-resolves its latest release too.
+  $ConnectQoderUpdater = Join-Path $ProjectRoot "scripts\update_connect_qoder.py"
+  & uv run --no-project --python 3.12 $ConnectQoderUpdater --output $ConnectQoderWork
+  if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled dsh-connect-qoder package." }
   # The Our Free Model lane stages the upstream package's sources.
   $OurFreeModelUpdater = Join-Path $ProjectRoot "scripts\update_our_free_model.py"
   & uv run --no-project --python 3.12 $OurFreeModelUpdater --output $OurFreeModelWork
@@ -173,6 +179,7 @@ try {
   Copy-CoreSource (Join-Path $ProjectRoot "young_router") (Join-Path $Core "young_router")
   Copy-CoreSource $VeridropWork (Join-Path $Core "young_router\adapters\veridrop")
   Copy-CoreSource $ConnectWorkBuddyWork (Join-Path $Core "young_router\adapters\connect-workbuddy")
+  Copy-CoreSource $ConnectQoderWork (Join-Path $Core "young_router\adapters\connect-qoder")
   Copy-CoreSource $OurFreeModelWork (Join-Path $Core "young_router\adapters\our-free-model")
   Copy-CoreSource $DshVisionRouterWork (Join-Path $Core "young_router\adapters\dsh-vision-router")
   Get-ChildItem -LiteralPath $Core -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
@@ -363,6 +370,16 @@ print('young-router-veridrop-import-ok')
   }
   if (-not (Test-Path (Join-Path $Core "young_router\adapters\connect-workbuddy\lib\index.js"))) {
     throw "The bundled dsh-connect-workbuddy package is missing."
+  }
+  if (-not (Test-Path (Join-Path $Core "young_router\adapters\connect-qoder\lib\index.js"))) {
+    throw "The bundled dsh-connect-qoder package is missing."
+  }
+  if (-not (Test-Path (Join-Path $Core "young_router\adapters\qoder_worker.mjs"))) {
+    throw "The Windows build output does not contain young_router/adapters/qoder_worker.mjs."
+  }
+  $QoderSurface = & (Join-Path $RuntimeBin "node.exe") (Join-Path $ProjectRoot "scripts\verify_connect_qoder.mjs") (Join-Path $Core "young_router\adapters\connect-qoder\lib\index.js") 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    throw "The bundled dsh-connect-qoder package no longer exports the surface the worker uses: $QoderSurface"
   }
   if (-not (Test-Path (Join-Path $Core "young_router\adapters\our_free_model_worker.mjs"))) {
     throw "The Windows build output does not contain young_router/adapters/our_free_model_worker.mjs."

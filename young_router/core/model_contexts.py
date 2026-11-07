@@ -357,6 +357,33 @@ _BUNDLED_RECORDS: dict[str, dict[str, Any]] = {
     "claude-sonnet-5": _record(1_000_000),
     "claude-opus-5": _record(1_000_000),
     "glm-5.3": _record(1_000_000),
+    # ``glm-5.3-flash`` is served by relays that only think at the top of the
+    # dial, and the ladder the registry would otherwise answer with is a
+    # third party's: no record states this route, so a suffix match against
+    # other providers' ``.../glm-5.3-flash`` entries is what ``high`` came
+    # from.  Measured 2026-11-07 on the native Responses wire with tools, both
+    # deployments of the group (api.sisct2.xyz, new.youyangai.top):
+    # ``effort=high`` produced a reasoning item on 1 of 16 short turns and
+    # ``effort=max`` on 19 of 21 -- and a turn without one reported
+    # ``output_tokens_details.reasoning_tokens: 0``, so the upstream answered
+    # without thinking and nothing was dropped on this side.  ``high`` on this
+    # route is therefore stated as what it really selects.  ``low`` is kept
+    # because it is where a request that asked for no thinking lands: every
+    # level above it maps to ``max``, and ``off``/``minimal`` clamp onto the
+    # only tier that turns thinking off.
+    "glm-5.3-flash": {
+        **_record(1_000_000, priority=45),
+        "reasoning": True,
+        "thinking_level_map": {
+            "off": None,
+            "minimal": None,
+            "low": "low",
+            "medium": None,
+            "high": "max",
+            "xhigh": None,
+            "max": "max",
+        },
+    },
     "kimi-k3": _record(262_144, 1_048_576, priority=25),
     "k3-256k": _record(262_144, priority=25),
     "gpt-image-2": _record(65_536),
@@ -1472,12 +1499,11 @@ class ModelContextRegistry:
         document on every call is what made one catalog build digest a 33 KB
         file five hundred times.
 
-        The key is the name's *identity* (``public_name_key``), not its
-        spelling: one public model is one group however its routes capitalise
-        it, so a lookup for the group reads every route of it.  Keying on the
-        exact spelling handed a group whose rows disagreed about case an empty
-        route list -- and an empty list is what publishes the unknown window
-        and drops the group's declared context.
+        The key is the name itself (``public_name_key``), not a folded form of
+        it: the name is the group, and the import already stated the one
+        spelling every route of it carries.  Keying on a folded name merges two
+        models the Router serves separately, so each group reads the other's
+        route list and can report a window none of its own routes stated.
         """
 
         if self.runtime_config_path is None:
@@ -2105,6 +2131,19 @@ class ModelContextRegistry:
         record = self._records.get(normalized_id)
         if record is None and "/" not in normalized_id:
             record = _lookup(self._records, normalized_id)
+        if record is None and "/" in normalized_id:
+            # A deployment states its model with the upstream's own prefix
+            # (``openai/glm-5.3-flash``), and a provider-qualified id is
+            # deliberately never fuzzy-matched here: inheriting whichever
+            # catalogue entry ends in the same name is how a relay route was
+            # handed another provider's ladder.  A policy this app declares for
+            # the model itself is not that kind of guess, so the declared name
+            # answers for its prefixed spellings too.  Without this the listing
+            # published a ladder (through the bare-name fallback in
+            # ``proxy.reasoning._model_listing_efforts``) that the request path
+            # could never apply, because every deployment id in the group was
+            # prefixed.
+            record = _BUNDLED_RECORDS.get(normalized_id.rsplit("/", 1)[-1])
         if record is None:
             alias = _BUNDLED_ALIASES.get(normalized_id)
             if alias:

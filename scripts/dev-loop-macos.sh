@@ -104,7 +104,7 @@ done
 # `--delete`, into deleting working adapters mid-sync.
 CORE_SYNC_EXCLUDES=(
   --exclude '__pycache__' --exclude '*.pyc' --exclude '*.pyo'
-  --exclude 'veridrop' --exclude 'connect-workbuddy'
+  --exclude 'veridrop' --exclude 'connect-workbuddy' --exclude 'connect-qoder'
   --exclude 'dsh-vision-router' --exclude 'our-free-model'
 )
 

@@ -4030,14 +4030,22 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   const NSInteger selectedRow = _tableView.selectedRow;
   if (selectedRow < 0 || static_cast<size_t>(selectedRow) >= viewProps.rowKeys.size() ||
       ([self isSpanningRow:selectedRow] && ![self isSelectableSpanningRow:selectedRow])) {
-    // A click on the empty space below the rows clears the native selection.
-    // Report the cleared state so the shared view drops the item its + / −
-    // header and editor were acting on instead of keeping a selection the
-    // list no longer highlights.
-    if (selectedRow < 0 && !viewProps.selectedKey.empty()) {
-      LiteLLMAppKitTableEventEmitter::OnSelectionChange event{"", -1};
-      std::static_pointer_cast<const LiteLLMAppKitTableEventEmitter>(_eventEmitter)->onSelectionChange(event);
+    // A click below the rows — or on a group header — names no row, and AppKit
+    // answers it by dropping the native selection.  That is not a state these
+    // lists can be in: the highlighted row is the only thing that says what the
+    // pane beside the list is editing, so a cleared selection leaves an editor
+    // with nothing in it and no row to click that would bring the old one back.
+    // Put the highlight back on the row ``selectedKey`` names and report
+    // nothing: a click on a row is a selection, a click on the space around the
+    // rows is not.
+    const NSInteger kept = SegmentIndex(viewProps.rowKeys, viewProps.selectedKey);
+    _synchronizingSelection = YES;
+    if (kept >= 0 && ![self isDisabledRow:kept] && ![self isSelectableSpanningRow:kept]) {
+      [_tableView selectRowIndexes:[NSIndexSet indexSetWithIndex:kept] byExtendingSelection:NO];
+    } else if (_tableView.selectedRow >= 0) {
+      [_tableView deselectAll:nil];
     }
+    _synchronizingSelection = NO;
     return;
   }
   LiteLLMAppKitTableEventEmitter::OnSelectionChange event{

@@ -19,6 +19,12 @@ credits, the ordering -- but a few facts belong to one machine:
   protocol bridges and stream recovery are methods on that hook, so an empty
   list is not "no token saver" but plain LiteLLM behind a health check that
   still answers 200.
+* The port a host serves on is published in a reverse proxy and a health probe,
+  both of which name a number rather than ask.  A value that travelled here in
+  the document must not move the listener they already point at, and a host may
+  not step forward to the next free port either: every status line would still
+  read "running" while every client got 502.  A desktop has neither contract,
+  so there the setting chooses and an occupied port may step.
 
 This used to live in a shell script in the deployment repository, which meant a
 host's behaviour was described in two places and only one of them was in the
@@ -41,6 +47,10 @@ GATEWAY = "gateway"
 #: environment value: it is a credential, and a unit that carried it would be
 #: readable by anyone allowed to run ``systemctl show``.
 PROXY_KEY_ENV = "YOUNG_ROUTER_HOST_PROXY_KEY_FILE"
+#: A host may state the port it publishes.  Two names because the two sides of
+#: one deployment state it differently: a unit file names ``LV_PORT`` for the
+#: launcher it starts, and the launcher hands the proxy ``LITELLM_PORT``.
+PORT_ENVS = ("LITELLM_PORT", "LV_PORT")
 
 #: The router's own hook is the data plane, not a desktop convenience.
 HOOK_CALLBACK = "young_router.callbacks.image_generation_routing_hook"
@@ -64,6 +74,31 @@ def stated_key() -> str:
         return ""
     stripped = text.strip()
     return stripped.splitlines()[0].strip() if stripped else ""
+
+
+def stated_port() -> int | None:
+    """The port this host publishes, or ``None`` when it states none.
+
+    ``None`` is the desktop's answer, and it is not a fallback to the setting:
+    it is the statement that the setting is the only writer, which is why the
+    caller may still step forward from an occupied port there.
+    """
+
+    if not active():
+        return None
+    for name in PORT_ENVS:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            continue
+        try:
+            port = int(raw)
+        except ValueError:
+            # A name this host states but cannot read is not a statement; the
+            # other name is, and there is nothing here to guess from.
+            continue
+        if 1 <= port <= 65535:
+            return port
+    return None
 
 
 def reachable(base: object) -> bool:

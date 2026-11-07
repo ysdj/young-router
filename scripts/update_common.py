@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Shared npm-registry staging helpers for the third-party update scripts.
 
-``update_connect_workbuddy.py`` and ``update_dsh_vision_router.py`` resolve an npm ``latest`` dist-tag, download the
+``update_connect_workbuddy.py``, ``update_connect_qoder.py`` and ``update_dsh_vision_router.py`` resolve an npm ``latest`` dist-tag, download the
 tarball, install it without touching a lockfile, and flatten the installed
 package into a Core directory.  The mechanics live here once; each script keeps
 only what is particular to its package (its peer rules and any staged rewrite).
@@ -469,7 +469,17 @@ def run_npm_install(
     *,
     package_name: str,
     timeout: int,
+    legacy_peer_deps: bool = False,
 ) -> None:
+    """Install one tarball plus the peers a worker actually imports.
+
+    ``legacy_peer_deps`` skips npm's automatic install of the peers' *own*
+    peer dependencies.  A package whose published closure is a whole client
+    application (Qoder's Harness plugin) would otherwise pull that application
+    in even though the worker imports only one chunk of it; the caller that
+    opts in must have proved the runtime closure (the Qoder staging script
+    keeps exactly the peers its verifier loads).
+    """
     npm_dependency_manifest(npm_root, peer_specs)
     command = [
         npm,
@@ -482,6 +492,7 @@ def run_npm_install(
         "--omit=dev",
         "--fund=false",
         "--audit=false",
+        *(["--legacy-peer-deps"] if legacy_peer_deps else []),
         str(package_tarball),
     ]
     env = os.environ.copy()

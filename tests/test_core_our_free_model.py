@@ -1145,13 +1145,21 @@ class LaneNameCollisionTests(unittest.TestCase):
             ),
         )
 
-    def test_an_unclaimed_name_is_left_exactly_as_the_catalog_spells_it(self) -> None:
-        """Renaming on import is the user's decision, not the importer's."""
+    def test_an_unclaimed_name_keeps_the_catalog_name_in_the_import_spelling(self) -> None:
+        """Renaming on import is the user's decision; the case is not a rename."""
 
         self.assertEqual(
             "weird-vendor/model:free",
             ProvidersModelsDomain._unique_lane_name(
                 "weird-vendor/model:free", {"weird-vendor/model:free": "kilo"}, set()
+            ),
+        )
+        # A catalog label in title case is filed under the one spelling a client
+        # types; the row is not renamed, its case is settled at the door.
+        self.assertEqual(
+            "qwen3.8-max",
+            ProvidersModelsDomain._unique_lane_name(
+                "qwen3.8-max", {}, set(), preferred="Qwen3.8-Max"
             ),
         )
 

@@ -103,6 +103,9 @@ BROWSER_SESSION_COOKIE = "yr-core-session"
 # origin is this listener: ``/ipc`` is same-origin and no CORS answer, preflight,
 # or second port is involved.  Only these names are answered.
 WEB_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "[::1]"})
+#: The same name the proxy forwards in (`proxy/web_forward.py`), so this module
+#: does not import the proxy to read one header string.
+PUBLISHED_HOST_HEADER = "X-Young-Router-Page-Host"
 # Where the page lives on the published local port.  The proxy owns that
 # listener and forwards this prefix to Core, which lets the browser keep one
 # origin: `/ui` is the page, `/ipc` is its API, and neither needs a CORS
@@ -1128,13 +1131,28 @@ class CoreIPCServer:
         # because those are bytes any page could fetch from a port on this
         # machine, and gating them behind a cookie would only mean the login
         # page could not load.
+        # A page opened on this machine is the owner's page: it is served the
+        # app, and the shell response hands it the session cookie the pane's
+        # `/ipc` calls need, so no form stands between a person and their own
+        # settings.  A page published behind a reverse proxy keeps the key.
+        local_session = ""
         if candidate.name == "index.html" and not self._page_signed_in(handler):
-            body = _web_login_page(self._web_language())
-            content_type = "text/html; charset=utf-8"
-            relative = "login.html"
+            if self._page_is_local(handler):
+                with self._lock:
+                    local_session = secrets.token_urlsafe(32)
+                    self._sessions[local_session] = _Session(
+                        token=local_session,
+                        expires_at=time.monotonic() + self.session_ttl_seconds,
+                    )
+            else:
+                body = _web_login_page(self._web_language())
+                content_type = "text/html; charset=utf-8"
+                relative = "login.html"
         handler.send_response(200)
         handler.send_header("Content-Type", content_type)
         handler.send_header("Content-Length", str(len(body)))
+        if local_session:
+            handler.send_header("Set-Cookie", handler._browser_session_cookie_header(local_session))
         handler.send_header(
             "Cache-Control",
             "no-store" if candidate.suffix.lower() == ".html" else "public, max-age=31536000, immutable",
@@ -1157,6 +1175,37 @@ class CoreIPCServer:
         except OSError:
             pass
         return True
+
+    def _page_published_host(self, handler: "_CoreRequestHandler") -> str:
+        """The `Host` the browser typed, when a forwarder states it.
+
+        The proxy on the published port always connects to Core over loopback
+        and states that loopback name as `Host` (the check that stops a
+        DNS-rebinding page).  It repeats the browser's own name in
+        ``PUBLISHED_HOST_HEADER``, which is the only thing that separates "the
+        owner opened the page on this machine" from "somebody reached the page
+        through a reverse proxy in front of it".
+        """
+
+        forwarded = (handler.headers.get(PUBLISHED_HOST_HEADER, "") or "").strip()
+        if forwarded:
+            return forwarded
+        return (handler.headers.get("Host", "") or "").strip()
+
+    def _page_is_local(self, handler: "_CoreRequestHandler") -> bool:
+        """Whether this request came from this machine's own browser.
+
+        A loopback page is not published anywhere: only the owner (or a process
+        running as the owner) can open it, so it is served without a key and
+        without a sign-in form.  A page reached through a reverse proxy is
+        published to whoever can reach that proxy, and stays gated.
+        """
+
+        peer = handler.client_address[0] if handler.client_address else ""
+        if peer not in {"127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"}:
+            return False
+        host = self._page_published_host(handler).rsplit(":", 1)[0].strip("[]").lower()
+        return host in WEB_HOSTS
 
     def _page_signed_in(self, handler: "_CoreRequestHandler") -> bool:
         """Whether this browser already holds a live session cookie.

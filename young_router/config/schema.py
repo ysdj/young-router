@@ -150,6 +150,8 @@ PROVIDER_AUTH_KINDS = {
     "openai_login",
     "workbuddy_login",
     "workbuddy_global_login",
+    "qoder_login",
+    "qoder_global_login",
     "our_free_model_login",
 }
 

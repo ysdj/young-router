@@ -36,6 +36,7 @@ update_common = importlib.import_module("update_common")
 node_runtime = importlib.import_module("update_node_runtime")
 bun_runtime = importlib.import_module("update_bun_runtime")
 workbuddy_connect = importlib.import_module("update_connect_workbuddy")
+qoder_connect = importlib.import_module("update_connect_qoder")
 our_free_model = importlib.import_module("update_our_free_model")
 dsh_vision_router = importlib.import_module("update_dsh_vision_router")
 
@@ -1043,6 +1044,45 @@ class OurFreeModelReleaseResolutionTests(unittest.TestCase):
             with self.assertRaises(update_common.UpdateError):
                 our_free_model.update(output, source_url="https://example.test/repo.git")
         clone.assert_called_once()
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class QoderRuntimeClosureTests(unittest.TestCase):
+    """The Qoder stage keeps the client closure and drops the Harness client."""
+
+    def test_only_the_runtime_closure_survives(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            staged = Path(directory) / "connect-qoder"
+            lib = staged / "lib"
+            lib.mkdir(parents=True)
+            for name in ("index.js", "chunk-ABC.js", "bin.js", "client.js"):
+                (lib / name).write_text("// " + name, encoding="utf-8")
+            scoped = staged / "node_modules" / "@deepseek-ai"
+            for name in ("dsh-atomic-write", "dsh-home-paths", "dsh-app-boot"):
+                (scoped / name).mkdir(parents=True)
+                (scoped / name / "index.js").write_text("// " + name, encoding="utf-8")
+            other = staged / "node_modules" / "@earendil-works" / "pi-ai"
+            other.mkdir(parents=True)
+            (other / "index.js").write_text("// pi-ai", encoding="utf-8")
+            binary = staged / "node_modules" / ".bin"
+            binary.mkdir()
+            (binary / "dsh-connect-qoder").write_text("#!/bin/sh\n", encoding="utf-8")
+
+            qoder_connect._keep_runtime_closure(staged)
+
+            self.assertTrue((staged / qoder_connect.CLOSURE_MARKER).is_file())
+            self.assertTrue((staged / "lib" / "index.js").is_file())
+            self.assertTrue((staged / "lib" / "chunk-ABC.js").is_file())
+            self.assertFalse((staged / "lib" / "bin.js").exists())
+            self.assertFalse((staged / "lib" / "client.js").exists())
+            self.assertTrue((scoped / "dsh-atomic-write").is_dir())
+            self.assertTrue((scoped / "dsh-home-paths").is_dir())
+            self.assertFalse((scoped / "dsh-app-boot").exists())
+            self.assertFalse((staged / "node_modules" / "@earendil-works").exists())
+            self.assertFalse(binary.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

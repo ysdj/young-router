@@ -27,7 +27,37 @@ export type HostChromeRequest =
   | (Base & { kind: "confirm"; title: string; message: string; confirmLabel: string; cancelLabel: string; destructive: boolean; resolve: (accepted: boolean) => void })
   | (Base & { kind: "prompt"; title: string; value: string; confirmLabel: string; cancelLabel: string; resolve: (value: string | null) => void })
   | (Base & { kind: "viewer"; title: string; text: string; closeLabel: string; resolve: () => void })
-  | (Base & { kind: "picker"; title: string; models: string[]; providerName: string; keyName: string; confirmLabel: string; cancelLabel: string; resolve: (models: string[] | undefined) => void })
+  | (Base & {
+      kind: "picker";
+      title: string;
+      models: string[];
+      providerName: string;
+      keyName: string;
+      confirmLabel: string;
+      cancelLabel: string;
+      /**
+       * The chooser's own words, because it is a surface and not a message: it
+       * has a heading, a provider/key line, a search field, 全选 and 反选, a
+       * count that follows the filter, and an empty result.  The native links
+       * carry these in their localization table; this host has no table, so the
+       * caller (which holds the same strings) states them.
+       */
+      labels: {
+        providerLabel: string;
+        keyLabel: string;
+        search: string;
+        selectAll: string;
+        selectAllToolTip: string;
+        invert: string;
+        invertToolTip: string;
+        count: string;
+        countFiltered: string;
+        countSelected: string;
+        empty: string;
+        noMatches: string;
+      };
+      resolve: (models: string[] | undefined) => void;
+    })
   | (Base & { kind: "menu"; title: string; items: HostChromeMenuItem[]; anchor: HostChromeAnchor; resolve: (index: number | undefined) => void });
 
 /** A request before the store assigns its id and settle callback. */

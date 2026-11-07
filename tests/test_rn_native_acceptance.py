@@ -812,15 +812,22 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("auto auto_grouping_baseline = std::make_shared<std::optional<std::vector<SheetRow>>>();", windows)
 
 
-    def test_native_tables_report_a_cleared_selection(self) -> None:
+    def test_native_tables_keep_the_row_a_click_outside_the_rows_does_not_name(self) -> None:
         mac = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
         mac_table = mac.split(
             "- (void)tableViewSelectionDidChange:", 1
         )[1].split("- (void)handleRowClick:", 1)[0]
         adapter = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
-        self.assertIn("if (selectedRow < 0 && !viewProps.selectedKey.empty()) {", mac_table)
-        self.assertIn('LiteLLMAppKitTableEventEmitter::OnSelectionChange event{"", -1};', mac_table)
-        # Windows is a React table; a row press always reaches the shared view.
+        # A click below the rows or on a group header names no row, and AppKit
+        # answers it by dropping the native selection.  This table draws the
+        # selection React holds, so reporting the cleared state left the list
+        # with nothing highlighted and the pane beside it with nothing to edit.
+        self.assertIn("const NSInteger kept = SegmentIndex(viewProps.rowKeys, viewProps.selectedKey);", mac_table)
+        self.assertIn("if (kept >= 0 && ![self isDisabledRow:kept] && ![self isSelectableSpanningRow:kept]) {", mac_table)
+        self.assertIn("[_tableView selectRowIndexes:[NSIndexSet indexSetWithIndex:kept] byExtendingSelection:NO];", mac_table)
+        self.assertNotIn('OnSelectionChange event{"", -1}', mac_table)
+        # Windows is a React table; a row press always reaches the shared view,
+        # and a press that hits no row reaches nothing at all.
         self.assertIn('const select = React.useCallback((row: TableProps["rows"][number], index: number): void => {', adapter)
         self.assertIn("onSelectionChange?.(row.key, index);", adapter)
 

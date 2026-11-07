@@ -38,6 +38,14 @@ from typing import Any, Iterable
 ENDPOINT_ENV = "YOUNG_ROUTER_CORE_IPC_ENDPOINT"
 #: The prefixes this app owns on the published port.
 FORWARDED_PREFIXES = ("/ui", "/ipc")
+#: The `Host` the browser actually used, forwarded for Core's own decision.
+#:
+#: Core sees a loopback `Host` on every forwarded request (the line above), so
+#: it cannot tell a page opened on this machine from one reached through a
+#: reverse proxy in front of it.  That difference decides whether the page is
+#: gated: the loopback page is already the owner's, and a page published under
+#: a real hostname is not.
+PUBLISHED_HOST_HEADER = "X-Young-Router-Page-Host"
 #: Headers that describe one hop and must not be copied to the next.
 #:
 #: ``server`` and ``date`` are here because this listener's own server writes
@@ -112,12 +120,32 @@ def _exchange(
         outbound = [
             (name.decode("latin-1"), value.decode("latin-1"))
             for name, value in headers
+            # A client can send this header itself, and it is the one that
+            # decides whether Core gates the page: the copy appended below is
+            # this hop's own statement, so any inbound one is dropped rather
+            # than trusted (and `dict()` would otherwise keep whichever came
+            # last).
             if name.decode("latin-1").lower() not in HOP_BY_HOP
+            and name.decode("latin-1").lower() != PUBLISHED_HOST_HEADER.lower()
         ]
         # Core answers a loopback `Host` name only; that check is what keeps a
         # DNS-rebinding page from reaching it, so the name is stated here
         # rather than inherited from whatever the browser typed.
+        #
+        # The name the browser typed travels beside it, under a header of this
+        # app's own, because Core has to know whether the page was opened on
+        # this machine or through a reverse proxy in front of it: the loopback
+        # page needs no key, and one published under a real hostname does.  A
+        # header rather than a guess, because everything reaching Core over
+        # this hop is a loopback connection either way.
+        page_host = next(
+            (value.decode("latin-1") for name, value in headers
+             if name.decode("latin-1").lower() == "host"),
+            "",
+        )
         outbound.append(("Host", f"{address}:{port}"))
+        if page_host:
+            outbound.append((PUBLISHED_HOST_HEADER, page_host))
         if body:
             outbound.append(("Content-Length", str(len(body))))
         connection.request(method, path, body=body or None, headers=dict(outbound))

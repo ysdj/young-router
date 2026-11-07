@@ -485,83 +485,186 @@ class PublicModelDomainTests(unittest.TestCase):
         self.assertEqual(272000, contexts["gpt-5.6-sol"]["context_window"])
         self.assertEqual(262144, contexts["kimi-k3"]["context_window"])
 
-    def test_one_public_model_is_one_group_in_every_case_it_is_spelled(self) -> None:
-        """A name one model answers to is one group, not one per spelling.
+    def test_two_spellings_of_one_name_are_two_public_models(self) -> None:
+        """A name is the group: two spellings are two public models.
 
-        ``minimax-m3.1-flash`` and ``MiniMax-M3.1-Flash`` reach one model; two
-        groups meant two settings surfaces for one name, an order rewritten for
-        half the routes, and a context window each half claimed the other could
-        not honour.  The group is the name's identity, and the spelling stays
-        exactly as the document states it.
+        ``minimax-m3.1-flash`` and ``MiniMax-M3.1-Flash`` are two deployment sets
+        in the Router, so the pane draws two groups and every action reaches the
+        group whose name it states.  The case is settled once, when a model is
+        imported; after that nothing folds one spelling onto another behind the
+        user's back.
         """
 
-        # One group's action reaches every route that spells the name.
+        # One group's action reaches the routes that state its own name.
         self.domain.dispatch(
             "public.model_patch",
             {"public_model": "MiniMax-M3.1-Flash", "changes": {"max_input_tokens": 196608}},
         )
         self.assertEqual(196608, self.model("00000004")["max_input_tokens"])
-        self.assertEqual(196608, self.model("00000005")["max_input_tokens"])
+        self.assertIsNone(self.model("00000005")["max_input_tokens"])
 
-        # The projection publishes one entry for the group, and the registry
-        # resolves both routes as one name.
+        # The projection publishes one entry per name, not one per folded case.
         contexts = self.domain.snapshot()["model_contexts"]
-        self.assertEqual(1, len([key for key in contexts if key.lower() == "minimax-m3.1-flash"]))
+        self.assertIn("MiniMax-M3.1-Flash", contexts)
+        self.assertIn("minimax-m3.1-flash", contexts)
 
-        # A group reorder names the routes of both spellings, and one route the
-        # caller forgot is a stale order rather than a half-rewritten group.
+        # A reorder names the routes of that one group.
         self.domain.dispatch(
             "routes.reorder_group",
             {
-                "public_model": "MINIMAX-M3.1-FLASH",
-                "route_ids": ["00000005", "00000004"],
+                "public_model": "minimax-m3.1-flash",
+                "route_ids": ["00000005"],
                 "renumber": True,
             },
         )
         self.assertEqual(0, self.model("00000005")["manual_order"])
-        self.assertEqual(1, self.model("00000004")["manual_order"])
+        self.assertEqual(3, self.model("00000004")["manual_order"])
 
-        # A rename is one identity change: the other spelling of this group is
-        # not another group standing in its way, and both routes move together.
-        # Settling a group's case is allowed — one route may restate the name it
-        # already serves.
-        self.domain.dispatch(
-            "model.patch",
-            {"provider_id": "primary", "model_id": "00000005", "changes": {"model_name": "MINIMAX-M3.1-FLASH"}},
-        )
-        self.assertEqual("MiniMax-M3.1-Flash", self.model("00000004")["model_name"])
+        # A rename is the user's spelling and stays exactly as they wrote it.
         self.domain.dispatch(
             "public.model_patch",
             {"public_model": "MiniMax-M3.1-Flash", "changes": {"name": "MiniMax-M3.2-Flash"}},
         )
         self.assertEqual("MiniMax-M3.2-Flash", self.model("00000004")["model_name"])
-        self.assertEqual("MiniMax-M3.2-Flash", self.model("00000005")["model_name"])
+        self.assertEqual("minimax-m3.1-flash", self.model("00000005")["model_name"])
         self.domain.apply()
         saved = self._saved()
         self.assertEqual(
-            ["gpt-5.6-sol", "kimi-k3", "MiniMax-M3.2-Flash"],
+            ["gpt-5.6-sol", "kimi-k3", "minimax-m3.1-flash", "MiniMax-M3.2-Flash"],
             saved["litellm_settings"]["public_model_groups"],
         )
 
-    def test_a_rename_refuses_a_name_another_group_already_has_in_any_case(self) -> None:
+    def test_an_import_files_the_name_it_read_in_lower_case(self) -> None:
+        """A catalog label is a label until the import states its spelling.
+
+        A pick from a fetched listing arrives with the name the chooser showed,
+        and the question the pane asked is the answer Core files it under: lower
+        case by default, the catalog's own spelling when the user kept it.  The
+        upstream keeps exactly what the station states either way, and a row the
+        user typed is not an import and keeps its case.
+        """
+
+        added = self.domain.dispatch(
+            "model.add_many",
+            {
+                "provider_id": "primary",
+                "models": [
+                    {
+                        "name": "MiniMax-M3.2-Flash",
+                        "upstream_model": "MiniMax-M3.2-Flash",
+                        "imported": True,
+                        "enabled": True,
+                        "order": 0,
+                    }
+                ],
+            },
+        )
+        imported = next(
+            model
+            for model in added["providers"][0]["models"]
+            if model["upstream_model"] == "MiniMax-M3.2-Flash"
+        )
+        self.assertEqual("minimax-m3.2-flash", imported["model_name"])
+        self.assertEqual("openai/MiniMax-M3.2-Flash", imported["litellm_model"])
+
+        # The same pick, with the user keeping the catalog's own spelling.
+        kept = self.domain.dispatch(
+            "model.add_many",
+            {
+                "provider_id": "primary",
+                "models": [
+                    {
+                        "name": "MiniMax-M3.3-Flash",
+                        "upstream_model": "MiniMax-M3.3-Flash",
+                        "imported": True,
+                        "imported_name_case": "original",
+                        "enabled": True,
+                        "order": 0,
+                    }
+                ],
+            },
+        )
+        original = next(
+            model
+            for model in kept["providers"][0]["models"]
+            if model["upstream_model"] == "MiniMax-M3.3-Flash"
+        )
+        self.assertEqual("MiniMax-M3.3-Flash", original["model_name"])
+        self.assertEqual("openai/MiniMax-M3.3-Flash", original["litellm_model"])
+
+        # A decision this app does not issue is not a spelling: unstated, and
+        # anything but 保留原样, files lower case.
+        fallback = self.domain.dispatch(
+            "model.add_many",
+            {
+                "provider_id": "primary",
+                "models": [
+                    {
+                        "name": "MiniMax-M3.4-Flash",
+                        "upstream_model": "MiniMax-M3.4-Flash",
+                        "imported": True,
+                        "imported_name_case": "KEEP-THE-LABEL",
+                        "enabled": True,
+                        "order": 0,
+                    }
+                ],
+            },
+        )
+        self.assertEqual(
+            "minimax-m3.4-flash",
+            next(
+                model["model_name"]
+                for model in fallback["providers"][0]["models"]
+                if model["upstream_model"] == "MiniMax-M3.4-Flash"
+            ),
+        )
+
+        typed = self.domain.dispatch(
+            "model.add",
+            {
+                "provider_id": "primary",
+                "model": {"name": "My-Model", "upstream_model": "my-model", "order": 0},
+            },
+        )
+        self.assertEqual(
+            "My-Model",
+            next(
+                model["model_name"]
+                for model in typed["providers"][0]["models"]
+                if model["upstream_model"] == "my-model"
+            ),
+        )
+        # The import's own flags never reach the document they filed.
+        for provider in self.domain.draft_state()["providers"]:
+            for model in provider.get("models", []):
+                self.assertNotIn("imported", model)
+                self.assertNotIn("imported_name_case", model)
+
+    def test_a_rename_refuses_a_name_another_group_already_has(self) -> None:
         with self.assertRaisesRegex(DomainError, "already exists"):
             self.domain.dispatch(
                 "public.model_patch",
-                {"public_model": "gpt-5.6-sol", "changes": {"name": "Kimi-K3"}},
+                {"public_model": "gpt-5.6-sol", "changes": {"name": "kimi-k3"}},
             )
+        # Another case is another name, and the user is free to state it.
+        self.domain.dispatch(
+            "public.model_patch",
+            {"public_model": "kimi-k3", "changes": {"name": "Kimi-K3"}},
+        )
+        self.assertEqual("Kimi-K3", self.model("00000003")["model_name"])
 
-    def test_the_saved_group_table_lists_one_entry_per_identity(self) -> None:
-        """A document whose rows disagree about case publishes one group.
+    def test_the_saved_group_table_lists_each_served_name_once(self) -> None:
+        """The group table is the names the document serves, each exactly once.
 
-        Both spellings are written in ``model_list`` — they are the routes' own
-        names — but the group table states the identity once, in the lower-case
-        spelling a client is most likely to send.
+        Both spellings the fixture states are served by their own rows, so the
+        table names both: a client that asks for either case reaches the rows that
+        state it, and the table promises nothing else.
         """
 
         self.domain.apply()
         saved = self._saved()
         self.assertEqual(
-            ["gpt-5.6-sol", "kimi-k3", "minimax-m3.1-flash"],
+            ["gpt-5.6-sol", "kimi-k3", "minimax-m3.1-flash", "MiniMax-M3.1-Flash"],
             saved["litellm_settings"]["public_model_groups"],
         )
         self.assertIn("model_name: MiniMax-M3.1-Flash", self.path.read_text(encoding="utf-8"))
@@ -822,14 +925,16 @@ class PublicModelDomainTests(unittest.TestCase):
         self.domain.apply()
         self.assertNotIn("router_settings", self._saved())
 
-    def test_a_hop_that_names_a_group_in_another_case_survives(self) -> None:
-        """The fallback graph names one group, in whatever case it was written.
+    def test_a_hop_names_the_group_in_the_case_the_document_states(self) -> None:
+        """A fallback reference is the group's name, case included.
 
-        A hop is resolved by identity, so a document that spells
-        ``MINIMAX-M3.1-FLASH`` names the group the router serves rather than a
-        group that does not exist.  Comparing the literal text dropped the hop,
-        which is a fallback the user configured silently disappearing on a
-        save.
+        The spelling is settled when a model is imported, and ``router_settings``
+        names the group the document serves.  A reference that states another
+        case names a group no route answers, so the Router would take the hop,
+        find no deployment, and answer a 500 over the real upstream failure --
+        the save drops that target and keeps the one whose case matches.  Here
+        both spellings exist as groups, and each reference keeps the one it
+        states.
         """
 
         self._with_router_settings(
@@ -837,9 +942,10 @@ class PublicModelDomainTests(unittest.TestCase):
             router_settings:
               fallbacks:
                 - kimi-k3:
+                    - MiniMax-M3.1-Flash
                     - MINIMAX-M3.1-FLASH
               model_group_alias:
-                fast-minimax: MiniMax-M3.1-Flash
+                fast-minimax: minimax-m3.1-flash
             """
         )
 
@@ -850,9 +956,9 @@ class PublicModelDomainTests(unittest.TestCase):
         self.domain.apply()
         saved = self._saved()
 
-        # The hop is restated in the spelling the group table publishes.
+        # The exact spelling is the group that answers; the other case is dropped.
         self.assertEqual(
-            [{"kimi-k3": ["minimax-m3.1-flash"]}],
+            [{"kimi-k3": ["MiniMax-M3.1-Flash"]}],
             saved["router_settings"]["fallbacks"],
         )
         self.assertEqual(

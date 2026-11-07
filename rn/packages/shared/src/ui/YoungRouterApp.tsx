@@ -8,7 +8,7 @@ import { canonicalWindowRoute, isSettingsPaneRoute, isSettingsShellRoute, LOG_TA
 import { NativeButton, NativeBusySpinner, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeSecureTextInput, NativeSegmentedControl, NativeTable, NativeTextField, NativeToggle, WINDOWS_CONTROL, nativeControlTextWidth } from "./NativeControls";
 import { CodeEditorWebView, editorMenuLabels, readOnlyCodeEditorHtml, type CodeEditorLanguage } from "./code-editor/CodeEditorWebView";
 import { modelGroupRowKey, modelIDFromRowKey, modelRowKey } from "./modelRowKeys";
-import { groupRoutesByPublicModel, publicModelKey } from "./publicModelNames";
+import { groupRoutesByPublicModel, importNeedsNameCase, publicModelKey } from "./publicModelNames";
 import { AccountsTable } from "./AccountsTable";
 import { usePendingAction } from "./pendingAction";
 import {
@@ -138,7 +138,7 @@ type DataManagementAction = "inspect" | "import" | "export" | "sync";
  */
 type ResultMessage = string | null | ((value: unknown) => string | null);
 
-const PROVIDER_AUTH_OPTIONS = ["api_key", "openai_login", "workbuddy_login", "workbuddy_global_login", "our_free_model_login"] as const satisfies readonly ProviderAuthKind[];
+const PROVIDER_AUTH_OPTIONS = ["api_key", "openai_login", "workbuddy_login", "workbuddy_global_login", "qoder_login", "qoder_global_login", "our_free_model_login"] as const satisfies readonly ProviderAuthKind[];
 
 
 function providerAuthKind(provider: UnknownRecord | undefined): ProviderAuthKind {
@@ -157,13 +157,15 @@ function providerAuthStatus(provider: UnknownRecord | undefined): ProviderAuthSt
 }
 
 /** The merged workspace shows every provider kind; this drives row labels. */
-type ProviderKind = "relay" | "openai" | "workbuddy" | "workbuddyGlobal" | "ourFreeModel" | "apiKey";
+type ProviderKind = "relay" | "openai" | "workbuddy" | "workbuddyGlobal" | "qoder" | "qoderGlobal" | "ourFreeModel" | "apiKey";
 
 function providerKind(provider: UnknownRecord | undefined): ProviderKind {
   const auth = providerAuthKind(provider);
   if (auth === "openai_login") return "openai";
   if (auth === "workbuddy_login") return "workbuddy";
   if (auth === "workbuddy_global_login") return "workbuddyGlobal";
+  if (auth === "qoder_login") return "qoder";
+  if (auth === "qoder_global_login") return "qoderGlobal";
   if (auth === "our_free_model_login") return "ourFreeModel";
   return stringValue(provider?.provider_type, "custom") === "relay" ? "relay" : "apiKey";
 }
@@ -179,7 +181,7 @@ function providerKind(provider: UnknownRecord | undefined): ProviderKind {
  * which address a provider carries, and whether its association section reads
  * as a service link rather than a relay station link.
  */
-type ServiceID = "openai" | "workbuddy" | "workbuddyGlobal" | "ourFreeModel";
+type ServiceID = "openai" | "workbuddy" | "workbuddyGlobal" | "qoder" | "qoderGlobal" | "ourFreeModel";
 
 /**
  * The key slot every Our Free Model entry carries.
@@ -205,6 +207,8 @@ const OUR_FREE_MODEL_KEY_NAME = "our-free-model-local";
 const MANAGED_SLOT_AUTH_KINDS = new Set<ProviderAuthKind>([
   "workbuddy_login",
   "workbuddy_global_login",
+  "qoder_login",
+  "qoder_global_login",
   "our_free_model_login",
 ]);
 
@@ -292,6 +296,11 @@ const SERVICE_BASE_URLS: Record<ServiceID, string> = {
   openai: "https://api.openai.com/v1",
   workbuddy: "https://copilot.tencent.com",
   workbuddyGlobal: "https://www.workbuddy.ai",
+  // Qoder is served by a Core-owned worker on this machine, exactly like Our
+  // Free Model: its port is assigned at launch, so there is no fixed address
+  // to print.  The entry carries Core's own `os.environ/` reference instead.
+  qoder: "",
+  qoderGlobal: "",
   // Our Free Model is served by a Core-owned worker on this machine, and
   // its port is assigned at launch, so it has no fixed address to print here.
   // The entry carries Core's own `os.environ/` reference instead, which is the
@@ -315,6 +324,8 @@ function serviceFromURL(value: string): ServiceID | undefined {
   if (matches("workbuddy.ai")) return "workbuddyGlobal";
   if (matches("codebuddy.ai") || matches("codebuddy.cn") || matches("copilot.tencent.com")) return "workbuddy";
   if (matches("opencode.ai")) return "ourFreeModel";
+  if (matches("qoder.sh")) return "qoderGlobal";
+  if (matches("qoder.com.cn")) return "qoder";
   if (matches("api.openai.com") || matches("openai.com") || matches("chatgpt.com")) return "openai";
   return undefined;
 }
@@ -322,7 +333,7 @@ function serviceFromURL(value: string): ServiceID | undefined {
 /** The service behind one provider entry: its kind first, then its address. */
 function providerService(provider: UnknownRecord | undefined): ServiceID | undefined {
   const kind = providerKind(provider ?? {});
-  if (kind === "openai" || kind === "workbuddy" || kind === "workbuddyGlobal" || kind === "ourFreeModel") return kind;
+  if (kind === "openai" || kind === "workbuddy" || kind === "workbuddyGlobal" || kind === "qoder" || kind === "qoderGlobal" || kind === "ourFreeModel") return kind;
   return serviceFromURL(stringValue(provider?.endpoint, stringValue(provider?.api_base)));
 }
 
@@ -360,6 +371,8 @@ function hasFreshServiceRates(service: ServiceID | undefined): boolean {
 function serviceCatalogRead(service: ServiceID, channel?: string): { action: string; providerId: string } | undefined {
   if (service === "workbuddy") return { action: "workbuddy_models", providerId: "workbuddy" };
   if (service === "workbuddyGlobal") return { action: "workbuddy_models", providerId: "workbuddy-global" };
+  if (service === "qoder") return { action: "qoder_models", providerId: "qoder" };
+  if (service === "qoderGlobal") return { action: "qoder_models", providerId: "qoder-global" };
   // One worker serves every channel, so the id decides which slice of the
   // roster comes back.  Defaulting to the lane's own id would list the
   // anonymous channel's rows for a Kilo entry.
@@ -438,13 +451,16 @@ function serviceCatalogRates(models: UnknownRecord[]): Record<string, string> {
   for (const entry of models) {
     const modelID = stringValue(entry.id).trim();
     if (!modelID) continue;
-    // The staged library publishes the rate it parsed, as a number.  ``0`` is a
-    // real answer (a model the upstream prices at nothing), so the presence of
-    // the field decides, not its truthiness.  The number is re-stated with the
-    // catalog's own leading `x` so the pane keeps spelling an account's rate the
-    // way the upstream does, not the way a relay group's `×` is spelled.
-    if (typeof entry.creditMultiplier === "number" && Number.isFinite(entry.creditMultiplier) && entry.creditMultiplier >= 0) {
-      rates[modelID] = rateSpelling(`x${entry.creditMultiplier}`);
+    // Core's normalized catalog states the rate as ``rate``; the staged
+    // WorkBuddy library publishes the same number as ``creditMultiplier``.
+    // ``0`` is a real answer (a model the upstream prices at nothing), so the
+    // presence of the field decides, not its truthiness.  The number is
+    // re-stated with the catalog's own leading `x` so the pane keeps spelling
+    // an account's rate the way the upstream does, not the way a relay group's
+    // `×` is spelled.
+    const statedRate = typeof entry.rate === "number" ? entry.rate : entry.creditMultiplier;
+    if (typeof statedRate === "number" && Number.isFinite(statedRate) && statedRate >= 0) {
+      rates[modelID] = rateSpelling(`x${statedRate}`);
       continue;
     }
     // An older worker forwarded the upstream's own ``billing`` document instead.
@@ -459,6 +475,29 @@ function serviceCatalogRates(models: UnknownRecord[]): Record<string, string> {
     if (billing.free === true) continue;
   }
   return rates;
+}
+
+/**
+ * Where a Qoder region's sign-in comes from, as the pane states it.
+ *
+ * The two are different facts and only one of them self-heals: an app session
+ * follows the desktop app (a new sign-in there is picked up on the next read),
+ * while a pasted PAT stays until someone replaces or forgets it.  Naming the
+ * source is what tells the user which of those they are looking at.
+ */
+function qoderCredentialSourceLabel(account: UnknownRecord | undefined, translate: Translate): string {
+  const source = stringValue(account?.signInSource);
+  if (source === "stored") return translate("providers.wizard.qoderSourcePat");
+  if (source === "app") return translate("providers.wizard.qoderSourceApp");
+  if (source === "env") return translate("providers.wizard.qoderSourceEnv");
+  return stringValue(account?.domain) || translate("common.notAvailable");
+}
+
+/** Which WorkBuddy product a provider kind borrows its sign-in from. */
+function qoderProviderIDFor(kind: ProviderKind): "qoder" | "qoder-global" | undefined {
+  if (kind === "qoder") return "qoder";
+  if (kind === "qoderGlobal") return "qoder-global";
+  return undefined;
 }
 
 /** Which WorkBuddy product a provider kind borrows its sign-in from. */
@@ -610,16 +649,20 @@ function providerKindLabel(kind: ProviderKind, translate: Translate): string {
           ? translate("providers.type.workbuddy")
           : kind === "workbuddyGlobal"
             ? translate("providers.type.workbuddyGlobal")
-            : kind === "ourFreeModel"
-              ? translate("providers.type.ourFreeModel")
-              : translate("providers.type.apiKey");
+            : kind === "qoder"
+              ? translate("providers.type.qoder")
+              : kind === "qoderGlobal"
+                ? translate("providers.type.qoderGlobal")
+                : kind === "ourFreeModel"
+                  ? translate("providers.type.ourFreeModel")
+                  : translate("providers.type.apiKey");
 }
 
 /** Whether this provider kind is one of the account-backed login services, whose
  * name, address, and key all belong to the service surface rather than to the
  * provider editor. */
 function isLoginProviderKind(kind: ProviderKind): boolean {
-  return kind === "openai" || kind === "workbuddy" || kind === "workbuddyGlobal" || kind === "ourFreeModel";
+  return kind === "openai" || kind === "workbuddy" || kind === "workbuddyGlobal" || kind === "qoder" || kind === "qoderGlobal" || kind === "ourFreeModel";
 }
 
 const DATA_PACKAGE_SECTIONS: ReadonlyArray<{ domain: ConfigDomain; labelKey: string }> = [
@@ -1425,6 +1468,11 @@ const TRANSIENT_READ_ACTIONS: ReadonlySet<string> = new Set([
   "workbuddy_status",
   "workbuddy_models",
   "workbuddy_login",
+  "qoder_status",
+  "qoder_models",
+  "qoder_login",
+  "qoder_logout",
+  "qoder_open_app",
   "our_free_model_status",
   "our_free_model_models",
   "service_provider_auth_status",
@@ -1503,6 +1551,14 @@ function isRevisionRetryableAction(type: string): boolean {
     || normalized === "providers_fetch_models"
     || normalized === "fetch_models"
     || normalized === "provider_fetch_relay_resource_models"
+    // A managed account's own action carries no draft value to invalidate: it
+    // reads or replaces the credential its worker owns, addressed by region.
+    // Staging a PAT advances Core's shared revision, so the sign-in dispatch
+    // that follows it in the same press would otherwise lose the race and
+    // report 更改未生效 for an account it never touched.
+    || normalized.startsWith("qoder_")
+    || normalized.startsWith("workbuddy_")
+    || normalized.startsWith("our_free_model_")
     || normalized === "api_key_set_auto_grouping"
     || normalized === "api_key_auto_group_align"
     // Station rebinding is idempotent and Core keeps a no-op rebind clean,
@@ -2216,7 +2272,7 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
   if (compactWeb) {
     // One column: the route strip is the sidebar, and the pane keeps the whole
     // width underneath it.
-    return <View style={styles.settingsShellFrame}>
+    return <View style={[styles.settingsShellFrame, Platform.OS === "web" && styles.webShellFrame]}>
       <View style={[styles.settingsShellHeader, isWindowsShell && styles.settingsShellHeaderWindows]}>
         <View style={styles.compactWebHeader}>
           <Text numberOfLines={1} style={styles.compactWebTitle}>{translate("app.title")}</Text>
@@ -3774,7 +3830,7 @@ function providerWizardKeyTarget(token: string, keyName: string): string {
   return `${WIZARD_PENDING_KEY_PREFIX}${token}\u001f${keyName}`;
 }
 
-type ServiceProviderKind = "openai_login" | "workbuddy_login" | "workbuddy_global_login" | "our_free_model_login";
+type ServiceProviderKind = "openai_login" | "workbuddy_login" | "workbuddy_global_login" | "qoder_login" | "qoder_global_login" | "our_free_model_login";
 
 /**
  * Every provider the snapshot carries, whatever its kind.
@@ -3798,6 +3854,11 @@ function serviceProviderRecords(snapshot: CoreSnapshot | undefined): UnknownReco
 }
 
 function serviceProviderKindLabel(kind: ServiceProviderKind, translate: Translate): string {
+  if (kind === "workbuddy_login") return translate("providers.type.workbuddy");
+  if (kind === "workbuddy_global_login") return translate("providers.type.workbuddyGlobal");
+  if (kind === "qoder_login") return translate("providers.type.qoder");
+  if (kind === "qoder_global_login") return translate("providers.type.qoderGlobal");
+  if (kind === "our_free_model_login") return translate("providers.type.ourFreeModel");
   return translate("relay.officialProviderOpenAI");
 }
 
@@ -3816,6 +3877,8 @@ function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProvid
   const base = kind === "openai_login" ? "OpenAI"
     : kind === "workbuddy_login" ? "WorkBuddy"
       : kind === "workbuddy_global_login" ? "WorkBuddy Global"
+        : kind === "qoder_login" ? "Qoder"
+          : kind === "qoder_global_login" ? "Qoder Global"
         // A lane channel states its own name: the name is what Core reads to
         // know which channel an entry is, so two entries cannot share one.
         : laneChannelName || "Our Free Model · OpenCode";
@@ -3828,7 +3891,7 @@ function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProvid
 
 function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayStations, busy, translate, dispatchWithOutcome, onSecretState, onStatus, onClose, onKeyToken, relay, addOfficialAccount, status }: { snapshot?: CoreSnapshot; native: NativeLeafAdapter; providers: UnknownRecord[]; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onStatus: (status?: string) => void; onClose: () => void; onKeyToken: (token: string) => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind, name?: string) => Promise<string>; /** The window's own result: a child window keeps no strip, so its footer states it. */ status?: string }): React.JSX.Element {
   type WizardStep = "provider" | "keys" | "model";
-  type WizardType = "api" | "openai" | "workbuddy" | "workbuddyGlobal" | "ourFreeModel" | "ourFreeModelKilo";
+  type WizardType = "api" | "openai" | "workbuddy" | "workbuddyGlobal" | "qoder" | "qoderGlobal" | "ourFreeModel" | "ourFreeModelKilo";
   const [step, setStep] = useState<WizardStep>("provider");
   // The step the last advance left, so one press cannot advance twice.
   const stepRef = useRef<WizardStep | undefined>("provider");
@@ -3906,6 +3969,14 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // its live catalog, so the wizard reads both instead of asking for a secret.
   const [workbuddyAccount, setWorkbuddyAccount] = useState<UnknownRecord | undefined>(undefined);
   const [workbuddyBusy, setWorkbuddyBusy] = useState(false);
+  // Qoder: the account signs in with a PAT, and the wizard reads its state
+  // before it creates the entry so a signed-out paste is refused here.
+  const [qoderAccount, setQoderAccount] = useState<UnknownRecord | undefined>(undefined);
+  const [qoderBusy, setQoderBusy] = useState(false);
+  const [qoderPatCommit, setQoderPatCommit] = useState(0);
+  const qoderPatWaiter = useRef<((present: boolean) => void) | undefined>(undefined);
+  const qoderPatState = useRef<{ status: string; present: boolean }>({ status: "ready", present: false });
+  const qoderPatCommitRequest = useRef(0);
   // The wizard's one status line: its own validation or feedback, and the wait
   // while the embedded sign-in page is up.  No step body repeats it.
   const wizardStatus = validation || loginFeedback.current || (loginPhase === "sign-in" ? translate("relay.loginWorking") : "");
@@ -3922,6 +3993,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
 
   const isOfficialLoginType = providerType === "openai";
   const isWorkBuddyType = providerType === "workbuddy" || providerType === "workbuddyGlobal";
+  const isQoderType = providerType === "qoder" || providerType === "qoderGlobal";
   // Our Free Model has no sign-in and no user secret at all: its provider is
   // created straight from the provider step, so it shares neither the key
   // step's fields nor the official services' web login.
@@ -3935,9 +4007,13 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     : isOurFreeModelType ? "ourFreeModel" : providerType;
   /** The provider this entry creates; the wizard names it. */
   const ourFreeModelProviderID = ourFreeModelProviderIDFor(providerType);
-  const isLoginType = isOfficialLoginType || isWorkBuddyType || isOurFreeModelType;
+  const isLoginType = isOfficialLoginType || isWorkBuddyType || isQoderType || isOurFreeModelType;
   const workbuddyProvider = providerType === "workbuddyGlobal" ? "workbuddy-global" : "workbuddy";
   const workbuddyAuthKind: ServiceProviderKind = providerType === "workbuddyGlobal" ? "workbuddy_global_login" : "workbuddy_login";
+  // The catalog id the worker's document answers under, and the auth kind the
+  // configuration stores: one region, two spellings.
+  const qoderProviderId = providerType === "qoderGlobal" ? "qoder-global" : "qoder";
+  const qoderAuthKind: ServiceProviderKind = providerType === "qoderGlobal" ? "qoder_global_login" : "qoder_login";
   const selectedProvider = providers.find((entry) => editorIdentifier(entry) === providerSelection);
   const providerID = selectedProvider ? editorIdentifier(selectedProvider) : "";
   const selectedProviderName = selectedProvider
@@ -4049,6 +4125,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     { type: "openai", label: translate("providers.type.openai") },
     { type: "workbuddy", label: translate("providers.type.workbuddy") },
     { type: "workbuddyGlobal", label: translate("providers.type.workbuddyGlobal") },
+    { type: "qoder", label: translate("providers.type.qoder") },
+    { type: "qoderGlobal", label: translate("providers.type.qoderGlobal") },
     // One entry per upstream channel, because each channel is a provider of its
     // own: a channel decides the wire its rows answer on and the window they
     // accept, and a provider is the only unit this app states those on. Adding
@@ -4070,12 +4148,14 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // whose address belongs to Core (Our Free Model) or to a desktop app
   // (WorkBuddy) has no value to print, and a required field reading 「不适用」
   // asks for something that cannot be given.
-  const wizardEditsBaseURL = !isWorkBuddyType && !isOurFreeModelType;
+  const wizardEditsBaseURL = !isWorkBuddyType && !isQoderType && !isOurFreeModelType;
   // The free lane and WorkBuddy carry no secret of their own — the lane imports
   // its roster on create, and the desktop app owns WorkBuddy's sign-in — so 密钥
   // is not a step of theirs at all.  A step that only says "nothing to type
   // here" is a page the user walks through for no reason; both the rail and the
   // walk between 供应商 and 模型 reflect that.
+  // Qoder's PAT is typed on the keys step, so that step stays.  WorkBuddy and
+  // Our Free Model have no secret of the user's to type, so theirs goes.
   const needsKeyStep = !isOurFreeModelType && !isWorkBuddyType;
   const stepItems: Array<{ id: WizardStep; title: string }> = [
     { id: "provider", title: translate("providers.wizard.stepProvider") },
@@ -4100,12 +4180,117 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       setWorkbuddyBusy(false);
     }
   };
+  const loadQoderAccount = async (refresh = false): Promise<UnknownRecord | undefined> => {
+    setQoderBusy(true);
+    try {
+      // Reading the account is this step's own wait: it can start the worker
+      // and exchange a jobToken, so every other control stays usable.
+      const next = await dispatchWithOutcome("qoder_status", { refresh, provider: qoderProviderId }, "providers_models", true);
+      if (!next) return undefined;
+      const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
+      const account = asRecord(asRecord(summary.providers)[qoderProviderId]);
+      setQoderAccount(account);
+      return account;
+    } finally {
+      setQoderBusy(false);
+    }
+  };
+  /**
+   * Wait for the PAT field to reach Core.
+   *
+   * The native secure field stages on blur, and the press that runs sign-in is
+   * the same press that blurred it.  The value therefore travels through the
+   * secret capability — never through React state or the action payload — and
+   * this wait is what tells the dispatch whether anything arrived.
+   */
+  const flushQoderPat = (): Promise<boolean> => {
+    if (qoderPatState.current.status !== "dirty" && qoderPatState.current.status !== "saving") {
+      return Promise.resolve(qoderPatState.current.present);
+    }
+    return new Promise<boolean>((resolve) => {
+      qoderPatWaiter.current = resolve;
+      qoderPatCommitRequest.current += 1;
+      setQoderPatCommit(qoderPatCommitRequest.current);
+    });
+  };
+  const handleQoderPatState = (state: SecretState): void => {
+    qoderPatState.current = { status: state.status, present: state.present };
+    if (state.status === "saved" || state.status === "ready" || state.status === "error") {
+      const waiter = qoderPatWaiter.current;
+      qoderPatWaiter.current = undefined;
+      waiter?.(state.present);
+    }
+  };
+  const signInQoder = async (): Promise<void> => {
+    setValidation("");
+    if (!(await flushQoderPat())) {
+      setValidation(translate("providers.wizard.required"));
+      return;
+    }
+    setQoderBusy(true);
+    try {
+      // The target is the region, not a value: the staged PAT never leaves the
+      // native secret store, and Core hands that exact target to the worker.
+      const next = await dispatchWithOutcome(
+        "qoder_login",
+        { provider: qoderProviderId, secret_target: qoderProviderId },
+        "providers_models",
+        true,
+      );
+      if (!next) return;
+      const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
+      const status = asRecord(summary.status);
+      setQoderAccount(status);
+      if (stringValue(status.state) !== "signed-in") {
+        setValidation(stringValue(status.reason) || translate("providers.authStatusSignedOut"));
+      }
+    } catch (reason: unknown) {
+      setValidation(errorMessage(reason, translate));
+    } finally {
+      setQoderBusy(false);
+    }
+  };
+  /**
+   * Hand a signed-out region to the Qoder desktop app.
+   *
+   * The sign-in happens there, not here, so this is the one action the wizard
+   * can take on its behalf; the read afterwards is what sees the result.
+   */
+  const openQoderApp = async (): Promise<void> => {
+    setQoderBusy(true);
+    try {
+      const next = await dispatchWithOutcome("qoder_open_app", { provider: qoderProviderId }, "providers_models", true);
+      const summary = asRecord(asRecord(next?.action_summaries?.providers_models).operation_summary);
+      if (summary.installed === false) {
+        setValidation(translate("providers.wizard.qoderAppMissing"));
+        return;
+      }
+      await loadQoderAccount(true);
+    } catch (reason: unknown) {
+      setValidation(errorMessage(reason, translate));
+    } finally {
+      setQoderBusy(false);
+    }
+  };
+  const signOutQoder = async (): Promise<void> => {
+    setQoderBusy(true);
+    try {
+      const next = await dispatchWithOutcome("qoder_logout", { provider: qoderProviderId }, "providers_models", true);
+      if (!next) return;
+      const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
+      setQoderAccount(asRecord(summary.status));
+      qoderPatState.current = { status: "ready", present: false };
+    } finally {
+      setQoderBusy(false);
+    }
+  };
   useEffect(() => {
     // Reaching the keys step asks the account question; it does not force a
     // new one.  Core's own window answers it from the read this pane just made
     // (运行时 adjusts the window), so walking back and forth through the wizard
     // costs no worker round trip and never repaints the account.
     if (step === "keys" && isWorkBuddyType) void loadWorkBuddyAccount(false);
+    if (step === "keys" && isQoderType) void loadQoderAccount(false);
     // The selected type and the reached step are the only triggers: a reload
     // on every render would fight the refresh button beside the account.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -4249,10 +4434,13 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     const channelName = OUR_FREE_MODEL_CHANNEL[value]?.name;
     setProviderName(value === "workbuddy" ? nextServiceProviderName(providers, "workbuddy_login")
       : value === "workbuddyGlobal" ? nextServiceProviderName(providers, "workbuddy_global_login")
-        : channelName ? nextServiceProviderName(providers, "our_free_model_login", channelName)
-          : value === "openai" ? nextServiceProviderName(providers, "openai_login")
-              : "");
+        : value === "qoder" ? nextServiceProviderName(providers, "qoder_login")
+          : value === "qoderGlobal" ? nextServiceProviderName(providers, "qoder_global_login")
+            : channelName ? nextServiceProviderName(providers, "our_free_model_login", channelName)
+              : value === "openai" ? nextServiceProviderName(providers, "openai_login")
+                  : "");
     setWorkbuddyAccount(undefined);
+    setQoderAccount(undefined);
     setSelectedModels([]);
     setModelFetchState("idle");
   };
@@ -4266,8 +4454,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     if (step !== "provider" || providerMode !== "new" || providerType === "api") return;
     const kind: ServiceProviderKind = providerType === "workbuddy" ? "workbuddy_login"
       : providerType === "workbuddyGlobal" ? "workbuddy_global_login"
-        : providerType === "ourFreeModel" ? "our_free_model_login"
-          : "openai_login";
+        : providerType === "qoder" ? "qoder_login"
+          : providerType === "qoderGlobal" ? "qoder_global_login"
+            : providerType === "ourFreeModel" ? "our_free_model_login"
+              : "openai_login";
     // The channel states its own name here too, or this repair would rewrite a
     // Kilo entry's suggestion back to the lane's default the moment the
     // provider list arrived.
@@ -4627,11 +4817,16 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const commitWizardProvider = async (): Promise<string | undefined> => {
     const name = providerName.trim();
     if (!name || !providerStepValid()) return undefined;
-    if (isWorkBuddyType) {
-      // The service entry is created empty: the desktop app's account and its
-      // model roster are associated in the provider's 「服务商关联」 section.
+    if (isWorkBuddyType || isQoderType) {
+      // The service entry is created empty, and it says so: an add mints a
+      // provider, never a roster.  Both accounts are the same shape here — the
+      // integration owns the sign-in, and which of its models this app serves is
+      // the user's pick in 获取模型 (选择要添加的模型), the one place a catalog
+      // becomes rows.  Omitting the list would ask Core to import the account's
+      // whole catalog with the create, which is exactly the behaviour this
+      // wizard must not have.
       const next = await dispatchWithOutcome("service_provider.add", {
-        kind: workbuddyAuthKind,
+        kind: isQoderType ? qoderAuthKind : workbuddyAuthKind,
         name,
         models: [],
       });
@@ -4653,16 +4848,28 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         setValidation(translate("providers.wizard.selectAtLeastOneModel"));
         return undefined;
       }
+      // The lane's roster is an import like any other: one question decides the
+      // spelling of the rows this create carries.
+      const keptNameCase = await importNameCaseAnswer(native, translate, kept);
       const next = await dispatchWithOutcome("service_provider.add", {
         kind: "our_free_model_login",
         // The channel is stored identity; the name beside it is a label the
         // user may change later.
         channel: OUR_FREE_MODEL_CHANNEL[providerType]?.tag ?? "",
         name,
-        // The public name is the upstream's own id, unchanged: renaming a
-        // model is the user's to do in the pane.  Core applies the same rule
-        // when it imports the roster itself.
-        models: kept.map((model_id) => ({ name: publicModelNameForLane(model_id), upstream_model: model_id, enabled: true, order: 0 })),
+        // The public name is the upstream's own id: renaming a model is the
+        // user's to do in the pane, and the spelling is the answer this step's
+        // one case question got.  Carrying it as an import is what keeps these
+        // rows filed the way Core files the same roster when it imports it
+        // itself -- two creaters, one rule.
+        models: kept.map((model_id) => ({
+          name: publicModelNameForLane(model_id),
+          upstream_model: model_id,
+          imported: true,
+          imported_name_case: keptNameCase,
+          enabled: true,
+          order: 0,
+        })),
       });
       if (!next) return undefined;
       const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
@@ -4931,6 +5138,20 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       return;
     }
     if (step === "keys") {
+      if (isQoderType) {
+        // A signed-out region has no catalog to import, so the step must not
+        // walk on.  The check re-reads once: the desktop app may have been
+        // signed in since this step was entered.
+        const account = stringValue(qoderAccount?.state) === "signed-in"
+          ? qoderAccount
+          : await loadQoderAccount(true);
+        if (stringValue(account?.state) !== "signed-in") {
+          setValidation(translate("providers.wizard.qoderSignInRequired"));
+          return;
+        }
+        advanceStepToModel();
+        return;
+      }
       if (isWorkBuddyType) {
         // Nothing is typed here: the desktop app owns the sign-in, and the
         // account is associated in the provider's 「服务商关联」 section.
@@ -5038,6 +5259,12 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       return;
     }
     // Model step.
+    // Every row this step imports is a listing row: the file the user keeps is
+    // the roster they just read.  One question decides its spelling -- Core
+    // files each picked row under that answer, and a row the user typed states
+    // its own name and is never re-spelled.
+    const selectedImportNames = modelCandidates.filter((name) => selectedModels.includes(name));
+    const importNameCase = await importNameCaseAnswer(native, translate, selectedImportNames);
     if (isOfficialLoginType && keyPath === "login") {
       // 完成 records the roster the user kept: the account's own models were
       // listed on this step, and leaving without them would leave the row
@@ -5057,6 +5284,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           models: selectedModels.map((name) => ({
             name,
             upstream_model: name,
+            imported: true,
+            imported_name_case: importNameCase,
             enabled: true,
             order: 0,
             ...(accountRef ? { account_ref: accountRef } : {}),
@@ -5073,7 +5302,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     // WorkBuddy imported nothing here: its models arrive with the account in
     // the provider's own association section, and 完成 is what creates its
     // service entry.
-    if (isWorkBuddyType) {
+    if (isWorkBuddyType || isQoderType) {
       setProcessing(true);
       try {
         const created = providerID || await commitWizardProvider();
@@ -5109,14 +5338,19 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       ? { name: draftModelName, upstream_model: draftUpstreamModel }
       : undefined;
     const usingProvidedKey = keyPath === "login";
+    // A row chosen from the listing is an import: Core files the public name
+    // under the answer this step collected (lower case, or the catalog's own
+    // spelling when the user kept it) and keeps the upstream id as the station
+    // spells it.  A row the user typed states its own name and carries no such
+    // flag.
     const requestedModels = usingProvidedKey ? [
       ...modelCandidates
         .filter((name) => selectedModels.includes(name))
-        .map((name) => ({ name, upstream_model: name })),
+        .map((name) => ({ name, upstream_model: name, imported: true, imported_name_case: importNameCase })),
     ] : [
       ...modelCandidates
         .filter((name) => selectedModels.includes(name))
-        .map((name) => ({ name, upstream_model: name, ...modelRecordCapabilityChanges(fetchedModelCapabilities[name]) })),
+        .map((name) => ({ name, upstream_model: name, imported: true, imported_name_case: importNameCase, ...modelRecordCapabilityChanges(fetchedModelCapabilities[name]) })),
       ...manualModels
         .filter((model) => selectedManualModelIDs.includes(model.id))
         .map(({ name, upstream_model }) => ({ name, upstream_model })),
@@ -5154,7 +5388,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         const nextProvider = snapshotProviderRecords(next).find((entry) => editorIdentifier(entry) === targetProviderID);
         const addedModels = nextProvider ? asRecords(nextProvider.models).map(modelRecord) : [];
         for (const requested of uniqueRequestedModels) {
-          const addedModel = addedModels.find((entry) => !existingModelIDs.has(editorIdentifier(entry)) && stringValue(entry.name).trim() === requested.name);
+          // The row is the route, not the name: an import files the public name
+          // under the answer it asked for, so the upstream id the pick stated is
+          // what names the row that pick created.
+          const addedModel = addedModels.find((entry) => !existingModelIDs.has(editorIdentifier(entry)) && stringValue(entry.upstream_model, stringValue(entry.name)).trim() === requested.upstream_model);
           if (!addedModel) return;
           const relayed = await dispatchWithOutcome("model.select_relay_resource", {
             provider_id: targetProviderID,
@@ -5208,7 +5445,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         </View> : <>
         {step === "provider" ? <View style={styles.providerWizardFormSection}>
           <NativeFormRow label={translate("providers.wizard.providerType")}>
-            <NativePicker labels={servicePickerLabels} selectedValue={selectedServiceLabel} disabled={wizardBusy} accessibilityLabel={translate("providers.wizard.providerType")} onChange={({ nativeEvent }) => { const kinds: WizardType[] = ["api", "openai", "workbuddy", "workbuddyGlobal", "ourFreeModel", "ourFreeModelKilo"]; chooseProviderType(kinds[nativeEvent.index] ?? "api"); }} style={styles.providerWizardPicker} />
+            <NativePicker labels={servicePickerLabels} selectedValue={selectedServiceLabel} disabled={wizardBusy} accessibilityLabel={translate("providers.wizard.providerType")} onChange={({ nativeEvent }) => { const kinds: WizardType[] = ["api", "openai", "workbuddy", "workbuddyGlobal", "qoder", "qoderGlobal", "ourFreeModel", "ourFreeModelKilo"]; chooseProviderType(kinds[nativeEvent.index] ?? "api"); }} style={styles.providerWizardPicker} />
           </NativeFormRow>
           {providerMode === "new" && isOfficialLoginType ? <NativeFormRow label={translate("providers.wizard.authPath")}>
             <NativePicker labels={[translate("providers.wizard.pathWebLogin"), translate("providers.wizard.pathCustomKey")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathWebLogin") : translate("providers.wizard.pathCustomKey")} disabled={wizardBusy} accessibilityLabel={translate("providers.wizard.authPath")} onChange={({ nativeEvent }) => { chooseOfficialAuthPath(nativeEvent.index === 1 ? "manual" : "login"); }} style={styles.providerWizardPicker} />
@@ -5224,6 +5461,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           {providerMode === "new" && wizardEditsBaseURL && providerType !== "api" ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.serviceUrlFixed")}</Text> : null}
           {providerMode === "new" && isOfficialLoginType && keyPath === "login" ? <Text style={styles.providerWizardHint}>{translate("relay.officialProviderWebViewHint")}</Text> : null}
           {providerMode === "new" && isWorkBuddyType ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyAppHint")}</Text> : null}
+          {providerMode === "new" && isQoderType ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.qoderAppHint")}</Text> : null}
           {providerMode === "new" && isOurFreeModelType ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.ourFreeModelHint")}</Text> : null}
           {providerMode === "existing" && selectedProvider ? <Text numberOfLines={1} style={styles.providerWizardHint}>{activeProviderBaseURL || translate("common.notAvailable")}</Text> : null}
         </View> : null}
@@ -5247,6 +5485,41 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
             {/* The lane signs itself in and its free roster is imported by the
                 create, so this step states that and asks for nothing. */}
             <Text style={styles.providerWizardHint}>{translate("providers.wizard.ourFreeModelHint")}</Text>
+          </> : isQoderType ? <>
+            {/* The account is the one the Qoder desktop app is signed into:
+                the worker reads that app's own session, so this step asks for
+                nothing and only states what it found.  A PAT is the override
+                for a machine whose app is not signed in (or for a host with no
+                window); it is typed into the native secure field and staged
+                through Core's secret capability, so it never enters React
+                state, the action payload, or config.yaml. */}
+            <Text style={styles.providerWizardHint}>{translate("providers.wizard.qoderKeyHint")}</Text>
+            <View style={styles.providerWizardAuthRow}>
+              <Text style={styles.providerWizardAuthStatus}>{stringValue(qoderAccount?.state) === "signed-in" ? translate("providers.authStatusSignedIn") : progressText(qoderBusy, translate) ?? translate("providers.authStatusSignedOut")}</Text>
+              <NativeButton title={translate("providers.wizard.qoderRefresh")} compact busy={qoderBusy} disabled={busy && !qoderBusy} onPress={() => { void loadQoderAccount(true); }} />
+              {/* Only a pasted PAT is this app's to forget: the app's own
+                  sign-in belongs to the app, and a button that cannot end it
+                  would be stating something it cannot make true. */}
+              {stringValue(qoderAccount?.signInSource) === "stored"
+                ? <NativeButton title={translate("providers.wizard.qoderSignOut")} compact busy={qoderBusy} disabled={busy && !qoderBusy} onPress={() => { void signOutQoder(); }} />
+                : null}
+            </View>
+            {stringValue(qoderAccount?.state) === "signed-in" ? <>
+              <Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.qoderAccount")}: {stringValue(qoderAccount?.nickname) || translate("common.notAvailable")} · {qoderCredentialSourceLabel(qoderAccount, translate)}</Text>
+              {workbuddyCreditsText(qoderAccount, translate) ? <Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.qoderCredits")}: {workbuddyCreditsText(qoderAccount, translate)}</Text> : null}
+            </> : <>
+              <Text style={styles.providerWizardHint}>{translate("providers.wizard.qoderSignInRequired")}</Text>
+              <View style={styles.providerWizardAuthRow}>
+                <Text style={styles.providerWizardAuthStatus}>{progressText(qoderBusy, translate) ?? ""}</Text>
+                <NativeButton title={translate("providers.wizard.qoderOpenApp")} compact busy={qoderBusy} disabled={busy && !qoderBusy} onPress={() => { void openQoderApp(); }} />
+              </View>
+              <NativeFormRow label={translate("providers.wizard.qoderPat")}><NativeSecureTextInput key={`qoder-pat:${qoderProviderId}`} label={translate("providers.wizard.qoderPat")} domain="providers_models" field="qoder_pat" target={qoderProviderId} plainText autoCommit disabled={wizardBusy} commitRequest={qoderPatCommit} onSecretState={handleQoderPatState} style={styles.providerWizardSecretInput} /></NativeFormRow>
+              <Text style={styles.providerWizardHint}>{translate("providers.wizard.qoderPatHint")}</Text>
+              <View style={styles.providerWizardAuthRow}>
+                <Text style={styles.providerWizardAuthStatus}>{progressText(qoderBusy, translate) ?? ""}</Text>
+                <NativeButton title={translate("providers.wizard.qoderSignIn")} primary compact busy={qoderBusy} disabled={busy && !qoderBusy} onPress={() => { void signInQoder(); }} />
+              </View>
+            </>}
           </> : isWorkBuddyType ? <>
             {/* The account is associated in the provider's own 「服务商关联」
                 section, so this step only states the desktop app's sign-in and
@@ -5260,7 +5533,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
               <Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyAccount")}: {stringValue(workbuddyAccount?.nickname) || translate("common.notAvailable")} · {stringValue(workbuddyAccount?.domain)}</Text>
               {workbuddyCreditsText(workbuddyAccount, translate) ? <Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyCredits")}: {workbuddyCreditsText(workbuddyAccount, translate)}</Text> : null}
             </> : <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddySignInRequired")}</Text>}
-            <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyAssociationHint")}</Text>
           </> : <>
             {providerType === "api" ? <NativeFormRow label={translate("providers.wizard.keyPath")}>
               <NativeSegmentedControl labels={[translate("providers.wizard.pathManual"), translate("providers.wizard.pathLogin")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathLogin") : translate("providers.wizard.pathManual")} disabled={wizardBusy} onChange={({ nativeEvent }) => { setKeyPath(nativeEvent.index === 1 ? "login" : "manual"); setValidation(""); }} style={styles.providerWizardModeControl} />
@@ -5326,6 +5598,9 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         </View> : isWorkBuddyType ? <View style={styles.providerWizardFormSection}>
           <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.providerName")}: {selectedProviderName}</Text></View>
           <Text style={styles.providerWizardHint}>{translate("providers.wizard.workbuddyAssociationHint")}</Text>
+        </View> : isQoderType ? <View style={styles.providerWizardFormSection}>
+          <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.providerName")}: {selectedProviderName}</Text></View>
+          <Text style={styles.providerWizardHint}>{translate("providers.wizard.qoderModelsHint")}</Text>
         </View> : isOurFreeModelType ? <View style={styles.providerWizardModelPane}>
           <View style={styles.providerWizardModelFormSection}>
             <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.models")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{translate("providers.wizard.providerName")}: {selectedProviderName}</Text></View>
@@ -5482,6 +5757,7 @@ function presentProviderAuthChallenge(native: NativeLeafAdapter, translate: Tran
 
 function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate, dispatch, dispatchWithOutcome, onStatus, onSecretState, applyProbedSurface, onOpenWizard, relay, addOfficialAccount }: { snapshot?: CoreSnapshot; ipc: IpcClient; onSnapshot: (next: CoreSnapshot) => void; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onStatus: (status?: string) => void; onSecretState: (state: SecretState) => void; applyProbedSurface: ApplyProbedSurface; onOpenWizard: () => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind) => Promise<string> }): React.JSX.Element {
   const [modelTableWidth, setModelTableWidth] = useState(0);
+  const [routeTableWidth, setRouteTableWidth] = useState(0);
   const state = domainState(snapshot, "providers_models");
   const relaySources = useMemo(() => relaySourcesFromSnapshot(snapshot), [snapshot]);
   const relayStations = useMemo(() => relayStationsFromSnapshot(snapshot), [snapshot]);
@@ -5571,12 +5847,14 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // table does not know would be repaired to the first route — the pane would
   // then edit the wrong row.
   const pendingRouteKey = useRef<string | undefined>(undefined);
-  // The list owns the selection: an explicitly cleared one (a click below the
-  // rows) leaves the panes empty instead of acting on a provider the list no
-  // longer highlights, while the first provider still opens the pane on load.
+  // The list owns the selection, and it always names a provider: a row the
+  // snapshot no longer carries (nothing chosen yet, or the provider was renamed
+  // or removed) falls back to the first one.  An empty selection is not a state
+  // this pane has — it would leave the models list, the + / − headers and the
+  // editor standing on nothing, and the only way back would be a click on a row
+  // the user had not been told was needed.
   const provider = useMemo(
-    () => providers.find((item) => editorIdentifier(item) === selectedProvider)
-      ?? (selectedProvider === undefined ? providers[0] : undefined),
+    () => providers.find((item) => editorIdentifier(item) === selectedProvider) ?? providers[0],
     [providers, selectedProvider],
   );
   const providerId = provider ? editorIdentifier(provider) : "";
@@ -5790,9 +6068,6 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       if (selectedProvider !== undefined) setSelectedProvider(undefined);
       return;
     }
-    // A cleared selection stays cleared: the provider list, the + / − headers,
-    // and the editor all read the one selection the user can see.
-    if (selectedProvider === "") return;
     if (!providers.some((item) => editorIdentifier(item) === selectedProvider)) {
       setSelectedProvider(editorIdentifier(providers[0]));
     }
@@ -5860,9 +6135,14 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     // the weaker identity ("one key is one slot, never one name").
     const apiKeyID = stringValue(summary.slot_id);
     const keyName = fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? apiKeyDisplayName(apiKeyName, translate);
-    void native.chooseModelsToAdd({ models: candidates, providerName, keyName }).then((selection) => {
+    void native.chooseModelsToAdd({ models: candidates, providerName, keyName }).then(async (selection) => {
       const selectedModels = (selection ?? []).filter((model, index, all) => candidateSet.has(model) && all.indexOf(model) === index);
       if (selectedModels.length === 0) return;
+      // The spelling this import files is the user's answer, asked once for the
+      // whole pick: a catalog label with upper case in it is a name their
+      // clients would have to type that way (Core files every picked row under
+      // the same answer).
+      const nameCase = await importNameCaseAnswer(native, translate, selectedModels);
       // The rows this pick creates are new, and the pane selects the first one
       // the moment Core answers: 获取模型's whole point is to leave the user on
       // the route they just added, ready to set its public name and order —
@@ -5871,7 +6151,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       pendingModelIds.current = { providerId, ids: new Set(models.map(editorIdentifier)) };
       void dispatch("model.add_many", {
         provider_id: providerId,
-        models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, api_key_name: apiKeyName, ...(apiKeyID ? { provider_key_id: apiKeyID } : {}), enabled: true, order: 0 })).map((model) => ({
+        models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, imported: true, imported_name_case: nameCase, api_key_name: apiKeyName, ...(apiKeyID ? { provider_key_id: apiKeyID } : {}), enabled: true, order: 0 })).map((model) => ({
           ...model,
           ...modelRecordCapabilityChanges(modelCapabilities[model.upstream_model]),
         })),
@@ -5889,9 +6169,23 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
    * surface's.
    */
   const handleFetchedServiceModels = (summary: UnknownRecord, service: ServiceID): void => {
-    const candidates = asRecords(summary.models)
-      .map((entry) => stringValue(entry.id).trim())
-      .filter((value, index, all) => Boolean(value) && all.indexOf(value) === index);
+    // The chooser shows the name the catalog states for people, not the key it
+    // is called by: Qoder's roster is `qmodel_38max` → `Qwen3.8-Max`, and a
+    // picker listing the key asks the user to recognize a model by a slug.
+    // A label two entries share is disambiguated with its id, which Core
+    // resolves back to that exact entry.
+    const roster = asRecords(summary.models)
+      .map((entry) => ({
+        id: stringValue(entry.id).trim(),
+        label: stringValue(entry.publicName).trim() || stringValue(entry.id).trim(),
+      }))
+      .filter((entry) => Boolean(entry.id));
+    const labelCounts = roster.reduce<Record<string, number>>((counts, entry) => {
+      counts[entry.label] = (counts[entry.label] ?? 0) + 1;
+      return counts;
+    }, {});
+    const candidates = [...new Set(roster.map((entry) => (labelCounts[entry.label] > 1 ? `${entry.label} (${entry.id})` : entry.label)))]
+      .filter(Boolean);
     if (summary.available === false) {
       onStatus(translate("providers.fetchFailed", { detail: stringValue(summary.detail) || translate("providers.fetchKeyUnavailable") }));
       return;
@@ -5906,13 +6200,16 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       models: candidates,
       providerName: provider ? providerDisplayName(provider) : providerId,
       keyName: providerKeyChoiceLabel({ name: slot?.name ?? stringValue(summary.api_key_name), kind: "independent" }, translate),
-    }).then((selection) => {
+    }).then(async (selection) => {
       const chosen = (selection ?? []).filter((model, index, all) => candidates.includes(model) && all.indexOf(model) === index);
       if (chosen.length === 0) return;
+      // One spelling decision for the whole pick: the labels are what the user
+      // just read in the chooser, and Core files each row under this answer.
+      const nameCase = await importNameCaseAnswer(native, translate, chosen);
       // The pick's own rows are what the pane should show afterwards; the same
       // reason the generic 获取模型 path records them above.
       pendingModelIds.current = { providerId, ids: new Set(models.map(editorIdentifier)) };
-      void dispatch("model.import_service_catalog", { provider_id: providerId, models: chosen })
+      void dispatch("model.import_service_catalog", { provider_id: providerId, models: chosen, public_name_case: nameCase })
         .then((next) => { settlePendingModels(next, providerId); })
         .catch((reason: unknown) => { onStatus(errorMessage(reason, translate)); });
     }).catch(() => undefined);
@@ -6137,12 +6434,12 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     return left.deploymentID.localeCompare(right.deploymentID);
   }), [modelDisplayName, modelOrderValue, providerDisplayName, providers]);
   // Routes grouped by their client-facing name: one public model is one group
-  // in the routes table and one settings surface.  The name's *identity* is the
-  // group, not its spelling: rows that spell one name in two cases are one
-  // group of several routes, which is what a client sees when it asks for the
-  // name at all.  The group publishes one spelling (lower case first) and the
-  // pane acts on that one, so a rename or a shared context reaches every row
-  // that serves the name.
+  // in the routes table and one settings surface.  The name *is* the group --
+  // an import filed it under the one spelling every route of it carries -- so
+  // rows that state the same name are one group of several routes, and a row
+  // that states another case is the other model the Router serves under it.
+  // A rename or a shared context acts on the group's own name, so it reaches
+  // every row that serves that name.
   const routeGroups = useMemo(() => groupRoutesByPublicModel(routes), [routes]);
   const modelContexts = asRecord(state.model_contexts);
   // The concurrency cap a route that states none of its own follows, read from the
@@ -6156,11 +6453,10 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     ? undefined
     : routeGroups.find((group) => publicModelKey(group.name) === publicModelKey(selectedPublicModel));
   const activeRoute = routes.find((entry) => entry.key === selectedRoute);
-  // The group a route belongs to is every row serving the same name, whatever
-  // case it states it in.
+  // The group a route belongs to is every row serving the same name.
   const activeRouteGroup = activeRoute ? routes.filter((entry) => publicModelKey(entry.publicModel) === publicModelKey(activeRoute.publicModel)) : [];
   const activeRouteIndex = activeRoute ? activeRouteGroup.findIndex((entry) => entry.key === activeRoute.key) : -1;
-  // The group a move rewrites is the one the pane draws: its own spelling, so
+  // The group a move rewrites is the one the pane draws: its own name, so
   // the action names the group the table and the settings pane name.
   const activePublicGroupName = activeRoute
     ? (routeGroups.find((group) => publicModelKey(group.name) === publicModelKey(activeRoute.publicModel))?.name ?? activeRoute.publicModel)
@@ -6174,11 +6470,15 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const canMoveRouteUp = !activeRouteGroupUsesMultiplier && activeRouteIndex > 0;
   const canMoveRouteDown = !activeRouteGroupUsesMultiplier && activeRouteIndex >= 0 && activeRouteIndex < activeRouteGroup.length - 1;
   useEffect(() => {
-    // A cleared route selection stays cleared; the first route only fills in
-    // when the selected one is gone from the list.
-    if (viewMode !== "routes" || routes.length === 0 || selectedRoute === "" || routes.some((entry) => entry.key === selectedRoute)) return;
+    // A public-model row is a selection of its own, so ``selectedRoute`` is
+    // empty while one is highlighted.  Anything else is a list that has lost
+    // the route it named (deleted, or moved to another provider): it takes the
+    // first row rather than standing with nothing highlighted and an empty
+    // inspector beside it.
+    if (viewMode !== "routes" || routes.length === 0 || selectedPublicModel !== undefined) return;
+    if (routes.some((entry) => entry.key === selectedRoute)) return;
     setSelectedRoute(routes[0].key);
-  }, [routes, selectedRoute, viewMode]);
+  }, [routes, selectedPublicModel, selectedRoute, viewMode]);
   useEffect(() => {
     const pending = pendingRouteKey.current;
     if (!pending || !routes.some((entry) => entry.key === pending)) return;
@@ -6582,14 +6882,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   );
   const selectRoute = useCallback((routeId: string): void => {
     setPublicModelReturn(undefined);
-    if (!routeId) {
-      // A click below the route rows clears the selection: the inspector
-      // empties instead of keeping a route active without a highlighted row.
-      setSelectedRoute("");
-      setSelectedPublicModel(undefined);
-      setProviderSourceModel(undefined);
-      return;
-    }
+    if (!routeId) return;
     const selected = routes.find((entry) => entry.key === routeId);
     if (!selected) return;
     setSelectedRoute(routeId);
@@ -6601,17 +6894,14 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // One routes table answers clicks for both row kinds: a public-model row
   // opens that group's own settings, a route row opens the model detail.
   const selectRouteTableRow = useCallback((rowKey: string): void => {
-    if (!rowKey) {
-      selectRoute("");
-      return;
-    }
+    if (!rowKey) return;
     if (rowKey.startsWith(ROUTE_PUBLIC_MODEL_PREFIX)) {
       const publicModel = rowKey.slice(ROUTE_PUBLIC_MODEL_PREFIX.length);
       const group = routeGroups.find((entry) => publicModelKey(entry.name) === publicModelKey(publicModel));
       if (!group) return;
-      // The group's own spelling is what the pane edits and what Core addresses:
-      // the row key came from the table, so it is the same name, but a stale
-      // draft may hand back another case of it.
+      // The group's own name is what the pane edits and what Core addresses:
+      // the row key came from the table, so it is the same name, and the group
+      // is read once more because a stale draft may have dropped it.
       setSelectedPublicModel(group.name);
       setSelectedRoute("");
       setProviderSourceModel(undefined);
@@ -6630,8 +6920,8 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (selectedPublicModel === undefined) return;
     const group = routeGroups.find((entry) => publicModelKey(entry.name) === publicModelKey(selectedPublicModel));
     if (group) {
-      // A group whose spelling moved (a rename landed, or the group folded two
-      // cases onto one) keeps the selection instead of dropping the pane.
+      // A group whose name moved (a rename landed) keeps the selection instead
+      // of dropping the pane.
       if (group.name !== selectedPublicModel) setSelectedPublicModel(group.name);
       return;
     }
@@ -6692,7 +6982,13 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       </View>
       {viewMode === "routes" ? <View style={styles.routeWorkspace}>
         <TablePane wide style={styles.routeTablePane} title={translate("providers.routes")} actions={<><IconButton label="+" title={translate("providers.newRoute")} disabled={busy || providers.length === 0} onPress={addRoute} />{activeRoute || selectedPublicModel !== undefined ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteRoute} /> : null}<IconButton label="↑" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveUp")} disabled={busy || !canMoveRouteUp} onPress={() => moveRoute("up")} /><IconButton label="↓" title={routeMoveTitleKey ? translate(routeMoveTitleKey) : translate("common.moveDown")} disabled={busy || !canMoveRouteDown} onPress={() => moveRoute("down")} /></>}>
-          <NativeTable columns={[{ label: translate("providers.upstream"), width: 160 }, { label: translate("providers.provider"), width: 84 }, { label: translate("providers.providerKey"), width: 150 }, { label: translate("common.order"), width: 48 }, ROUTE_TABLE_SPACER_COLUMN]} rows={routeRows} secondaryRowKeys={offRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => selectRouteTableRow(key)} style={styles.nativeRouteTable} />
+          {/* Measured on a wrapper of the table rather than on the pane: React
+              Native for Web observes an `onLayout` node once, when it mounts,
+              and the routes pane reuses the node the provider pane drew — the
+              first observation landed on a pane with no handler, so the width
+              stayed 0 and the columns stayed at their floors.  This node only
+              exists in the routes branch, so it is a new node every time. */}
+          <View style={styles.routeTableMeasure} onLayout={({ nativeEvent }) => setRouteTableWidth(nativeEvent.layout.width)}><NativeTable columns={routeTableColumns(routeTableWidth, translate)} rows={routeRows} secondaryRowKeys={offRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact preserveColumnWidths selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => selectRouteTableRow(key)} style={styles.nativeRouteTable} /></View>
           {/* The routes table is grouped by public model, so an empty Core and a
               Core whose every group is collapsed both draw a blank table.  Say
               which one this is and what creates the first row, rather than
@@ -6712,11 +7008,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       </View> : <View style={styles.providerWorkspace}>
         <View style={styles.providerModelColumns}>
           <TablePane style={styles.providerListPane} title={translate("providers.providers")} actions={<><IconButton label="+" title={translate("providers.newProvider")} disabled={busy} onPress={addProvider} />{provider ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteProvider} /> : null}</>}>
-            <NativeTable columns={[{ label: translate("providers.provider"), width: 112 }]} rows={providerRows} secondaryRowKeys={offProviderKeys} alertRowKeys={alertProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }} style={styles.nativeProviderTable} />
+            <NativeTable columns={[{ label: translate("providers.provider"), width: 112 }]} rows={providerRows} secondaryRowKeys={offProviderKeys} alertRowKeys={alertProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { if (!key) return; setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }} style={styles.nativeProviderTable} />
           </TablePane>
           <View style={styles.providerMiddlePane} onLayout={({ nativeEvent }) => setModelTableWidth(nativeEvent.layout.width)}>
             <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteModel} /> : null}</>}>
-              <View style={styles.nativeModelTable}><NativeTable columns={modelTableColumns(modelTableWidth, translate)} rows={modelRows} secondaryRowKeys={offModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange={(key) => { if (!key) { setSelectedModel(undefined); setSelectedModelRow(undefined); setProviderSourceModel(undefined); return; } const modelID = modelIDFromRowKey(key); if (modelID === undefined) return; setSelectedModel(modelID); setSelectedModelRow(key); setProviderSourceModel(undefined); }} style={styles.modelTable} /></View>
+              <View style={styles.nativeModelTable}><NativeTable columns={modelTableColumns(modelTableWidth, translate)} rows={modelRows} secondaryRowKeys={offModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange={(key) => { if (!key) { /* a click that names no model row leaves the provider — the row these models belong to — as the selection, so the inspector shows it instead of emptying */ setSelectedModel(undefined); setSelectedModelRow(undefined); setProviderSourceModel(undefined); return; } const modelID = modelIDFromRowKey(key); if (modelID === undefined) return; setSelectedModel(modelID); setSelectedModelRow(key); setProviderSourceModel(undefined); }} style={styles.modelTable} /></View>
               {provider ? <View style={styles.tableBottomRow}>{fetchKeyChoices.length > 0 ? <NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy} accessibilityLabel={translate("providers.providerKey")} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /> : null}<ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || (fetchKeyChoices.length > 0 && !selectedFetchKey)} onPress={() => { void fetchModels(); }} /></View> : null}
             </TablePane>
           </View>
@@ -6773,10 +7069,6 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     ? `account:${loginCredentials[0].ref}`
     : customKeys[0] ? `custom:${customKeys[0].id}` : providedRows[0] ? `provided:${providedRows[0].key}` : orphanSlots[0] ? `orphan:${orphanSlots[0].id}` : "";
   const [selectedKey, setSelectedKey] = useState<string>(firstSelectable);
-  // A cleared key selection (a click below the key rows) survives the repair
-  // below: the panel keeps no key selected, hides the −, and leaves its editor
-  // empty instead of quietly editing the first key again.
-  const [selectionCleared, setSelectionCleared] = useState(false);
   // The key a staged edit is waiting for: a ＋ names the new key by the only
   // identity it has before it exists, while a rename names the slot it edits
   // and the name it asked for, so a refused rename can never select another
@@ -6928,7 +7220,6 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     };
   }, [autoGrouping, autoGroupingKey]);
   useEffect(() => {
-    if (selectionCleared) return;
     // tableRows keys already carry the custom:/provided: prefix; compare the
     // selection verbatim or every click would snap back to the first row.
     const valid = new Set(tableRows.filter((row) => !row.spanning).map((row) => row.key));
@@ -6941,7 +7232,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     setSelectedKey(loginCredentials[0]
       ? `account:${loginCredentials[0].ref}`
       : customKeys[0] ? `custom:${customKeys[0].id}` : providedRows[0] ? `provided:${providedRows[0].key}` : orphanSlots[0] ? `orphan:${orphanSlots[0].id}` : "");
-  }, [customKeys, loginCredentials, orphanSlots, providedRows, selectedKey, selectionCleared, tableRows]);
+  }, [customKeys, loginCredentials, orphanSlots, providedRows, selectedKey, tableRows]);
   const addKey = (): void => {
     if (selectedGroup === "provided" && isRelay) {
       if (autoGrouping || stationAccounts.length === 0) return;
@@ -6958,7 +7249,6 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
       const added = customKeys.find((key) => key.name === pending);
       if (added) {
         pendingCustomKeyName.current = undefined;
-        setSelectionCleared(false);
         setSelectedKey(`custom:${added.id}`);
       }
     }
@@ -6972,7 +7262,6 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
         pendingCustomKeyRename.current = undefined;
       } else if (renamed.name === rename.name) {
         pendingCustomKeyRename.current = undefined;
-        setSelectionCleared(false);
         setSelectedKey(`custom:${renamed.id}`);
       }
     }
@@ -7058,7 +7347,6 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
         // it selects like any key — ignoring it left the account listed, never
         // selectable, and its editor column permanently empty.
         if (key.startsWith("group:")) return;
-        setSelectionCleared(key === "");
         setSelectedKey(key);
       }}
       style={variant === "inline" ? styles.keysTableInline : styles.keysTable}
@@ -7728,29 +8016,33 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
         <Text numberOfLines={1} style={styles.modelInspectorLabel}>{translate("providers.laneSource")}</Text>
         <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{translate(laneSource === LANE_ROUTE_REGION ? "providers.laneRoute.region" : "providers.laneRoute.main")}</Text>
       </View> : null}
-      <View style={styles.routeEditorRow}>
-        <TextField label={translate("providers.order")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} controlWidth={64} value={String(displayedOrder)} keyboardType="numeric" disabled={busy || followsMultiplier} onDraftChange={(value) => drafts?.setModelOrderDraft(providerId, id, value)} validate={(nextOrder) => {
-          // The order is a number the user typed (decimals included).  A draft
-          // that is not one stays in the field with its own message instead of
-          // silently becoming 0, which is the rule the runtime panes' number
-          // fields already follow.
-          const trimmed = nextOrder.trim();
-          return trimmed === "" || Number.isFinite(Number(trimmed)) ? undefined : translate("runtime.invalidNumber");
-        }} onCommit={(nextOrder) => {
-          const parsed = Number(nextOrder.trim());
-          const order = Number.isFinite(parsed) ? parsed : 0;
-          return dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { manual_order: order, order } });
-        }} style={styles.routeEditorField} />
-        {canFollowMultiplier ? <NativeCheckbox label={translate("providers.followMultiplier")} value={followsMultiplier} disabled={busy} onValueChange={(follow) => dispatch("model.patch", {
-          provider_id: providerId,
-          model_id: id,
-          changes: {
-            order_mode: follow ? "relay_multiplier" : "manual",
-            manual_order: manualOrder,
-            ...(follow ? {} : { order: manualOrder }),
-          },
-        })} style={styles.routeFollowControl} /> : null}
-      </View>
+      {/* A number and the control that says where the number comes from are one
+          row of the pane's grid: the switch is the field's accessory, not a
+          sibling of the field.  Beside a sibling it was a flex item against a
+          `width: "100%"` TextField, which the fallback hosts resolved by
+          collapsing the field to its content — 2 pt, a bezel with no number in
+          it — and which the page resolved by pushing the switch out of the
+          pane. */}
+      <TextField label={translate("providers.order")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} controlWidth={64} value={String(displayedOrder)} keyboardType="numeric" disabled={busy || followsMultiplier} onDraftChange={(value) => drafts?.setModelOrderDraft(providerId, id, value)} validate={(nextOrder) => {
+        // The order is a number the user typed (decimals included).  A draft
+        // that is not one stays in the field with its own message instead of
+        // silently becoming 0, which is the rule the runtime panes' number
+        // fields already follow.
+        const trimmed = nextOrder.trim();
+        return trimmed === "" || Number.isFinite(Number(trimmed)) ? undefined : translate("runtime.invalidNumber");
+      }} onCommit={(nextOrder) => {
+        const parsed = Number(nextOrder.trim());
+        const order = Number.isFinite(parsed) ? parsed : 0;
+        return dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { manual_order: order, order } });
+      }} accessory={canFollowMultiplier ? <NativeCheckbox label={translate("providers.followMultiplier")} value={followsMultiplier} disabled={busy} onValueChange={(follow) => dispatch("model.patch", {
+        provider_id: providerId,
+        model_id: id,
+        changes: {
+          order_mode: follow ? "relay_multiplier" : "manual",
+          manual_order: manualOrder,
+          ...(follow ? {} : { order: manualOrder }),
+        },
+      })} style={styles.routeFollowControl} /> : undefined} />
       <RouteConcurrencyField providerId={providerId} model={model} busy={busy} globalLimit={globalConcurrencyLimit} translate={translate} dispatch={dispatch} />
       <ProtocolPicker providerId={providerId} model={model} busy={busy} translate={translate} dispatch={dispatch} />
     </View>
@@ -7836,34 +8128,10 @@ function RouteConcurrencyField({ providerId, model, busy, globalLimit, translate
   const stated = model.max_concurrency;
   const followsGlobal = stated === undefined || stated === null;
   const [tipOpen, setTipOpen] = useState(false);
-  return <View style={styles.routeEditorRow}>
-    <TextField
-      label={translate("providers.routeConcurrency")}
-      labelWidth={MODEL_INSPECTOR_LABEL_WIDTH}
-      controlWidth={64}
-      keyboardType="numeric"
-      // A following route's cap is not editable here: the switch beside it is
-      // the control that decides where the number comes from, exactly as 跟随倍率
-      // does for 顺序.
-      disabled={busy || followsGlobal}
-      value={String(followsGlobal ? inheritedLimit : stated)}
-      validate={(next) => {
-        const trimmed = next.trim();
-        if (!trimmed) return undefined;
-        if (!Number.isFinite(Number(trimmed)) || !Number.isInteger(Number(trimmed))) return translate("runtime.invalidNumber");
-        const parsed = Number(trimmed);
-        return parsed >= 0 && parsed <= 4096 ? undefined : translate("runtime.invalidNumber");
-      }}
-      onCommit={(next) => {
-        const trimmed = next.trim();
-        // An empty draft returns the route to the global limit, which Core reads
-        // as no declaration of its own; it is never written as 0, because 0
-        // means "uncapped".
-        const changes = trimmed === "" ? { max_concurrency: null } : { max_concurrency: Number(trimmed) };
-        return dispatch("model.patch", { provider_id: providerId, model_id: id, changes });
-      }}
-      style={styles.routeEditorField}
-    />
+  // The switch and the mark that explains it are the number's accessory: they
+  // are the row's own items, laid out by the row's own gap, exactly as 顺序
+  // above it and as the protocol picker's mark below.
+  const accessory = <>
     <NativeCheckbox
       label={translate("providers.routeConcurrencyInherit")}
       value={followsGlobal}
@@ -7874,13 +8142,42 @@ function RouteConcurrencyField({ providerId, model, busy, globalLimit, translate
       onValueChange={(follow) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { max_concurrency: follow ? null : (stated ?? inheritedLimit) } })}
       style={styles.routeFollowControl}
     />
-    {/* The mark explains the number the switch states, so it reads as the last
-        word of 跟随全局 rather than as a second control in the row: it sits right
-        beside the label instead of at its own tab stop's distance. */}
+    {/* The mark explains the number the switch states, so it sits right beside
+        the label — at the row's own gap, which is the gap the protocol picker's
+        mark keeps below it, and no closer: the mark's 22 pt target already
+        leaves the ring inside it 4.5 pt of air, and pulling those points back
+        with a negative margin once put the ring on 跟随全局's last character. */}
     <View style={styles.routeFollowHelp}>
       <HelpTip open={tipOpen} text={translate("providers.routeConcurrencyHelp")} title={translate("providers.routeConcurrencyHelpTitle")} onToggle={() => setTipOpen((current) => !current)} />
     </View>
-  </View>;
+  </>;
+  return <TextField
+    label={translate("providers.routeConcurrency")}
+    labelWidth={MODEL_INSPECTOR_LABEL_WIDTH}
+    controlWidth={64}
+    keyboardType="numeric"
+    // A following route's cap is not editable here: the switch beside it is
+    // the control that decides where the number comes from, exactly as 跟随倍率
+    // does for 顺序.
+    disabled={busy || followsGlobal}
+    value={String(followsGlobal ? inheritedLimit : stated)}
+    validate={(next) => {
+      const trimmed = next.trim();
+      if (!trimmed) return undefined;
+      if (!Number.isFinite(Number(trimmed)) || !Number.isInteger(Number(trimmed))) return translate("runtime.invalidNumber");
+      const parsed = Number(trimmed);
+      return parsed >= 0 && parsed <= 4096 ? undefined : translate("runtime.invalidNumber");
+    }}
+    onCommit={(next) => {
+      const trimmed = next.trim();
+      // An empty draft returns the route to the global limit, which Core reads
+      // as no declaration of its own; it is never written as 0, because 0
+      // means "uncapped".
+      const changes = trimmed === "" ? { max_concurrency: null } : { max_concurrency: Number(trimmed) };
+      return dispatch("model.patch", { provider_id: providerId, model_id: id, changes });
+    }}
+    accessory={accessory}
+  />;
 }
 
 function ProtocolPicker({ providerId, model, busy, translate, dispatch }: { providerId: string; model: UnknownRecord; busy: boolean; translate: Translate; dispatch: Dispatch }): React.JSX.Element {
@@ -8114,16 +8411,49 @@ function modelTableColumns(width: number, translate: Translate): Array<{ label: 
   ];
 }
 
-// The native table grows its trailing column to the pane's width, which made
-// 顺序 — a header and a number — as wide as the name columns beside it.  A
-// trailing column that carries nothing takes that leftover instead, so 顺序
-// keeps the width its own content asks for at every window size.
-const ROUTE_TABLE_SPACER_COLUMN = { label: "", width: 1 };
+// The routes table is the widest pane in the window and the only one whose
+// every column was a hand-picked number: 160 / 84 / 150 / 48, plus an empty
+// column that took whatever the window had left.  On a wide window that spacer
+// was a third of the pane — a block of nothing beside a 密钥名 cut off at 150 pt,
+// which is shorter than the names a relay station gives its keys
+// (`riveryang6/CCMax-满血版`).  The four columns now share the width that exists:
+// the two name columns take the slack (密钥名 the larger half, because a key
+// name is a vendor prefix and a group name), 供应商 keeps the floor the longest
+// provider label asks for, and 顺序 stays the header and a number.
+const ROUTE_TABLE_MINIMUMS = [150, 96, 176, 48] as const;
+
+function routeTableColumns(width: number, translate: Translate): Array<{ label: string; width: number }> {
+  const labels = [translate("providers.upstream"), translate("providers.provider"), translate("providers.providerKey"), translate("common.order")];
+  const minimums = ROUTE_TABLE_MINIMUMS;
+  const minimumTotal = minimums.reduce((total, value) => total + value, 0);
+  // The table's own 1 pt frame on each side is not column space.  A pane that
+  // has not been measured yet keeps the floors, so its first frame is a table
+  // rather than four columns folded to a pixel.
+  const available = width > 0 ? width - 2 : minimumTotal;
+  if (!(available > minimumTotal)) {
+    // A pane narrower than the floors still shows every column in the pane it
+    // belongs to rather than drawing a table wider than its own view.
+    const share = Math.max(0, available) / minimumTotal;
+    const scaled = minimums.map((minimum) => Math.max(1, Math.floor(minimum * share)));
+    scaled[scaled.length - 1] = Math.max(1, available - scaled.slice(0, -1).reduce((total, value) => total + value, 0));
+    return labels.map((label, index) => ({ label, width: scaled[index] }));
+  }
+  // 供应商 and 顺序 are a label and a number: they keep their floors, and the
+  // whole remainder goes to the two columns that hold a name.
+  const slack = available - minimumTotal;
+  const keyWidth = minimums[2] + Math.ceil(slack * 0.68);
+  const upstreamWidth = minimums[0] + (slack - Math.ceil(slack * 0.68));
+  return [
+    { label: labels[0], width: upstreamWidth },
+    { label: labels[1], width: minimums[1] },
+    { label: labels[2], width: keyWidth },
+    { label: labels[3], width: Math.max(1, available - upstreamWidth - minimums[1] - keyWidth) },
+  ];
+}
 
 // The public-model row key the routes table uses for one public model.  The
-// name's identity is the selection identity, so the key carries that and not
-// the spelling: the same group drawn after a case change keeps its row, and a
-// key can never name a second group that is really the first one's other case.
+// name is the selection identity, so the key carries it: the name a group edits
+// is the name the Router serves, and no other group can state it.
 const ROUTE_PUBLIC_MODEL_PREFIX = "route-public-model:";
 
 function routePublicModelRowKey(publicModel: string): string {
@@ -8152,8 +8482,8 @@ function publicModelTokensText(value: number | null | undefined, translate: Tran
 
 // One public model's declared limit: the smallest value its routes carry, so a
 // group never promises more than every route behind it can deliver.  Absent
-// means the registry default stands.  Every route serving the name counts,
-// whatever case it states the name in.
+// means the registry default stands.  Every route serving the name counts --
+// the name is the group, and the import stated its one spelling.
 function publicModelCustomLimit(providers: UnknownRecord[], publicModel: string, field: "max_input_tokens"): number | undefined {
   const key = publicModelKey(publicModel);
   if (!key) return undefined;
@@ -8170,8 +8500,8 @@ function publicModelCustomLimit(providers: UnknownRecord[], publicModel: string,
 }
 
 function publicModelDefault(contexts: UnknownRecord, publicModel: string): number | undefined {
-  // Core keys this projection by identity, so a group drawn with one of its
-  // rows' spellings reads the window of the group.
+  // Core keys this projection by the name the document serves, so the group the
+  // pane draws reads its own record.
   const record = asRecord(contexts[publicModelContextKey(contexts, publicModel)]);
   // The recommendation is the registry's own profile, never the number this
   // app hands a client: a group that declares its own window publishes that
@@ -8187,15 +8517,15 @@ function publicModelDefault(contexts: UnknownRecord, publicModel: string): numbe
   return Number.isFinite(declared) ? declared : undefined;
 }
 
-// The key a snapshot uses for one public model's context record.  The exact
-// spelling is tried first, because that is what the projection normally carries;
-// the identity lookup is what keeps a group drawn from another spelling of the
-// same name from losing its window entirely.
+// The key a snapshot uses for one public model's context record: the name
+// itself.  The scan is only for surrounding whitespace, which is not part of a
+// name -- a group whose name is on the record is found without inventing a
+// second spelling for it.
 function publicModelContextKey(contexts: UnknownRecord, publicModel: string): string {
   if (Object.prototype.hasOwnProperty.call(contexts, publicModel)) return publicModel;
-  const key = publicModelKey(publicModel);
-  if (!key) return publicModel;
-  return Object.keys(contexts).find((candidate) => publicModelKey(candidate) === key) ?? publicModel;
+  const name = publicModelKey(publicModel);
+  if (!name) return publicModel;
+  return Object.prototype.hasOwnProperty.call(contexts, name) ? name : publicModel;
 }
 
 function identifier(record: UnknownRecord): string {
@@ -8435,6 +8765,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   const service = providerService(provider);
   const isOfficialAccount = kind === "openai";
   const isWorkBuddyAccount = kind === "workbuddy" || kind === "workbuddyGlobal";
+  const isQoderAccount = kind === "qoder" || kind === "qoderGlobal";
   // The one predicate, not a second spelling of it: a login service owns its
   // key, so no key editor may be drawn for it.  Re-deriving this locally from
   // the two kinds this pane also branches on left the Our Free Model lane
@@ -8495,11 +8826,10 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     error: translate("providers.authStatusError"),
     unsupported: translate("providers.authStatusUnsupported"),
   };
-  // The account the list highlights, and the rows it draws.  The list owns the
-  // selection the way the station's does: an explicitly cleared one (a click
-  // below the rows) leaves the editor empty instead of acting on an account the
-  // list no longer highlights, while the first account still opens the block on
-  // load.
+  // The account the list highlights, and the rows it draws.  The list owns one
+  // selection and it always names an account — the first one until the user
+  // picks another — so the block below the list is never left without an
+  // account to describe.
   //
   // These derive from `statusLabels`, which is a `const` declared above them and
   // *below* the identity fields: reading it any earlier is a temporal dead zone
@@ -8508,7 +8838,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   // last thing this block needs, so the block is stated last.
   const [selectedAuthAccountRef, setSelectedAuthAccountRef] = useState<string>();
   const selectedAuthAccount = authAccounts.find((account) => stringValue(account.ref) === (selectedAuthAccountRef ?? stringValue(authAccounts[0]?.ref)))
-    ?? (selectedAuthAccountRef === undefined ? authAccounts[0] : undefined);
+    ?? authAccounts[0];
   const authAccountRows = authAccounts
     .filter((account) => stringValue(account.ref))
     .map((account) => ({
@@ -8651,6 +8981,64 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     // state instead of calling the worker (a cold start here once froze every
     // window). The mount read below fills it in moments after the pane opens.
     || stringValue(asRecord(provider.auth_observed).state) === "signed-in";
+  // A Qoder account is read through the same Core-owned worker that owns the
+  // PAT.  Unlike WorkBuddy, this block never starts a sign-in: the PAT is typed
+  // into the wizard's native secret field, because this pane is not allowed to
+  // put a credential into an action payload either.
+  const [qoderStatusBusy, setQoderStatusBusy] = useState(false);
+  const [qoderAccount, setQoderAccount] = useState<UnknownRecord | undefined>(undefined);
+  const loadQoderAccount = async (refresh: boolean): Promise<UnknownRecord | undefined> => {
+    const providerKey = qoderProviderIDFor(kind);
+    if (!providerKey) return undefined;
+    setQoderStatusBusy(true);
+    try {
+      const next = await dispatchWithOutcome("qoder_status", { refresh, provider: providerKey }, "providers_models", true);
+      if (!next) return undefined;
+      const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
+      const account = asRecord(asRecord(summary.providers)[providerKey]);
+      setQoderAccount(account);
+      return account;
+    } finally {
+      setQoderStatusBusy(false);
+    }
+  };
+  const refreshQoderAccount = async (): Promise<void> => {
+    if (qoderStatusBusy) return;
+    try {
+      const account = await loadQoderAccount(true);
+      if (!account) return;
+      if (stringValue(account.state) !== "signed-in") {
+        onStatus?.(translate("providers.wizard.qoderSignInRequired"));
+        return;
+      }
+      const credits = workbuddyCreditsText(account, translate);
+      onStatus?.(credits ? `${translate("providers.wizard.qoderCredits")}: ${credits}` : translate("providers.authStatusSignedIn"));
+    } catch {
+      onStatus?.(translate("relay.operationFailed"));
+    }
+  };
+  useEffect(() => {
+    if (!isQoderAccount) return;
+    // The credential a Qoder account serves with is not this app's to know
+    // from a stored token: it comes from the desktop app, which can sign in or
+    // out under the pane.  So the mount read is the credit-carrying one (the
+    // same reason the WorkBuddy block's is), and it is not skipped just because
+    // Core remembers an observation: after a Core restart that memory is gone,
+    // and an account row that says 未登录 over a signed-in app is exactly the
+    // defect this read exists to prevent.
+    void loadQoderAccount(true).then((account) => {
+      if (account && stringValue(account.state) !== "signed-in") void loadQoderAccount(true);
+    });
+    // The provider id and its kind are the only triggers: a reload on every
+    // render would fight the refresh button beside the account.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, kind]);
+  const qoderObserved = asRecord(provider.auth_observed);
+  const qoderFacts = workbuddyAccountFacts(asRecord(qoderAccount), qoderObserved);
+  const qoderSignedIn = stringValue(qoderAccount?.state) === "signed-in"
+    // Until this block has read the account itself, the sign-in state is the
+    // one Core last observed rather than a guess.
+    || stringValue(qoderObserved.state) === "signed-in";
   const startLogin = async (): Promise<void> => {
     if (authPending !== undefined) return;
     const kind: ServiceProviderKind = "openai_login";
@@ -8901,7 +9289,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
       showConnectionFields={false}
       onStatus={onStatus}
     /> : null}
-    {(!isLogin || isWorkBuddyAccount) && !station ? <View style={styles.providerAccountsHeader}>
+    {(!isLogin || isWorkBuddyAccount || isQoderAccount) && !station ? <View style={styles.providerAccountsHeader}>
       <View style={styles.panelHeader}>
         {/* The one association block: a station-backed provider links a relay
             station, a provider addressed at an official service links that
@@ -8909,6 +9297,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
         <Text style={styles.panelTitle}>{translate(providerService(provider) ? "providers.serviceLinks" : "providers.accounts")}</Text>
         <View style={styles.panelActions}>
           {isWorkBuddyAccount && workbuddySignedIn ? <NativeButton title="" symbol="refresh" compact toolTip={translate("providers.wizard.workbuddyRefresh")} accessibilityLabel={translate("providers.wizard.workbuddyRefresh")} busy={workbuddyStatusBusy} disabled={busy && !workbuddyStatusBusy} onPress={() => { void refreshWorkBuddyAccount(); }} style={styles.iconButton} /> : null}
+          {isQoderAccount ? <NativeButton title="" symbol="refresh" compact toolTip={translate("providers.wizard.qoderRefresh")} accessibilityLabel={translate("providers.wizard.qoderRefresh")} busy={qoderStatusBusy} disabled={busy && !qoderStatusBusy} onPress={() => { void refreshQoderAccount(); }} style={styles.iconButton} /> : null}
           {isWorkBuddyAccount && !workbuddySignedIn && workbuddyAccount ? <NativeButton title={translate("providers.wizard.workbuddyLogin")} compact busy={workbuddyStatusBusy} disabled={busy && !workbuddyStatusBusy} onPress={() => { void openWorkBuddyApp(); }} /> : null}
           {vendorBaseURL && !providerService(provider) ? <NativeButton title="" symbol="plus" compact toolTip={translate("providers.addRelayAccount")} accessibilityLabel={translate("providers.addRelayAccount")} busy={relayAddBusy} disabled={busy} onPress={() => { void addRelayAccountToVendor(); }} style={styles.iconButton} /> : null}
         </View>
@@ -8929,7 +9318,20 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
           <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{workbuddyCreditsText(workbuddyFacts, translate) || progressText(workbuddyStatusBusy, translate) || translate("providers.workbuddyCreditUnavailable")}</Text>
         </View> : null}
       </> : null}
-      {providerService(provider) && !isWorkBuddyAccount ? <Text style={styles.keysHint}>{translate("providers.serviceKeyHint")}</Text> : null}
+      {isQoderAccount ? <>
+        <View style={styles.officialStatusRow}>
+          <Text style={styles.providerAuthStatusLabel}>{translate("providers.qoderAccount")}</Text>
+          <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{stringValue(qoderFacts.state) === "signed-in"
+            ? [stringValue(qoderFacts.nickname), qoderCredentialSourceLabel(qoderFacts, translate)].filter(Boolean).join(" · ") || translate("common.notAvailable")
+            : progressText(qoderStatusBusy, translate) ?? translate("providers.wizard.qoderSignInRequired")}</Text>
+        </View>
+        {qoderSignedIn ? <View style={styles.officialStatusRow}>
+          <Text style={styles.providerAuthStatusLabel}>{translate("providers.wizard.qoderCredits")}</Text>
+          <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{workbuddyCreditsText(qoderFacts, translate) || progressText(qoderStatusBusy, translate) || translate("providers.workbuddyCreditUnavailable")}</Text>
+        </View> : null}
+        <Text style={styles.keysHint}>{translate("providers.qoderAccountHint")}</Text>
+      </> : null}
+      {providerService(provider) && !isWorkBuddyAccount && !isQoderAccount ? <Text style={styles.keysHint}>{translate("providers.serviceKeyHint")}</Text> : null}
     </View> : null}
     </View>
   </PersistentScrollView>;
@@ -9836,6 +10238,10 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
   const portItem = runtimeSettings.find((item) => identifier(item) === "LITELLM_PORT");
   const portValue = stringValue(portItem?.value, "");
   const portDefault = stringValue(portItem?.default, "12390");
+  // A host states the port it publishes (its reverse proxy and its health probe
+  // name it), so the field shows that number and does not accept another: a
+  // stored value could not move the listener those two already point at.
+  const portStated = booleanValue(portItem?.host_stated);
   // The page's own key.  It is a Runtime secret, read over the same plaintext
   // lease the API key uses and drawn in the clear for the same reason: it is a
   // lock somebody reads and types into another browser, and dots cannot be
@@ -9856,6 +10262,14 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
     if (address) native.openExternalURL?.(address);
   };
   const webPageAddress = (() => {
+    // On the page itself, the address is the one in the address bar: a window
+    // reached through a reverse proxy knows the hostname it was published
+    // under, and printing a loopback address there names an address the reader
+    // cannot open.  The native hosts keep the derivation below -- they have no
+    // address bar to read.
+    if (Platform.OS === "web" && typeof window !== "undefined" && window.location.origin.startsWith("http")) {
+      return `${window.location.origin}/ui`;
+    }
     const running = serviceState === "running";
     const port = running ? stringValue(String(snapshot?.service.port ?? ""), "") : portValue;
     return port ? `http://127.0.0.1:${port}/ui` : "";
@@ -10077,10 +10491,10 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
           <View style={styles.generalRow}>
             <Text style={styles.generalRowLabel}>{translate("general.port")}</Text>
             <View style={styles.generalValueSlot}>
-              <RuntimeValueField label={translate("general.port")} width="number" value={portValue} keyboardType="numeric" validate={validatePort} onCommit={(next) => dispatch("set_setting", { key: "LITELLM_PORT", value: next }, "runtime")} />
+              <RuntimeValueField label={translate("general.port")} width="number" value={portValue} keyboardType="numeric" editable={!portStated} validate={validatePort} onCommit={(next) => dispatch("set_setting", { key: "LITELLM_PORT", value: next }, "runtime")} />
             </View>
           </View>
-          <View style={styles.generalHelpSlot}><Text style={styles.generalHelpText}>{translate("general.portHint", { default: portDefault })}</Text></View>
+          <View style={styles.generalHelpSlot}><Text style={styles.generalHelpText}>{portStated ? translate("general.portHostStated") : translate("general.portHint", { default: portDefault })}</Text></View>
         </View>
         <View style={styles.generalField}>
           <View style={styles.generalRow}>
@@ -10745,12 +11159,12 @@ function usePendingTextField(value: string, onCommit: (next: string) => void | P
   return { draft, error, onChangeText, commit, reset, resetTo, isDirty: () => dirtyRef.current, hasError: () => errorRef.current !== undefined };
 }
 
-function RuntimeValueField({ label, value, width, keyboardType, validate, resetToken = 0, resetValue = "", onCommit, onErrorChange }: { label: string; value: string; width: "number" | "text"; keyboardType?: "default" | "numeric"; validate?: (next: string) => string | undefined; resetToken?: number; resetValue?: string; onCommit: (value: string) => void | Promise<void>; onErrorChange?: (message?: string) => void }): React.JSX.Element {
+function RuntimeValueField({ label, value, width, keyboardType, editable = true, validate, resetToken = 0, resetValue = "", onCommit, onErrorChange }: { label: string; value: string; width: "number" | "text"; keyboardType?: "default" | "numeric"; editable?: boolean; validate?: (next: string) => string | undefined; resetToken?: number; resetValue?: string; onCommit: (value: string) => void | Promise<void>; onErrorChange?: (message?: string) => void }): React.JSX.Element {
   const field = usePendingTextField(value, onCommit, label, undefined, validate);
   useEffect(() => { onErrorChange?.(field.error); }, [field.error, onErrorChange]);
   // A reset click replaces any uncommitted draft with the default value.
   useEffect(() => { if (resetToken > 0) field.resetTo(resetValue); }, [resetToken]);
-  return <NativeTextField style={[styles.input, width === "number" ? styles.runtimeNumberControl : styles.runtimeTextControl, field.error !== undefined && styles.runtimeValueControlInvalid]} value={field.draft} onChangeText={field.onChangeText} onBlur={() => { void field.commit().catch(() => undefined); }} onSubmitEditing={() => { void field.commit().catch(() => undefined); }} autoCapitalize="none" autoCorrect={false} keyboardType={keyboardType} accessibilityLabel={label} />;
+  return <NativeTextField style={[styles.input, width === "number" ? styles.runtimeNumberControl : styles.runtimeTextControl, field.error !== undefined && styles.runtimeValueControlInvalid]} value={field.draft} editable={editable} onChangeText={field.onChangeText} onBlur={() => { void field.commit().catch(() => undefined); }} onSubmitEditing={() => { void field.commit().catch(() => undefined); }} autoCapitalize="none" autoCorrect={false} keyboardType={keyboardType} accessibilityLabel={label} />;
 }
 
 /**
@@ -13632,7 +14046,7 @@ const ActionButton = React.forwardRef<HostInstance, { title: string; onPress: ()
 
 function TextField({ label, value, onCommit, onDraftChange, hint, hintStyle, placeholder, secret, multiline, compactMultiline, keyboardType, stacked, labelWidth, labelAlign, controlWidth, labelVisible = true, suffix, disabled, validate, accessory, style }: { label: string; value: string; onCommit: (value: string) => void | Promise<void>; onDraftChange?: (value: string) => void; hint?: string; hintStyle?: StyleProp<TextStyle>; placeholder?: string; secret?: boolean; multiline?: boolean; compactMultiline?: boolean; keyboardType?: "default" | "numeric"; stacked?: boolean; labelWidth?: number; labelAlign?: "left" | "right"; controlWidth?: number; /** The caller renders the label itself (a stacked keys-editor row). */ labelVisible?: boolean; suffix?: string; disabled?: boolean; /** Commit-time validation: an invalid draft stays in the field with its message instead of reaching Core. */ validate?: (next: string) => string | undefined; /** A control that belongs to this row beside the field, such as its help mark. It rides the same grid level as PickerField's, so a field with an accessory and a picker with one draw the same column. */ accessory?: React.ReactNode; style?: StyleProp<ViewStyle> }): React.JSX.Element {
   const field = usePendingTextField(value, onCommit, label, onDraftChange, validate);
-  return <View style={[styles.formRow, compactStyles.formRow, (stacked || multiline) && styles.formRowStacked, style]}>{labelVisible ? <Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }, (stacked || multiline) && styles.formRowLabelStacked]}>{label}</Text> : null}<View style={[styles.formRowControl, compactStyles.formRowControl, controlWidth === undefined ? null : { width: controlWidth, flexGrow: 0, flexShrink: 0, flexBasis: "auto" }]}><NativeTextField style={[styles.input, compactStyles.input, multiline && styles.textArea, compactMultiline && styles.compactTextArea, field.error !== undefined && styles.inputInvalid]} value={field.draft} placeholder={placeholder} editable={!disabled} onChangeText={field.onChangeText} onBlur={() => { if (!disabled) void field.commit().catch(() => undefined); }} onSubmitEditing={multiline ? undefined : () => { if (!disabled) void field.commit().catch(() => undefined); }} multiline={multiline} secureTextEntry={secret} autoCapitalize="none" autoCorrect={false} keyboardType={keyboardType} accessibilityLabel={label} />{hint ? <Text style={[styles.fieldHint, hintStyle]}>{hint}</Text> : null}{field.error !== undefined ? <Text style={[styles.fieldError, hintStyle]} accessibilityLiveRegion="polite">{field.error}</Text> : null}</View>{accessory ?? null}{suffix ? <Text style={[styles.fieldHint, hintStyle]}>{suffix}</Text> : null}</View>;
+  return <View style={[styles.formRow, compactStyles.formRow, (stacked || multiline) && styles.formRowStacked, style]}>{labelVisible ? <Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }, (stacked || multiline) && styles.formRowLabelStacked]}>{label}</Text> : null}<View style={[controlWidth === undefined ? styles.formRowControl : styles.formRowControlFixed, compactStyles.formRowControl, controlWidth === undefined ? null : { width: controlWidth }]}><NativeTextField style={[styles.input, compactStyles.input, multiline && styles.textArea, compactMultiline && styles.compactTextArea, field.error !== undefined && styles.inputInvalid]} value={field.draft} placeholder={placeholder} editable={!disabled} onChangeText={field.onChangeText} onBlur={() => { if (!disabled) void field.commit().catch(() => undefined); }} onSubmitEditing={multiline ? undefined : () => { if (!disabled) void field.commit().catch(() => undefined); }} multiline={multiline} secureTextEntry={secret} autoCapitalize="none" autoCorrect={false} keyboardType={keyboardType} accessibilityLabel={label} />{hint ? <Text style={[styles.fieldHint, hintStyle]}>{hint}</Text> : null}{field.error !== undefined ? <Text style={[styles.fieldError, hintStyle]} accessibilityLiveRegion="polite">{field.error}</Text> : null}</View>{accessory ?? null}{suffix ? <Text style={[styles.fieldHint, hintStyle]}>{suffix}</Text> : null}</View>;
 }
 
 function NativeSecretInputControl({ label, hint, busy, domain, field, target, multiline = false, plainText = false, autoCommit = false, resetToken = 0, onSecretState, setTitle, setBelow, onSetReady, inputMinWidth }: { label: string; hint?: string; busy: boolean; domain: "providers_models" | "relay_accounts" | "codex" | "claude" | "runtime" | "webdav"; field: string; target?: string; multiline?: boolean; plainText?: boolean; autoCommit?: boolean; resetToken?: number; onSecretState: (state: SecretState) => void; setTitle?: string; setBelow?: boolean; onSetReady?: (requestSet: () => void, saving: boolean) => void; inputMinWidth?: number }): React.JSX.Element {
@@ -13759,7 +14173,7 @@ function PickerField({ label, value, values, onSelect, disabled, labelWidth, lab
   // The row's label is the picker's name: a pane with several pickers otherwise
   // announced a column of bare values, since neither platform derived one from
   // a sibling label.
-  return <View style={[styles.formRow, compactStyles.formRow]}><Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }]}>{label}</Text><NativePicker labels={options.map((option) => option.label)} selectedValue={selectedLabel} disabled={disabled} accessibilityLabel={label} onChange={({ nativeEvent }) => { const option = options[nativeEvent.index]; if (option) onSelect(option.value); }} style={[styles.picker, compactStyles.picker, allowShrink && styles.pickerShrink, controlWidth === undefined ? null : { width: controlWidth, flexGrow: 0, flexShrink: 0, flexBasis: "auto" }]} />{accessory ?? null}</View>;
+  return <View style={[styles.formRow, compactStyles.formRow]}><Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }]}>{label}</Text><NativePicker labels={options.map((option) => option.label)} selectedValue={selectedLabel} disabled={disabled} accessibilityLabel={label} onChange={({ nativeEvent }) => { const option = options[nativeEvent.index]; if (option) onSelect(option.value); }} style={[controlWidth === undefined ? styles.picker : styles.pickerFixed, compactStyles.picker, allowShrink && styles.pickerShrink, controlWidth === undefined ? null : { width: controlWidth }]} />{accessory ?? null}</View>;
 }
 
 function RawEditor({ label, domain, document, language, ipc, translate, showLabel = true, showDiff = true, codexPane = false, onConflict, onDirtyChange, deferStage = false, reloadToken = 0, baselineToken = 0, syncRevision, style }: { label: string; domain: AssistantSettingsDomain; document: RawEditorDocument; language: "toml" | "json" | "yaml"; ipc: IpcClient; translate: Translate; showLabel?: boolean; showDiff?: boolean; codexPane?: boolean; onConflict: RawEditorConflictHandler; onDirtyChange?: (dirty: boolean) => void; deferStage?: boolean; reloadToken?: number; baselineToken?: number; syncRevision?: number; style?: StyleProp<ViewStyle> }): React.JSX.Element {
@@ -14341,6 +14755,39 @@ function apiKeyDisplayName(value: unknown, translate: Translate): string {
   if (!name) return translate("common.notAvailable");
   return name === "default" ? translate("providers.defaultKey") : name;
 }
+/** The spelling one import files: lower case unless the user kept the roster's own. */
+type ImportNameCase = "lower" | "original";
+
+/** How many names one case question states before it stops listing them. */
+const IMPORT_NAME_CASE_SAMPLE = 3;
+
+/**
+ * Ask one import which spelling it files, when there is a spelling to decide.
+ *
+ * A roster label with upper case in it is a choice, not a rule: filed as lower
+ * case, a client types one spelling; kept as the catalog states it, the station's
+ * own name is what reaches the client.  Core files every row of the import under
+ * the answer (`public_names.imported_public_name`), so this asks once for the
+ * whole pick and never per row.  A roster that is already lower case is not a
+ * question with two answers, and asks nothing.
+ */
+async function importNameCaseAnswer(native: NativeLeafAdapter, translate: Translate, names: readonly string[]): Promise<ImportNameCase> {
+  if (!importNeedsNameCase(names)) return "lower";
+  const spelled = names
+    .map((name) => name.trim())
+    .filter((name, index, all) => Boolean(name) && name !== name.toLowerCase() && all.indexOf(name) === index);
+  const shown = spelled.slice(0, IMPORT_NAME_CASE_SAMPLE).join(translate("providers.orderListSeparator"));
+  const lower = await native.showConfirmation({
+    title: translate("providers.importNameCaseTitle"),
+    message: translate("providers.importNameCaseMessage", {
+      count: String(spelled.length),
+      names: spelled.length > IMPORT_NAME_CASE_SAMPLE ? `${shown}…` : shown,
+    }),
+    confirmLabel: translate("providers.importNameCaseLower"),
+    cancelLabel: translate("providers.importNameCaseOriginal"),
+  });
+  return lower ? "lower" : "original";
+}
 // A placeholder name every entry starts under until the user replaces it: a
 // name already in use gets the next free numeric suffix ("新建供应商2").
 function uniquePlaceholderName(existing: string[], base: string): string {
@@ -14572,7 +15019,24 @@ const styles = StyleSheet.create({
   // inspector.  Past the width the desktop window opens at, the frame stops
   // growing and centres on the page: the page is one window, and this is the
   // widest one this layout has proportions for.
-  webShellFrame: { width: "100%", maxWidth: 1280, alignSelf: "center" },
+  //
+  // The frame is a window, so it is drawn as one: a 1 pt edge and a shadow.
+  // Without them this host had no edge at all — the frame's own fill and the
+  // page's backdrop were both `windowBackgroundColor`, a 4/255 difference, so
+  // the app ended in the middle of the page with nothing to mark where.  The
+  // border is the line the native hosts get from their window server.
+  webShellFrame: {
+    width: "100%",
+    maxWidth: 1280,
+    alignSelf: "center",
+    borderWidth: 1,
+    borderColor: "#b8b8c0",
+    overflow: "hidden",
+    shadowColor: "#000000",
+    shadowOpacity: 0.18,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 6 },
+  },
   // The window's chrome is one L: the title bar and the sidebar draw the
   // border's own colour, so the two read as a single surface whose only edges
   // are the ones the content keeps.  A header rule would cut that surface in
@@ -14660,12 +15124,19 @@ const styles = StyleSheet.create({
   // points below it, and the sections under it keep the left column's row pitch.
   providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 12 }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, routeTableMeasure: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerListPane: { width: 120, minWidth: 120, maxWidth: 120, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 24, width: 24, minHeight: 24, height: 24, alignItems: "center", justifyContent: "center" }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, modelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 320, minWidth: 260, maxWidth: 360, flexGrow: 0, flexShrink: 1 }, providerEditorContent: { flex: 1, minHeight: 0 }, providerEditorScrollContent: { paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }, persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }, persistentScrollHost: { position: "relative", flex: 1, minHeight: 0 }, persistentScrollFill: { flex: 1, minHeight: 0 }, persistentScrollThumb: { position: "absolute", top: 2, right: 2, width: 4, borderRadius: 2, backgroundColor: "rgba(96,96,96,0.55)" }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, // A link is also a cursor: the row shows the pointing hand over the whole
 // finding, label included, exactly like every native link in the app.
-inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspectorProbeFindingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textDecorationLine: "underline" }, inspectorEnableControl: { flexShrink: 0 }, routeEditorRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, // The field sits *in* the row beside its switch, so it must not claim the
-  // whole of it: a TextField's own formRow is `width: "100%"`, and inheriting
-  // that pushed 跟随倍率 78 pt past the inspector's right edge, where it was
-  // clipped and could not be clicked.  Its width is its label column plus its
-  // own control column, both fixed.
-  routeEditorField: { width: "auto", flexGrow: 0, flexShrink: 0 }, routeFollowControl: { flexShrink: 0 }, routeFollowHelp: { marginLeft: -8, flexShrink: 0 }, modelWindowValue: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, modelWindowText: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, modelWindowLink: { flexShrink: 0 }, protocolSettings: { gap: 4 }, helpTipAnchor: { position: "relative", zIndex: 2 }, helpTipDismiss: { position: "absolute", left: -2400, right: -2400, top: -2400, bottom: -2400 }, helpTipButton: { width: 22, height: 22, minWidth: 22, minHeight: 22, marginHorizontal: -3, marginVertical: -3 }, helpTipPopupLeft: { position: "absolute", left: 0, bottom: 25, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipPopup: { position: "absolute", right: 0, bottom: 25, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
+inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspectorProbeFindingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textDecorationLine: "underline" }, inspectorEnableControl: { flexShrink: 0 }, // A switch follows a number field, not a label: the row's own gap is the
+  // label-to-control seam, and at 2 pt the bezel and the box touched.  Six
+  // more points separate them, and the mark keeps only the row's gap (see
+  // routeFollowHelp), so 跟随全局's mark and the protocol picker's mark below
+  // stand off their control by the same distance.
+  routeFollowControl: { flexShrink: 0, marginLeft: 6 }, // The mark keeps the row's gap, and gives back the one thing that gap
+  // measures differently here: an AppKit checkbox lays its title out 4.5 pt inside
+  // its own frame's trailing edge (measured; the page's checkbox has no such
+  // chrome), so that gap left the ring 10 pt from 跟随全局's last character while
+  // the protocol picker's mark below stood 7 pt from its pill.  Three of those
+  // points are taken back — the amount that puts both rings the same distance
+  // from their control's ink on this host.
+  routeFollowHelp: { flexShrink: 0, marginLeft: Platform.OS === "macos" ? -3 : 0 }, modelWindowValue: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }, modelWindowText: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE }, modelWindowLink: { flexShrink: 0 }, protocolSettings: { gap: 4 }, helpTipAnchor: { position: "relative", zIndex: 2 }, helpTipDismiss: { position: "absolute", left: -2400, right: -2400, top: -2400, bottom: -2400 }, helpTipButton: { width: 22, height: 22, minWidth: 22, minHeight: 22, marginVertical: -3 }, helpTipPopupLeft: { position: "absolute", left: 0, bottom: 25, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipPopup: { position: "absolute", right: 0, bottom: 25, width: 208, zIndex: 4, paddingHorizontal: 8, paddingVertical: 6, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 6, backgroundColor: systemColors.control, shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 8, shadowOffset: { width: 0, height: 2 } }, helpTipText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
   externalSettingsWorkspace: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 8 }, externalSettingsFieldList: { ...SETTINGS_FIELD_LIST },
   // One rail entry can carry two apps, so each app's block keeps the grid's
   // rhythm but not the grid: a title, then that app's own fields and files.
@@ -14752,7 +15223,13 @@ externalSettingsField: { ...SETTINGS_FIELD }, externalSettingsInputRow: { ...SET
   nativeSecretMultilineControl: { alignItems: "flex-start", minHeight: 108 },
   nativeSecretTextArea: { minHeight: 108, height: 108, alignSelf: "stretch" },
   secretActionButton: { width: 64, minWidth: 64, height: 26, flexShrink: 0 },
-  formRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, formRowStacked: { alignItems: "flex-start" }, formRowSecretStacked: { alignItems: "flex-start" }, formRowLabel: { width: 112, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, formRowLabelStacked: { paddingTop: 4 }, formRowControl: { flex: 1, minWidth: 0, gap: 3 }, picker: { flex: 1, minWidth: 180, height: 26 }, pickerShrink: { minWidth: 0 },
+  formRow: { width: "100%", minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6 }, formRowStacked: { alignItems: "flex-start" }, formRowSecretStacked: { alignItems: "flex-start" }, formRowLabel: { width: 112, flexShrink: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, textAlign: "left" }, formRowLabelStacked: { paddingTop: 4 }, formRowControl: { flex: 1, minWidth: 0, gap: 3 }, // A caller that fixes a width states the whole of it: the row's own width is not a
+  // suggestion.  It is the same box without `flex`, because a style array that overrides
+  // `flex: 1` with flexGrow/flexShrink/flexBasis carries *both* into the host, and the
+  // hosts disagreed about which wins — Yoga kept the basis `flex: 1` wrote (0), so the
+  // 64 pt field drew 2 pt wide, while the page honoured the width.  One property, one
+  // answer: no `flex` at all, and `width` is the size.
+  formRowControlFixed: { minWidth: 0, gap: 3 }, picker: { flex: 1, minWidth: 180, height: 26 }, pickerFixed: { minWidth: 0, height: 26 }, pickerShrink: { minWidth: 0 },
 });
 
 /**

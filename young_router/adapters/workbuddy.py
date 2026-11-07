@@ -69,6 +69,16 @@ WORKBUDDY_DISPLAY_NAMES = {
     WORKBUDDY_PROVIDER: "WorkBuddy",
     WORKBUDDY_GLOBAL_PROVIDER: "WorkBuddy Global",
 }
+
+# The product-neutral spelling of the same facts.  A domain that projects more
+# than one managed account integration reads these names, so a second
+# integration does not have to teach every caller its product prefix.
+AUTH_KINDS = WORKBUDDY_AUTH_KINDS
+DISPLAY_NAMES = WORKBUDDY_DISPLAY_NAMES
+PROVIDERS = WORKBUDDY_PROVIDERS
+# The operation name this integration's catalog read answers under.  A caller
+# that routes by module reads it here rather than spelling the product.
+MODELS_OPERATION = "workbuddy_models"
 # Variable names the managed proxy resolves for each region.  They are
 # process-local names, never credentials: the token itself lives only in this
 # Core process and in the worker's command line.

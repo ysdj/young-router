@@ -16,7 +16,7 @@
  */
 
 import React from "react";
-import { Platform, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Platform, ScrollView, StyleProp, StyleSheet, Text, View, ViewStyle } from "react-native";
 import { NativeButton, NativeCheckbox, NativeTextField, WINDOWS_CONTROL } from "./NativeControls";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 import { pushPresentation } from "../platform/presentationStack";
@@ -32,6 +32,11 @@ import {
 const COLOR = {
   surface: WINDOWS_CONTROL.fill,
   header: WINDOWS_CONTROL.fillSolid,
+  // A card is not a control: the bezel of a button (#d1d1d1) is meant to sit on
+  // a pane, and a white card carrying that bezel over a dimmed white page is a
+  // colour block with no outline.  The edge of a floating surface is stated
+  // with the stroke the child layers use.
+  edge: "#a9a9b0",
   stroke: WINDOWS_CONTROL.stroke,
   rule: WINDOWS_CONTROL.strokeSubtle,
   text: WINDOWS_CONTROL.text,
@@ -65,9 +70,9 @@ export function HostChromeHost(): React.JSX.Element | null {
 }
 
 /** The frame every dialog shares: scrim, card, title, body, footer. */
-function DialogFrame({ title, children, footer }: { title: string; children: React.ReactNode; footer: React.ReactNode }): React.JSX.Element {
+function DialogFrame({ title, children, footer, cardStyle }: { title: string; children: React.ReactNode; footer: React.ReactNode; cardStyle?: StyleProp<ViewStyle> }): React.JSX.Element {
   return <View style={styles.scrim} {...({ role: "dialog", "aria-modal": true, "aria-label": title } as object)}>
-    <View style={styles.card}>
+    <View style={[styles.card, cardStyle]}>
       <Text style={styles.cardTitle}>{title}</Text>
       {children}
       <View style={styles.footer}>{footer}</View>
@@ -131,30 +136,91 @@ function ViewerSurface({ request }: { request: Extract<HostChromeRequest, { kind
   </View>;
 }
 
+/**
+ * The model chooser: the one surface whose job is to pick several things out of
+ * a list that is longer than the window.
+ *
+ * The two native hosts build it as a panel with a heading, the provider and key
+ * it is choosing for, a search field that focuses itself, 全选 and 反选 over the
+ * rows the filter left, and a count that says both how many there are and how
+ * many are ticked.  This host drew the checkboxes and a footer, so a station
+ * that offers ninety models could only be searched by scrolling — the same
+ * window, missing the two controls a list of ninety needs.
+ *
+ * The filter matches the way the AppKit list does: case- and width-folded
+ * substring, so a search for `flash` finds `GLM-5.3-FLASH-FREE`.
+ */
 function PickerSurface({ request }: { request: Extract<HostChromeRequest, { kind: "picker" }> }): React.JSX.Element {
-  const [selected, setSelected] = React.useState<string[]>(request.models);
+  const labels = request.labels;
+  // Nothing is ticked when the chooser opens.  This host used to open with the
+  // whole list selected, so 添加已选模型 added every model a station offered
+  // without anyone ticking one — and the count read "已选 12 个" beside a search
+  // that had found three.  Both native hosts open at zero and keep Add disabled
+  // until a row is ticked.
+  const [selected, setSelected] = React.useState<string[]>([]);
+  const [query, setQuery] = React.useState("");
+  const folded = React.useMemo(() => request.models.map((model) => ({ model, key: model.normalize("NFKC").toLocaleLowerCase() })), [request.models]);
+  const needle = query.trim().normalize("NFKC").toLocaleLowerCase();
+  const visible = needle === "" ? request.models : folded.filter((entry) => entry.key.includes(needle)).map((entry) => entry.model);
   const toggle = (model: string, on: boolean): void => {
     setSelected((current) => on
       ? (current.includes(model) ? current : [...current, model])
       : current.filter((entry) => entry !== model));
   };
+  // 全选 and 反选 act on the rows the filter left, exactly as 全选当前可见模型
+  // says: ticking ninety models nobody can see is not what the button promises.
+  const selectAllVisible = (): void => setSelected((current) => [...current, ...visible.filter((model) => !current.includes(model))]);
+  const invertVisible = (): void => setSelected((current) => {
+    const hidden = current.filter((model) => !visible.includes(model));
+    return [...hidden, ...visible.filter((model) => !current.includes(model))];
+  });
+  const count = (template: string, values: Record<string, string>): string => Object.entries(values).reduce((text, [name, value]) => text.split(`{${name}}`).join(value), template);
+  const summary = (needle === ""
+    ? count(labels.count, { count: String(request.models.length) })
+    : count(labels.countFiltered, { visible: String(visible.length), total: String(request.models.length) }))
+    + (selected.length > 0 ? `  |  ${count(labels.countSelected, { count: String(selected.length) })}` : "");
   return <DialogFrame
     title={request.title}
+    cardStyle={styles.pickerCard}
     footer={<>
-      <Text numberOfLines={1} style={styles.footerStatus}>{`${request.providerName} · ${request.keyName}`}</Text>
+      {/* The provider and key are stated once, in the head: the footer stated
+          them again in a second notation two lines below. */}
+      <View style={styles.footerSpacer} />
       <NativeButton title={request.cancelLabel} compact onPress={() => settleHostChrome(request, undefined)} />
       {/* Both native hosts disable their Add button until something is
           selected; an enabled one here would hand back an empty list. */}
       <NativeButton title={request.confirmLabel} compact primary disabled={selected.length === 0} onPress={() => settleHostChrome(request, selected)} />
     </>}
   >
-    <ScrollView style={styles.cardBody} contentContainerStyle={styles.pickerBody}>
-      {request.models.map((model) => <NativeCheckbox
-        key={model}
-        label={model}
-        value={selected.includes(model)}
-        onValueChange={(on) => toggle(model, on)}
-      />)}
+    <View style={styles.pickerHead}>
+      {/* The card's own title row is the heading: a native chooser states it in
+          the window's title bar and again inside the window, and a card with no
+          window chrome that repeats it draws the same words twice. */}
+      <Text numberOfLines={1} style={styles.pickerSubtitle}>{`${labels.providerLabel}: ${request.providerName}    ${labels.keyLabel}: ${request.keyName}`}</Text>
+      <NativeTextField
+        value={query}
+        autoFocus
+        onChangeText={setQuery}
+        placeholder={labels.search}
+        accessibilityLabel={labels.search}
+        style={styles.pickerSearch}
+      />
+      <View style={styles.pickerControls}>
+        <NativeButton title={labels.selectAll} compact toolTip={labels.selectAllToolTip} disabled={visible.length === 0} onPress={selectAllVisible} />
+        <NativeButton title={labels.invert} compact toolTip={labels.invertToolTip} disabled={visible.length === 0} onPress={invertVisible} />
+        <View style={styles.footerSpacer} />
+        <Text numberOfLines={1} style={styles.pickerCount}>{summary}</Text>
+      </View>
+    </View>
+    <ScrollView style={[styles.cardBody, styles.pickerList]} contentContainerStyle={styles.pickerBody}>
+      {visible.length === 0
+        ? <Text style={styles.pickerEmpty}>{request.models.length === 0 ? labels.empty : labels.noMatches}</Text>
+        : visible.map((model) => <NativeCheckbox
+          key={model}
+          label={model}
+          value={selected.includes(model)}
+          onValueChange={(on) => toggle(model, on)}
+        />)}
     </ScrollView>
   </DialogFrame>;
 }
@@ -197,8 +263,15 @@ const styles = StyleSheet.create({
     maxHeight: "90%",
     borderRadius: 8,
     borderWidth: 1,
-    borderColor: COLOR.stroke,
+    borderColor: COLOR.edge,
     backgroundColor: COLOR.surface,
+    // The card is the same white as the panes it covers, so the stroke and the
+    // shadow together are what say the card is a surface in front, not another
+    // pane.
+    shadowColor: "#000000",
+    shadowOpacity: 0.34,
+    shadowRadius: 22,
+    shadowOffset: { width: 0, height: 12 },
     overflow: "hidden",
   },
   cardTitle: {
@@ -210,6 +283,9 @@ const styles = StyleSheet.create({
     fontWeight: "600",
   },
   cardBody: { maxHeight: 320 },
+  // The chooser's list is the surface: 480 pt is the height the AppKit panel
+  // gives it, and a heading, a search field and two buttons sit above it.
+  pickerList: { maxHeight: 480 },
   cardBodyContent: { paddingHorizontal: 16, paddingBottom: 12, gap: 8 },
   bodyText: { color: COLOR.text, fontSize: UI_FONT_SIZE, lineHeight: 19 },
   footer: {
@@ -225,6 +301,17 @@ const styles = StyleSheet.create({
   footerSpacer: { flex: 1 },
   footerStatus: { flex: 1, minWidth: 0, color: COLOR.secondary, fontSize: UI_TIP_FONT_SIZE },
   promptField: { minHeight: 26 },
+  // A chooser holds names, not a sentence: the native panel is 620 pt wide
+  // because a model id is read in full.  Its head states the provider and key
+  // it is choosing for, and the count sits on the controls' baseline at the
+  // trailing edge, as it does there.
+  pickerCard: { width: 620 },
+  pickerHead: { paddingHorizontal: 16, paddingTop: 2, paddingBottom: 8, gap: 6 },
+  pickerSubtitle: { color: COLOR.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
+  pickerSearch: { minHeight: 26 },
+  pickerControls: { flexDirection: "row", alignItems: "center", gap: 8 },
+  pickerCount: { color: COLOR.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16, flexShrink: 0 },
+  pickerEmpty: { color: COLOR.secondary, fontSize: UI_FONT_SIZE, lineHeight: 19, paddingVertical: 6 },
   pickerBody: { paddingHorizontal: 16, paddingBottom: 10, gap: 2 },
   viewerCard: {
     width: 920,
@@ -233,7 +320,7 @@ const styles = StyleSheet.create({
     maxHeight: "100%",
     borderRadius: 8,
     borderWidth: 1,
-    borderColor: COLOR.stroke,
+    borderColor: COLOR.edge,
     backgroundColor: COLOR.surface,
     overflow: "hidden",
   },
