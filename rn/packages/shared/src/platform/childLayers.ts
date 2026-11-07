@@ -234,7 +234,3 @@ export function dismissChildLayer(route: string): boolean {
   layer.close();
   return true;
 }
-
-export function hasChildLayer(route: string): boolean {
-  return layers.has(route);
-}

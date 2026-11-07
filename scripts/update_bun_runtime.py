@@ -41,7 +41,6 @@ from update_common import (
     UpdateError,
     download_bytes,
     package_metadata,
-    request_json,
 )
 
 

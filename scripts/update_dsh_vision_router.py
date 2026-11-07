@@ -41,7 +41,6 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from update_common import (
-    PACKAGE_VERSION_PATTERN,
     UpdateError,
     find_package_manager,
     flatten_npm_package,

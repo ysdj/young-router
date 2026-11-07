@@ -57,8 +57,3 @@ export function pushPresentation(presentation: Presentation): () => void {
     if (index >= 0) stack.splice(index, 1);
   };
 }
-
-/** Whether `presentation` is the layer Escape and Tab belong to right now. */
-export function isTopPresentation(presentation: Presentation): boolean {
-  return stack[stack.length - 1] === presentation;
-}

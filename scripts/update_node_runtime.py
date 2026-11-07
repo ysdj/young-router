@@ -154,7 +154,6 @@ def _install_node(node_output: Path, *, source: str | None, index_url: str, arch
             return "copied"
         version = "copied"
     else:
-        marker = node_output / "NODE_VERSION"
         try:
             version, filename, executable = _node_release(index_url)
         except UpdateError:
