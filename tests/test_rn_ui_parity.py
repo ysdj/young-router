@@ -4387,7 +4387,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'hintKey: "clients.claudeFilesHint"',
             "const claudeApps:",
             "const claudeLocalApiActive = claudeApps.every(",
-            'for (const { app } of claudeApps) await onClaudeUseLocalApi(app, selection);',
+            # The fan-out is stated once for both controls: a switch that reads
+            # "on" only when every app is on has to write to every app.
+            "const forEveryClaudeApp = async (",
+            'for (const { app } of claudeApps) await action(app, selection);',
+            "onUseLocalApi={(selection) => forEveryClaudeApp(onClaudeUseLocalApi, selection)}",
+            "onUseSavedModel={(selection) => forEveryClaudeApp(onClaudeUseSavedModel, selection)}",
             # Every Claude app's files under those controls.
             'files={claudeFiles}',
             "function FileEditorWorkspace",

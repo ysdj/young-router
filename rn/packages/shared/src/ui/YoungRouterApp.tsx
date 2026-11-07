@@ -9604,6 +9604,15 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
     ? [{ app: "claudeCode", state: claudeCode }, { app: "claudeDesktop", state: claudeDesktop }]
     : [{ app: "claudeCode", state: claudeCode }];
   const claudeLocalApiActive = claudeApps.every(({ state }) => booleanValue(state.uses_local_api));
+  // Both controls that point a client somewhere drive the whole pair, so the
+  // fan-out is stated once: a switch that reads "on" only when every app is on
+  // must write to every app when it moves.
+  const forEveryClaudeApp = async (
+    action: (app: ClaudeClientApp, selection: UnknownRecord) => Promise<void>,
+    selection: UnknownRecord,
+  ): Promise<void> => {
+    for (const { app } of claudeApps) await action(app, selection);
+  };
   const claudeRoute = asRecord(claudeCode.designated_route ?? claudeDesktop.designated_route);
   const claudeModelListEnabled = booleanValue(claudeCode.model_list_enabled);
   // A file this app generates only stays the user's while its own switch is
@@ -9735,12 +9744,8 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
             modelListHint={translate("claude.modelListHint")}
             busy={busy || !claudeDesktopAvailable}
             onStatus={onStatus}
-            onUseLocalApi={async (selection) => {
-              for (const { app } of claudeApps) await onClaudeUseLocalApi(app, selection);
-            }}
-            onUseSavedModel={async (selection) => {
-              for (const { app } of claudeApps) await onClaudeUseSavedModel(app, selection);
-            }}
+            onUseLocalApi={(selection) => forEveryClaudeApp(onClaudeUseLocalApi, selection)}
+            onUseSavedModel={(selection) => forEveryClaudeApp(onClaudeUseSavedModel, selection)}
             translate={translate}
           />
           <ClientFileRows
