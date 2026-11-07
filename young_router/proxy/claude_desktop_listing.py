@@ -132,6 +132,26 @@ def _declared_context_window(name: str) -> int | None:
         return None
 
 
+#: The Claude Code catalogue entry a route above the client's 200k default
+#: behaves as.  A gateway id is not in that catalogue, so without this the
+#: session resolves the route to its 200k default -- and Claude Desktop, which
+#: writes a ``modelPicker`` row for every discovered entry that states
+#: ``behaves_as``, has nothing to hand the Claude Code it spawns.  Mirrors
+#: ``core.domains.claude._CODE_BEHAVES_AS_1M``: the catalogue has no 500k
+#: entry, so a route at or above 500k borrows the 1M one (whose own maximum is
+#: what the client clamps a stated window to) and a route below it states
+#: nothing, which is the same 200k bucket the default entry carries.
+_BEHAVES_AS_ONE_MILLION: Final = "claude-opus-5-5"
+
+
+def _behaves_as(published: object) -> str | None:
+    """The catalogue entry this much window needs, or ``None`` below 500k."""
+
+    if isinstance(published, int) and not isinstance(published, bool) and published >= 500_000:
+        return _BEHAVES_AS_ONE_MILLION
+    return None
+
+
 def _published_context(
     public_id: str,
     row: Mapping[str, object],
@@ -213,6 +233,7 @@ def desktop_model_rows(
             continue
         display_name = row.get("display_name") or names.get(public_id) or public_id
         published = _published_context(public_id, row, window_for, declared_for)
+        behaves = _behaves_as(published)
         # Claude Desktop's 1M row is a name before it is a number: an id
         # carrying its own ``[1m]`` suffix is read at 1M by the session, and a
         # suffixed id is not a row that "offers 1M" to the picker, so no second
@@ -239,6 +260,10 @@ def desktop_model_rows(
                 # user's own declaration (see ``_published_context``).
                 "max_input_tokens": published,
                 "max_tokens": row.get("max_tokens"),
+                # Stated so the desktop app can write the ``modelPicker`` row
+                # its Claude Code reads; a route this app cannot size states
+                # nothing and keeps the client's own default.
+                **({"behaves_as": behaves} if behaves else {}),
             }
         )
     # The app's generated list was alphabetical by the name the picker shows,

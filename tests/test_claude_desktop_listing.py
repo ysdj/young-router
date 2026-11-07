@@ -182,6 +182,27 @@ class ClaudeDesktopRowsTests(unittest.TestCase):
         self.assertEqual(f"{claude_desktop_alias('kimi-k3.1-pro')}[1m]", rows[0]["id"])
         self.assertEqual("kimi-k3.1-pro", resolve_alias(rows[0]["id"], ["kimi-k3.1-pro"]))
 
+    def test_a_route_above_the_client_default_states_the_entry_it_behaves_as(self) -> None:
+        # A gateway id is not in Claude Code's catalogue, so the desktop app has
+        # nothing to give the client it spawns unless the row says which entry
+        # this much window behaves as.  Below 500k the client's own default is
+        # the right bucket and the row says nothing.
+        self.windows["gpt-6.1-sol"] = 500_000
+        self.declared["gpt-6.1-sol"] = 500_000
+        rows = claude_desktop_listing.desktop_model_rows(_response("gpt-6.1-sol"))["data"]
+        self.assertEqual("claude-opus-5-5", rows[0]["behaves_as"])
+
+    def test_a_small_window_states_no_behaviour_target(self) -> None:
+        self.windows["miniMax-m3.1-flash"] = 272_000
+        rows = claude_desktop_listing.desktop_model_rows(_response("miniMax-m3.1-flash"))["data"]
+        self.assertNotIn("behaves_as", rows[0])
+
+    def test_a_claude_shaped_route_keeps_its_own_metadata_only(self) -> None:
+        # A route the app already reads as an Anthropic model is in the
+        # catalogue under its own id; nothing here adds a target to it.
+        rows = claude_desktop_listing.desktop_model_rows(_response("claude-opus-5-5"))["data"]
+        self.assertNotIn("behaves_as", rows[0])
+
     def test_a_window_below_one_million_keeps_the_bare_alias(self) -> None:
         self.windows["gpt-6.1-sol"] = 500_000
         self.declared["gpt-6.1-sol"] = 500_000
