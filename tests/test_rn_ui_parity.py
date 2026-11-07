@@ -4390,6 +4390,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # The fan-out is stated once for both controls: a switch that reads
             # "on" only when every app is on has to write to every app.
             "const forEveryClaudeApp = async (",
+            # The remembered route has to be *absent*, not empty: the shared
+            # switch reads absence as "ask for a route" and an empty record as
+            # "return to a route", so an always-object answer made the Claude
+            # box dispatch an unchosen route where Codex opens the list.
+            "const claudeDesignated = (claudeCode.designated_route ?? claudeDesktop.designated_route) as UnknownRecord | undefined;",
+            "const claudeRoute = claudeDesignated ? asRecord(claudeDesignated) : undefined;",
+            "designatedSelection={claudeRoute}",
             'for (const { app } of claudeApps) await action(app, selection);',
             "onUseLocalApi={(selection) => forEveryClaudeApp(onClaudeUseLocalApi, selection)}",
             "onUseSavedModel={(selection) => forEveryClaudeApp(onClaudeUseSavedModel, selection)}",

@@ -9613,7 +9613,12 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
   ): Promise<void> => {
     for (const { app } of claudeApps) await action(app, selection);
   };
-  const claudeRoute = asRecord(claudeCode.designated_route ?? claudeDesktop.designated_route);
+  // Absent, not empty: the pane reads a remembered route as "off returns here,
+  // silently" and its absence as "off has to ask", so an empty record would
+  // make the switch dispatch a route nobody chose instead of opening the menu
+  // Codex opens.  Both apps remember their own; the pair answers once.
+  const claudeDesignated = (claudeCode.designated_route ?? claudeDesktop.designated_route) as UnknownRecord | undefined;
+  const claudeRoute = claudeDesignated ? asRecord(claudeDesignated) : undefined;
   const claudeModelListEnabled = booleanValue(claudeCode.model_list_enabled);
   // A file this app generates only stays the user's while its own switch is
   // off: with the switch on, Core rewrites that file whenever the list it came
@@ -9738,7 +9743,7 @@ function AssistantSettingsWorkspace({ busy, native, codexModels, codexModelCatal
             models={claudeModels}
             native={native}
             localApiActive={claudeLocalApiActive}
-            designatedRoute={claudeLocalApiActive ? "" : clientRouteLabel(stringValue(claudeRoute.provider), stringValue(claudeRoute.model))}
+            designatedRoute={claudeLocalApiActive || !claudeRoute ? "" : clientRouteLabel(stringValue(claudeRoute.provider), stringValue(claudeRoute.model))}
             designatedSelection={claudeRoute}
             modelList={{ enabled: claudeModelListEnabled, onToggle: (enabled) => onToggleClaudeModelList("claudeCode", enabled) }}
             modelListHint={translate("claude.modelListHint")}
