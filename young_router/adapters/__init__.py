@@ -118,19 +118,6 @@ def rate_provider_id(auth_kind: str) -> str:
     return ""
 
 
-def rate_auth_kind_for_provider_id(provider_id: str) -> str:
-    """The inverse: the auth kind a catalog id belongs to, or ``""``."""
-
-    for module in _managed_modules():
-        mapping = getattr(module, "RATE_AUTH_KIND_TO_PROVIDER", None)
-        if not isinstance(mapping, Mapping):
-            continue
-        for auth_kind, candidate in mapping.items():
-            if isinstance(candidate, str) and candidate.strip() == str(provider_id).strip():
-                return str(auth_kind).strip()
-    return ""
-
-
 def model_rate(entry: object) -> float | None:
     """The rate one catalog entry bills at, or ``None`` when it states none.
 

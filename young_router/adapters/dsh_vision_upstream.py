@@ -41,7 +41,6 @@ _WORKER_FILE_NAME = "dsh_vision_worker.mjs"
 #: The worker answers one line per request; a hung import must not hold a
 #: request open, and the first import loads sharp and the whole peer closure.
 _CALL_TIMEOUT_SECONDS = 20.0
-_STARTUP_TIMEOUT_SECONDS = 20.0
 
 
 class VisionWorkerUnavailable(RuntimeError):

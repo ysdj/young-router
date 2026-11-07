@@ -113,11 +113,8 @@ _DEFAULT_HTTP_PROVIDERS = (
     ("ovh", "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", "Mistral-Small-3.2-24B-Instruct-2506"),
     ("ovh", "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", "Qwen3.5-9B"),
 )
-# The degrade chain above was last reviewed against this upstream release.  It
-# is documentation and a fallback, never the routing source; the staged package
-# is.  Keep the two in step by re-reading the chain here when a release changes
-# it, so a degraded desktop is no further behind than one release.
-MIRRORED_UPSTREAM_VERSION = "3.0.1"
+# The degrade chain above is documentation and a fallback, never the routing
+# source; the staged package is.
 _LOCAL_OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1"
 _LOCAL_OLLAMA_MODEL = "qwen2.5vl"
 _LOCAL_LM_STUDIO_BASE_URL = "http://localhost:1234/v1"

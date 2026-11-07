@@ -97,8 +97,9 @@ OUR_FREE_MODEL_DISPLAY_NAMES = {
     OUR_FREE_MODEL_PROVIDER: f"{OUR_FREE_MODEL_DISPLAY_NAME_BASE} · OpenCode",
     OUR_FREE_MODEL_KILO_PROVIDER: f"{OUR_FREE_MODEL_DISPLAY_NAME_BASE} · Kilo",
 }
-#: The staged upstream package, as its own manifest names it.
-UPSTREAM_PACKAGE_NAME = "dsh-our-free-model"
+#: The key slot this lane's routes name, and the one the pane mirrors as
+#: ``OUR_FREE_MODEL_KEY_NAME``.  The provider list, the pane and the tests all
+#: read this name, so it belongs to the adapter's public surface.
 API_KEY_NAME = "our-free-model-local"
 
 #: The staged upstream tree, named for the package it holds.
@@ -135,10 +136,6 @@ def _lock_file(handle: Any, *, wait: bool) -> bool:
     except OSError:
         return False
     return True
-
-
-def _unlock_file(handle: Any) -> None:
-    _unlock_handle(handle)
 
 
 def _lock_handle(handle: Any, *, wait: bool) -> None:
@@ -442,7 +439,6 @@ class OurFreeModelRuntime:
         self._port = 0
         self._gateway_port = 0
         self._token = ""
-        self._stopping = False
 
     def environment(self, *, autostart: bool = False) -> dict[str, str]:
         if autostart:
@@ -471,7 +467,6 @@ class OurFreeModelRuntime:
         with self._lock:
             if self._process is not None and self._process.poll() is None and self._healthy():
                 return True
-            self._stopping = False
             self._stop()
             source_dir = str(self.settings.get(_SOURCE_STATE, "")).strip()
             if source_dir:
@@ -669,7 +664,6 @@ class OurFreeModelRuntime:
 
     def _stop(self) -> None:
         process = self._process
-        self._stopping = True
         self._process = None
         self._port = 0
         self._gateway_port = 0
@@ -685,7 +679,6 @@ class OurFreeModelRuntime:
         self._stop_process(process)
 
     def _stop_process(self, process: subprocess.Popen[bytes] | None) -> None:
-        self._stopping = True
         if process is not None and process.poll() is None:
             process.kill()
             process.wait(timeout=5)
@@ -748,7 +741,6 @@ class OurFreeModelRuntime:
         # returning all of it made the Kilo rows appear under the anonymous
         # channel's heading, because the picker groups by channel and had no
         # reason to doubt a roster it was handed for that channel.
-        channel = PROVIDER_TO_CHANNEL[provider]
         channels = _channel_membership(document.get("channels"))
         models = [
             dict(entry)
