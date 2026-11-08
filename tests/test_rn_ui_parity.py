@@ -2765,8 +2765,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('symbol="power-off"', self.ui)
         self.assertIn('translate("status.signOut")', self.ui)
         # The pane's staged edit is committed the same way leaving it commits
-        # it, before the session ends: signing out is leaving this page.
-        self.assertIn('await flushActivePane.current?.("navigate");', self.ui)
+        # it, before the session ends: signing out is leaving this page.  The
+        # commit is offered with a deadline, because a pane waiting on a Core
+        # that is applying is exactly when this is pressed and a way out that
+        # hangs on the way out is no button at all.
+        self.assertIn('await Promise.race([\n          flushActivePane.current?.("navigate") ?? Promise.resolve(true),', self.ui)
+        self.assertIn("setTimeout(() => resolve(false), SIGN_OUT_FLUSH_MS)", self.ui)
+        self.assertIn("const SIGN_OUT_FLUSH_MS = 1_200;", self.ui)
         self.assertIn('await native.signOutWebSession?.();', self.ui)
         # Both layouts draw it, and both in the title band's trailing corner:
         # the wide one at the end of the pane header, the one-column one at the

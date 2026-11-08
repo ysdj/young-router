@@ -65,6 +65,15 @@ export type BrowserCoreTransport = {
  * reached under any other name is published, which is where the key is typed
  * and therefore the only place 退出登录 has something to end.
  */
+/**
+ * How long 退出登录 waits for Core to answer before it reloads anyway.
+ *
+ * Long enough for a busy Core to end the lease, short enough that the person
+ * who pressed it sees the page change instead of wondering whether the press
+ * landed.
+ */
+const SIGN_OUT_TIMEOUT_MS = 2500;
+
 function isOwnerPage(): boolean {
   if (typeof window === "undefined") return false;
   const name = (window.location.hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
@@ -244,19 +253,31 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
    * a session, which is exactly the work signing out must not do.  A failure is
    * not a reason to stay: a Core that cannot answer is not a page that is still
    * signed in.
+   *
+   * The wait for that answer is bounded.  An `await` with no deadline is a
+   * button that does nothing: measured on lv, pressing 退出登录 while Core was
+   * rolling the proxy out left the request pending, so the reload behind it
+   * never ran and the page sat there still showing the session.  A Core that
+   * has not answered in a couple of seconds still has the cookie cleared on the
+   * next request it serves, and the gate the reload draws is the answer either
+   * way.
    */
   const signOut = async (): Promise<void> => {
+    const deadline = typeof AbortController === "function" ? new AbortController() : undefined;
+    const timer = deadline ? setTimeout(() => deadline.abort(), SIGN_OUT_TIMEOUT_MS) : undefined;
     try {
       await fetch(`${transport.baseURL}/ipc/web/logout`, {
         method: "POST",
         body: "{}",
         credentials: "include",
         cache: "no-store",
+        signal: deadline?.signal,
         headers: { "Content-Type": "application/json" },
       });
     } catch {
       // The reload below is the honest answer either way.
     } finally {
+      if (timer !== undefined) clearTimeout(timer);
       window.location.reload();
     }
   };

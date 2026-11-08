@@ -351,6 +351,15 @@ function providerService(provider: UnknownRecord | undefined): ServiceID | undef
  * painted model.
  */
 const SERVICE_RATE_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * How long 退出登录 gives the pane to commit before leaving anyway.
+ *
+ * A pane's flush can be waiting on a Core that is applying, which is exactly
+ * when a person presses this; a way out that hangs on the way out is the same as
+ * no button at all.
+ */
+const SIGN_OUT_FLUSH_MS = 1_200;
 const serviceRates = new Map<string, { at: number; catalog: UnknownRecord[]; rates: Record<string, string> }>();
 
 function peekServiceRate(service: ServiceID | undefined, modelID: string): string | undefined {
@@ -2317,7 +2326,14 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
     signingOut.current = true;
     void (async () => {
       try {
-        await flushActivePane.current?.("navigate");
+        // The commit is offered, not waited on forever.  A pane whose flush is
+        // stuck on a Core that is busy applying is exactly the moment a person
+        // presses this, and a way out that hangs on the way out is the same as
+        // no button at all.
+        await Promise.race([
+          flushActivePane.current?.("navigate") ?? Promise.resolve(true),
+          new Promise<boolean>((resolve) => setTimeout(() => resolve(false), SIGN_OUT_FLUSH_MS)),
+        ]);
       } catch {
         // Whatever the pane could not commit is the pane's own failure to
         // report; a person who asked to leave still leaves.
