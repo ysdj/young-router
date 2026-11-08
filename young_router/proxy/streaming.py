@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import base64
+import copy
 import re
+import time
+import uuid
 from typing import Callable
 
 from . import codex_fast_tier as _codex_fast_tier_module
@@ -458,7 +461,136 @@ def _payload_invalid_function_call_reason(payload: Any) -> Optional[str]:
                     return "function call arguments are not a valid JSON object"
     return None
 
+_ANNOUNCED_RESPONSE_ID_KEY = "_young_router_announced_response_id"
+_ANNOUNCED_FRAMES_SENT_KEY = "_young_router_announced_frames_sent"
+
+# The two frames that say "this turn exists" and carry no content of their own.
+_RESPONSE_OPENING_FRAME_TYPES = frozenset(
+    {"response.created", "response.in_progress"}
+)
+
+
+def _announced_response_id(request_data: Optional[dict]) -> Optional[str]:
+    """The id this proxy already gave the client, if it has spoken."""
+
+    if not isinstance(request_data, dict):
+        return None
+    value = request_data.get(_ANNOUNCED_RESPONSE_ID_KEY)
+    return value if isinstance(value, str) and value else None
+
+
+def _announce_response_id(request_data: dict) -> str:
+    """Mint the id this turn is announced under, once per request."""
+
+    existing = _announced_response_id(request_data)
+    if existing is not None:
+        return existing
+    minted = "resp_" + uuid.uuid4().hex
+    request_data[_ANNOUNCED_RESPONSE_ID_KEY] = minted
+    return minted
+
+
+def _response_opening_events(
+    request_data: dict,
+    completion_state: Any,
+) -> list[Any]:
+    """The frames that open a Responses turn before the upstream has spoken.
+
+    A Responses client's clock starts at ``response.created``.  On this router
+    that frame cannot come from the upstream: the routes serving these models
+    answer on the Chat wire, where the first thing LiteLLM yields is the first
+    token.  Measured on the live host, the upstream wrote its own
+    ``response.created`` 230 ms in while the client still held nothing at
+    900-1300 ms; the official endpoint opens the same turn at 170 ms.
+
+    So the proxy opens it, on the route it has already chosen, and keeps the
+    id: every later frame is rewritten to it, so the client sees one turn with
+    one id no matter which deployment ends up answering.
+    """
+
+    announced_id = _announce_response_id(request_data)
+    model = (
+        request_data.get("model")
+        if isinstance(request_data.get("model"), str)
+        else None
+    )
+    payload: dict[str, Any] = {
+        "id": announced_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "in_progress",
+        "output": [],
+    }
+    if model:
+        payload["model"] = model
+    if not isinstance(getattr(completion_state, "created_response", None), dict):
+        completion_state.created_response = copy.deepcopy(payload)
+    _trace_module._request_route_trace(
+        "responses_response_announced_before_upstream",
+        request_data,
+        response_id=announced_id,
+        model=model,
+    )
+    return [
+        _json_stream_event({"type": "response.created", "response": payload}),
+        _json_stream_event({"type": "response.in_progress", "response": payload}),
+    ]
+
+
+def _align_announced_response_identity(
+    delivered: Any,
+    request_data: Optional[dict] = None,
+) -> Any:
+    """Keep every frame of a turn under the id the client was told about."""
+
+    announced_id = _announced_response_id(request_data)
+    if announced_id is None or delivered is None:
+        return delivered
+    if not _request_is_responses_stream(request_data):
+        return delivered
+    if not isinstance(delivered, dict):
+        return delivered
+    frame_type = _stream_chunk_type(delivered)
+    response = delivered.get("response")
+    response_id = response.get("id") if isinstance(response, dict) else None
+    if frame_type in _RESPONSE_OPENING_FRAME_TYPES and response_id != announced_id:
+        # The turn is already open under our id.  A second opening carrying the
+        # upstream's id would give the client two ids for one turn.
+        return None
+    if isinstance(response, dict) and response_id != announced_id:
+        rewritten = dict(delivered)
+        response = dict(response)
+        response["id"] = announced_id
+        rewritten["response"] = response
+        return type(delivered)(rewritten) if type(delivered) is not dict else rewritten
+    return delivered
+
+
+def _delivered_frames(
+    chunks: Any,
+    request_data: Optional[dict] = None,
+):
+    """Deliver each frame, skipping the ones this router decides not to send."""
+
+    for chunk in chunks:
+        delivered = _responses_stream_chunk_for_delivery(chunk, request_data)
+        if delivered is not None:
+            yield delivered
+
+
 def _responses_stream_chunk_for_delivery(
+    chunk: Any,
+    request_data: Optional[dict] = None,
+) -> Any:
+    """Adapt one chunk, then keep it under the id the client was given."""
+
+    return _align_announced_response_identity(
+        _responses_stream_chunk_adapted_for_delivery(chunk, request_data),
+        request_data,
+    )
+
+
+def _responses_stream_chunk_adapted_for_delivery(
     chunk: Any,
     request_data: Optional[dict] = None,
 ) -> Any:
@@ -4992,8 +5124,8 @@ async def _yield_validated_structured_codex_compaction_stream(
 
     for chunk in buffer:
         if remember(chunk) is not None:
-            for event in events:
-                yield _responses_stream_chunk_for_delivery(event, request_data)
+            for delivered_frame in _delivered_frames(events, request_data):
+                yield delivered_frame
             await _close_async_iterator_safely(response)
             return
 
@@ -5005,8 +5137,8 @@ async def _yield_validated_structured_codex_compaction_stream(
             initial_chunk_count=len(buffer),
         ):
             if remember(chunk) is not None:
-                for event in events:
-                    yield _responses_stream_chunk_for_delivery(event, request_data)
+                for delivered_frame in _delivered_frames(events, request_data):
+                    yield delivered_frame
                 await _close_async_iterator_safely(response)
                 return
     except Exception as exception:
@@ -5018,8 +5150,8 @@ async def _yield_validated_structured_codex_compaction_stream(
         )
         if completed_compat is None:
             raise
-        for event in events:
-            yield _responses_stream_chunk_for_delivery(event, request_data)
+        for delivered_frame in _delivered_frames(events, request_data):
+            yield delivered_frame
         yield completed_compat
         await _close_async_iterator_safely(response)
         return
@@ -5030,8 +5162,8 @@ async def _yield_validated_structured_codex_compaction_stream(
         reason="clean_eof_after_completed_compaction_item",
     )
     if completed_compat is not None:
-        for event in events:
-            yield _responses_stream_chunk_for_delivery(event, request_data)
+        for delivered_frame in _delivered_frames(events, request_data):
+            yield delivered_frame
         yield completed_compat
         return
     raise _responses_incomplete_stream_exception(
@@ -5398,6 +5530,13 @@ async def _yield_guarded_original_stream(
             request_data,
         )
 
+    def deliverable_client_chunks(chunk: Any):
+        """Deliver one upstream frame unless this router withholds it."""
+
+        delivered = deliver_client_chunk(chunk)
+        if delivered is not None:
+            yield delivered
+
     def undeclared_tool_call_name(chunk: Any) -> Optional[str]:
         """The name of a call naming a tool this request never declared.
 
@@ -5709,12 +5848,14 @@ async def _yield_guarded_original_stream(
                 remember(synthetic_chunk)
                 remember_client_tool_call_exposure(synthetic_chunk)
                 yield synthetic_chunk
-            yield deliver_client_chunk(chunk)
+            for delivered_chunk in deliverable_client_chunks(chunk):
+                yield delivered_chunk
             await _close_async_iterator_safely(response)
             return
         elif _responses_stream_chunk_is_incomplete_terminal(chunk):
             if _is_young_router_terminal_failure_event(chunk):
-                yield deliver_client_chunk(chunk)
+                for delivered_chunk in deliverable_client_chunks(chunk):
+                    yield delivered_chunk
                 await _close_async_iterator_safely(response)
                 return
             terminal_events = completed_custom_tool_terminal_events()
@@ -5804,7 +5945,8 @@ async def _yield_guarded_original_stream(
             yield terminal
             await _close_async_iterator_safely(response)
             return
-        yield deliver_client_chunk(chunk)
+        for delivered_chunk in deliverable_client_chunks(chunk):
+            yield delivered_chunk
 
     try:
         async for chunk in _stream_with_idle_timeout(
@@ -5830,7 +5972,8 @@ async def _yield_guarded_original_stream(
             if chunk is None:
                 continue
             if _is_young_router_terminal_failure_event(chunk):
-                yield deliver_client_chunk(chunk)
+                for delivered_chunk in deliverable_client_chunks(chunk):
+                    yield delivered_chunk
                 await _close_async_iterator_safely(response)
                 return
             chunk_exception = _stream_chunk_priority_error_exception(
@@ -5903,12 +6046,14 @@ async def _yield_guarded_original_stream(
                 ):
                     remember(synthetic_chunk)
                     yield synthetic_chunk
-                yield deliver_client_chunk(chunk)
+                for delivered_chunk in deliverable_client_chunks(chunk):
+                    yield delivered_chunk
                 await _close_async_iterator_safely(response)
                 return
             elif _responses_stream_chunk_is_incomplete_terminal(chunk):
                 if _is_young_router_terminal_failure_event(chunk):
-                    yield deliver_client_chunk(chunk)
+                    for delivered_chunk in deliverable_client_chunks(chunk):
+                        yield delivered_chunk
                     await _close_async_iterator_safely(response)
                     return
                 terminal_events = completed_custom_tool_terminal_events()
@@ -5974,7 +6119,8 @@ async def _yield_guarded_original_stream(
                     buffer=event_tail,
                     request_data=request_data,
                 )
-            yield deliver_client_chunk(chunk)
+            for delivered_chunk in deliverable_client_chunks(chunk):
+                yield delivered_chunk
     except (Exception, asyncio.CancelledError) as exc:
         if isinstance(exc, asyncio.CancelledError) and not _routing_module._is_local_shutdown_exception(exc):
             # A cancellation is the runtime taking this task down for its own
@@ -6461,6 +6607,13 @@ async def _yield_start_buffered_stream_with_error_fallback(
     completion_state = _ResponsesStreamCompletionState(request_data)
     raw_tool_call_text_filter = _web_search_native_module._RawToolCallTextFilter()
 
+    # The turn is opened here, not by the upstream: see
+    # ``_response_opening_events`` for the measurement behind it.
+    if is_responses_stream and not request_data.get(_ANNOUNCED_FRAMES_SENT_KEY):
+        request_data[_ANNOUNCED_FRAMES_SENT_KEY] = True
+        for opening_event in _response_opening_events(request_data, completion_state):
+            yield opening_event
+
     try:
         stream = _stream_with_idle_timeout(
             response,
@@ -6501,11 +6654,11 @@ async def _yield_start_buffered_stream_with_error_fallback(
             ):
                 continue
             if _is_young_router_terminal_failure_event(chunk):
-                for buffered_chunk in [*buffer, chunk]:
-                    yield _responses_stream_chunk_for_delivery(
-                        buffered_chunk,
-                        request_data,
-                    )
+                for delivered_frame in _delivered_frames(
+                    [*buffer, chunk],
+                    request_data,
+                ):
+                    yield delivered_frame
                 await _close_async_iterator_safely(response)
                 return
             chunk_exception = _stream_chunk_priority_error_exception(
@@ -6551,11 +6704,11 @@ async def _yield_start_buffered_stream_with_error_fallback(
                     )
                 elif _responses_stream_chunk_is_incomplete_terminal(chunk):
                     if _is_young_router_terminal_failure_event(chunk):
-                        for buffered_chunk in buffer:
-                            yield _responses_stream_chunk_for_delivery(
-                                buffered_chunk,
-                                request_data,
-                            )
+                        for delivered_frame in _delivered_frames(
+                            buffer,
+                            request_data,
+                        ):
+                            yield delivered_frame
                         await _close_async_iterator_safely(response)
                         return
                     completed_compat_chunk = (
@@ -6566,11 +6719,11 @@ async def _yield_start_buffered_stream_with_error_fallback(
                         )
                     )
                     if completed_compat_chunk is not None:
-                        for buffered_chunk in buffer[:-1]:
-                            yield _responses_stream_chunk_for_delivery(
-                                buffered_chunk,
-                                request_data,
-                            )
+                        for delivered_frame in _delivered_frames(
+                            buffer[:-1],
+                            request_data,
+                        ):
+                            yield delivered_frame
                         yield completed_compat_chunk
                         await _close_async_iterator_safely(response)
                         return
@@ -6638,11 +6791,8 @@ async def _yield_start_buffered_stream_with_error_fallback(
             exception=exc,
         )
         if completed_compat is not None:
-            for buffered_chunk in buffer:
-                yield _responses_stream_chunk_for_delivery(
-                    buffered_chunk,
-                    request_data,
-                )
+            for delivered_frame in _delivered_frames(buffer, request_data):
+                yield delivered_frame
             yield completed_compat
             await _close_async_iterator_safely(response)
             return
@@ -6668,11 +6818,8 @@ async def _yield_start_buffered_stream_with_error_fallback(
             reason="clean_eof_after_completed_compaction_item",
         )
         if completed_compat is not None:
-            for buffered_chunk in buffer:
-                yield _responses_stream_chunk_for_delivery(
-                    buffered_chunk,
-                    request_data,
-                )
+            for delivered_frame in _delivered_frames(buffer, request_data):
+                yield delivered_frame
             yield completed_compat
             return
         incomplete_exception = _responses_incomplete_stream_exception(

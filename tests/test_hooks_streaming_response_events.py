@@ -591,6 +591,67 @@ class HookStreamingResponseEventTests(HookTestCase):
         self.assertEqual(calls, [])
         self.assertFalse(hasattr(raised.exception, "failed_deployment_id"))
         self.assertNotIn("_excluded_deployment_ids", request_data)
+    async def test_the_turn_opens_before_the_upstream_speaks(self) -> None:
+        """A Responses client's clock starts at ``response.created``.
+
+        The routes serving these models answer on the Chat wire, and LiteLLM
+        yields the first event only once the model has written its first token:
+        measured on the live host, the upstream's own ``response.created``
+        reached the process 230 ms in while the client still held nothing at
+        900-1300 ms, against 170 ms at the official endpoint.  So the router
+        opens the turn itself, before it has read anything, and keeps that id
+        for every frame that follows.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        released = asyncio.Event()
+
+        async def slow_upstream():
+            # Nothing at all until the test says so: exactly the window a client
+            # spends staring at an empty turn.
+            await released.wait()
+            yield {"type": "response.created", "response": {"id": "resp-upstream"}}
+            yield {"type": "response.output_text.delta", "delta": "hello"}
+            yield {
+                "type": "response.completed",
+                "response": {"id": "resp-upstream", "status": "completed"},
+            }
+
+        request_data = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Say hello."}],
+            "stream": True,
+            "model_info": {"id": "chat-route", "order": 1},
+        }
+
+        stream = hook.async_post_call_streaming_iterator_hook(
+            user_api_key_dict=None,
+            response=slow_upstream(),
+            request_data=request_data,
+        )
+
+        # The opening frames must arrive while the upstream has said nothing.
+        first = await asyncio.wait_for(stream.__anext__(), timeout=5)
+        second = await asyncio.wait_for(stream.__anext__(), timeout=5)
+        self.assertEqual(first["type"], "response.created")
+        self.assertEqual(second["type"], "response.in_progress")
+        self.assertFalse(released.is_set())
+
+        announced_id = first["response"]["id"]
+        self.assertTrue(announced_id)
+
+        released.set()
+        rest = [chunk async for chunk in stream]
+
+        self.assertEqual(
+            [chunk["type"] for chunk in rest],
+            ["response.output_text.delta", "response.completed"],
+        )
+        # The upstream's own opening frame does not survive: one turn, one id.
+        self.assertEqual(rest[-1]["response"]["id"], announced_id)
+        self.assertNotIn("resp-upstream", json.dumps(rest))
+
     async def test_responses_stream_with_text_delta_is_not_buffered_until_completed(self) -> None:
         hooks, proxy_server = load_hook_module()
 
@@ -622,13 +683,22 @@ class HookStreamingResponseEventTests(HookTestCase):
             )
         ]
 
+        # The turn opens under the router's own id, and the upstream's own
+        # ``response.created`` does not survive it: one turn, one id.
         self.assertEqual(
-            chunks,
+            [chunk["type"] for chunk in chunks],
             [
-                {"type": "response.created", "response": {"id": "resp-original"}},
-                {"type": "response.output_text.delta", "delta": "hello"},
-                {"type": "response.completed", "response": {"id": "resp-original"}},
+                "response.created",
+                "response.in_progress",
+                "response.output_text.delta",
+                "response.completed",
             ],
+        )
+        announced_id = chunks[0]["response"]["id"]
+        self.assertTrue(announced_id)
+        self.assertEqual(
+            [chunk["response"]["id"] for chunk in chunks if "response" in chunk],
+            [announced_id, announced_id, announced_id],
         )
 
     async def test_hook_streaming_boundary_never_forwards_a_dropped_chunk(self) -> None:
@@ -1228,9 +1298,14 @@ class HookStreamingResponseEventTests(HookTestCase):
 
         self.assertEqual(
             [chunk["type"] for chunk in json_chunks],
-            ["response.created", "response.output_text.delta", "response.failed"],
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_text.delta",
+                "response.failed",
+            ],
         )
-        self.assertEqual(json_chunks[1]["delta"], "12345")
+        self.assertEqual(json_chunks[2]["delta"], "12345")
         self.assertEqual(json_chunks[-1]["response"]["status"], "failed")
 
     async def test_responses_stream_output_limit_incomplete_with_output_completes_without_retry(self) -> None:
@@ -1293,7 +1368,10 @@ class HookStreamingResponseEventTests(HookTestCase):
             )
         ]
 
-        self.assertEqual([chunk["type"] for chunk in chunks], ["response.created", "response.completed"])
+        self.assertEqual(
+            [chunk["type"] for chunk in chunks],
+            ["response.created", "response.in_progress", "response.completed"],
+        )
         completed = chunks[-1]
         self.assertEqual(completed["response"]["status"], "completed")
         self.assertNotIn("incomplete_details", completed["response"])
@@ -1485,7 +1563,12 @@ class HookStreamingResponseEventTests(HookTestCase):
 
         self.assertEqual(
             [chunk["type"] for chunk in chunks],
-            ["response.created", "response.output_text.delta", "response.completed"],
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_text.delta",
+                "response.completed",
+            ],
         )
         self.assertEqual(chunks[-1]["response"]["status"], "completed")
         self.assertIn("Partial summary that Codex can store.", json.dumps(chunks[-1]))
@@ -1757,9 +1840,14 @@ class HookStreamingResponseEventTests(HookTestCase):
         self.assertEqual(calls, [])
         self.assertEqual(
             [chunk["type"] for chunk in chunks],
-            ["response.created", "response.output_text.delta", "response.failed"],
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_text.delta",
+                "response.failed",
+            ],
         )
-        self.assertEqual(chunks[1]["delta"], "partial answer")
+        self.assertEqual(chunks[2]["delta"], "partial answer")
         self.assertEqual(chunks[-1]["response"]["status"], "failed")
 
     async def test_streaming_hook_normalizes_completed_usage_at_delivery_boundary(self) -> None:
@@ -1954,8 +2042,21 @@ class HookStreamingResponseEventTests(HookTestCase):
             )
         ]
 
-        self.assertEqual(len(chunks), 2)
-        self.assertEqual(chunks[0], {"type": "response.output_text.delta", "delta": "fallback ok"})
+        # The turn was opened by the router before either route answered, so
+        # the replayed answer arrives inside a turn the client already has.
+        self.assertEqual(
+            [chunk["type"] for chunk in chunks],
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_text.delta",
+                "response.completed",
+            ],
+        )
+        self.assertEqual(
+            chunks[2],
+            {"type": "response.output_text.delta", "delta": "fallback ok"},
+        )
         self.assertEqual(jsonable_stream_chunk(chunks[-1])["type"], "response.completed")
         self.assertEqual(
             jsonable_stream_chunk(chunks[-1])["response"]["output"][0]["content"][0]["text"],
@@ -4094,10 +4195,13 @@ class StreamWithoutTerminalEventTests(HookTestCase):
             )
         ]
 
+        # The router opens every Responses turn itself, so the frame the
+        # upstream also sent is not the first one the client sees.
         self.assertEqual(
             [chunk.get("type") for chunk in chunks],
             [
                 "response.created",
+                "response.in_progress",
                 "response.output_text.delta",
                 "response.failed",
             ],

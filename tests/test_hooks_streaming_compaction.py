@@ -2276,7 +2276,12 @@ class HookStreamingCompactionTests(HookTestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertNotIn("use_chat_completions_api", calls[0])
-        self.assertEqual([chunk.get("type") for chunk in chunks], ["response.failed"])
+        # The turn opens under the router's id before the compaction is
+        # replayed; the failure closes that same turn.
+        self.assertEqual(
+            [chunk.get("type") for chunk in chunks],
+            ["response.created", "response.in_progress", "response.failed"],
+        )
         self.assertEqual(chunks[-1]["response"]["status"], "failed")
         self.assertNotIn("resp-fallback", json.dumps(chunks))
 

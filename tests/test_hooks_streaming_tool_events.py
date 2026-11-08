@@ -2191,8 +2191,20 @@ class HookStreamingToolEventTests(HookTestCase):
             )
         ]
 
-        self.assertEqual(len(chunks), 2)
-        self.assertEqual(chunks[0], {"type": "response.output_text.delta", "delta": "fallback ok"})
+        # The turn is opened by the router before any route answers.
+        self.assertEqual(
+            [chunk["type"] for chunk in chunks],
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_text.delta",
+                "response.completed",
+            ],
+        )
+        self.assertEqual(
+            chunks[2],
+            {"type": "response.output_text.delta", "delta": "fallback ok"},
+        )
         self.assertEqual(jsonable_stream_chunk(chunks[-1])["type"], "response.completed")
         self.assertEqual(
             jsonable_stream_chunk(chunks[-1])["response"]["output"][0]["content"][0]["text"],

@@ -652,12 +652,20 @@ class HookStreamingTimeoutTests(HookTestCase):
                 )
             ]
 
+            # The turn opens under the router's id before any route answers;
+            # the recovered answer arrives inside that same turn.
             self.assertEqual(
-                chunks,
+                [chunk["type"] for chunk in chunks],
                 [
-                    {"type": "response.output_text.delta", "delta": "fallback ok"},
-                    {"type": "response.completed", "response": {"id": "resp-fallback"}},
+                    "response.created",
+                    "response.in_progress",
+                    "response.output_text.delta",
+                    "response.completed",
                 ],
+            )
+            self.assertEqual(chunks[2]["delta"], "fallback ok")
+            self.assertEqual(
+                chunks[-1]["response"]["id"], chunks[0]["response"]["id"]
             )
             self.assertEqual(len(calls), 1)
             self.assertEqual(calls[0]["_excluded_deployment_ids"], ["order1-a"])
@@ -722,13 +730,19 @@ class HookStreamingTimeoutTests(HookTestCase):
             )
         ]
 
+        # The router opens the turn before the retry; see the note on
+        # ``_response_opening_events``.
         self.assertEqual(
-            chunks,
+            [chunk["type"] for chunk in chunks],
             [
-                {"type": "response.output_text.delta", "delta": "retry ok"},
-                {"type": "response.completed", "response": {"id": "resp-retry"}},
+                "response.created",
+                "response.in_progress",
+                "response.output_text.delta",
+                "response.completed",
             ],
         )
+        self.assertEqual(chunks[2]["delta"], "retry ok")
+        self.assertEqual(chunks[-1]["response"]["id"], chunks[0]["response"]["id"])
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["model"], "openai/vendor-chat")
         self.assertNotIn("_excluded_deployment_ids", calls[0])
@@ -839,13 +853,17 @@ class HookStreamingTimeoutTests(HookTestCase):
         ]
 
         self.assertEqual(
-            chunks,
+            [chunk["type"] for chunk in chunks],
             [
-                {"type": "response.created", "response": {"id": "resp-original"}},
-                {"type": "response.output_text.delta", "delta": "hello"},
-                {"type": "response.completed", "response": {"id": "resp-original"}},
+                "response.created",
+                "response.in_progress",
+                "response.output_text.delta",
+                "response.completed",
             ],
         )
+        self.assertEqual(chunks[2]["delta"], "hello")
+        # One turn, one id: the upstream's own id is replaced by the announced one.
+        self.assertEqual(chunks[-1]["response"]["id"], chunks[0]["response"]["id"])
 
     async def test_streaming_stall_timeout_resets_after_any_reasoning_event(self) -> None:
         hooks, proxy_server = load_hook_module()
@@ -887,12 +905,16 @@ class HookStreamingTimeoutTests(HookTestCase):
             ]
 
             self.assertEqual(
-                chunks,
+                [chunk["type"] for chunk in chunks],
                 [
-                    {"type": "response.output_text.delta", "delta": "visible later"},
-                    {"type": "response.completed", "response": {"id": "resp-original"}},
+                    "response.created",
+                    "response.in_progress",
+                    "response.output_text.delta",
+                    "response.completed",
                 ],
             )
+            self.assertEqual(chunks[2]["delta"], "visible later")
+            self.assertEqual(chunks[-1]["response"]["id"], chunks[0]["response"]["id"])
             self.assertEqual(calls, [])
             if log_path.exists():
                 self.assertEqual(log_path.read_text(encoding="utf-8").strip(), "")
@@ -1028,8 +1050,13 @@ class HookStreamingTimeoutTests(HookTestCase):
             )
         ]
 
+        # The router opens the turn itself; the answer frames follow inside it.
         self.assertEqual(
-            chunks,
+            [chunk["type"] for chunk in chunks[:2]],
+            ["response.created", "response.in_progress"],
+        )
+        self.assertEqual(
+            chunks[2:],
             [
                 {
                     "type": "response.output_item.added",
@@ -1099,7 +1126,7 @@ class HookStreamingTimeoutTests(HookTestCase):
                 {
                     "type": "response.completed",
                     "response": {
-                        "id": "resp-original",
+                        "id": chunks[0]["response"]["id"],
                         "output": [
                             {
                                 "id": "rs_1",
@@ -1191,16 +1218,19 @@ class HookStreamingTimeoutTests(HookTestCase):
             )
         ]
 
+        # The turn opens under the router's id; the thinking frames follow.
         self.assertEqual(
             [chunk["type"] for chunk in chunks],
             [
+                "response.created",
+                "response.in_progress",
                 "response.reasoning_summary_part.added",
                 "response.reasoning_summary_text.delta",
                 "response.output_text.delta",
                 "response.completed",
             ],
         )
-        self.assertEqual(chunks[1]["delta"], "Checking the arithmetic")
+        self.assertEqual(chunks[3]["delta"], "Checking the arithmetic")
 
         # The same frames go nowhere for a request that named no summary.
         silent_request = dict(request_data)
@@ -1213,10 +1243,14 @@ class HookStreamingTimeoutTests(HookTestCase):
                 request_data=silent_request,
             )
         ]
+        # This request asked for no summary, so no thinking frame appears --
+        # whatever frames the router itself opens the turn with.
+        silent_types = [chunk["type"] for chunk in silent_chunks]
         self.assertEqual(
-            [chunk["type"] for chunk in silent_chunks],
-            ["response.output_text.delta", "response.completed"],
+            [name for name in silent_types if "reasoning" in name],
+            [],
         )
+        self.assertEqual(silent_types[-1], "response.completed")
 
     async def test_streaming_error_chunk_before_content_replays_via_router(self) -> None:
         hooks, proxy_server = load_hook_module()
@@ -1270,8 +1304,19 @@ class HookStreamingTimeoutTests(HookTestCase):
             )
         ]
 
-        self.assertEqual(len(chunks), 2)
-        self.assertEqual(chunks[0], {"type": "response.output_text.delta", "delta": "fallback ok"})
+        self.assertEqual(
+            [chunk["type"] for chunk in chunks],
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_text.delta",
+                "response.completed",
+            ],
+        )
+        self.assertEqual(
+            chunks[2],
+            {"type": "response.output_text.delta", "delta": "fallback ok"},
+        )
         self.assertEqual(jsonable_stream_chunk(chunks[-1])["type"], "response.completed")
         self.assertEqual(
             jsonable_stream_chunk(chunks[-1])["response"]["output"][0]["content"][0]["text"],
@@ -1329,13 +1374,18 @@ class HookStreamingTimeoutTests(HookTestCase):
             )
         ]
 
+        # See above: the router opens the turn before the replay.
         self.assertEqual(
-            chunks,
+            [chunk["type"] for chunk in chunks],
             [
-                {"type": "response.output_text.delta", "delta": "fallback ok"},
-                {"type": "response.completed", "response": {"id": "resp-fallback"}},
+                "response.created",
+                "response.in_progress",
+                "response.output_text.delta",
+                "response.completed",
             ],
         )
+        self.assertEqual(chunks[2]["delta"], "fallback ok")
+        self.assertEqual(chunks[-1]["response"]["id"], chunks[0]["response"]["id"])
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["model"], "default-chat")
         self.assertEqual(calls[0]["_target_order"], 1)
@@ -1431,14 +1481,14 @@ class HookStreamingTimeoutTests(HookTestCase):
             )
         ]
 
+        # See above: the router opens the turn before the replay.
         self.assertEqual(
-            chunks,
+            [chunk["type"] for chunk in chunks],
             [
-                {"type": "response.output_text.delta", "delta": "chat recovered"},
-                {
-                    "type": "response.completed",
-                    "response": {"id": "resp-chat-recovered"},
-                },
+                "response.created",
+                "response.in_progress",
+                "response.output_text.delta",
+                "response.completed",
             ],
         )
         self.assertEqual(len(calls), 1)
@@ -1528,12 +1578,16 @@ class HookStreamingTimeoutTests(HookTestCase):
         ]
 
         self.assertEqual(
-            chunks,
+            [chunk["type"] for chunk in chunks],
             [
-                {"type": "response.output_text.delta", "delta": "recovered ok"},
-                {"type": "response.completed", "response": {"id": "resp-recovered"}},
+                "response.created",
+                "response.in_progress",
+                "response.output_text.delta",
+                "response.completed",
             ],
         )
+        self.assertEqual(chunks[2]["delta"], "recovered ok")
+        self.assertEqual(chunks[-1]["response"]["id"], chunks[0]["response"]["id"])
         self.assertEqual(len(calls), 2)
         self.assertNotIn("resp-empty-original", json.dumps(chunks))
         self.assertNotIn("resp-empty-fallback", json.dumps(chunks))
@@ -1588,12 +1642,16 @@ class HookStreamingTimeoutTests(HookTestCase):
         ]
 
         self.assertEqual(
-            chunks,
+            [chunk["type"] for chunk in chunks],
             [
-                {"type": "response.output_text.delta", "delta": "fallback after retries"},
-                {"type": "response.completed", "response": {"id": "resp-fallback"}},
+                "response.created",
+                "response.in_progress",
+                "response.output_text.delta",
+                "response.completed",
             ],
         )
+        self.assertEqual(chunks[2]["delta"], "fallback after retries")
+        self.assertEqual(chunks[-1]["response"]["id"], chunks[0]["response"]["id"])
         self.assertEqual(len(calls), 3)
         self.assertEqual(
             calls[0]["_excluded_deployment_ids"],
@@ -1647,9 +1705,14 @@ class HookStreamingTimeoutTests(HookTestCase):
             self.assertEqual(calls, [])
             self.assertEqual(
                 [chunk["type"] for chunk in chunks],
-                ["response.created", "response.output_text.delta", "response.failed"],
+                [
+                    "response.created",
+                    "response.in_progress",
+                    "response.output_text.delta",
+                    "response.failed",
+                ],
             )
-            self.assertEqual(chunks[1]["delta"], "partial answer")
+            self.assertEqual(chunks[2]["delta"], "partial answer")
             self.assertEqual(chunks[-1]["response"]["status"], "failed")
             # The watchdog is this worker's own verdict, so the event carries
             # its own code instead of the unclassified ``upstream_route_failure``

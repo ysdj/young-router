@@ -517,10 +517,17 @@ class HookImageRoutingTests(HookTestCase):
                     request_data=request_data,
                 )
             ]
-            delivered = jsonable_stream_chunk(chunks[0])
+            # The router opens the turn first; the image item follows inside it.
+            opening_types = [
+                jsonable_stream_chunk(chunk)["type"] for chunk in chunks[:2]
+            ]
+            self.assertEqual(
+                opening_types, ["response.created", "response.in_progress"]
+            )
+            delivered = jsonable_stream_chunk(chunks[2])
             self.assertEqual("response.output_item.added", delivered["type"])
             self.assertEqual("in_progress", delivered["item"]["status"])
-            completion = jsonable_stream_chunk(chunks[1])
+            completion = jsonable_stream_chunk(chunks[3])
             saved_path = Path(completion["item"]["saved_path"])
             self.assertEqual(
                 saved_path,
@@ -528,7 +535,7 @@ class HookImageRoutingTests(HookTestCase):
             )
             self.assertEqual(saved_path.read_bytes(), base64.b64decode(VALID_IMAGE_RESULT))
             self.assertEqual(
-                jsonable_stream_chunk(chunks[2])["delta"],
+                jsonable_stream_chunk(chunks[4])["delta"],
                 f"![参考图]({saved_path})",
             )
 

@@ -624,6 +624,10 @@ class HookTraceLoggingTests(HookTestCase):
                 response=_StopsMidAnswer(),
                 request_data=request_data,
             )
+            # The router opens the turn before the upstream speaks, so the
+            # answer is the third frame of the turn.
+            await stream.__anext__()  # response.created
+            await stream.__anext__()  # response.in_progress
             self.assertEqual(
                 {"type": "response.output_text.delta", "delta": "partial"},
                 await stream.__anext__(),

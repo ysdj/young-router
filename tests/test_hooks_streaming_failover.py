@@ -851,16 +851,20 @@ class HookStreamingFailoverTests(HookTestCase):
             )
         ]
 
+        # The turn is opened by the router before either route answers, so the
+        # recovered answer arrives inside a turn the client already has.
         self.assertEqual(
-            chunks,
+            [chunk["type"] for chunk in chunks],
             [
-                {"type": "response.output_text.delta", "delta": "recovered"},
-                {
-                    "type": "response.completed",
-                    "response": {"id": "resp-recovered", "status": "completed"},
-                },
+                "response.created",
+                "response.in_progress",
+                "response.output_text.delta",
+                "response.completed",
             ],
         )
+        self.assertEqual(chunks[2]["delta"], "recovered")
+        self.assertEqual(chunks[-1]["response"]["status"], "completed")
+        self.assertEqual(chunks[-1]["response"]["id"], chunks[0]["response"]["id"])
         self.assertEqual(len(calls), 1)
         self.assertIn("id:reasoning-eof-route", hooks._DEPLOYMENT_COOLDOWNS)
 
@@ -1109,16 +1113,20 @@ class HookStreamingFailoverTests(HookTestCase):
             )
         ]
 
+        # The turn is opened by the router before either route answers, so the
+        # recovered answer arrives inside a turn the client already has.
         self.assertEqual(
-            chunks,
+            [chunk["type"] for chunk in chunks],
             [
-                {"type": "response.output_text.delta", "delta": "recovered"},
-                {
-                    "type": "response.completed",
-                    "response": {"id": "resp-recovered", "status": "completed"},
-                },
+                "response.created",
+                "response.in_progress",
+                "response.output_text.delta",
+                "response.completed",
             ],
         )
+        self.assertEqual(chunks[2]["delta"], "recovered")
+        self.assertEqual(chunks[-1]["response"]["status"], "completed")
+        self.assertEqual(chunks[-1]["response"]["id"], chunks[0]["response"]["id"])
         self.assertEqual(len(calls), 1)
         self.assertIn("id:whitespace-eof-route", hooks._DEPLOYMENT_COOLDOWNS)
 

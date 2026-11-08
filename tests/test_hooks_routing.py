@@ -3281,13 +3281,20 @@ class HookRoutingTests(HookTestCase):
         ]
 
         self.assertEqual([call.get("_target_order") for call in calls], [2, 3])
+        # The turn opens once, under the router's id, before any order is asked;
+        # the answer from the order that served it arrives inside that turn.
         self.assertEqual(
-            chunks,
+            [chunk["type"] for chunk in chunks],
             [
-                {"type": "response.output_text.delta", "delta": "pro ok"},
-                {"type": "response.completed", "response": {"id": "resp-pro"}},
+                "response.created",
+                "response.in_progress",
+                "response.output_text.delta",
+                "response.completed",
             ],
         )
+        self.assertEqual(chunks[2]["delta"], "pro ok")
+        announced_id = chunks[0]["response"]["id"]
+        self.assertEqual(chunks[-1]["response"]["id"], announced_id)
 
     def test_route_recovery_next_poll_order_uses_unfiltered_configured_orders(self) -> None:
         hooks, _ = load_hook_module()
