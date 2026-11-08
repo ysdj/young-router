@@ -4172,6 +4172,12 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         : [];
     return scoped.filter((source) => source.enabled);
   }, [relaySources, signedInAccountID, stationForProvider]);
+  const signedInAccountLabel = useMemo(() => {
+    const account = signedInAccountID ? relayAccounts.find((item) => item.id === signedInAccountID) : undefined;
+    if (!account) return "";
+    const name = stringValue(account.username) || stringValue(account.label) || account.id;
+    return `${name} · ${translate(account.loginStatus === "signed_in" ? "providers.authStatusSignedIn" : "providers.authStatusSignedOut")}`;
+  }, [relayAccounts, signedInAccountID, translate]);
   const keyChoices = selectedProvider ? providerKeyChoices(selectedProvider, relaySources, activeProviderBaseURL) : [];
   const keyOptions = [
     { value: PROVIDER_WIZARD_NEW_KEY, label: translate("providers.wizard.addApiKey") },
@@ -5070,7 +5076,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // Embedded station sign-in: the vendor's base URL is the station origin.
   // After the login the vendor binds to the station so its provided keys
   // become selectable.
-  const beginRelayLogin = async (): Promise<void> => {
+  const beginRelayLogin = async (signInAnother = false): Promise<void> => {
     // The button reports progress instead of going dead, so a second press
     // must not start a parallel sign-in.
     if (loginBusy) return;
@@ -5084,8 +5090,12 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       return;
     }
     try {
+      // A station that already has a signed-in account is reused, because that
+      // is what "get the keys of this station" means when it is already done.
+      // 登录新账号 asks for the other thing: a second account on the same
+      // station, which the reuse shortcut used to make impossible.
       const existingAccounts = relayAccounts.filter((item) => stationOriginKey(item.origin) === stationOriginKey(candidate));
-      const reusable = existingAccounts.find((item) => item.loginStatus === "signed_in");
+      const reusable = signInAnother ? undefined : existingAccounts.find((item) => item.loginStatus === "signed_in");
       if (reusable) {
         setSignedInAccountID(reusable.id);
         setLoginBusy(false);
@@ -5578,6 +5588,14 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
               <NativeSegmentedControl labels={[translate("providers.wizard.pathManual"), translate("providers.wizard.pathLogin")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathLogin") : translate("providers.wizard.pathManual")} disabled={wizardBusy} onChange={({ nativeEvent }) => { setKeyPath(nativeEvent.index === 1 ? "login" : "manual"); setValidation(""); }} style={styles.providerWizardModeControl} />
             </NativeFormRow> : null}
             {keyPath === "login" ? <>
+              {/* Whose keys these are, and the way to a second account.  The
+                  list below only appears once a sign-in has produced keys, so
+                  before this row the step offered no way to sign in anyone
+                  else — and no way to add a second account to one station. */}
+              <View style={styles.providerWizardAuthRow}>
+                <Text numberOfLines={1} style={styles.providerWizardAuthStatus}>{translate("providers.authAccount")}: {signedInAccountLabel || translate("providers.authStatusSignedOut")}</Text>
+                <NativeButton title={translate("relay.loginAnotherAccount")} compact busy={loginBusy} disabled={(wizardBusy && !loginBusy) || !activeProviderBaseURL.trim()} onPress={() => { void beginRelayLogin(true); }} />
+              </View>
               {providedChoices.length > 0 ? <>
                 <Text style={styles.providerWizardHint}>{translate("providers.wizard.providedKeysHint", { count: providedChoices.length })}</Text>
                 <View style={styles.providerWizardModelList}>
@@ -5594,6 +5612,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                   })}
                 </View>
               </> : <>
+                {/* The row above already says whether anyone is signed in, so
+                    this states only what the press will do. */}
                 <Text style={styles.providerWizardHint}>{signedInAccountID ? translate("relay.resourcesNotLoaded") : translate("providers.wizard.loginFirstHint")}</Text>
                 <NativeButton title={translate("relay.login")} primary compact busy={loginBusy} disabled={(wizardBusy && !loginBusy) || !activeProviderBaseURL.trim()} onPress={() => { void beginRelayLogin(); }} />
               </>}

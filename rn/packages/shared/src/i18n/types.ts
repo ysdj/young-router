@@ -911,6 +911,7 @@ export type TranslationKey =
   | "relay.typeDetected"
   | "relay.typeNotDetected"
   | "relay.login"
+  | "relay.loginAnotherAccount"
   | "relay.goLogin"
   | "relay.refreshResources"
   | "relay.loginWorking"

@@ -944,6 +944,7 @@ export const en: Record<TranslationKey, string> = {
   "relay.typeDetected": "Detected: {type}",
   "relay.typeNotDetected": "Could not detect the relay type. Check the URL or choose it manually.",
   "relay.login": "Sign In",
+  "relay.loginAnotherAccount": "Sign In Another Account",
   "relay.goLogin": "Sign in",
   "relay.refreshResources": "Refresh Resources",
   "relay.loginWorking": "Complete sign-in in this window. On success, you will return to Service Provider Management.",

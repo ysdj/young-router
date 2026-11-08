@@ -298,7 +298,13 @@ export function mirrorPoint(
 
 function MirrorScreen({ mirror, title }: { mirror: MirrorSurface; title: string }): React.JSX.Element {
   const frame = React.useSyncExternalStore(mirror.subscribe, mirror.frame, mirror.frame);
-  return <View style={[styles.browserFrame, { aspectRatio: mirror.width / mirror.height, height: undefined }]}>
+  // The station's display is 560x820, and the frame keeps that shape instead
+  // of taking the card's width: at 100% of a wide card the picture grew past
+  // the window and its top and bottom were clipped away -- the wizard behind it
+  // showed through where the picture should have been.  A fixed height with the
+  // frame's own aspect ratio makes it 355 pt wide however wide the window is,
+  // and `maxHeight` keeps it inside a short one.
+  return <View style={[styles.browserFrame, { aspectRatio: mirror.width / mirror.height, width: undefined, alignSelf: "center" }]}>
     {frame
       ? React.createElement("img", {
           // The picture carries no words of its own; the dialog title names it.
@@ -551,7 +557,7 @@ const styles = StyleSheet.create({
   // The streamed screen is a 560x820 station page.  The box takes the pane's
   // width and keeps that page's own aspect, so a click lands where the person
   // aimed: the picture is scaled, never re-laid-out.
-  browserFrame: { width: "100%", height: 520, overflow: "hidden", backgroundColor: "#000" },
+  browserFrame: { height: 520, maxHeight: "70vh" as never, overflow: "hidden", backgroundColor: "#000" },
   // A chooser holds names, not a sentence: the native panel is 620 pt wide
   // because a model id is read in full.  Its head states the provider and key
   // it is choosing for, and the count sits on the controls' baseline at the

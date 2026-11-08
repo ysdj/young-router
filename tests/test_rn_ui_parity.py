@@ -1276,6 +1276,36 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('{...modelProbeProps(providerId, editorIdentifier(model), probeInputFingerprint(providerBaseURL(provider), modelUpstreamDisplay(providerId, model), model))}')
         self.assert_ui_not_has('{...modelProbeProps(providerId, editorIdentifier(model))}')
 
+    def test_the_login_step_can_sign_in_a_second_account(self) -> None:
+        """A station with an account already signed in still offers another.
+
+        The reuse shortcut answered "use the account you have" for every press,
+        and the key list only appeared once a sign-in had produced keys, so
+        after the first account the step had no way to add a second one.
+        """
+
+        self.assert_ui_has('const beginRelayLogin = async (signInAnother = false): Promise<void> => {')
+        self.assert_ui_has('const reusable = signInAnother ? undefined : existingAccounts.find((item) => item.loginStatus === "signed_in");')
+        self.assert_ui_has('translate("relay.loginAnotherAccount")')
+        self.assert_ui_has('onPress={() => { void beginRelayLogin(true); }}')
+        # The step states whose keys these are before it lists them.
+        self.assert_ui_has('{translate("providers.authAccount")}: {signedInAccountLabel || translate("providers.authStatusSignedOut")}')
+        zh = (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8")
+        en = (ROOT / "rn/packages/shared/src/i18n/en.ts").read_text(encoding="utf-8")
+        self.assertIn('"relay.loginAnotherAccount": "登录新账号",', zh)
+        self.assertIn('"relay.loginAnotherAccount": "Sign In Another Account",', en)
+
+    def test_the_station_picture_keeps_its_own_shape_inside_the_dialog(self) -> None:
+        """A 560x820 display drawn at 100% of a wide card overflows the window.
+
+        Its top and bottom were clipped away and the wizard behind showed
+        through where the picture should have been.
+        """
+
+        chrome = (ROOT / "rn/packages/shared/src/ui/HostChrome.tsx").read_text(encoding="utf-8")
+        self.assertIn('{ aspectRatio: mirror.width / mirror.height, width: undefined, alignSelf: "center" }', chrome)
+        self.assertIn('browserFrame: { height: 520, maxHeight: "70vh" as never, overflow: "hidden", backgroundColor: "#000" },', chrome)
+
     def test_the_wizard_reads_the_detection_it_asked_for(self) -> None:
         """A detection's answer belongs to the dispatch that asked for it.
 
@@ -8017,7 +8047,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # picker and no vendor type split.
         self.assertNotIn('translate("relay.stationChoice")', wizard)
         self.assertNotIn("stationMode", wizard)
-        self.assertIn("const beginRelayLogin = async (): Promise<void> => {", wizard)
+        self.assertIn("const beginRelayLogin = async (signInAnother = false): Promise<void> => {", wizard)
         self.assertIn("provider.select_relay_station", wizard)
         # Pending login: the shell is created only after sign-in succeeds, so
         # a cancelled flow reserves nothing and cannot cascade a station away.

@@ -955,6 +955,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "relay.typeDetected": "已识别: {type}",
   "relay.typeNotDetected": "无法识别中转站类别。请检查 URL 或手动选择。",
   "relay.login": "登录",
+  "relay.loginAnotherAccount": "登录新账号",
   "relay.goLogin": "去登录",
   "relay.refreshResources": "刷新",
   "relay.loginWorking": "请在当前窗口完成登录，成功后将返回服务商管理。",
