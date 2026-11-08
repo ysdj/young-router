@@ -1844,7 +1844,9 @@ class LogsDomain:
         self._online_usage_applied_rows: dict[str, int] = {}
         self._online_usage_total = 0
         self._online_usage_sources: list[dict[str, str]] = []
-        self._online_usage_sources_revision = -1
+        # The cursors of both documents the choices are read from.  ``-1`` is
+        # "nothing read yet", so the first view still pays for the walk.
+        self._online_usage_sources_revision: object = -1
         self._online_usage_source_id = ""
         # Only the latest requested source may replace the view. A slower
         # answer for an earlier source ends that request, never this one.
@@ -2044,7 +2046,7 @@ class LogsDomain:
             "limit": self._line_limit(tab),
         }
         if tab == "online-usage":
-            value["sources"] = self._online_usage_all_sources()
+            value["sources"] = self._online_usage_source_list()
         # A fresh domain starts with an empty view, and the source choices
         # belong to that first answer too; otherwise the pane would only show
         # a relay after someone left and re-entered the tab.
@@ -2059,15 +2061,47 @@ class LogsDomain:
             reader = OnlineUsageReader(self.config_path, self._relay_accounts)
         return reader
 
-    def _online_usage_source_list(self) -> list[dict[str, str]]:
-        """Read the selectable relays once per source-configuration revision.
+    def _relay_accounts_document_path(self) -> Path:
+        """Where the relay panes keep the stations and logins beside this config."""
 
-        The list costs a config parse and a credential walk, and the pane asks
-        for it on every poll, so it is cached against the configuration file's
-        own cursor instead of being rebuilt per view.
+        try:
+            from ...webdav.core import relay_accounts_path
+
+            return relay_accounts_path(self.config_path)
+        except Exception:
+            return self.config_path.parent / "relay-accounts.json"
+
+    def _online_usage_source_cursor(self) -> tuple[tuple[object, ...], ...]:
+        """The documents the dropdown's choices are derived from.
+
+        The choices come from the configuration *and* from the relay panes' own
+        account document: a station, its type and its logins live there, and on a
+        host that receives them by WebDAV pull the configuration itself never
+        changes at all.  Caching against the configuration alone left the
+        dropdown listing the relays the Core started with, so a relay whose
+        station record arrived later stayed missing — the tab showed the other
+        relays and never this one.
         """
 
-        cursor = self._file_cursor(self.config_path)
+        return (
+            self._file_cursor(self.config_path),
+            self._file_cursor(self._relay_accounts_document_path()),
+        )
+
+    def _online_usage_source_list(self) -> list[dict[str, str]]:
+        """The dropdown's choices, re-read once their source documents change.
+
+        The list costs a config parse and a credential walk, and the pane asks
+        for it on every poll, so it is cached against both documents' cursors
+        instead of being rebuilt per view.  Both, because a station and its
+        logins live in the relay panes' own account document, and on a host that
+        receives them by WebDAV pull the configuration never changes at all:
+        keyed on the configuration alone — or answering from the cache because it
+        already held something — the dropdown kept offering the relays the Core
+        started with, and a relay linked afterwards was simply absent.
+        """
+
+        cursor = self._online_usage_source_cursor()
         if cursor == self._online_usage_sources_revision:
             return self._online_usage_sources
         self._online_usage_sources_revision = cursor
@@ -2081,14 +2115,6 @@ class LogsDomain:
             for item in sources
             if isinstance(item, Mapping) and str(item.get("id", ""))
         ]
-        return self._online_usage_sources
-
-    def _online_usage_all_sources(self) -> list[dict[str, str]]:
-        """Read configured local choices after an empty source cache."""
-
-        if not self._online_usage_sources:
-            self._online_usage_sources_revision = -1
-            return self._online_usage_source_list()
         return self._online_usage_sources
 
     def _refresh_runtime_settings(self) -> None:
@@ -2613,7 +2639,7 @@ class LogsDomain:
                 source = (-1, -1)
         return (
             *source,
-            self._file_cursor(self.config_path) if tab == "online-usage" else None,
+            self._online_usage_source_cursor() if tab == "online-usage" else None,
             self._filters.get(tab, ""),
             self._line_limit(tab),
             tab in self._cleared,
@@ -2649,7 +2675,7 @@ class LogsDomain:
             # The tab's own dropdown is part of its view: the pane renders the
             # choices and the chosen one from the same snapshot its rows came
             # from, so a refresh can never label rows with another relay.
-            value["sources"] = self._online_usage_all_sources()
+            value["sources"] = self._online_usage_source_list()
             value["source_id"] = self._online_usage_source_id
             value["reason"] = self._online_usage_reason
             total = self._online_usage_total

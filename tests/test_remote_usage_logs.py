@@ -218,34 +218,36 @@ class RemoteUsageLogsTests(unittest.TestCase):
                 {"id": "slot-bob", "name": "bob", "value": "replace-bob"},
             ],
         }
+        keys = remote_usage_logs._provider_keys(provider)
+
+        def credential(model: dict) -> str:
+            return remote_usage_logs._route_slot(keys, model)[0]
+
         self.assertEqual(
             "replace-bob",
-            remote_usage_logs._credential_for_model(
-                provider, {"api_key_name": "bob", "provider_key_id": "slot-bob"}
-            ),
+            credential({"api_key_name": "bob", "provider_key_id": "slot-bob"}),
         )
         # A stale name does not decide once a slot is stated.
         self.assertEqual(
             "replace-default",
-            remote_usage_logs._credential_for_model(
-                provider, {"api_key_name": "bob", "provider_key_id": "slot-default"}
-            ),
+            credential({"api_key_name": "bob", "provider_key_id": "slot-default"}),
         )
         self.assertEqual(
             "",
-            remote_usage_logs._credential_for_model(
-                provider,
-                {"api_key_name": "bob", "provider_key_id": "provider-slot-00000000000000000000000000000000"},
+            credential(
+                {"api_key_name": "bob", "provider_key_id": "provider-slot-00000000000000000000000000000000"}
             ),
         )
+        self.assertEqual("", credential({"api_key_name": "gone"}))
+        # A route that names no key still follows the provider's own default,
+        # but it names no login: the route never said it was one of its keys.
+        self.assertEqual("replace-default", credential({}))
+        self.assertEqual(("replace-default", "", ""), remote_usage_logs._route_slot(keys, {}))
+        # A key the route carries itself is what the route sends, whatever the
+        # provider's own slots hold.
         self.assertEqual(
-            "",
-            remote_usage_logs._credential_for_model(provider, {"api_key_name": "gone"}),
-        )
-        # A route that names no key still follows the provider's own default.
-        self.assertEqual(
-            "replace-default",
-            remote_usage_logs._credential_for_model(provider, {}),
+            "replace-own",
+            credential({"api_key": "replace-own", "provider_key_id": "slot-bob"}),
         )
 
     def test_keys_of_one_account_are_one_target(self) -> None:
@@ -343,6 +345,85 @@ class RemoteUsageLogsTests(unittest.TestCase):
         self.assertEqual(["relay"], [source["label"] for source in sources])
         self.assertTrue(sources[0]["id"])
         self.assertNotIn("replace-me", sources[0]["id"])
+
+    def test_a_relay_that_changed_domain_stays_one_entry_under_its_own_name(self) -> None:
+        """A station the site moved keeps its relay in the dropdown.
+
+        The provider records which station it was created from, and the station
+        records the domain it answers on now.  Matching the two by base URL only
+        dropped the relay from the dropdown as soon as they disagreed — the tab
+        then showed the user's other relays and never this one, with nothing on
+        screen saying why — and reading the login's own record as a second
+        station listed the same login twice, once under a URL.
+        """
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "config.yaml"
+        path.write_text(
+            textwrap.dedent(
+                """
+                providers:
+                  relay:
+                    api_base: https://api.relay.test/v1
+                    x-young-router-provider-source:
+                      kind: relay
+                      station_id: station-test
+                    api_keys:
+                      - id: slot-a
+                        name: default
+                        value: replace-me
+                    x-young-router-relay-keys:
+                      version: 1
+                      slots:
+                        - id: slot-a
+                          api_key_name: default
+                          source:
+                            kind: relay
+                            station_id: station-test
+                            account_id: login-test
+                            resource_id: newapi-1
+                  vendor:
+                    api_base: https://api.vendor.test/v1
+                    api_keys:
+                      - name: default
+                        value: replace-vendor
+                model_list:
+                  - model_name: moved
+                    litellm_params:
+                      model: openai/moved
+                      api_base: https://api.relay.test/v1
+                    model_info:
+                      id: a1b2c3d4
+                      provider: relay
+                      api_key_name: default
+                      x-young-router-provider-key-id: slot-a
+                  - model_name: vendor-chat
+                    litellm_params:
+                      model: openai/vendor-chat
+                      api_base: https://api.vendor.test/v1
+                    model_info:
+                      id: e5f6a7b8
+                      provider: vendor
+                      api_key_name: default
+                """
+            ).lstrip(),
+            encoding="utf-8",
+        )
+        # The station answers on another domain now, and its login is recorded
+        # there; the provider still states the base its routes use.
+        self.write_relay_station(path, "https://relay-moved.test", account_id="login-test")
+
+        sources = remote_usage_logs.usage_sources(path)
+        targets = remote_usage_logs.active_usage_targets(path)
+
+        # One relay, one login, one entry — named by the provider, not the host
+        # the station happens to answer on.
+        self.assertEqual(["relay · tester"], [source["label"] for source in sources])
+        self.assertEqual(["https://api.relay.test/v1"], [target.api_base for target in targets])
+        # The provider that names no station is still a vendor API: the relay
+        # document decides which providers have a usage feed to read.
+        self.assertNotIn("vendor", " ".join(target.provider for target in targets))
 
     def test_a_usage_row_carries_its_relays_full_name_and_its_own_fields(self) -> None:
         path = self.write_signed_in_config()

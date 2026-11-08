@@ -95,78 +95,109 @@ def _credential_value(value: Any) -> str:
     return "" if "\r" in resolved or "\n" in resolved else resolved
 
 
-def _provider_keys(
-    provider: dict[str, Any],
-) -> tuple[dict[str, str], dict[str, str], list[str], dict[str, str], dict[str, str]]:
-    """Index a provider's credentials, keeping the account each one belongs to.
+@dataclass(frozen=True)
+class _KeyIndex:
+    """One provider's credentials, and what each one says about its routes.
 
-    A key's station account is what a usage read is scoped by: the same station
-    can hold one dashboard login per person, and each login answers only the
-    traffic its own keys served.  The account is therefore read from the relay
-    slot the key was minted from (``source``), which is the only place the
-    provider document records it without ever repeating a credential.
+    A relay key carries two facts a usage read needs and must never invent: the
+    dashboard login it was minted from — the read scope, because one station can
+    host a login per person and each answers only its own traffic — and the
+    station itself, recorded as the station's own id.  The id is what makes a
+    relay recognisable after the site changes domain; the configured base URL is
+    not, because the station's record then states another root.
     """
 
-    by_name: dict[str, str] = {}
-    by_id: dict[str, str] = {}
-    account_by_name: dict[str, str] = {}
-    account_by_id: dict[str, str] = {}
-    ordered: list[str] = []
+    by_name: dict[str, str]
+    by_id: dict[str, str]
+    ordered: list[str]
+    account_by_name: dict[str, str]
+    account_by_id: dict[str, str]
+    station_by_name: dict[str, str]
+    station_by_id: dict[str, str]
+
+
+def _provider_keys(provider: dict[str, Any]) -> _KeyIndex:
+    """Index a provider's credentials, keeping what each slot was created from.
+
+    The account and the station of a key are read from the relay slot it was
+    minted from (``source``), which is the only place the provider document
+    records them without ever repeating a credential.
+    """
+
+    index = _KeyIndex({}, {}, [], {}, {}, {}, {})
     raw_keys = provider.get("api_keys")
     if not isinstance(raw_keys, list):
-        return by_name, by_id, ordered, account_by_name, account_by_id
-    for index, item in enumerate(raw_keys, start=1):
+        return index
+    for position, item in enumerate(raw_keys, start=1):
         if not isinstance(item, dict):
             continue
-        name = _string(item.get("name")) or f"key-{index}"
+        name = _string(item.get("name")) or f"key-{position}"
         value = _credential_value(item.get("value"))
-        if not value or name in by_name:
+        if not value or name in index.by_name:
             continue
-        by_name[name] = value
+        index.by_name[name] = value
         key_id = _string(item.get("id"))
         if key_id:
-            by_id[key_id] = value
-        account = _key_account(item)
+            index.by_id[key_id] = value
+        account, station = _key_source(item)
         if account:
-            account_by_name[name] = account
+            index.account_by_name[name] = account
             if key_id:
-                account_by_id[key_id] = account
-        ordered.append(value)
-    return by_name, by_id, ordered, account_by_name, account_by_id
+                index.account_by_id[key_id] = account
+        if station:
+            index.station_by_name[name] = station
+            if key_id:
+                index.station_by_id[key_id] = station
+        index.ordered.append(value)
+    return index
 
 
-def _key_account(item: dict[str, Any]) -> str:
-    """The relay account one configured key was minted from, if any.
+def _key_source(item: dict[str, Any]) -> tuple[str, str]:
+    """The account and station one configured key was minted from, if any.
 
-    Only a key that came from a dashboard login names one.  A key the user
-    pasted by hand belongs to no account, and reading it as somebody else's
-    would put a station's newest account label on an unrelated credential.
+    Only a key that came from a dashboard login names either.  A key the user
+    pasted by hand belongs to no account and no station, and reading it as
+    somebody else's would put a station's newest account label on an unrelated
+    credential.
     """
 
     source = item.get("source")
     if not isinstance(source, dict) or _string(source.get("kind")) != "relay":
-        return ""
-    return _string(source.get("account_id"))
+        return "", ""
+    return _string(source.get("account_id")), _string(source.get("station_id"))
 
 
-def _credential_for_model(provider: dict[str, Any], model: dict[str, Any]) -> str:
+def _route_slot(keys: _KeyIndex, model: dict[str, Any]) -> tuple[str, str, str]:
+    """The credential, login and station one configured route names.
+
+    The slot is the key the route uses, and a name only decides when no slot is
+    stated.  A route that states a key this provider does not carry has no
+    usage to read: answering with the provider's default (or its only key)
+    would present another account's numbers as this route's.
+
+    A route that names no slot still sends the provider's own default
+    credential, but it names no login: the route never said it was one of a
+    login's keys, and claiming the login's whole history for it would answer for
+    traffic the route did not serve.
+    """
+
     direct = _credential_value(model.get("api_key"))
-    if direct:
-        return direct
-    by_name, by_id, ordered, _account_by_name, _account_by_id = _provider_keys(provider)
-    # The slot is the key the route uses, and a name only decides when no slot is
-    # stated.  A route that states a key this provider does not carry has no
-    # usage to read: answering with the provider's default (or its only key)
-    # would present another account's numbers as this route's.
     key_id = _string(model.get("provider_key_id"))
     preferred_name = _string(model.get("api_key_name"))
     if key_id:
-        return by_id.get(key_id, "")
-    if preferred_name:
-        return by_name.get(preferred_name, "")
-    if "default" in by_name:
-        return by_name["default"]
-    return ordered[0] if len(ordered) == 1 else ""
+        key = keys.by_id.get(key_id, "")
+        account, station = keys.account_by_id.get(key_id, ""), keys.station_by_id.get(key_id, "")
+    elif preferred_name:
+        key = keys.by_name.get(preferred_name, "")
+        account = keys.account_by_name.get(preferred_name, "")
+        station = keys.station_by_name.get(preferred_name, "")
+    elif "default" in keys.by_name:
+        key, account, station = keys.by_name["default"], "", ""
+    elif len(keys.ordered) == 1:
+        key, account, station = keys.ordered[0], "", ""
+    else:
+        key, account, station = "", "", ""
+    return direct or key, account, station
 
 
 @dataclass(frozen=True)
@@ -305,9 +336,16 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
     order: list[tuple[str, str]] = []
     roots: dict[tuple[str, str], str] = {}
     labels: dict[tuple[str, str], str] = {}
+    # Which stations each scope was created from.  A provider records the
+    # station's id, so a relay stays recognisable when the site moves to another
+    # domain — its configured base URL then names a root the station's own record
+    # no longer has, and the root alone would have dropped it.
+    scope_stations: dict[tuple[str, str], set[str]] = {}
     # The provider name a station was configured under, so an account of that
-    # station is named the way every other surface names it.
+    # station is named the way every other surface names it — even when the
+    # account's own origin is the domain the station moved to.
     provider_names: dict[str, str] = {}
+    provider_names_by_station: dict[str, str] = {}
     credentials: dict[tuple[str, str], list[str]] = {}
     # Every provider's routes are collected first, because whether one is a
     # *relay* is decided by the relay panes' own document, not by the provider
@@ -324,19 +362,22 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
         for account in accounts.values()
         if _string(account.get("origin"))
     }
+    station_ids = {entry["id"] for entry in stations.values() if entry["id"]}
     for raw_provider in raw_providers:
         if not isinstance(raw_provider, dict):
             continue
         provider_name = _string(raw_provider.get("name")) or "Configured relay"
         provider_base = _string(raw_provider.get("api_base"))
+        provider_station_id = _string(raw_provider.get("relay_station_id"))
         raw_models = raw_provider.get("models")
         if not isinstance(raw_models, list):
             continue
+        keys = _provider_keys(raw_provider)
         for raw_model in raw_models:
             if not isinstance(raw_model, dict):
                 continue
             api_base = _string(raw_model.get("api_base")) or provider_base
-            api_key = _credential_for_model(raw_provider, raw_model)
+            api_key, account_id, slot_station_id = _route_slot(keys, raw_model)
             root = service_root(api_base)
             if not root:
                 continue
@@ -344,14 +385,17 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
             # account it belongs to is recorded.  A route that names no
             # readable key still contributes its station, because another
             # route of the same station may name one.
-            account_id = _account_for_model(raw_provider, raw_model)
             scope = (root, account_id)
+            station_id = slot_station_id or provider_station_id
             if scope not in roots:
                 order.append(scope)
                 roots[scope] = api_base
                 labels[scope] = provider_name
                 provider_names[scope[0]] = provider_name
                 credentials[scope] = []
+            if station_id:
+                scope_stations.setdefault(scope, set()).add(station_id)
+                provider_names_by_station.setdefault(station_id, provider_name)
             if api_key and api_key not in credentials[scope]:
                 credentials[scope].append(api_key)
 
@@ -359,10 +403,17 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
     # no route carries one of its keys yet: it answers through its own session,
     # and leaving it out made the dropdown name only the logins that had already
     # been imported.
+    listed = {account_id for _root, account_id in order if account_id}
     for account_id, account in accounts.items():
         origin = _string(account.get("origin"))
         has_session = bool(account.get("session"))
         if not account_id or not origin or not has_session:
+            continue
+        # The same login reached by its station's provider is already one entry.
+        # Its own record can state another root than that provider — a station
+        # that moved domain leaves the account describing the new one — and
+        # adding it again listed one login twice in the dropdown.
+        if account_id in listed:
             continue
         scope = (service_root(origin + "/v1") or origin.rstrip("/"), account_id)
         if scope in roots:
@@ -372,9 +423,12 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
         # The name the relay panes show is the provider name the user gave the
         # station.  An account-only entry used the host instead, so the dropdown
         # listed `relay.example.test · tester` beside `relay` for the same
-        # station — the same relay under two names, one of them a URL.
+        # station — the same relay under two names, one of them a URL.  The same
+        # relay must stay named even when its login answers from the domain the
+        # station moved to, so the id it records decides before the host does.
         labels[scope] = (
             provider_names.get(scope[0])
+            or provider_names_by_station.get(_string(account.get("station_id")))
             or _station_label(origin)
             or _string(account.get("label"))
             or origin
@@ -385,8 +439,14 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
     # (`api.deepseek.com`) cannot be read here at all: there is no dashboard and
     # no usage feed.  A station the panes never registered is dropped with it,
     # because the alternative — offering every provider — is what put a vendor in
-    # the dropdown.  The relay document is the only authority on which is which.
-    order = [scope for scope in order if scope[0] in station_roots]
+    # the dropdown.  The relay document is the only authority on which is which,
+    # and either the root or the station's own id is enough to be one of its
+    # relays: a station that changed domain is the same station.
+    order = [
+        scope
+        for scope in order
+        if scope[0] in station_roots or scope_stations.get(scope, set()) & station_ids
+    ]
 
     targets: list[UsageTarget] = []
     for scope in order:
@@ -411,7 +471,7 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
                 account_id=account_id,
                 fallback_keys=tuple(keys[1:]),
                 station_type=_string(account.get("type"))
-                or _string(stations.get(root, "")),
+                or _string(stations.get(root, {}).get("type")),
                 session_headers=tuple(_session_headers(account).items()),
                 refresh_token=_string((account.get("session") or {}).get("refresh_token"))
                 if isinstance(account.get("session"), dict)
@@ -434,19 +494,6 @@ def _station_label(origin: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
-def _account_for_model(provider: dict[str, Any], model: dict[str, Any]) -> str:
-    """The relay account one configured route's credential was minted from."""
-
-    _by_name, by_id, _ordered, by_account_name, by_account_id = _provider_keys(provider)
-    key_id = _string(model.get("provider_key_id"))
-    if key_id:
-        return by_account_id.get(key_id, "")
-    preferred_name = _string(model.get("api_key_name"))
-    if preferred_name:
-        return by_account_name.get(preferred_name, "")
-    return ""
-
-
 def _relay_document(path: pathlib.Path) -> dict[str, Any]:
     """Read the relay panes' own account document, or an empty one."""
 
@@ -461,18 +508,24 @@ def _relay_document(path: pathlib.Path) -> dict[str, Any]:
     return document if isinstance(document, dict) else {}
 
 
-def _relay_stations(path: pathlib.Path) -> dict[str, str]:
-    """The relay stations this app knows: control-plane root -> station type.
+def _relay_stations(path: pathlib.Path) -> dict[str, dict[str, str]]:
+    """The relay stations this app knows, by control-plane root.
 
     This is what decides whether a provider is a *relay*.  A provider pointed
     straight at an upstream vendor has no entry here, so it is not a station and
     has no usage feed to read however many keys it carries.
+
+    Each entry keeps the station's own id beside its type, because a station
+    that moves to another domain keeps its id while its root stops matching the
+    provider that was created from it.  Matching on the root alone dropped that
+    relay from the dropdown entirely — the provider it was configured under is
+    the same station, and it says so.
     """
 
     raw_stations = _relay_document(path).get("stations")
     if not isinstance(raw_stations, list):
         return {}
-    stations: dict[str, str] = {}
+    stations: dict[str, dict[str, str]] = {}
     for raw in raw_stations:
         if not isinstance(raw, dict):
             continue
@@ -480,7 +533,10 @@ def _relay_stations(path: pathlib.Path) -> dict[str, str]:
         if not origin:
             continue
         root = service_root(origin + "/v1") or origin.rstrip("/")
-        stations[root] = _string(raw.get("type"))
+        stations[root] = {
+            "id": _string(raw.get("id")),
+            "type": _string(raw.get("type")),
+        }
     return stations
 
 
@@ -516,6 +572,7 @@ def _relay_accounts(path: pathlib.Path) -> dict[str, dict[str, Any]]:
         accounts[account_id] = {
             "id": account_id,
             "label": name[:64],
+            "station_id": _string(raw.get("station_id")) or _string(station.get("id")),
             "origin": _string(raw.get("origin"))
             or _string(station.get("origin")),
             "type": _string(raw.get("type")) or _string(station.get("type")),

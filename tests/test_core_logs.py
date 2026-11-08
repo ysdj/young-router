@@ -2534,6 +2534,59 @@ model_list:
                 domain.view("online-usage")["log"]["sources"],
             )
 
+    def test_online_usage_rereads_its_relays_when_the_account_document_changes(self) -> None:
+        """The dropdown follows the document the stations and logins live in.
+
+        A host that receives relay logins by WebDAV pull changes that document
+        without touching the configuration at all, and the tab went on offering
+        the relays the Core started with: the relay the user had just linked was
+        simply absent from the list, with nothing on screen saying why.
+        """
+
+        class _RecordingSources:
+            def __init__(self) -> None:
+                self.choices = [{"id": "one", "label": "relay-one"}]
+                self.reads = 0
+
+            def sources(self) -> list[dict[str, str]]:
+                self.reads += 1
+                return list(self.choices)
+
+            def refresh(self, source_id: str | None = None) -> list[dict[str, str]]:
+                return []
+
+        with tempfile.TemporaryDirectory() as directory:
+            # The relay panes keep their document beside a configuration that is
+            # not itself inside the runtime directory.
+            accounts_path = Path(directory) / ".litellm-runtime" / "relay-accounts.json"
+            accounts_path.parent.mkdir(parents=True, exist_ok=True)
+            accounts_path.write_text('{"version": 3, "stations": [], "accounts": []}', encoding="utf-8")
+            reader = _RecordingSources()
+            domain = LogsDomain(directory, online_usage_reader=reader)
+            first = domain.view("online-usage")
+            self.assertEqual(["relay-one"], [source["label"] for source in first["log"]["sources"]])
+            reads = reader.reads
+
+            # A poll that finds both documents unchanged answers from the cache,
+            # because the pane asks once a second.
+            domain.view("online-usage")
+            self.assertEqual(reads, reader.reads)
+
+            # The pull lands in the account document, and the relay it names is
+            # offered by the next poll.
+            reader.choices.append({"id": "two", "label": "relay-two"})
+            accounts_path.write_text(
+                '{"version": 3, "stations": [{"id": "station-two", "origin": "https://relay.example.test"}], "accounts": []}',
+                encoding="utf-8",
+            )
+            second = domain.view("online-usage", known_revision=first["revision"])
+
+            self.assertTrue(second["changed"])
+            self.assertEqual(
+                ["relay-one", "relay-two"],
+                [source["label"] for source in second["log"]["sources"]],
+            )
+
     def test_clearing_online_usage_does_not_hide_the_next_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             reader = _ChangingUsageReader()
