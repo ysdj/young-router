@@ -510,6 +510,45 @@ class HookResponsesRequestPrepTests(HookTestCase):
             original["instructions"],
         )
 
+    def test_codex_progress_contract_never_forces_a_choice_while_thinking(self) -> None:
+        """A thinking wire refuses every forced choice, so forcing ends the turn.
+
+        Measured through this proxy on the official DeepSeek endpoint, one
+        history three times: this contract injected ``tool_choice: required``
+        and the turn failed; the same history with no forced choice answered
+        and still returned the tool call the contract wanted.  The refusal read
+        "thinking mode does not support this tool_choice" while the request
+        summary showed ``tool_choice: null`` -- the field is added after that
+        summary is taken, which is what made it look like an upstream flake.
+        """
+
+        hooks, _ = load_hook_module()
+        contract = hooks._codex_contract_module
+        request = self._codex_collaboration_request()
+        request["input"].append(
+            {
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "I will run the tests."}],
+            }
+        )
+        request["reasoning"] = {"effort": "medium", "summary": "auto"}
+
+        self.assertIsNone(contract.with_progress_message_contract(request))
+
+        # The same request with thinking off still gets the barrier: nothing
+        # refuses a forced choice there.
+        request["reasoning"] = {"effort": "none"}
+        modified = contract.with_progress_message_contract(request)
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tool_choice"], "required")
+
+        # ``model_reasoning_summary`` is the Codex-shaped spelling of the same
+        # request and counts the same way.
+        request.pop("reasoning")
+        request["model_reasoning_summary"] = "auto"
+        self.assertIsNone(contract.with_progress_message_contract(request))
+
     def test_codex_commentary_discipline_instruction_can_be_disabled(self) -> None:
         hooks, _ = load_hook_module()
         contract = hooks._codex_contract_module

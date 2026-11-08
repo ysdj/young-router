@@ -164,6 +164,34 @@ def with_descendant_cleanup_barrier(
     return modified_kwargs if changed else None
 
 
+def _request_thinks(request_kwargs: dict) -> bool:
+    """Whether this turn asks the model to think before it answers.
+
+    Any ``reasoning`` block with an effort or a summary is that request; an
+    explicit off value is not.
+    """
+
+    reasoning = request_kwargs.get("reasoning")
+    if isinstance(reasoning, str):
+        return reasoning.strip().casefold() not in {"", "none", "off", "null", "false"}
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+        if isinstance(effort, str) and effort.strip().casefold() not in {
+            "", "none", "off", "null", "false", "minimal",
+        }:
+            return True
+        summary = reasoning.get("summary")
+        if isinstance(summary, str) and summary.strip().casefold() not in {
+            "", "none", "off", "null", "false",
+        }:
+            return True
+        return False
+    summary = request_kwargs.get("model_reasoning_summary")
+    if isinstance(summary, str):
+        return summary.strip().casefold() not in {"", "none", "off", "null", "false"}
+    return False
+
+
 def with_progress_message_contract(
     request_kwargs: dict,
 ) -> Optional[dict]:
@@ -187,6 +215,14 @@ def with_progress_message_contract(
     if _routing_module._protocol_fallback_relax_tool_choice(request_kwargs):
         return None
     if request_kwargs.get("tool_choice") not in (None, "auto"):
+        return None
+    if _request_thinks(request_kwargs):
+        # A thinking wire refuses every forced choice, so this one cannot be
+        # kept: measured on the official DeepSeek endpoint with the same
+        # history, ``tool_choice: required`` answers 400 "thinking mode does
+        # not support this tool_choice" and the same request without the field
+        # answers 200.  Forcing here did not hold the turn open -- it ended it,
+        # with an error the client could only resend.
         return None
 
     modified_kwargs = request_kwargs.copy()

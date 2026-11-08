@@ -1687,6 +1687,19 @@ def _install_generic_deployment_failover_patch() -> None:
                         max_retries=retry_budget,
                         configured_delay_seconds=retry_delay_seconds,
                     )
+                    # Asking again with the same bytes gets the same answer
+                    # when the refusal is about a field: a thinking route
+                    # refuses every forced ``tool_choice`` while serving the
+                    # same history with ``auto``.  This proxy is the one that
+                    # put that field there (``codex_contract`` forces
+                    # ``required`` so a progress message cannot end the turn),
+                    # so the retry relaxes it instead of repeating it.
+                    if _routing_module._is_forced_tool_choice_unsupported_error(
+                        exc, kwargs
+                    ):
+                        _routing_module._mark_protocol_fallback_relax_tool_choice(
+                            kwargs
+                        )
                     # This attempt goes back to the route that failed, so that
                     # route must not still be excluded by the failover marking
                     # that ran moments ago.
