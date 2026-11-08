@@ -7873,6 +7873,17 @@ def _record_deployment_failure_for_cooldown(
             exception, request_kwargs, "already_recorded_for_this_attempt"
         )
         return
+    if getattr(exception, "empty_completion", False):
+        # The route finished the turn; the answer was empty because the request
+        # asked for more thinking than its budget allowed.  That is a fact about
+        # the request, and charging it to the route is what let one
+        # ``max_output_tokens: 16`` probe quarantine the fastest route for five
+        # minutes -- the whole of which was served by a relay seven times
+        # slower.
+        _cooldown_failure_declined(
+            exception, request_kwargs, "empty_completion_is_not_a_route_failure"
+        )
+        return
 
     deployment_id = _responses_execution_module._failed_deployment_id(exception) or _deployment_id_from_request(request_kwargs)
     route_key = _responses_execution_module._failed_deployment_route_key(exception) or _deployment_route_key_from_request(

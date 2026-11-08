@@ -118,6 +118,53 @@ class ThinkingToolChoiceRefusalTests(HookTestCase):
         self.assertTrue(states, routing._DEPLOYMENT_COOLDOWNS)
         routing._DEPLOYMENT_COOLDOWNS.clear()
 
+    def _parked_states(self, routing):
+        return [
+            state
+            for state in routing._DEPLOYMENT_COOLDOWNS.values()
+            if isinstance(state, dict) and state.get("cooldown_until")
+        ]
+
+    def test_an_empty_completion_is_not_charged_to_the_route(self) -> None:
+        """A turn that spent its budget thinking says nothing about the route.
+
+        On the live host one ``max_output_tokens: 16`` probe -- ``input: "hi"``
+        with thinking on -- reached the output limit before it wrote any answer,
+        so the proxy ended the read loop on its own empty-completion verdict.
+        That was reported as a cut stream, and a cut stream is quarantined on
+        the first occurrence: ``api.deepseek.com`` was parked for 300 s and
+        every request in that window fell to a relay seven times slower (2298 ms
+        to first byte against 240 ms).  The client-facing code stays what it was;
+        only the route's health record is spared.
+        """
+
+        hooks, _ = load_hook_module()
+        routing = hooks._routing_module
+        streaming = hooks._streaming_module
+        routing._DEPLOYMENT_COOLDOWNS.clear()
+
+        for _ in range(5):
+            empty = streaming._responses_incomplete_stream_exception(
+                "the completion carried no answer",
+                buffer=[],
+                request_data=_route_request(),
+            )
+            empty.empty_completion = True
+            routing._record_deployment_failure_for_cooldown(empty, _route_request())
+
+        self.assertFalse(self._parked_states(routing), routing._DEPLOYMENT_COOLDOWNS)
+
+        # The same stream label without that verdict is still a cut stream, and
+        # a cut stream parks on the first occurrence.
+        cut = streaming._responses_incomplete_stream_exception(
+            "stream ended before response.completed",
+            buffer=[],
+            request_data=_route_request(),
+        )
+        routing._record_deployment_failure_for_cooldown(cut, _route_request())
+        self.assertTrue(self._parked_states(routing), routing._DEPLOYMENT_COOLDOWNS)
+        routing._DEPLOYMENT_COOLDOWNS.clear()
+
     def test_a_validation_refusal_never_parks_anything(self) -> None:
         hooks, _ = load_hook_module()
         routing = hooks._routing_module

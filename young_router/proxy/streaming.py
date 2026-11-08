@@ -5596,6 +5596,15 @@ async def _yield_guarded_original_stream(
             )
         return events
 
+    # An empty completion is this proxy's own verdict, not an upstream cut.  It
+    # ends the read loop the same way, but the two must not be conflated: a cut
+    # stream is evidence against the route and is quarantined on the first
+    # occurrence, while an answer that spent its whole budget thinking is a
+    # request that asked for too little.  Conflated, one ``max_output_tokens:
+    # 16`` probe on a thinking route evicted the fastest route for five minutes,
+    # and every request in that window fell to a relay seven times slower.
+    empty_completion_ended_stream = False
+
     def failed_terminal_event(reason: str, exception: Optional[Exception] = None) -> _JSONStreamEvent:
         failure = exception or _responses_incomplete_stream_exception(reason, buffer=event_tail)
         # Once part of a Responses stream has reached Codex, replaying that
@@ -5669,6 +5678,7 @@ async def _yield_guarded_original_stream(
                 return
             if empty_completed and completed_response_has_output_items(chunk):
                 if not answer_output_seen:
+                    empty_completion_ended_stream = True
                     break
                 # Answer text was streamed, but the fabricated terminal carries
                 # none of it.  Close with what the client actually read instead
@@ -5871,6 +5881,7 @@ async def _yield_guarded_original_stream(
                     return
                 if empty_completed and completed_response_has_output_items(chunk):
                     if not answer_output_seen:
+                        empty_completion_ended_stream = True
                         break
                     completed = completed_terminal_event(
                         "empty completed response after a streamed answer"
@@ -6045,10 +6056,22 @@ async def _yield_guarded_original_stream(
     if not saw_responses_completed:
         if visible_output_seen:
             incomplete_exception = _responses_incomplete_stream_exception(
-                "stream ended before response.completed",
+                (
+                    "the completion carried no answer"
+                    if empty_completion_ended_stream
+                    else "stream ended before response.completed"
+                ),
                 buffer=event_tail,
                 request_data=request_data,
             )
+            if empty_completion_ended_stream:
+                # Nothing was cut: the read loop reached its own end because
+                # the answer was empty.  The client-facing code stays what it
+                # was -- an empty answer still fails the turn -- but the route
+                # is told not to put this on its health record, because the
+                # first-strike quarantine is for a stream that was cut.
+                try: incomplete_exception.empty_completion = True  # type: ignore[attr-defined]
+                except Exception: pass
             if _routing_module._is_local_shutdown_exception(incomplete_exception):
                 # This worker is being replaced, so the stream ended because the
                 # process did -- not because any upstream refused.  Ending with
