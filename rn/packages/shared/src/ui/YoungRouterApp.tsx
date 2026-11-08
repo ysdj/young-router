@@ -1792,6 +1792,24 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       routeDataManagement: translate("card.dataManagement"), routeWebDavSettings: translate("webdav.detailsTitle"), routeProviderWizard: translate("providers.wizard.title"), routeFileEditor: translate("settings.editFile"), routeLogs: translate("card.logs"),
       providerAuthInstruction: translate("relay.officialProviderWebViewHint"),
       providerAuthBlocked: translate("relay.officialProviderAuthBlocked"),
+      // The page's own sign-in surface.  The native hosts never show it: their
+      // station sign-in is a WebKit window, so these strings exist for the one
+      // host that asks for the station account instead of presenting the site.
+      relaySignInTitle: translate("relay.signInTitle", { label: "{label}" }),
+      relaySignInHint: translate("relay.signInHint"),
+      relaySignInOrigin: translate("relay.signInOrigin"),
+      relaySignInAccount: translate("relay.signInAccount"),
+      relaySignInPassword: translate("relay.signInPassword"),
+      relaySignInRemember: translate("relay.signInRemember"),
+      relaySignInRememberHint: translate("relay.signInRememberHint"),
+      relaySignInRejected: translate("relay.signInRejected"),
+      relaySignInUnreachable: translate("relay.signInUnreachable"),
+      relaySignInLimit: translate("relay.loginRefusedElsewhere"),
+      relayBrowserShow: translate("relay.browserShow"),
+      relayBrowserWaiting: translate("relay.browserWaiting"),
+      relayBrowserUnavailable: translate("relay.browserUnavailable"),
+      relayBrowserLaunchFailed: translate("relay.browserLaunchFailed"),
+      relaySignInSubmit: translate("relay.login"),
       logOriginal: translate("logs.originalRecord"),
       providerAuthCode: translate("providers.authUserCode"),
       providerAuthCopy: translate("common.copy"),
@@ -2186,16 +2204,18 @@ function SignOutControl({ native, translate, onSignOut }: {
 }): React.JSX.Element | null {
   if (!native.signOutWebSession) return null;
   const title = translate("status.signOut");
-  return <View style={styles.settingsSignOut}>
-    <NativeButton
-      title={title}
-      symbol="power-off"
-      symbolWithTitle
-      toolTip={title}
-      accessibilityLabel={title}
-      onPress={onSignOut}
-    />
-  </View>;
+  // One glyph at the title band's trailing edge.  The words would be the only
+  // sentence in a row of titles, so the name is the button's hover label and
+  // its accessible name instead of a line beside the icon.
+  return <NativeButton
+    title=""
+    symbol="power-off"
+    compact
+    toolTip={title}
+    accessibilityLabel={title}
+    onPress={onSignOut}
+    style={styles.iconButton}
+  />;
 }
 
 function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, logTabRequest, nativeAction, onSnapshot, onNavigate, onClose, onRegisterFlush }: {
@@ -2314,7 +2334,7 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
     // One column: the route strip is the sidebar, and the pane keeps the whole
     // width underneath it.
     return <View style={[styles.settingsShellFrame, Platform.OS === "web" && styles.webShellFrame]}>
-      <View style={[styles.settingsShellHeader, isWindowsShell && styles.settingsShellHeaderWindows]}>
+      <View style={[styles.settingsShellHeader, styles.compactWebShellHeader, isWindowsShell && styles.settingsShellHeaderWindows]}>
         <View style={styles.compactWebHeader}>
           <Text numberOfLines={1} style={styles.compactWebTitle}>{translate("app.title")}</Text>
           <Text numberOfLines={1} style={styles.compactWebPaneTitle}>{translate(paneTitleKey)}</Text>
@@ -2343,7 +2363,10 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
         <Text numberOfLines={1} style={styles.settingsSidebarTitle}>{translate("app.title")}</Text>
       </View>
       <View style={[styles.settingsPaneHeader, styles.settingsPaneHeaderIntegrated]}>
-        <Text numberOfLines={1} style={styles.settingsPaneTitle}>{translate(paneTitleKey)}</Text>
+        <View style={styles.settingsPaneTitleBlock}>
+          <Text numberOfLines={1} style={styles.settingsPaneTitle}>{translate(paneTitleKey)}</Text>
+        </View>
+        {signOutControl}
       </View>
     </View>
     <View style={styles.settingsShell}>
@@ -2372,7 +2395,6 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
           onSelectionChange={selectPane}
           style={styles.settingsSidebarList}
         />
-        <SignOutControl native={native} translate={translate} onSignOut={signOut} />
         <View style={styles.settingsSidebarSpacer} />
       </View>
       <View style={[styles.settingsDetail, styles.settingsDetailIntegrated]}>
@@ -15224,12 +15246,16 @@ const styles = StyleSheet.create({
   // two, which is why the band carries none and the fill alone states where it
   // ends.
   compactWebHeader: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "baseline", gap: 10, paddingHorizontal: 14, paddingTop: 10, paddingBottom: 8 },
+  // The one action the title band carries, on its trailing edge: the same
+  // 14 pt the title row draws from its own edge, and the glyph centred in the
+  // band rather than pinned to its top.
+  compactWebShellHeader: { alignItems: "center", paddingRight: 14 },
   compactWebTitle: { flexShrink: 0, color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" },
   compactWebPaneTitle: { flexShrink: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   compactWebNav: { flexShrink: 0, paddingHorizontal: 12, paddingBottom: 8 },
   compactWebTabs: { width: "100%" },
   compactWebDetail: { flex: 1, minWidth: 0, minHeight: 0 },
-  settingsShellHeader: { flexShrink: 0, flexDirection: "row", minWidth: 0, backgroundColor: systemColors.separator }, settingsShellHeaderWindows: { backgroundColor: systemColors.window, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, minWidth: 0, flexShrink: 0, minHeight: 0, backgroundColor: systemColors.separator }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderIntegrated: { width: 200, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsSidebarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderRightWidth: 1, borderRightColor: WINDOWS_CONTROL.strokeSubtle }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { height: 8, flexShrink: 0 }, settingsSignOut: { flexShrink: 0, paddingHorizontal: 12, paddingVertical: 6 }, settingsSidebarList: { flex: 1, minWidth: 0, minHeight: 0 }, settingsPaneHeader: { flexShrink: 0, paddingHorizontal: SETTINGS_PANE_INSET, paddingTop: 10, paddingBottom: 8 }, settingsPaneHeaderIntegrated: { flex: 1, minWidth: 0, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailIntegrated: { paddingTop: 0 }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: SETTINGS_PANE_INSET, paddingTop: SETTINGS_HEADER_LEAD, paddingBottom: SETTINGS_HEADER_GAP, backgroundColor: systemColors.window }, settingsRailDetailHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
+  settingsShellHeader: { flexShrink: 0, flexDirection: "row", minWidth: 0, backgroundColor: systemColors.separator }, settingsShellHeaderWindows: { backgroundColor: systemColors.window, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, minWidth: 0, flexShrink: 0, minHeight: 0, backgroundColor: systemColors.separator }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderIntegrated: { width: 200, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsSidebarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderRightWidth: 1, borderRightColor: WINDOWS_CONTROL.strokeSubtle }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { height: 8, flexShrink: 0 }, settingsSidebarList: { flex: 1, minWidth: 0, minHeight: 0 }, settingsPaneHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: SETTINGS_PANE_INSET, paddingTop: 10, paddingBottom: 8 }, settingsPaneTitleBlock: { flex: 1, minWidth: 0 }, settingsPaneHeaderIntegrated: { flex: 1, minWidth: 0, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailIntegrated: { paddingTop: 0 }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: SETTINGS_PANE_INSET, paddingTop: SETTINGS_HEADER_LEAD, paddingBottom: SETTINGS_HEADER_GAP, backgroundColor: systemColors.window }, settingsRailDetailHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
   routeStatusBar: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, justifyContent: "space-between", paddingHorizontal: 16, paddingVertical: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusBarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderTopColor: WINDOWS_CONTROL.strokeSubtle }, routeStatusTextWindows: { color: WINDOWS_CONTROL.textSecondary }, routeStatusLead: { minWidth: 0, flex: 1, flexDirection: "row", alignItems: "center", gap: 6 },
   // The usage pager is the window's status bar on this tab: the row count stays
   // on the left where every other route states its status, and the page controls

@@ -755,6 +755,32 @@ export interface NativeLocalization {
   providerAuthCode?: string;
   providerAuthCopy?: string;
   providerAuthBlocked?: string;
+  /**
+   * The page's station sign-in form.  A browser host has no WebKit the station
+   * could sign into, so its answer is a form Core posts itself; these are the
+   * words around it.  `relaySignInTitle` carries the account's label as
+   * `{label}`.
+   */
+  relaySignInTitle?: string;
+  relaySignInHint?: string;
+  relaySignInOrigin?: string;
+  relaySignInAccount?: string;
+  relaySignInPassword?: string;
+  relaySignInRemember?: string;
+  relaySignInRememberHint?: string;
+  relaySignInRejected?: string;
+  relaySignInUnreachable?: string;
+  relaySignInLimit?: string;
+  /** What the wait says while Core holds the station's window open. */
+  /** The window case's action that raises a sign-in window again. */
+  relayBrowserShow?: string;
+  relayBrowserWaiting?: string;
+  /** A sign-in window that could not be opened at all, named as a sentence. */
+  relayBrowserUnavailable?: string;
+  /** A browser was installed and the window never appeared. */
+  relayBrowserLaunchFailed?: string;
+  /** The form's own primary button; the panes' word for the same action. */
+  relaySignInSubmit?: string;
   /** The read-only code viewer's own record label, read to a screen reader. */
   logOriginal?: string;
   modelChooserTitle: string;
@@ -988,6 +1014,8 @@ export interface NativeLeafAdapter {
     origin: string;
     language: LanguagePreference;
     username?: string;
+    /** The account's own remember-password preference, so a re-sign-in does not silently clear it. */
+    rememberPassword?: boolean;
     embedded?: boolean;
     /** Pending login: Core creates the account shell only after sign-in succeeds. */
     pendingAccount?: boolean;

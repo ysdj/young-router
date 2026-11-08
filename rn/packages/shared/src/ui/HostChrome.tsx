@@ -17,7 +17,7 @@
 
 import React from "react";
 import { Platform, ScrollView, StyleProp, StyleSheet, Text, View, ViewStyle } from "react-native";
-import { NativeButton, NativeCheckbox, NativeTextField, WINDOWS_CONTROL } from "./NativeControls";
+import { NativeBusySpinner, NativeButton, NativeCheckbox, NativeTextField, WINDOWS_CONTROL } from "./NativeControls";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 import { pushPresentation } from "../platform/presentationStack";
 import {
@@ -27,6 +27,7 @@ import {
   subscribeHostChrome,
   topHostChrome,
   type HostChromeRequest,
+  type MirrorSurface,
 } from "../platform/hostChrome";
 
 const COLOR = {
@@ -65,6 +66,9 @@ export function HostChromeHost(): React.JSX.Element | null {
     case "prompt": return <PromptSurface request={request} />;
     case "viewer": return <ViewerSurface request={request} />;
     case "picker": return <PickerSurface request={request} />;
+    case "relaySignIn": return <RelaySignInSurface request={request} />;
+    case "relayBrowser": return <RelayBrowserSurface request={request} />;
+    case "notice": return <NoticeSurface request={request} />;
     case "menu": return <MenuSurface request={request} />;
   }
 }
@@ -119,6 +123,204 @@ function PromptSurface({ request }: { request: Extract<HostChromeRequest, { kind
         accessibilityLabel={request.title}
       />
     </View>
+  </DialogFrame>;
+}
+
+/**
+ * The page's answer to the native hosts' sign-in window.
+ *
+ * A page cannot present the station's own login page: that document belongs to
+ * another origin, so its cookies are unreadable here and an iframe of it would
+ * still be another site's session.  What the page can do is collect the
+ * station account's credentials and let Core post the same form the station's
+ * page would have posted — the session then arrives through the one verified
+ * login boundary every host already uses.  The form stays up on a refusal: the
+ * station's reason is drawn beside fields that still hold what was typed.
+ *
+ * The password never enters React state.  It lives in a ref filled by the
+ * field's own change event, the same way the settings secret field keeps Core's
+ * plaintext out of the render path; only "something was typed" is state, so the
+ * submit button can enable.
+ */
+function RelaySignInSurface({ request }: { request: Extract<HostChromeRequest, { kind: "relaySignIn" }> }): React.JSX.Element {
+  const labels = request.labels;
+  const [username, setUsername] = React.useState(request.username);
+  // A re-sign-in opens on the account's own answer: an existing 记住密码 that
+  // silently flipped off would clear a saved password nobody asked to clear.
+  const [remember, setRemember] = React.useState(request.rememberPassword);
+  const [hasPassword, setHasPassword] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const [failure, setFailure] = React.useState("");
+  const password = React.useRef("");
+  const ready = username.trim() !== "" && hasPassword && !busy;
+  const submit = (): void => {
+    if (!ready) return;
+    setBusy(true);
+    setFailure("");
+    void request.submit({ username: username.trim(), password: password.current, rememberPassword: remember }).then((outcome) => {
+      if (outcome.ok) {
+        settleHostChrome(request, outcome.value);
+        return;
+      }
+      setBusy(false);
+      setFailure(outcome.message);
+    }).catch(() => {
+      // The submit is the host's own exchange and states its refusals itself;
+      // a throw here is a broken bridge, and a form left busy forever would be
+      // worse than one that lets the person try again.
+      setBusy(false);
+    });
+  };
+  return <DialogFrame
+    title={request.title}
+    footer={<>
+      <View style={styles.footerSpacer} />
+      <NativeButton title={labels.cancel} compact disabled={busy} onPress={() => settleHostChrome(request, undefined)} />
+      <NativeButton title={labels.submit} compact primary busy={busy} disabled={!ready} onPress={submit} />
+    </>}
+  >
+    <ScrollView style={styles.cardBody} contentContainerStyle={styles.cardBodyContent}>
+      <Text style={styles.bodyText}>{request.hint}</Text>
+      <View style={styles.signInField}>
+        <Text style={styles.signInLabel}>{labels.origin}</Text>
+        <Text selectable numberOfLines={2} style={styles.signInOrigin}>{request.origin}</Text>
+      </View>
+      <View style={styles.signInField}>
+        <Text style={styles.signInLabel}>{labels.username}</Text>
+        <NativeTextField
+          value={username}
+          // A row that already knows the account starts at the password; an
+          // empty one starts at the account. Exactly one field owns the focus.
+          autoFocus={request.username.trim() === ""}
+          editable={!busy}
+          autoCapitalize="none"
+          autoCorrect={false}
+          onChangeText={(next) => { setUsername(next); setFailure(""); }}
+          onSubmitEditing={submit}
+          accessibilityLabel={labels.username}
+          style={styles.signInInput}
+        />
+      </View>
+      <View style={styles.signInField}>
+        <Text style={styles.signInLabel}>{labels.password}</Text>
+        <NativeTextField
+          secureTextEntry
+          autoFocus={request.username.trim() !== ""}
+          editable={!busy}
+          autoCapitalize="none"
+          autoCorrect={false}
+          onChangeText={(next) => { password.current = next; setHasPassword(next !== ""); setFailure(""); }}
+          onSubmitEditing={submit}
+          accessibilityLabel={labels.password}
+          style={styles.signInInput}
+        />
+      </View>
+      <NativeCheckbox label={labels.remember} value={remember} disabled={busy} onValueChange={setRemember} />
+      <Text style={styles.signInHint}>{labels.rememberHint}</Text>
+      {failure ? <Text accessibilityLiveRegion="polite" style={styles.signInFailure}>{failure}</Text> : null}
+    </ScrollView>
+  </DialogFrame>;
+}
+
+/**
+ * Waiting for the browser window Core opened at the station.
+ *
+ * The window is the station's own page and the person is using it, not this
+ * document; all this surface does is state that the sign-in is happening, name
+ * the browser it happens in, and offer 取消.  It deliberately has no fields: a
+ * captcha, a code, or a redirect finished in the real window is what this host
+ * cannot draw, and drawing an empty box where a login page should be is the
+ * failure it replaces.
+ */
+function RelayBrowserSurface({ request }: { request: Extract<HostChromeRequest, { kind: "relayBrowser" }> }): React.JSX.Element {
+  return <DialogFrame
+    title={request.title}
+    footer={<>
+      <View style={styles.footerSpacer} />
+      {request.mirror ? null : <NativeButton title={request.showLabel} compact onPress={request.show} />}
+      <NativeButton title={request.cancelLabel} compact onPress={() => settleHostChrome(request, undefined)} />
+    </>}
+  >
+    {request.mirror
+      ? <MirrorScreen mirror={request.mirror} title={request.title} />
+      : <View style={styles.cardBodyContent}>
+          <View style={styles.browserWaitRow}>
+            <NativeBusySpinner label={request.title} />
+            <Text style={styles.bodyText}>{request.body}</Text>
+          </View>
+          <Text style={styles.signInHint}>{request.browser}</Text>
+        </View>}
+  </DialogFrame>;
+}
+
+/**
+ * The station's own page, as the frames Core sends.
+ *
+ * Every way a station signs a person in — a password form, a code, a captcha,
+ * an OAuth redirect — happens on that real page, so this draws what it draws
+ * and forwards what the person does: a click at the picture's own coordinates,
+ * a key, a wheel.  The picture is not an `<img>` to be saved or dragged; it is
+ * a screen, so the click that focuses it is the click that reaches the page.
+ */
+function MirrorScreen({ mirror, title }: { mirror: MirrorSurface; title: string }): React.JSX.Element {
+  const frame = React.useSyncExternalStore(mirror.subscribe, mirror.frame, mirror.frame);
+  const map = (element: { clientWidth: number; clientHeight: number }, x: number, y: number) => ({
+    x: Math.round((x * mirror.width) / Math.max(1, element.clientWidth)),
+    y: Math.round((y * mirror.height) / Math.max(1, element.clientHeight)),
+  });
+  return <View style={[styles.browserFrame, { aspectRatio: mirror.width / mirror.height, height: undefined }]}>
+    {frame
+      ? React.createElement("img", {
+          // The picture carries no words of its own; the dialog title names it.
+          alt: title,
+          src: frame,
+          draggable: false,
+          tabIndex: 0,
+          onDragStart: (event: { preventDefault: () => void }) => event.preventDefault(),
+          onClick: (event: { nativeEvent: { offsetX: number; offsetY: number; currentTarget: { clientWidth: number; clientHeight: number } } }) => {
+            const point = map(event.nativeEvent.currentTarget, event.nativeEvent.offsetX, event.nativeEvent.offsetY);
+            mirror.send({ type: "click", ...point });
+          },
+          onKeyDown: (event: { key: string; ctrlKey: boolean; metaKey: boolean; altKey: boolean; preventDefault: () => void }) => {
+            if (event.ctrlKey || event.metaKey || event.altKey) return;
+            if (event.key.length === 1) {
+              mirror.send({ type: "text", text: event.key });
+              return;
+            }
+            // Enter, Tab, Backspace and the arrows are the keys a form moves
+            // with; anything else is left to the browser's own shortcut.
+            if (MIRROR_KEYS.has(event.key)) {
+              event.preventDefault();
+              mirror.send({ type: "key", key: event.key });
+            }
+          },
+          onWheel: (event: { deltaY: number; preventDefault: () => void }) => {
+            event.preventDefault();
+            mirror.send({ type: "wheel", deltaY: Math.round(event.deltaY) });
+          },
+          style: { width: "100%", height: "100%", display: "block", objectFit: "contain", cursor: "default", outline: "none" },
+        })
+      : <View style={styles.browserWaitRow}>
+          <NativeBusySpinner label={title} />
+        </View>}
+  </View>;
+}
+
+/** The keys this pane forwards; everything else stays the browser's. */
+const MIRROR_KEYS = new Set(["Enter", "Tab", "Backspace", "Delete", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End"]);
+
+/** One statement and its one button; see `notice` in `platform/hostChrome`. */
+function NoticeSurface({ request }: { request: Extract<HostChromeRequest, { kind: "notice" }> }): React.JSX.Element {
+  return <DialogFrame
+    title={request.title}
+    footer={<>
+      <View style={styles.footerSpacer} />
+      <NativeButton title={request.closeLabel} compact primary onPress={() => settleHostChrome(request, undefined)} />
+    </>}
+  >
+    <ScrollView style={styles.cardBody} contentContainerStyle={styles.cardBodyContent}>
+      <Text style={styles.bodyText}>{request.message}</Text>
+    </ScrollView>
   </DialogFrame>;
 }
 
@@ -301,6 +503,20 @@ const styles = StyleSheet.create({
   footerSpacer: { flex: 1 },
   footerStatus: { flex: 1, minWidth: 0, color: COLOR.secondary, fontSize: UI_TIP_FONT_SIZE },
   promptField: { minHeight: 26 },
+  // The sign-in form is a field stack, not a sentence: the label owns the row
+  // above its own control, as every settings field does, and the station is a
+  // value (a selectable address), not a second title.
+  signInField: { gap: 3 },
+  signInLabel: { color: COLOR.secondary, fontSize: UI_TIP_FONT_SIZE },
+  signInOrigin: { color: COLOR.text, fontSize: UI_TIP_FONT_SIZE, fontFamily: Platform.OS === "web" ? "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" : "Menlo" },
+  signInInput: { minHeight: 26 },
+  signInHint: { color: COLOR.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
+  signInFailure: { color: WINDOWS_CONTROL.danger, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
+  browserWaitRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  // The streamed screen is a 560x820 station page.  The box takes the pane's
+  // width and keeps that page's own aspect, so a click lands where the person
+  // aimed: the picture is scaled, never re-laid-out.
+  browserFrame: { width: "100%", height: 520, overflow: "hidden", backgroundColor: "#000" },
   // A chooser holds names, not a sentence: the native panel is 620 pt wide
   // because a model id is read in full.  Its head states the provider and key
   // it is choosing for, and the count sits on the controls' baseline at the

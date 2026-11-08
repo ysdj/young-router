@@ -21,6 +21,32 @@ export type HostChromeMenuItem = { title: string; enabled?: boolean; checked?: b
 
 export type HostChromeAnchor = { x: number; y: number; width: number; height: number };
 
+/** What the page's sign-in form hands back when the station accepted it. */
+export type RelaySignInAnswer = { revision: number; loginStatus: "signed_in"; username: string };
+
+/**
+ * The answer one submit attempt gives the surface.
+ *
+ * A refusal stays *inside* the form: the surface draws the reason beside the
+ * fields and keeps what the person typed, because the one thing a failed
+ * station sign-in must not do is make someone retype their account and
+ * password.  Only an accepted sign-in settles the request.
+ */
+export type RelaySignInOutcome =
+  | { ok: true; value: RelaySignInAnswer }
+  | { ok: false; message: string };
+
+/** One sign-in's streamed screen: the latest frame and the input path back. */
+export type MirrorSurface = {
+  width: number;
+  height: number;
+  /** The newest frame as a data URL, or "" until the first one arrives. */
+  frame: () => string;
+  subscribe: (listener: () => void) => () => void;
+  /** Forward one click, key or wheel to the browser Core is running. */
+  send: (event: Record<string, unknown>) => void;
+};
+
 type Base = { id: number };
 
 export type HostChromeRequest =
@@ -58,6 +84,71 @@ export type HostChromeRequest =
       };
       resolve: (models: string[] | undefined) => void;
     })
+  | (Base & {
+      kind: "relaySignIn";
+      title: string;
+      origin: string;
+      /** The account name the row already knows, pre-filled. */
+      username: string;
+      /** The account's own remember-password preference, as the box opens. */
+      rememberPassword: boolean;
+      hint: string;
+      labels: {
+        origin: string;
+        username: string;
+        password: string;
+        remember: string;
+        rememberHint: string;
+        submit: string;
+        cancel: string;
+      };
+      submit: (credentials: { username: string; password: string; rememberPassword: boolean }) => Promise<RelaySignInOutcome>;
+      resolve: (answer: RelaySignInAnswer | undefined) => void;
+    })
+  | (Base & {
+      /**
+       * Waiting for a real browser window Core opened at the station.
+       *
+       * The window is the station's own page, so a captcha, a code, or an
+       * OAuth redirect finishes there.  This surface states what is being
+       * waited for and offers the one action a wait needs: cancel.
+       */
+      kind: "relayBrowser";
+      title: string;
+      body: string;
+      browser: string;
+      cancelLabel: string;
+      /** Raise the window again, for one that opened behind everything else. */
+      showLabel: string;
+      show: () => void;
+      /**
+       * The station's own page, drawn from frames Core streams.
+       *
+       * A server has no screen to put a window on, and a page opened through a
+       * reverse proxy is not on the machine running Core.  Both run the browser
+       * headless and send its frames here: the person clicks and types into
+       * this picture, and Core turns that back into input on the real page.
+       */
+      mirror?: MirrorSurface;
+      resolve: () => void;
+    })
+  | (Base & {
+      /**
+       * One statement, one button.
+       *
+       * A page has no menu bar and no system alert, so "this host cannot do
+       * that, here is what to do instead" needs a surface of its own: a
+       * question (`confirm`) would ask for a decision nobody is making, and a
+       * viewer would draw it as a record.  Used where a capability is absent
+       * rather than refused — the editor's Paste item on a page served over
+       * plain HTTP, where the browser withholds the clipboard read API.
+       */
+      kind: "notice";
+      title: string;
+      message: string;
+      closeLabel: string;
+      resolve: () => void;
+    })
   | (Base & { kind: "menu"; title: string; items: HostChromeMenuItem[]; anchor: HostChromeAnchor; resolve: (index: number | undefined) => void });
 
 /** A request before the store assigns its id and settle callback. */
@@ -65,6 +156,9 @@ type RequestBody = Omit<Extract<HostChromeRequest, { kind: "confirm" }>, "id" | 
   | Omit<Extract<HostChromeRequest, { kind: "prompt" }>, "id" | "resolve">
   | Omit<Extract<HostChromeRequest, { kind: "viewer" }>, "id" | "resolve">
   | Omit<Extract<HostChromeRequest, { kind: "picker" }>, "id" | "resolve">
+  | Omit<Extract<HostChromeRequest, { kind: "relaySignIn" }>, "id" | "resolve">
+  | Omit<Extract<HostChromeRequest, { kind: "relayBrowser" }>, "id" | "resolve">
+  | Omit<Extract<HostChromeRequest, { kind: "notice" }>, "id" | "resolve">
   | Omit<Extract<HostChromeRequest, { kind: "menu" }>, "id" | "resolve">;
 
 let requests: HostChromeRequest[] = [];
@@ -96,6 +190,9 @@ export function dismissalFor(request: HostChromeRequest): unknown {
     case "prompt": return null;
     case "viewer": return undefined;
     case "picker": return undefined;
+    case "relaySignIn": return undefined;
+    case "relayBrowser": return undefined;
+    case "notice": return undefined;
     case "menu": return undefined;
   }
 }
@@ -134,4 +231,22 @@ export function settleHostChrome(request: HostChromeRequest, answer: unknown): v
 /** Close every open request with its dismissing answer, topmost first. */
 export function dismissHostChrome(): void {
   for (const request of [...requests].reverse()) settleHostChrome(request, dismissalFor(request));
+}
+
+/**
+ * End the open surface of one kind, if there is one.
+ *
+ * The relay sign-in is the one host surface a caller has to be able to end from
+ * outside: 取消登录 in the wizard, a second press that starts a new sign-in, and
+ * a host that is replaced while the form is up all mean the same thing — the
+ * question is no longer being asked.  Closing every surface here would take the
+ * decision dialog behind it as well, which is the failure the one stack exists
+ * to avoid.
+ */
+export function cancelHostChrome(kind: HostChromeRequest["kind"]): void {
+  for (const request of [...requests].reverse()) {
+    if (request.kind !== kind) continue;
+    settleHostChrome(request, dismissalFor(request));
+    return;
+  }
 }

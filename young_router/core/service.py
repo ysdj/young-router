@@ -22,6 +22,7 @@ from pathlib import Path
 import re
 import secrets
 import stat
+import tempfile
 import threading
 import time
 import uuid
@@ -1117,6 +1118,12 @@ class CoreStore:
         # When a user action last reached this store.  An automatic WebDAV sync
         # holds the store for its whole round trip, so it waits for quiet.
         self._last_activity = time.monotonic()
+        # The page host's sign-in windows: a real browser this Core launched at
+        # a station's own address, keyed by the id the page polls.  They live
+        # here rather than in a domain because a window is not configuration --
+        # nothing about it is written down, and a Core that stops takes them
+        # with it (see ``_shutdown_browser_logins``).
+        self._browser_logins: dict[str, dict[str, Any]] = {}
         self._disk: dict[str, dict[str, Any]] = {}
         self._disk_identities: dict[str, str | None] = {}
         self._logs: dict[str, dict[str, Any]] = {
@@ -1403,6 +1410,10 @@ class CoreStore:
 
         self._stop_webdav_scheduler()
         self._stop_image_context_sweeper()
+        # A sign-in window this Core opened belongs to this Core: a replacement
+        # or a quit must not leave a browser running on a throwaway profile that
+        # nobody will ever collect.
+        self._close_browser_logins()
         # Nobody may start a proxy behind this stop.  The flag is set before
         # the loop is joined, so a pass that is between its check and its own
         # start sees it; a pass already inside the replacement holds the
@@ -2518,16 +2529,61 @@ class CoreStore:
                     or matching.get("origin") != origin
                 ):
                     raise CoreError("relay_login_failed", "Relay account does not match the saved site")
-                public = accepter(
-                    str(account_id),
-                    username=str(username),
-                    cookie=str(cookie) if isinstance(cookie, str) else "",
-                    access_token=str(access_token) if isinstance(access_token, str) else "",
-                    refresh_token=str(refresh_token) if isinstance(refresh_token, str) else "",
-                    password=str(password) if isinstance(password, str) else "",
-                    user_id=user_id,
-                    remember_password=remember_choice,
-                )
+                host_session = cookie if isinstance(cookie, str) else ""
+                host_token = access_token if isinstance(access_token, str) else ""
+                if host_session or host_token:
+                    public = accepter(
+                        str(account_id),
+                        username=str(username),
+                        cookie=host_session,
+                        access_token=host_token,
+                        refresh_token=str(refresh_token) if isinstance(refresh_token, str) else "",
+                        password=str(password) if isinstance(password, str) else "",
+                        user_id=user_id,
+                        remember_password=remember_choice,
+                    )
+                else:
+                    # A host with no browser of its own (the page host) sends
+                    # the station account's credentials instead of a session
+                    # cookie: a cookie minted in another tab is unreadable from
+                    # the page, and the station's login page cannot be run
+                    # under this app's origin.  Core posts the same form the
+                    # station's page would have posted, so the session still
+                    # arrives through the one verified-login boundary.  The
+                    # codes name the reason the form has to show, since the
+                    # station's own sentence is English Core prose and the
+                    # pane's words are already localized.
+                    from .domains.relay_accounts import (
+                        RelayAccountsError,
+                        RelaySessionLimitError,
+                        RelayTransportError,
+                    )
+
+                    signer = getattr(relay, "sign_in_with_password", None)
+                    if (
+                        not callable(signer)
+                        or not isinstance(username, str)
+                        or not username.strip()
+                        or not isinstance(password, str)
+                        or not password
+                    ):
+                        raise CoreError("relay_login_failed", "Relay login result is incomplete")
+                    try:
+                        public = signer(
+                            str(account_id),
+                            username=username,
+                            password=password,
+                            remember_password=remember_choice,
+                        )
+                    except RelaySessionLimitError:
+                        raise CoreError(
+                            "relay_session_limit",
+                            "Relay login was refused: the station's concurrent-session limit is reached",
+                        ) from None
+                    except RelayTransportError:
+                        raise CoreError("relay_unreachable", "Relay is unavailable") from None
+                    except RelayAccountsError:
+                        raise CoreError("relay_login_rejected", "Relay login was rejected") from None
                 # Login is the durable browser-session boundary. Resource
                 # discovery is a separate explicit action so a station API
                 # outage cannot change the result of a successful sign-in.
@@ -2577,6 +2633,302 @@ class CoreStore:
                 "login_status": "signed_in",
                 "username": str(public.get("username", username)),
             }
+
+    def start_relay_browser_login(
+        self,
+        *,
+        account_id: object,
+        account_type: object,
+        label: object,
+        origin: object,
+        username: object = "",
+        pending_account: object = False,
+        station_id: object = None,
+        station_name: object = None,
+        station_type: object = None,
+        station_origin: object = None,
+        page_is_local: bool = True,
+    ) -> dict[str, Any]:
+        """Open a real browser at a station so a page host can sign in.
+
+        The two native hosts present the station's own login page in a WebKit
+        view they own; a browser page cannot (another origin's cookies are
+        unreadable there, and the station's page cannot be served under this
+        app's origin).  What it can do is ask the Core beside it — same
+        machine, same person — to open that page in a real browser.  The
+        window is the station's own, so a captcha, a code, or a redirect works
+        exactly as it does in any browser; Core then reads the session that
+        browser holds and finishes the same verified-login boundary the native
+        hosts use.
+
+        Nothing is created here: a pending account still exists only after the
+        station accepted a session.  The window and the throwaway profile are
+        this Core's, closed with it (see ``_close_browser_logins``).
+        """
+
+        from . import relay_browser
+
+        # A published page is open in somebody else's browser -- a gateway, a
+        # server, a machine on the LAN.  A window this Core opened would appear
+        # on the server's screen (if it has one), which is not where the person
+        # is; so is a machine with no screen at all.  Both run the browser
+        # headless and stream its frames to the page.
+        embedded = (not page_is_local) or relay_browser.embedded_display()
+        reason = relay_browser.unavailable_reason()
+        if reason:
+            return {"status": "unsupported", "reason": reason}
+        if not isinstance(origin, str) or not origin.strip():
+            raise CoreError("relay_login_failed", "Relay origin is invalid")
+        with self._lock:
+            relay = self._domains.get("relay_accounts")
+            if relay is None or not callable(getattr(relay, "verify_browser_session", None)):
+                raise CoreError("relay_login_failed", "Relay account is unavailable")
+            # A window somebody opened and walked away from holds a browser and
+            # a profile; the next sign-in is the one moment this side can see it.
+            # Taken out of the map here and closed *after* the lock: stopping a
+            # process and waiting for it is seconds, and every window's snapshot
+            # needs this lock.
+            stale = [entry for entry in self._browser_logins.values() if entry["browser"].expired]
+            if stale:
+                self._browser_logins = {
+                    key: entry for key, entry in self._browser_logins.items() if not entry["browser"].expired
+                }
+            login_id = secrets.token_urlsafe(18)
+            profile_root = self._relay_browser_profiles_root()
+        for entry in stale:
+            try:
+                entry["browser"].close()
+            except Exception:
+                pass
+        try:
+            browser = relay_browser.launch(
+                origin.strip(),
+                profile_root=profile_root,
+                account_id=str(account_id),
+                embedded=embedded,
+            )
+        except relay_browser.BrowserUnavailable:
+            return {"status": "unsupported", "reason": "no_browser"}
+        except relay_browser.BrowserLaunchFailed:
+            # A browser is installed and this launch did not reach it: the
+            # window never appeared, so the pane must not pretend one is open.
+            # The page says so and offers the credential form instead.
+            return {"status": "unsupported", "reason": "launch_failed"}
+        with self._lock:
+            self._browser_logins[login_id] = {
+                "browser": browser,
+                "account_id": str(account_id),
+                "type": str(account_type),
+                "label": str(label),
+                "origin": origin.strip(),
+                "username": str(username) if isinstance(username, str) else "",
+                "pending_account": pending_account is True,
+                "station_id": station_id,
+                "station_name": station_name,
+                "station_type": station_type,
+                "station_origin": station_origin,
+                "last_cookie": "",
+            }
+        result: dict[str, Any] = {"login_id": login_id, "browser": browser.browser.name, "status": "waiting"}
+        mirror = getattr(browser, "mirror", None)
+        if mirror is not None:
+            # The page draws the station itself, from the frames this session
+            # streams, at exactly the size the browser was opened.
+            result["mirror"] = {"width": int(mirror.width), "height": int(mirror.height)}
+        return result
+
+    def relay_browser_mirror(self, login_id: object) -> Mapping[str, Any] | None:
+        """The session one login streams from, or None.
+
+        Frames and input are answered only for a login that exists here, which
+        is what keeps one page from driving another person's browser: the id
+        is minted per sign-in and never leaves the page that asked for it.
+        """
+
+        with self._lock:
+            entry = self._browser_logins.get(str(login_id))
+        if entry is None:
+            return None
+        browser = entry.get("browser")
+        if browser is None or getattr(browser, "expired", False):
+            return None
+        mirror = getattr(browser, "mirror", None)
+        return browser if mirror is not None else None
+
+    def poll_relay_browser_login(self, login_id: object) -> dict[str, Any]:
+        """Answer whether the browser window has produced a usable session.
+
+        A jar read is not a login: the cookie is offered to the station, and
+        only a profile answer accepts it.  A station that refuses (or a jar
+        that holds only its own consent cookies) leaves the window open and the
+        caller waiting; the cookie is remembered so the same refused jar is not
+        sent to the station on every poll.
+        """
+
+        from .domains.relay_accounts import RelayAccountsError, RelayTransportError
+
+        with self._lock:
+            entry = self._browser_logins.get(str(login_id))
+        if entry is None:
+            return {"status": "unknown"}
+        browser = entry["browser"]
+        if browser.expired:
+            self._forget_browser_login(str(login_id))
+            return {"status": "expired"}
+        if browser.process.poll() is not None:
+            # The window is gone.  A session it produced before closing is
+            # still a session — the person may have closed the window right
+            # after the station answered — so the jar is read once more before
+            # the close is reported.
+            outcome = self._verify_browser_jar(str(login_id), entry)
+            self._forget_browser_login(str(login_id))
+            if outcome is not None:
+                return outcome
+            return {"status": "closed"}
+        outcome = self._verify_browser_jar(str(login_id), entry)
+        if outcome is not None:
+            self._forget_browser_login(str(login_id))
+            return outcome
+        with self._lock:
+            current = self._browser_logins.get(str(login_id))
+            if current is None:
+                return {"status": "closed"}
+            if current["last_cookie"] == entry["last_cookie"] and current.get("last_error"):
+                return {"status": "waiting", "detail": current["last_error"]}
+        return {"status": "waiting"}
+
+    def _verify_browser_jar(self, login_id: str, entry: Mapping[str, Any]) -> dict[str, Any] | None:
+        """Offer one jar to the station; answer a finished login, or None.
+
+        The jar is only sent when it changed since the last attempt, so a page
+        polling once a second does not turn into one station login attempt a
+        second.  ``None`` means "still waiting"; a returned mapping ends the
+        sign-in.
+        """
+
+        from . import relay_browser
+        from .domains.relay_accounts import RelayAccountsError, RelayTransportError
+
+        browser = entry["browser"]
+        try:
+            cookies = browser.cookies()
+            storage = browser.storage()
+        except Exception:
+            return None
+        header = relay_browser.cookie_header(cookies, entry["origin"])
+        if not header:
+            return None
+        token = ""
+        for key in ("access_token", "token", "accessToken", "auth_token"):
+            value = storage.get(key)
+            if isinstance(value, str) and value.strip():
+                token = value.strip()
+                break
+        user_id = str(storage.get("id") or storage.get("user_id") or storage.get("userId") or "")
+        signature = f"{header}\u0000{token}\u0000{user_id}"
+        if entry.get("last_cookie") == signature:
+            return None
+        entry["last_cookie"] = signature
+        with self._lock:
+            relay = self._domains.get("relay_accounts")
+            verifier = getattr(relay, "verify_browser_session", None) if relay is not None else None
+        if not callable(verifier):
+            return None
+        try:
+            verified = verifier(
+                origin=entry["origin"],
+                account_type=entry["type"],
+                cookie=header,
+                access_token=token,
+                user_id=user_id,
+            )
+        except RelayTransportError:
+            return None
+        except RelayAccountsError:
+            # The station answered and did not accept this jar: the window stays
+            # up and the person is still signing in.
+            return None
+        except Exception:
+            return None
+        return self._accept_browser_session(entry, verified)
+
+    def _accept_browser_session(self, entry: Mapping[str, Any], verified: Mapping[str, Any]) -> dict[str, Any]:
+        """Hand one verified browser session to the one login boundary."""
+
+        try:
+            result = self.accept_relay_login(
+                account_id=entry["account_id"],
+                account_type=entry["type"],
+                label=entry["label"],
+                origin=entry["origin"],
+                username=str(verified.get("username") or entry["username"]),
+                cookie=str(verified.get("cookie", "")),
+                access_token=str(verified.get("access_token", "")),
+                user_id=str(verified.get("user_id", "")),
+                station_id=entry["station_id"],
+                station_name=entry["station_name"],
+                station_type=entry["station_type"],
+                station_origin=entry["station_origin"],
+                pending_account=entry["pending_account"] is True,
+            )
+        except CoreError as exc:
+            return {"status": "rejected", "code": exc.code}
+        return {"status": "signed_in", **{key: value for key, value in result.items() if key != "status"}}
+
+    def focus_relay_browser_login(self, login_id: object) -> dict[str, Any]:
+        """Bring one sign-in window back to the front.
+
+        A window that opened behind the person's own browser, or onto another
+        Space, is a window they cannot find; the waiting surface offers one
+        press that raises it instead of leaving them to guess.
+        """
+
+        with self._lock:
+            entry = self._browser_logins.get(str(login_id))
+        if entry is None:
+            return {"focused": False}
+        try:
+            focused = bool(entry["browser"].focus())
+        except Exception:
+            focused = False
+        return {"focused": focused}
+
+    def cancel_relay_browser_login(self, login_id: object) -> dict[str, Any]:
+        """End one sign-in window, and answer whether there was one."""
+
+        return {"cancelled": self._forget_browser_login(str(login_id))}
+
+    def _forget_browser_login(self, login_id: str) -> bool:
+        with self._lock:
+            entry = self._browser_logins.pop(login_id, None)
+        if entry is None:
+            return False
+        entry["browser"].close()
+        return True
+
+    def _close_browser_logins(self) -> None:
+        with self._lock:
+            entries = list(self._browser_logins.values())
+            self._browser_logins.clear()
+        for entry in entries:
+            try:
+                entry["browser"].close()
+            except Exception:
+                pass
+
+    def _relay_browser_profiles_root(self) -> Path:
+        """Where throwaway sign-in profiles live.
+
+        Beside the Core metadata when the host states one (both native hosts
+        do) so a profile never lands in the person's home; a temporary
+        directory otherwise.  Each launch makes its own subdirectory inside it.
+        """
+
+        if self._metadata_store is not None:
+            root = Path(self._metadata_store.path).expanduser().parent / ".relay-browser"
+        else:
+            root = Path(tempfile.gettempdir()) / "young-router-relay-browser"
+        return root
 
     def refresh_relay_resources(
         self,
@@ -3526,7 +3878,7 @@ class CoreStore:
                     webdav_operations.pull_bundle(client, settings, config_path, state_path, "pull")
                     pulled = True
                 else:
-                    local_manifest, local_digests = webdav_core.build_manifest_and_digests(config_path)
+                    local = webdav_core.local_snapshot(config_path)
                     try:
                         remote_manifest = webdav_operations.read_remote_manifest(client, settings)
                     except webdav_core.SyncError as exc:
@@ -3541,13 +3893,8 @@ class CoreStore:
                         # and the user asked for a sync, not for a decision.
                         archived_remote = webdav_operations.archive_remote_bundle(client, settings)
                         remote_manifest = None
-                    remote_digests = (
-                        webdav_operations.read_remote_digests(client, settings, remote_manifest)
-                        if remote_manifest is not None
-                        else None
-                    )
-                    base_manifest = webdav_core.baseline_manifest(state_path)
-                    base_digests = webdav_core.baseline_digests(state_path)
+                    remote = webdav_operations.remote_snapshot(client, settings, remote_manifest)
+                    base = webdav_core.baseline_snapshot(state_path)
                     # One comparison decides every sync, including the
                     # unattended one: a side that moved alone is the side to
                     # take.  Two sides that both moved are a real conflict --
@@ -3555,46 +3902,17 @@ class CoreStore:
                     # no branch asks for a saved direction, because there is no
                     # such setting any more.  What counts as a move is the
                     # compared digest: a relay balance another machine read is
-                    # nobody's edit, so it cannot manufacture a conflict.
-                    plan = webdav_core.smart_sync_plan(
-                        local_manifest,
-                        remote_manifest,
-                        base_manifest,
-                        local_digests=local_digests,
-                        remote_digests=remote_digests,
-                        base_digests=base_digests,
-                    )
-                    record_missing = remote_digests is None
-                    if plan == "conflict" and record_missing and remote_manifest is not None:
-                        # The remote was published by a version that wrote no
-                        # digest record, so the byte comparison above cannot
-                        # tell an observation from an edit.  The bundle answers
-                        # it, and the conflict branch would download that same
-                        # bundle to keep the comparison anyway -- one download
-                        # is what not asking the reader costs.
-                        bundle_digests = webdav_operations.remote_digests_from_bundle(
-                            client, settings, remote_manifest
-                        )
-                        if bundle_digests is not None:
-                            remote_digests = bundle_digests
-                            plan = webdav_core.smart_sync_plan(
-                                local_manifest,
-                                remote_manifest,
-                                base_manifest,
-                                local_digests=local_digests,
-                                remote_digests=remote_digests,
-                                base_digests=base_digests,
-                            )
+                    # nobody's edit, so it cannot manufacture a conflict.  A
+                    # remote with no record is asked once through its bundle,
+                    # which is the download the conflict branch would make.
+                    plan, remote = webdav_operations.decide_sync(client, settings, local, remote, base)
                     if plan == "unchanged":
-                        if remote_digests is None:
-                            # Byte equality proved the remote holds these same
-                            # digests, so they can be stated for it.
-                            remote_digests = local_digests
-                        webdav_core.save_sync_state(state_path, settings, local_manifest, "sync", remote_digests)
-                        if record_missing:
-                            webdav_operations.publish_remote_digests(
-                                client, settings, remote_manifest, remote_digests
-                            )
+                        # Byte equality proved the remote holds these same
+                        # digests, so they can be stated for it.
+                        agreed = webdav_core.SyncSnapshot(remote.manifest, remote.digests or local.digests)
+                        webdav_core.save_sync_state(state_path, settings, agreed, "sync")
+                        if remote.digests is None:
+                            webdav_operations.publish_remote_digests(client, settings, agreed)
                         outcome = "unchanged"
                     elif plan == "push":
                         webdav_operations.push_bundle(client, settings, config_path, state_path, "sync-push")

@@ -28,7 +28,7 @@ import type { AppRoute, LanguagePreference, NativeLocalization, NativeMenuAction
 import type { NativeIpcBridge, NativeLeafBridge } from "./nativeBridge";
 import { isSettingsShellRoute } from "../routes";
 import { pushPresentation } from "./presentationStack";
-import { requestHostChrome } from "./hostChrome";
+import { cancelHostChrome, requestHostChrome, type MirrorSurface, type RelaySignInAnswer } from "./hostChrome";
 import {
   finishRelayGroupApply,
   openRelayGroupSheet,
@@ -43,16 +43,19 @@ export type BrowserCoreTransport = {
 };
 
 /**
- * The session this document learned, kept in memory for this page only.
+ * The page does not send `Authorization` at all.
  *
- * It is deliberately not written to `sessionStorage`. The credential is the
- * `HttpOnly` cookie Core set at sign-in, and a remembered copy in page storage
- * outlived the Core that minted it: after a Core restart the browser sent the
- * stale lease in `Authorization`, the fresh cookie disagreed with it, and Core
- * refused every request — a page stuck on 加载中 under a storm of 401s. Asking
- * `hello` once per document costs one round trip and cannot outlive its Core.
+ * Its credential is the `HttpOnly` cookie Core set, and that cookie is the one
+ * Core checks.  The native hosts put the lease in a header because they hold it
+ * in process memory; a page cannot read the cookie, so a header it sent would
+ * be a *second*, remembered copy — and two credentials that disagree are
+ * refused on purpose.  That mismatch is not hypothetical: a reload replaces the
+ * cookie while the previous document's calls are still in flight, so the old
+ * document's header no longer matched the new cookie, Core answered 401, and
+ * the 401 handler reloaded again — a page that never finished loading, under a
+ * storm of refusals.  With the cookie as the only credential the question has
+ * one answer.
  */
-let rememberedSession: string | undefined;
 
 /**
  * Whether this document is the machine owner's own page.
@@ -74,10 +77,9 @@ function isOwnerPage(): boolean {
  * request carries it; the remembered value above is only what this document
  * already learned, so a reload does not have to ask a second time.
  */
-function coreRequest(transport: BrowserCoreTransport, path: string, init: RequestInit, session: string | undefined): Promise<Response> {
+function coreRequest(transport: BrowserCoreTransport, path: string, init: RequestInit): Promise<Response> {
   const headers = new Headers(init.headers);
   headers.set("Accept", "application/json");
-  if (session) headers.set("Authorization", `Bearer ${session}`);
   return fetch(`${transport.baseURL}${path}`, {
     ...init,
     headers,
@@ -88,20 +90,13 @@ function coreRequest(transport: BrowserCoreTransport, path: string, init: Reques
   });
 }
 
-async function hello(transport: BrowserCoreTransport): Promise<string> {
+async function hello(transport: BrowserCoreTransport): Promise<void> {
   // No credential is presented here: the browser sends the session cookie Core
-  // set when this page signed in with the web password. Presenting one is what
-  // makes `/ipc/hello` answer with the session this page keeps.
-  const response = await coreRequest(
-    transport,
-    "/ipc/hello",
-    { method: "POST", body: "{}" },
-    undefined,
-  );
+  // set when this page signed in with the web password, and that cookie is what
+  // Core answers about.  The lease stays in it — a page may read neither the
+  // header nor the cookie — so there is nothing to keep on this side.
+  const response = await coreRequest(transport, "/ipc/hello", { method: "POST", body: "{}" });
   if (!response.ok) throw new Error("Core IPC authentication failed");
-  // The lease itself stays in the HttpOnly cookie; a page may not read the
-  // header, so an empty value simply means the cookie is doing the work.
-  return response.headers.get("X-LiteLLM-Core-Session") ?? "";
 }
 
 /** The bridge plus the two host-route doors only a host process may use. */
@@ -117,7 +112,7 @@ export type BrowserCoreBridge = NativeIpcBridge & {
 };
 
 export function createBrowserIpcBridge(transport: BrowserCoreTransport): BrowserCoreBridge {
-  let session: string | undefined = rememberedSession;
+  let established = false;
   let pending: Promise<void> | undefined;
 
   /**
@@ -130,11 +125,14 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
    * a reload re-enters the same way.
    */
   const establish = (): Promise<void> => {
-    if (session !== undefined) return Promise.resolve();
+    if (established) return Promise.resolve();
     if (pending !== undefined) return pending;
     const exchange = (async () => {
-      session = await hello(transport);
-      rememberedSession = session;
+      await hello(transport);
+      // One greeting per document: it queues this document behind Core's
+      // session, so every later call carries the cookie Core just answered
+      // for.  A greeting per call would be one extra round trip per control.
+      established = true;
     })();
     // Cleared by identity, and only after the assignment below, so two callers
     // that arrive in the same tick both await the exchange instead of one of
@@ -170,7 +168,7 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
       method: "POST",
       body,
       headers: { "Content-Type": "application/json" },
-    }, session);
+    });
     if (response.status === 401) leaveForSignIn();
     return response;
   };
@@ -196,7 +194,23 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
   const hostRoute = async (path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> => {
     const response = await call(path, JSON.stringify(body));
     const text = await response.text();
-    if (!response.ok || !text) throw new Error("The requested secret field is unavailable");
+    if (!response.ok || !text) {
+      // A refused host exchange can carry a reason the caller can act on: the
+      // station rejecting a password reads differently from a station that
+      // never answered, and the relay sign-in form draws that difference.  The
+      // code travels on the error; the message stays the capability wording
+      // every other caller already ignores.
+      let code = "";
+      try {
+        const payload = JSON.parse(text) as { error?: { code?: unknown } };
+        code = typeof payload?.error?.code === "string" ? payload.error.code : "";
+      } catch {
+        code = "";
+      }
+      const failure = new Error("The requested secret field is unavailable") as Error & { code?: string };
+      failure.code = code;
+      throw failure;
+    }
     return JSON.parse(text) as Record<string, unknown>;
   };
 
@@ -255,7 +269,6 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
               credentials: "include",
               cache: "no-store",
               signal: controller.signal,
-              headers: session ? { Authorization: `Bearer ${session}` } : {},
             },
           );
           if (response.status === 401) {
@@ -323,6 +336,273 @@ function serviceStateWord(strings: NativeLocalization | undefined, state: Servic
     case "stopped": return strings?.serviceStopped || "Stopped";
     default: return strings?.serviceUnknown || "Unknown";
   }
+}
+
+/** One `{label}` placeholder in a host string, the shape `translate` uses. */
+function fillLabel(template: string, value: string): string {
+  return template.split("{label}").join(value);
+}
+
+/**
+ * Put text on the pasteboard, whichever way this origin allows.
+ *
+ * `navigator.clipboard` only exists in a secure context, so a page published
+ * over plain HTTP from a server has no copy API at all — and a copy button that
+ * silently does nothing is how an API key looked "broken" there.  The legacy
+ * editing command still works from a user gesture, which is what a press is, so
+ * that is the fallback.  It is the same pair the editor page uses for its own
+ * copy item, for the same reason.
+ */
+async function writeClipboard(text: string): Promise<boolean> {
+  try {
+    if (typeof navigator !== "undefined" && typeof navigator.clipboard?.writeText === "function") {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Denied or unavailable: the editing command below is the other way.
+  }
+  if (typeof document === "undefined") return false;
+  const scratch = document.createElement("textarea");
+  scratch.value = text;
+  scratch.setAttribute("readonly", "true");
+  scratch.setAttribute("aria-hidden", "true");
+  scratch.style.position = "fixed";
+  scratch.style.top = "-10000px";
+  scratch.style.left = "0";
+  scratch.style.opacity = "0";
+  document.body.appendChild(scratch);
+  const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  let copied = false;
+  try {
+    scratch.select();
+    scratch.setSelectionRange(0, text.length);
+    copied = document.execCommand("copy");
+  } catch {
+    copied = false;
+  } finally {
+    scratch.remove();
+    previous?.focus();
+  }
+  return copied;
+}
+
+/** What the form says about the window that could not be shown. */
+function browserLoginFallbackHint(strings: NativeLocalization | undefined): string {
+  switch (lastBrowserLoginReason) {
+    case "launch_failed": return strings?.relayBrowserLaunchFailed ?? "";
+    default: return strings?.relayBrowserUnavailable ?? "";
+  }
+}
+
+/** The code a refused host exchange carried, or "". */
+function hostErrorCode(error: unknown): string {
+  return typeof error === "object" && error !== null && typeof (error as { code?: unknown }).code === "string"
+    ? (error as { code: string }).code
+    : "";
+}
+
+/**
+ * Why a window could not be shown, as Core named it.
+ *
+ * The form that follows states this, because "why is this page asking for my
+ * password when the station has a website" is the question a person actually
+ * has: a page published from a server is open in their own browser, and a
+ * window on the server's screen is not theirs to see.
+ */
+let lastBrowserLoginReason = "";
+
+/** How often the page asks Core whether the browser finished the sign-in. */
+const BROWSER_LOGIN_POLL_MS = 900;
+
+/** One pause a cancel can cut short: the loop below checks `cancelled` after it. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+/**
+ * The streamed screen of one sign-in: poll Core for the newest frame, and send
+ * back what the person does to it.
+ *
+ * A frame is a JPEG in a data URL — one picture, replaced as the station draws
+ * — and the poll is a long one: Core holds the request until something changed
+ * or a second passes, so an idle login form costs nothing and a page that draws
+ * answers immediately.  The loop ends when the surface does: cancel, a finished
+ * login, a closed browser and the ten-minute limit all clear `cancelled`.
+ */
+function startMirrorSurface(
+  core: BrowserCoreBridge,
+  loginId: string,
+  spec: unknown,
+  cancelled: () => boolean,
+): MirrorSurface | undefined {
+  if (typeof spec !== "object" || spec === null) return undefined;
+  const size = spec as { width?: unknown; height?: unknown };
+  if (typeof size.width !== "number" || typeof size.height !== "number") return undefined;
+  const listeners = new Set<() => void>();
+  let frame = "";
+  let seq = 0;
+  const publish = (next: string) => {
+    frame = next;
+    for (const listener of listeners) listener();
+  };
+  const pump = async () => {
+    while (!cancelled()) {
+      let answer: Record<string, unknown>;
+      try {
+        answer = await core.hostRoute("/ipc/host/relay/browser/frames", { login_id: loginId, since: seq });
+      } catch {
+        // A refused or closed session answers nothing; the poll that follows
+        // the surface's own status decides what happens next.
+        return;
+      }
+      const next = Number(answer.seq ?? seq);
+      if (Number.isFinite(next)) seq = next;
+      if (typeof answer.frame === "string" && answer.frame) {
+        publish(`data:image/jpeg;base64,${answer.frame}`);
+      }
+    }
+  };
+  void pump();
+  return {
+    width: size.width,
+    height: size.height,
+    frame: () => frame,
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    },
+    send: (event) => {
+      void core.hostRoute("/ipc/host/relay/browser/input", { login_id: loginId, event }).catch(() => undefined);
+    },
+  };
+}
+
+/**
+ * Sign in by letting Core open the station in a real browser.
+ *
+ * `"unavailable"` is the answer that means "this host has no browser to open,
+ * use the credential form instead" — a capability answer, not a failed
+ * sign-in.  Every other answer is what the pane already reads from a native
+ * sign-in: the account's state, or `undefined` when the person cancelled.
+ *
+ * The wait is a surface of its own: the person is working in another window,
+ * so this document says what is being waited for and offers 取消, instead of
+ * leaving a dead button on screen.  Cancel, a closed window, and the ten
+ * minutes Core allows all end the same way, and Core is told to close the
+ * window in every one of them.
+ */
+async function browserWindowLogin(
+  core: BrowserCoreBridge,
+  options: {
+    accountId: string;
+    type: string;
+    label: string;
+    origin: string;
+    username?: string;
+    pendingAccount?: boolean;
+    stationId?: string;
+    stationName?: string;
+    stationType?: string;
+    stationOrigin?: string;
+  },
+  strings: NativeLocalization | undefined,
+): Promise<{ revision: number; loginStatus: "signed_in"; username: string } | undefined | "unavailable"> {
+  const body: Record<string, unknown> = {
+    account_id: options.accountId,
+    type: options.type,
+    label: options.label,
+    origin: options.origin,
+    username: options.username ?? "",
+    pending_account: options.pendingAccount === true,
+  };
+  if (options.stationId) body.station_id = options.stationId;
+  if (options.stationName) body.station_name = options.stationName;
+  if (options.stationType) body.station_type = options.stationType;
+  if (options.stationOrigin) body.station_origin = options.stationOrigin;
+  let started: Record<string, unknown>;
+  try {
+    started = await core.hostRoute("/ipc/host/relay/browser/start", body);
+  } catch (error) {
+    // A refused start is answered, not thrown: `unsupported` below is the one
+    // answer that means "this host cannot show you the station", and it falls
+    // back to the form.  Anything else is a failed sign-in and stays one.
+    return hostErrorCode(error) === "relay_browser_unavailable" ? "unavailable" : undefined;
+  }
+  if (String(started.status ?? "") === "unsupported") {
+    // `reason` names which side is missing, so the form can say it: a page
+    // opened on another machine than Core (`remote`), a host with no browser
+    // (`no_browser`), no screen (`no_display`), or a launch that never
+    // reached its window (`launch_failed`).
+    lastBrowserLoginReason = String(started.reason ?? "");
+    return "unavailable";
+  }
+  lastBrowserLoginReason = "";
+  const loginId = typeof started.login_id === "string" ? started.login_id : "";
+  if (!loginId) return undefined;
+  const browserName = typeof started.browser === "string" ? started.browser : "";
+  // A Core with no screen of its own, or a page opened through a proxy, cannot
+  // show a window anybody is looking at.  It answers with the frames of a
+  // headless browser instead, and this surface draws them.
+  const mirror = startMirrorSurface(core, loginId, started.mirror, () => cancelled);
+  cancelHostChrome("relayBrowser");
+  let cancelled = false;
+  const wait = requestHostChrome<"form" | undefined>({
+    kind: "relayBrowser",
+    title: fillLabel(strings?.relaySignInTitle ?? "Sign in", options.label),
+    body: strings?.relayBrowserWaiting ?? "",
+    browser: browserName,
+    cancelLabel: strings?.cancel ?? "Cancel",
+    showLabel: strings?.relayBrowserShow ?? "",
+    // A window can open behind the person's own browser — or onto a Space they
+    // are not looking at — and then "nothing happened" is exactly what they
+    // see.  One press raises it again; Core recreates it if it was dismissed.
+    show: () => { void core.hostRoute("/ipc/host/relay/browser/focus", { login_id: loginId }).catch(() => undefined); },
+    mirror,
+  });
+  void wait.then(() => { cancelled = true; });
+  try {
+    while (!cancelled) {
+      let answer: Record<string, unknown>;
+      try {
+        answer = await core.hostRoute("/ipc/host/relay/browser/poll", { login_id: loginId });
+      } catch {
+        return undefined;
+      }
+      const status = String(answer.status ?? "");
+      if (status === "signed_in") {
+        return {
+          revision: Number(answer.revision ?? 0),
+          loginStatus: "signed_in",
+          username: String(answer.username ?? options.username ?? ""),
+        };
+      }
+      if (status === "closed" || status === "expired" || status === "unknown" || status === "rejected") return undefined;
+      await sleep(BROWSER_LOGIN_POLL_MS);
+    }
+    return undefined;
+  } finally {
+    cancelHostChrome("relayBrowser");
+    void core.hostRoute("/ipc/host/relay/browser/cancel", { login_id: loginId }).catch(() => undefined);
+  }
+}
+
+/**
+ * What a refused page sign-in says beside its own fields.
+ *
+ * Core's codes are the three answers a person can act on differently: the
+ * station refused the credential, the station is already holding as many
+ * sessions as it allows, or the station was never reached.  Anything else is a
+ * generic refusal rather than a claim about the password — Core's English
+ * prose is never printed into a localized pane, so the code chooses the row.
+ */
+function relaySignInFailure(error: unknown, strings: NativeLocalization | undefined): string {
+  const code = typeof error === "object" && error !== null && typeof (error as { code?: unknown }).code === "string"
+    ? (error as { code: string }).code
+    : "";
+  if (code === "relay_session_limit") return strings?.relaySignInLimit || strings?.relaySignInRejected || "";
+  if (code === "relay_unreachable") return strings?.relaySignInUnreachable || "";
+  return strings?.relaySignInRejected || "";
 }
 
 export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
@@ -632,12 +912,7 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
       if (token === undefined) return false;
       const lease = await secretCapability("/ipc/host/secret/read", { secret_read_token: token });
       if (typeof lease?.value !== "string") return false;
-      try {
-        await navigator.clipboard.writeText(lease.value);
-        return true;
-      } catch {
-        return false;
-      }
+      return writeClipboard(lease.value);
     },
     // 分组管理 is a layer here instead of a window: the four calls below are the
     // same contract the native sheets implement, and `platform/relayGroupSheet`
@@ -649,32 +924,106 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
     finishGroupManagerApply: async (options) => { finishRelayGroupApply(options); },
     updateGroupManager: async (snapshot) => updateRelayGroupSheet(snapshot),
     relayLogin: async (options) => {
-      // A page has no authenticated browser to put the station's login form in,
-      // and a cookie minted in another tab is unreadable here. What a page can
-      // do is ask Core to use the credential it already holds: the restore route
-      // probes the saved session first and, when that is refused, signs in with
-      // the remembered password. The answer is the login state, exactly the
-      // shape the pane reads from a native sign-in — a station Core cannot sign
-      // in to without a browser answers `signed_out`, and the pane says so
-      // instead of the row waiting on a sign-in that never started.
-      try {
-        const body = {
-          account_id: options.accountId,
-          type: options.type || "",
-          label: options.label,
-          origin: options.origin,
-          username: options.username ?? "",
-          login_status: "signed_out",
-        };
-        const result = await core.hostRoute("/ipc/host/relay/restore", body);
-        return result.login_status === "signed_in"
-          ? { revision: Number(result.revision ?? 0), loginStatus: "signed_in", username: String(result.username ?? options.username ?? "") }
-          : undefined;
-      } catch {
-        return undefined;
+      // Ask Core first, for every account that might already have a session.
+      // That is the silent sign-in: the saved cookie, or the password this
+      // account already remembers, is used without a form.  A pending account
+      // (the add flow) has no such session and does not ask.
+      if (options.pendingAccount !== true) {
+        try {
+          const body = {
+            account_id: options.accountId,
+            type: options.type || "",
+            label: options.label,
+            origin: options.origin,
+            username: options.username ?? "",
+            login_status: "signed_out",
+          };
+          const result = await core.hostRoute("/ipc/host/relay/restore", body);
+          if (result.login_status === "signed_in") {
+            return { revision: Number(result.revision ?? 0), loginStatus: "signed_in", username: String(result.username ?? options.username ?? "") };
+          }
+        } catch {
+          // No saved session Core can use. The form below is the next answer,
+          // not a second failure: an unreachable station or a refused password
+          // is stated inside it, where the person can act on it.
+        }
       }
+      // The station's own login page, in a real browser: Core opens the
+      // window on this machine (the one the page is served from) at the
+      // station's address, so a captcha, a verification code, or an OAuth
+      // redirect finishes exactly where it does in any browser — the page
+      // itself cannot present another origin's form, and a cookie another tab
+      // minted is unreadable from here.  Core reads the session that window
+      // holds and finishes the same verified-login boundary the native hosts
+      // use.  A machine with no Chromium-family browser answers
+      // `relay_browser_unavailable` and the credential form below is the
+      // fallback, not a second feature.
+      const browserLogin = await browserWindowLogin(core, options, strings);
+      if (browserLogin !== "unavailable") return browserLogin;
+      // No browser to open: the form says so first, because a station page
+      // this host cannot show is the reason a password is being asked for.
+      // A page cannot run the station's login page under this app's own
+      // origin.  On a host with no browser to open, asking the station
+      // account's own credentials and letting Core post the same form the
+      // station's page would have posted is what still signs in; the refusal
+      // is drawn beside fields that keep what was typed.
+      cancelHostChrome("relaySignIn");
+      return requestHostChrome<RelaySignInAnswer | undefined>({
+        kind: "relaySignIn",
+        title: fillLabel(strings?.relaySignInTitle ?? "Sign in", options.label),
+        origin: options.origin,
+        username: options.username ?? "",
+        rememberPassword: options.rememberPassword === true,
+        // Why a page is asking for this at all when the station has a website:
+        // the answer is the reason Core named, in the person's own words.
+        hint: [browserLoginFallbackHint(strings), strings?.relaySignInHint].filter((part) => part && part !== "").join(" "),
+        labels: {
+          origin: strings?.relaySignInOrigin ?? "",
+          username: strings?.relaySignInAccount ?? "",
+          password: strings?.relaySignInPassword ?? "",
+          remember: strings?.relaySignInRemember ?? "",
+          rememberHint: strings?.relaySignInRememberHint ?? "",
+          submit: strings?.relaySignInSubmit ?? "Sign In",
+          cancel: strings?.cancel ?? "Cancel",
+        },
+        submit: async ({ username, password, rememberPassword }) => {
+          try {
+            const body: Record<string, unknown> = {
+              account_id: options.accountId,
+              type: options.type,
+              label: options.label,
+              origin: options.origin,
+              username,
+              password,
+              remember_password: rememberPassword,
+              pending_account: options.pendingAccount === true,
+            };
+            if (options.stationId) body.station_id = options.stationId;
+            if (options.stationName) body.station_name = options.stationName;
+            if (options.stationType) body.station_type = options.stationType;
+            if (options.stationOrigin) body.station_origin = options.stationOrigin;
+            const result = await core.hostRoute("/ipc/host/relay/login", body);
+            if (result.login_status !== "signed_in") {
+              return { ok: false as const, message: strings?.relaySignInRejected ?? "" };
+            }
+            return {
+              ok: true as const,
+              value: {
+                revision: Number(result.revision ?? 0),
+                loginStatus: "signed_in" as const,
+                username: String(result.username ?? username),
+              },
+            };
+          } catch (error) {
+            return { ok: false as const, message: relaySignInFailure(error, strings) };
+          }
+        },
+      });
     },
-    cancelRelayLogin: () => undefined,
+    cancelRelayLogin: () => {
+      cancelHostChrome("relayBrowser");
+      cancelHostChrome("relaySignIn");
+    },
     restoreRelaySession: async (options) => {
       try {
         const body = {

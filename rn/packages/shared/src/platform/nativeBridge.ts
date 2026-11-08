@@ -122,6 +122,8 @@ export interface NativeLeafBridge {
     origin: string;
     language: LanguagePreference;
     username?: string;
+    /** The account's own remember-password preference, so a re-sign-in does not silently clear it. */
+    rememberPassword?: boolean;
     embedded?: boolean;
     /** Pending login: Core creates the account shell only after sign-in succeeds. */
     pendingAccount?: boolean;

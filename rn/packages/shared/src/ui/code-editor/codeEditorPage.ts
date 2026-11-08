@@ -31,6 +31,17 @@ export type CodeEditorMenuLabels = {
   selectAll: string;
   undo: string;
   redo: string;
+  /**
+   * What the host says when it cannot read the pasteboard itself.
+   *
+   * A page served over plain HTTP has no `navigator.clipboard`; the keyboard's
+   * own paste still reaches the editor, so the host states that instead of
+   * letting the menu item do nothing.  Optional because the two native hosts
+   * always have a pasteboard to read and never show this.
+   */
+  pasteHint?: string;
+  /** The one button a statement closes with, for the same notice. */
+  close?: string;
 };
 
 export function editorMenuLabels(translate: (key: string) => string): CodeEditorMenuLabels {
@@ -41,6 +52,8 @@ export function editorMenuLabels(translate: (key: string) => string): CodeEditor
     selectAll: translate("common.selectAll"),
     undo: translate("common.undo"),
     redo: translate("common.redo"),
+    pasteHint: translate("editor.pasteHint"),
+    close: translate("status.close"),
   };
 }
 

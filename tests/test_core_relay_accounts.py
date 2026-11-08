@@ -1719,6 +1719,103 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 fake.password_logins,
             )
 
+    def test_a_page_signs_in_with_a_password_instead_of_a_browser_cookie(self) -> None:
+        """The browser host has no WebKit, so Core posts the station's own form.
+
+        A cookie another tab minted is unreadable from the page, and the
+        station's login page cannot run under this app's origin.  What the page
+        can do is send the account and password the person typed; Core performs
+        the login over HTTP and the session still crosses the one verified
+        boundary.  Pending is the add flow: the account shell exists only
+        because this attempt succeeded.
+        """
+
+        fake = FakeRelayHTTPClient(
+            {},
+            password_login_result={
+                "username": "person@example.test",
+                "cookie": "session=replace-page-cookie",
+                "access_token": "replace-page-token",
+                "refresh_token": "",
+                "user_id": "2411",
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relay = RelayAccountsDomain(root, http_client=fake)
+            core = CoreStore(domains=[relay])
+            account_id = "login-page-0123456789abcdef0123"
+
+            result = core.accept_relay_login(
+                account_id=account_id,
+                account_type="newapi",
+                label="Page Station",
+                origin="https://relay.example.test",
+                username="person@example.test",
+                password="replace-page-password",
+                station_name="Page Station",
+                station_type="newapi",
+                station_origin="https://relay.example.test",
+                remember_password=True,
+                pending_account=True,
+            )
+
+            self.assertEqual("signed_in", result["login_status"])
+            self.assertEqual(
+                [("https://relay.example.test", "newapi", "person@example.test", "replace-page-password")],
+                fake.password_logins,
+            )
+            account = core.snapshot()["domains"]["relay_accounts"]["accounts"][0]
+            self.assertEqual("signed_in", account["login_status"])
+            self.assertTrue(account["remember_password"])
+            self.assertTrue(account["password_saved"])
+            persisted = json.loads(
+                (root / ".litellm-runtime" / "relay-accounts.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual([account_id], [item["id"] for item in persisted["accounts"]])
+            self.assertEqual("2411", persisted["accounts"][0]["user_id"])
+            self.assertIn("replace-page-cookie", persisted["accounts"][0]["session"]["cookie"])
+
+    def test_a_refused_page_sign_in_names_the_reason_and_leaves_nothing(self) -> None:
+        """A pending account exists only because its first sign-in worked.
+
+        The page's form has three answers the person can act on differently: a
+        rejected credential (retype it), a station at its concurrent-session
+        limit (sign out elsewhere, do not retype), and a station that was never
+        reached (check the address).  Flattening them into one code is what
+        sends someone to retype a password the station never questioned, so the
+        code is the answer's own noun and the rollback leaves no half-created
+        account behind.
+        """
+
+        cases = (
+            (RelayAccountsError("Relay username or password is invalid"), "relay_login_rejected"),
+            (RelaySessionLimitError(), "relay_session_limit"),
+            (RelayTransportError(), "relay_unreachable"),
+        )
+        for failure, code in cases:
+            with self.subTest(code=code):
+                fake = FakeRelayHTTPClient({}, password_login_result=failure)
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    relay = RelayAccountsDomain(root, http_client=fake)
+                    core = CoreStore(domains=[relay])
+                    with self.assertRaises(CoreError) as raised:
+                        core.accept_relay_login(
+                            account_id="login-page-0123456789abcdef0123",
+                            account_type="newapi",
+                            label="Page Station",
+                            origin="https://relay.example.test",
+                            username="person@example.test",
+                            password="replace-page-password",
+                            pending_account=True,
+                        )
+                    self.assertEqual(code, raised.exception.code)
+                    self.assertEqual([], core.snapshot()["domains"]["relay_accounts"]["accounts"])
+                    self.assertEqual([], json.loads(
+                        (root / ".litellm-runtime" / "relay-accounts.json").read_text(encoding="utf-8")
+                    )["accounts"])
+
     def test_account_delete_supersedes_a_pending_password_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             domain = RelayAccountsDomain(directory)

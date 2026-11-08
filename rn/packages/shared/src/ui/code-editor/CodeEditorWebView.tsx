@@ -11,6 +11,7 @@ import {
   type CodeEditorMenuLabels,
   type EditorPlatform,
 } from "./codeEditorPage";
+import { requestHostChrome } from "../../platform/hostChrome";
 
 export { editorMenuLabels };
 export type { CodeEditorDiff, CodeEditorLanguage, CodeEditorMenuLabels };
@@ -170,12 +171,39 @@ function WebCodeEditor({
 
   // The page asks for the system pasteboard through its own menu; a browser
   // grants that read only to a document the person is using, so this side asks
-  // and hands the text back. A refused read is not an error the editor can act
-  // on — the keyboard's own paste still works inside the frame.
+  // and hands the text back.
+  //
+  // Two ways this has nothing to hand back, and both used to look like a dead
+  // menu item.  A page served over plain HTTP on another machine (a gateway, a
+  // server on the LAN) has no `navigator.clipboard` at all: the browser grants
+  // that API to secure contexts, and `http://host:port` is not one.  A refused
+  // read is the other.  In both the keyboard still works — the frame is a
+  // document the person is typing in, so ⌘V/Ctrl+V reaches Ace as a normal
+  // paste event — so the answer is to focus the editor and say that, rather
+  // than to leave a menu entry that does nothing.
   const pasteFromClipboard = React.useCallback((): void => {
-    void navigator.clipboard?.readText?.().then((text) => {
+    const reader = typeof navigator !== "undefined" ? navigator.clipboard?.readText : undefined;
+    if (typeof reader !== "function") {
+      post({ type: "focus" });
+      void requestHostChrome<void>({
+        kind: "notice",
+        title: labelsRef.current?.paste ?? "Paste",
+        message: labelsRef.current?.pasteHint ?? "",
+        closeLabel: labelsRef.current?.close ?? "OK",
+      });
+      return;
+    }
+    void reader.call(navigator.clipboard).then((text) => {
       if (text) post({ type: "insertText", text });
-    }).catch(() => undefined);
+    }).catch(() => {
+      post({ type: "focus" });
+      void requestHostChrome<void>({
+        kind: "notice",
+        title: labelsRef.current?.paste ?? "Paste",
+        message: labelsRef.current?.pasteHint ?? "",
+        closeLabel: labelsRef.current?.close ?? "OK",
+      });
+    });
   }, [post]);
 
   React.useEffect(() => {

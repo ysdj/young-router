@@ -601,6 +601,26 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
     def _owner(self) -> "CoreIPCServer":
         return self.server.core_ipc_owner  # type: ignore[attr-defined]
 
+    def handle_one_request(self) -> None:
+        """Answer one request, with the body flag belonging to that request.
+
+        A keep-alive connection is a loop over this method on *one* handler
+        instance, so ``_body_consumed`` set by request 1 is still set for
+        request 2.  That is a desync, not a saved byte: a 401 or a 404 answered
+        without reading its body then skipped the drain, the unread JSON stayed
+        in the socket buffer, and the next request line was read back as
+        `{"protocol_version":…}GET` — which http.server answers with a 501
+        "Unsupported method" page.  The page then showed an "Error response"
+        document instead of the app, in the middle of an ordinary pane switch.
+
+        The reset belongs here rather than in each ``do_*`` so no route can
+        forget it: every answer, early or late, starts from "this request's
+        body is unread".
+        """
+
+        self._body_consumed = False
+        super().handle_one_request()
+
     def log_message(self, _format: str, *_args: object) -> None:
         # HTTP's default stderr logger includes request paths and would make a
         # credential-bearing query/body easy to correlate.  The Core has no
@@ -940,6 +960,107 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_error(400, code="invalid_file_capability", message="The selected file is unavailable")
                 return
             self._send(200, {"protocol_version": PROTOCOL_VERSION, "token": capability})
+            return
+        if route in {"/ipc/host/relay/browser/frames", "/ipc/host/relay/browser/input"}:
+            token = self._session_authorization()
+            if not self._owner._valid_session(token):
+                self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
+                return
+            # One sign-in's screen and keyboard.  The frame is a JPEG the page
+            # paints; the input is the person's click and typing turned into the
+            # DevTools calls that mean the same thing.  Both answer only for a
+            # login this Core minted, so a page cannot drive another's browser.
+            from . import relay_mirror
+
+            try:
+                data = decode_message(self._read_body())
+                entry = self._owner.core.relay_browser_mirror(data.get("login_id"))
+                mirror = getattr(entry, "mirror", None) if entry is not None else None
+                if mirror is None:
+                    raise CoreError("relay_login_failed", "Relay sign-in window is closed")
+                if route.endswith("/frames"):
+                    since = data.get("since", 0)
+                    if not isinstance(since, int) or since < 0:
+                        raise CoreError("relay_login_failed", "Relay sign-in frame is invalid")
+                    seq, frame = mirror.latest(since)
+                    payload: dict[str, Any] = {
+                        "protocol_version": PROTOCOL_VERSION,
+                        "status": "frame" if frame else "idle",
+                        "seq": seq,
+                        "width": int(mirror.width),
+                        "height": int(mirror.height),
+                    }
+                    if frame:
+                        payload["frame"] = base64.b64encode(frame).decode("ascii")
+                    self._send(200, payload)
+                    return
+                event = data.get("event")
+                if not isinstance(event, Mapping):
+                    raise CoreError("relay_login_failed", "Relay sign-in input is invalid")
+                dispatched = relay_mirror.dispatch(
+                    entry.port,
+                    entry.origin,
+                    event,
+                    width=int(mirror.width),
+                    height=int(mirror.height),
+                )
+                self._send(200, {"protocol_version": PROTOCOL_VERSION, "dispatched": bool(dispatched)})
+            except CoreError as exc:
+                self._send_error(400, code=exc.code, message=exc.message)
+            except Exception:
+                self._send_error(400, code="relay_login_failed", message="Relay sign-in input is unavailable")
+            return
+        if route in {"/ipc/host/relay/browser/start", "/ipc/host/relay/browser/poll", "/ipc/host/relay/browser/cancel", "/ipc/host/relay/browser/focus"}:
+            token = self._session_authorization()
+            if not self._owner._valid_session(token):
+                self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
+                return
+            # The page host's sign-in window: Core opens a real browser at the
+            # station's own address, because a page cannot present another
+            # origin's login form and cannot read a cookie another tab minted.
+            # The window is the station's own, so a captcha, a code, or an
+            # OAuth redirect behaves exactly as it does in any browser.
+            try:
+                data = decode_message(self._read_body())
+                if route.endswith("/browser/start"):
+                    allowed = {"account_id", "type", "label", "origin", "username", "pending_account", "station_id", "station_name", "station_type", "station_origin"}
+                    required = {"account_id", "type", "label", "origin"}
+                    if not required.issubset(data) or set(data).difference(allowed):
+                        raise CoreError("relay_login_failed", "Relay login result is invalid")
+                    result = self._owner.core.start_relay_browser_login(
+                        account_id=data.get("account_id"),
+                        account_type=data.get("type"),
+                        label=data.get("label"),
+                        origin=data.get("origin"),
+                        username=data.get("username", ""),
+                        pending_account=data.get("pending_account", False),
+                        station_id=data.get("station_id"),
+                        station_name=data.get("station_name"),
+                        station_type=data.get("station_type"),
+                        station_origin=data.get("station_origin"),
+                        # The page's own origin decides whether a window this
+                        # Core opens is one the person can see: a published page
+                        # is open in somebody else's browser, and the answer
+                        # routes it to the sign-in the page itself can run.
+                        page_is_local=self._owner._page_is_local(self),
+                    )
+                elif route.endswith("/browser/poll"):
+                    if set(data) != {"login_id"} or not isinstance(data.get("login_id"), str):
+                        raise CoreError("relay_login_failed", "Relay login result is invalid")
+                    result = self._owner.core.poll_relay_browser_login(data.get("login_id"))
+                elif route.endswith("/browser/focus"):
+                    if set(data) != {"login_id"} or not isinstance(data.get("login_id"), str):
+                        raise CoreError("relay_login_failed", "Relay login result is invalid")
+                    result = self._owner.core.focus_relay_browser_login(data.get("login_id"))
+                else:
+                    if set(data) != {"login_id"} or not isinstance(data.get("login_id"), str):
+                        raise CoreError("relay_login_failed", "Relay login result is invalid")
+                    result = self._owner.core.cancel_relay_browser_login(data.get("login_id"))
+                self._send(200, {"protocol_version": PROTOCOL_VERSION, **result})
+            except CoreError as exc:
+                self._send_error(400, code=exc.code, message=exc.message)
+            except Exception:
+                self._send_error(400, code="relay_login_failed", message="Relay login result is invalid")
             return
         if route in {"/ipc/host/secret/capability", "/ipc/host/secret/stage", "/ipc/host/relay/login", "/ipc/host/relay/restore", "/ipc/host/relay/resources", "/ipc/host/relay/import"}:
             token = self._session_authorization()

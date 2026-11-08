@@ -48,6 +48,13 @@ INSTALL_LOCK="$STAGING_CACHE/install.lock"
 mkdir -p "$(dirname "$INSTALL_LOCK")"
 DESTINATION="${YOUNG_ROUTER_INSTALL_APP:-/Applications/Young Router.app}"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+# Station sign-in drives a Chromium-family browser: a window on a machine with a
+# screen, headless frames on one without.  The deploy is where that prerequisite
+# belongs — an install that leaves it missing ships an app whose station sign-in
+# can only fall back to the password form.  A failure here is reported, never
+# fatal: the browser is the vendor's package, and a deploy must not stop because
+# a package mirror is down.  A build-only caller installs nothing.
+BROWSER_INSTALLER="$ROOT/scripts/install-chromium.sh"
 if [[ "${YOUNG_ROUTER_ALLOW_CONCURRENT_INSTALL:-}" != "1" ]]; then
   INSTALL_LOCK_OWNER="$(mktemp "${TMPDIR:-/tmp}/young-router-build-lock.XXXXXX")"
   rm -f "$INSTALL_LOCK_OWNER"
@@ -437,6 +444,12 @@ command -v pnpm >/dev/null 2>&1 || {
   echo "pnpm is required to build the React Native macOS host." >&2
   exit 1
 }
+
+if [[ "$BUILD_ONLY" -eq 0 && -x "$BROWSER_INSTALLER" ]]; then
+  if ! "$BROWSER_INSTALLER"; then
+    echo "Young Router: no Chromium-family browser could be installed; relay station sign-in will offer the password form only." >&2
+  fi
+fi
 
 # Every entry point reaches this script, and not all of them install the
 # workspace themselves: scripts/package-release.sh calls it directly. Install

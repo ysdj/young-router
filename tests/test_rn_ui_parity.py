@@ -2768,11 +2768,29 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # it, before the session ends: signing out is leaving this page.
         self.assertIn('await flushActivePane.current?.("navigate");', self.ui)
         self.assertIn('await native.signOutWebSession?.();', self.ui)
-        # Both layouts draw it: the sidebar's bottom and, in one column, the
-        # header beside the pane title.
+        # Both layouts draw it, and both in the title band's trailing corner:
+        # the wide one at the end of the pane header, the one-column one at the
+        # end of the compact header.  The sidebar's bottom keeps no second copy.
         shell = self.ui.split("function SettingsShell(", 1)[1].split("function RouteSurface(", 1)[0]
-        self.assertEqual(2, shell.count("<SignOutControl"))
+        self.assertEqual(2, shell.count("{signOutControl}"))
+        pane_header = shell.split('<View style={[styles.settingsPaneHeader, styles.settingsPaneHeaderIntegrated]}>', 1)[1].split("<View style={[styles.settingsSidebar, isWindowsShell && styles.settingsSidebarWindows]}>", 1)[0]
+        self.assertIn("{signOutControl}", pane_header)
+        sidebar = shell.split("<View style={[styles.settingsSidebar, isWindowsShell && styles.settingsSidebarWindows]}>", 1)[1].split("<View style={[styles.settingsDetail, styles.settingsDetailIntegrated]}>", 1)[0]
+        self.assertNotIn("signOutControl", sidebar)
         self.assertIn('<Text numberOfLines={1} style={styles.settingsSidebarTitle}>{translate("app.title")}</Text>', shell)
+        # One glyph, not a glyph plus a sentence: the label the band would
+        # otherwise repeat is the button's own hover hint and accessible name.
+        sign_out = self.ui.split("function SignOutControl(", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn('title=""', sign_out)
+        self.assertIn('symbol="power-off"', sign_out)
+        self.assertNotIn("symbolWithTitle", sign_out)
+        self.assertIn("toolTip={title}", sign_out)
+        self.assertIn("accessibilityLabel={title}", sign_out)
+        # A browser draws a hover label from the host node's `title`, which
+        # React Native Web does not forward; an icon-only page button would
+        # otherwise have nothing to read under the pointer.
+        self.assertIn('node?.setAttribute?.("title", hoverLabel);', self.native_controls)
+        self.assertIn("props.toolTip ?? (showsTitle ? undefined : props.title)", self.native_controls)
         # The page is the one host that answers it, and Core's own route is what
         # it answers with.
         browser_leaf = (ROOT / "rn/packages/shared/src/platform/browserLeaf.ts").read_text(encoding="utf-8")
@@ -3234,6 +3252,26 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )
         self.assertIn("sourceCellViewFlex: { flex: 1, minWidth: 0 }", self.native_controls)
 
+    def test_a_browser_field_draws_its_hint_in_secondary_ink(self) -> None:
+        """A placeholder is a hint, not a value, on the page too.
+
+        React Native for Web draws `::placeholder` as
+        `color: var(--placeholderTextColor)` and fills that variable from the
+        field's own `placeholderTextColor`.  Neither browser leaf passed one, so
+        the declaration was invalid at computed-value time and the hint
+        inherited the field's `#1b1b1b` — an empty 配置供应商 read as one that
+        already had `https://api.example.com/v1` typed into it.  The two native
+        hosts ask AppKit/WinUI for the placeholder ink themselves; the page has
+        to state it on the leaf.
+        """
+
+        self.assertIn("const webPlaceholderInk = (): string => WINDOWS_CONTROL.textSecondary;", self.native_controls)
+        field = self.native_controls.split("export function NativeTextField(", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("placeholderTextColor={props.placeholderTextColor ?? webPlaceholderInk()}", field)
+        # The browser's password field is the page's second `<input>`: the WebDAV
+        # and provider-key hints arrive through it, so it states the same ink.
+        secret = self.native_controls.split("function WebSecureTextInput(", 1)[1]
+        self.assertIn("placeholderTextColor={webPlaceholderInk()}", secret)
 
     def test_windows_codegen_declares_every_prop_its_spec_does(self) -> None:
         import re

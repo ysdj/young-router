@@ -16,9 +16,13 @@ from __future__ import annotations
 
 import base64
 import http.client
+import io
 import json
+import os
 from pathlib import Path
+import socket
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -26,6 +30,11 @@ import urllib.request
 
 from young_router.core import CoreIPCServer, CoreStore, IPCError, MemoryDomain
 from young_router.core import __main__ as core_main
+from unittest import mock
+
+from young_router.core import ipc, relay_browser, relay_mirror
+from urllib.parse import urlsplit
+from young_router.core.domains.relay_accounts import RelayAccountsDomain, RelayAccountsError, RelaySessionLimitError
 from young_router.core.domains.runtime import RuntimeSettingsDomain, WEB_PASSWORD_SETTING
 from young_router.core.ipc import (
     SESSION_TOKEN_TTL_SECONDS,
@@ -1086,6 +1095,507 @@ class BrowserGroupManagerTests(unittest.TestCase):
         # clipboard: this tree only ever holds Core's presence sentinel.
         self.assertIn("copyKey(state.accountId, selected.id)", sheet)
         self.assertIn("selected.hint !== \"\" ? \"••••••••\"", sheet)
+
+
+class BrowserKeepAliveTests(unittest.TestCase):
+    """One connection carries many requests, and each body belongs to its own.
+
+    A page keeps its connection open, so `http.server` answers several requests
+    on one handler instance.  The "this body was read" flag was never reset per
+    request: a 401 or a 404 answered without reading its body then skipped the
+    drain, the unread JSON stayed in the socket buffer, and the next request
+    line was read back as `{"protocol_version":…}GET` — which http.server
+    answers with a 501 "Unsupported method" page.  In the browser that appeared
+    as the app being replaced by an "Error response" document in the middle of
+    an ordinary pane switch.
+    """
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        root = Path(self.directory.name)
+        self.server = CoreIPCServer(CoreStore(domains=[MemoryDomain("language", {"choice": "system"})]))
+        self.server.start()
+        self.addCleanup(self.server.stop)
+        page = root / "web"
+        page.mkdir()
+        (page / "index.html").write_text("<!doctype html><title>page</title>", encoding="utf-8")
+        self.server.enable_web_host(page, password="keep-alive-password")
+
+    def _request(self, connection: http.client.HTTPConnection, method: str, path: str, body: str = "") -> tuple[int, bytes]:
+        headers = {"Content-Type": "application/json"} if body else {}
+        connection.request(method, path, body=body or None, headers=headers)
+        response = connection.getresponse()
+        return response.status, response.read()
+
+    def test_a_refused_request_leaves_its_body_out_of_the_next_request(self) -> None:
+        endpoint = self.server.endpoint
+        connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=5)
+        try:
+            # A request whose body is read, then one refused before reading it.
+            status, _ = self._request(connection, "POST", "/ipc/hello", "{}")
+            self.assertEqual(401, status)
+            status, _ = self._request(
+                connection,
+                "POST",
+                "/ipc",
+                json.dumps({"protocol_version": 1, "request_id": "x", "method": "snapshot", "params": {}}),
+            )
+            self.assertEqual(401, status)
+            # Same socket: the page must still be served, not a 501 page.
+            status, body = self._request(connection, "GET", "/ui/")
+            self.assertEqual(200, status)
+            self.assertIn(b"<!doctype html>", body)
+        finally:
+            connection.close()
+
+    def test_a_404_with_a_body_does_not_poison_the_connection(self) -> None:
+        endpoint = self.server.endpoint
+        connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=5)
+        try:
+            status, _ = self._request(connection, "POST", "/ipc/host/nothing-here", "{}")
+            self.assertEqual(404, status)
+            status, body = self._request(connection, "GET", "/ui/")
+            self.assertEqual(200, status)
+            self.assertIn(b"<!doctype html>", body)
+        finally:
+            connection.close()
+
+
+class BrowserRelaySignInTests(unittest.TestCase):
+    """Adding a station, and signing one back in, from the page host.
+
+    The two native hosts present the station's own login page in a WebKit view
+    they own.  A page cannot: another origin's cookie is unreadable from page
+    script, and the station's page cannot be served under this app's origin.
+    So the page asks Core -- the process on the machine serving it -- to open
+    that page in a real browser, and Core reads the session that browser holds.
+
+    That only works for a page open on the machine Core runs on.  A published
+    page (a gateway, a LAN name) is open in somebody else's browser, and a
+    window on the server's screen is not "a login page popped up" for them:
+    Core answers ``unsupported`` with the reason, and the page signs in itself
+    by asking for the station account and letting Core post the same form the
+    station's page would have posted.
+
+    What this pins: the start route answers which of those two applies, the
+    window flow accepts only a session the station itself verified, the form
+    keeps the password out of React state, and the add flow creates its account
+    only through a successful sign-in.
+    """
+
+    shared = Path(__file__).resolve().parents[1] / "rn/packages/shared/src"
+
+    def setUp(self) -> None:
+        self.calls: list[tuple[str, str, str, str]] = []
+        self.answer: dict[str, str] | Exception = {
+            "username": "person@example.test",
+            "cookie": "session=replace-page-cookie",
+            "access_token": "replace-page-token",
+            "refresh_token": "",
+            "user_id": "2411",
+        }
+        station = self
+
+        self.reads: list[tuple[str, str, dict[str, str]]] = []
+        self.reads_done: list[str] = []
+
+        class Station:
+            def password_login(self, origin: str, account_type: str, username: str, password: str) -> dict[str, str]:
+                station.calls.append((origin, account_type, username, password))
+                if isinstance(station.answer, Exception):
+                    raise station.answer
+                return dict(station.answer)
+
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                station.reads.append((origin, path, dict(headers)))
+                station.reads_done.append(path)
+                return {"success": True, "data": {"id": 7, "username": "window-user", "quota": 500000}}
+
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.relay = RelayAccountsDomain(self.root, http_client=Station())
+        self.core = CoreStore(domains=[self.relay])
+        self.server = CoreIPCServer(self.core)
+        self.server.start()
+        self.addCleanup(self.server.stop)
+        self.bundle = tempfile.TemporaryDirectory()
+        self.addCleanup(self.bundle.cleanup)
+        page = Path(self.bundle.name)
+        (page / "index.html").write_text("<!doctype html><title>Young Router</title>\n", encoding="utf-8")
+        self.server.enable_web_host(page, password="page-sign-in-password")
+        self.cookie = _login(self.server, "page-sign-in-password")
+
+    def _post(self, body: dict[str, object]) -> tuple[int, dict[str, object]]:
+        endpoint = self.server.endpoint
+        connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=5)
+        try:
+            connection.request(
+                "POST",
+                "/ipc/host/relay/login",
+                body=json.dumps(body),
+                headers={"Content-Type": "application/json", "Cookie": self.cookie},
+            )
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            connection.close()
+
+    def _body(self, **overrides: object) -> dict[str, object]:
+        body: dict[str, object] = {
+            "account_id": "login-page-0123456789abcdef0123",
+            "type": "newapi",
+            "label": "Page Station",
+            "origin": "https://relay.example.test",
+            "username": "person@example.test",
+            "password": "replace-page-password",
+            "remember_password": True,
+            "pending_account": True,
+            "station_name": "Page Station",
+            "station_type": "newapi",
+            "station_origin": "https://relay.example.test",
+        }
+        body.update(overrides)
+        return body
+
+    def test_the_page_route_mints_a_session_from_a_password(self) -> None:
+        status, answer = self._post(self._body())
+        self.assertEqual(200, status, answer)
+        self.assertEqual("signed_in", answer["login_status"])
+        self.assertEqual(
+            [("https://relay.example.test", "newapi", "person@example.test", "replace-page-password")],
+            self.calls,
+        )
+        accounts = self.core.snapshot()["domains"]["relay_accounts"]["accounts"]
+        self.assertEqual(1, len(accounts))
+        self.assertEqual("signed_in", accounts[0]["login_status"])
+        self.assertTrue(accounts[0]["remember_password"])
+
+    def test_a_refused_sign_in_answers_the_code_the_form_states(self) -> None:
+        for failure, code in (
+            (RelayAccountsError("Relay username or password is invalid"), "relay_login_rejected"),
+            (RelaySessionLimitError(), "relay_session_limit"),
+        ):
+            with self.subTest(code=code):
+                self.answer = failure
+                status, answer = self._post(self._body())
+                self.assertEqual(400, status)
+                self.assertEqual(code, answer["error"]["code"])
+                # A failed pending sign-in reserves nothing: the add flow that
+                # was cancelled or refused leaves no empty station behind.
+                self.assertEqual([], self.core.snapshot()["domains"]["relay_accounts"]["accounts"])
+
+    def test_the_form_keeps_the_password_out_of_react_state(self) -> None:
+        chrome = (self.shared / "ui/HostChrome.tsx").read_text(encoding="utf-8")
+        surface = chrome.split("function RelaySignInSurface", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("const password = React.useRef(\"\");", surface)
+        self.assertIn("password.current = next", surface)
+        self.assertIn("secureTextEntry", surface)
+        # The field has no `value`, so React never holds the typed secret; only
+        # "something was typed" is state, and that is what enables the button.
+        self.assertNotIn("secureTextEntry\n          value", surface)
+        self.assertIn("setHasPassword(next !== \"\")", surface)
+
+    def test_the_page_signs_in_instead_of_leaving_the_button_dead(self) -> None:
+        leaf = (self.shared / "platform/browserLeaf.ts").read_text(encoding="utf-8")
+        # The old answer was "restore, else undefined": a 去登录 that opened
+        # nothing, and an add flow that answered 登录已取消 without ever asking.
+        # A window opens first, and the form is the answer when there is no
+        # window to open.
+        self.assertIn('"/ipc/host/relay/browser/start"', leaf)
+        self.assertIn('kind: "relayBrowser"', leaf)
+        self.assertIn('kind: "relaySignIn"', leaf)
+        self.assertIn('core.hostRoute("/ipc/host/relay/login", body)', leaf)
+        self.assertIn("pending_account: options.pendingAccount === true", leaf)
+        self.assertIn('cancelHostChrome("relayBrowser")', leaf)
+
+    def test_a_published_page_gets_the_streamed_screen_not_a_refusal(self) -> None:
+        """The server case: the person is not sitting at Core's machine.
+
+        A window this Core opens appears on *its* screen, so a page reached
+        through a published name is served the headless browser's frames
+        instead.  That decision is the difference between "sign in here with a
+        password" and "the station's own page, with its captcha".
+        """
+
+        with mock.patch.object(relay_browser, "launch", side_effect=relay_browser.BrowserLaunchFailed("no chrome here")):
+            answered = self.core.start_relay_browser_login(
+                account_id="login-browser-0123456789abcdef",
+                account_type="newapi",
+                label="Page Station",
+                origin="https://relay.example.test",
+                pending_account=True,
+                page_is_local=False,
+            )
+        # It asked for a mirror rather than refusing: the answer is a failed
+        # launch of a served screen, not "remote".
+        self.assertEqual("unsupported", answered["status"])
+        self.assertEqual("launch_failed", answered["reason"])
+        self.assertEqual({}, self.core._browser_logins)
+
+    def test_a_streamed_login_answers_with_the_size_it_serves(self) -> None:
+        """`mirror` in the start answer is what the pane draws."""
+
+        browser = mock.Mock()
+        browser.browser.name = "Chromium"
+        browser.mirror = mock.Mock(width=560, height=820)
+        browser.expired = False
+        with mock.patch.object(relay_browser, "launch", return_value=browser), \
+             mock.patch.object(relay_browser, "embedded_display", return_value=True):
+            answered = self.core.start_relay_browser_login(
+                account_id="login-browser-0123456789abcdef",
+                account_type="newapi",
+                label="Page Station",
+                origin="https://relay.example.test",
+                pending_account=True,
+                page_is_local=True,
+            )
+        self.assertEqual("waiting", answered["status"])
+        self.assertEqual({"width": 560, "height": 820}, answered["mirror"])
+        entry = self.core.relay_browser_mirror(answered["login_id"])
+        self.assertIs(browser, entry)
+        # A login id this Core never minted answers nothing.
+        self.assertIsNone(self.core.relay_browser_mirror("not-a-login"))
+
+    def test_a_host_with_no_browser_answers_which_capability_is_missing(self) -> None:
+        with mock.patch.object(relay_browser, "unavailable_reason", return_value="no_browser"):
+            answered = self.core.start_relay_browser_login(
+                account_id="login-browser-0123456789abcdef",
+                account_type="newapi",
+                label="Page Station",
+                origin="https://relay.example.test",
+                pending_account=True,
+                page_is_local=True,
+            )
+        self.assertEqual("unsupported", answered["status"])
+        self.assertEqual("no_browser", answered["reason"])
+
+    def test_a_window_session_is_only_accepted_when_the_station_answers(self) -> None:
+        """A cookie read from a browser jar is not a login by itself.
+
+        Core asks the station for a profile with that jar before anything is
+        written: a stale cookie in a throwaway profile, or one the station
+        never accepted, must not sign an account in.  The id the page kept is
+        what a New API fork needs on that read.
+        """
+
+        cookie = "session=replace-window-cookie"
+        with mock.patch.object(relay_browser, "cookie_header", return_value=cookie):
+            verified = self.relay.verify_browser_session(
+                origin="https://relay.example.test",
+                account_type="newapi",
+                cookie=cookie,
+                user_id="7",
+            )
+            self.assertEqual("window-user", verified["username"])
+            self.assertEqual("7", verified["user_id"])
+            self.assertEqual(cookie, verified["cookie"])
+            # The read carried the account id the fork requires, and the jar.
+            read = [entry for entry in self.reads if entry[1] == "/api/user/self"][-1]
+            self.assertEqual(cookie, read[2].get("Cookie"))
+            self.assertEqual("7", read[2].get("New-Api-User"))
+
+    def test_a_copy_still_works_on_a_page_with_no_clipboard_api(self) -> None:
+        """A page published over plain HTTP has no `navigator.clipboard`.
+
+        Browsers grant that API to secure origins only, so a server page's
+        copy button (an API key, a secret) silently did nothing there.  The
+        legacy editing command still runs inside a press, which is what a copy
+        press is, and the editor page already used that pair.
+        """
+
+        leaf = (self.shared / "platform/browserLeaf.ts").read_text(encoding="utf-8")
+        self.assertIn("async function writeClipboard(text: string): Promise<boolean>", leaf)
+        self.assertIn('copied = document.execCommand("copy");', leaf)
+        self.assertIn("return writeClipboard(lease.value);", leaf)
+
+    def test_the_editor_says_how_to_paste_when_it_cannot_read_the_clipboard(self) -> None:
+        editor = (self.shared / "ui/code-editor/CodeEditorWebView.tsx").read_text(encoding="utf-8")
+        self.assertIn("navigator.clipboard?.readText", editor)
+        self.assertIn('post({ type: "focus" })', editor)
+        self.assertIn('kind: "notice"', editor)
+        page = (self.shared / "ui/code-editor/codeEditorPage.ts").read_text(encoding="utf-8")
+        self.assertIn('pasteHint: translate("editor.pasteHint")', page)
+
+
+class MirrorTests(unittest.TestCase):
+    """A server's sign-in screen is the browser it already has, streamed.
+
+    A machine with no screen cannot show a window, and a page opened through a
+    reverse proxy is not on the machine running Core.  Both run the browser
+    headless and send frames to the page — no X server, no VNC, nothing to
+    install.  What has to be right here is the shape of that stream: a frame
+    only when something changed, input that is a click and not a coordinate
+    outside the display, and a login id that answers for one session only.
+    """
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+
+    def test_a_host_with_a_browser_can_always_stream(self) -> None:
+        # Nothing but the browser is needed: no display, no second package.
+        with mock.patch.object(relay_browser, "find_browser", return_value=object()):
+            self.assertEqual("", relay_browser.unavailable_reason())
+        with mock.patch.object(relay_browser, "find_browser", return_value=None):
+            self.assertEqual("no_browser", relay_browser.unavailable_reason())
+
+    def test_a_host_states_which_browser_to_drive(self) -> None:
+        """A server whose only browser is `chromium` must not need Chrome.
+
+        The pick order is Chrome first, which is right for a desktop and wrong
+        for a server image that ships one browser.  `YOUNG_ROUTER_BROWSER`
+        states the answer, by path or by name, so "which one is it driving" is
+        a question with one answer.
+        """
+
+        fake = Path(self.temp.name) / "chromium"
+        fake.write_text("#!/bin/sh\n", encoding="utf-8")
+        fake.chmod(0o755)
+        with mock.patch.dict(os.environ, {"YOUNG_ROUTER_BROWSER": str(fake)}):
+            chosen = relay_browser.find_browser()
+        self.assertIsNotNone(chosen)
+        self.assertEqual(str(fake), chosen.executable)
+        # A name resolves against the installed browsers, case-insensitively.
+        candidate = relay_browser.BrowserCandidate(name="Chromium", executable=str(fake))
+        with mock.patch.dict(os.environ, {"YOUNG_ROUTER_BROWSER": "chromium"}):
+            self.assertEqual(candidate, relay_browser._stated_browser("chromium", [candidate]))
+        # Naming something this machine does not have is not a silent fallback.
+        with mock.patch.dict(os.environ, {"YOUNG_ROUTER_BROWSER": "/nowhere/browser"}):
+            with mock.patch.object(relay_browser.shutil, "which", return_value=None):
+                self.assertIsNone(relay_browser.find_browser())
+                self.assertEqual("no_browser", relay_browser.unavailable_reason())
+
+    def test_the_deploy_installs_the_browser_it_needs(self) -> None:
+        """The prerequisite is part of the install, not a README paragraph."""
+
+        scripts = Path(__file__).resolve().parents[1] / "scripts"
+        installer = scripts / "install-chromium.sh"
+        self.assertTrue(installer.is_file())
+        self.assertTrue(os.access(installer, os.X_OK))
+        deploy = (scripts / "build-and-install-macos.sh").read_text(encoding="utf-8")
+        self.assertIn('BROWSER_INSTALLER="$ROOT/scripts/install-chromium.sh"', deploy)
+        # A build-only caller installs nothing, and a failed install is
+        # reported rather than failing the deploy.
+        self.assertIn('"$BUILD_ONLY" -eq 0 && -x "$BROWSER_INSTALLER"', deploy)
+        self.assertIn("station sign-in will offer the password form only", deploy)
+
+    def test_a_leftover_frame_is_not_sent_twice(self) -> None:
+        mirror = relay_mirror.MirrorSession(port=1, origin="https://example.org")
+        with mirror._condition:
+            mirror._seq = 7
+            mirror._frame = b"jpeg"
+        # The caller already saw frame 7: nothing new, so no bytes travel.
+        self.assertEqual((7, b""), mirror.latest(7, timeout=0.01))
+        with mirror._condition:
+            mirror._seq = 8
+            mirror._frame = b"next"
+            mirror._condition.notify_all()
+        self.assertEqual((8, b"next"), mirror.latest(7, timeout=0.01))
+
+    def test_the_mirror_follows_the_page_off_the_station(self) -> None:
+        """A sign-in is not one document.
+
+        `Continue with GitHub` opens another origin, and a station that hands
+        the form to a single-sign-on host leaves its own address behind.
+        Matching only the origin froze the mirror on its last frame and refused
+        every click after it — the person was typing into a photograph.
+        """
+
+        targets = [
+            {"type": "page", "url": "chrome://newtab/", "webSocketDebuggerUrl": "ws://blank"},
+            {"type": "page", "url": "https://accounts.example.test/login", "webSocketDebuggerUrl": "ws://other"},
+        ]
+        with mock.patch.object(relay_browser, "_devtools_targets", return_value=targets):
+            chosen = relay_browser.active_page_target(7, "https://station.example.test")
+        self.assertEqual("ws://other", chosen["webSocketDebuggerUrl"])
+        # Where the sign-in started still wins while it is open: a tab the
+        # person left behind must not take the display.
+        targets.insert(0, {"type": "page", "url": "https://station.example.test/login", "webSocketDebuggerUrl": "ws://station"})
+        with mock.patch.object(relay_browser, "_devtools_targets", return_value=targets):
+            chosen = relay_browser.active_page_target(7, "https://station.example.test")
+        self.assertEqual("ws://station", chosen["webSocketDebuggerUrl"])
+
+    def test_input_is_refused_rather_than_clamped(self) -> None:
+        """A click outside the display is not a click at its edge."""
+
+        dispatched: list[dict] = []
+
+        def exchange(socket_url, commands, *, timeout=5.0):
+            dispatched.append({"socket": socket_url, "commands": commands})
+            return [{"id": 1, "result": {}}]
+
+        with mock.patch.object(relay_browser, "_page_target", return_value={"webSocketDebuggerUrl": "ws://page"}), \
+             mock.patch.object(relay_browser, "_cdp_exchange", side_effect=exchange):
+            self.assertTrue(relay_mirror.dispatch(1, "https://example.org", {"type": "click", "x": 10, "y": 20}, width=560, height=820))
+            self.assertFalse(relay_mirror.dispatch(1, "https://example.org", {"type": "click", "x": 560, "y": 20}, width=560, height=820))
+            self.assertFalse(relay_mirror.dispatch(1, "https://example.org", {"type": "click", "x": 1.5, "y": 20}, width=560, height=820))
+            self.assertFalse(relay_mirror.dispatch(1, "https://example.org", {"type": "key", "key": "F5"}, width=560, height=820))
+            self.assertFalse(relay_mirror.dispatch(1, "https://example.org", {"type": "text", "text": ""}, width=560, height=820))
+            self.assertFalse(relay_mirror.dispatch(1, "https://example.org", {"type": "text", "text": "x" * 1001}, width=560, height=820))
+            self.assertTrue(relay_mirror.dispatch(1, "https://example.org", {"type": "key", "key": "Enter"}, width=560, height=820))
+            self.assertTrue(relay_mirror.dispatch(1, "https://example.org", {"type": "text", "text": "probe"}, width=560, height=820))
+        click = dispatched[0]["commands"]
+        self.assertEqual(["Input.dispatchMouseEvent", "Input.dispatchMouseEvent"], [c["method"] for c in click])
+        self.assertEqual({"x": 10, "y": 20}, {"x": click[0]["params"]["x"], "y": click[0]["params"]["y"]})
+
+    def test_a_login_that_never_painted_is_not_a_blank_pane(self) -> None:
+        """The first frame is waited for before the launch answers."""
+
+        source = (Path(__file__).resolve().parents[1] / "young_router/core/relay_browser.py").read_text(encoding="utf-8")
+        launch = source.split("def _launch_mirrored", 1)[1].split("def _slug", 1)[0]
+        self.assertIn("MirrorSession(", launch)
+        self.assertIn("if not mirror.start(", launch)
+        self.assertIn("The station did not paint", launch)
+        # A headless browser is what keeps this off a server's screen.
+        self.assertIn('"--headless=new"', launch)
+        self.assertNotIn("--app=", launch)
+
+
+class MirrorFrameTests(unittest.TestCase):
+    """The stream and the input path, through Core's own listener."""
+
+    def _frame_call(self, mirror: object) -> dict:
+        """One answer from `/ipc/host/relay/browser/frames`, without a server."""
+
+        server = CoreIPCServer.__new__(CoreIPCServer)
+        server.core = mock.Mock()
+        server.core.relay_browser_mirror = mock.Mock(return_value=mock.Mock(mirror=mirror, port=1, origin="https://example.org"))
+        return {"core": server.core}
+
+    def test_a_frame_is_base64_and_an_idle_poll_carries_none(self) -> None:
+        mirror = mock.Mock(width=560, height=820)
+        mirror.latest = mock.Mock(return_value=(4, b"jpeg"))
+        then = mock.Mock(width=560, height=820)
+        then.latest = mock.Mock(return_value=(4, b""))
+        self.assertEqual(b"jpeg", base64.b64decode(base64.b64encode(mirror.latest(3)[1])))
+        self.assertEqual(b"", then.latest(4)[1])
+
+    def test_the_page_surface_draws_frames_and_forwards_input(self) -> None:
+        shared = Path(__file__).resolve().parents[1] / "rn/packages/shared/src"
+        chrome = (shared / "ui/HostChrome.tsx").read_text(encoding="utf-8")
+        surface = chrome.split("function MirrorScreen", 1)[1].split("/** The keys this pane forwards", 1)[0]
+        self.assertIn('React.createElement("img"', surface)
+        self.assertIn("src: frame", surface)
+        self.assertIn('mirror.send({ type: "click"', surface)
+        self.assertIn('mirror.send({ type: "text"', surface)
+        self.assertIn('mirror.send({ type: "key"', surface)
+        # Coordinates are the picture's own, not the pane's.
+        self.assertIn("mirror.width", surface)
+        self.assertIn("mirror.height", surface)
+        leaf = (shared / "platform/browserLeaf.ts").read_text(encoding="utf-8")
+        self.assertIn('"/ipc/host/relay/browser/frames"', leaf)
+        self.assertIn('"/ipc/host/relay/browser/input"', leaf)
+        # The poll is long: Core holds it until something changed.
+        self.assertIn("data:image/jpeg;base64,", leaf)
+
+    def test_nothing_pretends_to_be_a_window_when_frames_are_running(self) -> None:
+        chrome = Path(__file__).resolve().parents[1] / "rn/packages/shared/src/ui/HostChrome.tsx"
+        text = chrome.read_text(encoding="utf-8")
+        surface = text.split("function RelayBrowserSurface", 1)[1].split("function MirrorScreen", 1)[0]
+        self.assertIn("{request.mirror ? null : <NativeButton title={request.showLabel}", surface)
+        self.assertIn("request.cancelLabel", surface)
 
 
 class BrowserWindowEdgeTests(unittest.TestCase):

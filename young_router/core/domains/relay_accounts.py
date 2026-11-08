@@ -3996,6 +3996,123 @@ class RelayAccountsDomain:
             preserve_resources=True,
         )
 
+    def sign_in_with_password(
+        self,
+        account_id: str,
+        *,
+        username: str,
+        password: str,
+        remember_password: bool | None = None,
+    ) -> dict[str, Any]:
+        """Mint one session from a password a person typed into a host.
+
+        The two native hosts hand this app a cookie their own WebKit minted, so
+        a browser page cannot follow them: a cookie another tab minted lives on
+        the station's origin, which page script may not read, and the station's
+        login page cannot be run under this app's own origin (it is another
+        site, with its own CSP, cookies and redirects).  What a page *can* do is
+        ask for the station account's own credentials and let Core post the same
+        form the station's page would have posted.  That is why the page's
+        sign-in surface is a form and not an embedded page, and why a station
+        that answers with a captcha or a third-party redirect has to name the
+        desktop app as the place to finish.
+
+        ``restore_saved_password`` is the other caller of the same protocol; it
+        replays the password the account already remembers.  Both end in
+        :meth:`accept_login_result`, so the verified-session boundary and the
+        password decision are the same here as on a native host.
+        """
+
+        index = self._index(account_id)
+        account = copy.deepcopy(self._accounts[index])
+        login = getattr(self._http, "password_login", None)
+        username_value = _text(username, "Relay username", limit=320)
+        password_value = _text(password, "Relay password", limit=4096)
+        if not callable(login):
+            raise RelayAccountsError("Relay login result is incomplete")
+        # The station, not this app, says whether the account is accepted: a
+        # refusal is answered with the station's own reason (a capped account
+        # keeps its observation, a wrong password is a rejected credential) and
+        # a station that was never reached is a transport error, not a verdict.
+        result = login(account["origin"], account["type"], username_value, password_value)
+        if not isinstance(result, Mapping):
+            raise RelayAccountsError("Relay login was rejected")
+        return self.accept_login_result(
+            account_id,
+            username=str(result.get("username") or username_value),
+            cookie=str(result.get("cookie", "")),
+            access_token=str(result.get("access_token", "")),
+            refresh_token=str(result.get("refresh_token", "")),
+            password=password_value,
+            user_id=result.get("user_id", ""),
+            remember_password=remember_password,
+        )
+
+    def verify_browser_session(
+        self,
+        *,
+        origin: object,
+        account_type: object,
+        cookie: object,
+        access_token: object = "",
+        user_id: object = "",
+    ) -> dict[str, str]:
+        """Ask the station whether the cookie a real browser holds is a login.
+
+        This is the page host's answer to the native hosts' login window: Core
+        opened a browser at the station's own address, the person signed in
+        there, and Core read the cookie that browser holds.  A cookie read from
+        a jar is not by itself a login — the station never said anything about
+        it — so the session is asked for a profile first, with the same headers
+        every later dashboard read sends (a New API fork takes its account id as
+        ``New-Api-User``; the page's own storage is where that id and any token
+        beside the cookie come from).
+
+        It answers the facts the caller needs and writes nothing: the sign-in
+        itself goes through ``accept_login_result`` in one place, exactly as the
+        native hosts' completed sign-ins do, so a pending account is only
+        created by a verified session.
+        """
+
+        origin_value = _origin(origin)
+        type_value = str(account_type or "")
+        if type_value not in ACCOUNT_TYPES:
+            raise RelayAccountsError("Relay account type is invalid")
+        cookie_value = _text(cookie, "Relay cookie", limit=32768)
+        token_value = _text(access_token, "Relay access token", limit=32768, required=False)
+        station_user_id = _station_user_id(user_id)
+        path = "/api/user/self" if type_value == "newapi" else "/api/v1/auth/me"
+        headers: dict[str, str] = {"Cookie": cookie_value}
+        if token_value:
+            headers["Authorization"] = f"Bearer {token_value}"
+        if station_user_id and type_value == "newapi":
+            headers["New-Api-User"] = station_user_id
+        payload = self._http.json(origin_value, path, headers=headers)
+        profile = _json_data(payload)
+        if not isinstance(profile, Mapping):
+            raise RelayAccountsError("Relay returned an invalid response")
+        user = profile.get("user") if isinstance(profile.get("user"), Mapping) else profile
+        username = next(
+            (
+                value.strip()
+                for value in (
+                    user.get("username"),
+                    user.get("display_name"),
+                    user.get("email"),
+                )
+                if isinstance(value, str) and value.strip()
+            ),
+            "",
+        )
+        if not station_user_id:
+            station_user_id = _station_user_id(user.get("id"))
+        return {
+            "username": username,
+            "user_id": station_user_id,
+            "access_token": token_value,
+            "cookie": cookie_value,
+        }
+
     def set_login_status(self, account_id: str, status: str) -> dict[str, Any]:
         """Record one station outcome that did not yield a usable session.
 

@@ -16,6 +16,43 @@ code signing, and no per-architecture build, and it reaches a machine that
 already runs Core. A Tauri/Electron wrapper would add a second native stack to
 keep building, which is the cost this host exists to avoid.
 
+## Signing in to a station from a server
+
+Two native hosts present a station's login page in a WebKit view they own. A
+page cannot: another origin's page cannot be framed, its cookies are unreadable,
+and a proxied copy carries this app's hostname into a captcha's site key. So
+Core opens the station itself — and *where* depends on whether this machine has
+a screen:
+
+- **a machine with a screen** opens a real window on it, raises it if it landed
+  behind something, and reads the session over CDP when it closes;
+- **a server** has no screen to put a window on, so it streams one: the browser
+  this machine already has runs headless, `Page.startScreencast` sends a JPEG
+  whenever the station's page changes, and `Input.dispatch*` turns the person's
+  click and typing back into input on that page. Nothing is installed for this
+  and no second port exists.
+
+Measured on a station login page at 560×820: 21 KB per frame, 13–31 ms to
+capture one, and silence while nothing moves. The pane draws the frames as one
+`<img>` and sends clicks in the picture's own coordinates, keys the form moves
+with, and the wheel.
+
+Two things the stream states about itself, because a headless browser otherwise
+gives them away: the user agent from `Browser.getVersion` with `HeadlessChrome`
+replaced, and a 560×820 screen through `setDeviceMetricsOverride`. A station
+that still refuses a datacenter address is a judgement about the network; the
+pane says the sign-in failed rather than pretending to retry.
+
+Frames and input answer only for a login id this Core minted, through the same
+`yr-core-session` cookie as the shell: one page cannot drive another person's
+browser, and the id never leaves the pane that asked for it.
+
+The one prerequisite is a Chromium-family browser. `scripts/install-chromium.sh`
+installs one when a host has none (apt, dnf, zypper, pacman, apk or brew) and is
+idempotent; `scripts/build-and-install-macos.sh` runs it as part of the install
+and only warns when it cannot. `YOUNG_ROUTER_BROWSER` states which browser to
+drive, by path or by name, for a host whose only one is `chromium`.
+
 ## What serves it
 
 The page rides the port a person and a client already know: the router's own
@@ -31,8 +68,10 @@ local port. The proxy owns that listener, so it forwards `/ui` (this bundle) and
   neither that header nor a token in `localStorage`. It states `Max-Age` for
   thirty days and Core records the digest beside its metadata, so neither a
   closed browser nor a replaced Core (a deploy, or the app's own restart)
-  turns a signed-in page back into the key form; **退出登录**, at the bottom of
-  the sidebar, ends the lease and its record and reloads onto the gate.
+  turns a signed-in page back into the key form; **退出登录**, the one glyph at the
+  title band's trailing corner, ends the lease and its record and reloads onto
+  the gate (its name is the button's hover label, so the band keeps one row of
+  titles).
   `Secure` is added when the request reached Core over TLS, which the proxy
   states on the hop it forwards;
 - the sign-in key is `YOUNG_ROUTER_WEB_PASSWORD`, generated on first use and
@@ -88,9 +127,34 @@ serving it over a link nobody sized for it.
   second window.
 - **No menu bar, no tray, no launch-at-login.** A page has none of them. The
   address bar is the menu.
-- **No relay WebView sign-in.** The native hosts own an authenticated browser
-  for it; a page cannot. 记住的密码 sign-in works because Core does it over
-  HTTP.
+- **The station's login page opens in a real browser, on this machine.** A
+  page cannot present another origin's form (its cookies are unreadable here and
+  the station's page cannot be served under this origin), so Core — the process
+  serving this page — starts the station's own address in a Chromium-family
+  browser it finds on the machine, on a throwaway profile with a debugging port.
+  The person signs in there, captcha and redirects included; Core reads the
+  session that browser holds over CDP, asks the station for a profile with it,
+  closes the window and finishes the same verified-login boundary the native
+  hosts use. No browser is bundled: none installed means the credential form
+  below is the answer, and the pane says so.
+- **On a published page the sign-in runs in the page itself.** A page reached
+  through a name that is not loopback is open in somebody else's browser, and a
+  window on the server's screen is not "a login page popped up" for them — so
+  Core answers `unsupported` with `remote` (or `no_browser`/`no_display`) and the
+  pane asks for the station account instead, which Core posts as the same form
+  the station's page would have posted. A station that insists on a captcha or a
+  third-party sign-in is finished on the machine that runs Core, at the same
+  address; a page opened there gets the browser window.
+- **The page's only credential is the cookie.** It sends no `Authorization`
+  header: a remembered header is a second credential, and when the cookie and
+  the header disagree (a reload replaces the cookie while the previous
+  document's calls are in flight) Core refuses the pair — the 401 handler then
+  reloads, and the page never finishes loading. One credential, one answer.
+- **Clipboard work is best effort by design.** `navigator.clipboard` exists only
+  in a secure context, so a page published over plain HTTP from a server has no
+  copy API; copying a key falls back to the editing command inside the press, and
+  the editor's Paste item says to use ⌘V/Ctrl+V (which the frame receives as a
+  normal paste event) instead of silently doing nothing.
 - **`Platform.OS` is `web`.** `NativeControls` answers those branches with
   plain React (`NativeButton`, `NativeSegmentedControl`/a scrollable strip,
   `NativeTextField`, the Windows toggle and checkbox); this host adds a real

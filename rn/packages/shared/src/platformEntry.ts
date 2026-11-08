@@ -81,6 +81,8 @@ type NativeModule = {
     origin: string;
     language: LanguagePreference;
     username?: string;
+    /** The account's own remember-password preference, so a re-sign-in does not silently clear it. */
+    rememberPassword?: boolean;
   }) => Promise<{ revision: number; loginStatus: "signed_in"; username: string } | undefined>;
   cancelRelayLogin?: () => void;
   openRelayLogs?: (options: {
