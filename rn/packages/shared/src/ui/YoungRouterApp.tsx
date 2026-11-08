@@ -753,14 +753,6 @@ const ONLINE_USAGE_TIME_OPTIONS = ["all", "today", "7d", "30d", "custom"] as con
 type OnlineUsageTimeOption = typeof ONLINE_USAGE_TIME_OPTIONS[number];
 type OnlineUsageRange = { since?: number; until?: number };
 
-function localDateParts(now = new Date()): [string, string] {
-  const pad = (value: number): string => String(value).padStart(2, "0");
-  return [
-    `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`,
-    `${pad(now.getHours())}:${pad(now.getMinutes())}`,
-  ];
-}
-
 function parseLocalDate(value: string, end = false): number | undefined {
   const match = /^(\d{4})-(\d{2})-(\d{2})(?:\s+(\d{2}):(\d{2}))?$/.exec(value.trim());
   if (!match) return undefined;
@@ -9848,11 +9840,12 @@ function ClientFileRows({ files, revealFileLabel, revealFile, busy, translate, o
   translate: Translate;
   onOpenFile: (file: ClientFile) => void;
 }): React.JSX.Element {
-  const row = (file: ClientFile): React.JSX.Element => <View key={file.id} style={assistantFileSurfaceStyles.fileRow}>
-    <View style={assistantFileSurfaceStyles.fileMeta}>
-      <Text numberOfLines={1} style={assistantFileSurfaceStyles.fileLabel}>{file.name}</Text>
-      {/* The path itself is the reveal control, so a click opens the platform
-          file manager at that file (or its directory). */}
+  const row = (file: ClientFile): React.JSX.Element => <SettingsActionRow
+    key={file.id}
+    title={<Text numberOfLines={1} style={styles.settingsActionRowTitle}>{file.name}</Text>}
+    detail={
+      /* The path itself is the reveal control, so a click opens the platform
+         file manager at that file (or its directory). */
       <NativeButton
         link
         plainLink
@@ -9864,10 +9857,10 @@ function ClientFileRows({ files, revealFileLabel, revealFile, busy, translate, o
         onPress={() => revealFile?.(file.path)}
         style={assistantFileSurfaceStyles.filePathLink}
       />
-    </View>
-    {file.exists ? null : <Text style={assistantFileSurfaceStyles.fileMissing}>{translate("clients.fileMissing")}</Text>}
-    <NativeButton title={translate("settings.editFile")} toolTip={file.exists ? undefined : translate("clients.fileMissing")} accessibilityLabel={`${translate("settings.editFile")}: ${file.display_path}`} disabled={busy || !file.exists} onPress={() => onOpenFile(file)} style={assistantFileSurfaceStyles.editFileButton} />
-  </View>;
+    }
+    note={file.exists ? null : <Text style={styles.settingsActionRowNote}>{translate("clients.fileMissing")}</Text>}
+    action={<NativeButton title={translate("settings.editFile")} toolTip={file.exists ? undefined : translate("clients.fileMissing")} accessibilityLabel={`${translate("settings.editFile")}: ${file.display_path}`} disabled={busy || !file.exists} onPress={() => onOpenFile(file)} style={assistantFileSurfaceStyles.editFileButton} />}
+  />;
   return <>{files.map(row)}</>;
 }
 
@@ -11192,26 +11185,22 @@ function WebDavSyncSection({ snapshot, onOpenSettings, status, translate }: { sn
   // clears it: only a conflict asks the reader to pick a side.
   const failureRemedy = webdavFailureRemedy(stringValue(lastResult.code));
   const host = webdavHost(stringValue(state.url));
-  // A category in the sync list is a field of the same grid every other pane
-  // draws: one label column (the category's own name), one control column (what
-  // it is set to), one action column (the way into its form), and the facts it
-  // reports underneath that control column -- no band of its own above them, and
-  // no bold caption standing in for a row label.
-  return <View style={SETTINGS_FIELD}>
-    <View style={SETTINGS_FIELD_ROW_INDENTED}>
-      <Text numberOfLines={1} style={SETTINGS_FIELD_LABEL}>{translate("webdav.sectionTitle")}</Text>
-      <View style={SETTINGS_FIELD_CELL}><Text numberOfLines={1} style={SETTINGS_FIELD_VALUE_TEXT}>{webDavStateLabel(translate, enabled)}</Text></View>
-      <View style={SETTINGS_FIELD_ACTION_SLOT}><ActionButton title={translate("webdav.details")} onPress={onOpenSettings} /></View>
-    </View>
-    {/* Where it syncs and when it last did: one item each, and a failed run
-        reddens its whole stamp so the line reads at a glance. */}
-    <View style={[SETTINGS_FIELD_HELP_SLOT, styles.webdavFactsRow]}>
-      <Text numberOfLines={1} style={SETTINGS_FIELD_HELP_TEXT}>{translate("webdav.serverLabel")}{host === "" ? translate("webdav.notSet") : host}</Text>
-      {lastSyncAt === "" ? null : <Text numberOfLines={1} style={[SETTINGS_FIELD_HELP_TEXT, lastFailed ? styles.webdavFactFailed : null]}>{translate("dataManagement.lastSync", { time: formatActionTimestamp(lastSyncAt) })}{lastFailed ? ` ${translate("webdav.failedSuffix")}` : ""}</Text>}
-      {lastFailed && lastSyncAt !== "" ? <Text numberOfLines={1} style={SETTINGS_FIELD_HELP_TEXT}>{translate(failureRemedy)}</Text> : null}
-      {status === undefined ? null : <Text numberOfLines={1} style={SETTINGS_FIELD_HELP_TEXT}>{status}</Text>}
-    </View>
-  </View>;
+  // A category in the sync list is one row of the shared action row -- the same
+  // two columns the client file list draws: the thing and its facts on the left,
+  // the one action at the far end.  A middle value column put 设置 a column away
+  // from the name it belongs to, and no bold caption of its own: 备份与同步"s own
+  // header already names 同步.
+  return <SettingsActionRow
+    title={translate("webdav.sectionTitle")}
+    detail={<View style={styles.settingsActionRowFacts}>
+      <Text numberOfLines={1} style={styles.settingsActionRowFact}>{webDavStateLabel(translate, enabled)}</Text>
+      <Text numberOfLines={1} style={styles.settingsActionRowFact}>{translate("webdav.serverLabel")}{host === "" ? translate("webdav.notSet") : host}</Text>
+      {lastSyncAt === "" ? null : <Text numberOfLines={1} style={[styles.settingsActionRowFact, lastFailed ? styles.settingsActionRowFactFailed : null]}>{translate("dataManagement.lastSync", { time: formatActionTimestamp(lastSyncAt) })}{lastFailed ? ` ${translate("webdav.failedSuffix")}` : ""}</Text>}
+      {lastFailed && lastSyncAt !== "" ? <Text numberOfLines={1} style={styles.settingsActionRowFact}>{translate(failureRemedy)}</Text> : null}
+      {status === undefined ? null : <Text numberOfLines={1} style={styles.settingsActionRowFact}>{status}</Text>}
+    </View>}
+    action={<ActionButton title={translate("webdav.details")} onPress={onOpenSettings} />}
+  />;
 }
 
 /** 已开启 / 未开启: the switch lives in the form, so the display states it. */
@@ -14980,6 +14969,34 @@ const SETTINGS_SECTION_LIST: ViewStyle = { ...SETTINGS_PANE_CONTENT, gap: SETTIN
  * title, so every pane's headings and labels line up with every other pane's.
  */
 const SETTINGS_SECTION_TITLE: TextStyle = { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" };
+/**
+ * A row that names one thing and offers one action at its right edge.
+ *
+ * Two columns, never three: the thing's own facts live under its name in that
+ * same left column, and the action sits at the far end.  A middle "value"
+ * column separates the action from the row it acts on -- 设置 stood a column
+ * away from WebDAV 同步 -- and leaves the row unable to line up with the file
+ * rows beside it, which are this same shape (name over path, action at the end).
+ */
+function SettingsActionRow({ title, detail, note, action, style }: {
+  title: React.ReactNode;
+  /** The row's own second line or lines: a path, the facts it reports. */
+  detail?: React.ReactNode;
+  /** A short state that belongs beside the copy, before the action. */
+  note?: React.ReactNode;
+  action?: React.ReactNode;
+  style?: StyleProp<ViewStyle>;
+}): React.JSX.Element {
+  return <View style={[styles.settingsActionRow, style]}>
+    <View style={styles.settingsActionRowCopy}>
+      {typeof title === "string" ? <Text numberOfLines={1} style={styles.settingsActionRowTitle}>{title}</Text> : title}
+      {detail === undefined ? null : detail}
+    </View>
+    {note}
+    <View style={styles.settingsActionRowAction}>{action}</View>
+  </View>;
+}
+
 /** The action column: a row's buttons land on one x, whatever its value is. */
 const SETTINGS_FIELD_ACTION_SLOT: ViewStyle = { width: 72, minHeight: 26, flexShrink: 0, justifyContent: "center" };
 /** A settings route owns its own inset: the wrapper contributes none. */
@@ -15004,13 +15021,7 @@ const assistantFileSurfaceStyles = StyleSheet.create({
   // are separated from the next file by the pane's own rhythm. A rule under
   // every row (and one more under the last) turns four files into a stack of
   // dividers, so the detail body stays rule-free below its header band.
-  // The file rows start on the same x as the field labels above them: the
-  // lead every field row carries is part of the pane's grid, not the fields'.
-  fileRow: { minHeight: 36, flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 4, paddingLeft: SETTINGS_FIELD_LEAD },
-  fileMeta: { flex: 1, minWidth: 0, gap: 1 },
-  fileLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE },
   filePathLink: { alignSelf: "stretch", minWidth: 0, flexGrow: 0, flexShrink: 1 },
-  fileMissing: { flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
   editFileButton: { minWidth: 92 },
   editorHeader: { minHeight: 52, flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 14, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: systemColors.separator, backgroundColor: systemColors.window },
   editorHeaderCopy: { flex: 1, minWidth: 0, gap: 2 },
@@ -15172,6 +15183,10 @@ const styles = StyleSheet.create({
   // Only what General states itself: the scroll surface, the one action column
   // its service row keeps aligned with every other row's, and the page address
   // as a link.  Every field, label, slot and tip is the shared grid above.
+  // A row that names one thing and offers one action at its end: the client
+  // file list and the sync list draw this same row, so a 设置 and an 编辑文件 sit
+  // on one x and both rows start on the field labels' own x.
+  settingsActionRow: { minHeight: 36, flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 4, paddingLeft: SETTINGS_FIELD_LEAD }, settingsActionRowCopy: { flex: 1, minWidth: 0, gap: 1 }, settingsActionRowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE }, settingsActionRowFacts: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 12 }, settingsActionRowFact: { flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }, settingsActionRowFactFailed: { color: systemColors.red }, settingsActionRowNote: { flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }, settingsActionRowAction: { flexShrink: 0 },
   generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalServiceAction: { minWidth: 72 }, generalWebAddress: { flex: 1, minWidth: 0 }, generalWebAddressText: { color: systemColors.link }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, toolbarSpacer: { flex: 1 }, windowTabsRow: { flex: 1, minWidth: 0, height: 28, flexDirection: "row", alignItems: "center", gap: 8 }, windowTabsToolbarRow: { flex: 1, minWidth: 0, width: "100%", height: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6, overflow: "hidden" }, windowTabs: { width: 224, height: 24 }, windowTabsWithActions: { flexShrink: 1 }, windowTabsActions: { flex: 1, minWidth: 0, maxWidth: 400, marginLeft: "auto", flexShrink: 0 },
   providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceModel: { flex: 1, minHeight: 0 }, providerWizardSignInPanel: { width: "100%", minHeight: 160, justifyContent: "center", gap: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, backgroundColor: systemColors.control, paddingHorizontal: 16, paddingVertical: 18 }, providerWizardAuthRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAuthStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   providerMiddlePane: { flex: 1, minWidth: 0, gap: 6 }, // The empty pane reads as the top of a list that has no rows yet, not as a
@@ -15263,7 +15278,6 @@ inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspec
   // command it exists for. Not the settings form's label column.
   // A sync category is three lines: its header, its server, its command. The
   // form behind 详情设置 carries everything else.
-  webdavFactsRow: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 12 }, webdavFactFailed: { color: systemColors.red },
   // The category's own form is fields of the same grid every pane draws, so
   // its label column, value column and help indent line up with 运行时 and 外部.
   // Each control takes the grid's width for what it holds: the URL and the

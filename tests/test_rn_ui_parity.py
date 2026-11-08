@@ -553,7 +553,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'SETTINGS_RAIL_BODY',
             '<SettingsRail',
             'await flushPendingFields();',
-            "assistantFileSurfaceStyles.fileRow",
+            "<SettingsActionRow",
             'const stagedDomainsForRoute = useCallback((currentSnapshot: CoreSnapshot | undefined): ConfigDomain[] => {',
             'if (settingsRoute) {',
             'return (["codex", "claude", "clients"] as const).filter((name) => currentSnapshot?.drafts[name]?.dirty);',
@@ -2096,7 +2096,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('translate("dataManagement.lastSync", { time: formatActionTimestamp(lastSyncAt) })')
         self.assert_ui_has('function formatActionTimestamp(value: string): string {')
         self.assert_ui_has('{translate("webdav.serverLabel")}{host === "" ? translate("webdav.notSet") : host}')
-        self.assert_ui_has('style={[SETTINGS_FIELD_HELP_TEXT, lastFailed ? styles.webdavFactFailed : null]}')
+        self.assert_ui_has('style={[styles.settingsActionRowFact, lastFailed ? styles.settingsActionRowFactFailed : null]}')
         self.assert_ui_has('{lastFailed ? ` ${translate("webdav.failedSuffix")}` : ""}')
         self.assert_ui_has('function webdavHost(url: string): string {')
         self.assert_ui_has('const lastFailed = lastResult.ok === false && ["sync", "push", "pull"].includes(stringValue(lastResult.action));')
@@ -2248,8 +2248,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # A sync category keeps the one pane inset and reports in captions over
         # values; the form it opens is fields of the same grid the panes draw.
         for marker in (
-            'webdavFactsRow: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 12 }',
-            'webdavFactFailed: { color: systemColors.red }',
+            'settingsActionRowFacts: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 12 }',
+            'settingsActionRowFactFailed: { color: systemColors.red }',
             'webdavDialogBodyContent: { padding: SETTINGS_PANE_INSET }',
         ):
             self.assert_ui_has(marker)
@@ -2418,10 +2418,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # values, the one switch, and the command it exists for. The form it
         # opens draws the same grid every pane does, including the label column.
         for marker in (
-            '<View style={SETTINGS_FIELD}>',
-            '<View style={SETTINGS_FIELD_ROW_INDENTED}>',
-            '<Text numberOfLines={1} style={SETTINGS_FIELD_LABEL}>',
-            '<View style={[SETTINGS_FIELD_HELP_SLOT, styles.webdavFactsRow]}>',
+            '<SettingsActionRow',
+            '<View style={styles.settingsActionRowFacts}>',
+            'style={styles.settingsActionRowFact}',
             '{translate("webdav.serverLabel")}{host === "" ? translate("webdav.notSet") : host}',
             '<ActionButton title={translate("webdav.details")}',
         ):
@@ -2443,7 +2442,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'style={styles.webdavFieldHelpText}',
         ):
             self.assert_ui_has(marker)
-        self.assertNotIn('SETTINGS_FIELD_LABEL', webdav)
+        # The row label is the grid's own `SETTINGS_FIELD_LABEL` (regular weight,
+        # label column), and the form's rows spread the same grid through one
+        # alias -- the form's rows are a labelled field, the display is a row.
         self.assertIn('webdavFieldLabel: { ...SETTINGS_FIELD_LABEL }', self.ui)
         self.assertNotIn('<DataManagementGroup style={styles.webDavForm}>', self.ui)
         for legacy_form in (
@@ -3413,7 +3414,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # of its own is the frame, the rail body and the scroll surface.
             "RuntimeWorkspace": ("runtimeWorkspaceFrame:", "SETTINGS_RAIL_BODY", "runtimeScrollSurface:"),
             "DataManagementWorkspace": ("dataManagementWorkspace:", "dataManagementPane:"),
-            "WebDavSyncSection": ("webdavFactsRow:", "webdavFactFailed:"),
+            "WebDavSyncSection": ("settingsActionRowFacts:", "ActionButton title={translate(\"webdav.details\")"),
             "WebDavSettingsPanel": ("webdavDialogSurface:", "webdavDialogBody:", "webdavDialogBodyContent:"),
             "LogsWorkspace": (
                 "logsWindow:",
@@ -3522,7 +3523,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "onOpenFile(file)",
             "disabled={busy || !file.exists}",
             'toolTip={file.exists ? undefined : translate("clients.fileMissing")}',
-            "assistantFileSurfaceStyles.fileRow",
+            "<SettingsActionRow",
             "assistantFileSurfaceStyles.filePathLink",
         ):
             self.assertIn(marker, pane)
@@ -3534,7 +3535,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('const SETTINGS_FIELD: ViewStyle = { minWidth: 0, alignSelf: "stretch", gap: 2 };', self.ui)
         self.assertIn('const SETTINGS_FIELD_LIST: ViewStyle = { gap: 10 };', self.ui)
         # The client files below the fields start on the fields' own label x.
-        self.assertIn('fileRow: { minHeight: 36, flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 4, paddingLeft: SETTINGS_FIELD_LEAD },', self.ui)
+        self.assertIn('settingsActionRow: { minHeight: 36, flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 4, paddingLeft: SETTINGS_FIELD_LEAD },', self.ui)
         self.assertNotIn("borderBottomWidth", pane)
         self.assertNotIn("borderColor", pane)
         # Codex is the one client with a client-level action: adopt this app's
@@ -3682,7 +3683,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.ui,
         )
         self.assertIn(
-            "fileLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE },",
+            "settingsActionRowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE },",
             self.ui,
         )
         # The Core listing is the only path source, and the pane no longer
@@ -8325,18 +8326,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '{webDavStateLabel(translate, enabled)}',
             # The category names itself and carries its own 设置: that button
             # belongs to WebDAV 同步, not to the 同步 tab that lists categories.
-            '<Text numberOfLines={1} style={SETTINGS_FIELD_LABEL}>{translate("webdav.sectionTitle")}</Text>',
             '<ActionButton title={translate("webdav.details")} onPress={onOpenSettings} />',
             # The category is two lines: the title with its state and 设置, then
             # the server it syncs to with the last run's outcome.
             # One grid row: row label, value cell, action column, and the facts
             # under the same control column as every other pane's tip.
-            '<View style={SETTINGS_FIELD}>',
-            '<View style={SETTINGS_FIELD_ROW_INDENTED}>',
-            '<Text numberOfLines={1} style={SETTINGS_FIELD_LABEL}>{translate("webdav.sectionTitle")}</Text>',
-            '<View style={[SETTINGS_FIELD_HELP_SLOT, styles.webdavFactsRow]}>',
-            '<Text numberOfLines={1} style={SETTINGS_FIELD_HELP_TEXT}>{translate("webdav.serverLabel")}{host === "" ? translate("webdav.notSet") : host}</Text>',
-            '<Text numberOfLines={1} style={[SETTINGS_FIELD_HELP_TEXT, lastFailed ? styles.webdavFactFailed : null]}>{translate("dataManagement.lastSync", { time: formatActionTimestamp(lastSyncAt) })}{lastFailed ? ` ${translate("webdav.failedSuffix")}` : ""}</Text>',
+            # Two columns, like the client file rows: the thing and its facts on
+            # the left, the one action at the end.
+            '<SettingsActionRow',
+            'title={translate("webdav.sectionTitle")}',
+            'detail={<View style={styles.settingsActionRowFacts}>',
+            '<Text numberOfLines={1} style={styles.settingsActionRowFact}>{translate("webdav.serverLabel")}{host === "" ? translate("webdav.notSet") : host}</Text>',
+            '<Text numberOfLines={1} style={[styles.settingsActionRowFact, lastFailed ? styles.settingsActionRowFactFailed : null]}>{translate("dataManagement.lastSync", { time: formatActionTimestamp(lastSyncAt) })}{lastFailed ? ` ${translate("webdav.failedSuffix")}` : ""}</Text>',
             # The form it opens is fields of the shared settings grid.
             '<View style={styles.webdavFieldList}>',
             '<WebDavField label={translate("webdav.url")}>',
@@ -8362,9 +8363,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # control column), and the dialog's labelled rows are the same grid, so one
         # edit moves 运行时, 外部, 备份与同步 and this form together.  Neither
         # states a label width, a weight, or a help indent of its own.
-        self.assertIn("<Text numberOfLines={1} style={SETTINGS_FIELD_LABEL}>{translate(\"webdav.sectionTitle\")}</Text>", section)
+        self.assertIn('title={translate("webdav.sectionTitle")}', section)
         self.assertNotIn("fontWeight", section)
         self.assertNotIn("webdavSection", section)
+        # The action is the row's own third column's worth of width, not a value
+        # cell: a middle column put 设置 a column away from the name it acts on.
+        self.assertNotIn("SETTINGS_FIELD_CELL", section)
         self.assertIn("webdavFieldRow: { ...SETTINGS_FIELD_ROW_INDENTED }", self.ui)
         self.assertIn("webdavFieldLabel: { ...SETTINGS_FIELD_LABEL }", self.ui)
         # The display states the state; the switch itself is the form's.
@@ -8373,7 +8377,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # Nothing else may join the category: two rows is the whole display,
         # and everything that acts (the switch, the one-off run, the probe)
         # stays in the form.
-        for removed in ("webdavFact", "webdavEnableRow", "webdavSectionActions"):
+        for removed in ("webdavEnableRow", "webdavSectionActions"):
             self.assertNotIn(removed, section)
         self.assertNotIn("dataManagement.webdavHint", self.ui)
         self.assertNotIn("dataManagement.syncNow", self.ui)
@@ -8396,7 +8400,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # control (推送 / 拉取 / 测试连接) that clears it.
         self.assert_ui_has('const failureRemedy = webdavFailureRemedy(stringValue(lastResult.code));')
         self.assert_ui_has('function webdavFailureRemedy(code: string): TranslationKey {')
-        self.assert_ui_has('{lastFailed && lastSyncAt !== "" ? <Text numberOfLines={1} style={styles.webdavSectionStatus}>{translate(failureRemedy)}</Text> : null}')
+        self.assert_ui_has('{lastFailed && lastSyncAt !== "" ? <Text numberOfLines={1} style={styles.settingsActionRowFact}>{translate(failureRemedy)}</Text> : null}')
         self.assertIn('"webdav.remedy.conflict": "两端都有改动，请在设置里比较后保留其中一侧"', self.zh)
         self.assertIn('"webdav.remedy.incompatible": "远端文件由旧版本创建，下次同步会先另存一份再覆盖它"', self.zh)
         self.assertIn('"webdav.remedy.unsaved": "请先保存或重新加载本机的改动，再同步"', self.zh)
@@ -8625,7 +8629,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_codex_raw_editors_share_height_and_follow_disk_generation(self) -> None:
         for marker in (
             "showLabel={false} showDiff codexPane deferStage={Platform.OS === \"windows\"} onDirtyChange={handleEditorDirtyChange} syncRevision={Platform.OS === \"windows\" ? undefined : syncRevision} style={assistantFileSurfaceStyles.editorRouteRaw}",
-            "assistantFileSurfaceStyles.fileRow",
+            "<SettingsActionRow",
             "assistantFileSurfaceStyles.editorRoute",
             "function FileEditorWorkspace",
             "const [settingsRawReloadToken, setSettingsRawReloadToken] = useState(0);",
