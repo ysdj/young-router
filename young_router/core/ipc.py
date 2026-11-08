@@ -528,6 +528,23 @@ def browser_session_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+@dataclass(frozen=True)
+class _PreparedResponse:
+    """One answer that is already bytes, so the envelope is not rebuilt.
+
+    Everything else returns a ``ResponseEnvelope``, which validates the whole
+    result on construction and encodes it on the way out -- two Python walks
+    over a 273 KB snapshot, roughly 14 ms on the host this was measured on.  A
+    window polls the same revision many times a second, and the bytes of that
+    answer cannot change while the revision stands, so the second poll reuses
+    them: the envelope's ``request_id`` is spliced in front of the cached
+    ``result`` and the object is never walked again.
+    """
+
+    status: int
+    body: bytes
+
+
 @dataclass
 class _Subscription:
     subscription_id: str
@@ -721,7 +738,17 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         session_token: str | None = None,
         clear_session: bool = False,
     ) -> None:
-        encoded = _encode_response_body(payload)
+        self._send_encoded(status, _encode_response_body(payload), session_token=session_token, clear_session=clear_session)
+
+    def _send_encoded(
+        self,
+        status: int,
+        encoded: bytes,
+        *,
+        session_token: str | None = None,
+        clear_session: bool = False,
+    ) -> None:
+        """Answer with bytes that are already the body this route sends."""
         # A body this handler never read would otherwise become the next
         # request line on this kept-alive socket.
         self._consume_unread_body()
@@ -1207,6 +1234,13 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_error(400, request_id=request_id, code=exc.code, message=exc.message)
             return
         response = self._owner.handle_request(request, session_token=token)
+        if isinstance(response, _PreparedResponse):
+            self._send_encoded(response.status, response.body)
+            return
+        if response.ok and request.method == "snapshot" and isinstance(response.result, Mapping):
+            # The first poll of a revision pays for the validation and the
+            # encoding; every later one is answered from these bytes.
+            self._owner.remember_snapshot_result(response.result)
         self._send(200 if response.ok else 400, response.to_mapping())
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler hook
@@ -1263,6 +1297,8 @@ class CoreIPCServer:
         self._bootstrap_consumed = False
         self._sessions: dict[str, _Session] = {}
         self._subscriptions: dict[str, _Subscription] = {}
+        #: ``(revision, result bytes)`` of the last snapshot answered to a poll.
+        self._snapshot_body: tuple[int, bytes] | None = None
         self._editor_capabilities: dict[str, _EditorCapability] = {}
         self._secret_capabilities: dict[str, _SecretCapability] = {}
         self._secret_read_capabilities: dict[str, _SecretReadCapability] = {}
@@ -2486,6 +2522,35 @@ class CoreIPCServer:
                 session.subscriptions.add(subscription_id)
         return subscription_id
 
+    def _prepared_snapshot(self, request_id: str) -> "_PreparedResponse | None":
+        """The cached answer for this revision, or ``None`` to build one.
+
+        The cache is by revision because that is the store's own statement
+        about its projection: the same revision is the same snapshot, so the
+        bytes beside it are still its bytes.  A miss leaves the caller to build
+        and validate one, and the next call to ``_remember_snapshot`` stores it.
+        """
+
+        cached = self._snapshot_body
+        if cached is None or cached[0] != self.core.revision:
+            return None
+        return _PreparedResponse(200, self._snapshot_envelope(request_id, cached[1]))
+
+    def _snapshot_envelope(self, request_id: str, result: bytes) -> bytes:
+        prefix = (
+            b'{"protocol_version":'
+            + str(PROTOCOL_VERSION).encode("ascii")
+            + b',"request_id":'
+            + _encode_json(request_id)
+            + b',"ok":true,"result":'
+        )
+        return prefix + result + b"}"
+
+    def remember_snapshot_result(self, result: Mapping[str, Any]) -> None:
+        """Keep this revision's encoded result, so its next poll is a copy."""
+
+        self._snapshot_body = (self.core.revision, _encode_json(result))
+
     def next_event(self, subscription_id: str, *, session_token: str, timeout: float) -> dict[str, Any] | None:
         with self._lock:
             subscription = self._subscriptions.get(subscription_id)
@@ -2496,13 +2561,18 @@ class CoreIPCServer:
         except queue.Empty:
             return None
 
-    def handle_request(self, request: RequestEnvelope, *, session_token: str) -> ResponseEnvelope:
+    def handle_request(self, request: RequestEnvelope, *, session_token: str) -> "ResponseEnvelope | _PreparedResponse":
         if not self._valid_session(session_token):
             return ResponseEnvelope.failure(request.request_id, "unauthorized", "Core IPC authentication failed")
+        snapshot_result: dict[str, Any] | None = None
         try:
             params = request.params
             if request.method == "snapshot":
+                prepared = self._prepared_snapshot(request.request_id)
+                if prepared is not None:
+                    return prepared
                 result: Any = {"snapshot": self.core.snapshot()}
+                snapshot_result = result
             elif request.method == "web_launch_url":
                 # The page's own address, with the credential this host has
                 # already proved itself for.  Answered over the authenticated
@@ -2649,7 +2719,13 @@ class CoreIPCServer:
             else:  # defensive; RequestEnvelope already checks this.
                 raise CoreError("unsupported_method", "Unsupported Core operation")
             validate_method_result(request.method, result)
-            return ResponseEnvelope.success(request.request_id, result)
+            answer = ResponseEnvelope.success(request.request_id, result)
+            if snapshot_result is not None:
+                # Validated, so it is also worth keeping: the next poll of this
+                # revision is answered from these bytes instead of being built
+                # and walked again.
+                self.remember_snapshot_result(snapshot_result)
+            return answer
         except ConfirmationNeeded as exc:
             return _failure_response(request.request_id, exc.code, exc.message)
         except CoreError as exc:

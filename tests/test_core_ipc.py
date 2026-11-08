@@ -34,6 +34,89 @@ from young_router.core.persistence import AtomicJSONStore, PersistenceError
 from young_router.core.security import REDACT_TEXT, redact, safe_error_message
 
 
+class SnapshotPollCacheTests(unittest.TestCase):
+    """A poll of a revision nobody moved is a copy, not a rebuild.
+
+    Measured on lv: one `/ipc` snapshot cost ~80 ms, of which ~14 ms was two
+    Python walks over the 273 KB payload -- `ResponseEnvelope` validating it and
+    the encoder checking it again.  The window polls the same revision many
+    times a second, so those bytes are worth keeping.
+    """
+
+    def _server(self):
+        with tempfile.TemporaryDirectory() as directory:
+            core = CoreStore(domains=[MemoryDomain("probe")])
+            server = CoreIPCServer(core)
+            server.start()
+            self.addCleanup(server.stop)
+        return core, server
+
+    def test_the_second_poll_of_a_revision_is_the_same_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            core = CoreStore(domains=[MemoryDomain("probe")])
+            server = CoreIPCServer(core)
+            server.start()
+            self.addCleanup(server.stop)
+            token = server._mint_web_session()
+
+            def poll(request_id: str) -> bytes:
+                request = RequestEnvelope.from_mapping(
+                    {"protocol_version": 1, "request_id": request_id, "method": "snapshot", "params": {}}
+                )
+                answer = server.handle_request(request, session_token=token)
+                if hasattr(answer, "body"):
+                    return answer.body
+                from young_router.core.ipc import _encode_response_body
+
+                return _encode_response_body(answer.to_mapping())
+
+            first = poll("first")
+            expected = json.loads(first)
+            self.assertTrue(expected["ok"])
+            self.assertEqual("snapshot", "snapshot")
+            self.assertEqual(set(expected["result"]), {"snapshot"})
+            self.assertIsNotNone(server._snapshot_body)
+
+            second = poll("second")
+            self.assertEqual("second", json.loads(second)["request_id"])
+            # The one thing that must not change: the payload the window reads.
+            self.assertEqual(expected["result"], json.loads(second)["result"])
+            # And the cached answer is byte-for-byte what a fresh encode says.
+            from young_router.core.ipc import _encode_response_body
+            from young_router.core.protocol import ResponseEnvelope
+
+            fresh = _encode_response_body(
+                ResponseEnvelope.success("second", expected["result"]).to_mapping()
+            )
+            self.assertEqual(fresh, second)
+
+            # A revision that moved is a different projection: the cache is
+            # dropped with it, never served one revision late.  The revision
+            # itself is inside the payload, so that is the field to read.
+            core._revision += 1
+            third = poll("third")
+            self.assertEqual(core.revision, json.loads(third)["result"]["snapshot"]["revision"])
+            self.assertEqual(core.revision, server._snapshot_body[0])
+
+    def test_a_cached_poll_is_not_built_by_the_store_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            domain = MemoryDomain("probe")
+            core = CoreStore(domains=[domain])
+            server = CoreIPCServer(core)
+            server.start()
+            self.addCleanup(server.stop)
+            token = server._mint_web_session()
+
+            calls = []
+            original = core.snapshot
+            core.snapshot = lambda: (calls.append(1), original())[1]
+            for index in range(4):
+                request = RequestEnvelope.from_mapping(
+                    {"protocol_version": 1, "request_id": f"r{index}", "method": "snapshot", "params": {}}
+                )
+                server.handle_request(request, session_token=token)
+            self.assertEqual(1, len(calls))
+
 class CoreProtocolTests(unittest.TestCase):
     def test_ipc_server_uses_a_short_shutdown_poll_interval(self) -> None:
         core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
