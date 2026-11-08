@@ -265,28 +265,33 @@ function RelayBrowserSurface({ request }: { request: Extract<HostChromeRequest, 
 /**
  * Where in the station's own 560x820 display a click on this picture landed.
  *
- * The picture is drawn with `object-fit: contain`, so it is letterboxed inside
- * whatever box the dialog gives it: a 560x820 frame in a 418x520 box is 355 px
- * wide with 31 px of black on each side.  Dividing by the box instead of by the
- * drawn image put every click off by that margin — measured live, "关闭公告"
- * and the field labels were unclickable while the picture looked perfect, and a
- * click in the black margin mapped *outside* the display, where Core refuses the
- * event outright (`dispatched: false`) and the pane looks dead.
+ * Two things had to be right and neither was:
+ *
+ * - The picture is drawn with `object-fit: contain`, so it is letterboxed: a
+ *   560x820 frame in a 418x520 box is 355 px wide with 31 px of black on each
+ *   side.  Dividing by the box put every click off by that margin.
+ * - React delegates events to its root, so `event.nativeEvent.currentTarget`
+ *   is the *root container*, not the picture: the box measured was the whole
+ *   page and every click mapped outside the display, where Core refuses it.
+ *   Measured live as "nothing on the picture can be clicked".
+ *
+ * So this takes the picture's own rect and the pointer's client coordinates,
+ * which mean the same thing no matter who is listening.
  */
 export function mirrorPoint(
   mirror: { width: number; height: number },
-  box: { clientWidth: number; clientHeight: number },
-  offsetX: number,
-  offsetY: number,
+  rect: { left: number; top: number; width: number; height: number },
+  clientX: number,
+  clientY: number,
 ): { x: number; y: number } | null {
-  const boxWidth = Math.max(1, box.clientWidth);
-  const boxHeight = Math.max(1, box.clientHeight);
+  const boxWidth = Math.max(1, rect.width);
+  const boxHeight = Math.max(1, rect.height);
   const scale = Math.min(boxWidth / mirror.width, boxHeight / mirror.height);
   if (!Number.isFinite(scale) || scale <= 0) return null;
   const insetX = (boxWidth - mirror.width * scale) / 2;
   const insetY = (boxHeight - mirror.height * scale) / 2;
-  const x = Math.round((offsetX - insetX) / scale);
-  const y = Math.round((offsetY - insetY) / scale);
+  const x = Math.round((clientX - rect.left - insetX) / scale);
+  const y = Math.round((clientY - rect.top - insetY) / scale);
   if (x < 0 || y < 0 || x >= mirror.width || y >= mirror.height) return null;
   return { x, y };
 }
@@ -302,8 +307,12 @@ function MirrorScreen({ mirror, title }: { mirror: MirrorSurface; title: string 
           draggable: false,
           tabIndex: 0,
           onDragStart: (event: { preventDefault: () => void }) => event.preventDefault(),
-          onClick: (event: { nativeEvent: { offsetX: number; offsetY: number; currentTarget: { clientWidth: number; clientHeight: number } } }) => {
-            const point = mirrorPoint(mirror, event.nativeEvent.currentTarget, event.nativeEvent.offsetX, event.nativeEvent.offsetY);
+          onClick: (event: { currentTarget?: unknown; target?: unknown; nativeEvent?: { clientX?: number; clientY?: number } }) => {
+            const node = (event.currentTarget ?? event.target) as { getBoundingClientRect?: () => DOMRect } | null;
+            const native = event.nativeEvent;
+            if (!node || typeof node.getBoundingClientRect !== "function" || !native) return;
+            if (typeof native.clientX !== "number" || typeof native.clientY !== "number") return;
+            const point = mirrorPoint(mirror, node.getBoundingClientRect(), native.clientX, native.clientY);
             // A click in the letterbox is not a click on the station.
             if (point) mirror.send({ type: "click", ...point });
           },

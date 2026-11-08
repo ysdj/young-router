@@ -1661,8 +1661,13 @@ class MirrorFrameTests(unittest.TestCase):
         # Outside the picture is not a click: the margin is not the station.
         self.assertIn("if (x < 0 || y < 0 || x >= mirror.width || y >= mirror.height) return null", rule)
         surface = chrome.split("function MirrorScreen", 1)[1].split("const MIRROR_KEYS", 1)[0]
-        self.assertIn("mirrorPoint(mirror, event.nativeEvent.currentTarget", surface)
+        # React delegates to its root: `nativeEvent.currentTarget` is the root
+        # container, not the picture, so the handler measures the picture's own
+        # rect and uses client coordinates.
+        self.assertIn("node.getBoundingClientRect()", surface)
+        self.assertIn("native.clientX", surface)
         self.assertIn("if (point) mirror.send({ type: \"click\", ...point })", surface)
+        self.assertNotIn("mirror.width) / Math.max(1, element.clientWidth)", chrome)
 
     def test_nothing_pretends_to_be_a_window_when_frames_are_running(self) -> None:
         chrome = Path(__file__).resolve().parents[1] / "rn/packages/shared/src/ui/HostChrome.tsx"
