@@ -1535,6 +1535,26 @@ class MirrorTests(unittest.TestCase):
         self.assertIn('_text(cookie, "Relay cookie", limit=32768, required=False)', verify)
         self.assertIn("if cookie_value:\n            headers[\"Cookie\"] = cookie_value", verify)
 
+    def test_a_page_that_goes_away_ends_its_sign_in(self) -> None:
+        """Closing or reloading the page must not leave a browser running.
+
+        Measured before this existed: reloading the page mid sign-in left three
+        Chrome processes and three profiles on the host, each alive until the
+        ten-minute limit, because the login id lived only in the document that
+        was being replaced.  `beforeunload`/`pagehide` cannot await a fetch, so
+        the cancel goes out as a beacon.
+        """
+
+        leaf = (Path(__file__).resolve().parents[1] / "rn/packages/shared/src/platform/browserLeaf.ts").read_text(encoding="utf-8")
+        self.assertIn('hostBeacon("/ipc/host/relay/browser/cancel", { login_id: loginId })', leaf)
+        self.assertIn('window.addEventListener("beforeunload", abandon)', leaf)
+        self.assertIn('window.addEventListener("pagehide", abandon)', leaf)
+        self.assertIn('window.removeEventListener("beforeunload", abandon)', leaf)
+        self.assertIn('window.removeEventListener("pagehide", abandon)', leaf)
+        bridge = leaf.split("const hostBeacon =", 1)[1].split("const hostRoute =", 1)[0]
+        self.assertIn("navigator.sendBeacon", bridge)
+        self.assertIn('type: "application/json"', bridge)
+
     def test_a_leftover_frame_is_not_sent_twice(self) -> None:
         mirror = relay_mirror.MirrorSession(port=1, origin="https://example.org")
         with mirror._condition:

@@ -102,6 +102,14 @@ async function hello(transport: BrowserCoreTransport): Promise<void> {
 /** The bridge plus the two host-route doors only a host process may use. */
 export type BrowserCoreBridge = NativeIpcBridge & {
   hostRoute(path: string, body: Record<string, unknown>): Promise<Record<string, unknown>>;
+  /**
+   * Hand Core one last message on the way out of the page.
+   *
+   * `beforeunload`/`pagehide` cannot await a fetch, and a request that has not
+   * left before the document dies never arrives.  A beacon does: the browser
+   * delivers it even while it replaces the page.
+   */
+  hostBeacon(path: string, body: Record<string, unknown>): boolean;
   request(method: string, params?: Record<string, unknown>): string;
   /**
    * End this page's session: Core drops the lease the cookie names, answers
@@ -191,6 +199,15 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
   });
 
   /** The host-only capability leases, which travel on their own routes. */
+  const hostBeacon = (path: string, body: Record<string, unknown>): boolean => {
+    try {
+      const payload = new Blob([JSON.stringify(body)], { type: "application/json" });
+      return navigator.sendBeacon(`${transport.baseURL}${path}`, payload);
+    } catch {
+      return false;
+    }
+  };
+
   const hostRoute = async (path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> => {
     const response = await call(path, JSON.stringify(body));
     const text = await response.text();
@@ -324,7 +341,7 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
     };
   };
 
-  return { send, subscribe: sharedSubscribe, hostRoute, request, signOut };
+  return { send, subscribe: sharedSubscribe, hostRoute, hostBeacon, request, signOut };
 }
 
 /** The service state in the app's words, as the title bar states it. */
@@ -549,6 +566,17 @@ async function browserWindowLogin(
   // `ReferenceError: Cannot access 's' before initialization`, with the dialog
   // drawn black and no frame ever requested.
   let cancelled = false;
+  // A page that is closed or reloaded mid sign-in cannot await anything, and
+  // the browser Core started for it would go on running until the ten-minute
+  // limit.  One beacon on the way out ends it now: `beforeunload` is the reload
+  // a person asked for, `pagehide` a tab closed or discarded in the background.
+  // Measured before this existed: reloading the page left three Chrome
+  // processes and three profiles behind on the host.
+  const abandon = () => {
+    core.hostBeacon("/ipc/host/relay/browser/cancel", { login_id: loginId });
+  };
+  window.addEventListener("beforeunload", abandon);
+  window.addEventListener("pagehide", abandon);
   // A Core with no screen of its own, or a page opened through a proxy, cannot
   // show a window anybody is looking at.  It answers with the frames of a
   // headless browser instead, and this surface draws them.
@@ -589,6 +617,8 @@ async function browserWindowLogin(
     }
     return undefined;
   } finally {
+    window.removeEventListener("beforeunload", abandon);
+    window.removeEventListener("pagehide", abandon);
     cancelHostChrome("relayBrowser");
     void core.hostRoute("/ipc/host/relay/browser/cancel", { login_id: loginId }).catch(() => undefined);
   }
