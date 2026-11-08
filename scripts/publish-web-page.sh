@@ -21,6 +21,12 @@
 # this working tree: the asset's name is the commit, so a page carrying
 # uncommitted edits would be a page attributed to code it does not contain.
 #
+# The release holds the page of one commit, and a publish replaces it -- the
+# release that is there is deleted (tag and all) before this commit's page is
+# uploaded.  Publishing HEAD is therefore also how the bucket moves forward; an
+# older commit's page stops being downloadable at that moment, so publish the
+# commit a host is about to run rather than one it used to run.
+#
 # Usage:
 #   scripts/publish-web-page.sh                  # HEAD
 #   scripts/publish-web-page.sh --commit <sha>    # a commit already on the branch
@@ -30,17 +36,25 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 REPOSITORY=ysdj/young-router
 TAG=web
-# This release is an artifact bucket, not a product release.  GitHub shows a
-# release on `/releases` and, unless it says otherwise, treats the newest one as
-# "Latest" -- and a `web` release published as ordinary therefore became the
-# repository's latest release: `/releases/latest` redirected to the page
-# tarball, and `/releases` opened on "Browser page (built per commit)" above the
-# app's own release.  The page is a build artifact per commit (fourteen of them
-# at last count); `v<version>` is the thing this repository releases.  A
-# prerelease is left out of "Latest" by GitHub's own rule, so the flag is what
-# keeps the artifact off the releases front page, not a cosmetic marker.
-RELEASE_TITLE="Browser page builds (per-commit artifacts, not a release)"
-RELEASE_NOTES="The browser page Core serves at /ui, one archive per commit it was built from. Artifacts only: this is not a version of Young Router and carries no release notes."
+# The bucket holds the page of *one* commit, and a publish replaces it.
+#
+# It accumulated one asset per commit -- fourteen of them at last count -- and
+# the reason is that nothing ever removed one: the publisher uploaded
+# `web-<commit>.tar.gz` beside whatever was already there, so the bucket's only
+# growing edge was the list of commits whose page it happened to witness.  A
+# host installs exactly the page of the commit it is about to run, so a page
+# for any other commit is an artifact nothing reads, kept public and permanent.
+# Replacing the release is therefore the publisher's job, not a cleanup someone
+# remembers: the asset that was there is deleted before the new one lands.
+#
+# This is also what makes the bucket a prerelease rather than a release list
+# entry: GitHub shows a release on `/releases` and, unless it says otherwise,
+# treats the newest one as "Latest" -- the bucket did become the repository's
+# latest release, and `/releases/latest` redirected to a page tarball.  A
+# prerelease is left out of that slot by GitHub's own rule.  `v<version>` is
+# what this repository releases.
+RELEASE_TITLE="Browser page builds (latest commit only)"
+RELEASE_NOTES="The browser page Core serves at /ui, for one commit at a time: this release is replaced on every publish. Artifacts only: it is not a version of Young Router and carries no release notes."
 
 commit_ref=HEAD
 output_dir=""
@@ -201,45 +215,34 @@ command -v gh >/dev/null 2>&1 || {
   echo "publish-web-page: gh is required to upload $asset (pass --output to build only)" >&2
   exit 1
 }
-if ! gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
-  gh release create "$TAG" --repo "$REPOSITORY" --title "$RELEASE_TITLE" \
-    --prerelease --latest=false --notes "$RELEASE_NOTES"
+# The bucket holds one asset: the page of one commit.  Whatever it holds is
+# replaced, not added to -- a second `web-<commit>.tar.gz` is a page no host will
+# install (each host asks for its own commit), so leaving it is a public
+# artifact with no reader.
+#
+# The archive is built and verified above, before anything remote is touched, so
+# the only exposure is the two calls that swap the release.  A failure inside
+# that window leaves the bucket empty, and that is the failure the host is
+# written to survive: `lv-web-bundle --from-release` exits non-zero when the
+# asset is not there, and `yr-sync` answers by keeping the page already
+# installed ("keeping the installed page: none published for <commit>") -- a
+# stopped release is a host on its previous page, not a host with no page.
+#
+# Each run therefore does the whole cycle: delete the release that is there
+# (tag included), create it again as a prerelease, upload this commit's page.
+# Republishing a commit rebuilds and replaces its own page byte for byte -- the
+# build is reproducible, so what a host downloads for `<commit>` is still that
+# commit's page.
+if gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+  previous=$(gh release view "$TAG" --repo "$REPOSITORY" --json assets \
+    --jq '.assets[].name' | tr '\n' ' ')
+  echo "replacing release $TAG (${previous:-no assets})" >&2
+  gh release delete "$TAG" --repo "$REPOSITORY" --cleanup-tag --yes >/dev/null
 fi
-# An existing release is repaired rather than trusted: created before this
-# script passed `--prerelease`, `web` was the repository's Latest release, and
-# an upload path that only creates a missing release would leave it that way.
-# Re-stating both flags on every publish is idempotent and costs one call.
-gh release edit "$TAG" --repo "$REPOSITORY" --prerelease --latest=false \
-  --title "$RELEASE_TITLE" >/dev/null
-
-# Uploading twice is how one commit ends up with two different pages: the host
-# installs by name, so the second upload silently changes what "that commit's
-# page" means.  An existing asset is therefore compared, not replaced -- by the
-# page it holds, which is its manifest's own digests, not by archive metadata.
-existing="$work/existing"
-if gh release download "$TAG" --repo "$REPOSITORY" --pattern "$asset" --dir "$existing" >/dev/null 2>&1; then
-  mkdir -p "$existing/unpacked"
-  tar -xzf "$existing/$asset" -C "$existing/unpacked"
-  published_manifest=$(find "$existing/unpacked" -name MANIFEST.json -print -quit)
-  if [[ -n "$published_manifest" ]]; then
-    if command -v shasum >/dev/null 2>&1; then
-      published=$(shasum -a 256 "$published_manifest" | cut -d' ' -f1)
-    else
-      published=$(sha256sum "$published_manifest" | cut -d' ' -f1)
-    fi
-  else
-    published="missing"
-  fi
-  if [[ "$published" == "$digest" ]]; then
-    echo "already published: $asset (page $digest)"
-    exit 0
-  fi
-  echo "publish-web-page: $asset is already published with a different page" >&2
-  echo "  published $published" >&2
-  echo "  built     $digest" >&2
-  echo "  the same commit must build the same page; nothing was uploaded" >&2
-  exit 1
-fi
+gh release create "$TAG" --repo "$REPOSITORY" --title "$RELEASE_TITLE" \
+  --prerelease --latest=false --notes "$RELEASE_NOTES" --target "$commit" \
+  >/dev/null
 
 gh release upload "$TAG" "$work/$asset" --repo "$REPOSITORY"
-echo "published: $asset (page $digest, archive $bytes)"
+echo "published: $asset (page $digest, archive $bytes) -- release $TAG replaced"
+

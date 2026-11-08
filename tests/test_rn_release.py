@@ -702,10 +702,40 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn('asset="web-$commit.tar.gz"', publisher)
         self.assertIn('{ built_from: process.argv[3], files }', publisher)
         self.assertIn('MANIFEST.json', publisher)
-        # Uploading twice would silently change what "that commit's page" means.
-        self.assertIn('gh release download "$TAG" --repo "$REPOSITORY" --pattern "$asset"', publisher)
-        self.assertIn("the same commit must build the same page; nothing was uploaded", publisher)
         self.assertIn('gh release upload "$TAG" "$work/$asset" --repo "$REPOSITORY"', publisher)
+
+    def test_the_page_bucket_holds_one_commit_and_is_replaced_each_publish(self) -> None:
+        """The bucket is one page, not an archive of every page ever built.
+
+        Nothing removed an asset: each publish uploaded `web-<commit>.tar.gz`
+        beside the ones already there, so the release grew to fourteen public
+        tarballs -- thirteen of which no host could install, because a host asks
+        for the page of the commit it is about to run.  The bucket is now
+        replaced on every publish, and the delete happens before the create so
+        the release the repository shows is never the stale one.
+        """
+
+        publisher = (ROOT / "scripts" / "publish-web-page.sh").read_text(encoding="utf-8")
+
+        # The whole cycle, in order: delete what is there, create the bucket,
+        # upload this commit's page.
+        delete = publisher.index('gh release delete "$TAG" --repo "$REPOSITORY" --cleanup-tag --yes')
+        create = publisher.index('gh release create "$TAG" --repo "$REPOSITORY"')
+        upload = publisher.index('gh release upload "$TAG" "$work/$asset" --repo "$REPOSITORY"')
+        self.assertLess(delete, create)
+        self.assertLess(create, upload)
+        # The tag travels with the release: a leftover `web` tag would point at a
+        # release that no longer exists and be moved by the next create anyway.
+        self.assertIn("--cleanup-tag", publisher)
+        # The replacement is announced, with what it is replacing: a publish that
+        # silently swaps a public asset is the failure this cannot repeat.
+        self.assertIn('echo "replacing release $TAG (${previous:-no assets})" >&2', publisher)
+        # No upload path compares-against-published-then-exits any more: that
+        # branch was what let the bucket accumulate ("already published: ..."
+        # returned early, and a different page refused to overwrite, so the only
+        # outcome that added an asset was a new commit's page).
+        self.assertNotIn('already published: $asset', publisher)
+        self.assertNotIn('the same commit must build the same page; nothing was uploaded', publisher)
 
     def test_the_page_bucket_never_becomes_the_latest_release(self) -> None:
         """An artifact bucket must not answer as the repository's latest release.
@@ -717,26 +747,20 @@ class ReactNativeReleaseTests(unittest.TestCase):
         release: `/releases/latest` redirected to a page archive instead of the
         app, and `/releases` opened on the bucket rather than on a version.
 
-        `--prerelease` is what keeps it out of that slot, `--latest=false`
-        states it a second time for the case where GitHub would pick by date,
-        and an existing bucket is repaired on every publish rather than only
-        being created correctly -- the release that was wrong already existed,
-        so a create-only fix could not have corrected it.
+        `--prerelease` is what keeps it out of that slot, and `--latest=false`
+        states it a second time for the case where GitHub would pick by date.
         """
 
         publisher = (ROOT / "scripts" / "publish-web-page.sh").read_text(encoding="utf-8")
 
         self.assertIn('gh release create "$TAG" --repo "$REPOSITORY" --title "$RELEASE_TITLE"', publisher)
         create = publisher[publisher.index('gh release create "$TAG"') :]
-        create = create[: create.index('fi')]
+        create = create[: create.index('\n\n')]
         self.assertIn("--prerelease", create)
         self.assertIn("--latest=false", create)
-        # An existing release is edited as well: the flag has to be re-stated on
-        # the bucket that is already published.
-        self.assertIn('gh release edit "$TAG" --repo "$REPOSITORY" --prerelease --latest=false', publisher)
         # The title says what the thing is, so the releases page does not read
         # "Browser page (built per commit)" as a product release name.
-        self.assertIn('RELEASE_TITLE="Browser page builds (per-commit artifacts, not a release)"', publisher)
+        self.assertIn('RELEASE_TITLE="Browser page builds (latest commit only)"', publisher)
 
     def test_the_page_travels_precompressed_and_without_the_editors_inline_copy(self) -> None:
         """The page is the one thing every browser on a remote host downloads.
