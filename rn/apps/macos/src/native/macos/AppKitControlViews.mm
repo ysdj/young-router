@@ -1031,6 +1031,36 @@ void SyncTableHeaderScrollOffset(NSScrollView *scrollView);
 
 @implementation LiteLLMTableView
 
+// AppKit resizes a table's document view behind the component's back.
+//
+// A clip view that grows or shrinks posts `NSViewFrameDidChangeNotification`,
+// and `NSTableView` answers it with an autoresize-to-fit that leaves the table a
+// reserved scroller-width wider than the view it is drawn through: the settings
+// rail's clip view grew 198 -> 200 pt, the table followed to 200, and AppKit's
+// own pass took it to 230.  The component's next layout pass computes the
+// document width itself and would put that right, but a pass that never comes
+// leaves the oversized frame in place -- which is what made the same rail draw a
+// rounded capsule when entered from one pane and one cut square against the
+// divider when entered from another.
+//
+// A table with no horizontal scroller has no width past its viewport to be: the
+// overflow is not scrollable, so it is only drawn, and the clip view cuts it
+// square at its trailing edge -- every row, and with it a source list's
+// selection capsule.  The width a table does want is the component's decision
+// (`MAX(viewport, laid-out columns)`), so it is re-asserted here, the one path
+// every AppKit-initiated resize goes through.
+- (void)setFrameSize:(NSSize)newSize
+{
+  NSScrollView *scrollView = self.enclosingScrollView;
+  if (scrollView != nil && !scrollView.hasHorizontalScroller) {
+    const CGFloat viewportWidth = NSWidth(scrollView.bounds);
+    if (viewportWidth > 0.5 && newSize.width > viewportWidth + 0.5) {
+      newSize.width = viewportWidth;
+    }
+  }
+  [super setFrameSize:newSize];
+}
+
 - (void)scrollWheel:(NSEvent *)event
 {
   NSScrollView *owner = ParentScrollView(self);

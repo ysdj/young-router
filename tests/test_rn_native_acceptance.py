@@ -2831,6 +2831,36 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("column.headerCell.attributedStringValue = TableHeaderTitle(columnTitle);", controls)
         self.assertIn("constraintEqualToAnchor:cell.leadingAnchor constant:8", controls)
 
+    def test_macos_table_keeps_its_frame_inside_a_scrollerless_viewport(self) -> None:
+        """A table without a horizontal scroller is never wider than its clip.
+
+        AppKit resizes a table's document view on its own: a clip view that
+        grows posts `NSViewFrameDidChangeNotification`, and `NSTableView`
+        answers it with an autoresize-to-fit that leaves the table a reserved
+        scroller-width wider than the viewport (the settings rail's clip went
+        198 -> 200 pt and the table went 200 -> 230).  The component's own
+        layout pass computes the document width and would undo that, but the
+        wide frame survives whenever that pass does not run again — so the same
+        rail drew its selection capsule rounded when entered from one pane and
+        cut square against the divider when entered from another, because the
+        clip view crops every row at its trailing edge and the capsule with it.
+
+        The width a table wants is the component's decision (`MAX(viewport,
+        laid-out columns)`), so the override re-asserts the viewport for the
+        tables that cannot scroll that overflow sideways.  A table with a
+        horizontal scroller keeps the frame AppKit gave it: that width is real
+        and reachable.
+        """
+        controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
+        table_view = controls.split("@implementation LiteLLMTableView", 1)[1].split("@end", 1)[0]
+        self.assertIn("- (void)setFrameSize:(NSSize)newSize", table_view)
+        self.assertIn("NSScrollView *scrollView = self.enclosingScrollView;", table_view)
+        self.assertIn("if (scrollView != nil && !scrollView.hasHorizontalScroller) {", table_view)
+        self.assertIn("const CGFloat viewportWidth = NSWidth(scrollView.bounds);", table_view)
+        self.assertIn("if (viewportWidth > 0.5 && newSize.width > viewportWidth + 0.5) {", table_view)
+        self.assertIn("newSize.width = viewportWidth;", table_view)
+        self.assertIn("[super setFrameSize:newSize];", table_view)
+
     def test_macos_tables_only_show_scrollers_for_overflow(self) -> None:
         controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
         self.assertIn("_scrollView.scrollerStyle = NSScrollerStyleLegacy", controls)
