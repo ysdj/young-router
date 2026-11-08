@@ -1113,6 +1113,85 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertEqual(len(attempts), 1)
         assert_upstream_route_failed_terminal(self, chunks)
 
+    async def test_single_route_concurrency_cap_keeps_polling_for_a_slot(
+        self,
+    ) -> None:
+        """A route at its cap judged nothing about the body.
+
+        Measured live: one route serving 16 requests refused a 17th with
+        "already serving 16 request(s)", and the single-route rule took that
+        as a verdict on the bytes and ended the turn in 46 ms.  The two are
+        not the same: no upstream read this history, so the same body is
+        served as soon as a slot frees, and the poll is how the turn waits
+        for it.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "30")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        attempts = []
+
+        class AtCapacity(Exception):
+            status_code = 503
+
+        capacity = AtCapacity(
+            "litellm.RateLimitError: model concurrency limit reached: "
+            "id:only-route is already serving 16 request(s) at the cap"
+        )
+        capacity.failed_deployment_id = "only-route"
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [{"model_info": {"id": "only-route", "order": 0}}]
+
+        proxy_server.llm_router = Router()
+        served = []
+
+        async def capped_attempt(request_data, exception, **kwargs):
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise AtCapacity(str(capacity))
+            served.append(1)
+            yield {
+                "type": "response.completed",
+                "response": {"id": "r", "status": "completed", "output": []},
+            }
+
+        request_data = {
+            "model": "single-route-chat",
+            "input": [
+                {"role": "assistant", "content": "ok"},
+                {"type": "function_call", "call_id": "c1", "name": "ls", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "a.txt"},
+            ],
+            "stream": True,
+            "metadata": {"request_id": "single-route-concurrency-cap"},
+            "model_info": {"id": "only-route", "order": 0},
+        }
+
+        with mock.patch.object(
+            hooks._streaming_module,
+            "_stream_route_recovery_poll_attempt",
+            capped_attempt,
+        ), mock.patch.object(
+            hooks._streaming_module,
+            "_stream_native_route_recovery_poll_attempt",
+            capped_attempt,
+        ):
+            chunks = [
+                chunk
+                async for chunk in hooks._stream_route_recovery_poll(
+                    request_data,
+                    capacity,
+                )
+            ]
+
+        # The turn waited through two capped attempts and was then served --
+        # it was not ended on the first cap.
+        self.assertEqual(served, [1])
+        self.assertGreaterEqual(len(attempts), 3)
+        self.assertEqual(chunks[-1].get("type"), "response.completed")
+
     async def test_single_route_cooldown_refusal_keeps_polling_for_its_own_recovery(
         self,
     ) -> None:
