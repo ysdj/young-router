@@ -3785,38 +3785,43 @@ class CoreStore:
                     refresh_contexts_now()
                 except Exception:
                     pass
-        with self._lock:
-            live_domains = ("claude", "codex") if include_claude else ("codex",)
-            revisions_before = {
-                name: getattr(self._domains.get(name), "revision", None)
-                for name in live_domains
-            }
-            if include_claude:
-                claude = self._domains.get("claude")
-                refresh = getattr(claude, "refresh_model_lists", None)
-                if callable(refresh):
-                    try:
-                        refresh()
-                    except Exception:
-                        pass
-            codex = self._domains.get("codex")
-            refresh_catalog = getattr(codex, "refresh_model_catalog", None)
-            if callable(refresh_catalog):
+        live_domains = ("claude", "codex") if include_claude else ("codex",)
+        revisions_before = {
+            name: getattr(self._domains.get(name), "revision", None)
+            for name in live_domains
+        }
+        # The generators read and rewrite client files, and one of them asks the
+        # running proxy what it serves -- which is precisely the question that
+        # cannot be answered while the proxy is being replaced.  The domains keep
+        # their own locks, so this work runs outside the store's: a window
+        # polling its snapshot must never wait for a client document.
+        if include_claude:
+            claude = self._domains.get("claude")
+            refresh = getattr(claude, "refresh_model_lists", None)
+            if callable(refresh):
                 try:
-                    refresh_catalog()
+                    refresh()
                 except Exception:
                     pass
-            # The live read belongs to this lane, not to ``snapshot``.  A
-            # window polls the projection many times a second while the proxy
-            # reloads, and a read taken there both blocks every other request on
-            # the store lock and pays the endpoint timeout once per poll.  When
-            # the observation lands, publish it like any other mutation so the
-            # memoized projection is rebuilt on the next read.
-            revisions_after = {
-                name: getattr(self._domains.get(name), "revision", None)
-                for name in live_domains
-            }
-            if revisions_after != revisions_before:
+        codex = self._domains.get("codex")
+        refresh_catalog = getattr(codex, "refresh_model_catalog", None)
+        if callable(refresh_catalog):
+            try:
+                refresh_catalog()
+            except Exception:
+                pass
+        # The live read belongs to this lane, not to ``snapshot``.  A window
+        # polls the projection many times a second while the proxy reloads, and
+        # a read taken there both blocks every other request on the store lock
+        # and pays the endpoint timeout once per poll.  When the observation
+        # lands, publish it like any other mutation so the memoized projection
+        # is rebuilt on the next read.
+        revisions_after = {
+            name: getattr(self._domains.get(name), "revision", None)
+            for name in live_domains
+        }
+        if revisions_after != revisions_before:
+            with self._lock:
                 self._revision += 1
                 self._snapshot_cache = None
                 try:
