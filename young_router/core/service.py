@@ -1512,15 +1512,6 @@ class CoreStore:
             self._disk_identities[name] = self._external_disk_identity(adapter)
         return name
 
-    def unregister_domain(self, domain: str) -> None:
-        name = _canonical_domain(domain)
-        with self._lock:
-            self._domains.pop(name, None)
-            self._baselines.pop(name, None)
-            self._drafts.pop(name, None)
-            self._disk.pop(name, None)
-            self._disk_identities.pop(name, None)
-
     def settings_domain(self, name: str) -> DomainAdapter | None:
         """One registered settings domain, for a host that needs its own door.
 
@@ -6306,19 +6297,6 @@ class CoreStore:
             self._persist_metadata()
             self._emit()
             return copy.deepcopy(self._service)
-
-    def set_log_summary(self, tab: str, *, available: bool, paused: bool = False, line_count: int = 0) -> None:
-        if tab not in LOG_TABS:
-            raise CoreError("invalid_log_tab", "Log tab is invalid")
-        with self._lock:
-            self._logs[tab] = {
-                "tab": tab,
-                "available": bool(available),
-                "paused": bool(paused),
-                "line_count": max(0, int(line_count)),
-            }
-            self._revision += 1
-            self._emit()
 
 __all__ = [
     "CORE_METADATA_VERSION",

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-import hashlib
 import re
 import threading
 import time
@@ -586,12 +585,6 @@ def _merge_records(target: dict[str, dict[str, Any]], incoming: Mapping[str, Map
         target[model_id] = merged
 
 
-def _route_index_text_digest(text: str) -> str:
-    """A cheap content identity for the provider config's route index."""
-
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
 def _candidate_ids(value: str) -> list[str]:
     raw = value.strip().casefold()
     if not raw:
@@ -1059,8 +1052,6 @@ class ModelContextRegistry:
         self._fetcher = fetcher or self._fetch_json
         self._clock = clock or time.time
         self._records: dict[str, dict[str, Any]] = RecordLookupIndex()
-        # The record keys grouped by their last path segment, for `_lookup`.
-        self._record_tail_index: dict[str, tuple[str, ...]] = {}
         self._cache_loaded = False
         # Identity of the cache file this instance's records came from.  The
         # cache has more than one writer -- this registry's own refresh, and the
@@ -1076,9 +1067,6 @@ class ModelContextRegistry:
         # once per file generation replaces the per-model re-reads that made a
         # single catalog build parse a 33 KB YAML three dozen times.
         self._route_index_key: tuple[int, int, int] | None = None
-        # The contents digest the cached index was built from.  An unchanged
-        # mtime is only evidence of an unchanged file when the digest agrees.
-        self._route_index_digest: str | None = None
         self._route_index_cache: dict[str, list[dict[str, Any]]] = {}
         self._cache_fetched_at: float | None = None
         # The windows the routes' own upstreams stated, as the caller that
@@ -1484,20 +1472,12 @@ class ModelContextRegistry:
     def _route_index(self) -> dict[str, list[dict[str, Any]]]:
         """Return the parsed ``model_list`` of the provider config, by name.
 
-        The index is keyed by the configuration file's identity so an edited
-        file is picked up immediately while repeated lookups inside one catalog
-        build reuse a single parse.  The window between Core's own write of that
-        file and this reader's ``stat`` can be shorter than the filesystem's
-        timestamp resolution, which would leave the key unchanged for a file
-        that did change; a file small enough to digest therefore keys on its
-        contents.
-
-        The digest is only paid when the file's (inode, mtime, size) identity
-        moved.  Every writer this app owns replaces the document atomically, so
-        a change always arrives as a new inode even when a coarse timestamp
-        cannot tell the two writes apart.  Re-reading and hashing the whole
-        document on every call is what made one catalog build digest a 33 KB
-        file five hundred times.
+        The index is keyed by the configuration file's (inode, mtime, size)
+        identity so an edited file is picked up immediately while repeated
+        lookups inside one catalog build reuse a single parse.  That identity
+        is sufficient because every writer this app owns replaces the document
+        atomically: a change always arrives as a new inode, even when a coarse
+        timestamp cannot tell two writes apart.
 
         The key is the name itself (``public_name_key``), not a folded form of
         it: the name is the group, and the import already stated the one
@@ -1509,7 +1489,6 @@ class ModelContextRegistry:
         if self.runtime_config_path is None:
             return {}
         text: str | None = None
-        digest: str | None = None
         try:
             details = self.runtime_config_path.stat()
             key: tuple[int, int, int] | None = (
@@ -1544,9 +1523,6 @@ class ModelContextRegistry:
                 if name:
                     index.setdefault(name, []).append(dict(deployment))
         self._route_index_key = key
-        self._route_index_digest = digest if digest is not None else (
-            _route_index_text_digest(text) if isinstance(text, str) else None
-        )
         self._route_index_cache = index
         return index
 

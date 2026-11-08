@@ -594,7 +594,6 @@ class OurFreeModelRuntime:
                 _unlock_handle(worker_lock)
                 time.sleep(0.05)
                 continue
-            self._ready_handle = None
             self._ready_pipe = None
             self._worker_lock = None
             break

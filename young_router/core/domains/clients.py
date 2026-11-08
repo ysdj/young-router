@@ -167,12 +167,6 @@ class ClientSettingsDomain:
 
     # -- registry -----------------------------------------------------------
 
-    def _spec(self, document: object) -> dict[str, Any]:
-        for spec in _DOCUMENT_SPECS:
-            if spec["id"] == document:
-                return spec
-        raise DomainError("The requested client configuration is unavailable")
-
     def _read(self, document: str) -> tuple[str, bool]:
         path = self._paths[document]
         try:

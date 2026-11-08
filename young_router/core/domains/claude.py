@@ -629,24 +629,6 @@ def default_settings_path() -> pathlib.Path:
     return pathlib.Path.home() / DEFAULT_SETTINGS_DIR / SETTINGS_FILENAME
 
 
-#: The families Claude Desktop can identify on its own.
-_ANTHROPIC_MODEL_FAMILIES = ("opus", "sonnet", "haiku")
-
-
-def _names_an_anthropic_family(name: str) -> bool:
-    """Whether Claude Desktop renders this id itself, with its own controls."""
-
-    text = name.strip().lower().rsplit("/", 1)[-1]
-    if not text.startswith("claude-"):
-        return False
-    tail = text.removeprefix("claude-")
-    # Both spellings are real Anthropic models: the current ``claude-opus-5-5``
-    # and the older ``claude-3-5-sonnet``, which the app also renders itself.
-    if tail[:1].isdigit():
-        return True
-    return any(tail.startswith(family) or tail.startswith(f"{family}-") for family in _ANTHROPIC_MODEL_FAMILIES)
-
-
 #: Claude Code's compiled catalog entries this app names through
 #: ``modelPicker[].behavesAs``.  A public gateway id is not in that catalog, so
 #: without a substitute Claude Code assumes 200k and offers no Effort ladder;
@@ -741,16 +723,6 @@ def _code_auto_compact_window(max_input_tokens: object) -> int | str:
     if not isinstance(max_input_tokens, int) or isinstance(max_input_tokens, bool):
         return "auto"
     return max(_CODE_AUTO_COMPACT_MIN, min(max_input_tokens, _CODE_AUTO_COMPACT_MAX))
-
-
-def _strip_adapter_prefix(value: str) -> str:
-    """The model id a person recognises, without this app's adapter prefix."""
-
-    text = value.strip()
-    for adapter in ("openai/", "anthropic/", "azure/", "vertex_ai/", "gemini/"):
-        if text.startswith(adapter):
-            return text[len(adapter):]
-    return text
 
 
 def _claude_client(data: Mapping[str, Any]) -> str:
@@ -1689,55 +1661,6 @@ class ClaudeSettingsDomain:
             return False
         current = set(self._desktop.snapshot().get("model_names") or [])
         return current.issubset(generated) or generated.issubset(current)
-
-    def _desktop_labels(self) -> dict[str, str]:
-        """The name Claude Desktop's picker should show for each public model.
-
-        An id Desktop can map onto an Anthropic model renders itself -- with
-        the model's own display name and Effort control -- so labelling it
-        would replace better text with worse.  An alias it cannot map is drawn
-        verbatim, and that is the case worth labelling: the route's own upstream
-        model is what the person reading the picker recognises, so
-        ``claude-dsv41-flash`` reads as ``deepseek-v4.1-flash``.
-        """
-
-        try:
-            _, rows = saved_routes(self.runtime_config_path)
-        except DomainError:
-            return {}
-        labels: dict[str, str] = {}
-        for row in rows:
-            public_name = str(row.get("model") or "").strip()
-            upstream = str(row.get("upstream_model") or "").strip()
-            if not public_name or not upstream or public_name in labels:
-                continue
-            if _names_an_anthropic_family(public_name):
-                continue
-            labels[public_name] = _strip_adapter_prefix(upstream)
-        return labels
-
-    def desktop_model_names(self) -> list[str]:
-        """The public names Claude Desktop will actually keep in its picker.
-
-        Verified against the app rather than read off its documentation: given
-        ``claude-opus-5-5``, ``anthropic/claude-sonnet-4-5``, ``grok-4.7``,
-        ``gpt-6.1-sol`` and ``gemini-3.8-flash``, the picker offered the first
-        two and deleted the rest -- and a ``behavesAs`` mapping on the deleted
-        ones did not save them.  Desktop builds its picker from models it can
-        map onto an Anthropic model, and this gateway serves whatever public
-        names the user configured, so a route is visible there only when its
-        public name is the Claude model it stands in for.
-
-        Leaving the list unset is not an escape hatch: with nothing to go on,
-        Desktop discovers ``/v1/models`` from this gateway and applies the same
-        rule, then falls back to its own built-in lineup -- so the models it
-        cannot name stay invisible either way, and only the warning disappears.
-        """
-
-        return [
-            name for name in (self._public_models() or [])
-            if desktop_accepts_model_name(name)
-        ]
 
     def desktop_model_entries(self) -> list[dict[str, str]]:
         """The ``inferenceModels`` rows for this router's public models.

@@ -14,7 +14,6 @@ from pathlib import Path
 import re
 import socket
 import ssl
-import tempfile
 import threading
 import time
 import urllib.error
@@ -61,7 +60,6 @@ from ...public_names import import_name_case, imported_public_name, public_name_
 from ...values import explicit_bool
 from ...values import int_or_none as _int_or_none
 from ...api_base import api_base_for_surface, isolated_http_opener, service_root
-from ..persistence import atomic_write_text
 from ..security import (
     REDACT_TEXT,
     redact,
@@ -1598,11 +1596,6 @@ class ProvidersModelsDomain:
         return f"{root}/v1/models" if isinstance(root, str) and root else None
 
     @classmethod
-    def _model_candidates(cls, payload: object) -> list[str] | None:
-        catalog = cls._model_catalog(payload)
-        return catalog[0] if catalog is not None else None
-
-    @classmethod
     def _model_responses_compaction_capabilities(
         cls,
         item: Mapping[str, Any],
@@ -2904,7 +2897,6 @@ class ProvidersModelsDomain:
         keeps it out of every projection.
         """
 
-        auth_kind = self._provider_auth_state(provider)["kind"]
         manager = self._auth_manager()
         credential = manager.chatgpt_request_credential(account_ref)
         return (
@@ -3646,7 +3638,6 @@ class ProvidersModelsDomain:
         """
 
         provider_id = provider_id or our_free_model_module.AUTH_KIND_TO_PROVIDER[auth_kind]
-        channel = our_free_model_module.PROVIDER_TO_CHANNEL[provider_id]
         try:
             document = self._our_free_model_runtime().models(provider_id, refresh=True)
         except our_free_model_module.OurFreeModelCatalogUnavailable:
@@ -3670,7 +3661,6 @@ class ProvidersModelsDomain:
         self._remember_lane_wires(provider_id, document.get("wires"))
         channels = document.get("channels") or {}
         wires = document.get("wires") or {}
-        windows = document.get("windows") or {}
         models: list[dict[str, Any]] = []
         for entry in document.get("models") or []:
             if not isinstance(entry, Mapping):
@@ -6836,55 +6826,6 @@ class ProvidersModelsDomain:
         )
         models[model_index] = model
         providers[provider_index] = provider
-
-    def link_model_to_relay_key(
-        self,
-        provider_id: str,
-        model_id: str,
-        provider_key_id: str,
-        **options: Any,
-    ) -> dict[str, Any]:
-        return self.dispatch(
-            "model.link_relay_key",
-            {
-                "provider_id": provider_id,
-                "model_id": model_id,
-                "provider_key_id": provider_key_id,
-                **options,
-            },
-        )
-
-    def rebind_model_to_relay_key(
-        self,
-        provider_id: str,
-        model_id: str,
-        provider_key_id: str,
-        **options: Any,
-    ) -> dict[str, Any]:
-        return self.dispatch(
-            "model.rebind_relay_key",
-            {
-                "provider_id": provider_id,
-                "model_id": model_id,
-                "provider_key_id": provider_key_id,
-                **options,
-            },
-        )
-
-    def detach_model_from_relay_key(
-        self,
-        provider_id: str,
-        model_id: str,
-        *,
-        api_key_name: str | None = None,
-    ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "provider_id": provider_id,
-            "model_id": model_id,
-        }
-        if api_key_name is not None:
-            payload["api_key_name"] = api_key_name
-        return self.dispatch("model.detach_relay_key", payload)
 
     @staticmethod
     def _relay_import_models(source: Mapping[str, Any]) -> list[str]:

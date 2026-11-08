@@ -1973,11 +1973,6 @@ class RelayAccountsDomain:
     def persistence_paths(self) -> tuple[Path, ...]:
         return (self.storage_path,)
 
-    def operation_journal_paths(self) -> tuple[Path, ...]:
-        """Return the non-rollback journal used after remote side effects."""
-
-        return (self.journal_path,)
-
     def external_disk_state(self) -> dict[str, bool]:
         current = self._read_storage_bytes()
         return {"changed": current != self._baseline_bytes, "exists": current is not None}
@@ -5255,13 +5250,6 @@ class RelayAccountsDomain:
             except ValueError:
                 raise RelayAccountsError("The selected relay API resource is unavailable") from None
         return remote_id
-
-    def _mark_resources_stale(self, index: int) -> None:
-        account = copy.deepcopy(self._accounts[index])
-        account["resource_status"] = "idle"
-        account["resource_error"] = "none"
-        account["last_updated_at"] = _utc_now_iso()
-        self._accounts[index] = _private_account(account)
 
     def _newapi_token_for_update(self, account: Mapping[str, Any], remote_id: str) -> dict[str, Any]:
         try:
