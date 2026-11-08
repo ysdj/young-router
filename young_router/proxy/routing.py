@@ -1256,6 +1256,36 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
     )
 
 
+def _is_refusal_about_the_request_body(exception: Exception) -> bool:
+    """Whether an upstream's refusal was a verdict on these bytes.
+
+    A single-route group has nowhere to send a body the route rejected, so a
+    verdict on the body ends the turn; anything else is the route being
+    unavailable and is waited out.  Telling the two apart needs positive
+    evidence that an upstream *read the body and refused it*, not the absence
+    of evidence that it was available:
+
+    * the route was at its concurrency cap -- measured live, one route serving
+      16 requests refused a 17th with "already serving 16 request(s)", and
+      that read as a body verdict, ending a turn whose bytes were never
+      judged at all;
+    * the route is unavailable, cooling down, or unreachable -- no upstream
+      saw the body in that case either.
+
+    What remains is a 4xx from a route that took the request.  That is the
+    only shape that repeats identically on the same bytes.
+    """
+
+    if _is_model_concurrency_rejection_error(exception):
+        return False
+    if _is_no_deployments_available_error(exception):
+        return False
+    status_code = _exception_status_code(exception)
+    if status_code is None:
+        status_code = _nested_upstream_status_code(exception)
+    return status_code is not None and 400 <= status_code < 500
+
+
 def _recovery_max_seconds() -> float:
     return _env_float_seconds(
         _RECOVERY_MAX_SECONDS_ENV,

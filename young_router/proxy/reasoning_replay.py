@@ -108,8 +108,33 @@ def _is_blank_reasoning_text_part(part: Any) -> bool:
     )
 
 
+def _summary_text(item: Dict[str, Any]) -> Optional[str]:
+    """The thinking this item already publishes as a summary, if it keeps one.
+
+    This router delivers a native route's thinking as ``summary`` and strips the
+    raw ``content`` part on purpose, so a client replays a summary and no
+    content.  Measured on ``api.deepseek.com``: that summary holds the model's
+    actual words, and the wire refuses the replay anyway, because it reads
+    ``content[].reasoning_text`` and nothing else.  The text is therefore
+    already here -- moving it onto the field the wire reads is a translation,
+    not an invention.
+    """
+
+    summary = item.get("summary")
+    if not isinstance(summary, list):
+        return None
+    for part in summary:
+        if not isinstance(part, dict):
+            continue
+        for field in ("text", "summary_text"):
+            text = part.get(field)
+            if isinstance(text, str) and text:
+                return text
+    return None
+
+
 def _repaired_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """The same item with a placeholder thinking part, or ``None`` to leave it."""
+    """The same item with the thinking text on the field the wire reads."""
 
     if _readable_reasoning_text(item) is not None:
         return None
@@ -118,7 +143,11 @@ def _repaired_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     # A part that is present but blank is what the wire refused, so it is
     # replaced rather than joined by a second part saying the same nothing.
     kept = [part for part in parts if not _is_blank_reasoning_text_part(part)]
-    kept.append({"type": "reasoning_text", "text": REASONING_TEXT_PLACEHOLDER})
+    # The turn's own thinking first: a summary this router published is the
+    # text that produced the turn, and replaying it verbatim keeps the history
+    # honest.  The placeholder is only for a turn whose thinking is truly gone.
+    text = _summary_text(item) or REASONING_TEXT_PLACEHOLDER
+    kept.append({"type": "reasoning_text", "text": text})
     repaired = dict(item)
     repaired["content"] = kept
     return repaired

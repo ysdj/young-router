@@ -1287,9 +1287,16 @@ async def _stream_route_recovery_poll(
     )
     refusal_about_the_body = bool(
         len(single_route_deployment_ids) == 1
-        and not _routing_module._is_no_deployments_available_error(exception)
-        and _routing_module._recovery_policy_for_exception(exception)
-        == _routing_module._RECOVERY_POLICY_RECOVERY
+        and _routing_module._is_refusal_about_the_request_body(exception)
+    )
+    # A route at its cap is *busy*, not unreachable: the pool empties for as
+    # long as other requests run and refills without anything here changing.
+    # Measured live at the cap: the round after the opening one carries the
+    # fallback round's own "no deployments available ... try again in 5
+    # seconds", so reading only the latest exception counted a cap as "cannot
+    # progress" and ended 5 of 6 turns at 5.3 s for bytes the route then served.
+    opening_refusal_was_a_cap = bool(
+        _routing_module._is_model_concurrency_rejection_error(exception)
     )
     single_route_empty_pool_rounds = 0
     ignore_local_constraints = bool(
@@ -1697,7 +1704,17 @@ async def _stream_route_recovery_poll(
                 single_route_group
                 and single_route_deployment_ids <= excluded_after_attempt
                 and _route_recovery_poll_cooldown_wait(request_data) is None
+                and not opening_refusal_was_a_cap
+                and not _routing_module._is_model_concurrency_rejection_error(
+                    last_exception
+                )
             ):
+                # A route that is only at its cap is excluded from this round
+                # for as long as other requests run, not because nothing can
+                # serve these bytes: it takes the next attempt a slot frees.
+                # Waiting it out like any other unavailable route is the whole
+                # point -- ending here measured live at 5.3 s of silence for
+                # five of six turns that the route then served fine.
                 single_route_empty_pool_rounds += 1
                 if single_route_empty_pool_rounds >= _SINGLE_ROUTE_EMPTY_POOL_ROUNDS:
                     _trace_module._request_route_trace(

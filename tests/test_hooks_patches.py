@@ -2588,6 +2588,52 @@ class HookPatchTests(HookTestCase):
                 )
             )
 
+            # The thinking this router itself published as a ``summary`` is the
+            # text to replay.  A native route's answer delivers thinking as
+            # ``summary`` and strips the raw ``content`` part, so a client
+            # replays a summary and no content -- measured on the real route:
+            # refused, while the summary holds the model's actual words.
+            # Moving that text onto ``content[].reasoning_text`` replays the
+            # turn honestly instead of inserting a placeholder.
+            calls.clear()
+            summary_replay = [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "ls"}],
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_summary",
+                    "status": "completed",
+                    "summary": [
+                        {"type": "summary_text", "text": "I should run ls first."}
+                    ],
+                    "encrypted_content": "opaque-blob",
+                },
+                tool_call,
+                tool_output,
+            ]
+            response = await router.make_call(
+                original_function,
+                model="deepseek-v4.1-flash",
+                model_info={"id": "ce96bf46"},
+                input=summary_replay,
+            )
+            self.assertEqual({"ok": True}, response)
+            # The route has already answered a repaired replay above, so this
+            # turn is repaired *before* it is sent and is never refused: what
+            # matters is what left the proxy, not how many times it left.
+            self.assertEqual(
+                [{"type": "reasoning_text", "text": "I should run ls first."}],
+                calls[-1]["input"][1]["content"],
+            )
+            self.assertEqual("opaque-blob", calls[-1]["input"][1]["encrypted_content"])
+            self.assertEqual(
+                [{"type": "summary_text", "text": "I should run ls first."}],
+                calls[-1]["input"][1]["summary"],
+            )
+
             # A route that refuses the repaired body too has answered about
             # something else, and the marker stops the same bytes being sent a
             # third time.
