@@ -262,12 +262,37 @@ function RelayBrowserSurface({ request }: { request: Extract<HostChromeRequest, 
  * a key, a wheel.  The picture is not an `<img>` to be saved or dragged; it is
  * a screen, so the click that focuses it is the click that reaches the page.
  */
+/**
+ * Where in the station's own 560x820 display a click on this picture landed.
+ *
+ * The picture is drawn with `object-fit: contain`, so it is letterboxed inside
+ * whatever box the dialog gives it: a 560x820 frame in a 418x520 box is 355 px
+ * wide with 31 px of black on each side.  Dividing by the box instead of by the
+ * drawn image put every click off by that margin — measured live, "关闭公告"
+ * and the field labels were unclickable while the picture looked perfect, and a
+ * click in the black margin mapped *outside* the display, where Core refuses the
+ * event outright (`dispatched: false`) and the pane looks dead.
+ */
+export function mirrorPoint(
+  mirror: { width: number; height: number },
+  box: { clientWidth: number; clientHeight: number },
+  offsetX: number,
+  offsetY: number,
+): { x: number; y: number } | null {
+  const boxWidth = Math.max(1, box.clientWidth);
+  const boxHeight = Math.max(1, box.clientHeight);
+  const scale = Math.min(boxWidth / mirror.width, boxHeight / mirror.height);
+  if (!Number.isFinite(scale) || scale <= 0) return null;
+  const insetX = (boxWidth - mirror.width * scale) / 2;
+  const insetY = (boxHeight - mirror.height * scale) / 2;
+  const x = Math.round((offsetX - insetX) / scale);
+  const y = Math.round((offsetY - insetY) / scale);
+  if (x < 0 || y < 0 || x >= mirror.width || y >= mirror.height) return null;
+  return { x, y };
+}
+
 function MirrorScreen({ mirror, title }: { mirror: MirrorSurface; title: string }): React.JSX.Element {
   const frame = React.useSyncExternalStore(mirror.subscribe, mirror.frame, mirror.frame);
-  const map = (element: { clientWidth: number; clientHeight: number }, x: number, y: number) => ({
-    x: Math.round((x * mirror.width) / Math.max(1, element.clientWidth)),
-    y: Math.round((y * mirror.height) / Math.max(1, element.clientHeight)),
-  });
   return <View style={[styles.browserFrame, { aspectRatio: mirror.width / mirror.height, height: undefined }]}>
     {frame
       ? React.createElement("img", {
@@ -278,8 +303,9 @@ function MirrorScreen({ mirror, title }: { mirror: MirrorSurface; title: string 
           tabIndex: 0,
           onDragStart: (event: { preventDefault: () => void }) => event.preventDefault(),
           onClick: (event: { nativeEvent: { offsetX: number; offsetY: number; currentTarget: { clientWidth: number; clientHeight: number } } }) => {
-            const point = map(event.nativeEvent.currentTarget, event.nativeEvent.offsetX, event.nativeEvent.offsetY);
-            mirror.send({ type: "click", ...point });
+            const point = mirrorPoint(mirror, event.nativeEvent.currentTarget, event.nativeEvent.offsetX, event.nativeEvent.offsetY);
+            // A click in the letterbox is not a click on the station.
+            if (point) mirror.send({ type: "click", ...point });
           },
           onKeyDown: (event: { key: string; ctrlKey: boolean; metaKey: boolean; altKey: boolean; preventDefault: () => void }) => {
             if (event.ctrlKey || event.metaKey || event.altKey) return;

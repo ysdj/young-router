@@ -1642,6 +1642,28 @@ class MirrorFrameTests(unittest.TestCase):
         self.assertLess(body.index("let cancelled = false;"), body.index("startMirrorSurface("))
         self.assertIn("void Promise.resolve().then(pump);", leaf)
 
+    def test_a_click_is_mapped_onto_the_drawn_picture_not_the_box(self) -> None:
+        """The frame is letterboxed; clicks are not.
+
+        Measured live: the picture looked perfect and nothing on it could be
+        clicked.  The pane divided the click by the box it was drawn in, while
+        `object-fit: contain` left 31 px of black on each side (a 560x820 frame
+        in a 418x520 box), so every click landed ~50 px off in the station's own
+        coordinates -- and a click in the margin mapped outside the display,
+        where Core refuses the event and the pane looks dead.
+        """
+
+        chrome = (Path(__file__).resolve().parents[1] / "rn/packages/shared/src/ui/HostChrome.tsx").read_text(encoding="utf-8")
+        rule = chrome.split("export function mirrorPoint", 1)[1].split("function MirrorScreen", 1)[0]
+        self.assertIn("Math.min(boxWidth / mirror.width, boxHeight / mirror.height)", rule)
+        self.assertIn("(boxWidth - mirror.width * scale) / 2", rule)
+        self.assertIn("(boxHeight - mirror.height * scale) / 2", rule)
+        # Outside the picture is not a click: the margin is not the station.
+        self.assertIn("if (x < 0 || y < 0 || x >= mirror.width || y >= mirror.height) return null", rule)
+        surface = chrome.split("function MirrorScreen", 1)[1].split("const MIRROR_KEYS", 1)[0]
+        self.assertIn("mirrorPoint(mirror, event.nativeEvent.currentTarget", surface)
+        self.assertIn("if (point) mirror.send({ type: \"click\", ...point })", surface)
+
     def test_nothing_pretends_to_be_a_window_when_frames_are_running(self) -> None:
         chrome = Path(__file__).resolve().parents[1] / "rn/packages/shared/src/ui/HostChrome.tsx"
         text = chrome.read_text(encoding="utf-8")
