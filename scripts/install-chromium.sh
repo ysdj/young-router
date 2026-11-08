@@ -19,6 +19,11 @@
 # browser must be the distribution's (or the vendor's) package so its security
 # updates keep arriving; a private copy would be one nobody patches.
 #
+# It also installs the CJK font a station's own pages are written in. Measured on
+# a host with Chrome and no CJK font: every Chinese label on the station's login
+# page came back as a box, so 用户名 and 密码 were indistinguishable. macOS ships
+# those fonts, so this is a Linux-only step.
+#
 # Exit codes: 0 installed or present, 1 missing (--check), 2 unsupported host,
 # 3 present but not installable without an operator (no root, no sudo -n).
 set -euo pipefail
@@ -97,6 +102,21 @@ existing() {
   return 1
 }
 
+# fontconfig's own answer, not a package name that may be installed and unusable.
+fonts_present() {
+  # Only a Linux host is ours to font-manage: macOS and Windows ship the CJK
+  # faces a station's page needs, and have no `fc-list` to ask.
+  command -v apt-get >/dev/null 2>&1 || return 0
+  command -v fc-list >/dev/null 2>&1 || return 1
+  fc-list :lang=zh 2>/dev/null | head -1 | grep -q .
+}
+
+install_fonts() {
+  as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fontconfig fonts-noto-cjk >/dev/null || return $?
+  as_root fc-cache -f >/dev/null 2>&1 || true
+  return 0
+}
+
 as_root() {
   if [ "$(id -u)" = "0" ]; then
     "$@"
@@ -132,30 +152,50 @@ install_browser() {
 }
 
 # `set -e` would otherwise make a missing browser look like a typo in this file.
-if found=$(existing); then
-  echo "install-chromium: using $found"
+found=""
+existing >/dev/null 2>&1 && found=$(existing)
+fonts_ok=0
+fonts_present && fonts_ok=1
+
+if [ -n "$found" ] && [ "$fonts_ok" = 1 ]; then
+  echo "install-chromium: using $found (CJK fonts present)"
   exit 0
 fi
 
 if [ "$check_only" = true ]; then
-  echo "install-chromium: no Chromium-family browser on this host" >&2
+  [ -n "$found" ] || echo "install-chromium: no Chromium-family browser on this host" >&2
+  [ "$fonts_ok" = 1 ] || echo "install-chromium: no CJK font; a station's Chinese labels would render as boxes" >&2
   exit 1
 fi
+if [ -n "$found" ]; then
+  echo "install-chromium: using $found"
+fi
 
-if ! install_browser; then
-  status=$?
-  if [ "$status" = "2" ]; then
-    echo "install-chromium: no package manager here knows chromium; install Google Chrome, Chromium, Edge or Brave by hand" >&2
+if [ -z "$found" ]; then
+  if ! install_browser; then
+    status=$?
+    if [ "$status" = "2" ]; then
+      echo "install-chromium: no package manager here knows chromium; install Google Chrome, Chromium, Edge or Brave by hand" >&2
+      exit 2
+    fi
+    echo "install-chromium: could not install a browser without an operator (no root and no passwordless sudo)" >&2
+    echo "install-chromium: run 'apt-get install -y chromium' (or the equivalent) on this host" >&2
+    exit 3
+  fi
+  existing >/dev/null 2>&1 && found=$(existing)
+  if [ -z "$found" ]; then
+    echo "install-chromium: the package manager finished and no browser is on PATH" >&2
     exit 2
   fi
-  echo "install-chromium: could not install a browser without an operator (no root and no passwordless sudo)" >&2
-  echo "install-chromium: run 'apt-get install -y chromium' (or the equivalent) on this host" >&2
-  exit 3
+  echo "install-chromium: installed $found"
 fi
 
-if found=$(existing); then
-  echo "install-chromium: using $found"
-  exit 0
+if [ "$fonts_ok" != 1 ]; then
+  if ! install_fonts; then
+    echo "install-chromium: the CJK font package could not be installed; Chinese labels will render as boxes" >&2
+  else
+    echo "install-chromium: installed fonts-noto-cjk"
+  fi
 fi
-echo "install-chromium: the package manager finished and no browser is on PATH" >&2
-exit 2
+echo "install-chromium: using $found"
+exit 0

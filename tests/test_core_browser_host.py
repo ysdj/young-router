@@ -1481,6 +1481,23 @@ class MirrorTests(unittest.TestCase):
         self.assertIn('"$BUILD_ONLY" -eq 0 && -x "$BROWSER_INSTALLER"', deploy)
         self.assertIn("station sign-in will offer the password form only", deploy)
 
+    def test_the_deploy_also_installs_the_font_the_page_needs(self) -> None:
+        """Chrome without a CJK font draws every Chinese label as a box.
+
+        Measured on the lv host: the station's login page streamed back with
+        `□□` over 用户名, 密码 and the agreement line while ASCII rendered
+        normally.  The install has to cover the font for the same reason it
+        covers the browser: the sign-in is unreadable without it.
+        """
+
+        scripts = Path(__file__).resolve().parents[1] / "scripts"
+        installer = (scripts / "install-chromium.sh").read_text(encoding="utf-8")
+        self.assertIn("fonts-noto-cjk", installer)
+        self.assertIn("fc-list :lang=zh", installer)
+        self.assertIn("fonts_present", installer)
+        # A host that is not Linux ships the faces and has no fc-list to ask.
+        self.assertIn("command -v apt-get >/dev/null 2>&1 || return 0", installer)
+
     def test_a_leftover_frame_is_not_sent_twice(self) -> None:
         mirror = relay_mirror.MirrorSession(port=1, origin="https://example.org")
         with mirror._condition:
