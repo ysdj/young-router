@@ -8507,6 +8507,25 @@ def _upstream_tool_history_rejected_message(model_group: str) -> str:
     )
 
 
+def _upstream_thinking_replay_rejected_message(model_group: str) -> str:
+    """The one sentence for a route that refused the replayed thinking.
+
+    Shared by the Responses terminal event and the raised final failure.  It
+    names the cause -- a thinking-mode route refusing a history whose thinking
+    came back unreadable -- and the action that changes the outcome, a new task,
+    instead of inviting the same replay again.  ``reasoning_replay`` already
+    repairs the shape the client kept; this is the answer for a history that
+    carried no thinking at all to repair.
+    """
+
+    return (
+        "The upstream refused this conversation's replayed thinking for "
+        f"{model_group}: a thinking-mode route requires the reasoning text of "
+        "earlier turns to be sent back, and this history no longer carries it. "
+        "Start a new task; the same history meets the same refusal."
+    )
+
+
 def _is_upstream_request_field_rejected_error(exception: Exception) -> bool:
     """Whether every route refused the *fields* this proxy asked it to accept.
 

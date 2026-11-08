@@ -15,6 +15,7 @@ from . import responses_execution as _responses_execution_module
 from . import responses_output as _responses_output_module
 from . import web_search_native as _web_search_native_module
 from . import reasoning as _reasoning_module
+from . import reasoning_replay as _reasoning_replay_module
 from . import routing as _routing_module
 from . import streaming as _streaming_module
 from . import trace as _trace_module
@@ -1101,11 +1102,14 @@ def _install_selected_deployment_marker_patch() -> None:
         )
         token = _CURRENT_SELECTED_DEPLOYMENT.set(None)
         try:
-            response = await _call_deployment_with_reasoning_parameters_compat(
-                original_make_call,
-                self,
-                original_function,
-                args,
+            response = await _reasoning_replay_module.call_with_replay_repair(
+                lambda: _call_deployment_with_reasoning_parameters_compat(
+                    original_make_call,
+                    self,
+                    original_function,
+                    args,
+                    kwargs,
+                ),
                 kwargs,
             )
             marker = _CURRENT_SELECTED_DEPLOYMENT.get()

@@ -24,6 +24,7 @@ HOOK_MODULE_NAMES = (
     "api_base",
     "proxy.request_context",
     "proxy.reasoning",
+    "proxy.reasoning_replay",
     "proxy.codex_fast_tier",
     "proxy.trace",
     "log_rotation",

@@ -2403,6 +2403,348 @@ class HookPatchTests(HookTestCase):
                 )
             self.assertEqual(1, len(calls))
 
+    async def test_make_call_hands_a_refused_thinking_replay_back_with_its_text(self) -> None:
+        """A refused thinking replay is answered on the same route, once.
+
+        Measured against api.deepseek.com: a replayed history that carries a
+        tool call is refused with HTTP 400 ``the `reasoning_text` in the
+        thinking mode must be passed back to the api`` unless every reasoning
+        item still passes text back -- and a client keeps only the encrypted
+        blob, so every such turn was refused on the group's fastest route and
+        advanced to a sibling that answered the same history (a 3 s relay taking
+        the place of a 160 ms route).  The refusal is about this body, so the
+        same route is asked again with a placeholder for the thinking it lost,
+        and the route that answers it is remembered.
+        """
+
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "routing.json"
+            self.set_env(hooks._DEPLOYMENT_COOLDOWN_FILE_ENV, str(state_path))
+            replay_module = hooks._reasoning_replay_module
+            replay_module._REQUIREMENTS.clear()
+            replay_module._REQUIREMENTS_LOADED_AT = 0.0
+
+            router_module = types.ModuleType("litellm.router")
+
+            class Router:
+                def _update_kwargs_with_deployment(self, deployment, kwargs, function_name=None):
+                    kwargs["model_info"] = deployment["model_info"].copy()
+
+                async def make_call(self, original_function, *args, **kwargs):
+                    response = original_function(*args, **kwargs)
+                    if hasattr(response, "__await__"):
+                        return await response
+                    return response
+
+            router_module.Router = Router
+            sys.modules["litellm.router"] = router_module
+            hooks._install_selected_deployment_marker_patch()
+
+            calls = []
+
+            class ThinkingReplayRefused(Exception):
+                status_code = 400
+
+                def __init__(self) -> None:
+                    super().__init__(
+                        'litellm.BadRequestError: OpenAIException - {"error":{"message":'
+                        '"The `reasoning_text` in the thinking mode must be passed '
+                        'back to the API.","type":"invalid_request_error"}}'
+                    )
+
+            def refuses(items) -> bool:
+                # The wire's own rule, measured: an empty ``reasoning_text`` is
+                # refused exactly like a missing one, and one character answers.
+                for item in items:
+                    if not isinstance(item, dict) or item.get("type") != "reasoning":
+                        continue
+                    parts = item.get("content") or []
+                    if not any(
+                        isinstance(part, dict)
+                        and isinstance(part.get("text"), str)
+                        and part["text"]
+                        for part in parts
+                    ):
+                        return True
+                return False
+
+            encrypted = {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [],
+                "encrypted_content": "opaque-blob",
+            }
+            readable = {
+                "type": "reasoning",
+                "id": "rs_2",
+                "summary": [],
+                "content": [{"type": "reasoning_text", "text": "mine"}],
+            }
+            tool_call = {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "ls",
+                "arguments": "{}",
+            }
+            tool_output = {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "a.txt",
+            }
+            replay = [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "ls"}],
+                },
+                encrypted,
+                readable,
+                tool_call,
+                tool_output,
+            ]
+
+            async def original_function(**kwargs):
+                calls.append(dict(kwargs))
+                if refuses(kwargs["input"]):
+                    raise ThinkingReplayRefused()
+                return {"ok": True}
+
+            router = Router()
+            response = await router.make_call(
+                original_function,
+                model="deepseek-v4.1-flash",
+                model_info={"id": "ce96bf46"},
+                input=replay,
+            )
+
+            self.assertEqual({"ok": True}, response)
+            self.assertEqual(2, len(calls))
+            # The refused body is the client's own replay, untouched.
+            self.assertIs(encrypted, calls[0]["input"][1])
+            self.assertNotIn("content", calls[0]["input"][1])
+            # The retry carries a readable placeholder on that one item: the
+            # item that already had text, and every non-reasoning item, are the
+            # objects the client sent.
+            repaired_input = calls[1]["input"]
+            self.assertEqual("opaque-blob", repaired_input[1]["encrypted_content"])
+            self.assertEqual(
+                [{"type": "reasoning_text", "text": " "}],
+                repaired_input[1]["content"],
+            )
+            self.assertIs(readable, repaired_input[2])
+            self.assertIs(tool_call, repaired_input[3])
+            self.assertIs(tool_output, repaired_input[4])
+            self.assertTrue(
+                calls[1]["litellm_metadata"][replay_module.RETRY_METADATA_KEY]
+            )
+
+            # The route answered the repaired body, so the requirement is
+            # remembered for the first attempt of the next turn -- including for
+            # a worker that only ever sees the shared file.
+            self.assertTrue(
+                replay_module._recorded_replay_requirement(
+                    {"model_info": {"id": "ce96bf46"}, "input": []}
+                )
+            )
+            self.assertIn(
+                "reasoning_text_replay", json.loads(state_path.read_text())
+            )
+            replay_module._REQUIREMENTS.clear()
+            replay_module._REQUIREMENTS_LOADED_AT = 0.0
+            self.assertTrue(
+                replay_module._recorded_replay_requirement(
+                    {"model_info": {"id": "ce96bf46"}, "input": []}
+                )
+            )
+            # A requirement belongs to the route *and its wire*: a fact learned
+            # from a Responses replay never rewrites the Chat one.
+            self.assertFalse(
+                replay_module._recorded_replay_requirement(
+                    {"model_info": {"id": "ce96bf46"}, "messages": []}
+                )
+            )
+            pre_call = replay_module._with_recorded_replay_repair(
+                {
+                    "model": "deepseek-v4.1-flash",
+                    "model_info": {"id": "ce96bf46"},
+                    "input": [encrypted, tool_call],
+                }
+            )
+            self.assertIsNotNone(pre_call)
+            assert pre_call is not None
+            self.assertEqual(
+                [{"type": "reasoning_text", "text": " "}],
+                pre_call["input"][0]["content"],
+            )
+            # ... and only for that route.
+            self.assertIsNone(
+                replay_module._with_recorded_replay_repair(
+                    {
+                        "model": "deepseek-v4.1-flash",
+                        "model_info": {"id": "some-other-route"},
+                        "input": [encrypted],
+                    }
+                )
+            )
+
+            # A route that refuses the repaired body too has answered about
+            # something else, and the marker stops the same bytes being sent a
+            # third time.
+            calls.clear()
+
+            async def always_refuses(**kwargs):
+                calls.append(dict(kwargs))
+                raise ThinkingReplayRefused()
+
+            with self.assertRaises(ThinkingReplayRefused):
+                await router.make_call(
+                    always_refuses,
+                    model="deepseek-v4.1-flash",
+                    model_info={"id": "another-route"},
+                    input=replay,
+                )
+            self.assertEqual(2, len(calls))
+
+            # A turn the client kept no thinking for at all -- a history
+            # restored from a summary, or a client that never stored the item --
+            # is answered by inserting one.  Measured against the same upstream:
+            # the history without it is refused, and the same history with the
+            # placeholder inserted answers a full streamed turn (usage, thinking
+            # frames, text).
+            calls.clear()
+
+            async def no_thinking_original_function(**kwargs):
+                calls.append(dict(kwargs))
+                kinds = [
+                    item.get("type")
+                    for item in kwargs.get("input") or []
+                    if isinstance(item, dict)
+                ]
+                if "function_call" in kinds:
+                    position = kinds.index("function_call")
+                    if "reasoning" not in kinds[:position]:
+                        raise ThinkingReplayRefused()
+                return {"ok": True}
+
+            bare_replay = [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "ls"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "ok"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_9",
+                    "name": "ls",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_9",
+                    "output": "a.txt",
+                },
+            ]
+            response = await router.make_call(
+                no_thinking_original_function,
+                model="deepseek-v4.1-flash",
+                model_info={"id": "bare-route"},
+                input=bare_replay,
+            )
+            self.assertEqual({"ok": True}, response)
+            self.assertEqual(2, len(calls))
+            self.assertEqual(
+                ["message", "message", "function_call", "function_call_output"],
+                [
+                    item.get("type") or item.get("role")
+                    for item in calls[0]["input"]
+                ],
+            )
+            # The item opens the turn, before the assistant message: with a
+            # ``tools`` declaration the upstream refuses it beside the
+            # ``function_call`` (measured on the real route).
+            inserted = calls[1]["input"][1]
+            self.assertEqual("reasoning", inserted["type"])
+            self.assertEqual(" ", inserted["content"][0]["text"])
+            self.assertIn("call_9", inserted["id"])
+            self.assertEqual("message", calls[1]["input"][2]["type"])
+            self.assertEqual("function_call", calls[1]["input"][3]["type"])
+            # Repairing the same body twice says the same thing: the id is
+            # derived from the tool call, so one turn is never two.
+            self.assertIsNone(
+                replay_module.with_reasoning_text_replay(
+                    {"input": calls[1]["input"]}
+                )
+            )
+
+            # The Chat wire of the same route refuses the same absence under
+            # its own spelling, and ``reasoning_content: ""`` answers there.
+            calls.clear()
+
+            async def chat_original_function(**kwargs):
+                calls.append(dict(kwargs))
+                for message in kwargs.get("messages") or []:
+                    if (
+                        isinstance(message, dict)
+                        and message.get("role") == "assistant"
+                        and message.get("tool_calls")
+                        and "reasoning_content" not in message
+                    ):
+                        raise ThinkingReplayRefused()
+                return {"ok": True}
+
+            chat_replay = [
+                {"role": "user", "content": "ls"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "ls", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "a.txt"},
+            ]
+            response = await router.make_call(
+                chat_original_function,
+                model="deepseek-v4.1-flash",
+                model_info={"id": "chat-route"},
+                messages=chat_replay,
+            )
+            self.assertEqual({"ok": True}, response)
+            self.assertEqual(2, len(calls))
+            self.assertNotIn("reasoning_content", calls[0]["messages"][1])
+            self.assertEqual("", calls[1]["messages"][1]["reasoning_content"])
+            self.assertEqual("ls", calls[1]["messages"][0]["content"])
+
+            # An ordinary 400 is not the thinking-replay contract and keeps its
+            # own reading: no second request, no rewritten body.
+            calls.clear()
+
+            class PlainBadRequest(Exception):
+                status_code = 400
+
+            async def rejecting_original_function(**kwargs):
+                calls.append(dict(kwargs))
+                raise PlainBadRequest("invalid_request_error: unknown field 'foo'")
+
+            with self.assertRaises(PlainBadRequest):
+                await router.make_call(
+                    rejecting_original_function,
+                    model="deepseek-v4.1-flash",
+                    model_info={"id": "ce96bf46"},
+                    input=replay,
+                )
+            self.assertEqual(1, len(calls))
+
     async def test_public_image_generation_reuses_common_fallback_path(self) -> None:
         hooks, _ = load_hook_module()
         router_module = types.ModuleType("litellm.router")

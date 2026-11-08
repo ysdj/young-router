@@ -1030,6 +1030,165 @@ class HookRouteRecoveryTests(HookTestCase):
             )
         )
 
+    async def test_single_route_body_refusal_ends_the_poll_after_one_attempt(self) -> None:
+        """One route and a verdict about the body: polling is a four-hour silence.
+
+        The group has a single configured deployment, so the poll's reopen
+        selects that same deployment again and replays the same bytes.  A
+        refusal about the body (the thinking replay without its thinking, a
+        tool history that no longer pairs up) answers identically every time,
+        and the client sits behind a keepalive until the recovery window runs
+        out -- four hours by default.  Measured live: a single-route group
+        replayed the refused body every five seconds and never ended the turn.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "30")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        attempts = []
+
+        class Refused(Exception):
+            status_code = 400
+
+        refusal = Refused(
+            'litellm.BadRequestError: OpenAIException - {"error":{"message":'
+            '"the `reasoning_text` in the thinking mode must be passed back to '
+            'the api."}}'
+        )
+        refusal.failed_deployment_id = "only-route"
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [{"model_info": {"id": "only-route", "order": 0}}]
+
+        proxy_server.llm_router = Router()
+
+        async def refusing_attempt(request_data, exception, **kwargs):
+            attempts.append(
+                sorted(
+                    hooks._responses_request_module._request_excluded_deployment_ids(
+                        request_data
+                    )
+                )
+            )
+            raise Refused(
+                'litellm.BadRequestError: OpenAIException - {"error":{"message":'
+                '"the `reasoning_text` in the thinking mode must be passed back '
+                'to the api."}}'
+            )
+            # Keep this an async generator: the poll iterates the attempt, and
+            # a plain coroutine is not iterable.
+            if False:
+                yield None
+
+        request_data = {
+            "model": "single-route-chat",
+            "input": [
+                {"role": "assistant", "content": "ok"},
+                {"type": "function_call", "call_id": "c1", "name": "ls", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "a.txt"},
+            ],
+            "stream": True,
+            "metadata": {"request_id": "single-route-body-refusal"},
+            "model_info": {"id": "only-route", "order": 0},
+        }
+
+        with mock.patch.object(
+            hooks._streaming_module,
+            "_stream_route_recovery_poll_attempt",
+            refusing_attempt,
+        ), mock.patch.object(
+            hooks._streaming_module,
+            "_stream_native_route_recovery_poll_attempt",
+            refusing_attempt,
+        ):
+            chunks = [
+                chunk
+                async for chunk in hooks._stream_route_recovery_poll(
+                    request_data,
+                    refusal,
+                )
+            ]
+
+        self.assertEqual(len(attempts), 1)
+        assert_upstream_route_failed_terminal(self, chunks)
+
+    async def test_single_route_cooldown_refusal_keeps_polling_for_its_own_recovery(
+        self,
+    ) -> None:
+        """A route that is only unavailable is waited out, not abandoned.
+
+        The other half of the single-route rule: a refusal about the route's
+        *availability* answers nothing about these bytes, so the cooldown that
+        parked it expires and the same route serves.  Ending the turn there
+        would turn a provider blip into a user-visible failure on exactly the
+        deployments that have nowhere else to go.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "30")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        attempts = []
+
+        class Unavailable(Exception):
+            status_code = 503
+
+        refusal = Unavailable("upstream temporarily unavailable")
+        refusal.failed_deployment_id = "only-route"
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [{"model_info": {"id": "only-route", "order": 0}}]
+
+        proxy_server.llm_router = Router()
+
+        async def unavailable_attempt(request_data, exception, **kwargs):
+            attempts.append(1)
+            if len(attempts) >= 2:
+                yield {
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_recovered",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "recovered on the only route",
+                }
+                return
+            raise Unavailable("upstream temporarily unavailable")
+
+        request_data = {
+            "model": "single-route-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "metadata": {"request_id": "single-route-unavailable"},
+            "model_info": {"id": "only-route", "order": 0},
+        }
+
+        with mock.patch.object(
+            hooks._streaming_module,
+            "_stream_route_recovery_poll_attempt",
+            unavailable_attempt,
+        ), mock.patch.object(
+            hooks._streaming_module,
+            "_stream_native_route_recovery_poll_attempt",
+            unavailable_attempt,
+        ):
+            chunks = [
+                chunk
+                async for chunk in hooks._stream_route_recovery_poll(
+                    request_data,
+                    refusal,
+                )
+            ]
+
+        self.assertGreaterEqual(len(attempts), 2)
+        self.assertTrue(
+            any(
+                isinstance(chunk, dict)
+                and chunk.get("delta") == "recovered on the only route"
+                for chunk in chunks
+            )
+        )
+
     def test_thinking_refusal_keeps_the_recovery_stream_despite_an_ordered_entry(self) -> None:
         hooks, _proxy_server = load_hook_module()
         self.set_env(hooks._RECOVERY_POLICY_REQUEST_ERROR_ENV, None)

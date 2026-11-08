@@ -1976,6 +1976,27 @@ def _synthesized_failed_response_event(
         )
         error_type = "invalid_request_error"
         error_code = "invalid_prompt"
+    elif _routing_module._is_thinking_replay_contract_error(exception):
+        # A thinking-mode route refused the replay because the reasoning text of
+        # earlier turns is not in it any more.  ``reasoning_replay`` answers that
+        # on the same route for a history that still carries its thinking in any
+        # form; reaching here means there was nothing left to repair, and the
+        # same bytes meet the same refusal.  Reading it as an unclassified stop
+        # told the reader the route "produced no answer" and invited a resend of
+        # exactly that history, so the turn looped on a refusal it could never
+        # clear.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        message = _routing_module._upstream_thinking_replay_rejected_message(
+            model_group
+        )
+        # Same pair as the deterministic siblings: a wire type that stops the
+        # client and the Codex code for "no resend changes this".
+        error_type = "invalid_request_error"
+        error_code = "invalid_prompt"
     elif _routing_module._is_upstream_request_field_rejected_error(exception):
         # The route refused the *fields* this proxy sent, not the conversation:
         # an ``extra_body`` container, a ``litellm_params`` container, or one of
@@ -2379,6 +2400,10 @@ def _native_stream_error_code(exception: Exception) -> str:
         # A code of its own: the route's channel client is stale, which is a
         # configuration change, not a transport hiccup worth reconnecting for.
         return "upstream_client_outdated"
+    if _routing_module._is_thinking_replay_contract_error(exception):
+        # The replayed thinking is gone from this history and no resend adds it
+        # back, so the client must not reconnect over the same body.
+        return "invalid_prompt"
     if _routing_module._is_upstream_tool_history_rejected_error(exception):
         return "invalid_prompt"
     if _routing_module._is_upstream_request_field_rejected_error(exception):
@@ -2471,6 +2496,15 @@ def _native_stream_error_message(
             or "the requested model"
         )
         return _routing_module._upstream_client_version_rejected_message(model_group)
+    if _routing_module._is_thinking_replay_contract_error(exception):
+        # Same reading as the Responses branch: the thinking this route needs
+        # back is not in the history any more, so a resend carries the same gap.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        return _routing_module._upstream_thinking_replay_rejected_message(model_group)
     if _routing_module._is_upstream_tool_history_rejected_error(exception):
         # The replay cannot be repaired on the client's side by sending it
         # again: the interrupted tool call stays in the history forever.

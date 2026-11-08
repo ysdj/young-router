@@ -9,6 +9,7 @@ from . import request_context as _request_context_module
 from . import responses_surfaces as _responses_surfaces_module
 from . import responses_tools as _responses_tools_module
 from . import web_search_native as _web_search_native_module
+from . import reasoning_replay as _reasoning_replay_module
 from . import routing as _routing_module
 from . import streaming as _streaming_module
 from . import tools as _tools_module
@@ -1506,10 +1507,25 @@ def _wrap_generic_function_for_deployment_failover(
             dispatch_kwargs = _routing_module._surface_adapted_dispatch_kwargs(
                 call_kwargs
             )
-            response = original_function(**dispatch_kwargs)
-            if inspect.isawaitable(response):
-                return await response
-            return response
+
+            async def call_deployment() -> Any:
+                response = original_function(**dispatch_kwargs)
+                if inspect.isawaitable(response):
+                    return await response
+                return response
+
+            # Every call this deployment receives funnels through here -- the
+            # plain dispatch, the client-tool adapter and the Chat bridge -- so
+            # this is where a wire that refuses a replay for missing its own
+            # thinking gets the same route asked again with that field filled
+            # in (see ``reasoning_replay``).  The refusal names this body, not
+            # the route: answered here, the group's fastest route keeps the
+            # turn instead of handing it to whichever sibling accepts the
+            # history.
+            return await _reasoning_replay_module.call_with_replay_repair(
+                call_deployment,
+                dispatch_kwargs,
+            )
 
         native_client_tool_kwargs = (
             _responses_surfaces_module._with_responses_native_client_tool_passthrough(

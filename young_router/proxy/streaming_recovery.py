@@ -983,6 +983,17 @@ async def _stream_native_route_recovery_poll_attempt(
         except Exception:
             pass
 
+#: How many rounds a single-route group may spend with an empty pool before the
+#: poll stops.  One, not zero: the first round of a poll can meet only this
+#: request's own exclusion (the fallback round left it behind), so `nothing to
+#: try` is not yet evidence about the route.  Two rounds with an empty pool and
+#: nothing cooling is: no attempt can reach an upstream any more, and holding the
+#: client for the rest of the window is keepalives until it expires -- four hours
+#: by default.  A route that is only cooling never gets here: the wait branch
+#: above it serves out the cooldown and that same route answers.
+_SINGLE_ROUTE_EMPTY_POOL_ROUNDS = 2
+
+
 def _route_recovery_poll_keep_going(exception: Exception) -> bool:
     if _routing_module._is_upstream_model_not_found_error(exception):
         return False
@@ -1266,6 +1277,21 @@ async def _stream_route_recovery_poll(
     last_exception = exception
     attempt = 0
     waited_for_all_cooldown = False
+    # Whether this poll can ever do anything other than replay these bytes.
+    # Read once, from the refusal that opened it: a cooldown or a network
+    # outage may recover on its own and that same route then serves, while a
+    # verdict about the body cannot -- and ``last_exception`` stops naming the
+    # original verdict as soon as LiteLLM re-wraps it for the poll.
+    single_route_deployment_ids = _route_recovery_poll_configured_deployment_ids(
+        request_data
+    )
+    refusal_about_the_body = bool(
+        len(single_route_deployment_ids) == 1
+        and not _routing_module._is_no_deployments_available_error(exception)
+        and _routing_module._recovery_policy_for_exception(exception)
+        == _routing_module._RECOVERY_POLICY_RECOVERY
+    )
+    single_route_empty_pool_rounds = 0
     ignore_local_constraints = bool(
         request_data.pop("_route_recovery_ignore_local_constraints", False)
     )
@@ -1626,6 +1652,66 @@ async def _stream_route_recovery_poll(
                     exception=_routing_module._trace_exception(last_exception),
                 )
                 break
+
+            # A group with one configured deployment has nothing for the
+            # reopen to select: it recomputes the same order and picks the same
+            # route again.  So this pool's whole budget is two rounds, and what
+            # makes the turn final is one of two facts:
+            #
+            # * the refusal was about *the body* -- a thinking replay without
+            #   its thinking, a tool history that no longer pairs up, a
+            #   parameter the route's validator will not take.  The same bytes
+            #   at that route get the same answer, so one attempt is the whole
+            #   answer.  (Measured live: replayed every five seconds for four
+            #   hours behind keepalives.)
+            # * the pool is empty and nothing is cooling it back in.  No later
+            #   attempt can reach an upstream at all.  One round is granted
+            #   first, because a poll's first round can meet only this
+            #   request's own exclusion -- the fallback round just left it
+            #   behind -- which says nothing yet about the route.
+            #
+            # A refusal about the route's *availability* is neither: the
+            # cooldown branch above serves out the cooldown and that same route
+            # answers, which is why a provider blip is not turned into a
+            # user-visible failure on the deployments that have nowhere else to
+            # go.
+            single_route_group = len(single_route_deployment_ids) == 1
+            if single_route_group and refusal_about_the_body:
+                _trace_module._request_route_trace(
+                    "route_recovery_poll_single_route_refused_the_body",
+                    request_data,
+                    poll_attempt=attempt,
+                    configured_deployment_ids=sorted(single_route_deployment_ids),
+                    elapsed_seconds=round(time.monotonic() - started_at_monotonic, 3),
+                    exception=_routing_module._trace_exception(last_exception),
+                )
+                # Report the refusal that ended the turn, not the wrapper the
+                # fallback round made of it: the wrapper says "upstream rate
+                # limit" and carries ``stream_incomplete``, so the terminal read
+                # as a transport blip that invited the same history again.  The
+                # opening refusal is the one with a cause and a wire type.
+                last_exception = exception
+                break
+
+            if (
+                single_route_group
+                and single_route_deployment_ids <= excluded_after_attempt
+                and _route_recovery_poll_cooldown_wait(request_data) is None
+            ):
+                single_route_empty_pool_rounds += 1
+                if single_route_empty_pool_rounds >= _SINGLE_ROUTE_EMPTY_POOL_ROUNDS:
+                    _trace_module._request_route_trace(
+                        "route_recovery_poll_single_route_cannot_progress",
+                        request_data,
+                        poll_attempt=attempt,
+                        configured_deployment_ids=sorted(single_route_deployment_ids),
+                        empty_pool_rounds=single_route_empty_pool_rounds,
+                        elapsed_seconds=round(
+                            time.monotonic() - started_at_monotonic, 3
+                        ),
+                        exception=_routing_module._trace_exception(last_exception),
+                    )
+                    break
 
             now = time.monotonic()
             if max_poll_seconds <= 0 or (
