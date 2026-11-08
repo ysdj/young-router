@@ -1626,6 +1626,22 @@ class MirrorFrameTests(unittest.TestCase):
         # The poll is long: Core holds it until something changed.
         self.assertIn("data:image/jpeg;base64,", leaf)
 
+    def test_the_stream_never_reads_a_binding_that_is_not_initialized(self) -> None:
+        """`let cancelled` has to exist before the stream asks about it.
+
+        Measured on the live page: the dialog rendered black and no frame was
+        ever requested, because the stream's first tick read `cancelled` before
+        its `let` had been initialized -- `Cannot access 's' before
+        initialization` in the bundle.  The pump is deferred too, so a caller
+        cannot be handed a closure over a half-built function.
+        """
+
+        leaf = (Path(__file__).resolve().parents[1] / "rn/packages/shared/src/platform/browserLeaf.ts").read_text(encoding="utf-8")
+        body = leaf.split("const browserName = typeof started.browser", 1)[1].split("cancelHostChrome(", 1)[0]
+        self.assertIn("let cancelled = false;", body)
+        self.assertLess(body.index("let cancelled = false;"), body.index("startMirrorSurface("))
+        self.assertIn("void Promise.resolve().then(pump);", leaf)
+
     def test_nothing_pretends_to_be_a_window_when_frames_are_running(self) -> None:
         chrome = Path(__file__).resolve().parents[1] / "rn/packages/shared/src/ui/HostChrome.tsx"
         text = chrome.read_text(encoding="utf-8")

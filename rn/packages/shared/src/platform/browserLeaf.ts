@@ -463,7 +463,9 @@ function startMirrorSurface(
       }
     }
   };
-  void pump();
+  // Started after this call returns, so a caller cannot be reading a binding
+  // that its own function has not finished initializing.
+  void Promise.resolve().then(pump);
   return {
     width: size.width,
     height: size.height,
@@ -541,12 +543,17 @@ async function browserWindowLogin(
   const loginId = typeof started.login_id === "string" ? started.login_id : "";
   if (!loginId) return undefined;
   const browserName = typeof started.browser === "string" ? started.browser : "";
+  // Declared before the stream, not after it: the stream's loop asks this on its
+  // first tick, and a `let` that has not been initialized yet throws rather than
+  // reading as `false` — measured on the live page as
+  // `ReferenceError: Cannot access 's' before initialization`, with the dialog
+  // drawn black and no frame ever requested.
+  let cancelled = false;
   // A Core with no screen of its own, or a page opened through a proxy, cannot
   // show a window anybody is looking at.  It answers with the frames of a
   // headless browser instead, and this surface draws them.
   const mirror = startMirrorSurface(core, loginId, started.mirror, () => cancelled);
   cancelHostChrome("relayBrowser");
-  let cancelled = false;
   const wait = requestHostChrome<"form" | undefined>({
     kind: "relayBrowser",
     title: fillLabel(strings?.relaySignInTitle ?? "Sign in", options.label),
