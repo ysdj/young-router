@@ -381,11 +381,16 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
             root = service_root(api_base)
             if not root:
                 continue
-            # A route states its key by slot, and the slot is where the
-            # account it belongs to is recorded.  A route that names no
-            # readable key still contributes its station, because another
-            # route of the same station may name one.
+            # One read scope per relay *account*: the route's own slot names the
+            # login its credential was minted from, and routes pointing at that
+            # login are one entry.  A route that names no readable key still
+            # contributes its station, because another route of the same station
+            # may name one.
             scope = (root, account_id)
+            # The station this route belongs to, from the slot it uses or from
+            # the provider it was configured under.  It is recorded on the scope
+            # because a station's own record can name another domain, and the
+            # membership test below must still recognise its relay.
             station_id = slot_station_id or provider_station_id
             if scope not in roots:
                 order.append(scope)
