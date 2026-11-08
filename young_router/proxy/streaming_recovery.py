@@ -358,7 +358,8 @@ async def _stream_streaming_error_fallback(
                 allow_repeated_attempt = True
                 continue
 
-            if attempt < max_retries:
+            attempt_budget = _routing_module._same_deployment_retry_budget(exc)
+            if attempt < attempt_budget:
                 attempt += 1
                 retry_delay_seconds = _routing_module._route_exhaustion_retry_delay_for_exception(
                     exc,
@@ -367,7 +368,7 @@ async def _stream_streaming_error_fallback(
                 _trace_module._request_route_trace(
                     "route_exhaustion_retry", request_data,
                     retry_attempt=attempt,
-                    max_retries=max_retries,
+                    max_retries=attempt_budget,
                     retry_delay_seconds=retry_delay_seconds,
                     configured_retry_delay_seconds=delay_seconds,
                     exception=_routing_module._trace_exception(exc),

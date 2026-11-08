@@ -139,3 +139,160 @@ class ThinkingToolChoiceRefusalTests(HookTestCase):
                 if isinstance(state, dict) and state.get("cooldown_until")
             ]
         )
+
+    def test_the_refusal_earns_one_more_attempt_on_the_same_route(self) -> None:
+        """A coin flip is asked again, on the route that flipped it.
+
+        Measured through this proxy: the request DeepSeek refused carried
+        ``tool_choice: null``, so there was nothing to relax and the bytes were
+        not the problem -- the same payload signature is served outright about
+        half the time.  With the configured budget at its default of zero the
+        only outcomes were a sibling (which a single-route group does not have)
+        or a failed turn, and the cooldown that parked the route had nothing to
+        wait for.
+        """
+
+        hooks, _ = load_hook_module()
+        routing = hooks._routing_module
+        self.set_env(routing._SAME_DEPLOYMENT_RETRIES_ENV, "0")
+        self.assertEqual(0, routing._same_deployment_retries())
+
+        self.assertGreaterEqual(
+            routing._same_deployment_retry_budget(_tool_choice_error()), 1
+        )
+        # Everything else keeps the configured budget: this allowance is about
+        # one class, not a global change of retry behaviour.
+        self.assertEqual(
+            0,
+            routing._same_deployment_retry_budget(
+                _tool_choice_error(
+                    "litellm.BadRequestError: OpenAIException - tool_choice "
+                    "references a tool that does not exist"
+                )
+            ),
+        )
+
+    def test_the_extra_attempt_is_asked_again_immediately(self) -> None:
+        """Waiting the recovery interval would make the flake cost seconds.
+
+        Nothing has to recover for this class: the route is up and answering,
+        it just answered the other way this time.
+        """
+
+        hooks, _ = load_hook_module()
+        routing = hooks._routing_module
+        recovery_interval = routing._stream_route_exhaustion_retry_delay_seconds()
+        self.assertGreater(recovery_interval, 0.2)
+
+        self.assertLessEqual(
+            routing._route_exhaustion_retry_delay_for_exception(
+                _tool_choice_error(), recovery_interval
+            ),
+            0.2,
+        )
+        # A 429 still honours its own backoff, and an ordinary failure keeps the
+        # configured delay.
+        self.assertEqual(
+            recovery_interval,
+            routing._route_exhaustion_retry_delay_for_exception(
+                _tool_choice_error(
+                    "litellm.RateLimitError: OpenAIException - slow down"
+                ),
+                recovery_interval,
+            ),
+        )
+
+    async def test_the_retry_reaches_the_route_that_refused(self) -> None:
+        """The extra attempt is worthless if the route is still excluded.
+
+        Measured live on a single-route group: the retry ran (``final_route_retry``
+        with a 0.2 s delay) and the next attempt answered "no deployments
+        available" without contacting an upstream, because the failover marking
+        had already put that one route in the exclusion list.  The retry must put
+        it back -- and only it, so another route's verdict still stands.
+        """
+
+        hooks, _ = load_hook_module()
+        routing = hooks._routing_module
+        self.set_env(routing._SAME_DEPLOYMENT_RETRIES_ENV, "0")
+        self.set_env(routing._RECOVERY_INTERVAL_SECONDS_ENV, "0")
+
+        refusal = _tool_choice_error()
+        refusal.failed_deployment_id = "ce96bf46"
+        request = _route_request()
+        request["_excluded_deployment_ids"] = ["ce96bf46", "someone-else"]
+        request["litellm_metadata"] = {
+            "excluded_deployment_ids": ["ce96bf46", "someone-else"]
+        }
+
+        routing._allow_the_failed_deployment_again(refusal, request)
+
+        self.assertEqual(["someone-else"], request["_excluded_deployment_ids"])
+        self.assertEqual(
+            ["someone-else"],
+            request["litellm_metadata"]["excluded_deployment_ids"],
+        )
+
+        # The last exclusion goes away entirely rather than leaving an empty
+        # list the router would read as "every route is excluded".
+        request["_excluded_deployment_ids"] = ["ce96bf46"]
+        routing._allow_the_failed_deployment_again(refusal, request)
+        self.assertNotIn("_excluded_deployment_ids", request)
+
+    async def test_a_served_retry_ends_the_turn_and_parks_nothing(self) -> None:
+        """The retry is the whole remedy: no cooldown, no second refusal.
+
+        The upstream serves this payload signature about half the time, so one
+        route asked twice usually answers.  Running it through the generic
+        helper is what proves the attempt is spent on the same route instead of
+        advancing to a peer that does not exist.
+        """
+
+        hooks, _ = load_hook_module()
+        routing = hooks._routing_module
+        self.set_env(routing._SAME_DEPLOYMENT_RETRIES_ENV, "0")
+        self.set_env(routing._RECOVERY_INTERVAL_SECONDS_ENV, "0")
+        routing._DEPLOYMENT_COOLDOWNS.clear()
+
+        router_module = types.ModuleType("litellm.router")
+        attempts = []
+
+        class Router:
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await original_generic_function(**kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_generic_deployment_failover_patch()
+
+        async def original_generic_function(**kwargs):
+            attempts.append(kwargs.get("_young_router_upstream_url_surface"))
+            if len(attempts) == 1:
+                error = _tool_choice_error()
+                error.failed_deployment_id = "ce96bf46"
+                routing._mark_exception_for_deployment_failover(error, kwargs)
+                raise error
+            return {"served": True}
+
+        request = _route_request()
+        request.pop("model", None)
+        response = await Router()._ageneric_api_call_with_fallbacks_helper(
+            "deepseek-v4.1-flash",
+            original_generic_function,
+            **request,
+        )
+
+        self.assertEqual({"served": True}, response)
+        self.assertEqual(2, len(attempts))
+        self.assertFalse(
+            [
+                state
+                for state in routing._DEPLOYMENT_COOLDOWNS.values()
+                if isinstance(state, dict) and state.get("cooldown_until")
+            ]
+        )

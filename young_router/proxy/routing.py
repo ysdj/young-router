@@ -916,6 +916,71 @@ def _same_deployment_retries() -> int:
         return _SAME_DEPLOYMENT_RETRIES_DEFAULT
 
 
+def _same_deployment_retry_budget(exception: Exception) -> int:
+    """How many extra attempts this failure may spend on its own route.
+
+    The configured budget (``YOUNG_ROUTER_SAME_DEPLOYMENT_RETRIES``, zero by
+    default) assumes a failure is either the connection's or the body's.  One
+    class is neither: a thinking route that answers ``400 thinking mode does
+    not support this tool_choice`` to a payload carrying no ``tool_choice`` at
+    all, and serves the same payload signature outright about half the time
+    (measured live: 160 of 305 attempts on one deployment).  Measured again
+    through this proxy: the request that failed carried
+    ``tool_choice: null`` -- there was nothing to relax -- so the only remedy
+    is asking again.
+
+    Left at zero, a single-route group turns a coin flip into a failed turn,
+    because there is no sibling to advance to and the cooldown wait has nothing
+    to wait for.  One extra attempt turns it back into a coin flip, and after
+    that the ordinary failure accounting takes over.
+    """
+
+    configured = _same_deployment_retries()
+    if _is_thinking_tool_choice_unsupported_error(exception):
+        return max(configured, _THINKING_TOOL_CHOICE_RETRY_ATTEMPTS)
+    return configured
+
+
+def _allow_the_failed_deployment_again(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+) -> None:
+    """Put the route this failure came from back in the candidate pool.
+
+    A same-route retry is worthless once the failover marking has excluded that
+    route: the retry reaches deployment selection, finds the only candidate
+    excluded, and answers "no deployments available" without contacting an
+    upstream at all.  Measured live on a single-route group: the retry ran
+    (``final_route_retry``, 0.2 s later) and the very next attempt was filtered
+    out, turning the extra attempt into a second failure.
+
+    Only the deployment this failure named is returned; every other exclusion
+    in the request is someone else's verdict and stays.
+    """
+
+    failed_id = _responses_execution_module._failed_deployment_id(exception)
+    if not failed_id or not isinstance(request_kwargs, dict):
+        return
+    excluded_ids = _responses_request_module._request_excluded_deployment_ids(
+        request_kwargs
+    )
+    if failed_id not in excluded_ids:
+        return
+    excluded_ids.discard(failed_id)
+    if excluded_ids:
+        request_kwargs["_excluded_deployment_ids"] = sorted(excluded_ids)
+    else:
+        request_kwargs.pop("_excluded_deployment_ids", None)
+    metadata = request_kwargs.get("litellm_metadata")
+    if isinstance(metadata, dict):
+        updated_metadata = metadata.copy()
+        if excluded_ids:
+            updated_metadata["excluded_deployment_ids"] = sorted(excluded_ids)
+        else:
+            updated_metadata.pop("excluded_deployment_ids", None)
+        request_kwargs["litellm_metadata"] = updated_metadata
+
+
 def _same_deployment_retry_exhausted(exception: Exception) -> bool:
     return bool(getattr(exception, _SAME_DEPLOYMENT_RETRY_EXHAUSTED_ATTR, False))
 
@@ -6500,12 +6565,26 @@ def _exception_retry_after_seconds(exception: Exception) -> Optional[float]:
     return _parse_retry_after_seconds(_exception_text(exception))
 
 
+_THINKING_TOOL_CHOICE_RETRY_DELAY_SECONDS = 0.2
+# Measured at 160 served of 305 attempts (0.52). One extra attempt leaves a
+# failure every fourth occurrence, two leave it near one in nine -- and each
+# attempt is cheap next to a failed turn on a group with nowhere else to go.
+_THINKING_TOOL_CHOICE_RETRY_ATTEMPTS = 2
+
+
 def _route_exhaustion_retry_delay_for_exception(
     exception: Exception,
     configured_delay_seconds: float,
 ) -> float:
     if configured_delay_seconds <= 0:
         return 0.0
+    if _is_thinking_tool_choice_unsupported_error(exception):
+        # Asking a coin flip again is worth a fraction of a second; the
+        # recovery interval is for a route that has to recover something, and
+        # nothing here does.
+        return min(
+            configured_delay_seconds, _THINKING_TOOL_CHOICE_RETRY_DELAY_SECONDS
+        )
     if _exception_status_code(exception) != 429:
         return configured_delay_seconds
     retry_after = _exception_retry_after_seconds(exception)

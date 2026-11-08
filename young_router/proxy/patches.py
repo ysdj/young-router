@@ -1669,8 +1669,13 @@ def _install_generic_deployment_failover_patch() -> None:
                     target_order=target_order,
                     excluded_deployment_ids=kwargs.get("_excluded_deployment_ids"),
                 )
+                # The budget is a property of the failure, not of the process:
+                # a class the upstream itself contradicts (a coin flip on the
+                # same payload) gets its one extra attempt even when the
+                # configured budget is the default zero.
+                retry_budget = _routing_module._same_deployment_retry_budget(exc)
                 if (
-                    retry_attempt < max_retries
+                    retry_attempt < retry_budget
                     and _routing_module._should_retry_final_upstream_route_error(exc, kwargs)
                 ):
                     retry_attempt += 1
@@ -1679,9 +1684,13 @@ def _install_generic_deployment_failover_patch() -> None:
                         exc,
                         kwargs,
                         attempt=retry_attempt,
-                        max_retries=max_retries,
+                        max_retries=retry_budget,
                         configured_delay_seconds=retry_delay_seconds,
                     )
+                    # This attempt goes back to the route that failed, so that
+                    # route must not still be excluded by the failover marking
+                    # that ran moments ago.
+                    _routing_module._allow_the_failed_deployment_again(exc, kwargs)
                     _responses_execution_module._restore_routing_constraints(
                         kwargs,
                         target_order=target_order,
