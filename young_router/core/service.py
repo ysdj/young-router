@@ -5135,40 +5135,65 @@ class CoreStore:
             self._restore_replace_process_request(True)
         with self._lock:
             self._set_service_from_result(service_result, increment=False)
-            if service_result.get("state") == "running":
-                codex = self._domains.get("codex")
-                refresh_catalog = getattr(codex, "refresh_model_catalog", None)
-                if callable(refresh_catalog):
-                    catalog_revision_before = getattr(codex, "revision", None)
-                    try:
-                        refresh_catalog()
-                    except Exception:
-                        pass
-                    if getattr(codex, "revision", None) != catalog_revision_before:
-                        # A snapshot is memoized on Core's revision; a domain
-                        # observation that changed the catalog must invalidate
-                        # that memo even though no draft moved.
-                        self._revision += 1
-                        self._snapshot_cache = None
-                        try:
-                            self._persist_metadata()
-                        except PersistenceError:
-                            pass
-                self._follow_codex_local_api(codex)
-                self.refresh_client_model_lists(refresh_contexts=False)
-                # The image-context switch lives in the runtime settings and the
-                # fetch server in the client's document.  Reconciling here as
-                # well as on Apply is what makes the two agree after a start:
-                # a settings file edited while the app was closed, or a client
-                # file restored from a backup, would otherwise leave the pass on
-                # with no tool to fetch what it omitted.
-                self._sync_codex_image_context_mcp(["codex"])
-            stopping = self._service_reload_stopping
+            running = service_result.get("state") == "running"
             self._emit()
+        if running:
+            # This reconciliation reads and rewrites the client documents on
+            # disk -- the Codex catalog, the Claude picker, the fetch-server
+            # entry -- and it used to run with the store lock held.  Measured on
+            # lv: a page poll taken while the proxy was being replaced waited
+            # 0.67-0.82 s for that lock, which is a window that feels frozen
+            # exactly when a person is watching the reload happen.  The domains
+            # keep their own locks, so the work moves out of the store's.
+            self._reconcile_client_documents_after_reload()
+            with self._lock:
+                self._emit()
+        stopping = self._service_reload_stopping
         if stopping:
             # The host quit while this restart was in flight; shutdown() may
             # have stopped the previous proxy before this one started.
             self._stop_service_after_reload_shutdown()
+
+    def _reconcile_client_documents_after_reload(self) -> None:
+        """Bring the generated client documents up to date with the proxy.
+
+        Called after the proxy answers again, with no store lock held: every
+        step here touches a file on disk, and a window polling its snapshot must
+        not wait for those writes.  The one part that does move Core's own
+        projection -- a catalog observation that changes the revision -- takes
+        the lock for that bookkeeping alone.
+        """
+
+        codex = self._domains.get("codex")
+        refresh_catalog = getattr(codex, "refresh_model_catalog", None)
+        if callable(refresh_catalog):
+            catalog_revision_before = getattr(codex, "revision", None)
+            try:
+                refresh_catalog()
+            except Exception:
+                pass
+            if getattr(codex, "revision", None) != catalog_revision_before:
+                with self._lock:
+                    # A snapshot is memoized on Core's revision; a domain
+                    # observation that changed the catalog must invalidate that
+                    # memo even though no draft moved.
+                    self._revision += 1
+                    self._snapshot_cache = None
+                    try:
+                        self._persist_metadata()
+                    except PersistenceError:
+                        pass
+        with self._lock:
+            self._follow_codex_local_api(codex)
+        self.refresh_client_model_lists(refresh_contexts=False)
+        # The image-context switch lives in the runtime settings and the fetch
+        # server in the client's document.  Reconciling here as well as on Apply
+        # is what makes the two agree after a start: a settings file edited
+        # while the app was closed, or a client file restored from a backup,
+        # would otherwise leave the pass on with no tool to fetch what it
+        # omitted.
+        with self._lock:
+            self._sync_codex_image_context_mcp(["codex"])
 
     def _follow_codex_local_api(self, codex: object | None = None) -> None:
         """Keep a Codex client that uses this app's proxy on its current endpoint.
