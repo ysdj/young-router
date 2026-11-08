@@ -1309,6 +1309,34 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("setSignedInAccountID(landedID);", wizard)
         self.assertNotIn("relay.refreshResources(pendingID", wizard)
 
+    def test_the_login_step_names_the_account_the_station_already_has(self) -> None:
+        """账号: 未登录 cannot sit above a 已登录 row for the same station.
+
+        The step read only the id *this run* had signed in, so opening it for a
+        station whose account the pane behind it listed as 已登录 printed
+        未登录, and 登录 then asked for a sign-in that was already done.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        self.assertIn("const stationSignedInAccount = useMemo(() => {", wizard)
+        self.assertIn('item.loginStatus === "signed_in"', wizard)
+        self.assertIn("const activeRelayAccount = useMemo(", wizard)
+        self.assertIn("relayAccounts.find((item) => item.id === signedInAccountID) ?? stationSignedInAccount", wizard)
+        # The label and the hint follow that account, not the run's own id.
+        # The label is built one level up, where the snapshot lives.
+        self.assertIn('if (!activeRelayAccount) return "";', self.ui)
+        self.assertIn(
+            '{activeRelayAccount ? translate("relay.resourcesNotLoaded") : translate("providers.wizard.loginFirstHint")}',
+            wizard,
+        )
+        # And the reuse decision reads the account list it is deciding about,
+        # because this window's snapshot can predate the pane behind it.
+        self.assertIn("accountsFromSnapshot((await relay.refreshAccounts()) ?? undefined)", wizard)
+        self.assertIn(
+            'if (step !== "keys" || keyPath !== "login" || isOfficialLoginType) return;',
+            wizard,
+        )
+
     def test_the_login_step_can_sign_in_a_second_account(self) -> None:
         """A station with an account already signed in still offers another.
 

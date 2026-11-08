@@ -4166,6 +4166,21 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     [activeProviderBaseURL, relayStations],
   );
   const relayAccounts = useMemo(() => accountsFromSnapshot(snapshot), [snapshot]);
+  // The account this step speaks for.  A sign-in performed in this run sets it;
+  // otherwise it is the station's own signed-in account.  Reading only the id
+  // this run remembered printed 账号: 未登录 over a station whose account the
+  // pane behind this sheet listed as 已登录 — the step contradicted the window
+  // it was opened from.
+  const stationSignedInAccount = useMemo(() => {
+    if (!stationForProvider) return undefined;
+    const stationKey = stationOriginKey(stationForProvider.baseURL);
+    return relayAccounts.find((item) => item.loginStatus === "signed_in"
+      && (item.stationID === stationForProvider.id || stationOriginKey(item.origin) === stationKey));
+  }, [relayAccounts, stationForProvider]);
+  const activeRelayAccount = useMemo(
+    () => (signedInAccountID ? relayAccounts.find((item) => item.id === signedInAccountID) ?? stationSignedInAccount : stationSignedInAccount),
+    [relayAccounts, signedInAccountID, stationSignedInAccount],
+  );
   // Provided keys stay scoped to the selected provider's station: either the
   // account this wizard session signed into, or the station bound to the
   // provider's base URL. An unscoped fallback would list every station's
@@ -4179,11 +4194,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     return scoped.filter((source) => source.enabled);
   }, [relaySources, signedInAccountID, stationForProvider]);
   const signedInAccountLabel = useMemo(() => {
-    const account = signedInAccountID ? relayAccounts.find((item) => item.id === signedInAccountID) : undefined;
-    if (!account) return "";
-    const name = stringValue(account.username) || stringValue(account.label) || account.id;
-    return `${name} · ${translate(account.loginStatus === "signed_in" ? "providers.authStatusSignedIn" : "providers.authStatusSignedOut")}`;
-  }, [relayAccounts, signedInAccountID, translate]);
+    if (!activeRelayAccount) return "";
+    const name = stringValue(activeRelayAccount.username) || stringValue(activeRelayAccount.label) || activeRelayAccount.id;
+    return `${name} · ${translate(activeRelayAccount.loginStatus === "signed_in" ? "providers.authStatusSignedIn" : "providers.authStatusSignedOut")}`;
+  }, [activeRelayAccount, translate]);
   const keyChoices = selectedProvider ? providerKeyChoices(selectedProvider, relaySources, activeProviderBaseURL) : [];
   const keyOptions = [
     { value: PROVIDER_WIZARD_NEW_KEY, label: translate("providers.wizard.addApiKey") },
@@ -5082,6 +5096,15 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // Embedded station sign-in: the vendor's base URL is the station origin.
   // After the login the vendor binds to the station so its provided keys
   // become selectable.
+  // The keys step is about one station's accounts, so it asks for them on the
+  // way in: this window's snapshot can predate the provider pane that already
+  // lists the account, and 账号: 未登录 beside a 已登录 row is the contradiction
+  // that produced.
+  useEffect(() => {
+    if (step !== "keys" || keyPath !== "login" || isOfficialLoginType) return;
+    if (!activeProviderBaseURL.trim()) return;
+    void relay.refreshAccounts();
+  }, [step, keyPath, isOfficialLoginType, activeProviderBaseURL, relay]);
   const beginRelayLogin = async (signInAnother = false): Promise<void> => {
     // The button reports progress instead of going dead, so a second press
     // must not start a parallel sign-in.
@@ -5100,7 +5123,12 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       // is what "get the keys of this station" means when it is already done.
       // 登录新账号 asks for the other thing: a second account on the same
       // station, which the reuse shortcut used to make impossible.
-      const existingAccounts = relayAccounts.filter((item) => stationOriginKey(item.origin) === stationOriginKey(candidate));
+      // The account list is asked for, not assumed: this window's snapshot can
+      // predate the pane behind it, and deciding 已登录 from a stale list is how
+      // the step offered a sign-in for a station that already had a session.
+      const existingAccounts = signInAnother
+        ? relayAccounts.filter((item) => stationOriginKey(item.origin) === stationOriginKey(candidate))
+        : accountsFromSnapshot((await relay.refreshAccounts()) ?? undefined).filter((item) => stationOriginKey(item.origin) === stationOriginKey(candidate));
       const reusable = signInAnother ? undefined : existingAccounts.find((item) => item.loginStatus === "signed_in");
       if (reusable) {
         setSignedInAccountID(reusable.id);
@@ -5650,7 +5678,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
               </> : <>
                 {/* The row above already says whether anyone is signed in, so
                     this states only what the press will do. */}
-                <Text style={styles.providerWizardHint}>{signedInAccountID ? translate("relay.resourcesNotLoaded") : translate("providers.wizard.loginFirstHint")}</Text>
+                <Text style={styles.providerWizardHint}>{activeRelayAccount ? translate("relay.resourcesNotLoaded") : translate("providers.wizard.loginFirstHint")}</Text>
                 <NativeButton title={translate("relay.login")} primary compact busy={loginBusy} disabled={(wizardBusy && !loginBusy) || !activeProviderBaseURL.trim()} onPress={() => { void beginRelayLogin(); }} />
               </>}
             </> : <>
