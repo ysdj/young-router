@@ -2796,7 +2796,7 @@ def _install_usage_cache_read_no_overwrite_patch() -> None:
     """
 
     try:
-        from litellm.types.utils import PromptTokensDetailsWrapper, Usage
+        from litellm.types.utils import Usage
     except Exception:
         return
     original_init = getattr(Usage, "__init__", None)
@@ -2805,9 +2805,6 @@ def _install_usage_cache_read_no_overwrite_patch() -> None:
 
     # Read the OpenAI-shaped count the base model already validated, before the
     # Anthropic assignment in ``Usage.__init__`` runs.
-    class _KeepingPromptTokensDetails(PromptTokensDetailsWrapper):
-        pass
-
     def patched_init(self: Any, *args: Any, **kwargs: Any) -> None:
         details = kwargs.get("prompt_tokens_details")
         read = kwargs.get("cache_read_input_tokens")

@@ -206,8 +206,8 @@ def _route_recovery_next_poll_order(
     request_data: dict,
     exception: Exception,
 ) -> Optional[_RouteOrder]:
-    orders = _streaming_module._configured_deployment_orders(router, request_data)
-    return _streaming_module._next_configured_order(orders, _streaming_module._route_recovery_exhausted_order(request_data, exception))
+    orders = _configured_deployment_orders(router, request_data)
+    return _next_configured_order(orders, _route_recovery_exhausted_order(request_data, exception))
 
 
 def _concurrency_queue_deadline(
@@ -333,7 +333,7 @@ async def _stream_streaming_error_fallback(
             from litellm.proxy.proxy_server import llm_router
 
             configured_deployment_ids = (
-                _streaming_module._configured_deployment_ids(llm_router, request_data)
+                _configured_deployment_ids(llm_router, request_data)
                 if llm_router is not None
                 else set()
             )
@@ -372,7 +372,7 @@ async def _stream_streaming_error_fallback(
                     configured_retry_delay_seconds=delay_seconds,
                     exception=_routing_module._trace_exception(exc),
                 )
-                _streaming_module._reset_route_exhaustion_retry_state(
+                _reset_route_exhaustion_retry_state(
                     request_data,
                     exc,
                     preserve_failed_deployment=False,
@@ -589,7 +589,7 @@ async def _stream_route_recovery_poll_attempt(
                             timeout_seconds=configured_timeout_seconds,
                             selected_deployment_box=selected_deployment_box,
                         ) from None
-                    yield _streaming_module._route_recovery_sse_keepalive(
+                    yield _route_recovery_sse_keepalive(
                         attempt,
                         request_data=request_data,
                         phase="attempt",
@@ -697,7 +697,7 @@ def _native_stream_chunk_is_terminal(
         if isinstance(requested_choices, int) and requested_choices > 0
         else 1
     )
-    return _streaming_module._chat_completions_stream_chunk_is_terminal(
+    return _chat_completions_stream_chunk_is_terminal(
         chunk,
         finished_choice_indices,
         expected_choices=expected_choices,
@@ -768,7 +768,7 @@ async def _yield_native_stream_after_terminal(
                 )
                 raise chunk_exception
             buffered_chunks.append(chunk)
-            saw_terminal = saw_terminal or _streaming_module._native_stream_chunk_is_terminal(
+            saw_terminal = saw_terminal or _native_stream_chunk_is_terminal(
                 chunk,
                 request_data,
                 finished_choice_indices,
@@ -787,7 +787,7 @@ async def _yield_native_stream_after_terminal(
     except Exception:
         raise
 
-    raise _streaming_module._native_stream_incomplete_exception(
+    raise _native_stream_incomplete_exception(
         request_data,
         buffered_chunks=len(buffered_chunks),
         selected_deployment_box=selected_deployment_box,
@@ -897,7 +897,7 @@ async def _stream_native_route_recovery_poll_attempt(
             except StopAsyncIteration:
                 next_chunk_task = None
                 if not saw_terminal:
-                    raise _streaming_module._native_stream_incomplete_exception(
+                    raise _native_stream_incomplete_exception(
                         request_data,
                         buffered_chunks=len(buffered_chunks),
                         selected_deployment_box=selected_deployment_box,
@@ -913,7 +913,7 @@ async def _stream_native_route_recovery_poll_attempt(
                         chunk = completed_task.result()
                     except StopAsyncIteration:
                         if not saw_terminal:
-                            raise _streaming_module._native_stream_incomplete_exception(
+                            raise _native_stream_incomplete_exception(
                                 request_data,
                                 buffered_chunks=len(buffered_chunks),
                                 selected_deployment_box=selected_deployment_box,
@@ -940,7 +940,7 @@ async def _stream_native_route_recovery_poll_attempt(
                         selected_deployment_box=selected_deployment_box,
                     ) from None
                 else:
-                    yield _streaming_module._route_recovery_sse_keepalive(
+                    yield _route_recovery_sse_keepalive(
                         attempt,
                         request_data=request_data,
                         phase="attempt",
@@ -971,7 +971,7 @@ async def _stream_native_route_recovery_poll_attempt(
                 raise chunk_exception
 
             buffered_chunks.append(chunk)
-            saw_terminal = saw_terminal or _streaming_module._native_stream_chunk_is_terminal(
+            saw_terminal = saw_terminal or _native_stream_chunk_is_terminal(
                 chunk,
                 request_data,
                 finished_choice_indices,
@@ -1169,13 +1169,13 @@ async def _yield_downstream_keepalive_stream(
                         idle_seconds=no_progress_seconds,
                         saw_chunk=True,
                     ) from None
-                yield _streaming_module._stream_keepalive_chunk(request_data, sequence)
+                yield _stream_keepalive_chunk(request_data, sequence)
                 continue
             if kind == "end":
                 return
             if kind == "error":
                 raise payload
-            if not _is_stream_keepalive_chunk(payload) and not _streaming_module._is_route_recovery_sse_keepalive(payload):
+            if not _is_stream_keepalive_chunk(payload) and not _is_route_recovery_sse_keepalive(payload):
                 last_progress_at = time.monotonic()
             yield payload
     finally:
@@ -1201,7 +1201,7 @@ async def _sleep_route_recovery_poll_interval(
         return
     if delay_seconds < _streaming_module._ROUTE_RECOVERY_SSE_KEEPALIVE_MIN_DELAY_SECONDS:
         if emit_for_short_delay:
-            yield _streaming_module._route_recovery_sse_keepalive(
+            yield _route_recovery_sse_keepalive(
                 attempt,
                 request_data=request_data,
                 phase=phase,
@@ -1211,7 +1211,7 @@ async def _sleep_route_recovery_poll_interval(
 
     remaining = delay_seconds
     while remaining > 0:
-        yield _streaming_module._route_recovery_sse_keepalive(
+        yield _route_recovery_sse_keepalive(
             attempt,
             request_data=request_data,
             phase=phase,
@@ -1255,7 +1255,7 @@ async def _stream_route_recovery_poll(
         # Establish every supported stream immediately while the first
         # upstream probe is pending.  Without this event a quiet offline
         # interval is indistinguishable from a failed request to the client.
-        yield _streaming_module._route_recovery_sse_keepalive(
+        yield _route_recovery_sse_keepalive(
             0,
             request_data=request_data,
             phase="network",
@@ -1288,7 +1288,7 @@ async def _stream_route_recovery_poll(
 
     try:
         while True:
-            cooldown_wait = _streaming_module._route_recovery_poll_cooldown_wait(
+            cooldown_wait = _route_recovery_poll_cooldown_wait(
                 request_data,
                 ignore_constraints=ignore_local_constraints,
             )
@@ -1307,7 +1307,7 @@ async def _stream_route_recovery_poll(
                     )
                     break
                 cooldown_until = cooldown_wait["cooldown_until"]
-                delay_seconds = _streaming_module._route_recovery_cooldown_wait_delay(
+                delay_seconds = _route_recovery_cooldown_wait_delay(
                     cooldown_until,
                     poll_interval_seconds=poll_interval_seconds,
                     deadline=deadline,
@@ -1337,7 +1337,7 @@ async def _stream_route_recovery_poll(
                 if new_recovery_state_key and new_recovery_state_key != recovery_state_key:
                     _streaming_module._route_recovery_state_remove(recovery_state_key)
                     recovery_state_key = new_recovery_state_key
-                async for keepalive in _streaming_module._sleep_route_recovery_poll_interval(
+                async for keepalive in _sleep_route_recovery_poll_interval(
                     delay_seconds,
                     attempt=attempt,
                     request_data=request_data,
@@ -1412,7 +1412,7 @@ async def _stream_route_recovery_poll(
                 except Exception:
                     llm_router = None
                 if llm_router is not None:
-                    forced_target_order = _streaming_module._route_recovery_next_poll_order(
+                    forced_target_order = _route_recovery_next_poll_order(
                         llm_router,
                         request_data,
                         last_exception,
@@ -1424,7 +1424,7 @@ async def _stream_route_recovery_poll(
                     excluded_deployment_ids=previous_excluded_ids,
                     exception=_routing_module._trace_exception(last_exception),
                 )
-            _streaming_module._reset_route_exhaustion_retry_state(
+            _reset_route_exhaustion_retry_state(
                 request_data,
                 last_exception,
                 preserve_failed_deployment=(
@@ -1494,7 +1494,7 @@ async def _stream_route_recovery_poll(
                     attempt=attempt,
                     deadline=deadline,
                 ):
-                    if _streaming_module._is_route_recovery_sse_keepalive(chunk):
+                    if _is_route_recovery_sse_keepalive(chunk):
                         yield chunk
                         continue
                     yielded = True
@@ -1544,7 +1544,7 @@ async def _stream_route_recovery_poll(
                         ),
                         exception=_routing_module._trace_exception(last_exception),
                     )
-                elif not _streaming_module._route_recovery_poll_keep_going(last_exception):
+                elif not _route_recovery_poll_keep_going(last_exception):
                     _trace_module._request_route_trace(
                         "route_recovery_poll_terminal_error", request_data,
                         poll_attempt=attempt,
@@ -1576,7 +1576,7 @@ async def _stream_route_recovery_poll(
                         ),
                         exception=_routing_module._trace_exception(last_exception),
                     )
-                elif not _streaming_module._route_recovery_poll_keep_going(poll_exception):
+                elif not _route_recovery_poll_keep_going(poll_exception):
                     last_exception = poll_exception
                     _trace_module._request_route_trace(
                         "route_recovery_poll_terminal_error", request_data,
@@ -1665,7 +1665,7 @@ async def _stream_route_recovery_poll(
             if new_recovery_state_key and new_recovery_state_key != recovery_state_key:
                 _streaming_module._route_recovery_state_remove(recovery_state_key)
                 recovery_state_key = new_recovery_state_key
-            async for keepalive in _streaming_module._sleep_route_recovery_poll_interval(
+            async for keepalive in _sleep_route_recovery_poll_interval(
                 delay_seconds,
                 attempt=attempt,
                 request_data=request_data,
@@ -1791,11 +1791,6 @@ def _route_recovery_poll_configured_deployment_ids(request_data: dict) -> set[st
     except Exception:
         return set()
 
-
-def _route_recovery_poll_has_no_available_deployments(request_data: dict) -> bool:
-    """Compatibility predicate for callers that only need the cooling state."""
-
-    return _streaming_module._route_recovery_poll_cooldown_wait(request_data) is not None
 
 def _route_recovery_cooldown_wait_delay(
     cooldown_until: float,

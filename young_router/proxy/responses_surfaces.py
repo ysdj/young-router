@@ -1554,10 +1554,6 @@ def _responses_chat_bridge_empty_success_exception(request_kwargs: dict) -> Exce
         exception.status_code = 503  # type: ignore[attr-defined]
     except Exception:
         pass
-    try:
-        exception.responses_chat_bridge_empty = True  # type: ignore[attr-defined]
-    except Exception:
-        pass
     _routing_module._mark_exception_for_deployment_failover(exception, request_kwargs)
     return exception
 

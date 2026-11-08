@@ -8827,10 +8827,6 @@ def _sanitized_upstream_route_exception(
             setattr(sanitized, attr, value)
         except Exception:
             pass
-    try:
-        sanitized.original_exception_class = type(exception).__name__  # type: ignore[attr-defined]
-    except Exception:
-        pass
     return sanitized
 
 

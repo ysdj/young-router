@@ -21,7 +21,7 @@ Three boundaries this module keeps:
   it changes the bytes the client will send forever after.  Only the mutable
   suffix is rewritten, so a task on a signed-history route keeps its cache.
 * **A removed image stays recoverable.**  Every id this module omits can be
-  served from the task's own replayed history (``image_for_turn``), and the
+  served from the task's own replayed history (``store.fetched``), and the
   scanned items carry the bytes, so the fetch tool never reads a transcript,
   never opens a path, and never needs the client's filesystem.
 * **Selection is read, never written.**  The state file is Context Attachment
@@ -1916,38 +1916,3 @@ def _trace(
 
 
 CODEX_IMAGE_CONTEXT_REQUEST_STEPS = (_with_codex_image_context,)
-
-
-# --------------------------------------------------------------------------
-# The fetch side: what the model's own tool answers with
-# --------------------------------------------------------------------------
-
-
-def image_for_turn(
-    request_kwargs: Mapping[str, Any],
-    ids: List[str],
-) -> List[Tuple[str, Optional[str], Optional[str]]]:
-    """Resolve placeholder ids against the replay that is being served.
-
-    Returns one ``(id, mime, data_url)`` per requested id, with ``None`` for a
-    data URL the replay no longer carries -- which is what a session looks like
-    after the client compacted the image away.  The bytes come from the request
-    itself, so this never reads a transcript, a path, or the client's
-    filesystem.
-    """
-
-    wanted = [value.strip().upper() for value in ids if isinstance(value, str)]
-    index: Dict[str, _Found] = {}
-    for image in scan(request_kwargs.get("input")):
-        index[image.image_id or ""] = image
-    resolved: List[Tuple[str, Optional[str], Optional[str]]] = []
-    for value in wanted:
-        image = index.get(value)
-        if image is None or not isinstance(image.mime, str):
-            resolved.append((value, None, None))
-            continue
-        encoded = base64.b64encode(image.raw).decode("ascii")
-        resolved.append((value, image.mime, f"data:{image.mime};base64,{encoded}"))
-    return resolved
-
-
