@@ -1675,6 +1675,12 @@ class HookResponsesToolBridgeTests(HookTestCase):
                     "summary": [
                         {"type": "summary_text", "text": "Let me check the current"}
                     ],
+                    # The same thinking on the field the next replay is read
+                    # from: a client stores what it was given, and replays it
+                    # verbatim on the following turn.
+                    "content": [
+                        {"type": "reasoning_text", "text": "Let me check the current"}
+                    ],
                 },
                 {
                     "id": "call_1",

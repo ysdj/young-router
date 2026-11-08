@@ -1039,6 +1039,9 @@ class HookStreamingTimeoutTests(HookTestCase):
                         "type": "reasoning",
                         "status": "in_progress",
                         "summary": [],
+                        # The thinking rides the field the next replay is read
+                        # from; the summary channel stays untouched.
+                        "content": [{"type": "reasoning_text", "text": "private"}],
                     },
                 },
                 {
@@ -1085,6 +1088,10 @@ class HookStreamingTimeoutTests(HookTestCase):
                                 "text": "Verifying tool choice compatibility in auto mode",
                             }
                         ],
+                        # The thinking also rides the field the next replay is
+                        # read from, so the client's stored item is accepted
+                        # back on the following turn.
+                        "content": [{"type": "reasoning_text", "text": "private"}],
                         "encrypted_content": "opaque-signed-reasoning",
                     },
                 },
@@ -1103,6 +1110,9 @@ class HookStreamingTimeoutTests(HookTestCase):
                                         "type": "summary_text",
                                         "text": "Verifying tool choice compatibility in auto mode",
                                     }
+                                ],
+                                "content": [
+                                    {"type": "reasoning_text", "text": "private"}
                                 ],
                                 "encrypted_content": "opaque-signed-reasoning",
                             },

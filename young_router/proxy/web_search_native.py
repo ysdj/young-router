@@ -1568,13 +1568,80 @@ def _public_reasoning_is_allowed(request_kwargs: Optional[dict]) -> bool:
     summary = _requested_reasoning_summary(request_kwargs)
     return summary is not None and summary not in _REASONING_SUMMARY_OFF_VALUES
 
+def _summary_only_thinking_text(item: Any) -> Optional[str]:
+    """The thinking a reasoning item publishes as a summary, if it has one."""
+
+    summary = item.get("summary") if isinstance(item, dict) else None
+    if not isinstance(summary, list):
+        return None
+    for part in summary:
+        if not isinstance(part, dict):
+            continue
+        for field in ("text", "summary_text"):
+            text = part.get(field)
+            if isinstance(text, str) and text.strip():
+                return text
+    return None
+
+
 def _sanitize_reasoning_output_item(item: Any) -> Optional[Any]:
-    """Keep the public summary and opaque replay token, never raw reasoning."""
+    """Give a reasoning item the thinking text its replay needs.
+
+    This used to strip ``content`` so the raw reasoning never left the proxy,
+    and the strip was what broke the next turn: a client replays exactly what
+    it was given, so it replayed a ``summary`` with no ``content``, and the
+    thinking-mode wire reads ``content[].reasoning_text`` and nothing else.
+    Measured on api.deepseek.com with a tool declaration: that replay answers
+    400, and the same text on that one field answers 200.  The refusal was
+    therefore ours to avoid, not the client's to repair.
+
+    So the text moves *onto* the field instead of out of the item.  The
+    summary (and the opaque blob, and the item's identity) stay as they are,
+    which is what a client renders and what it stores; ``content`` is the
+    replay channel, and it now carries the words that produced the turn.
+
+    A provider that supplies raw reasoning without a summary gets one derived
+    from its ``content`` parts, so a client that renders summaries still shows
+    something.
+    """
     if not isinstance(item, dict) or item.get("type") != "reasoning":
         return None
-    if "content" not in item:
-        return item
     clean_item = copy.deepcopy(item)
+    parts = clean_item.get("content")
+    if not isinstance(parts, list) or not parts:
+        # The route published its thinking as a summary only, which is the
+        # shape a client replays and the wire refuses.  The text is already
+        # here; put it where the replay reads it.
+        summary_text = _summary_only_thinking_text(clean_item)
+        if summary_text:
+            # Summary only, which is the shape a client replays and the wire
+            # refuses: the text is already here, put it where the replay reads
+            # it.  The summary itself is left as it is.
+            clean_item["content"] = [
+                {"type": "reasoning_text", "text": summary_text}
+            ]
+            return clean_item
+        clean_item.pop("content", None)
+        return clean_item
+    readable: list[Any] = []
+    if isinstance(parts, list):
+        readable = [
+            part
+            for part in parts
+            if isinstance(part, dict)
+            and part.get("type") == "reasoning_text"
+            and isinstance(part.get("text"), str)
+            and part["text"]
+        ]
+    if readable:
+        # The item's own summary stays exactly as the route wrote it: at the
+        # opening frame it is still empty and arrives later as its own deltas,
+        # so anything written here would preempt that channel and leak the raw
+        # text into the view the client renders.
+        clean_item["content"] = readable
+        return clean_item
+    # Nothing to replay through ``content``: dropping a blank one says the same
+    # thing without claiming thinking text the provider never wrote.
     clean_item.pop("content", None)
     return clean_item
 

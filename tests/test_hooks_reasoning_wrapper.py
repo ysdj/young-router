@@ -223,14 +223,23 @@ class HookReasoningWrapperTests(HookTestCase):
         # ``summary: "auto"`` asks for the thinking (it is what pi sends), so
         # the summary frame and the item that carries it are delivered.
         asked_for_summary = {"reasoning": {"effort": "high", "summary": "auto"}}
+        # The delivered reasoning item carries the thinking on the field the
+        # next replay is read from, so what the client stores is accepted back.
+        # Everything else about the item is untouched.
         self.assertEqual(
             hooks._sanitize_web_search_stream_chunk(chunk, asked_for_summary),
             chunk,
         )
+        done = hooks._sanitize_web_search_stream_chunk(done_chunk, asked_for_summary)
         self.assertEqual(
-            hooks._sanitize_web_search_stream_chunk(done_chunk, asked_for_summary),
-            done_chunk,
+            done["item"]["content"],
+            [{"type": "reasoning_text", "text": "We need inspect the state."}],
         )
+        self.assertEqual(
+            done["item"]["summary"],
+            [{"type": "summary_text", "text": "We need inspect the state."}],
+        )
+        self.assertEqual(done["item"]["id"], "rs_1")
         named = hooks._sanitize_response_stream_payload(
             response,
             asked_for_summary,
@@ -406,6 +415,55 @@ class HookReasoningWrapperTests(HookTestCase):
 
         self.assertEqual(delivered_payload["delta"], LEAKED_TAIL)
         self.assertEqual(delivered_payload["item_id"], "item_1")
+
+    def test_delivered_thinking_is_replayable_as_it_stands(self) -> None:
+        """What the client stores has to be what the wire will accept back.
+
+        The sanitizer used to strip ``content`` so raw reasoning never left the
+        proxy, and the strip was the refusal: a client replays exactly what it
+        was given, so it replayed a summary with no content, while the
+        thinking-mode wire reads ``content[].reasoning_text`` and nothing else.
+        Measured on api.deepseek.com with a tool declaration: that replay
+        answers 400, and the same words on that one field answer 200.
+
+        The text is moved onto the field rather than out of the item, so the
+        summary, the blob and the identity all still reach the client.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        request_data = {
+            "model": "default-chat",
+            "input": "go",
+            "reasoning": {"effort": "high", "summary": "auto"},
+        }
+        thinking = "I should run ls before answering."
+        payload = {
+            "id": "resp_1",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "item_reasoning",
+                    "summary": [{"type": "summary_text", "text": thinking}],
+                    "encrypted_content": "opaque-blob",
+                }
+            ],
+        }
+
+        sanitized = hooks._sanitize_response_stream_payload(payload, request_data)
+        item = sanitized["output"][0]
+
+        self.assertEqual(
+            [{"type": "reasoning_text", "text": thinking}], item["content"]
+        )
+        # Nothing else about the item moved: the client still renders the
+        # summary and still stores the replay token and the id.
+        self.assertEqual(
+            [{"type": "summary_text", "text": thinking}], item["summary"]
+        )
+        self.assertEqual("opaque-blob", item["encrypted_content"])
+        self.assertEqual("item_reasoning", item["id"])
 
     def test_whole_response_sanitizer_preserves_the_item_identity(self) -> None:
         hooks, _proxy_server = load_hook_module()
