@@ -2754,6 +2754,41 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("footerExact", self.ui)
         self.assertNotIn('exact={route === "providers-models"}', self.ui)
 
+    def test_only_the_page_host_offers_a_sign_out(self) -> None:
+        # 退出登录 belongs to the host that signed in with a key, which is the
+        # browser page: its session is a 30-day cookie, so the way out is a
+        # control rather than closing the tab.  The desktop hosts hold their
+        # lease in the memory of a process a person quits, so they leave the
+        # capability undefined and the shell draws nothing -- a switch nobody
+        # can honour is worse than no switch (AGENTS.md).
+        self.assertIn('if (!native.signOutWebSession) return null;', self.ui)
+        self.assertIn('symbol="power-off"', self.ui)
+        self.assertIn('translate("status.signOut")', self.ui)
+        # The pane's staged edit is committed the same way leaving it commits
+        # it, before the session ends: signing out is leaving this page.
+        self.assertIn('await flushActivePane.current?.("navigate");', self.ui)
+        self.assertIn('await native.signOutWebSession?.();', self.ui)
+        # Both layouts draw it: the sidebar's bottom and, in one column, the
+        # header beside the pane title.
+        shell = self.ui.split("function SettingsShell(", 1)[1].split("function RouteSurface(", 1)[0]
+        self.assertEqual(2, shell.count("<SignOutControl"))
+        self.assertIn('<Text numberOfLines={1} style={styles.settingsSidebarTitle}>{translate("app.title")}</Text>', shell)
+        # The page is the one host that answers it, and Core's own route is what
+        # it answers with.
+        browser_leaf = (ROOT / "rn/packages/shared/src/platform/browserLeaf.ts").read_text(encoding="utf-8")
+        self.assertIn('signOutWebSession: isOwnerPage() ? undefined : () => core.signOut()', browser_leaf)
+        # The owner's own page is signed in by Core without a key, so a sign-out
+        # there would reload straight back into a new session and read as a
+        # button that did nothing.  The address rule is the gate's own.
+        self.assertIn('function isOwnerPage(): boolean {', browser_leaf)
+        self.assertIn('return name === "127.0.0.1" || name === "::1" || name === "localhost";', browser_leaf)
+        self.assertIn('fetch(`${transport.baseURL}/ipc/web/logout`', browser_leaf)
+        self.assertIn('signOutWebSession: bridge.signOutWebSession ? () => bridge.signOutWebSession!() : undefined,', (ROOT / "rn/packages/shared/src/platform/nativeBridge.ts").read_text(encoding="utf-8"))
+        # The word is in both languages, and the Chinese one is a verb a person
+        # recognises instead of a protocol value.
+        self.assertIn('"status.signOut": "Sign Out",', (ROOT / "rn/packages/shared/src/i18n/en.ts").read_text(encoding="utf-8"))
+        self.assertIn('"status.signOut": "退出登录",', (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8"))
+
     def test_application_fonts_use_medium_size_with_smaller_form_tips(self) -> None:
         typography = TYPOGRAPHY.read_text(encoding="utf-8")
         relay = RELAY_MANAGER.read_text(encoding="utf-8")

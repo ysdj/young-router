@@ -166,6 +166,12 @@ export interface NativeLeafBridge {
   pendingFileEditorTarget?(): string;
   setLocalization(strings: NativeLocalization): void;
   setShortcuts(shortcuts: Record<string, string>): void;
+  /**
+   * End this page's own session.  Present only on a host that signed in with
+   * something a person typed — the browser page — so its absence is what keeps
+   * a desktop window from drawing a 退出登录 it has no session behind.
+   */
+  signOutWebSession?(): Promise<void>;
 }
 
 function parseJson<T>(json: string, label: string): T {
@@ -257,5 +263,6 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
     pendingFileEditorTarget: bridge.pendingFileEditorTarget ? () => bridge.pendingFileEditorTarget!() : undefined,
     setLocalization: (strings) => bridge.setLocalization(strings),
     setShortcuts: (shortcuts) => bridge.setShortcuts(shortcuts),
+    signOutWebSession: bridge.signOutWebSession ? () => bridge.signOutWebSession!() : undefined,
   };
 }

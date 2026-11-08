@@ -1058,6 +1058,14 @@ export interface NativeLeafAdapter {
   pendingFileEditorTarget?(): string;
   setLocalization(strings: NativeLocalization): void;
   setShortcuts(shortcuts: Record<string, string>): void;
+  /**
+   * End this page's own session.
+   *
+   * Only the browser host has one to end: the desktop hosts hold their lease
+   * in memory, inside a process a person quits rather than signs out of, so
+   * they leave this undefined and the settings shell draws no 退出登录 for them.
+   */
+  signOutWebSession?(): Promise<void>;
 }
 
 /** The triggering control's window-local rectangle, in React Native DIPs. */

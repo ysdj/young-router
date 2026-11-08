@@ -129,9 +129,10 @@ class CoreProtocolTests(unittest.TestCase):
                 events.append(f"{self._name}.stop")
 
         class FakeServer:
-            def __init__(self, _core: object, *, address: str, port: int) -> None:
+            def __init__(self, _core: object, *, address: str, port: int, web_sessions_path: object = None) -> None:
                 self.address = address
                 self.port = port
+                self.web_sessions_path = web_sessions_path
 
             def start(self) -> None:
                 events.append("server.start")
@@ -215,9 +216,10 @@ class CoreProtocolTests(unittest.TestCase):
                     pass
 
             class FakeServer:
-                def __init__(self, _core: object, *, address: str, port: int) -> None:
+                def __init__(self, _core: object, *, address: str, port: int, web_sessions_path: object = None) -> None:
                     self.address = address
                     self.port = port
+                    self.web_sessions_path = web_sessions_path
 
                 def start(self) -> None:
                     started.append("server")

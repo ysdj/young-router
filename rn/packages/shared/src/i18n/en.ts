@@ -21,6 +21,7 @@ export const en: Record<TranslationKey, string> = {
   "status.version": "Version Information",
   "status.about": "About",
   "status.quit": "Quit Young Router",
+  "status.signOut": "Sign Out",
   "language.auto": "Auto",
   "language.english": "English",
   "language.simplified_chinese": "简体中文",

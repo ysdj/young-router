@@ -148,6 +148,24 @@ def _packaged_web_host() -> Path | None:
     return candidate if (candidate / "index.html").is_file() else None
 
 
+def _web_session_store_path(args: argparse.Namespace) -> Path:
+    """Where the browser host's 30-day sessions are remembered.
+
+    Beside the Core metadata when the host states one (both native apps do),
+    and in this installation's runtime directory otherwise -- the same place
+    the configuration document lives, so an upgrade that moves this process to
+    a new snapshot still finds the sessions it issued.
+    """
+
+    from .ipc import WEB_SESSION_STORE_FILENAME
+
+    if args.metadata is not None:
+        return Path(args.metadata).expanduser().parent / WEB_SESSION_STORE_FILENAME
+    from .. import config_paths
+
+    return config_paths.runtime_root(args.runtime_root) / config_paths.RUNTIME_DIRECTORY / WEB_SESSION_STORE_FILENAME
+
+
 def _publish_web_url(path: Path | None, url: str) -> None:
     """Keep one small file holding the address a person should open.
 
@@ -195,7 +213,12 @@ def run(argv: list[str] | None = None) -> int:
         runtime_root=args.runtime_root,
         reset_transient_routing_state=True,
     )
-    server = CoreIPCServer(core, address=args.address, port=args.port)
+    server = CoreIPCServer(
+        core,
+        address=args.address,
+        port=args.port,
+        web_sessions_path=_web_session_store_path(args),
+    )
     # The interval loop lives beside the IPC server: it reads the saved switch
     # and interval, so a machine nobody is looking at still syncs.
     webdav_scheduler = core.webdav_scheduler()

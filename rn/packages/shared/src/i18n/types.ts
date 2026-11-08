@@ -22,6 +22,7 @@ export type TranslationKey =
   | "status.version"
   | "status.about"
   | "status.quit"
+  | "status.signOut"
   | "error.renderFaultTitle"
   | "error.renderFaultRetry"
   | "language.auto"

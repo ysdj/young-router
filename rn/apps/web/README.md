@@ -28,7 +28,13 @@ local port. The proxy owns that listener, so it forwards `/ui` (this bundle) and
 - no second port for anyone to remember, and none for a firewall to explain;
 - the session is an `HttpOnly; SameSite=Strict` cookie (`yr-core-session`)
   rather than the header the native hosts use, because page script may read
-  neither that header nor a token in `localStorage`;
+  neither that header nor a token in `localStorage`. It states `Max-Age` for
+  thirty days and Core records the digest beside its metadata, so neither a
+  closed browser nor a replaced Core (a deploy, or the app's own restart)
+  turns a signed-in page back into the key form; **退出登录**, at the bottom of
+  the sidebar, ends the lease and its record and reloads onto the gate.
+  `Secure` is added when the request reached Core over TLS, which the proxy
+  states on the hop it forwards;
 - the sign-in key is `YOUNG_ROUTER_WEB_PASSWORD`, generated on first use and
   editable only in the app's General pane, which reads it over the same
   plaintext lease as the proxy key.

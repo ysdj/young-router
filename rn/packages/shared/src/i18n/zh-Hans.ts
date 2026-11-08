@@ -21,6 +21,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "status.version": "版本信息",
   "status.about": "关于",
   "status.quit": "退出漾路由",
+  "status.signOut": "退出登录",
   "language.auto": "自动",
   "language.english": "English",
   "language.simplified_chinese": "简体中文",

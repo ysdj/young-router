@@ -55,6 +55,20 @@ export type BrowserCoreTransport = {
 let rememberedSession: string | undefined;
 
 /**
+ * Whether this document is the machine owner's own page.
+ *
+ * The same address rule Core's gate uses: a loopback name is the owner's door,
+ * so the page is served without a key and a session is minted for it.  A page
+ * reached under any other name is published, which is where the key is typed
+ * and therefore the only place 退出登录 has something to end.
+ */
+function isOwnerPage(): boolean {
+  if (typeof window === "undefined") return false;
+  const name = (window.location.hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
+  return name === "127.0.0.1" || name === "::1" || name === "localhost";
+}
+
+/**
  * The browser cannot read `X-LiteLLM-Core-Session`, so Core hands it the same
  * lease as an `HttpOnly` cookie. That cookie is the real credential and every
  * request carries it; the remembered value above is only what this document
@@ -94,6 +108,12 @@ async function hello(transport: BrowserCoreTransport): Promise<string> {
 export type BrowserCoreBridge = NativeIpcBridge & {
   hostRoute(path: string, body: Record<string, unknown>): Promise<Record<string, unknown>>;
   request(method: string, params?: Record<string, unknown>): string;
+  /**
+   * End this page's session: Core drops the lease the cookie names, answers
+   * with a cookie the browser must not keep, and the page is reloaded onto its
+   * own sign-in gate.
+   */
+  signOut(): Promise<void>;
 };
 
 export function createBrowserIpcBridge(transport: BrowserCoreTransport): BrowserCoreBridge {
@@ -180,6 +200,36 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
     return JSON.parse(text) as Record<string, unknown>;
   };
 
+  /**
+   * Sign this page out.
+   *
+   * The cookie is the only credential this host has, so signing out is Core
+   * ending the lease that cookie names and answering with one the browser must
+   * not keep.  The reload is the second half and is not optional: the shell on
+   * screen was drawn from a session that no longer exists, and asking Core for
+   * the page again is what draws the gate.
+   *
+   * It goes through `fetch` rather than `call` because `call` first establishes
+   * a session, which is exactly the work signing out must not do.  A failure is
+   * not a reason to stay: a Core that cannot answer is not a page that is still
+   * signed in.
+   */
+  const signOut = async (): Promise<void> => {
+    try {
+      await fetch(`${transport.baseURL}/ipc/web/logout`, {
+        method: "POST",
+        body: "{}",
+        credentials: "include",
+        cache: "no-store",
+        headers: { "Content-Type": "application/json" },
+      });
+    } catch {
+      // The reload below is the honest answer either way.
+    } finally {
+      window.location.reload();
+    }
+  };
+
   const subscribe = (listener: (event: string) => void): (() => void) => {
     let cancelled = false;
     let subscription: string | undefined;
@@ -261,7 +311,7 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
     };
   };
 
-  return { send, subscribe: sharedSubscribe, hostRoute, request };
+  return { send, subscribe: sharedSubscribe, hostRoute, request, signOut };
 }
 
 /** The service state in the app's words, as the title bar states it. */
@@ -657,6 +707,13 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
     },
     versionInfo: async () => ({ app: "web", litellm: "" }),
     openExternalURL: (url) => { window.open(url, "_blank", "noopener"); },
+    // This host is the one that signs in with a key, so it is the one host with
+    // a session to end.  A native host leaves this undefined -- its lease is
+    // this process's memory and ends with the app -- and so does the owner's
+    // own page: Core signs a loopback page in without a key, so signing out of
+    // it would reload into a fresh session and read as a button that did
+    // nothing.
+    signOutWebSession: isOwnerPage() ? undefined : () => core.signOut(),
     setLocalization: (next) => { strings = next; },
     setShortcuts: () => undefined,
   };

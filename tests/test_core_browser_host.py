@@ -19,15 +19,28 @@ import http.client
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 import urllib.error
 import urllib.request
 
 from young_router.core import CoreIPCServer, CoreStore, IPCError, MemoryDomain
+from young_router.core import __main__ as core_main
 from young_router.core.domains.runtime import RuntimeSettingsDomain, WEB_PASSWORD_SETTING
+from young_router.core.ipc import (
+    SESSION_TOKEN_TTL_SECONDS,
+    WEB_SESSION_STORE_FILENAME,
+    browser_session_digest,
+)
 
 
-def _hello(server: CoreIPCServer, *, bootstrap: str | None = None, cookie: str | None = None) -> tuple[int, dict[str, str], bytes]:
+def _hello(
+    server: CoreIPCServer,
+    *,
+    bootstrap: str | None = None,
+    cookie: str | None = None,
+    forwarded_proto: str | None = None,
+) -> tuple[int, dict[str, str], bytes]:
     endpoint = server.endpoint
     connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=5)
     headers = {"Content-Type": "application/json"}
@@ -35,6 +48,9 @@ def _hello(server: CoreIPCServer, *, bootstrap: str | None = None, cookie: str |
         headers["Authorization"] = f"Bearer {bootstrap}"
     if cookie is not None:
         headers["Cookie"] = cookie
+    if forwarded_proto is not None:
+        # What the proxy states about the hop the browser used.
+        headers["X-Forwarded-Proto"] = forwarded_proto
     try:
         connection.request("POST", "/ipc/hello", body=b"{}", headers=headers)
         response = connection.getresponse()
@@ -61,9 +77,22 @@ class BrowserSessionTests(unittest.TestCase):
         self.assertIn("HttpOnly", cookie)
         self.assertIn("SameSite=Strict", cookie)
         self.assertIn("Path=/", cookie)
-        # A browser session must not outlive the browser, exactly like the
-        # native hosts' in-memory lease.
-        self.assertNotIn("Max-Age", cookie)
+        # A page's lease is thirty days: a person who typed the key once keeps
+        # the page, across a closed browser and across a replaced Core.
+        self.assertIn(f"Max-Age={30 * 24 * 60 * 60}", cookie)
+        # A loopback page is plain http, so a `Secure` cookie there would never
+        # come back.
+        self.assertNotIn("Secure", cookie)
+
+    def test_a_published_page_gets_a_secure_cookie(self) -> None:
+        # The proxy forwards the scheme the browser used, and a page reached
+        # over TLS must not hand its 30-day cookie to a plaintext hop.
+        _status, headers, _body = _hello(
+            self.server,
+            forwarded_proto="https",
+            bootstrap=self.server.bootstrap_token,
+        )
+        self.assertIn("Secure", headers.get("set-cookie", ""))
 
     def test_a_cookie_alone_authenticates_a_request(self) -> None:
         _status, headers, _body = _hello(self.server, bootstrap=self.server.bootstrap_token)
@@ -128,6 +157,153 @@ class BrowserSessionTests(unittest.TestCase):
         from young_router.core.ipc import BROWSER_SESSION_COOKIE
 
         self.assertEqual("yr-core-session", BROWSER_SESSION_COOKIE)
+
+
+class BrowserSessionLifetimeTests(unittest.TestCase):
+    """What keeps a page signed in, and what a person's sign-out means.
+
+    Two failures this pins down, both seen on a hosted install: the browser's
+    cookie was a session cookie, so closing the browser was a sign-out; and the
+    lease lived only in the process, so every deploy -- which replaces Core --
+    put the password form in front of a person whose key had never been wrong.
+    """
+
+    def setUp(self) -> None:
+        self.core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.sessions = self.root / WEB_SESSION_STORE_FILENAME
+        self.bundle = self.root / "web"
+        self.bundle.mkdir()
+        (self.bundle / "index.html").write_text(
+            '<!doctype html><title>Young Router</title><script src="/bundle.js"></script>\n',
+            encoding="utf-8",
+        )
+        (self.bundle / "bundle.js").write_text("export {};\n", encoding="utf-8")
+        self.server = self._start()
+
+    def _start(self) -> CoreIPCServer:
+        server = CoreIPCServer(self.core, web_sessions_path=self.sessions)
+        server.start()
+        self.addCleanup(server.stop)
+        server.enable_web_host(self.bundle, password="s3cret-word")
+        return server
+
+    def _replacement(self) -> CoreIPCServer:
+        """A Core the way a deploy or an app restart leaves one: no sessions."""
+
+        self.server.stop()
+        self.server = self._start()
+        return self.server
+
+    def _page(self, server: CoreIPCServer, cookie: str) -> str:
+        # A published name, so the page is gated: a loopback page is the
+        # owner's own and never asks for a key.
+        status, _headers, body = _get(server, "/", cookie=cookie, page_host="router.example.com")
+        self.assertEqual(200, status)
+        return body.decode("utf-8")
+
+    def test_a_page_stays_signed_in_across_a_replaced_core(self) -> None:
+        cookie = _login(self.server, "s3cret-word")
+        server = self._replacement()
+
+        # A reload after the deploy: the cookie is the only credential there is.
+        text = self._page(server, cookie)
+        self.assertIn("bundle.js", text)
+        self.assertNotIn('type="password"', text)
+        # The pane's own calls accept it too, or the shell would draw empty.
+        self.assertEqual(200, _hello(server, cookie=cookie)[0])
+        self.assertEqual(200, _post_snapshot(server, cookie)[0])
+
+    def test_the_record_is_a_digest_and_does_not_grow_per_call(self) -> None:
+        cookie = _login(self.server, "s3cret-word")
+        token = cookie.split("=", 1)[1]
+        payload = json.loads(self.sessions.read_text(encoding="utf-8"))
+        self.assertNotIn(token, self.sessions.read_text(encoding="utf-8"))
+        self.assertEqual(1, len(payload["sessions"]))
+        self.assertEqual(browser_session_digest(token), payload["sessions"][0]["digest"])
+        # A lease renewed by ordinary use must not add a record per request.
+        for _ in range(3):
+            self.assertEqual(200, _hello(self.server, cookie=cookie)[0])
+        self.assertEqual(1, len(json.loads(self.sessions.read_text(encoding="utf-8"))["sessions"]))
+
+    def test_a_cookie_no_record_names_is_the_gate_again(self) -> None:
+        cookie = _login(self.server, "s3cret-word")
+        self.sessions.unlink()
+        server = self._replacement()
+        self.assertIn('type="password"', self._page(server, cookie))
+        self.assertEqual(401, _hello(server, cookie=cookie)[0])
+
+    def test_an_expired_record_is_not_resumed(self) -> None:
+        cookie = _login(self.server, "s3cret-word")
+        payload = json.loads(self.sessions.read_text(encoding="utf-8"))
+        payload["sessions"][0]["expires_at"] = int(time.time()) - 60
+        self.sessions.write_text(json.dumps(payload), encoding="utf-8")
+        server = self._replacement()
+        self.assertIn('type="password"', self._page(server, cookie))
+        self.assertEqual(401, _hello(server, cookie=cookie)[0])
+
+    def test_signing_out_ends_the_lease_the_cookie_and_the_record(self) -> None:
+        cookie = _login(self.server, "s3cret-word")
+        status, headers, body = _logout(self.server, cookie)
+        self.assertEqual(200, status)
+        self.assertTrue(json.loads(body)["ok"])
+        # The browser is told to delete the cookie it is holding.
+        answer = headers.get("set-cookie", "")
+        self.assertIn("yr-core-session=;", answer)
+        self.assertIn("Max-Age=0", answer)
+        # The page it reloads is the gate, and its `/ipc` calls are refused.
+        self.assertIn('type="password"', self._page(self.server, cookie))
+        self.assertEqual(401, _hello(self.server, cookie=cookie)[0])
+        # A copied cookie does not come back after a restart either: the record
+        # it would have been resumed from is gone.
+        server = self._replacement()
+        self.assertIn('type="password"', self._page(server, cookie))
+        self.assertEqual([], json.loads(self.sessions.read_text(encoding="utf-8"))["sessions"])
+
+    def test_signing_out_twice_is_still_signed_out(self) -> None:
+        cookie = _login(self.server, "s3cret-word")
+        self.assertEqual(200, _logout(self.server, cookie)[0])
+        self.assertEqual(200, _logout(self.server, cookie)[0])
+
+    def test_a_native_host_keeps_its_thirty_minute_lease(self) -> None:
+        _status, headers, _body = _hello(self.server, bootstrap=self.server.bootstrap_token)
+        session = headers["x-litellm-core-session"]
+        with self.server._lock:
+            lease = self.server._sessions[session]
+            self.assertFalse(lease.browser)
+            self.assertLessEqual(lease.expires_at - time.monotonic(), SESSION_TOKEN_TTL_SECONDS)
+            self.assertEqual({}, self.server._web_sessions)
+        # Nothing about a native host's lease is written down: it is this
+        # process's, and a restart is meant to end it.
+        self.assertFalse(self.sessions.exists())
+
+    def test_both_ttls_survive_a_restart_in_their_own_way(self) -> None:
+        # The page's lease is the recorded one; the native lease is not, because
+        # it never was: a replaced Core answers a native host's stale token with
+        # 401 and the host mints a new one from its own bootstrap credential.
+        cookie = _login(self.server, "s3cret-word")
+        _status, headers, _body = _hello(self.server, bootstrap=self.server.bootstrap_token)
+        native = headers["x-litellm-core-session"]
+        server = self._replacement()
+        self.assertEqual(200, _hello(server, cookie=cookie)[0])
+        self.assertEqual(401, _post_snapshot(server, f"yr-core-session={native}")[0])
+
+
+class WebSessionStorePathTests(unittest.TestCase):
+    def test_the_record_lives_beside_the_metadata_or_in_the_runtime_root(self) -> None:
+        parser = core_main.build_parser()
+        self.assertEqual(
+            Path("/opt/yr/.litellm-runtime") / WEB_SESSION_STORE_FILENAME,
+            core_main._web_session_store_path(
+                parser.parse_args(["--metadata", "/opt/yr/.litellm-runtime/metadata.json"])
+            ),
+        )
+        self.assertEqual(
+            Path("/srv/example/.litellm-runtime") / WEB_SESSION_STORE_FILENAME,
+            core_main._web_session_store_path(parser.parse_args(["--runtime-root", "/srv/example"])),
+        )
 
 
 class BrowserPageTests(unittest.TestCase):
@@ -1070,6 +1246,41 @@ def _launch_response(server: CoreIPCServer, token: str) -> tuple[int, dict[str, 
             "/ipc/web/launch",
             body=json.dumps({"launch": token}).encode("utf-8"),
             headers={"Content-Type": "application/json", "Host": f"127.0.0.1:{endpoint.port}"},
+        )
+        response = connection.getresponse()
+        return response.status, {key.lower(): value for key, value in response.getheaders()}, response.read()
+    finally:
+        connection.close()
+
+
+def _post_snapshot(server: CoreIPCServer, cookie: str) -> tuple[int, dict[str, object]]:
+    endpoint = server.endpoint
+    connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=5)
+    request = json.dumps(
+        {"protocol_version": 1, "request_id": "web-snapshot", "method": "snapshot", "params": {}}
+    ).encode("utf-8")
+    try:
+        connection.request(
+            "POST",
+            "/ipc",
+            body=request,
+            headers={"Content-Type": "application/json", "Cookie": cookie, "Host": f"127.0.0.1:{endpoint.port}"},
+        )
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+    finally:
+        connection.close()
+
+
+def _logout(server: CoreIPCServer, cookie: str) -> tuple[int, dict[str, str], bytes]:
+    endpoint = server.endpoint
+    connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=5)
+    try:
+        connection.request(
+            "POST",
+            "/ipc/web/logout",
+            body=b"{}",
+            headers={"Content-Type": "application/json", "Cookie": cookie, "Host": f"127.0.0.1:{endpoint.port}"},
         )
         response = connection.getresponse()
         return response.status, {key.lower(): value for key, value in response.getheaders()}, response.read()

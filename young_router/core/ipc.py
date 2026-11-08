@@ -35,6 +35,7 @@ import urllib.error
 import urllib.request
 import uuid
 
+from .persistence import PersistenceError, atomic_write_json, read_json
 from .protocol import (
     MAX_EDITOR_DOCUMENT_BYTES,
     MAX_MESSAGE_BYTES,
@@ -94,6 +95,30 @@ def _encode_response_body(payload: Mapping[str, Any]) -> bytes:
 
 BOOTSTRAP_TOKEN_TTL_SECONDS = 120.0
 SESSION_TOKEN_TTL_SECONDS = 30 * 60.0
+#: How long a browser's page stays signed in.
+#:
+#: A native host renews a 30-minute lease from a process that is already
+#: running.  A page is not that: the browser it lives in gets closed and
+#: reopened, the tab is reloaded, and the Core it talks to is replaced by a
+#: deploy or by the app's own restart -- and every one of those used to end
+#: with the password form in front of a person who had already typed the key.
+#: Thirty days is the lease the cookie states and the lease that is recorded on
+#: disk, so neither the browser closing nor Core being replaced is a sign-out.
+WEB_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60.0
+#: What the cookie's ``Max-Age`` says, in seconds: the same 30 days.
+WEB_SESSION_COOKIE_MAX_AGE_SECONDS = int(WEB_SESSION_TTL_SECONDS)
+#: The file that remembers issued browser sessions across a Core replacement.
+#: It holds digests, never tokens: a reader of the file cannot mint the cookie
+#: it names.
+WEB_SESSION_STORE_FILENAME = "web-sessions.json"
+WEB_SESSION_STORE_VERSION = 1
+#: How many browser sessions one installation remembers.  This is one person's
+#: browser tabs, not a fleet of clients: an unbounded list would only grow.
+MAX_PERSISTED_WEB_SESSIONS = 32
+#: How far a live session's recorded expiry is moved forward at most this
+#: often.  Every authenticated call renews the lease, and a rewrite of the file
+#: on every 25-second event poll would be disk chatter nothing reads.
+WEB_SESSION_PERSIST_INTERVAL_SECONDS = 60 * 60.0
 # The browser host's session travels in this cookie rather than a readable
 # header: page script can neither read ``X-LiteLLM-Core-Session`` nor be given
 # a session it could exfiltrate.  ``SameSite=Strict`` also keeps it out of every
@@ -485,6 +510,22 @@ class _Session:
     token: str
     expires_at: float
     subscriptions: set[str] = field(default_factory=set)
+    #: What this lease renews for.  A native host's is the 30-minute session
+    #: above; a browser page's is ``web_session_ttl_seconds``.
+    ttl_seconds: float = SESSION_TOKEN_TTL_SECONDS
+    #: Whether this is a browser page's lease, which is the one recorded on
+    #: disk instead of living only as long as this process.
+    browser: bool = False
+
+
+def browser_session_digest(token: str) -> str:
+    """The on-disk name of one browser session.
+
+    The cookie is the credential; the file states only what can be checked, so
+    a copy of the file is not a set of usable sessions.
+    """
+
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -631,16 +672,35 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             remaining -= len(chunk)
 
-    def _browser_session_cookie_header(self, session_token: str) -> str:
-        # No ``Max-Age``: the session ends when the browser does, exactly like
-        # the native hosts' in-memory lease.  A renewed session arrives on the
-        # next request and replaces this one.
-        return (
-            f"{BROWSER_SESSION_COOKIE}={session_token}; Path=/; HttpOnly; "
-            "SameSite=Strict"
-        )
+    def _browser_session_cookie_header(self, token: str, *, max_age_seconds: int = WEB_SESSION_COOKIE_MAX_AGE_SECONDS) -> str:
+        # ``Max-Age`` is what makes the page outlive the browser: a session
+        # cookie is dropped when the browser closes, and a person who reopened
+        # it met the password form again for a key they had already typed.
+        # The value is the same 30 days the lease itself runs for, so the
+        # cookie never outlives the session it names.  ``0`` is the sign-out
+        # answer: it deletes the cookie the browser is holding.
+        parts = [
+            f"{BROWSER_SESSION_COOKIE}={token}",
+            "Path=/",
+            "HttpOnly",
+            "SameSite=Strict",
+            f"Max-Age={max(0, int(max_age_seconds))}",
+        ]
+        # The published page is reached over TLS (and says so on the hop the
+        # proxy forwarded); a loopback page is plain http on this machine, and
+        # a `Secure` cookie there would simply never be sent back.
+        if (self.headers.get("X-Forwarded-Proto", "") or "").strip().lower() == "https":
+            parts.append("Secure")
+        return "; ".join(parts)
 
-    def _send(self, status: int, payload: Mapping[str, Any], *, session_token: str | None = None) -> None:
+    def _send(
+        self,
+        status: int,
+        payload: Mapping[str, Any],
+        *,
+        session_token: str | None = None,
+        clear_session: bool = False,
+    ) -> None:
         encoded = _encode_response_body(payload)
         # A body this handler never read would otherwise become the next
         # request line on this kept-alive socket.
@@ -655,6 +715,10 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         if session_token:
             self.send_header("X-LiteLLM-Core-Session", session_token)
             self.send_header("Set-Cookie", self._browser_session_cookie_header(session_token))
+        elif clear_session:
+            # Sign-out: the browser is told to forget the cookie it holds, so
+            # the page it reloads meets the gate that a dead lease deserves.
+            self.send_header("Set-Cookie", self._browser_session_cookie_header("", max_age_seconds=0))
         self.end_headers()
         try:
             self.wfile.write(encoded)
@@ -710,6 +774,10 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
             # The one route a page may call with nothing but the credential a
             # terminal put in the address it printed.
             self._owner._handle_web_launch(self)
+            return
+        if route == "/ipc/web/logout":
+            # The page's own sign-out: it names the cookie it wants ended.
+            self._owner._handle_web_logout(self)
             return
         if route == "/ipc/host/shutdown":
             token = self._session_authorization()
@@ -1053,6 +1121,8 @@ class CoreIPCServer:
         port: int = 0,
         bootstrap_ttl_seconds: float = BOOTSTRAP_TOKEN_TTL_SECONDS,
         session_ttl_seconds: float = SESSION_TOKEN_TTL_SECONDS,
+        web_session_ttl_seconds: float = WEB_SESSION_TTL_SECONDS,
+        web_sessions_path: Path | str | None = None,
     ) -> None:
         if address not in {"127.0.0.1", "::1", "localhost"}:
             raise IPCError("Core IPC must bind to a loopback address")
@@ -1063,6 +1133,7 @@ class CoreIPCServer:
         self.requested_port = port
         self.bootstrap_ttl_seconds = max(1.0, float(bootstrap_ttl_seconds))
         self.session_ttl_seconds = max(1.0, float(session_ttl_seconds))
+        self.web_session_ttl_seconds = max(1.0, float(web_session_ttl_seconds))
         self._server: http.server.ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._core_unsubscribe: Callable[[], None] | None = None
@@ -1099,6 +1170,13 @@ class CoreIPCServer:
         self._web_launch_token = ""
         # Whether the address this process publishes carries that credential.
         self._web_auto_login = False
+        # The browser's own lease outlives this process, so the digests of the
+        # sessions it issued are recorded beside the Core metadata.  A host
+        # that states no path (a test, a bare CLI run) keeps them in memory
+        # only, which is the old behaviour stated rather than guessed at.
+        self._web_sessions_path = Path(web_sessions_path).expanduser() if web_sessions_path is not None else None
+        self._web_sessions: dict[str, float] = {}
+        self._web_sessions_written: dict[str, float] = {}
         self._lock = threading.RLock()
 
     @property
@@ -1243,12 +1321,9 @@ class CoreIPCServer:
         local_session = ""
         if candidate.name == "index.html" and not self._page_signed_in(handler):
             if self._page_is_local(handler):
-                with self._lock:
-                    local_session = secrets.token_urlsafe(32)
-                    self._sessions[local_session] = _Session(
-                        token=local_session,
-                        expires_at=time.monotonic() + self.session_ttl_seconds,
-                    )
+                # The owner's own page, signed in as it always was -- with a
+                # lease that now lasts as long as the browser keeps the cookie.
+                local_session = self._mint_web_session()
             else:
                 body = _web_login_page(self._web_language(handler))
                 content_type = "text/html; charset=utf-8"
@@ -1338,18 +1413,16 @@ class CoreIPCServer:
         form.  The form is not a security boundary by itself -- the boundary is
         `/ipc/web/login` and the session cookie -- but it is what a person
         meets, so it must never be the app's shell shown empty and broken.
+
+        The cookie is the whole answer, and it is checked through the same path
+        every other request uses: the lease this process holds, or the one a
+        replaced Core recorded before it went away.
         """
 
         cookie = handler._browser_session_cookie()
         if not cookie:
             return False
-        with self._lock:
-            session = self._sessions.get(cookie)
-            return bool(
-                session is not None
-                and session.expires_at >= time.monotonic()
-                and hmac.compare_digest(session.token, cookie)
-            )
+        return self._valid_session(cookie)
 
     def enable_web_host(
         self,
@@ -1803,6 +1876,7 @@ class CoreIPCServer:
             self._bootstrap_token = secrets.token_urlsafe(32)
             self._bootstrap_expires_at = time.monotonic() + self.bootstrap_ttl_seconds
             self._bootstrap_consumed = False
+            self._load_web_sessions()
             self._core_unsubscribe = self.core.subscribe(self._publish)
             self._thread = threading.Thread(
                 target=server.serve_forever,
@@ -1820,6 +1894,8 @@ class CoreIPCServer:
             unsubscribe = self._core_unsubscribe
             self._core_unsubscribe = None
             self._sessions.clear()
+            self._web_sessions.clear()
+            self._web_sessions_written.clear()
             self._subscriptions.clear()
             self._editor_capabilities.clear()
             self._secret_capabilities.clear()
@@ -1877,17 +1953,13 @@ class CoreIPCServer:
             handler.close_connection = True
         token = handler._authorization()
         cookie = handler._browser_session_cookie()
-        with self._lock:
-            now = time.monotonic()
-            bootstrap = self._valid_bootstrap(token)
-            candidate = token or cookie
-            session = self._sessions.get(candidate) if candidate else None
-            valid_session = bool(
-                candidate
-                and session is not None
-                and session.expires_at >= now
-                and hmac.compare_digest(session.token, candidate)
-            )
+        bootstrap = self._valid_bootstrap(token)
+        # A page that already signed in keeps its cookie across reloads, so
+        # ``/ipc/hello`` accepts it too instead of asking for the password
+        # again -- including the cookie a replaced Core only knows from its
+        # own recorded digest.
+        candidate = token or cookie
+        valid_session = bool(candidate) and self._valid_session(candidate)
         if bootstrap:
             self._issue_session(handler, token, consumed_bootstrap=True)
             return
@@ -1905,17 +1977,24 @@ class CoreIPCServer:
             if existing is not None:
                 # Keep the credential stable: subscriptions and editor
                 # revisions are intentionally bound to this session.
-                existing.expires_at = now + self.session_ttl_seconds
+                existing.expires_at = now + existing.ttl_seconds
                 session_token = existing.token
+                if existing.browser:
+                    self._record_web_session(session_token)
             else:
                 session_token = secrets.token_urlsafe(32)
                 self._sessions[session_token] = _Session(
                     token=session_token,
                     expires_at=now + self.session_ttl_seconds,
+                    ttl_seconds=self.session_ttl_seconds,
                 )
         handler._send(
             200,
-            {"protocol_version": PROTOCOL_VERSION, "ok": True, "session": {"expires_in": int(self.session_ttl_seconds)}},
+            {
+                "protocol_version": PROTOCOL_VERSION,
+                "ok": True,
+                "session": {"expires_in": int(existing.ttl_seconds if existing is not None else self.session_ttl_seconds)},
+            },
             session_token=session_token,
         )
 
@@ -1933,13 +2012,25 @@ class CoreIPCServer:
             # page would read as an expired session.
             handler._send(401, {"ok": False, "error": {"code": "invalid_password", "message": "Web password is incorrect"}})
             return
+        session_token = self._mint_web_session()
+        handler._send(200, {"ok": True, "session": {"expires_in": int(self.web_session_ttl_seconds)}}, session_token=session_token)
+
+    def _handle_web_logout(self, handler: _CoreRequestHandler) -> None:
+        """End this browser's page session and clear its cookie.
+
+        Signing out has to mean something after a restart, so the lease is
+        dropped on disk as well as in memory: a cookie copied out of the
+        browser before this call is dead either way.  The answer is idempotent
+        -- a page whose cookie is already gone is signed out too -- and it
+        clears the cookie the browser is holding, which is what the reload that
+        follows reads as "show me the gate".
+        """
+
         with self._lock:
-            session_token = secrets.token_urlsafe(32)
-            self._sessions[session_token] = _Session(
-                token=session_token,
-                expires_at=time.monotonic() + self.session_ttl_seconds,
-            )
-        handler._send(200, {"ok": True, "session": {"expires_in": int(self.session_ttl_seconds)}}, session_token=session_token)
+            tokens = {value for value in (handler._authorization(), handler._browser_session_cookie()) if value}
+            for token in tokens:
+                self._drop_session(token)
+        handler._send(200, {"ok": True}, clear_session=True)
 
     def _handle_web_launch(self, handler: _CoreRequestHandler) -> None:
         """Admit the page a terminal printed the address for.
@@ -1965,13 +2056,8 @@ class CoreIPCServer:
         ):
             handler._send(401, {"ok": False, "error": {"code": "invalid_launch", "message": "This launch address is not valid"}})
             return
-        with self._lock:
-            session_token = secrets.token_urlsafe(32)
-            self._sessions[session_token] = _Session(
-                token=session_token,
-                expires_at=time.monotonic() + self.session_ttl_seconds,
-            )
-        handler._send(200, {"ok": True, "session": {"expires_in": int(self.session_ttl_seconds)}}, session_token=session_token)
+        session_token = self._mint_web_session()
+        handler._send(200, {"ok": True, "session": {"expires_in": int(self.web_session_ttl_seconds)}}, session_token=session_token)
 
     def _accepts_web_password(self, submitted: str) -> bool:
         expected = self._web_password_value()
@@ -1999,52 +2085,190 @@ class CoreIPCServer:
         now = time.monotonic()
         with self._lock:
             session = self._sessions.get(token)
+            if session is None and self._resume_web_session(token):
+                # A Core that was replaced -- a deploy, the app's own restart --
+                # starts with no sessions at all.  The recorded digest is what
+                # makes the cookie this browser already holds still mean
+                # something, so the page keeps its seat instead of meeting the
+                # key form again.
+                session = self._sessions.get(token)
             if session is None or session.expires_at < now:
-                self._sessions.pop(token, None)
-                self._editor_capabilities = {
-                    key: item
-                    for key, item in self._editor_capabilities.items()
-                    if not hmac.compare_digest(item.session_token, token)
-                }
-                self._secret_capabilities = {
-                    key: item
-                    for key, item in self._secret_capabilities.items()
-                    if not hmac.compare_digest(item.session_token, token)
-                }
-                self._secret_read_capabilities = {
-                    key: item
-                    for key, item in self._secret_read_capabilities.items()
-                    if not hmac.compare_digest(item.session_token, token)
-                }
-                self._import_plans = {
-                    key: item
-                    for key, item in self._import_plans.items()
-                    if not hmac.compare_digest(item.session_token, token)
-                }
-                # A dead session's event subscriptions go with it.  They were
-                # never swept, so every relaunched host left subscriptions (and
-                # the events queued in them) behind for the process lifetime,
-                # and a poll reusing the id read as a quiet heartbeat.
-                #
-                # An unknown token has no record to walk: a browser tab that was
-                # reloaded, or any caller presenting a token this Core never
-                # minted, takes this branch with ``session is None``.  Walking
-                # its subscriptions raised AttributeError, which aborts the
-                # request handler thread and closes the connection with no
-                # answer at all — the caller then retries a request that will
-                # fail the same way.
-                for subscription_id in tuple(session.subscriptions if session is not None else ()):
-                    subscription = self._subscriptions.get(subscription_id)
-                    if subscription is not None and hmac.compare_digest(subscription.session_token, token):
-                        self._subscriptions.pop(subscription_id, None)
+                self._drop_session(token)
                 return False
             if not hmac.compare_digest(session.token, token):
                 return False
             # Event polling and normal host operations are authenticated
             # activity. Keep their session alive so a healthy Core is never
             # reaped solely because its host has been idle in the foreground.
-            session.expires_at = now + self.session_ttl_seconds
+            session.expires_at = now + session.ttl_seconds
+            if session.browser:
+                self._record_web_session(token)
             return True
+
+    def _drop_session(self, token: str) -> None:
+        """Forget one lease and everything that was minted under it."""
+
+        with self._lock:
+            session = self._sessions.pop(token, None)
+            recorded = self._web_sessions.pop(browser_session_digest(token), None) is not None
+            self._editor_capabilities = {
+                key: item
+                for key, item in self._editor_capabilities.items()
+                if not hmac.compare_digest(item.session_token, token)
+            }
+            self._secret_capabilities = {
+                key: item
+                for key, item in self._secret_capabilities.items()
+                if not hmac.compare_digest(item.session_token, token)
+            }
+            self._secret_read_capabilities = {
+                key: item
+                for key, item in self._secret_read_capabilities.items()
+                if not hmac.compare_digest(item.session_token, token)
+            }
+            self._import_plans = {
+                key: item
+                for key, item in self._import_plans.items()
+                if not hmac.compare_digest(item.session_token, token)
+            }
+            # A dead session's event subscriptions go with it.  They were
+            # never swept, so every relaunched host left subscriptions (and
+            # the events queued in them) behind for the process lifetime,
+            # and a poll reusing the id read as a quiet heartbeat.
+            #
+            # An unknown token has no record to walk: a browser tab that was
+            # reloaded, or any caller presenting a token this Core never
+            # minted, arrives here with ``session is None``.  Walking its
+            # subscriptions raised AttributeError, which aborts the request
+            # handler thread and closes the connection with no answer at all —
+            # the caller then retries a request that will fail the same way.
+            for subscription_id in tuple(session.subscriptions if session is not None else ()):
+                subscription = self._subscriptions.get(subscription_id)
+                if subscription is not None and hmac.compare_digest(subscription.session_token, token):
+                    self._subscriptions.pop(subscription_id, None)
+            if recorded:
+                self._save_web_sessions(force=True)
+
+    def _mint_web_session(self) -> str:
+        """One browser page's lease: 30 days, in memory and recorded."""
+
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._sessions[token] = _Session(
+                token=token,
+                expires_at=time.monotonic() + self.web_session_ttl_seconds,
+                ttl_seconds=self.web_session_ttl_seconds,
+                browser=True,
+            )
+            self._web_sessions[browser_session_digest(token)] = time.time() + self.web_session_ttl_seconds
+            self._save_web_sessions()
+        return token
+
+    def _record_web_session(self, token: str) -> None:
+        """Move a live browser lease's recorded expiry forward.
+
+        Every authenticated call renews the lease, and the record only has to
+        be as fresh as the next restart that reads it: an hour of slack costs
+        nothing and keeps the file from being rewritten on every event poll.
+        """
+
+        digest = browser_session_digest(token)
+        with self._lock:
+            expiry = time.time() + self.web_session_ttl_seconds
+            if expiry - self._web_sessions.get(digest, 0.0) < WEB_SESSION_PERSIST_INTERVAL_SECONDS:
+                return
+            self._web_sessions[digest] = expiry
+            self._save_web_sessions()
+
+    def _resume_web_session(self, token: str) -> bool:
+        """Adopt a browser lease this process did not mint.
+
+        The token is checked against the recorded digest, and the record's own
+        expiry decides whether it is still worth anything; a token nothing
+        recorded is simply unknown.
+        """
+
+        digest = browser_session_digest(token)
+        with self._lock:
+            expiry = self._web_sessions.get(digest)
+            now = time.time()
+            if expiry is None:
+                return False
+            if expiry <= now:
+                self._web_sessions.pop(digest, None)
+                self._save_web_sessions(force=True)
+                return False
+            self._sessions[token] = _Session(
+                token=token,
+                expires_at=time.monotonic() + max(1.0, min(expiry - now, self.web_session_ttl_seconds)),
+                ttl_seconds=self.web_session_ttl_seconds,
+                browser=True,
+            )
+            return True
+
+    def _load_web_sessions(self) -> None:
+        """Read the browser sessions an earlier process recorded."""
+
+        path = self._web_sessions_path
+        if path is None:
+            return
+        try:
+            payload = read_json(path, default={})
+        except PersistenceError:
+            # An unreadable record is not a reason to refuse to serve a page:
+            # the cost is the sessions it held, which is the same page the
+            # gate draws for anyone who has not signed in.
+            payload = {}
+        entries = payload.get("sessions")
+        restored: dict[str, float] = {}
+        now = time.time()
+        if isinstance(entries, Sequence) and not isinstance(entries, (str, bytes, bytearray)):
+            for entry in entries:
+                if not isinstance(entry, Mapping):
+                    continue
+                digest = entry.get("digest")
+                expires_at = entry.get("expires_at")
+                if not isinstance(digest, str) or len(digest) != 64:
+                    continue
+                if type(expires_at) not in {int, float}:
+                    continue
+                if float(expires_at) <= now:
+                    continue
+                restored[digest] = float(expires_at)
+        with self._lock:
+            self._web_sessions = dict(restored)
+            self._web_sessions_written = dict(restored)
+
+    def _save_web_sessions(self, *, force: bool = False) -> None:
+        """Write the browser sessions a later process may resume."""
+
+        now = time.time()
+        with self._lock:
+            live = {digest: expiry for digest, expiry in self._web_sessions.items() if expiry > now}
+            if len(live) > MAX_PERSISTED_WEB_SESSIONS:
+                newest = sorted(live.items(), key=lambda item: item[1], reverse=True)[:MAX_PERSISTED_WEB_SESSIONS]
+                live = dict(newest)
+            self._web_sessions = live
+            path = self._web_sessions_path
+            if path is None:
+                return
+            if not force and live == self._web_sessions_written:
+                return
+            payload = {
+                "version": WEB_SESSION_STORE_VERSION,
+                "sessions": [
+                    {"digest": digest, "expires_at": int(expiry)}
+                    for digest, expiry in sorted(live.items(), key=lambda item: item[1], reverse=True)
+                ],
+            }
+            try:
+                atomic_write_json(path, payload)
+            except PersistenceError:
+                # A record that cannot be written is bookkeeping, not a
+                # request: this page keeps its lease, and only a restart that
+                # cannot find the record asks for the key again.
+                return
+            self._web_sessions_written = dict(live)
 
     def _register_import_plan(self, prepared: PreparedImport, *, session_token: str) -> str:
         token = secrets.token_urlsafe(32)
@@ -2489,10 +2713,14 @@ class CoreIPCClient:
 
 __all__ = [
     "BOOTSTRAP_TOKEN_TTL_SECONDS",
+    "BROWSER_SESSION_COOKIE",
     "CoreIPCClient",
     "CoreIPCServer",
     "EVENT_POLL_TIMEOUT_SECONDS",
     "IPCError",
     "IpcEndpoint",
     "SESSION_TOKEN_TTL_SECONDS",
+    "WEB_SESSION_COOKIE_MAX_AGE_SECONDS",
+    "WEB_SESSION_STORE_FILENAME",
+    "WEB_SESSION_TTL_SECONDS",
 ]
