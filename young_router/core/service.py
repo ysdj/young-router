@@ -828,7 +828,18 @@ def _checkpoint_files(paths: Iterable[Path]) -> tuple[_FileCheckpoint, ...]:
 def _restore_files(checkpoints: Iterable[_FileCheckpoint]) -> None:
     for checkpoint in checkpoints:
         if checkpoint.data is not None:
-            atomic_write_bytes(checkpoint.path, checkpoint.data, mode=checkpoint.mode)
+            # A rollback of a file that never changed must not write it.  The
+            # bytes are equal either way, but the mtime is the document's
+            # identity to everything watching it: a WebDAV sync that stops on a
+            # conflict rolls every checkpoint back, and rewriting an unchanged
+            # `config.yaml` told the client-model loop that somebody had edited
+            # the roster -- one rolling proxy reload every sync interval, for as
+            # long as nobody answered the conflict.  Measured on lv: a reload
+            # every two minutes for eleven hours, from a sync that wrote
+            # nothing.
+            current = read_bytes(checkpoint.path)
+            if current != checkpoint.data:
+                atomic_write_bytes(checkpoint.path, checkpoint.data, mode=checkpoint.mode)
         else:
             try:
                 details = checkpoint.path.lstat()
@@ -3645,21 +3656,32 @@ class CoreStore:
             "last_sync_at": last_sync_at if isinstance(last_sync_at, str) else None,
         }
 
-    def run_automatic_webdav_sync(self) -> None:
-        """Run one smart sync for the interval loop.
+    def run_automatic_webdav_sync(self) -> str:
+        """Run one smart sync for the interval loop, and say how it ended.
 
         This goes straight to the sync rather than through ``dispatch``: only
         the Core decides to run it, so no IPC action can ask for the unattended
         behaviour.  There is one sync, not a direction to read first: every run
         compares both sides and takes the newer one.
+
+        The answer is the loop's own input.  A conflict is a question for the
+        reader -- the pane shows both sides and stops -- so an unattended retry
+        can only ask it again; measured on lv, a two-minute interval retried a
+        conflict 300+ times overnight, and every retry wrote the same files and
+        rolled the proxy reload over with them.  Any other failure is worth
+        another try, on a backing-off interval.
         """
 
-        self._dispatch_webdav_sync(
-            "sync",
-            {"sections": ["providers_models", "relay_accounts"]},
-            None,
-            automatic=True,
-        )
+        try:
+            self._dispatch_webdav_sync(
+                "sync",
+                {"sections": ["providers_models", "relay_accounts"]},
+                None,
+                automatic=True,
+            )
+        except CoreError as exc:
+            return str(exc.code or "webdav_sync_failed")
+        return "ok"
 
     def webdav_scheduler(self) -> Any:
         """The interval loop, created once and owned by this store."""

@@ -17,6 +17,44 @@ from young_router.core.persistence import atomic_write_json
 from young_router.core.service import CoreStore
 
 
+class RollbackWriteTests(unittest.TestCase):
+    def test_a_rollback_that_changes_nothing_leaves_the_file_alone(self) -> None:
+        """The mtime is the document's identity to everything watching it.
+
+        Measured on lv: a WebDAV sync that stopped on a conflict rolled every
+        checkpoint back -- rewriting `config.yaml` with the same bytes -- and
+        the client-model loop read the new mtime as an edit, so the proxy took a
+        rolling reload every two minutes for eleven hours.
+        """
+
+        from young_router.core.service import _checkpoint_files, _restore_files
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text("providers: {}\n", encoding="utf-8")
+            before = path.stat().st_mtime_ns
+            _restore_files(_checkpoint_files([path]))
+            self.assertEqual(before, path.stat().st_mtime_ns)
+
+            # A file that really moved is still restored from the checkpoint
+            # taken before it moved.
+            checkpoints = _checkpoint_files([path])
+            path.write_text("providers: {sisct2: {}}\n", encoding="utf-8")
+            _restore_files(checkpoints)
+            self.assertEqual("providers: {}\n", path.read_text(encoding="utf-8"))
+
+    def test_restoring_a_changed_file_puts_the_checkpoint_back(self) -> None:
+        from young_router.core.service import _checkpoint_files, _restore_files
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text("kept\n", encoding="utf-8")
+            checkpoints = _checkpoint_files([path])
+            path.write_text("changed by a half-finished apply\n", encoding="utf-8")
+            _restore_files(checkpoints)
+            self.assertEqual("kept\n", path.read_text(encoding="utf-8"))
+
+
 class CoreServiceReloadTests(unittest.TestCase):
     def test_provider_apply_reloads_service_after_source_config_commit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

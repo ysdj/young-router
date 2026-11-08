@@ -42,6 +42,24 @@ syncs: a pane that dispatches on a poll keeps a Core busy forever, so after this
 long the loop runs anyway.
 """
 
+CONFLICT_CODE = "webdav_sync_conflict"
+"""The failure that means a person has to choose, not try again later.
+
+Both ends moved, so no unattended run can settle it: the pane shows the two
+sides and waits.  Retrying it on the interval is what turned a conflict on lv
+into a proxy reload every two minutes overnight.
+"""
+
+UNSAVED_CODE = "webdav_sync_unsaved"
+"""The run stood aside for a pane's unsaved edits, which is not a failure."""
+
+MAX_BACKOFF_FACTOR = 8.0
+"""How far an ordinary failure may stretch the interval before it is retried.
+
+A server that is down overnight is worth asking again; asking it every two
+minutes for a night is not.  The wait doubles per failure and stops here, so a
+short interval still becomes a quiet one."""
+
 
 class WebDAVSyncScheduler:
     """Wait out the configured interval, then run the configured sync.
@@ -78,6 +96,11 @@ class WebDAVSyncScheduler:
         self._last_attempt: float | None = None
         self._started_at: float | None = None
         self._due_since: float | None = None
+        #: Failures since the last run that ended cleanly: the backoff ladder.
+        self._failures = 0
+        #: A conflict is a question for the reader; the loop stays quiet until
+        #: something changes (a settings edit, a manual sync, a resolution).
+        self._blocked = False
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> None:
@@ -100,8 +123,16 @@ class WebDAVSyncScheduler:
             thread.join(timeout=timeout)
 
     def kick(self) -> None:
-        """Re-read the settings now — call this when they change."""
+        """Re-read the settings now — call this when they change.
 
+        Whoever kicked it also just acted: a settings edit, the pane's own sync
+        button, or the answer to a conflict.  Any of those is a reason to stop
+        backing off and to ask again, so the two penalties are dropped here
+        rather than left to expire on their own.
+        """
+
+        self._failures = 0
+        self._blocked = False
         self._wake.set()
 
     # -- scheduling --------------------------------------------------------
@@ -116,10 +147,20 @@ class WebDAVSyncScheduler:
         state = self._read_state()
         if state is None:
             return (None, False)
+        if self._blocked:
+            # Nothing on a clock can answer this one.  The pane is holding the
+            # two sides of a conflict and the next run is the reader's, not
+            # the timer's.
+            return (None, False)
         interval = self._interval_seconds(state)
         if interval is None:
             return (None, False)
         due = self._due_in(interval, state.get("last_sync_at"))
+        if self._failures:
+            # An ordinary failure keeps its own interval, stretched: doubling
+            # per failure up to the cap.  A server that is down is worth asking
+            # again, just not on the fast clock.
+            due = max(due, self._backoff_seconds(interval) - (self._clock() - (self._last_attempt or 0.0)))
         if due > 0:
             self._due_since = None
             return (min(due, self._max_sleep), False)
@@ -212,6 +253,12 @@ class WebDAVSyncScheduler:
                 continue
             # The wait elapsed: recompute, which fires when the time is up.
 
+    def _backoff_seconds(self, interval: float) -> float:
+        """How long to wait after ``self._failures`` consecutive failures."""
+
+        factor = min(2.0 ** max(0, self._failures), MAX_BACKOFF_FACTOR)
+        return interval * factor
+
     def _run(self) -> None:
         # Stamp the attempt before running so the next pass measures from here
         # whatever the sync does, then let the sync's own status file carry the
@@ -219,6 +266,29 @@ class WebDAVSyncScheduler:
         self._last_attempt = self._clock()
         self._due_since = None
         try:
-            self._sync()
-        except Exception:
+            outcome = self._sync()
+        except Exception as exc:
+            outcome = str(getattr(exc, "code", "") or "webdav_sync_failed")
+        self._observe(outcome)
+
+    def _observe(self, outcome: object) -> None:
+        """Turn one run's answer into how long the loop waits next.
+
+        ``sync`` is allowed to answer nothing (a loop that never fails), a code
+        string, or ``None``/True for a run that ended cleanly.
+        """
+
+        code = outcome if isinstance(outcome, str) else ""
+        if not code or code == "ok":
+            self._failures = 0
             return
+        if code == UNSAVED_CODE:
+            # A run that stood aside because a pane held unsaved edits is not a
+            # failure of the server: it is this loop being polite, and it must
+            # not stretch its own interval for it.
+            return
+        if code == CONFLICT_CODE:
+            self._blocked = True
+            self._failures = 0
+            return
+        self._failures += 1

@@ -197,6 +197,83 @@ class WebDAVSyncSchedulerTests(unittest.TestCase):
         scheduler.kick()
         self.assertEqual((0.0, True), scheduler.next_run())
 
+    def test_a_short_interval_backs_off_instead_of_retrying_every_two_minutes(self) -> None:
+        """The lv case: a 2-minute interval and a sync that keeps failing.
+
+        Retrying on the fast clock is what made a broken sync into a proxy
+        reload every two minutes for a night.  A failure stretches the wait
+        instead, and the ladder stops growing at the cap.
+        """
+
+        clock = FakeClock()
+        state = self.enabled(sync_interval_minutes=2, last_sync_at=None)
+
+        def fail() -> None:
+            raise RuntimeError("The remote is unreachable")
+
+        scheduler, _state = self.build(state, sync=fail, clock=clock, initial_delay=0.0, settle=0.0, max_sleep=3600.0)
+        self.assertEqual((0.0, True), scheduler.next_run())
+        for expected in (240.0, 480.0, 960.0, 960.0):
+            scheduler._run()
+            delay, fire = scheduler.next_run()
+            self.assertFalse(fire)
+            self.assertAlmostEqual(expected, delay)
+
+    def test_a_conflict_stops_the_loop_until_a_person_acts(self) -> None:
+        """Both ends moved is a question for the reader, not a retry.
+
+        Measured on lv: a conflict nobody answered was re-detected every two
+        minutes, and every detection rolled the proxy reload over with it.  The
+        loop that cannot settle it must not be the loop that keeps asking.
+        """
+
+        clock = FakeClock()
+        state = self.enabled(sync_interval_minutes=2, last_sync_at=stamp(clock.now - 3600.0))
+        scheduler, _state = self.build(state, sync=lambda: "webdav_sync_conflict", clock=clock, settle=0.0)
+        self.assertEqual((0.0, True), scheduler.next_run())
+        scheduler._run()
+        self.assertEqual((None, False), scheduler.next_run())
+        # Still quiet a day later, because no clock can answer it.
+        clock.advance(24 * 3600.0)
+        self.assertEqual((None, False), scheduler.next_run())
+        # The answer -- a chosen side, a settings edit, the pane's own button --
+        # is a kick, and the loop resumes.
+        scheduler.kick()
+        self.assertEqual((0.0, True), scheduler.next_run())
+
+    def test_a_run_that_stood_aside_for_unsaved_edits_keeps_the_interval(self) -> None:
+        """Staying polite is not a failure of the server, so it is not punished."""
+
+        clock = FakeClock()
+        scheduler, _state = self.build(
+            self.enabled(sync_interval_minutes=2, last_sync_at=stamp(clock.now - 3600.0)),
+            sync=lambda: "webdav_sync_unsaved",
+            clock=clock,
+            settle=0.0,
+            max_sleep=3600.0,
+        )
+        self.assertEqual((0.0, True), scheduler.next_run())
+        scheduler._run()
+        self.assertEqual((120.0, False), scheduler.next_run())
+
+    def test_a_clean_run_clears_the_backoff(self) -> None:
+        clock = FakeClock()
+        state = self.enabled(sync_interval_minutes=2, last_sync_at=None)
+        outcomes: list[str] = []
+        scheduler, _state = self.build(state, sync=lambda: outcomes.pop() if outcomes else "ok", clock=clock, initial_delay=0.0, settle=0.0, max_sleep=3600.0)
+        outcomes.extend(["webdav_sync_failed", "webdav_sync_failed"])
+        scheduler.next_run()
+        scheduler._run()
+        scheduler._run()
+        delay, _fire = scheduler.next_run()
+        self.assertAlmostEqual(480.0, delay)
+        outcomes.append("ok")
+        clock.advance(delay)
+        self.assertEqual((0.0, True), scheduler.next_run())
+        scheduler._run()
+        # Back to the plain interval.
+        self.assertAlmostEqual(120.0, scheduler.next_run()[0])
+
     def test_stop_ends_a_loop_that_has_nothing_scheduled(self) -> None:
         scheduler, _state = self.build(self.enabled(enabled=False), settle=0.0)
         scheduler.start()

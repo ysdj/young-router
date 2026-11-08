@@ -2027,6 +2027,53 @@ class CoreOperationsTests(unittest.TestCase):
                 {key: result["action_summary"][key] for key in ("outcome", "archived_remote")},
             )
 
+    def test_a_conflicting_automatic_run_leaves_the_document_untouched(self) -> None:
+        """A sync that stops must not look like somebody edited the roster.
+
+        Its rollback restores every checkpoint, and rewriting `config.yaml` with
+        the same bytes still moves the mtime -- which is the document's identity
+        to the client-model loop.  Measured on lv: a conflict nobody answered,
+        re-detected every two minutes, put the proxy through a rolling reload on
+        each one for eleven hours.  The file, and the mtime the loop reads, are
+        the same after the run as before it.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            original = textwrap.dedent(PROVIDER_CONFIG).lstrip()
+            config.write_text(original, encoding="utf-8")
+            providers = ProvidersModelsDomain(config)
+            relay = RelayAccountsDomain(storage_path=root / ".litellm-runtime" / "relay-accounts.json")
+            webdav = self._configured_webdav_domain(root, config)
+            core = CoreStore(domains=[providers, relay, webdav])
+
+            base = {"files": [{"path": "config.yaml", "present": True, "sha256": "base"}]}
+            local = {"files": [{"path": "config.yaml", "present": True, "sha256": "local"}]}
+            remote = {"files": [{"path": "config.yaml", "present": True, "sha256": "remote"}]}
+            webdav_core.save_sync_state(root / "webdav-state.json", webdav.sync_settings(), base, "sync")
+            mtime_before = config.stat().st_mtime_ns
+            with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
+                "young_router.webdav.core.local_snapshot",
+                return_value=webdav_core.SyncSnapshot(local),
+            ), mock.patch("young_router.webdav.operations.read_remote_manifest", return_value=remote), mock.patch(
+                "young_router.webdav.operations.read_remote_digests", return_value=None
+            ), mock.patch(
+                "young_router.webdav.operations.remote_snapshot_from_bundle", return_value=None
+            ), mock.patch(
+                "young_router.webdav.operations.remember_remote_bundle"
+            ), mock.patch("young_router.webdav.operations.push_bundle") as pushed, mock.patch(
+                "young_router.webdav.operations.pull_bundle"
+            ) as pulled:
+                outcome = core.run_automatic_webdav_sync()
+
+            # The loop is told what happened, so it can stop asking.
+            self.assertEqual("webdav_sync_conflict", outcome)
+            pushed.assert_not_called()
+            pulled.assert_not_called()
+            self.assertEqual(original, config.read_text(encoding="utf-8"))
+            self.assertEqual(mtime_before, config.stat().st_mtime_ns)
+
     def test_a_diverged_sync_keeps_both_sides_and_writes_nothing(self) -> None:
         """Both ends changed: the run stops, and the comparison survives it.
 
