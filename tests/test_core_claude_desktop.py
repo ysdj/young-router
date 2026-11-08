@@ -429,10 +429,11 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
             picker = json.loads(domain.raw_text(include_sensitive=True))["modelPicker"]
             self.assertTrue(picker["replaceBuiltInOptions"])
             # One row per route, and each route is named the way the desktop
-            # session names it: at or above 1M the client's own ``[1m]`` spelling.
+            # session names it: at or above 1M the client's own ``[1m]`` spelling,
+            # including a public name the client already keeps as written.
             self.assertEqual(
                 [
-                    "claude-opus-5-5",
+                    "claude-opus-5-5[1m]",
                     f"{alias_claude_desktop('gemini-3.8-flash')}[1m]",
                     alias_claude_desktop("gpt-6.1-sol"),
                     f"{alias_claude_desktop('kimi-k3.1-pro')}[1m]",
@@ -457,13 +458,17 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
             # The smaller-output 1M entry is the one below a full 1M.
             self.assertEqual("claude-opus-4-8", by_id[alias_claude_desktop("gpt-6.1-sol")]["behavesAs"])
             self.assertEqual("gpt-6.1-sol", by_id[alias_claude_desktop("gpt-6.1-sol")]["label"])
-            # A real Claude id is already in the client's catalog and needs no
-            # substitute; the client keeps its own friendly label for it.
-            self.assertEqual({"model": "claude-opus-5-5", "description": "\u200b"}, by_id["claude-opus-5-5"])
+            # A real Claude id needs no substitute, and its row is the client's
+            # own: the suffix is the whole statement, so no label either.
+            self.assertEqual(
+                {"model": "claude-opus-5-5[1m]", "description": "\u200b"},
+                by_id["claude-opus-5-5[1m]"],
+            )
             settings = json.loads(domain.raw_text(include_sensitive=True))["modelSettings"]
-            # A Claude-shaped 1M route keeps the number it states: the catalogue
-            # applies it to the model the id names.
-            self.assertEqual(1_000_000, settings["claude-opus-5-5"]["autoCompactWindow"])
+            # A Claude-shaped 1M route keeps the number it states, under the id
+            # the row names.
+            self.assertEqual(1_000_000, settings["claude-opus-5-5[1m]"]["autoCompactWindow"])
+            self.assertNotIn("claude-opus-5-5", settings)
             self.assertEqual(500_000, settings[alias_claude_desktop("gpt-6.1-sol")]["autoCompactWindow"])
             self.assertEqual(
                 1_000_000,

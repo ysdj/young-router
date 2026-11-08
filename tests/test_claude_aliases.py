@@ -111,13 +111,32 @@ class ClaudeDesktopAliasTests(unittest.TestCase):
             with self.subTest(family=family):
                 self.assertEqual(names[0], resolve_alias(f"{family}{digest}[1m]", names))
 
+    def test_a_one_million_spelling_of_a_served_name_resolves(self) -> None:
+        # A public name the client keeps as written is published at 1M under
+        # the same suffix, so the row still names one route when the session
+        # sends it.  The suffix selects a picker row; it is never a route.
+        names = ["deepseek-v4.1-flash", "claude-opus-5-5"]
+        for spelling in (
+            "claude-opus-5-5[1m]",
+            "claude-opus-5-5[1M]",
+            "claude-opus-5-5[1m] ",
+        ):
+            with self.subTest(spelling=spelling):
+                self.assertEqual("claude-opus-5-5", resolve_alias(spelling, names))
+        # The alias namespace answers the same way for a third-party route,
+        # whatever the picker appended to it.
+        self.assertEqual(
+            "deepseek-v4.1-flash", resolve_alias("deepseek-v4.1-flash[1m]", names)
+        )
+        # A name the router serves is answered as written, suffix and all: the
+        # route comes first, the rewriting second.
+        self.assertIsNone(resolve_alias("claude-opus-5-5[1m]", ["claude-opus-5-5[1m]"]))
+
     def test_a_one_million_spelling_of_something_else_is_left_alone(self) -> None:
         names = ["deepseek-v4.1-flash"]
-        # A public name the router serves, an unknown alias, an unknown route,
-        # and a real Claude id keep the router's own answer -- including the
-        # suffix rule LiteLLM already applies to a served name.
+        # An unknown alias, an unknown route, a real Claude id and a bare
+        # suffix all keep the router's own answer.
         for name in (
-            "deepseek-v4.1-flash[1m]",
             "claude-fable-000000[1m]",
             "some-route[1m]",
             "claude-opus-5-5[1m]",

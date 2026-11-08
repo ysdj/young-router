@@ -29,7 +29,7 @@ from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from typing import Any, Final
 
-from ..claude_aliases import CONTEXT_SUFFIX, claude_desktop_alias, desktop_keeps_model_id
+from ..claude_aliases import CONTEXT_SUFFIX, claude_desktop_alias, context_suffix_free, desktop_keeps_model_id
 
 #: A profile may name its client explicitly.  The desktop app sends
 #: ``inferenceCustomHeaders`` on the discovery request as well as on turns, so
@@ -165,6 +165,42 @@ def _published_context(
         return None
 
 
+def _states_one_million(value: object) -> bool:
+    """Whether a stated window is the client's large-window spelling.
+
+    At or above 1M is the same statement: the client has one large-window
+    spelling, its per-model setting accepts 100k..1M, and every other surface
+    here clamps to that ceiling.
+    """
+
+    return isinstance(value, int) and not isinstance(value, bool) and value >= _ONE_MILLION
+
+
+def _kept_row(public_id: str, row: Mapping[str, object]) -> dict[str, object]:
+    """One discovery row for an id the client already keeps as written.
+
+    The row is the router's own: id, display name, and the window the canonical
+    listing stated.  One thing is this view's to decide -- a route stated at 1M
+    is published under the client's ``[1m]`` spelling, exactly as an alias row
+    is.  ``max_input_tokens`` at 1M alone is a row the picker answers with two
+    entries for one route (``Opus 5.5`` and ``Opus 5.5 1M``): the plain one
+    reports the client's 200k default, and both name the route this router
+    serves.  A suffixed id reads as the large window by name, so there is no
+    second entry -- and unlike the profile preference that hides it
+    (``modelPrefer1mContext``), a name travels with the answer to any client,
+    including one pointed at a published host whose profile this app never
+    writes.
+    """
+
+    kept = dict(row)
+    if not _states_one_million(row.get("max_input_tokens")):
+        return kept
+    kept["max_input_tokens"] = _ONE_MILLION
+    if context_suffix_free(public_id) == public_id:
+        kept["id"] = f"{public_id}{CONTEXT_SUFFIX}"
+    return kept
+
+
 def desktop_model_rows(
     response: Mapping[str, object],
     display_names: Mapping[str, str] | None = None,
@@ -173,11 +209,12 @@ def desktop_model_rows(
     """Rewrite one Anthropic-shaped listing for Claude Desktop's discovery.
 
     A route the app already reads as an Anthropic model keeps the id it was
-    listed under, so the app's own display name and controls are untouched.
-    Every other route is published under the alias ``claude_aliases`` derives,
-    with the public name as ``display_name`` -- the app shows that name and
-    derives the full effort ladder from the alias family.  Image generators are
-    dropped in both cases.
+    listed under, so the app's own display name and controls are untouched;
+    a 1M one carries the client's ``[1m]`` spelling so it stays one row (see
+    ``_kept_row``).  Every other route is published under the alias
+    ``claude_aliases`` derives, with the public name as ``display_name`` -- the
+    app shows that name and derives the full effort ladder from the alias
+    family.  Image generators are dropped in both cases.
 
     ``public_window`` is the one public number a route states.  It is
     injectable so the view can be checked without reading this machine's catalog
@@ -196,7 +233,7 @@ def desktop_model_rows(
         if _route_is_image(public_id):
             continue
         if desktop_keeps_model_id(public_id):
-            rows.append(dict(row))
+            rows.append(_kept_row(public_id, row))
             continue
         display_name = row.get("display_name") or names.get(public_id) or public_id
         published = _published_context(public_id, row, window_for)

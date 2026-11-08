@@ -1721,14 +1721,14 @@ class ClaudeSettingsDomain:
 
         One id space for both Claude apps.  Claude Desktop's Code tab launches
         this same Claude Code with the id the discovery view published -- the
-        derived alias, and a 1M route's alias with the client's ``[1m]`` suffix
-        -- so a picker keyed by the public name would describe a model the
-        desktop session never asks for, and every context setting would have to
-        be written twice (once per spelling).  Naming the alias here is what
-        makes one row, one ``modelSettings`` entry and one behavior target
-        serve both apps; the proxy resolves the alias back through
-        ``claude_aliases``, and a Claude-shaped id (already in the client's own
-        catalog) is kept as written.
+        derived alias, a public name the client keeps as written, and a 1M
+        route's spelling with the client's ``[1m]`` suffix -- so a picker keyed
+        by the public name would describe a model the desktop session never
+        asks for, and every context setting would have to be written twice
+        (once per spelling).  Naming the published id here is what makes one
+        row, one ``modelSettings`` entry and one behavior target serve both
+        apps; the proxy resolves either spelling back through
+        ``claude_aliases``.
 
         A route this app publishes at 1M carries the suffix too, because that
         is the id the desktop session sends: one route under two spellings would
@@ -1736,8 +1736,9 @@ class ClaudeSettingsDomain:
         it.  It also states the window by name instead of only by substitute
         (``behavesAs``), and the discovery view suffixes the same set from the
         same number (``desktop_model_rows``), so the two agree by construction.
-        A Claude-shaped id is left alone in both, because the client's catalogue
-        already answers for it.
+        A public name the client already keeps is suffixed there too, for the
+        same reason: without it the picker answers its own catalogue row with a
+        second, standard entry beside the 1M one.
 
         ``max_input_tokens`` is the number this app publishes for the route --
         the one its own pane shows and its ``/v1/models`` answers.  At or above
@@ -1745,9 +1746,11 @@ class ClaudeSettingsDomain:
         every surface here clamps to the same ceiling.
         """
 
-        if claude_aliases.desktop_keeps_model_id(name):
-            return name
-        base = claude_aliases.claude_desktop_alias(name)
+        base = (
+            name
+            if claude_aliases.desktop_keeps_model_id(name)
+            else claude_aliases.claude_desktop_alias(name)
+        )
         if (
             isinstance(max_input_tokens, int)
             and not isinstance(max_input_tokens, bool)
@@ -1801,11 +1804,14 @@ class ClaudeSettingsDomain:
             route = known.get(name)
             if route is not None:
                 row.setdefault("description", _CLAUDE_CODE_BLANK_DESCRIPTION)
-                if model_id != name:
+                if model_id != name and not claude_aliases.desktop_keeps_model_id(name):
                     # The picker shows this; the client sends the id.  A label
                     # this app used to add to separate the two rows is ours, not
                     # the user's, and now that there is one row it is just a
-                    # second name for one model.
+                    # second name for one model.  A public name the client keeps
+                    # is not labelled: its own catalogue already reads the id,
+                    # suffix or not, and this app's spelling of it would only
+                    # replace the friendly name the client draws.
                     if row.get("label") in (None, "", f"{name} (Desktop)"):
                         row["label"] = name
                 behaves_as = _code_behaves_as(name, window)

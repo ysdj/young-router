@@ -233,11 +233,44 @@ class ClaudeDesktopRowsTests(unittest.TestCase):
 
     def test_a_claude_shaped_route_keeps_its_own_metadata(self) -> None:
         # This app does not alias it, so the row is the router's own and its
-        # window is whatever the canonical listing said.
+        # window is whatever the canonical listing said -- stated at the one
+        # ceiling the client accepts when it is at or above 1M.
+        response = _response("claude-opus-5-5")
+        response["data"][0]["max_input_tokens"] = 1_048_576
+        rows = claude_desktop_listing.desktop_model_rows(response)["data"]
+        self.assertEqual(1_000_000, rows[0]["max_input_tokens"])
+
+    def test_a_claude_shaped_one_million_route_is_one_suffixed_row(self) -> None:
+        # The picker answers a Claude-shaped row it already knows with two
+        # entries -- ``Opus 5.5`` and ``Opus 5.5 1M`` -- and both name this
+        # router's one route.  Stating the window in the name instead keeps it
+        # one row, exactly as for an alias row, and the profile preference that
+        # would collapse the pair only exists on the machine running the client.
         response = _response("claude-opus-5-5")
         response["data"][0]["max_input_tokens"] = 1_000_000
         rows = claude_desktop_listing.desktop_model_rows(response)["data"]
-        self.assertEqual(1_000_000, rows[0]["max_input_tokens"])
+        self.assertEqual(1, len(rows))
+        self.assertEqual("claude-opus-5-5[1m]", rows[0]["id"])
+        self.assertEqual("claude-opus-5-5", rows[0]["display_name"])
+        self.assertEqual(
+            "claude-opus-5-5", resolve_alias(rows[0]["id"], ["claude-opus-5-5"])
+        )
+
+    def test_a_claude_shaped_row_is_never_suffixed_twice(self) -> None:
+        # A router can publish the client's own spelling as the public name.
+        response = _response("claude-opus-5-5")
+        response["data"][0]["id"] = "claude-opus-5-5[1m]"
+        response["data"][0]["display_name"] = "claude-opus-5-5[1m]"
+        response["data"][0]["max_input_tokens"] = 1_000_000
+        rows = claude_desktop_listing.desktop_model_rows(response)["data"]
+        self.assertEqual("claude-opus-5-5[1m]", rows[0]["id"])
+
+    def test_a_claude_shaped_route_below_one_million_keeps_its_bare_id(self) -> None:
+        response = _response("claude-opus-5-5")
+        response["data"][0]["max_input_tokens"] = 200_000
+        rows = claude_desktop_listing.desktop_model_rows(response)["data"]
+        self.assertEqual("claude-opus-5-5", rows[0]["id"])
+        self.assertEqual(200_000, rows[0]["max_input_tokens"])
 
     def test_an_image_generator_is_never_listed(self) -> None:
         rows = claude_desktop_listing.desktop_model_rows(

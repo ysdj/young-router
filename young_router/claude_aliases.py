@@ -126,6 +126,10 @@ _ALIAS_DIGEST = re.compile(r"[0-9a-f]{6}$")
 #: collapse, and the session still resolves the model at 1M.  Only the browser
 #: client's own discovery sees that id; every other caller keeps the public
 #: name, and ``context_suffix_free`` is how a request naming it is resolved.
+#:
+#: Every id that view publishes is either a derived alias or a public name the
+#: client already keeps as written, and both spell ``1m`` the same way here, so
+#: one resolver answers both: a suffixed id reaches the route it names.
 CONTEXT_SUFFIX = "[1m]"
 _CONTEXT_SUFFIX = re.compile(r"\[1m\]$", re.IGNORECASE)
 
@@ -229,24 +233,38 @@ def resolve_alias(model: object, public_names: Iterable[str]) -> str | None:
     is left for the router to answer as it always has.
 
     The picker's 1M spelling resolves too.  Desktop offers a route that reads
-    as 1M as ``<alias>`` plus ``<alias>[1m]`` and sends the suffixed id, which
-    is not a route this router serves: without this the chosen row answered
+    as 1M as ``<id>`` plus ``<id>[1m]`` and sends the suffixed id, which is not
+    a route this router serves: without this the chosen row answered
     ``Invalid model name`` (one real session picked the 1M row for 11 of its 12
     turns).  The suffix only selects a row in the client; it is stripped, so
     the public name reaches the router and the upstream exactly as before.
+
+    Both shapes the desktop view publishes are answered, because both can carry
+    the suffix: a derived alias, and a Claude-shaped public name the client
+    already keeps as written (``claude-opus-5-5[1m]``).  A served name is never
+    rewritten to a second served name: only an id the router does not serve,
+    whose unsuffixed reading is exactly one of its routes, resolves.
     """
 
     if not isinstance(model, str) or not model.strip():
         return None
     names = tuple(str(name or "").strip() for name in public_names)
+    raw = model.strip()
+    # A name the router serves is already addressed: the caller keeps it as
+    # written, even when it is one of the picker's suffixed spellings.
+    if raw in names:
+        return None
     index = alias_index(names)
     legacy = legacy_alias_index(names)
-    for text in (model.strip(), context_suffix_free(model)):
+    stripped = context_suffix_free(raw)
+    for text in (raw, stripped):
         if not text:
             continue
         resolved = index.get(text) or legacy.get(text)
         if resolved is not None:
             return resolved
+    if stripped != raw and stripped in names:
+        return stripped
     return None
 
 
