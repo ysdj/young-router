@@ -1292,6 +1292,23 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('accessibilityRole="radio"', self.native_controls)
         self.assertIn("export function NativeRadio(", self.native_controls)
 
+    def test_a_sign_in_reads_the_account_it_actually_landed_on(self) -> None:
+        """Core never writes a second row for one site and address.
+
+        The wizard asked with a pending id and then read that id's resources.
+        When the login landed on the station's existing account — which is the
+        normal case for signing in again, and the only case after 记住密码 — the
+        read targeted a row that was never created, and a sign-in that had just
+        succeeded reported 操作失败.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        self.assertIn("const landed = accounts.find((item) => item.id !== pendingID", wizard)
+        self.assertIn("const landedID = landed?.id ?? pendingID;", wizard)
+        self.assertIn("await relay.refreshResources(landedID, { force: true })", wizard)
+        self.assertIn("setSignedInAccountID(landedID);", wizard)
+        self.assertNotIn("relay.refreshResources(pendingID", wizard)
+
     def test_the_login_step_can_sign_in_a_second_account(self) -> None:
         """A station with an account already signed in still offers another.
 
@@ -5925,8 +5942,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("relayRefreshInFlight.current.delete(accountId);", refresh)
         # The station round trip after a sign-in is the one read that must not
         # come out of the reuse window, in the panel and in both host flows.
-        forced = [line for line in self.ui.splitlines() if "refreshResources(pendingID" in line]
-        self.assertEqual(2, len(forced))
+        forced = [line for line in self.ui.splitlines() if "refreshResources(landed?.id ?? pendingID" in line or "refreshResources(landedID" in line]
+        self.assertEqual(2, len(forced), "the wizard and the relay pane both read the account the login landed on")
         for line in forced:
             self.assertIn("{ force: true }", line)
 
@@ -8242,7 +8259,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('// The subscription, or the next pane action, repaints the staged row.')
         # The vendor sign-in binds the station it signed in to and states the
         # station read it actually got.
-        self.assert_ui_has('const resourceStatus = await relay.refreshResources(pendingID, { force: true });')
+        self.assert_ui_has('const resourceStatus = await relay.refreshResources(landed?.id ?? pendingID, { force: true });')
         self.assert_ui_has('const bound = await dispatchWithOutcome("provider.select_relay_station", { provider_id: id, station_id: stationID });')
         self.assert_ui_has('onStatus?.(translate(resourceStatus === "ready" ? "relay.loginComplete" : "relay.loginResourcesUnavailable"));')
         # An address that cannot bind because its station name is taken says so

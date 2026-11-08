@@ -362,6 +362,12 @@ const SERVICE_RATE_TTL_MS = 5 * 60 * 1000;
  */
 const QODER_STATUS_TIMEOUT_MS = 20_000;
 
+/** How tall the WebDAV child may become, and the least it is ever sized to. */
+const WEBDAV_WINDOW_MIN_HEIGHT = 380;
+const WEBDAV_WINDOW_MAX_HEIGHT = 760;
+/** What the footer and the window's own edges add to the measured form. */
+const WEBDAV_WINDOW_CHROME_HEIGHT = 58;
+
 /**
  * How long 退出登录 gives the pane to commit before leaving anyway.
  *
@@ -5138,20 +5144,31 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         if (signedInAccountID === pendingID) setSignedInAccountID(undefined);
         return;
       }
-      const status = await relay.refreshResources(pendingID, { force: true });
-      if (status !== "ready") setLoginFeedbackMessage(translate("relay.loginResourcesUnavailable"));
-      else setLoginFeedbackMessage(translate("relay.loginComplete"));
-      // Bind the vendor to the station so its keys become linkable.
+      // Which account this login produced.  It is the station's existing row
+      // whenever that address is already known — Core never writes a second
+      // account for the same site and address — so the id this flow asked with
+      // is often not the id that now exists.  Reading the resources of the
+      // pending id then failed against a row that was never created, and a
+      // sign-in that had just succeeded reported 操作失败.
       const next = await relay.refreshAccounts();
       const accounts = accountsFromSnapshot(next ?? undefined);
       const target = stationOriginKey(candidate);
+      const landed = accounts.find((item) => item.id !== pendingID
+        && stationOriginKey(item.origin) === target
+        && (result.username ? item.username === result.username : item.loginStatus === "signed_in"))
+        ?? accounts.find((item) => item.id === pendingID);
+      const landedID = landed?.id ?? pendingID;
+      const status = await relay.refreshResources(landedID, { force: true });
+      if (status !== "ready") setLoginFeedbackMessage(translate("relay.loginResourcesUnavailable"));
+      else setLoginFeedbackMessage(translate("relay.loginComplete"));
+      // Bind the vendor to the station so its keys become linkable.
       const boundAccount = accounts.find((item) => stationOriginKey(item.origin) === target);
-      const stationID = boundAccount?.stationID
+      const stationID = landed?.stationID ?? boundAccount?.stationID
         ?? stationsFromSnapshot(next ?? undefined, accounts).find((station) => stationOriginKey(station.origin) === target)?.id;
       if (providerID && stationID) {
         await dispatchWithOutcome("provider.select_relay_station", { provider_id: providerID, station_id: stationID });
       }
-      setSignedInAccountID(pendingID);
+      setSignedInAccountID(landedID);
       setLoginPhase("idle");
     } catch {
       if (request === setupLoginRequest.current) setLoginFeedbackMessage(translate("relay.operationFailed"));
@@ -5546,7 +5563,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const wizardBusy = busy || processing || loginBusy;
   return <View style={styles.providerWizardSurface} accessibilityViewIsModal>
     <View style={styles.providerWizardSetupContent}>
-      <View style={[styles.providerWizardSetupSurface, step === "model" && styles.providerWizardSetupSurfaceModel]}>
+      <View style={[styles.providerWizardSetupSurface, (step === "model" || (step === "keys" && providedChoices.length > 0)) && styles.providerWizardSetupSurfaceFill]}>
         {/* The progress rail already names the wizard, and its active step
             names what this window is configuring: a title restating that plus
             a sentence about the steps the rail itself draws is the redundant
@@ -9263,17 +9280,25 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
         onStatus?.(translate("relay.loginNotCompleted"));
         return;
       }
+      // Whose resources to read: signing in to a station this window already
+      // knows lands on that row, not on the id this flow asked with, and the
+      // read of a row that was never created is what turned a successful
+      // sign-in into an error line.
+      const next = await relay.refreshAccounts();
+      const accounts = accountsFromSnapshot(next ?? undefined);
+      const targetOrigin = stationOriginKey(origin);
+      const landed = accounts.find((item) => item.id !== pendingID
+        && stationOriginKey(item.origin) === targetOrigin
+        && (result.username ? item.username === result.username : item.loginStatus === "signed_in"))
+        ?? accounts.find((item) => item.id === pendingID);
       // Resource discovery is reported, not assumed: the sign-in succeeded
       // either way, but a station whose keys could not be read says so instead
       // of claiming 登录成功 over an empty key list.
-      const resourceStatus = await relay.refreshResources(pendingID, { force: true });
+      const resourceStatus = await relay.refreshResources(landed?.id ?? pendingID, { force: true });
       // Bind this vendor to the station it just signed in to, the way the
       // wizard binds the vendor it creates: that is what makes the station's
       // keys linkable here, and it is why the pane does not depend on the
       // workspace's background rebind (which skips a name collision silently).
-      const next = await relay.refreshAccounts();
-      const accounts = accountsFromSnapshot(next ?? undefined);
-      const targetOrigin = stationOriginKey(origin);
       const boundAccount = accounts.find((item) => stationOriginKey(item.origin) === targetOrigin);
       const stationID = boundAccount?.stationID
         ?? stationsFromSnapshot(next ?? undefined, accounts).find((item) => stationOriginKey(item.origin) === targetOrigin)?.id;
@@ -11615,8 +11640,20 @@ function WebDavSettingsPanel({ snapshot, busy, status, translate, onSecretState,
   useEffect(() => {
     if (!comparing) return undefined;
     onSetContentSize(900, 620);
-    return () => onSetContentSize(600, 470);
+    return () => onSetContentSize(600, fittedHeight.current || WEBDAV_WINDOW_MIN_HEIGHT);
   }, [comparing]);
+  // The form is not the window: a six-field page in a 470 pt window left a
+  // third of the child empty under the last row.  The content reports its own
+  // height and the window takes it, within a floor and a ceiling so a long
+  // help text cannot turn this into a full-screen sheet.
+  const fittedHeight = useRef(0);
+  const fitWindowHeight = (contentHeight: number): void => {
+    if (comparing || !Number.isFinite(contentHeight) || contentHeight <= 0) return;
+    const wanted = Math.round(Math.min(WEBDAV_WINDOW_MAX_HEIGHT, Math.max(WEBDAV_WINDOW_MIN_HEIGHT, contentHeight + WEBDAV_WINDOW_CHROME_HEIGHT)));
+    if (Math.abs(wanted - fittedHeight.current) < 4) return;
+    fittedHeight.current = wanted;
+    onSetContentSize(600, wanted);
+  };
   // The native secure field stages the password through Core as it is typed;
   // its value never enters this process. It is still part of this one draft,
   // so a save that changed nothing else must apply it (and 关闭 drops it).
@@ -11716,7 +11753,7 @@ function WebDavSettingsPanel({ snapshot, busy, status, translate, onSecretState,
     />;
   }
   return <View style={styles.webdavDialogSurface} accessibilityViewIsModal>
-    <PersistentScrollView style={styles.webdavDialogBody} contentContainerStyle={styles.webdavDialogBodyContent} keyboardShouldPersistTaps="handled">
+    <PersistentScrollView style={styles.webdavDialogBody} contentContainerStyle={styles.webdavDialogBodyContent} keyboardShouldPersistTaps="handled" onContentSizeChange={(_width, height) => fitWindowHeight(height)}>
       <View style={styles.webdavFieldList}>
         <WebDavField label={translate("webdav.enabled")}>
           <NativeToggle accessibilityLabel={translate("webdav.enabled")} value={values.enabled} disabled={waiting} onValueChange={(enabled) => update({ enabled })} style={styles.webdavFieldSwitch} />
@@ -15352,7 +15389,7 @@ const styles = StyleSheet.create({
   // on one x and both rows start on the field labels' own x.
   settingsActionRow: { minHeight: 36, flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 4, paddingLeft: SETTINGS_FIELD_LEAD }, settingsActionRowCopy: { flex: 1, minWidth: 0, gap: 1 }, settingsActionRowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE }, settingsActionRowFacts: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 12 }, settingsActionRowFact: { flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }, settingsActionRowFactFailed: { color: systemColors.red }, settingsActionRowNote: { flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }, settingsActionRowAction: { flexShrink: 0 },
   generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalServiceAction: { minWidth: 72 }, generalWebAddress: { flex: 1, minWidth: 0 }, generalWebAddressText: { color: systemColors.link }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, toolbarSpacer: { flex: 1 }, windowTabsRow: { flex: 1, minWidth: 0, height: 28, flexDirection: "row", alignItems: "center", gap: 8 }, windowTabsToolbarRow: { flex: 1, minWidth: 0, width: "100%", height: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6, overflow: "hidden" }, windowTabs: { width: 224, height: 24 }, windowTabsWithActions: { flexShrink: 1 }, windowTabsActions: { flex: 1, minWidth: 0, maxWidth: 400, marginLeft: "auto", flexShrink: 0 },
-  providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceModel: { flex: 1, minHeight: 0 }, providerWizardSignInPanel: { width: "100%", minHeight: 160, justifyContent: "center", gap: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, backgroundColor: systemColors.control, paddingHorizontal: 16, paddingVertical: 18 }, providerWizardAuthRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAuthStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
+  providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceFill: { flex: 1, minHeight: 0 }, providerWizardSignInPanel: { width: "100%", minHeight: 160, justifyContent: "center", gap: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, backgroundColor: systemColors.control, paddingHorizontal: 16, paddingVertical: 18 }, providerWizardAuthRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAuthStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
   providerMiddlePane: { flex: 1, minWidth: 0, gap: 6 }, // The empty pane reads as the top of a list that has no rows yet, not as a
   // poster centred in a large window: it keeps the column's width and the
   // window's whole height (a `flex: 1` the sibling panes rely on), but packs its
