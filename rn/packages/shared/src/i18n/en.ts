@@ -948,6 +948,7 @@ export const en: Record<TranslationKey, string> = {
   "relay.goLogin": "Sign in",
   "relay.refreshResources": "Refresh Resources",
   "relay.loginWorking": "Complete sign-in in this window. On success, you will return to Service Provider Management.",
+  "relay.signInWindowHint": "The station opened its sign-in page in its own window; finish there and this window returns by itself.",
   "relay.loginComplete": "Signed in. Matching providers now show these API keys automatically.",
   "relay.loginResourcesUnavailable": "Signed in, but API resources could not be loaded. Select Refresh Resources to retry.",
   "relay.loginNotCompleted": "Sign-in was cancelled or no valid sign-in was detected.",

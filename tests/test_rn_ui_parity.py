@@ -1276,6 +1276,22 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('{...modelProbeProps(providerId, editorIdentifier(model), probeInputFingerprint(providerBaseURL(provider), modelUpstreamDisplay(providerId, model), model))}')
         self.assert_ui_not_has('{...modelProbeProps(providerId, editorIdentifier(model))}')
 
+    def test_one_key_out_of_many_is_a_radio_list_that_scrolls(self) -> None:
+        """Nineteen keys, one answer, and a window that cannot grow to fit them.
+
+        The list was a plain View of checkboxes: an exact-count list read as
+        "any number of these", and the rows past the fold could not be reached
+        at all.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        self.assertIn('<NativeRadio\n                      key={value}', wizard)
+        self.assertIn('<PersistentScrollView style={styles.providerWizardModelListScroll} contentContainerStyle={styles.providerWizardModelList} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">', wizard)
+        # The control itself is a radio to a screen reader, and a radio is what
+        # the drawn box says.
+        self.assertIn('accessibilityRole="radio"', self.native_controls)
+        self.assertIn("export function NativeRadio(", self.native_controls)
+
     def test_the_login_step_can_sign_in_a_second_account(self) -> None:
         """A station with an account already signed in still offers another.
 
@@ -5504,9 +5520,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
         # One standalone wheel per branch (the official account's roster, the
-        # lane's roster, and the generic listing), and the buttons that start
-        # those reads draw none of their own for the same wait.
-        self.assertEqual(3, wizard.count("<NativeBusySpinner"))
+        # lane's roster, the generic listing) plus the sign-in wait, and the
+        # buttons that start those reads draw none of their own for the same
+        # wait.
+        self.assertEqual(4, wizard.count("<NativeBusySpinner"))
         self.assertNotIn('busy={modelFetchState === "loading"}', wizard)
         self.assertNotIn("providerWizardModelLoading", wizard)
         self.assertNotIn("providerWizardModelLoading", self.ui)
@@ -8054,7 +8071,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("pendingAccount: true,", wizard)
         self.assertNotIn("await relay.addAccount(", wizard)
         self.assertNotIn('relay.commit("account.delete"', wizard)
-        self.assertIn("embedded: true,", wizard)
+        # The station's page is its own window: embedding it made the wizard a
+        # mostly blank window with a whole site loading inside its body.
+        self.assertIn("embedded: false,", wizard)
+        self.assertIn('translate("relay.signInWindowHint")', wizard)
         self.assertIn("native.cancelRelayLogin();", wizard)
         self.assertIn('provider.select_relay_station', wizard)
         # Login providers keep the official device-code flow on the keys step.

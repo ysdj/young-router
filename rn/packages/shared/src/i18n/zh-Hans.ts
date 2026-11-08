@@ -959,6 +959,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "relay.goLogin": "去登录",
   "relay.refreshResources": "刷新",
   "relay.loginWorking": "请在当前窗口完成登录，成功后将返回服务商管理。",
+  "relay.signInWindowHint": "站点登录页已在单独的窗口中打开，请在那里完成登录；成功后自动返回。",
   "relay.loginComplete": "登录成功。基础 URL 匹配的供应商会自动显示这些 API 密钥。",
   "relay.loginResourcesUnavailable": "登录成功，但无法加载 API 资源。请点击“刷新”重试。",
   "relay.loginNotCompleted": "登录已取消，或未检测到有效登录状态。",

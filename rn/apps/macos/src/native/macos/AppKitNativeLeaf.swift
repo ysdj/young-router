@@ -1829,7 +1829,8 @@ private enum NativeRelayOriginPolicy {
             normalized.path = path.isEmpty ? "" : "/" + path
             return normalized.url ?? originURL
         } ?? originURL
-        let embeddedWindow = embedded ? routeWindows["provider-wizard"].flatMap { $0.contentView == nil ? nil : $0 } : nil
+        let wizardWindow = routeWindows["provider-wizard"]
+        let embeddedWindow = embedded ? wizardWindow.flatMap { $0.contentView == nil ? nil : $0 } : nil
         guard !embedded || embeddedWindow != nil else {
             completion(nil)
             return
@@ -1840,7 +1841,11 @@ private enum NativeRelayOriginPolicy {
         let embeddedClose: (() -> Void)? = embedded ? { [weak self] in
             self?.close(route: "provider-wizard")
         } : nil
-        let presentationParent = embeddedWindow == nil ? settingsWindow() : nil
+        // A sign-in opened from the wizard is the wizard's child panel, so it
+        // draws above that window and the wizard stays locked behind it.  It
+        // used to be attached to the settings window, which put the panel
+        // behind the wizard that had just asked for it.
+        let presentationParent = embeddedWindow ?? wizardWindow ?? settingsWindow()
         let controller = NativeRelayLoginController(
             accountID: accountID,
             type: type,

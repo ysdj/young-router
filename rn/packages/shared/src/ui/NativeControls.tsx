@@ -187,6 +187,14 @@ function StaticBooleanIndicator({ value }: { value: boolean }): React.JSX.Elemen
   return <View style={[styles.staticBooleanIndicator, value && styles.staticBooleanIndicatorChecked]}><Text style={styles.staticBooleanIndicatorText}>{value ? "x" : ""}</Text></View>;
 }
 
+type RadioProps = {
+  label: string;
+  value: boolean;
+  disabled?: boolean;
+  onValueChange?: (value: boolean) => void;
+  style?: StyleProp<ViewStyle>;
+};
+
 type PickerProps = {
   labels: string[];
   selectedValue: string;
@@ -717,6 +725,32 @@ export function NativeCheckbox({ label, value, disabled, compact = true, labelVi
     return <AppKitCheckbox label={label} labelVisible={labelVisible} value={value} disabled={disabled} compact={compact} onValueChange={onValueChange} style={sizedStyle} />;
   }
   return <Pressable style={[styles.checkboxFallback, sizedStyle]} disabled={disabled} onPress={() => onValueChange?.(!value)} accessibilityRole="checkbox" accessibilityLabel={label} accessibilityState={{ checked: value, disabled }}><StaticBooleanIndicator value={value} />{labelVisible ? <Text style={styles.controlText}>{label}</Text> : null}</Pressable>;
+}
+
+/**
+ * One choice out of a list, drawn as a radio.
+ *
+ * A checklist says "any number of these"; a station hands out one key per
+ * provider, so the list of them is one answer, not several.  The box is drawn
+ * rather than taken from AppKit because the only native radio this app could
+ * reach is a control inside a table cell: the same geometry is what a window,
+ * a page, and Windows all show, and it keeps the row height and the hit target
+ * the checkbox rows already have.
+ */
+export function NativeRadio({ label, value, disabled, onValueChange, style }: RadioProps): React.JSX.Element {
+  return <Pressable
+    style={[styles.radioRow, style]}
+    disabled={disabled}
+    onPress={() => { if (!value) onValueChange?.(true); }}
+    accessibilityRole="radio"
+    accessibilityLabel={label}
+    accessibilityState={{ checked: value === true, disabled: disabled === true }}
+  >
+    <View style={[styles.radioBox, value === true && styles.radioBoxChecked, disabled === true && styles.radioBoxDisabled]}>
+      {value === true ? <View style={[styles.radioDot, disabled === true && styles.radioDotDisabled]} /> : null}
+    </View>
+    <Text numberOfLines={1} style={styles.controlText}>{label}</Text>
+  </Pressable>;
 }
 
 export function NativePicker({ labels, selectedValue, disabled, compact = true, overlayLayer = false, accessibilityLabel, onChange, style }: PickerProps): React.JSX.Element {
@@ -1686,6 +1720,14 @@ const styles = StyleSheet.create({
   segmented: { minHeight: 24 },
   toggleFallback: { minWidth: 24, minHeight: 24, justifyContent: "center" },
   checkboxFallback: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 },
+  // A radio's own box: 13 pt at 1 pt stroke matches the checkbox beside it, and
+  // the dot is the selection state a screen reader hears as `checked`.
+  radioRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 },
+  radioBox: { width: 13, height: 13, borderRadius: 6.5, borderWidth: 1, borderColor: WINDOWS_CONTROL.stroke, alignItems: "center", justifyContent: "center" },
+  radioBoxChecked: { borderColor: WINDOWS_CONTROL.accent },
+  radioBoxDisabled: { borderColor: WINDOWS_CONTROL.strokeSubtle },
+  radioDot: { width: 7, height: 7, borderRadius: 3.5, backgroundColor: WINDOWS_CONTROL.accent },
+  radioDotDisabled: { backgroundColor: WINDOWS_CONTROL.stroke },
   staticBooleanIndicator: { width: 16, height: 16, borderWidth: 1, borderColor: WINDOWS_CONTROL.strokeStrong, alignItems: "center", justifyContent: "center", backgroundColor: WINDOWS_CONTROL.fill },
   staticBooleanIndicatorChecked: { backgroundColor: WINDOWS_CONTROL.accentSubtle, borderColor: WINDOWS_CONTROL.accent },
   staticBooleanIndicatorText: { fontSize: UI_TIP_FONT_SIZE, lineHeight: 14, color: WINDOWS_CONTROL.text, fontWeight: "700" },

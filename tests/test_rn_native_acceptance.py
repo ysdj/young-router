@@ -1923,9 +1923,14 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # and the window keeps its own title-bar close button.
         self.assertIn('embeddedWindow: embeddedWindow,', mac_leaf)
         self.assertNotIn("sheetParent", mac_leaf)
-        self.assertIn('let presentationParent = embeddedWindow == nil ? settingsWindow() : nil', mac_leaf)
+        # The sign-in panel is a child of the window that asked for it: the
+        # wizard's own window when it is open, never the settings window the
+        # wizard is floating over.
+        self.assertIn('let presentationParent = embeddedWindow ?? wizardWindow ?? settingsWindow()', mac_leaf)
         self.assertIn("presentChildPanel(panel, in: presentationParent", mac_leaf)
-        self.assertIn("embedded: true,", wizard_ui)
+        # The station's own window, and a waiting panel in the wizard's body:
+        # an embedded page made the wizard a mostly blank window.
+        self.assertIn("embedded: false,", wizard_ui)
         self.assertIn("suggestedRelayStationName(candidate)", wizard_ui)
         # The relay family is auto-detected; no manual type state survives.
         self.assertNotIn("manualType", wizard_ui)
@@ -2104,7 +2109,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("presentChildPanel(window, in: settingsWindow())", mac_leaf)
         self.assertIn("@objc private func closeEmbeddedWindow", mac_leaf)
         self.assertIn('self?.close(route: "provider-wizard")', mac_leaf)
-        self.assertIn('routeWindows["provider-wizard"].flatMap', mac_leaf)
+        self.assertIn('let wizardWindow = routeWindows["provider-wizard"]', mac_leaf)
+        self.assertIn("wizardWindow.flatMap", mac_leaf)
         self.assertNotIn('text("Check Sign-In", "检查登录")', mac_leaf)
         self.assertIn('text("No valid sign-in was found.', mac_leaf)
         self.assertIn('L"Verify Sign-In", L"验证登录"', windows_relay)

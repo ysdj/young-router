@@ -5,7 +5,7 @@ import { createTranslator } from "../i18n";
 import { assistantSettingOptions, type AssistantSettingOption } from "../i18n/assistantSettingsI18n";
 import { runtimeCategoryLabel, runtimeFieldHelp, runtimeFieldLabel, runtimeOptionLabel, runtimeUnitLabel } from "../i18n/runtimeSettingsI18n";
 import { canonicalWindowRoute, isSettingsPaneRoute, isSettingsShellRoute, LOG_TABS, routeMenuActions, ROUTES, SETTINGS_PANES, SETTINGS_PANE_PRESENTATION } from "../routes";
-import { NativeButton, NativeBusySpinner, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeSecureTextInput, NativeSegmentedControl, NativeTable, NativeTextField, NativeToggle, WINDOWS_CONTROL, nativeControlTextWidth } from "./NativeControls";
+import { NativeButton, NativeBusySpinner, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeRadio, NativeSecureTextInput, NativeSegmentedControl, NativeTable, NativeTextField, NativeToggle, WINDOWS_CONTROL, nativeControlTextWidth } from "./NativeControls";
 import { CodeEditorWebView, editorMenuLabels, readOnlyCodeEditorHtml, type CodeEditorLanguage } from "./code-editor/CodeEditorWebView";
 import { modelGroupRowKey, modelIDFromRowKey, modelRowKey } from "./modelRowKeys";
 import { groupRoutesByPublicModel, importNeedsNameCase, publicModelKey } from "./publicModelNames";
@@ -4442,11 +4442,11 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     // the poll on label or status changes is safe.
   }, [dispatchWithOutcome, isLoginType, officialStatus, providerID, providerType, selectedProviderName, translate]);
 
-  // Keep window geometry aligned with the embedded sign-in step.
+  // The sign-in page has a window of its own, so this one keeps the size its
+  // step needs instead of growing to fit a page it no longer shows.
   useEffect(() => {
     if (Platform.OS === "windows") return;
-    const showingSignIn = loginPhase === "sign-in";
-    void native.window.setContentSize?.("provider-wizard", showingSignIn ? 900 : 620, showingSignIn ? 620 : 460);
+    void native.window.setContentSize?.("provider-wizard", 620, 460);
   }, [loginPhase, native.window]);
 
   useEffect(() => {
@@ -5125,7 +5125,11 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         stationName: (stationForProvider?.name ?? suggestedRelayStationName(candidate)) || candidate,
         stationType: accountType,
         stationOrigin: candidate,
-        embedded: true,
+        // Its own window, not this one: an embedded page turned the wizard
+        // into a mostly blank window while a full site loaded inside it, and
+        // the station's form then shared a frame with a step rail that no
+        // longer applied to it.
+        embedded: false,
       });
       const cancelled = request !== setupLoginRequest.current;
       if (cancelled) return;
@@ -5536,6 +5540,9 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const selectedProviderPickerLabel = providerOptions.find((option) => option.value === providerSelection)?.label ?? providerPickerLabels[0] ?? "";
   const keyPickerLabels = keyOptions.map((option) => option.label);
   const selectedKeyPickerLabel = keyOptions.find((option) => option.value === activeKeySelection)?.label ?? keyPickerLabels[0] ?? "";
+  // The origin the sign-in window is showing, so the waiting panel names the
+  // site the person is looking at in the other window.
+  const relayLoginStation = normalizeRelayOrigin(activeProviderBaseURL) || activeProviderBaseURL.trim();
   const wizardBusy = busy || processing || loginBusy;
   return <View style={styles.providerWizardSurface} accessibilityViewIsModal>
     <View style={styles.providerWizardSetupContent}>
@@ -5546,7 +5553,15 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
             in-content heading the compact density forbids. */}
         <NativeWizardProgress steps={stepItems.map((item) => item.title)} activeIndex={stepItems.findIndex((item) => item.id === step)} />
         {loginPhase === "sign-in" ? <View style={styles.providerWizardSignInPanel}>
-          <Text style={styles.providerWizardPanelTitle}>{translate("relay.stepSignIn")}</Text>
+          <View style={styles.providerWizardAuthRow}>
+            <NativeBusySpinner label={translate("relay.stepSignIn")} />
+            <Text style={styles.providerWizardPanelTitle}>{translate("relay.stepSignIn")}</Text>
+          </View>
+          <Text numberOfLines={1} style={styles.providerWizardHint}>{relayLoginStation || translate("common.notAvailable")}</Text>
+          <Text style={styles.providerWizardHint}>{translate("relay.signInWindowHint")}</Text>
+          <View style={styles.providerWizardAuthRow}>
+            <NativeButton title={translate("status.cancel")} compact onPress={cancelRelaySignIn} />
+          </View>
         </View> : <>
         {step === "provider" ? <View style={styles.providerWizardFormSection}>
           <NativeFormRow label={translate("providers.wizard.providerType")}>
@@ -5598,10 +5613,14 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
               </View>
               {providedChoices.length > 0 ? <>
                 <Text style={styles.providerWizardHint}>{translate("providers.wizard.providedKeysHint", { count: providedChoices.length })}</Text>
-                <View style={styles.providerWizardModelList}>
+                {/* One key goes on to become the provider's, so the choice is a
+                    radio list, and it is the one list on this step that can be
+                    longer than the window: a plain View drew nineteen rows with
+                    no way to reach the ones below the fold. */}
+                <View style={styles.providerWizardModelListFrame}><PersistentScrollView style={styles.providerWizardModelListScroll} contentContainerStyle={styles.providerWizardModelList} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">
                   {providedChoices.map((source) => {
                     const value = `relay:${relaySourceSelectionID(source)}`;
-                    return <NativeCheckbox
+                    return <NativeRadio
                       key={value}
                       label={relaySourceName(source) || source.resourceLabel}
                       value={(selectedProvidedChoice && `relay:${relaySourceSelectionID(selectedProvidedChoice)}`) === value}
@@ -5610,7 +5629,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                       style={styles.providerWizardModelCheckbox}
                     />;
                   })}
-                </View>
+                </PersistentScrollView></View>
               </> : <>
                 {/* The row above already says whether anyone is signed in, so
                     this states only what the press will do. */}

@@ -915,6 +915,7 @@ export type TranslationKey =
   | "relay.goLogin"
   | "relay.refreshResources"
   | "relay.loginWorking"
+  | "relay.signInWindowHint"
   | "relay.loginComplete"
   | "relay.loginResourcesUnavailable"
   | "relay.loginNotCompleted"
