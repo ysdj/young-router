@@ -12,19 +12,19 @@ from .core import (
     MANIFEST_MAX_BYTES,
     Settings,
     SyncError,
+    SyncSnapshot,
     WebDAVClient,
     WebDAVHTTPError,
-    _expected_bundle_files,
     _validate_bundle_header,
     archived_bundle_name,
     build_digest_record,
-    build_manifest_and_digests,
+    bundle_snapshot,
     bundle_url,
     collection_url,
-    content_digest,
-    create_bundle_and_digests,
+    create_bundle,
     digests_url,
     install_bundle,
+    local_snapshot,
     manifest_name,
     manifest_url,
     manifests_match,
@@ -33,6 +33,7 @@ from .core import (
     remote_sibling_url,
     save_conflict_record,
     save_sync_state,
+    smart_sync_plan,
 )
 
 def print_manifest_summary(prefix: str, manifest: dict[str, Any]) -> None:
@@ -45,12 +46,6 @@ def print_manifest_summary(prefix: str, manifest: dict[str, Any]) -> None:
     )
 
 
-def create_outbound_bundle(
-    config_path: pathlib.Path,
-) -> tuple[bytes, dict[str, Any], dict[str, str | None], str]:
-    bundle_data, manifest, digests = create_bundle_and_digests(config_path)
-    bundle_content_type = "application/json; charset=utf-8"
-    return bundle_data, manifest, digests, bundle_content_type
 
 
 def read_remote_manifest(client: WebDAVClient, settings: Settings) -> dict[str, Any] | None:
@@ -104,8 +99,7 @@ def read_remote_digests(
 def publish_remote_digests(
     client: WebDAVClient,
     settings: Settings,
-    manifest: dict[str, Any],
-    digests: dict[str, str | None],
+    snapshot: SyncSnapshot,
 ) -> bool:
     """Write the record that lets the next run compare content, not bytes.
 
@@ -115,10 +109,12 @@ def publish_remote_digests(
     and no sync fails over a record that is only an optimization.
     """
 
+    if snapshot.manifest is None or snapshot.digests is None:
+        return False
     try:
         client.put(
             digests_url(settings),
-            build_digest_record(manifest, digests),
+            build_digest_record(snapshot.manifest, snapshot.digests),
             "application/json; charset=utf-8",
         )
     except Exception:
@@ -126,21 +122,12 @@ def publish_remote_digests(
     return True
 
 
-def remote_digests_from_bundle(
+def remote_snapshot_from_bundle(
     client: WebDAVClient,
     settings: Settings,
     remote_manifest: dict[str, Any],
-) -> dict[str, str | None] | None:
-    """The compared digests of the remote bundle, read from its own content.
-
-    Used where the sidecar record is missing or was written for another
-    manifest: a remote built by an earlier version has none, and the first run
-    after an upgrade must not read an observation as an edit just because the
-    record has not been published yet.  The bundle has to be downloaded for
-    that answer, which is the download the conflict branch would make anyway;
-    a bundle whose manifest is not the one just compared is not mixed in, so a
-    stale sidecar can never lend its identity to other bytes.
-    """
+) -> SyncSnapshot | None:
+    """The remote side read from its bundle, when the bundle is that manifest."""
 
     try:
         bundle_data = client.get(bundle_url(settings), max_bytes=CONFIG_BUNDLE_MAX_BYTES)
@@ -149,10 +136,54 @@ def remote_digests_from_bundle(
         return None
     if not manifests_match(bundle_manifest, remote_manifest):
         return None
-    return {
-        name: (content_digest(name, files[name]) if name in files else None)
-        for name in _expected_bundle_files()
-    }
+    return bundle_snapshot(bundle_manifest, files)
+
+
+def remote_snapshot(
+    client: WebDAVClient,
+    settings: Settings,
+    remote_manifest: dict[str, Any] | None,
+) -> SyncSnapshot:
+    """The remote side, with whatever its digest record says about it.
+
+    One read of the sidecar answers for the whole side; a manifest with no
+    record, or one written for another manifest, is a side that compares by
+    bytes.  The bundle is not downloaded here: ``decide_sync`` asks for it only
+    when the byte comparison would stop the run, which is the only case where
+    the answer changes what happens.
+    """
+
+    if remote_manifest is None:
+        return SyncSnapshot(None)
+    return SyncSnapshot(remote_manifest, read_remote_digests(client, settings, remote_manifest))
+
+
+def decide_sync(
+    client: WebDAVClient,
+    settings: Settings,
+    local: SyncSnapshot,
+    remote: SyncSnapshot,
+    base: SyncSnapshot,
+) -> tuple[str, SyncSnapshot]:
+    """The plan for these sides, and the remote side that plan was made on.
+
+    The remote's digest record is an optimization the server may not have: a
+    collection that refuses the file, a bundle published before the record
+    existed.  Without it the comparison falls back to bytes, which reads the
+    relay store's own poll as an edit on both ends and would stop a run where
+    only one side moved.  So a plan that stops is asked again once with the
+    digests the bundle itself proves -- that bundle is what the conflict branch
+    downloads anyway, and the caller gets back the side the plan was made on so
+    the baseline it saves describes the content it actually compared.
+    """
+
+    plan = smart_sync_plan(local, remote, base)
+    if plan != "conflict" or remote.digests is not None or remote.manifest is None:
+        return plan, remote
+    from_bundle = remote_snapshot_from_bundle(client, settings, remote.manifest)
+    if from_bundle is None:
+        return plan, remote
+    return smart_sync_plan(local, from_bundle, base), from_bundle
 
 
 def read_manifest_from_remote_bundle(client: WebDAVClient, settings: Settings) -> dict[str, Any]:
@@ -269,12 +300,13 @@ def push_bundle(
     action: str = "push",
 ) -> tuple[int, dict[str, Any]]:
     remote_bundle_url = bundle_url(settings)
-    bundle_data, manifest, digests, bundle_content_type = create_outbound_bundle(config_path)
+    bundle_data, snapshot = create_bundle(config_path)
+    manifest = snapshot.manifest or {}
     manifest_data = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
-    digest_data = build_digest_record(manifest, digests)
+    digest_data = build_digest_record(manifest, snapshot.digests or {})
 
     client.try_mkcol(collection_url(settings))
-    client.put(remote_bundle_url, bundle_data, bundle_content_type)
+    client.put(remote_bundle_url, bundle_data, "application/json; charset=utf-8")
     try:
         client.put(manifest_url(settings), manifest_data, "application/json; charset=utf-8")
     except WebDAVHTTPError as exc:
@@ -291,7 +323,7 @@ def push_bundle(
             if exc.code not in {403, 404, 405, 409, 500, 502, 503, 504}:
                 raise
     if state_path is not None:
-        save_sync_state(state_path, settings, manifest, action, digests)
+        save_sync_state(state_path, settings, snapshot, action)
     return len(bundle_data), manifest
 
 
@@ -319,44 +351,35 @@ def pull_bundle(
     remote_bundle_url = bundle_url(settings)
     if skip_when_unchanged and config_path.exists():
         try:
-            local_manifest, local_digests = build_manifest_and_digests(config_path)
-            remote_manifest = read_remote_manifest(client, settings)
-            remote_digests = (
-                read_remote_digests(client, settings, remote_manifest)
-                if remote_manifest is not None
-                else None
-            )
+            local = local_snapshot(config_path)
+            remote = remote_snapshot(client, settings, read_remote_manifest(client, settings))
         except SyncError:
-            remote_manifest = None
+            remote = SyncSnapshot(None)
         else:
-            if remote_manifest is not None and manifests_match(
-                local_manifest, remote_manifest, local_digests, remote_digests
-            ):
+            if remote.manifest is not None and local.matches(remote):
+                # The bytes matched, so this side's digests describe the remote
+                # too.  Stating them for the run keeps the next comparison off
+                # the raw bytes, and publishing them keeps the other machine's
+                # next run off them as well.
+                agreed = SyncSnapshot(remote.manifest, remote.digests or local.digests)
                 if state_path is not None:
-                    save_sync_state(
-                        state_path,
-                        settings,
-                        remote_manifest,
-                        action,
-                        remote_digests or local_digests,
-                    )
-                if remote_digests is None:
-                    # The bytes matched, so the local digests describe the
-                    # remote too; publishing them keeps the next run from
-                    # comparing observations to edits.
-                    publish_remote_digests(client, settings, remote_manifest, local_digests)
+                    save_sync_state(state_path, settings, agreed, action)
+                if remote.digests is None:
+                    publish_remote_digests(client, settings, agreed)
                 return {
-                    "manifest": remote_manifest,
-                    "digests": remote_digests or local_digests,
+                    "manifest": agreed.manifest,
+                    "digests": agreed.digests,
+                    "snapshot": agreed,
                     "installed": [],
                     "removed": [],
                     "backups": [],
                 }
     bundle_data = client.get(remote_bundle_url, max_bytes=CONFIG_BUNDLE_MAX_BYTES)
     result = install_bundle(bundle_data, config_path)
+    snapshot = result["snapshot"]
     if state_path is not None:
-        save_sync_state(state_path, settings, result["manifest"], action, result["digests"])
+        save_sync_state(state_path, settings, snapshot, action)
     # A pull has the bundle in hand, so the record can always be stated for the
     # manifest it came with -- even when this run installed nothing new.
-    publish_remote_digests(client, settings, result["manifest"], result["digests"])
+    publish_remote_digests(client, settings, snapshot)
     return result

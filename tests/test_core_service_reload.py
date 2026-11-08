@@ -1166,7 +1166,7 @@ class WebDAVPullReloadTests(unittest.TestCase):
             # The baseline is what this Mac last synced, and the remote has
             # moved since: the comparison owes a pull, and the loop runs it
             # without being told a direction.
-            baseline = webdav_core.build_manifest(config_path)
+            baseline = webdav_core.local_snapshot(config_path).manifest
             webdav_core.save_sync_state(root / "webdav-state.json", webdav.sync_settings(), baseline, "sync")
             remote_manifest = json.loads(json.dumps(baseline))
             for entry in remote_manifest["files"]:

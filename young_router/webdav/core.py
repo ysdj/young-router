@@ -782,6 +782,17 @@ def sync_targets(config_path: pathlib.Path) -> list[tuple[str, pathlib.Path, boo
 #: had merely observed.  The sync compares what a reader set; a session still
 #: travels inside a bundle that a real change produced, and each machine keeps
 #: the fresher copy of what it observed (``_merge_relay_accounts``).
+#:
+#: The list is deliberately short and explicit, and it lives here rather than
+#: being derived from the relay domain's own schema.  `resources` and `groups`
+#: must stay excluded even though a staged rename or group pick is written
+#: inside them: the poll rewrites those same two fields from the station's
+#: answer, and the journal that names the reader's work
+#: (`relay-apply-operations.json`) is not part of the bundle.  Deriving the list
+#: from the account schema would pull both back in and turn every station read
+#: into an edit again.  A field joining the store later enters the comparison by
+#: default, which is the safe direction: an unknown field that only a poll
+#: writes can show up as a conflict, never as an edit silently dropped.
 RELAY_OBSERVATION_FIELDS = frozenset(
     {
         "balance",
@@ -813,6 +824,11 @@ def _durable_relay_bytes(data: bytes) -> bytes | None:
     ``None`` when the file is not a JSON object: the caller then compares the
     bytes it has, so an unreadable document never matches a readable one by
     pretending to hold nothing.
+
+    The rows are keyed and sorted here rather than left as the writer emitted
+    them, because two machines produce the same content in different orders: a
+    station that lists its keys in its own order, a group catalog that arrives
+    re-sorted.  Order is the writer's, content is the reader's.
     """
 
     try:
@@ -861,6 +877,24 @@ def content_digest(name: str, data: bytes) -> str:
         if durable is not None:
             return _sha256_bytes(durable)
     return _sha256_bytes(data)
+
+
+def bundle_snapshot(manifest: dict[str, Any], files: dict[str, bytes]) -> SyncSnapshot:
+    """The side a bundle describes: its manifest and the digests it compares by.
+
+    A bundle carries the bytes its manifest hashed, so the digests are read from
+    the same content the manifest names rather than from whatever is on disk
+    after the install.  A file the bundle does not carry has no digest, which is
+    the same value an absent file has everywhere else in the comparison.
+    """
+
+    return SyncSnapshot(
+        manifest,
+        {
+            name: (content_digest(name, files[name]) if name in files else None)
+            for name in _expected_bundle_files()
+        },
+    )
 
 
 def _sync_snapshot(
@@ -918,17 +952,11 @@ def _sync_snapshot(
     return manifest, digests, contents
 
 
-def build_manifest(config_path: pathlib.Path) -> dict[str, Any]:
-    return _sync_snapshot(config_path)[0]
-
-
-def build_manifest_and_digests(
-    config_path: pathlib.Path,
-) -> tuple[dict[str, Any], dict[str, str | None]]:
-    """This machine's snapshot and the digests a sync compares it by."""
+def local_snapshot(config_path: pathlib.Path) -> SyncSnapshot:
+    """This machine's side of a comparison: its manifest and compared digests."""
 
     manifest, digests, _contents = _sync_snapshot(config_path)
-    return manifest, digests
+    return SyncSnapshot(manifest, digests)
 
 
 def _manifest_fingerprints(manifest: dict[str, Any] | None) -> dict[str, str | None]:
@@ -946,6 +974,56 @@ def _manifest_fingerprints(manifest: dict[str, Any] | None) -> dict[str, str | N
             continue
         fingerprints[name] = entry.get("sha256") if entry.get("present") else None
     return fingerprints
+
+
+@dataclass(frozen=True)
+class SyncSnapshot:
+    """One side of a three-way comparison, as the very bytes it describes.
+
+    The manifest and the compared digests have to travel together: the bytes in
+    the manifest are what a bundle verifies, and the digests are what the plan
+    attributes a move by.  Handing them around as two arguments is how a caller
+    ends up comparing this side's digests against the other side's bytes -- a
+    comparison that answers "conflict" without either machine having moved.
+
+    ``digests`` is ``None`` for a side that has none: a manifest published by an
+    earlier version, a state file written before digests existed.  That is a
+    different value from an empty record, and it is what makes the comparison
+    fall back to bytes for exactly that side instead of for all of them.
+    """
+
+    manifest: dict[str, Any] | None
+    digests: dict[str, str | None] | None = None
+
+    @property
+    def fingerprints(self) -> dict[str, str | None]:
+        return _manifest_fingerprints(self.manifest)
+
+    def digest_of(self, name: str) -> str | None:
+        value = (self.digests or {}).get(name)
+        return value if isinstance(value, str) else None
+
+    def matches(self, other: SyncSnapshot) -> bool:
+        """Whether this side and ``other`` hold the same content, file by file."""
+
+        return _manifest_entries_match(
+            self.fingerprints, other.fingerprints, self.digests, other.digests
+        )
+
+
+def as_snapshot(value: SyncSnapshot | dict[str, Any] | None) -> SyncSnapshot:
+    """One side of a comparison, from a snapshot or from a bare manifest.
+
+    A caller that only has a manifest -- the CLI's own summaries, a test that
+    builds two sides by hand -- states the side it has, and the comparison then
+    answers by bytes for that side, exactly as the digests' absence says it
+    should.  Coercing here keeps that reading available without letting a
+    manifest's digests arrive at a different call site than its bytes.
+    """
+
+    if isinstance(value, SyncSnapshot):
+        return value
+    return SyncSnapshot(value)
 
 
 def _fingerprint_matches(
@@ -995,22 +1073,13 @@ def manifests_match(
     what this comparison did before digests existed.
     """
 
-    return _manifest_entries_match(
-        _manifest_fingerprints(left),
-        _manifest_fingerprints(right),
-        left_digests,
-        right_digests,
-    )
+    return SyncSnapshot(left, left_digests).matches(SyncSnapshot(right, right_digests))
 
 
 def _completed_baseline_digests(
-    base_manifest: dict[str, Any] | None,
-    base_digests: dict[str, str | None] | None,
-    base_fingerprints: dict[str, str | None],
-    local_manifest: dict[str, Any] | None,
-    local_digests: dict[str, str | None] | None,
-    remote_manifest: dict[str, Any] | None,
-    remote_digests: dict[str, str | None] | None,
+    base: SyncSnapshot,
+    local: SyncSnapshot,
+    remote: SyncSnapshot,
 ) -> dict[str, str | None] | None:
     """A baseline from an earlier version, with the digests its bytes prove.
 
@@ -1022,20 +1091,18 @@ def _completed_baseline_digests(
     anything would be a guess.
     """
 
-    if base_manifest is None:
-        return base_digests
-    local_fingerprints = _manifest_fingerprints(local_manifest)
-    remote_fingerprints = _manifest_fingerprints(remote_manifest)
-    completed = dict(base_digests or {})
-    for name, base_fingerprint in base_fingerprints.items():
+    if base.manifest is None:
+        return base.digests
+    completed = dict(base.digests or {})
+    for name, base_fingerprint in base.fingerprints.items():
         if isinstance(completed.get(name), str):
             continue
         if not isinstance(base_fingerprint, str):
             continue
-        if local_fingerprints.get(name) == base_fingerprint:
-            digest = (local_digests or {}).get(name)
-        elif remote_fingerprints.get(name) == base_fingerprint:
-            digest = (remote_digests or {}).get(name)
+        if local.fingerprints.get(name) == base_fingerprint:
+            digest = local.digest_of(name)
+        elif remote.fingerprints.get(name) == base_fingerprint:
+            digest = remote.digest_of(name)
         else:
             continue
         if isinstance(digest, str):
@@ -1084,13 +1151,9 @@ def newest_snapshot(
 
 
 def smart_sync_plan(
-    local_manifest: dict[str, Any] | None,
-    remote_manifest: dict[str, Any] | None,
-    base_manifest: dict[str, Any] | None,
-    *,
-    local_digests: dict[str, str | None] | None = None,
-    remote_digests: dict[str, str | None] | None = None,
-    base_digests: dict[str, str | None] | None = None,
+    local: SyncSnapshot | dict[str, Any] | None,
+    remote: SyncSnapshot | dict[str, Any] | None,
+    base: SyncSnapshot | dict[str, Any] | None,
 ) -> str:
     """What a smart sync does with these snapshots: push, pull, unchanged, or conflict.
 
@@ -1105,84 +1168,66 @@ def smart_sync_plan(
 
     What counts as a move is the compared digest, not the file's bytes: the
     relay store is rewritten whenever a machine reads a balance or refreshes a
-    session, and those observations are nobody's edit.  A caller that has no
-    digests (an earlier version's state file, a manifest without a digest
-    record) gets the byte-for-byte comparison every version before this one
-    made, and a baseline saved without digests has them filled in wherever a
-    side's bytes prove what the baseline held.
+    session, and those observations are nobody's edit.  A side with no digests
+    (an earlier version's state file, a manifest without a digest record) is
+    compared by its bytes, which is what every version before this one did, and
+    a baseline saved without digests borrows them wherever a side's bytes prove
+    what the baseline held.
+
+    A file the two sides already agree on is not a question, even when both of
+    them moved to that same content since the baseline: taking either side keeps
+    the reader's work.  The files they disagree on are what decides the
+    direction -- one side's moves are the snapshot to carry, both sides' moves
+    are a choice the reader has to make.  That rule is the same whether or not
+    the two snapshots name the same files, so there is one loop over the union
+    of them rather than a bundle-level rule that restates it.
     """
 
-    if not isinstance(remote_manifest, dict):
+    local = as_snapshot(local)
+    remote = as_snapshot(remote)
+    base = as_snapshot(base)
+    if not isinstance(remote.manifest, dict):
         return "push"
-    local_fingerprints = _manifest_fingerprints(local_manifest)
-    remote_fingerprints = _manifest_fingerprints(remote_manifest)
-    if set(local_fingerprints) != set(remote_fingerprints):
-        # The two snapshots do not even name the same files, so there is no
-        # per-file answer to give; the bundle-level rule decides.
-        if manifests_match(local_manifest, remote_manifest, local_digests, remote_digests):
-            return "unchanged"
-        if base_manifest is None:
-            return "pull" if newest_snapshot(local_manifest, remote_manifest) == "remote" else "push"
-        local_changed = not manifests_match(local_manifest, base_manifest, local_digests, base_digests)
-        remote_changed = not manifests_match(remote_manifest, base_manifest, remote_digests, base_digests)
-        if local_changed and not remote_changed:
-            return "push"
-        if remote_changed and not local_changed:
-            return "pull"
-        return "conflict"
+    names = set(local.fingerprints) | set(remote.fingerprints)
     if all(
         _fingerprint_matches(
-            fingerprint,
-            remote_fingerprints[name],
-            (local_digests or {}).get(name),
-            (remote_digests or {}).get(name),
+            local.fingerprints.get(name),
+            remote.fingerprints.get(name),
+            local.digest_of(name),
+            remote.digest_of(name),
         )
-        for name, fingerprint in local_fingerprints.items()
+        for name in names
     ):
         return "unchanged"
-    if base_manifest is None:
-        return "pull" if newest_snapshot(local_manifest, remote_manifest) == "remote" else "push"
-    base_fingerprints = _manifest_fingerprints(base_manifest)
-    base_digests = _completed_baseline_digests(
-        base_manifest,
-        base_digests,
-        base_fingerprints,
-        local_manifest,
-        local_digests,
-        remote_manifest,
-        remote_digests,
-    )
-    # A file the two sides already agree on is not a question, even when both
-    # of them moved to that same content since the baseline: taking either side
-    # keeps the reader's work.  The files they disagree on are what decides the
-    # direction -- one side's moves are the snapshot to carry, both sides'
-    # moves are a choice the reader has to make.
+    if base.manifest is None or not isinstance(base.manifest, dict):
+        return "pull" if newest_snapshot(local.manifest, remote.manifest) == "remote" else "push"
+    base_digests = _completed_baseline_digests(base, local, remote)
     local_moved = False
     remote_moved = False
-    for name, local_fingerprint in local_fingerprints.items():
+    for name in sorted(names):
         if _fingerprint_matches(
-            local_fingerprint,
-            remote_fingerprints.get(name),
-            (local_digests or {}).get(name),
-            (remote_digests or {}).get(name),
+            local.fingerprints.get(name),
+            remote.fingerprints.get(name),
+            local.digest_of(name),
+            remote.digest_of(name),
         ):
             continue
         local_unchanged = _fingerprint_matches(
-            local_fingerprint,
-            base_fingerprints.get(name),
-            (local_digests or {}).get(name),
+            local.fingerprints.get(name),
+            base.fingerprints.get(name),
+            local.digest_of(name),
             (base_digests or {}).get(name),
         )
         remote_unchanged = _fingerprint_matches(
-            remote_fingerprints.get(name),
-            base_fingerprints.get(name),
-            (remote_digests or {}).get(name),
+            remote.fingerprints.get(name),
+            base.fingerprints.get(name),
+            remote.digest_of(name),
             (base_digests or {}).get(name),
         )
         if local_unchanged and remote_unchanged:
             # Each side still holds the baseline, yet the two sides differ: the
-            # bytes and the digests disagree about the same content, which is
-            # a damaged comparison rather than an edit.  Ask the reader.
+            # bytes and the digests disagree about the same content, which is a
+            # damaged comparison rather than an edit.  Ask the reader.
             return "conflict"
         if local_unchanged:
             remote_moved = True
@@ -1216,26 +1261,36 @@ def load_sync_state(path: pathlib.Path) -> dict[str, Any]:
 def save_sync_state(
     path: pathlib.Path,
     settings: Settings,
-    manifest: dict[str, Any],
+    snapshot: SyncSnapshot | dict[str, Any],
     action: str,
     digests: dict[str, str | None] | None = None,
 ) -> None:
+    """Record the content both ends agreed on, as the next run will compare it.
+
+    ``digests`` is only for a caller holding the two separately; a snapshot
+    already states both halves of its own side.
+    """
+
+    if not isinstance(snapshot, SyncSnapshot):
+        snapshot = SyncSnapshot(snapshot, digests)
     data: dict[str, Any] = {
         "version": SYNC_STATE_VERSION,
         "updated_at": _utc_now(),
         "action": action,
         "remote_url": _redact_url(bundle_url(settings)),
         "remote_name": settings.remote_name,
-        "manifest": manifest,
+        "manifest": snapshot.manifest,
     }
     # The baseline has to say what was compared, not only which bytes were
     # agreed: the next run attributes a move by comparing against this side,
     # and without the digests the relay store's own observations would read as
     # an edit again.  Optional, so a state file an earlier version wrote still
     # loads and a run that has no digests simply compares bytes.
-    if digests is not None:
+    if snapshot.digests is not None:
         data["digests"] = {
-            name: value for name, value in digests.items() if isinstance(name, str) and (value is None or isinstance(value, str))
+            name: value
+            for name, value in snapshot.digests.items()
+            if isinstance(name, str) and (value is None or isinstance(value, str))
         }
     _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"))
 
@@ -1267,16 +1322,25 @@ def read_status_file(path: pathlib.Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def baseline_manifest(path: pathlib.Path) -> dict[str, Any] | None:
+def baseline_snapshot(path: pathlib.Path) -> SyncSnapshot:
+    """The last agreed snapshot, with the digests its own run compared by.
+
+    One read of the state file answers the whole side: the manifest it agreed
+    on and the compared digests saved beside it.  A state file an earlier
+    version wrote has the manifest and no digests, which is a side that
+    compares by bytes -- not a side that is missing.
+    """
+
     state = load_sync_state(path)
+    return SyncSnapshot(_stored_manifest(state), _stored_digests(state))
+
+
+def _stored_manifest(state: dict[str, Any]) -> dict[str, Any] | None:
     manifest = state.get("manifest")
     return manifest if isinstance(manifest, dict) else None
 
 
-def baseline_digests(path: pathlib.Path) -> dict[str, str | None] | None:
-    """The compared digests the baseline was saved with, when it carries them."""
-
-    state = load_sync_state(path)
+def _stored_digests(state: dict[str, Any]) -> dict[str, str | None] | None:
     stored = state.get("digests")
     if not isinstance(stored, dict):
         return None
@@ -1396,10 +1460,8 @@ def clear_conflict_record(path: pathlib.Path) -> None:
         return
 
 
-def create_bundle_and_digests(
-    config_path: pathlib.Path,
-) -> tuple[bytes, dict[str, Any], dict[str, str | None]]:
-    """The outbound bundle, its manifest, and the digests that describe it.
+def create_bundle(config_path: pathlib.Path) -> tuple[bytes, SyncSnapshot]:
+    """The outbound bundle and the side it describes.
 
     The content is decoded from the very bytes the manifest hashed.  Reading
     the file a second time with text newline translation would let a CRLF
@@ -1420,12 +1482,10 @@ def create_bundle_and_digests(
         "format": CONFIG_BUNDLE_FORMAT,
         "files": files,
     }
-    return json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"), manifest, digests
-
-
-def create_bundle(config_path: pathlib.Path) -> tuple[bytes, dict[str, Any]]:
-    bundle_data, manifest, _digests = create_bundle_and_digests(config_path)
-    return bundle_data, manifest
+    return (
+        json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"),
+        SyncSnapshot(manifest, digests),
+    )
 
 
 def _expected_bundle_files() -> dict[str, tuple[bool, str]]:
@@ -1653,16 +1713,15 @@ def install_bundle(bundle_data: bytes, config_path: pathlib.Path) -> dict[str, A
             target_path.unlink()
             removed.append(str(target_path))
 
+    snapshot = bundle_snapshot(manifest, files)
     return {
         "manifest": manifest,
         # What the remote side holds, in the terms the next sync compares by.
         # Saved as the baseline, so content this machine kept on top of the
         # bundle (a station only it had) still reads as this side's move and
         # gets pushed to the other one.
-        "digests": {
-            name: (content_digest(name, files[name]) if name in files else None)
-            for name in _expected_bundle_files()
-        },
+        "digests": snapshot.digests,
+        "snapshot": snapshot,
         "installed": installed,
         "removed": removed,
         "backups": backups,

@@ -2070,13 +2070,14 @@ class CoreOperationsTests(unittest.TestCase):
             core.snapshot()
             webdav_core.save_sync_state(root / "webdav-state.json", webdav.sync_settings(), base, "sync")
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
-                "young_router.webdav.core.build_manifest_and_digests", return_value=(local, None)
+                "young_router.webdav.core.local_snapshot",
+                return_value=webdav_core.SyncSnapshot(local),
             ), mock.patch("young_router.webdav.operations.read_remote_manifest", return_value=remote), mock.patch(
                 "young_router.webdav.operations.read_remote_digests", return_value=None
             ), mock.patch(
                 # No record and no bundle to read it from: the run keeps the
                 # comparison and stops, which is this test's subject.
-                "young_router.webdav.operations.remote_digests_from_bundle", return_value=None
+                "young_router.webdav.operations.remote_snapshot_from_bundle", return_value=None
             ), mock.patch(
                 "young_router.webdav.operations.remember_remote_bundle", side_effect=remember
             ), mock.patch("young_router.webdav.operations.push_bundle") as pushed, mock.patch(
@@ -2170,7 +2171,8 @@ class CoreOperationsTests(unittest.TestCase):
             relay_path = root / ".litellm-runtime" / "relay-accounts.json"
             relay_path.parent.mkdir(parents=True, exist_ok=True)
             relay_path.write_text(json.dumps(relay_store("2026-11-08T03:07:33Z")), encoding="utf-8")
-            host_manifest, host_digests = webdav_core.build_manifest_and_digests(config)
+            host_snapshot = webdav_core.local_snapshot(config)
+            host_manifest, host_digests = host_snapshot.manifest, host_snapshot.digests
 
             # The baseline is the state both ends last agreed on: same route,
             # an older balance read, and the digests that say so.
@@ -2180,7 +2182,8 @@ class CoreOperationsTests(unittest.TestCase):
             base_relay = base_dir / ".litellm-runtime" / "relay-accounts.json"
             base_relay.parent.mkdir(parents=True, exist_ok=True)
             base_relay.write_text(json.dumps(relay_store("2026-11-08T03:00:00Z")), encoding="utf-8")
-            base_manifest, base_digests = webdav_core.build_manifest_and_digests(base_dir / "config.yaml")
+            base_snapshot = webdav_core.local_snapshot(base_dir / "config.yaml")
+            base_manifest, base_digests = base_snapshot.manifest, base_snapshot.digests
             webdav_core.save_sync_state(state_path, webdav.sync_settings(), base_manifest, "sync", base_digests)
 
             # The reader edits a route; this machine's own poller also refreshes
@@ -2188,7 +2191,8 @@ class CoreOperationsTests(unittest.TestCase):
             # both sides differ from the baseline.
             config.write_text(original.replace("replace-me-secret", "edited-secret"), encoding="utf-8")
             relay_path.write_text(json.dumps(relay_store("2026-11-08T03:11:37Z")), encoding="utf-8")
-            local_manifest, local_digests = webdav_core.build_manifest_and_digests(config)
+            local_snapshot = webdav_core.local_snapshot(config)
+            local_manifest, local_digests = local_snapshot.manifest, local_snapshot.digests
             self.assertEqual(
                 "conflict",
                 webdav_core.smart_sync_plan(local_manifest, host_manifest, base_manifest),
@@ -2196,12 +2200,9 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual(
                 "push",
                 webdav_core.smart_sync_plan(
-                    local_manifest,
-                    host_manifest,
-                    base_manifest,
-                    local_digests=local_digests,
-                    remote_digests=host_digests,
-                    base_digests=base_digests,
+                    webdav_core.SyncSnapshot(local_manifest, local_digests),
+                    webdav_core.SyncSnapshot(host_manifest, host_digests),
+                    webdav_core.SyncSnapshot(base_manifest, base_digests),
                 ),
             )
 
@@ -2267,13 +2268,15 @@ class CoreOperationsTests(unittest.TestCase):
 
             pushed: list[object] = []
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
-                "young_router.webdav.core.build_manifest_and_digests", return_value=(local, local_digests)
+                "young_router.webdav.core.local_snapshot",
+                return_value=webdav_core.SyncSnapshot(local, local_digests),
             ), mock.patch(
                 "young_router.webdav.operations.read_remote_manifest", return_value=remote
             ), mock.patch(
                 "young_router.webdav.operations.read_remote_digests", return_value=None
             ), mock.patch(
-                "young_router.webdav.operations.remote_digests_from_bundle", return_value=remote_digests
+                "young_router.webdav.operations.remote_snapshot_from_bundle",
+                return_value=webdav_core.SyncSnapshot(remote, remote_digests),
             ) as from_bundle, mock.patch(
                 "young_router.webdav.operations.publish_remote_digests", return_value=True
             ), mock.patch(

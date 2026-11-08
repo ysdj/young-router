@@ -283,13 +283,12 @@ class WebDAVConflictRecordTests(unittest.TestCase):
                 command="sync",
             )
             with patch("young_router.webdav.core.WebDAVClient", return_value=object()), patch(
-                "young_router.webdav.commands.build_manifest_and_digests", return_value=(local, None)
+                "young_router.webdav.commands.local_snapshot", return_value=webdav_core.SyncSnapshot(local)
             ), patch("young_router.webdav.commands.read_remote_manifest", return_value=remote), patch(
-                "young_router.webdav.commands.read_remote_digests", return_value=None
+                "young_router.webdav.commands.decide_sync",
+                return_value=("conflict", webdav_core.SyncSnapshot(remote)),
             ), patch(
-                "young_router.webdav.commands.remote_digests_from_bundle", return_value=None
-            ), patch(
-                "young_router.webdav.commands.baseline_manifest", return_value=base
+                "young_router.webdav.commands.baseline_snapshot", return_value=webdav_core.SyncSnapshot(base)
             ), patch(
                 "young_router.webdav.commands.default_conflict_file", return_value=root / "conflict.json"
             ), patch(
@@ -437,7 +436,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             source_config = self.write_config(source)
             target_config = target / "config.yaml"
 
-            bundle, manifest = webdav_core.create_bundle(source_config)
+            bundle, manifest_snapshot = webdav_core.create_bundle(source_config)
+            manifest = manifest_snapshot.manifest
             result = webdav_core.install_bundle(bundle, target_config)
 
             self.assertEqual(manifest["app"], "young-router")
@@ -459,7 +459,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             target = temp / "target"
             source.mkdir()
             target.mkdir()
-            bundle, _manifest = webdav_core.create_bundle(self.write_config(source))
+            bundle, _manifest_snapshot = webdav_core.create_bundle(self.write_config(source))
+            _manifest = _manifest_snapshot.manifest
             config_path = target / "config.yaml"
 
             first = webdav_core.install_bundle(bundle, config_path)
@@ -490,7 +491,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             target = temp / "target"
             source.mkdir()
             target.mkdir()
-            bundle, manifest = webdav_core.create_bundle(self.write_config(source))
+            bundle, manifest_snapshot = webdav_core.create_bundle(self.write_config(source))
+            manifest = manifest_snapshot.manifest
             config_path = target / "config.yaml"
             webdav_core.install_bundle(bundle, config_path)
             manifest_data = json.dumps(manifest).encode("utf-8")
@@ -533,7 +535,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             source.mkdir()
             target.mkdir()
             config_path = target / "config.yaml"
-            old_bundle, _old_manifest = webdav_core.create_bundle(self.write_config(source))
+            old_bundle, _old_manifest_snapshot = webdav_core.create_bundle(self.write_config(source))
+            _old_manifest = _old_manifest_snapshot.manifest
             webdav_core.install_bundle(old_bundle, config_path)
 
             source_config = self.write_config(source)
@@ -543,7 +546,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            new_bundle, new_manifest = webdav_core.create_bundle(source_config)
+            new_bundle, new_manifest_snapshot = webdav_core.create_bundle(source_config)
+            new_manifest = new_manifest_snapshot.manifest
             manifest_data = json.dumps(new_manifest).encode("utf-8")
 
             class FakeClient:
@@ -603,7 +607,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             relay_path.write_text(json.dumps(relay_payload), encoding="utf-8")
             relay_path.chmod(0o600)
 
-            bundle, _manifest = webdav_core.create_bundle(source_config)
+            bundle, _manifest_snapshot = webdav_core.create_bundle(source_config)
+            _manifest = _manifest_snapshot.manifest
             self.assertIn(b"replace-password", bundle)
             self.assertIn(b"replace-cookie", bundle)
             result = webdav_core.install_bundle(bundle, target / "config.yaml")
@@ -687,7 +692,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             remote_relay.parent.mkdir(parents=True, exist_ok=True)
             remote_relay.write_text(json.dumps(remote_document), encoding="utf-8")
 
-            bundle, _manifest = webdav_core.create_bundle(remote_config)
+            bundle, _manifest_snapshot = webdav_core.create_bundle(remote_config)
+            _manifest = _manifest_snapshot.manifest
             webdav_core.install_bundle(bundle, local_config)
 
             merged = json.loads(local_relay.read_text(encoding="utf-8"))
@@ -765,7 +771,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
                 json.dumps(document([account("2026-01-01T00:00:00Z", "session=other-mac")])), encoding="utf-8"
             )
 
-            bundle, _manifest = webdav_core.create_bundle(remote_config)
+            bundle, _manifest_snapshot = webdav_core.create_bundle(remote_config)
+            _manifest = _manifest_snapshot.manifest
             webdav_core.install_bundle(bundle, local_config)
 
             merged = json.loads(local_relay.read_text(encoding="utf-8"))
@@ -843,8 +850,10 @@ class WebDAVSyncBundleTests(unittest.TestCase):
                 json.dumps(self._relay_store("2026-11-08T03:07:33Z", "session=host")), encoding="utf-8"
             )
 
-            desktop_manifest, desktop_digests = webdav_core.build_manifest_and_digests(desktop_config)
-            host_manifest, host_digests = webdav_core.build_manifest_and_digests(host_config)
+            desktop_snapshot = webdav_core.local_snapshot(desktop_config)
+            desktop_manifest, desktop_digests = desktop_snapshot.manifest, desktop_snapshot.digests
+            host_snapshot = webdav_core.local_snapshot(host_config)
+            host_manifest, host_digests = host_snapshot.manifest, host_snapshot.digests
 
             # The bytes really do differ -- that is the whole bug.
             self.assertNotEqual(
@@ -858,12 +867,9 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             self.assertEqual(
                 "unchanged",
                 webdav_core.smart_sync_plan(
-                    desktop_manifest,
-                    host_manifest,
-                    desktop_manifest,
-                    local_digests=desktop_digests,
-                    remote_digests=host_digests,
-                    base_digests=desktop_digests,
+                    webdav_core.SyncSnapshot(desktop_manifest, desktop_digests),
+                    webdav_core.SyncSnapshot(host_manifest, host_digests),
+                    webdav_core.SyncSnapshot(desktop_manifest, desktop_digests),
                 ),
             )
 
@@ -895,13 +901,16 @@ class WebDAVSyncBundleTests(unittest.TestCase):
                 relay_path.parent.mkdir(parents=True, exist_ok=True)
                 relay_path.write_text(json.dumps(self._relay_store(read_at, session)), encoding="utf-8")
 
-            base_manifest, base_digests = webdav_core.build_manifest_and_digests(base_config)
-            host_manifest, host_digests = webdav_core.build_manifest_and_digests(host_config)
+            base_snapshot = webdav_core.local_snapshot(base_config)
+            base_manifest, base_digests = base_snapshot.manifest, base_snapshot.digests
+            host_snapshot = webdav_core.local_snapshot(host_config)
+            host_manifest, host_digests = host_snapshot.manifest, host_snapshot.digests
             desktop_config.write_text(
                 desktop_config.read_text(encoding="utf-8").replace("default-chat", "edited-chat"),
                 encoding="utf-8",
             )
-            desktop_manifest, desktop_digests = webdav_core.build_manifest_and_digests(desktop_config)
+            desktop_snapshot = webdav_core.local_snapshot(desktop_config)
+            desktop_manifest, desktop_digests = desktop_snapshot.manifest, desktop_snapshot.digests
 
             # Byte comparison: the relay files moved on both sides since the
             # baseline, so the run would stop and ask which side to keep.
@@ -913,12 +922,9 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             self.assertEqual(
                 "push",
                 webdav_core.smart_sync_plan(
-                    desktop_manifest,
-                    host_manifest,
-                    base_manifest,
-                    local_digests=desktop_digests,
-                    remote_digests=host_digests,
-                    base_digests=base_digests,
+                    webdav_core.SyncSnapshot(desktop_manifest, desktop_digests),
+                    webdav_core.SyncSnapshot(host_manifest, host_digests),
+                    webdav_core.SyncSnapshot(base_manifest, base_digests),
                 ),
             )
 
@@ -953,18 +959,18 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             base_relay.parent.mkdir(parents=True, exist_ok=True)
             base_relay.write_text(json.dumps(base_store), encoding="utf-8")
 
-            desktop_manifest, desktop_digests = webdav_core.build_manifest_and_digests(desktop_config)
-            host_manifest, host_digests = webdav_core.build_manifest_and_digests(host_config)
-            base_manifest, base_digests = webdav_core.build_manifest_and_digests(base_config)
+            desktop_snapshot = webdav_core.local_snapshot(desktop_config)
+            desktop_manifest, desktop_digests = desktop_snapshot.manifest, desktop_snapshot.digests
+            host_snapshot = webdav_core.local_snapshot(host_config)
+            host_manifest, host_digests = host_snapshot.manifest, host_snapshot.digests
+            base_snapshot = webdav_core.local_snapshot(base_config)
+            base_manifest, base_digests = base_snapshot.manifest, base_snapshot.digests
             self.assertEqual(
                 "conflict",
                 webdav_core.smart_sync_plan(
-                    desktop_manifest,
-                    host_manifest,
-                    base_manifest,
-                    local_digests=desktop_digests,
-                    remote_digests=host_digests,
-                    base_digests=base_digests,
+                    webdav_core.SyncSnapshot(desktop_manifest, desktop_digests),
+                    webdav_core.SyncSnapshot(host_manifest, host_digests),
+                    webdav_core.SyncSnapshot(base_manifest, base_digests),
                 ),
             )
 
@@ -1001,15 +1007,17 @@ class WebDAVSyncBundleTests(unittest.TestCase):
                 relay_path.write_text(json.dumps(stores[name]), encoding="utf-8")
 
             # The baseline was saved by the version before digests: raw only.
-            base_manifest = webdav_core.build_manifest(config_paths["base"])
-            host_manifest, host_digests = webdav_core.build_manifest_and_digests(config_paths["host"])
+            base_manifest = webdav_core.local_snapshot(config_paths["base"]).manifest
+            host_snapshot = webdav_core.local_snapshot(config_paths["host"])
+            host_manifest, host_digests = host_snapshot.manifest, host_snapshot.digests
 
             # The desktop edits a route; its relay bytes are still the baseline's.
             config_paths["desktop"].write_text(
                 config_paths["desktop"].read_text(encoding="utf-8").replace("default-chat", "edited-chat"),
                 encoding="utf-8",
             )
-            desktop_manifest, desktop_digests = webdav_core.build_manifest_and_digests(config_paths["desktop"])
+            desktop_snapshot = webdav_core.local_snapshot(config_paths["desktop"])
+            desktop_manifest, desktop_digests = desktop_snapshot.manifest, desktop_snapshot.digests
 
             # Raw comparison: the host's balance read looks like a second edit.
             self.assertEqual(
@@ -1021,12 +1029,9 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             self.assertEqual(
                 "push",
                 webdav_core.smart_sync_plan(
-                    desktop_manifest,
-                    host_manifest,
-                    base_manifest,
-                    local_digests=desktop_digests,
-                    remote_digests=host_digests,
-                    base_digests=None,
+                    webdav_core.SyncSnapshot(desktop_manifest, desktop_digests),
+                    webdav_core.SyncSnapshot(host_manifest, host_digests),
+                    webdav_core.SyncSnapshot(base_manifest, None),
                 ),
             )
 
@@ -1072,9 +1077,12 @@ class WebDAVSyncBundleTests(unittest.TestCase):
                     encoding="utf-8",
                 )
 
-            base_manifest, base_digests = webdav_core.build_manifest_and_digests(base_config)
-            desktop_manifest, desktop_digests = webdav_core.build_manifest_and_digests(desktop_config)
-            host_manifest, host_digests = webdav_core.build_manifest_and_digests(host_config)
+            base_snapshot = webdav_core.local_snapshot(base_config)
+            base_manifest, base_digests = base_snapshot.manifest, base_snapshot.digests
+            desktop_snapshot = webdav_core.local_snapshot(desktop_config)
+            desktop_manifest, desktop_digests = desktop_snapshot.manifest, desktop_snapshot.digests
+            host_snapshot = webdav_core.local_snapshot(host_config)
+            host_manifest, host_digests = host_snapshot.manifest, host_snapshot.digests
 
             # Snapshot-level attribution would have called this a conflict
             # (both sides differ from the baseline); per file, the route both
@@ -1087,12 +1095,9 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             self.assertEqual(
                 "pull",
                 webdav_core.smart_sync_plan(
-                    desktop_manifest,
-                    host_manifest,
-                    base_manifest,
-                    local_digests=desktop_digests,
-                    remote_digests=host_digests,
-                    base_digests=base_digests,
+                    webdav_core.SyncSnapshot(desktop_manifest, desktop_digests),
+                    webdav_core.SyncSnapshot(host_manifest, host_digests),
+                    webdav_core.SyncSnapshot(base_manifest, base_digests),
                 ),
             )
 
@@ -1104,7 +1109,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             source = root / "source"
             source.mkdir()
             config_path = self.write_config(source)
-            manifest, digests = webdav_core.build_manifest_and_digests(config_path)
+            snapshot = webdav_core.local_snapshot(config_path)
+            manifest, digests = snapshot.manifest, snapshot.digests
             record = webdav_core.build_digest_record(manifest, digests)
 
             self.assertEqual(digests, webdav_core.read_digest_record(record, manifest))
@@ -1152,7 +1158,7 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             manifest_data = client.puts[webdav_core.manifest_url(settings)]
             record_data = client.puts[webdav_core.digests_url(settings)]
             manifest = json.loads(manifest_data)
-            digests = webdav_core.baseline_digests(state_path)
+            digests = webdav_core.baseline_snapshot(state_path).digests
 
             self.assertIsNotNone(digests)
             self.assertEqual(digests, webdav_core.read_digest_record(record_data, manifest))
@@ -1172,9 +1178,142 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             config_path = self.write_config(source)
             config_path.write_bytes(config_path.read_bytes().replace(b"\n", b"\r\n"))
 
-            bundle, _manifest = webdav_core.create_bundle(config_path)
+            bundle, _manifest_snapshot = webdav_core.create_bundle(config_path)
+            _manifest = _manifest_snapshot.manifest
             _manifest, files = webdav_core.read_config_bundle(bundle)
             self.assertEqual(config_path.read_bytes(), files["config.yaml"])
+
+    def test_a_station_read_is_not_content_and_an_account_edit_is(self) -> None:
+        """Only what a reader set is compared; the poll's own answers are not.
+
+        Both machines rewrite the relay store on their own poll: a balance, the
+        moment it was read, the session a login proved, the station's key list
+        and its group catalog.  Those reads are nobody's edit, so they must not
+        reach the digest -- and an account's own fields must, or a rename on one
+        machine would be dropped instead of carried.
+        """
+
+        def digest(**changes: object) -> str:
+            store = self._relay_store("2026-11-08T03:11:37Z", "session=desktop")
+            store["accounts"][0].update(changes)  # type: ignore[index]
+            return webdav_core.content_digest(
+                "relay-accounts.json", json.dumps(store).encode("utf-8")
+            )
+
+        baseline = digest()
+        # Every field the poll rewrites, one at a time.
+        for name, value in (
+            ("balance", 99.0),
+            ("last_updated_at", "2026-11-08T09:00:00Z"),
+            ("login_observed_at", "2026-11-08T09:00:00Z"),
+            ("login_status", "signed_out"),
+            ("resource_status", "unavailable"),
+            ("resource_error", "login_expired"),
+            ("resources", [{"id": "k-renamed", "name": "renamed", "enabled": False}]),
+            ("groups", [{"id": "22", "name": "other", "multiplier": 1.0}]),
+            ("station_resource_names", {"k1": "station-name"}),
+            ("session", {"cookie": "session=other", "access_token": "", "refresh_token": ""}),
+            ("user_id", "42"),
+        ):
+            self.assertEqual(baseline, digest(**{name: value}), name)
+        # The fields a reader sets do reach it.  ``auto_grouping`` is already
+        # true in this store, so flipping it to true would prove nothing.
+        for name, value in (
+            ("label", "renamed-account"),
+            ("auto_grouping", False),
+            ("remember_password", False),
+            ("password", "a-new-password"),
+            ("username", "someone-else@example.test"),
+        ):
+            self.assertNotEqual(baseline, digest(**{name: value}), name)
+
+    def test_a_plan_that_stops_asks_a_remote_without_a_record_once(self) -> None:
+        """The bundle answers a byte comparison the server published no record for.
+
+        A conflict is the plan that costs a download anyway, so asking the
+        bundle there is free -- and it is the only place the answer changes what
+        the run does: a record the server does hold, or a plan that already
+        knows its direction, fetches nothing.
+        """
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            base_dir, desktop, host = root / "base", root / "desktop", root / "host"
+            for directory in (base_dir, desktop, host):
+                directory.mkdir()
+            configs = {
+                "base": self.write_config(base_dir),
+                "desktop": self.write_config(desktop),
+                "host": self.write_config(host),
+            }
+            stores = {
+                "base": self._relay_store("2026-11-08T03:00:00Z", "session=base"),
+                "desktop": self._relay_store("2026-11-08T03:00:00Z", "session=base"),
+                "host": self._relay_store("2026-11-08T03:07:33Z", "session=host"),
+            }
+            for name, config_path in configs.items():
+                relay_path = webdav_core.relay_accounts_path(config_path)
+                relay_path.parent.mkdir(parents=True, exist_ok=True)
+                relay_path.write_text(json.dumps(stores[name]), encoding="utf-8")
+
+            base = webdav_core.local_snapshot(configs["base"])
+            # The desktop edits a route; its relay bytes are still the
+            # baseline's, and the host only re-read its station.
+            configs["desktop"].write_text(
+                configs["desktop"].read_text(encoding="utf-8").replace("default-chat", "edited-chat"),
+                encoding="utf-8",
+            )
+            local = webdav_core.local_snapshot(configs["desktop"])
+            bundle, published = webdav_core.create_bundle(configs["host"])
+            settings = webdav_core.Settings(url="https://example.com/dav/resource/", remote_name="config.json")
+
+            # The host's bundle is what the server holds, and no digest record
+            # was ever published beside it.
+            class Client:
+                def __init__(self) -> None:
+                    self.gets = 0
+
+                def get(self, _url: str, *, max_bytes: int) -> bytes:
+                    self.gets += 1
+                    return bundle
+
+            remote = webdav_core.SyncSnapshot(published.manifest)
+            self.assertEqual("conflict", webdav_core.smart_sync_plan(local, remote, base))
+
+            client = Client()
+            plan, resolved = webdav_operations.decide_sync(client, settings, local, remote, base)
+            self.assertEqual(1, client.gets)
+            self.assertEqual("push", plan)
+            self.assertEqual(published.digests, resolved.digests)
+
+            # A record the server does hold is never asked for again.
+            client = Client()
+            plan, _resolved = webdav_operations.decide_sync(
+                client, settings, local, webdav_core.SyncSnapshot(published.manifest, published.digests), base
+            )
+            self.assertEqual(0, client.gets)
+            self.assertEqual("push", plan)
+
+            # A plan with a direction needs no bundle at all.
+            client = Client()
+            webdav_operations.decide_sync(
+                client, settings, webdav_core.SyncSnapshot(base.manifest, base.digests), remote, base
+            )
+            self.assertEqual(0, client.gets)
+
+            # A bundle that is not the manifest just compared is not mixed in:
+            # its digests would describe content the caller is not looking at.
+            replaced = json.loads(json.dumps(published.manifest))
+            for entry in replaced["files"]:
+                if entry.get("path") == "config.yaml":
+                    entry["sha256"] = "0" * 64
+            client = Client()
+            plan, resolved = webdav_operations.decide_sync(
+                client, settings, local, webdav_core.SyncSnapshot(replaced), base
+            )
+            self.assertEqual(1, client.gets)
+            self.assertEqual("conflict", plan)
+            self.assertIsNone(resolved.digests)
 
     def test_a_bundle_answers_for_its_manifest_when_no_record_exists(self) -> None:
         """A remote published before digests existed is still compared fairly."""
@@ -1190,7 +1329,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
                 json.dumps(self._relay_store("2026-11-08T03:11:37Z", "session=desktop")),
                 encoding="utf-8",
             )
-            bundle, manifest, digests = webdav_core.create_bundle_and_digests(config_path)
+            bundle, snapshot = webdav_core.create_bundle(config_path)
+            manifest, digests = snapshot.manifest, snapshot.digests
             settings = webdav_core.Settings(url="https://example.com/dav/resource/", remote_name="config.json")
 
             class Client:
@@ -1200,10 +1340,11 @@ class WebDAVSyncBundleTests(unittest.TestCase):
                 def get(self, _url: str, *, max_bytes: int) -> bytes:
                     return self.data
 
-            self.assertEqual(
-                digests,
-                webdav_operations.remote_digests_from_bundle(Client(bundle), settings, manifest),
+            from_bundle = webdav_operations.remote_snapshot_from_bundle(
+                Client(bundle), settings, manifest
             )
+            self.assertIsNotNone(from_bundle)
+            self.assertEqual(digests, from_bundle.digests)
 
             # A sidecar manifest that does not describe this bundle is not
             # answered from it: the digests would name content the caller is
@@ -1213,7 +1354,7 @@ class WebDAVSyncBundleTests(unittest.TestCase):
                 if entry.get("path") == "config.yaml":
                     entry["sha256"] = "0" * 64
             self.assertIsNone(
-                webdav_operations.remote_digests_from_bundle(Client(bundle), settings, other)
+                webdav_operations.remote_snapshot_from_bundle(Client(bundle), settings, other)
             )
 
             # Publishing is best effort: a collection that refuses the file
@@ -1226,7 +1367,11 @@ class WebDAVSyncBundleTests(unittest.TestCase):
                     self.puts[url] = data
 
             ready = ReadyClient()
-            self.assertTrue(webdav_operations.publish_remote_digests(ready, settings, manifest, digests))
+            self.assertTrue(
+                webdav_operations.publish_remote_digests(
+                    ready, settings, webdav_core.SyncSnapshot(manifest, digests)
+                )
+            )
             self.assertEqual(
                 digests,
                 webdav_core.read_digest_record(ready.puts[webdav_core.digests_url(settings)], manifest),
@@ -1237,7 +1382,9 @@ class WebDAVSyncBundleTests(unittest.TestCase):
                     raise webdav_core.WebDAVHTTPError("PUT", _url, 403, "Forbidden")
 
             self.assertFalse(
-                webdav_operations.publish_remote_digests(RefusingClient(), settings, manifest, digests)
+                webdav_operations.publish_remote_digests(
+                    RefusingClient(), settings, webdav_core.SyncSnapshot(manifest, digests)
+                )
             )
 
     def test_a_bundle_without_a_relay_store_does_not_delete_the_local_one(self) -> None:
@@ -1274,7 +1421,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             )
 
             # The remote tree never had a relay store at all.
-            bundle, manifest = webdav_core.create_bundle(remote_config)
+            bundle, manifest_snapshot = webdav_core.create_bundle(remote_config)
+            manifest = manifest_snapshot.manifest
             self.assertFalse(
                 [entry for entry in manifest["files"] if entry["path"] == "relay-accounts.json"][0]["present"]
             )
@@ -1335,7 +1483,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            bundle, manifest = webdav_core.create_bundle(config)
+            bundle, manifest_snapshot = webdav_core.create_bundle(config)
+            manifest = manifest_snapshot.manifest
 
             self.assertGreater(len(bundle), 0)
             relay_entry = next(item for item in manifest["files"] if item["path"] == "relay-accounts.json")
@@ -1355,7 +1504,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             source = self.write_config(temp)
             target = temp / "target.yaml"
             target.write_text("untouched\n", encoding="utf-8")
-            bundle, _manifest = webdav_core.create_bundle(source)
+            bundle, _manifest_snapshot = webdav_core.create_bundle(source)
+            _manifest = _manifest_snapshot.manifest
             payload = json.loads(bundle)
             config_entry = next(
                 entry for entry in payload["files"] if entry["path"] == "config.yaml"
@@ -1372,7 +1522,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
     def test_bundle_rejects_duplicate_or_unexpected_file_entries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             source = self.write_config(Path(temp_dir))
-            bundle, _manifest = webdav_core.create_bundle(source)
+            bundle, _manifest_snapshot = webdav_core.create_bundle(source)
+            _manifest = _manifest_snapshot.manifest
             payload = json.loads(bundle)
             payload["files"].append(dict(payload["files"][0]))
 
@@ -1387,7 +1538,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
     def test_bundle_rejects_duplicate_json_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             source = self.write_config(Path(temp_dir))
-            bundle, _manifest = webdav_core.create_bundle(source)
+            bundle, _manifest_snapshot = webdav_core.create_bundle(source)
+            _manifest = _manifest_snapshot.manifest
             text = bundle.decode("utf-8")
             duplicate_key_bundle = text.replace(
                 '"app": "young-router",',
@@ -1410,7 +1562,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
     def test_bundle_rejects_removed_schema_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             source = self.write_config(Path(temp_dir))
-            bundle, _manifest = webdav_core.create_bundle(source)
+            bundle, _manifest_snapshot = webdav_core.create_bundle(source)
+            _manifest = _manifest_snapshot.manifest
             payload = json.loads(bundle)
             config_entry = next(
                 entry for entry in payload["files"] if entry["path"] == "config.yaml"
@@ -1741,7 +1894,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
     def test_checkpointed_manifest_falls_back_to_bundle_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = self.write_config(Path(temp_dir))
-            bundle, manifest = webdav_core.create_bundle(config_path)
+            bundle, manifest_snapshot = webdav_core.create_bundle(config_path)
+            manifest = manifest_snapshot.manifest
 
         class FakeClient:
             def __init__(self) -> None:
@@ -1776,7 +1930,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
     def test_missing_sidecar_manifest_falls_back_to_bundle_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = self.write_config(Path(temp_dir))
-            bundle, manifest = webdav_core.create_bundle(config_path)
+            bundle, manifest_snapshot = webdav_core.create_bundle(config_path)
+            manifest = manifest_snapshot.manifest
 
         class FakeClient:
             def __init__(self) -> None:
@@ -1805,7 +1960,8 @@ class WebDAVSyncBundleTests(unittest.TestCase):
     def test_server_error_sidecar_manifest_falls_back_to_bundle_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = self.write_config(Path(temp_dir))
-            bundle, manifest = webdav_core.create_bundle(config_path)
+            bundle, manifest_snapshot = webdav_core.create_bundle(config_path)
+            manifest = manifest_snapshot.manifest
 
         class FakeClient:
             def get(self, url: str, *, max_bytes: int) -> bytes:
