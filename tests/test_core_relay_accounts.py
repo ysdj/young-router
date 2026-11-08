@@ -782,6 +782,43 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )
             self.assertNotIn("replace-private-value", json.dumps(result))
 
+    def test_a_detection_answers_on_its_own_dispatch_not_only_in_the_shared_slot(self) -> None:
+        """The wizard reads the dispatch's answer; the slot is shared.
+
+        Measured on lv: the pane's own relay refresh replaced
+        ``action_summaries.relay_accounts`` between the detection and the
+        snapshot the wizard reads behind it, so a station that had just answered
+        ``/api/status`` was reported as 无法识别中转站类别.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake = FakeRelayHTTPClient(
+                {},
+                probes={"/api/status": (200, {"success": True, "data": {"system_name": "TKEN"}})},
+            )
+            relay = RelayAccountsDomain(directory, http_client=fake)
+            core = CoreStore(domains=[relay])
+            core.snapshot()
+
+            answer = core.dispatch(
+                {
+                    "domain": "relay_accounts",
+                    "type": "account.detect_type",
+                    "payload": {"origin": "https://pawuvo.example.test"},
+                },
+                expected_revision=core.revision,
+            )
+
+            self.assertEqual(
+                {"detected_type": "newapi", "confidence": "high"},
+                answer.get("action_summary"),
+            )
+            # The shared slot still renders it for the pane that only polls.
+            self.assertEqual(
+                "newapi",
+                core.snapshot()["action_summaries"]["relay_accounts"]["detected_type"],
+            )
+
     def test_type_detection_classifies_sub2api_from_unauthenticated_key_envelope(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fake = FakeRelayHTTPClient(

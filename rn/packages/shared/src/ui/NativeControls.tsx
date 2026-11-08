@@ -397,9 +397,13 @@ function WindowsButton({ title, symbol, symbolWithTitle, symbolTrailing, toolTip
     style={[styles.windowsButton, compact && styles.windowsButtonCompact, link && styles.windowsButtonLink, plainLink && styles.windowsButtonPlainLink, primary && styles.windowsButtonPrimary, destructive && styles.windowsButtonDestructive, disabled && styles.windowsButtonDisabled, busy && styles.buttonBusy, style]}
   >
     {busy === true ? <ActivityIndicator size="small" color={ink} style={styles.buttonBusyIndicator} /> : null}
-    {symbol && !symbolTrailing ? <ButtonGlyph symbol={symbol} ink={ink} /> : null}
+    {/* A symbol-only button *is* its glyph, so a busy one draws the wheel in
+        that glyph's place.  Drawing both put two circles in a 24 pt bezel --
+        the refresh arrow behind a spinner -- which is what the Qoder row's
+        reader saw while the worker was answering. */}
+    {symbol && !symbolTrailing && !(busy === true && !showsTitle) ? <ButtonGlyph symbol={symbol} ink={ink} /> : null}
     {showsTitle ? <Text numberOfLines={1} style={[styles.windowsButtonTitle, (link || plainLink) && styles.windowsButtonLinkTitle, { color: ink }, plainLink && styles.windowsButtonPlainLinkTitle]}>{title}</Text> : null}
-    {symbol && symbolTrailing ? <ButtonGlyph symbol={symbol} ink={ink} /> : null}
+    {symbol && symbolTrailing && !(busy === true && !showsTitle) ? <ButtonGlyph symbol={symbol} ink={ink} /> : null}
   </Pressable>;
 }
 

@@ -353,6 +353,16 @@ function providerService(provider: UnknownRecord | undefined): ServiceID | undef
 const SERVICE_RATE_TTL_MS = 5 * 60 * 1000;
 
 /**
+ * How long the Qoder account row waits for the Core-owned worker.
+ *
+ * The read starts a bridge process: 4.5 s cold on lv, 1.2 s warm.  This is a
+ * ceiling on the row's spinner, not on the read -- a late answer still folds
+ * into the state it lands in, but nothing may leave the row claiming it is
+ * still loading.
+ */
+const QODER_STATUS_TIMEOUT_MS = 20_000;
+
+/**
  * How long 退出登录 gives the pane to commit before leaving anyway.
  *
  * A pane's flush can be waiting on a Core that is applying, which is exactly
@@ -3724,6 +3734,12 @@ function RouteSurface({ route, shell = false, windowRoute, snapshot, ipc, native
   const detectRelayType = useCallback(async (origin: string): Promise<RelayType | undefined> => {
     const staged = await enqueueDispatch("account.detect_type", { origin }, "relay_accounts");
     revision.current = staged.revision;
+    // The answer belongs to this dispatch.  The snapshot slot it also lands in
+    // is shared with every other relay action, and the pane's own account
+    // refresh can replace it before this call reads it -- measured on lv as
+    // 无法识别中转站类别 for a station whose /api/status had just answered.
+    const direct = asRecord(staged.action_summary).detected_type;
+    if (direct === "newapi" || direct === "sub2api") return direct;
     const next = await refresh();
     const detected = asRecord(next.action_summaries?.relay_accounts).detected_type;
     return detected === "newapi" || detected === "sub2api" ? detected : undefined;
@@ -9039,7 +9055,14 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     if (!providerKey) return undefined;
     setQoderStatusBusy(true);
     try {
-      const next = await dispatchWithOutcome("qoder_status", { refresh, provider: providerKey }, "providers_models", true);
+      // The read goes through the Core-owned worker, which starts the Qoder
+      // bridge: measured on lv at 1.2 s warm and 4.5 s cold.  A worker that
+      // never answers must not leave the row saying 正在加载 for ever, so the
+      // wait has a deadline and a late answer still lands in the state below.
+      const next = await Promise.race([
+        dispatchWithOutcome("qoder_status", { refresh, provider: providerKey }, "providers_models", true),
+        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), QODER_STATUS_TIMEOUT_MS)),
+      ]);
       if (!next) return undefined;
       const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
       const account = asRecord(asRecord(summary.providers)[providerKey]);
@@ -9073,9 +9096,10 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     // Core remembers an observation: after a Core restart that memory is gone,
     // and an account row that says 未登录 over a signed-in app is exactly the
     // defect this read exists to prevent.
-    void loadQoderAccount(true).then((account) => {
-      if (account && stringValue(account.state) !== "signed-in") void loadQoderAccount(true);
-    });
+    // One read.  A signed-out answer used to be read again at once, which
+    // doubled the wait this row spends saying 正在加载 -- two worker round
+    // trips instead of one -- for an answer the first read had already given.
+    void loadQoderAccount(true);
     // The provider id and its kind are the only triggers: a reload on every
     // render would fight the refresh button beside the account.
     // eslint-disable-next-line react-hooks/exhaustive-deps

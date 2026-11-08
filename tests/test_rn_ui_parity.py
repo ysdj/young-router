@@ -1276,6 +1276,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('{...modelProbeProps(providerId, editorIdentifier(model), probeInputFingerprint(providerBaseURL(provider), modelUpstreamDisplay(providerId, model), model))}')
         self.assert_ui_not_has('{...modelProbeProps(providerId, editorIdentifier(model))}')
 
+    def test_the_wizard_reads_the_detection_it_asked_for(self) -> None:
+        """A detection's answer belongs to the dispatch that asked for it.
+
+        The snapshot slot it also lands in is shared with every relay action,
+        so the pane's own account refresh can replace it before the wizard reads
+        it -- measured on lv as 无法识别中转站类别 for a station whose
+        /api/status had just answered.
+        """
+
+        self.assert_ui_has('const direct = asRecord(staged.action_summary).detected_type;')
+        self.assert_ui_has('if (direct === "newapi" || direct === "sub2api") return direct;')
+        # The shared slot stays as the fallback for a Core that predates this.
+        wizard = self.ui.split("const detectRelayType = useCallback(", 1)[1].split("}, [enqueueDispatch, refresh]);", 1)[0]
+        self.assertIn("await refresh()", wizard)
+
     def test_loading_buttons_keep_their_title_width_and_color_with_a_spinner(self) -> None:
         """A working button reports progress; it never disables, renames, or resizes itself."""
 
@@ -1293,6 +1308,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         mac_button_spec = (ROOT / "rn/packages/shared/src/ui/macos/NativeButtonNativeComponent.ts").read_text(encoding="utf-8")
         self.assertIn("busy?: WithDefault<boolean, false>;", mac_button_spec)
         self.assertIn("busy === true ? <ActivityIndicator", self.native_controls)
+        # A symbol-only button has no title to keep beside a leading wheel, so
+        # the wheel takes the glyph's place: drawing both put a refresh arrow
+        # behind a spinner inside a 24 pt bezel, which is what a reader saw in
+        # the Qoder account row while its worker was answering.
+        self.assertIn("{symbol && !symbolTrailing && !(busy === true && !showsTitle) ? <ButtonGlyph symbol={symbol} ink={ink} /> : null}", self.native_controls)
+        self.assertIn("{symbol && symbolTrailing && !(busy === true && !showsTitle) ? <ButtonGlyph symbol={symbol} ink={ink} /> : null}", self.native_controls)
         # Every loading button reports its own progress and keeps its label;
         # the disabled state is left for controls that merely wait on a sibling.
         for marker in (

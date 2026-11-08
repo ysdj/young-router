@@ -4604,6 +4604,23 @@ class CoreStore:
                             # window's status poll can replace that slot before
                             # the caller refreshes it.
                             action_summary = dict(summary)
+                        elif (
+                            name == "relay_accounts"
+                            and normalized_action in {"detect_type", "account_detect_type", "relay_detect_type"}
+                            and isinstance(safe_result, Mapping)
+                            and "detected_type" in safe_result
+                        ):
+                            # A detection is the same kind of answer as a
+                            # catalog read: it names no operation, so it only
+                            # lands in the shared slot every relay action
+                            # overwrites.  Measured on lv: the pane's own account
+                            # refresh replaced it between the dispatch and the
+                            # `snapshot` behind it, and the wizard reported
+                            # 无法识别中转站类别 for a station that had just
+                            # answered /api/status.
+                            action_summary = {
+                                key: value for key, value in safe_result.items() if key != "revision"
+                            }
                 cosmetic_binding = bool(
                     name == "providers_models"
                     and normalized_action == "provider_select_relay_station"
