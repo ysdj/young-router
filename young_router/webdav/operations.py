@@ -8,22 +8,28 @@ from collections.abc import Sequence
 
 from .core import (
     CONFIG_BUNDLE_MAX_BYTES,
+    DIGESTS_MAX_BYTES,
     MANIFEST_MAX_BYTES,
     Settings,
     SyncError,
     WebDAVClient,
     WebDAVHTTPError,
+    _expected_bundle_files,
     _validate_bundle_header,
     archived_bundle_name,
-    build_manifest,
+    build_digest_record,
+    build_manifest_and_digests,
     bundle_url,
     collection_url,
-    create_bundle,
+    content_digest,
+    create_bundle_and_digests,
+    digests_url,
     install_bundle,
     manifest_name,
     manifest_url,
     manifests_match,
     read_config_bundle,
+    read_digest_record,
     remote_sibling_url,
     save_conflict_record,
     save_sync_state,
@@ -39,10 +45,12 @@ def print_manifest_summary(prefix: str, manifest: dict[str, Any]) -> None:
     )
 
 
-def create_outbound_bundle(config_path: pathlib.Path) -> tuple[bytes, dict[str, Any], str]:
-    bundle_data, manifest = create_bundle(config_path)
+def create_outbound_bundle(
+    config_path: pathlib.Path,
+) -> tuple[bytes, dict[str, Any], dict[str, str | None], str]:
+    bundle_data, manifest, digests = create_bundle_and_digests(config_path)
     bundle_content_type = "application/json; charset=utf-8"
-    return bundle_data, manifest, bundle_content_type
+    return bundle_data, manifest, digests, bundle_content_type
 
 
 def read_remote_manifest(client: WebDAVClient, settings: Settings) -> dict[str, Any] | None:
@@ -66,6 +74,85 @@ def read_remote_manifest(client: WebDAVClient, settings: Settings) -> dict[str, 
         raise SyncError("Remote manifest must be a JSON object")
     _validate_bundle_header(remote_manifest)
     return remote_manifest
+
+
+def read_remote_digests(
+    client: WebDAVClient,
+    settings: Settings,
+    remote_manifest: dict[str, Any],
+) -> dict[str, str | None] | None:
+    """The compared digests that belong to this remote manifest, or ``None``.
+
+    The record is an optimization, never the connection: a server that refuses
+    the file, an earlier version that never wrote one, or a record for a
+    manifest that has since been replaced all answer ``None``, and the caller
+    compares bytes the way every version before this one did.
+    """
+
+    try:
+        data = client.get(digests_url(settings), max_bytes=DIGESTS_MAX_BYTES)
+    except SyncError:
+        # Every refusal reads as "no record": a server that does not answer for
+        # this file must not turn a sync that worked yesterday into a failure.
+        # `WebDAVHTTPError` is one of these.  The manifest and the bundle are
+        # still read with the same credentials, so a real connection problem
+        # surfaces there, with its own cause.
+        return None
+    return read_digest_record(data, remote_manifest)
+
+
+def publish_remote_digests(
+    client: WebDAVClient,
+    settings: Settings,
+    manifest: dict[str, Any],
+    digests: dict[str, str | None],
+) -> bool:
+    """Write the record that lets the next run compare content, not bytes.
+
+    A run that changed nothing still knows something the remote may not: which
+    content its manifest holds.  Publishing it there is best effort -- a
+    collection that refuses this file keeps the byte comparison it always had,
+    and no sync fails over a record that is only an optimization.
+    """
+
+    try:
+        client.put(
+            digests_url(settings),
+            build_digest_record(manifest, digests),
+            "application/json; charset=utf-8",
+        )
+    except Exception:
+        return False
+    return True
+
+
+def remote_digests_from_bundle(
+    client: WebDAVClient,
+    settings: Settings,
+    remote_manifest: dict[str, Any],
+) -> dict[str, str | None] | None:
+    """The compared digests of the remote bundle, read from its own content.
+
+    Used where the sidecar record is missing or was written for another
+    manifest: a remote built by an earlier version has none, and the first run
+    after an upgrade must not read an observation as an edit just because the
+    record has not been published yet.  The bundle has to be downloaded for
+    that answer, which is the download the conflict branch would make anyway;
+    a bundle whose manifest is not the one just compared is not mixed in, so a
+    stale sidecar can never lend its identity to other bytes.
+    """
+
+    try:
+        bundle_data = client.get(bundle_url(settings), max_bytes=CONFIG_BUNDLE_MAX_BYTES)
+        bundle_manifest, files = read_config_bundle(bundle_data)
+    except SyncError:
+        return None
+    if not manifests_match(bundle_manifest, remote_manifest):
+        return None
+    return {
+        name: (content_digest(name, files[name]) if name in files else None)
+        for name in _expected_bundle_files()
+    }
 
 
 def read_manifest_from_remote_bundle(client: WebDAVClient, settings: Settings) -> dict[str, Any]:
@@ -182,8 +269,9 @@ def push_bundle(
     action: str = "push",
 ) -> tuple[int, dict[str, Any]]:
     remote_bundle_url = bundle_url(settings)
-    bundle_data, manifest, bundle_content_type = create_outbound_bundle(config_path)
+    bundle_data, manifest, digests, bundle_content_type = create_outbound_bundle(config_path)
     manifest_data = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+    digest_data = build_digest_record(manifest, digests)
 
     client.try_mkcol(collection_url(settings))
     client.put(remote_bundle_url, bundle_data, bundle_content_type)
@@ -192,8 +280,18 @@ def push_bundle(
     except WebDAVHTTPError as exc:
         if exc.code not in {403, 404, 405, 409, 500, 502, 503, 504}:
             raise
+    else:
+        # The record is bound to the manifest that was just written.  A server
+        # that refuses either one therefore leaves the other stale by identity,
+        # which the next read treats as "no record" instead of as an answer
+        # about content this upload never carried.
+        try:
+            client.put(digests_url(settings), digest_data, "application/json; charset=utf-8")
+        except WebDAVHTTPError as exc:
+            if exc.code not in {403, 404, 405, 409, 500, 502, 503, 504}:
+                raise
     if state_path is not None:
-        save_sync_state(state_path, settings, manifest, action)
+        save_sync_state(state_path, settings, manifest, action, digests)
     return len(bundle_data), manifest
 
 
@@ -221,16 +319,35 @@ def pull_bundle(
     remote_bundle_url = bundle_url(settings)
     if skip_when_unchanged and config_path.exists():
         try:
-            local_manifest = build_manifest(config_path)
+            local_manifest, local_digests = build_manifest_and_digests(config_path)
             remote_manifest = read_remote_manifest(client, settings)
+            remote_digests = (
+                read_remote_digests(client, settings, remote_manifest)
+                if remote_manifest is not None
+                else None
+            )
         except SyncError:
             remote_manifest = None
         else:
-            if remote_manifest is not None and manifests_match(local_manifest, remote_manifest):
+            if remote_manifest is not None and manifests_match(
+                local_manifest, remote_manifest, local_digests, remote_digests
+            ):
                 if state_path is not None:
-                    save_sync_state(state_path, settings, remote_manifest, action)
+                    save_sync_state(
+                        state_path,
+                        settings,
+                        remote_manifest,
+                        action,
+                        remote_digests or local_digests,
+                    )
+                if remote_digests is None:
+                    # The bytes matched, so the local digests describe the
+                    # remote too; publishing them keeps the next run from
+                    # comparing observations to edits.
+                    publish_remote_digests(client, settings, remote_manifest, local_digests)
                 return {
                     "manifest": remote_manifest,
+                    "digests": remote_digests or local_digests,
                     "installed": [],
                     "removed": [],
                     "backups": [],
@@ -238,5 +355,8 @@ def pull_bundle(
     bundle_data = client.get(remote_bundle_url, max_bytes=CONFIG_BUNDLE_MAX_BYTES)
     result = install_bundle(bundle_data, config_path)
     if state_path is not None:
-        save_sync_state(state_path, settings, result["manifest"], action)
+        save_sync_state(state_path, settings, result["manifest"], action, result["digests"])
+    # A pull has the bundle in hand, so the record can always be stated for the
+    # manifest it came with -- even when this run installed nothing new.
+    publish_remote_digests(client, settings, result["manifest"], result["digests"])
     return result

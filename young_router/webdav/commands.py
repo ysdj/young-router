@@ -15,8 +15,10 @@ from .core import (
     WebDAVHTTPError,
     _redact_url,
     _settings_from_raw,
+    baseline_digests,
     baseline_manifest,
     build_manifest,
+    build_manifest_and_digests,
     bundle_url,
     clear_conflict_record,
     collection_url,
@@ -34,9 +36,12 @@ from .core import (
 )
 from .operations import (
     print_manifest_summary,
+    publish_remote_digests,
     pull_bundle,
     push_bundle,
+    read_remote_digests,
     read_remote_manifest,
+    remote_digests_from_bundle,
     remember_remote_bundle,
 )
 
@@ -139,9 +144,11 @@ def command_sync(args: argparse.Namespace) -> int:
     config_path = args.config.expanduser()
     settings = load_settings(args.settings)
     client = WebDAVClient(settings)
-    local_manifest = build_manifest(config_path)
+    local_manifest, local_digests = build_manifest_and_digests(config_path)
     remote_manifest = read_remote_manifest(client, settings)
+    remote_digests = read_remote_digests(client, settings, remote_manifest) if remote_manifest is not None else None
     base_manifest = baseline_manifest(args.state)
+    base_digests = baseline_digests(args.state)
 
     print_manifest_summary("Local snapshot", local_manifest)
     if remote_manifest is None:
@@ -152,9 +159,35 @@ def command_sync(args: argparse.Namespace) -> int:
         return 0
 
     print_manifest_summary("Remote snapshot", remote_manifest)
-    plan = smart_sync_plan(local_manifest, remote_manifest, base_manifest)
+    plan = smart_sync_plan(
+        local_manifest,
+        remote_manifest,
+        base_manifest,
+        local_digests=local_digests,
+        remote_digests=remote_digests,
+        base_digests=base_digests,
+    )
+    record_missing = remote_digests is None
+    if plan == "conflict" and record_missing:
+        # A remote written by a version without the digest record: read the
+        # bundle once so an ordinary station read is not mistaken for an edit.
+        bundle_digests = remote_digests_from_bundle(client, settings, remote_manifest)
+        if bundle_digests is not None:
+            remote_digests = bundle_digests
+            plan = smart_sync_plan(
+                local_manifest,
+                remote_manifest,
+                base_manifest,
+                local_digests=local_digests,
+                remote_digests=remote_digests,
+                base_digests=base_digests,
+            )
     if plan == "unchanged":
-        save_sync_state(args.state, settings, local_manifest, "sync")
+        if remote_digests is None:
+            remote_digests = local_digests
+        save_sync_state(args.state, settings, local_manifest, "sync", remote_digests)
+        if record_missing:
+            publish_remote_digests(client, settings, remote_manifest, remote_digests)
         clear_conflict_record(default_conflict_file())
         print("WebDAV sync: already up to date")
         return 0
@@ -210,33 +243,49 @@ def command_status(args: argparse.Namespace) -> int:
     print(f"HTTP timeout: {settings.timeout_seconds:g} seconds")
     print(f"Local config: {config_path}")
     local_manifest = None
+    local_digests = None
     if config_path.exists():
-        local_manifest = build_manifest(config_path)
+        local_manifest, local_digests = build_manifest_and_digests(config_path)
         print_manifest_summary("Local snapshot", local_manifest)
     else:
         print("Local snapshot: missing config.yaml")
 
     client = WebDAVClient(settings)
     remote_manifest = None
+    remote_digests = None
     try:
         remote_manifest = read_remote_manifest(client, settings)
         if remote_manifest is None:
             print(f"Remote snapshot: missing manifest at {_redact_url(manifest_url(settings))}")
         else:
             print_manifest_summary("Remote snapshot", remote_manifest)
+            remote_digests = read_remote_digests(client, settings, remote_manifest)
+            print(f"Remote digests: {'present' if remote_digests is not None else 'missing (bytes are compared)'}")
     except Exception as exc:
         print(f"Remote snapshot: could not read manifest: {exc}")
 
     try:
         base = baseline_manifest(args.state)
+        base_digests = baseline_digests(args.state)
         if base is None:
             print("Sync baseline: missing")
         else:
             print_manifest_summary("Sync baseline", base)
+            print(f"Baseline digests: {'present' if base_digests is not None else 'missing (bytes are compared)'}")
             if local_manifest is not None and remote_manifest is not None:
                 # What a sync would do with these three snapshots: the same one
                 # comparison the unattended loop asks.
-                print(f"Sync plan: {smart_sync_plan(local_manifest, remote_manifest, base)}")
+                print(
+                    "Sync plan: "
+                    + smart_sync_plan(
+                        local_manifest,
+                        remote_manifest,
+                        base,
+                        local_digests=local_digests,
+                        remote_digests=remote_digests,
+                        base_digests=base_digests,
+                    )
+                )
     except Exception as exc:
         print(f"Sync baseline: could not read state: {exc}")
 

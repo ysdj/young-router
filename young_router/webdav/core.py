@@ -40,6 +40,7 @@ LEGACY_REMOTE_NAMES = ("litellm-config.json",)
 CONFIG_BUNDLE_FORMAT = "json"
 CONFIG_BUNDLE_MAX_BYTES = 16 * 1024 * 1024
 MANIFEST_MAX_BYTES = 64 * 1024
+DIGESTS_MAX_BYTES = 64 * 1024
 HTTP_ERROR_BODY_MAX_BYTES = 4 * 1024
 DEFAULT_RESPONSE_MAX_BYTES = HTTP_ERROR_BODY_MAX_BYTES
 RESPONSE_HEADER_MAX_BYTES = 64 * 1024
@@ -62,6 +63,7 @@ RELAY_ACCOUNTS_FILE = "relay-accounts.json"
 """The one synced target whose content exists nowhere else."""
 SENSITIVE_QUERY_KEYS = {"x-vercel-protection-bypass"}
 SYNC_STATE_VERSION = 1
+SYNC_DIGESTS_VERSION = 1
 DEFAULT_SYNC_INTERVAL_MINUTES = 30
 DEFAULT_TIMEOUT_SECONDS = 30.0
 WEBDAV_REQUEST_RETRY_ATTEMPTS = 3
@@ -771,17 +773,120 @@ def sync_targets(config_path: pathlib.Path) -> list[tuple[str, pathlib.Path, boo
     ]
 
 
-def build_manifest(config_path: pathlib.Path) -> dict[str, Any]:
+#: The relay store's own observations, one per station read.  Each machine
+#: rewrites them on its own poll -- a balance, the moment of the last read, the
+#: session a login proved, the station's catalog -- so they are not content the
+#: sync is meant to carry between machines.  Comparing them made two ordinary
+#: background refreshes read as "both ends changed": a reader who edited one
+#: route got a conflict dialog whose other side was a balance the other machine
+#: had merely observed.  The sync compares what a reader set; a session still
+#: travels inside a bundle that a real change produced, and each machine keeps
+#: the fresher copy of what it observed (``_merge_relay_accounts``).
+RELAY_OBSERVATION_FIELDS = frozenset(
+    {
+        "balance",
+        "groups",
+        "last_updated_at",
+        "login_observed_at",
+        "login_status",
+        "resource_error",
+        "resource_status",
+        "resources",
+        "session",
+        "station_resource_names",
+        "user_id",
+    }
+)
+
+
+def _relay_rows(value: object, order: str) -> list[dict[str, Any]]:
+    """The object rows of one relay list, in an order every machine agrees on."""
+
+    rows = [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
+    rows.sort(key=lambda row: str(row.get(order, "")))
+    return rows
+
+
+def _durable_relay_bytes(data: bytes) -> bytes | None:
+    """The relay store with the observations removed, in a stable order.
+
+    ``None`` when the file is not a JSON object: the caller then compares the
+    bytes it has, so an unreadable document never matches a readable one by
+    pretending to hold nothing.
+    """
+
+    try:
+        document = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    accounts = [
+        {key: value for key, value in account.items() if key not in RELAY_OBSERVATION_FIELDS}
+        for account in _relay_rows(document.get("accounts"), "id")
+    ]
+    cleanups = _relay_rows(document.get("pending_credential_cleanups"), "account_id")
+    cleanups.sort(key=lambda row: json.dumps(row, ensure_ascii=False, sort_keys=True))
+    # Every field this version does not know is kept: a future durable field
+    # must still be able to tell the two ends apart, and only the observations
+    # named above are known to be written without a reader's hand.
+    durable = {
+        key: value
+        for key, value in document.items()
+        if key not in {"accounts", "stations", "pending_credential_cleanups"}
+    }
+    durable.update(
+        {
+            "stations": _relay_rows(document.get("stations"), "id"),
+            "accounts": accounts,
+            "pending_credential_cleanups": cleanups,
+        }
+    )
+    return json.dumps(durable, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def content_digest(name: str, data: bytes) -> str:
+    """The digest a sync compares for one file: the reader's content in it.
+
+    A configuration file is compared byte for byte, because its text is what
+    the reader applied.  The relay store is compared without the observations
+    its own poller writes (``RELAY_OBSERVATION_FIELDS``), so a balance read on
+    one machine cannot stand in for an edit on the other.  The raw ``sha256``
+    in a manifest keeps describing the bytes, because that is what a bundle
+    verifies before it installs anything.
+    """
+
+    if name == RELAY_ACCOUNTS_FILE:
+        durable = _durable_relay_bytes(data)
+        if durable is not None:
+            return _sha256_bytes(durable)
+    return _sha256_bytes(data)
+
+
+def _sync_snapshot(
+    config_path: pathlib.Path,
+) -> tuple[dict[str, Any], dict[str, str | None], dict[str, bytes]]:
+    """One read of every synced file: its manifest entry, compared digest, bytes.
+
+    The three travel together because the digest that describes the remote side
+    has to describe the content this bundle carries.  The relay store is
+    rewritten by its own poller, so a second read could describe a balance the
+    upload never included -- and then the other machine would compare against a
+    snapshot neither side holds.
+    """
+
     if not config_path.exists():
         raise SyncError(f"Missing config file: {config_path}")
-    validate_config_bytes("config.yaml", config_path.read_bytes(), "model_list")
 
     files: list[dict[str, Any]] = []
+    digests: dict[str, str | None] = {}
+    contents: dict[str, bytes] = {}
     for archive_name, path, required, required_key in sync_targets(config_path):
         if not path.exists():
             if required:
                 raise SyncError(f"Missing required sync file: {path}")
             files.append({"path": archive_name, "present": False})
+            digests[archive_name] = None
             continue
         data = path.read_bytes()
         validate_config_bytes(archive_name, data, required_key)
@@ -799,8 +904,10 @@ def build_manifest(config_path: pathlib.Path) -> dict[str, Any]:
                 .replace("+00:00", "Z"),
             }
         )
+        digests[archive_name] = content_digest(archive_name, data)
+        contents[archive_name] = data
 
-    return {
+    manifest = {
         "app": APP_NAME,
         "version": ARCHIVE_VERSION,
         "format": CONFIG_BUNDLE_FORMAT,
@@ -808,6 +915,20 @@ def build_manifest(config_path: pathlib.Path) -> dict[str, Any]:
         "summary": local_summary(config_path),
         "files": files,
     }
+    return manifest, digests, contents
+
+
+def build_manifest(config_path: pathlib.Path) -> dict[str, Any]:
+    return _sync_snapshot(config_path)[0]
+
+
+def build_manifest_and_digests(
+    config_path: pathlib.Path,
+) -> tuple[dict[str, Any], dict[str, str | None]]:
+    """This machine's snapshot and the digests a sync compares it by."""
+
+    manifest, digests, _contents = _sync_snapshot(config_path)
+    return manifest, digests
 
 
 def _manifest_fingerprints(manifest: dict[str, Any] | None) -> dict[str, str | None]:
@@ -827,8 +948,99 @@ def _manifest_fingerprints(manifest: dict[str, Any] | None) -> dict[str, str | N
     return fingerprints
 
 
-def manifests_match(left: dict[str, Any] | None, right: dict[str, Any] | None) -> bool:
-    return _manifest_fingerprints(left) == _manifest_fingerprints(right)
+def _fingerprint_matches(
+    left: str | None,
+    right: str | None,
+    left_digest: str | None,
+    right_digest: str | None,
+) -> bool:
+    """Whether one file's content matches, by digest when both sides have one."""
+
+    if isinstance(left_digest, str) and isinstance(right_digest, str):
+        return left_digest == right_digest
+    return left == right
+
+
+def _manifest_entries_match(
+    left: dict[str, str | None],
+    right: dict[str, str | None],
+    left_digests: dict[str, str | None] | None,
+    right_digests: dict[str, str | None] | None,
+) -> bool:
+    if set(left) != set(right):
+        return False
+    for name, left_fingerprint in left.items():
+        if not _fingerprint_matches(
+            left_fingerprint,
+            right[name],
+            (left_digests or {}).get(name),
+            (right_digests or {}).get(name),
+        ):
+            return False
+    return True
+
+
+def manifests_match(
+    left: dict[str, Any] | None,
+    right: dict[str, Any] | None,
+    left_digests: dict[str, str | None] | None = None,
+    right_digests: dict[str, str | None] | None = None,
+) -> bool:
+    """Whether two snapshots hold the same content, one file at a time.
+
+    A compared digest answers for a file when both sides have one for it: that
+    is what keeps an observed balance out of the comparison.  Everywhere else
+    -- a manifest from an earlier version, an absent file, a record that does
+    not belong to this manifest -- the raw ``sha256`` answers, which is exactly
+    what this comparison did before digests existed.
+    """
+
+    return _manifest_entries_match(
+        _manifest_fingerprints(left),
+        _manifest_fingerprints(right),
+        left_digests,
+        right_digests,
+    )
+
+
+def _completed_baseline_digests(
+    base_manifest: dict[str, Any] | None,
+    base_digests: dict[str, str | None] | None,
+    base_fingerprints: dict[str, str | None],
+    local_manifest: dict[str, Any] | None,
+    local_digests: dict[str, str | None] | None,
+    remote_manifest: dict[str, Any] | None,
+    remote_digests: dict[str, str | None] | None,
+) -> dict[str, str | None] | None:
+    """A baseline from an earlier version, with the digests its bytes prove.
+
+    A side whose bytes equal the baseline's holds exactly the baseline content,
+    so that side's compared digest is the baseline's.  Filling those in lets
+    the first run after an upgrade attribute a move instead of reading the
+    relay store's own observations as edits.  A file whose bytes match neither
+    side stays unfilled: that baseline content is unknown, and comparing it as
+    anything would be a guess.
+    """
+
+    if base_manifest is None:
+        return base_digests
+    local_fingerprints = _manifest_fingerprints(local_manifest)
+    remote_fingerprints = _manifest_fingerprints(remote_manifest)
+    completed = dict(base_digests or {})
+    for name, base_fingerprint in base_fingerprints.items():
+        if isinstance(completed.get(name), str):
+            continue
+        if not isinstance(base_fingerprint, str):
+            continue
+        if local_fingerprints.get(name) == base_fingerprint:
+            digest = (local_digests or {}).get(name)
+        elif remote_fingerprints.get(name) == base_fingerprint:
+            digest = (remote_digests or {}).get(name)
+        else:
+            continue
+        if isinstance(digest, str):
+            completed[name] = digest
+    return completed
 
 
 def _newest_modified_epoch(manifest: dict[str, Any] | None) -> float | None:
@@ -875,6 +1087,10 @@ def smart_sync_plan(
     local_manifest: dict[str, Any] | None,
     remote_manifest: dict[str, Any] | None,
     base_manifest: dict[str, Any] | None,
+    *,
+    local_digests: dict[str, str | None] | None = None,
+    remote_digests: dict[str, str | None] | None = None,
+    base_digests: dict[str, str | None] | None = None,
 ) -> str:
     """What a smart sync does with these snapshots: push, pull, unchanged, or conflict.
 
@@ -886,20 +1102,102 @@ def smart_sync_plan(
     pane shows both sides.  Without a baseline nothing says either side moved;
     the later snapshot wins there, so a first sync between two machines still
     finishes.
+
+    What counts as a move is the compared digest, not the file's bytes: the
+    relay store is rewritten whenever a machine reads a balance or refreshes a
+    session, and those observations are nobody's edit.  A caller that has no
+    digests (an earlier version's state file, a manifest without a digest
+    record) gets the byte-for-byte comparison every version before this one
+    made, and a baseline saved without digests has them filled in wherever a
+    side's bytes prove what the baseline held.
     """
 
     if not isinstance(remote_manifest, dict):
         return "push"
-    if manifests_match(local_manifest, remote_manifest):
+    local_fingerprints = _manifest_fingerprints(local_manifest)
+    remote_fingerprints = _manifest_fingerprints(remote_manifest)
+    if set(local_fingerprints) != set(remote_fingerprints):
+        # The two snapshots do not even name the same files, so there is no
+        # per-file answer to give; the bundle-level rule decides.
+        if manifests_match(local_manifest, remote_manifest, local_digests, remote_digests):
+            return "unchanged"
+        if base_manifest is None:
+            return "pull" if newest_snapshot(local_manifest, remote_manifest) == "remote" else "push"
+        local_changed = not manifests_match(local_manifest, base_manifest, local_digests, base_digests)
+        remote_changed = not manifests_match(remote_manifest, base_manifest, remote_digests, base_digests)
+        if local_changed and not remote_changed:
+            return "push"
+        if remote_changed and not local_changed:
+            return "pull"
+        return "conflict"
+    if all(
+        _fingerprint_matches(
+            fingerprint,
+            remote_fingerprints[name],
+            (local_digests or {}).get(name),
+            (remote_digests or {}).get(name),
+        )
+        for name, fingerprint in local_fingerprints.items()
+    ):
         return "unchanged"
     if base_manifest is None:
         return "pull" if newest_snapshot(local_manifest, remote_manifest) == "remote" else "push"
-    local_changed = not manifests_match(local_manifest, base_manifest)
-    remote_changed = not manifests_match(remote_manifest, base_manifest)
-    if local_changed and not remote_changed:
+    base_fingerprints = _manifest_fingerprints(base_manifest)
+    base_digests = _completed_baseline_digests(
+        base_manifest,
+        base_digests,
+        base_fingerprints,
+        local_manifest,
+        local_digests,
+        remote_manifest,
+        remote_digests,
+    )
+    # A file the two sides already agree on is not a question, even when both
+    # of them moved to that same content since the baseline: taking either side
+    # keeps the reader's work.  The files they disagree on are what decides the
+    # direction -- one side's moves are the snapshot to carry, both sides'
+    # moves are a choice the reader has to make.
+    local_moved = False
+    remote_moved = False
+    for name, local_fingerprint in local_fingerprints.items():
+        if _fingerprint_matches(
+            local_fingerprint,
+            remote_fingerprints.get(name),
+            (local_digests or {}).get(name),
+            (remote_digests or {}).get(name),
+        ):
+            continue
+        local_unchanged = _fingerprint_matches(
+            local_fingerprint,
+            base_fingerprints.get(name),
+            (local_digests or {}).get(name),
+            (base_digests or {}).get(name),
+        )
+        remote_unchanged = _fingerprint_matches(
+            remote_fingerprints.get(name),
+            base_fingerprints.get(name),
+            (remote_digests or {}).get(name),
+            (base_digests or {}).get(name),
+        )
+        if local_unchanged and remote_unchanged:
+            # Each side still holds the baseline, yet the two sides differ: the
+            # bytes and the digests disagree about the same content, which is
+            # a damaged comparison rather than an edit.  Ask the reader.
+            return "conflict"
+        if local_unchanged:
+            remote_moved = True
+        elif remote_unchanged:
+            local_moved = True
+        else:
+            return "conflict"
+    if local_moved and remote_moved:
+        return "conflict"
+    if local_moved:
         return "push"
-    if remote_changed and not local_changed:
+    if remote_moved:
         return "pull"
+    # The two sides disagree on files that neither moved alone.  Nothing here
+    # can attribute them, so the choice is the reader's.
     return "conflict"
 
 
@@ -915,8 +1213,14 @@ def load_sync_state(path: pathlib.Path) -> dict[str, Any]:
     return data
 
 
-def save_sync_state(path: pathlib.Path, settings: Settings, manifest: dict[str, Any], action: str) -> None:
-    data = {
+def save_sync_state(
+    path: pathlib.Path,
+    settings: Settings,
+    manifest: dict[str, Any],
+    action: str,
+    digests: dict[str, str | None] | None = None,
+) -> None:
+    data: dict[str, Any] = {
         "version": SYNC_STATE_VERSION,
         "updated_at": _utc_now(),
         "action": action,
@@ -924,6 +1228,15 @@ def save_sync_state(path: pathlib.Path, settings: Settings, manifest: dict[str, 
         "remote_name": settings.remote_name,
         "manifest": manifest,
     }
+    # The baseline has to say what was compared, not only which bytes were
+    # agreed: the next run attributes a move by comparing against this side,
+    # and without the digests the relay store's own observations would read as
+    # an edit again.  Optional, so a state file an earlier version wrote still
+    # loads and a run that has no digests simply compares bytes.
+    if digests is not None:
+        data["digests"] = {
+            name: value for name, value in digests.items() if isinstance(name, str) and (value is None or isinstance(value, str))
+        }
     _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"))
 
 
@@ -958,6 +1271,23 @@ def baseline_manifest(path: pathlib.Path) -> dict[str, Any] | None:
     state = load_sync_state(path)
     manifest = state.get("manifest")
     return manifest if isinstance(manifest, dict) else None
+
+
+def baseline_digests(path: pathlib.Path) -> dict[str, str | None] | None:
+    """The compared digests the baseline was saved with, when it carries them."""
+
+    state = load_sync_state(path)
+    stored = state.get("digests")
+    if not isinstance(stored, dict):
+        return None
+    digests: dict[str, str | None] = {}
+    for name, value in stored.items():
+        if not isinstance(name, str):
+            continue
+        if value is not None and not isinstance(value, str):
+            return None
+        digests[name] = value
+    return digests
 
 
 def default_conflict_file() -> pathlib.Path:
@@ -1066,14 +1396,23 @@ def clear_conflict_record(path: pathlib.Path) -> None:
         return
 
 
-def create_bundle(config_path: pathlib.Path) -> tuple[bytes, dict[str, Any]]:
-    manifest = build_manifest(config_path)
-    target_paths = {archive_name: path for archive_name, path, _required, _required_key in sync_targets(config_path)}
+def create_bundle_and_digests(
+    config_path: pathlib.Path,
+) -> tuple[bytes, dict[str, Any], dict[str, str | None]]:
+    """The outbound bundle, its manifest, and the digests that describe it.
+
+    The content is decoded from the very bytes the manifest hashed.  Reading
+    the file a second time with text newline translation would let a CRLF
+    document enter a bundle whose ``sha256`` describes different bytes, which
+    the reading side rejects as a tampered file.
+    """
+
+    manifest, digests, contents = _sync_snapshot(config_path)
     files: list[dict[str, Any]] = []
     for file_info in manifest["files"]:
         entry = dict(file_info)
         if entry.get("present"):
-            entry["content"] = target_paths[entry["path"]].read_text(encoding="utf-8")
+            entry["content"] = contents[entry["path"]].decode("utf-8")
         files.append(entry)
 
     bundle = {
@@ -1081,7 +1420,12 @@ def create_bundle(config_path: pathlib.Path) -> tuple[bytes, dict[str, Any]]:
         "format": CONFIG_BUNDLE_FORMAT,
         "files": files,
     }
-    return json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"), manifest
+    return json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"), manifest, digests
+
+
+def create_bundle(config_path: pathlib.Path) -> tuple[bytes, dict[str, Any]]:
+    bundle_data, manifest, _digests = create_bundle_and_digests(config_path)
+    return bundle_data, manifest
 
 
 def _expected_bundle_files() -> dict[str, tuple[bool, str]]:
@@ -1311,6 +1655,14 @@ def install_bundle(bundle_data: bytes, config_path: pathlib.Path) -> dict[str, A
 
     return {
         "manifest": manifest,
+        # What the remote side holds, in the terms the next sync compares by.
+        # Saved as the baseline, so content this machine kept on top of the
+        # bundle (a station only it had) still reads as this side's move and
+        # gets pushed to the other one.
+        "digests": {
+            name: (content_digest(name, files[name]) if name in files else None)
+            for name in _expected_bundle_files()
+        },
         "installed": installed,
         "removed": removed,
         "backups": backups,
@@ -1392,6 +1744,79 @@ def manifest_url(settings: Settings) -> str:
     url = bundle_url(settings)
     parsed = urllib.parse.urlsplit(url)
     return _remote_with_path(url, f"{parsed.path.rsplit('/', 1)[0]}/{urllib.parse.quote(manifest_name(settings.remote_name))}")
+
+
+def digests_name(remote_name: str) -> str:
+    """The sidecar a sync compares by: what changed, not which bytes changed.
+
+    It travels beside the manifest and is bound to it.  A version that does not
+    know the name never reads it, and a record whose manifest is gone is
+    ignored, so a mixed pair of versions falls back to comparing bytes instead
+    of trusting digests of a snapshot that is no longer on the server.
+    """
+
+    stem = remote_name[:-5] if remote_name.endswith(".json") else remote_name
+    return f"{stem}.digests.json"
+
+
+def digests_url(settings: Settings) -> str:
+    url = bundle_url(settings)
+    parsed = urllib.parse.urlsplit(url)
+    return _remote_with_path(url, f"{parsed.path.rsplit('/', 1)[0]}/{urllib.parse.quote(digests_name(settings.remote_name))}")
+
+
+def manifest_identity(manifest: dict[str, Any]) -> str:
+    """What a digest record names: this one manifest, and no other."""
+
+    payload = {key: manifest.get(key) for key in ("app", "version", "format", "created_at", "summary", "files")}
+    return _sha256_bytes(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+
+
+def build_digest_record(manifest: dict[str, Any], digests: dict[str, str | None]) -> bytes:
+    """The record the next sync compares the remote side by."""
+
+    record = {
+        "app": APP_NAME,
+        "version": SYNC_DIGESTS_VERSION,
+        "manifest": manifest_identity(manifest),
+        "files": {name: digests.get(name) for name in _expected_bundle_files()},
+    }
+    return json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+
+
+def read_digest_record(data: bytes, manifest: dict[str, Any]) -> dict[str, str | None] | None:
+    """The digests that belong to ``manifest``, or ``None``.
+
+    ``None`` means "compare the bytes": a server that never stored the record,
+    a file damaged in transit, or one written for another manifest.  Guessing
+    here would attribute a change to a snapshot the caller is not looking at,
+    which is the one thing a three-way comparison must not do.
+    """
+
+    try:
+        record = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    if record.get("app") != APP_NAME or record.get("version") != SYNC_DIGESTS_VERSION:
+        return None
+    if record.get("manifest") != manifest_identity(manifest):
+        return None
+    files = record.get("files")
+    if not isinstance(files, dict) or set(files) != set(_expected_bundle_files()):
+        return None
+    digests: dict[str, str | None] = {}
+    for name, value in files.items():
+        if value is None:
+            digests[name] = None
+        elif isinstance(value, str):
+            digests[name] = value
+        else:
+            return None
+    return digests
 
 
 def archived_bundle_name(remote_name: str, stamp: str | None = None) -> str:

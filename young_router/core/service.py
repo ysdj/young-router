@@ -3526,7 +3526,7 @@ class CoreStore:
                     webdav_operations.pull_bundle(client, settings, config_path, state_path, "pull")
                     pulled = True
                 else:
-                    local_manifest = webdav_core.build_manifest(config_path)
+                    local_manifest, local_digests = webdav_core.build_manifest_and_digests(config_path)
                     try:
                         remote_manifest = webdav_operations.read_remote_manifest(client, settings)
                     except webdav_core.SyncError as exc:
@@ -3541,16 +3541,60 @@ class CoreStore:
                         # and the user asked for a sync, not for a decision.
                         archived_remote = webdav_operations.archive_remote_bundle(client, settings)
                         remote_manifest = None
+                    remote_digests = (
+                        webdav_operations.read_remote_digests(client, settings, remote_manifest)
+                        if remote_manifest is not None
+                        else None
+                    )
                     base_manifest = webdav_core.baseline_manifest(state_path)
+                    base_digests = webdav_core.baseline_digests(state_path)
                     # One comparison decides every sync, including the
                     # unattended one: a side that moved alone is the side to
                     # take.  Two sides that both moved are a real conflict --
                     # the pane shows both texts and the reader keeps one -- and
                     # no branch asks for a saved direction, because there is no
-                    # such setting any more.
-                    plan = webdav_core.smart_sync_plan(local_manifest, remote_manifest, base_manifest)
+                    # such setting any more.  What counts as a move is the
+                    # compared digest: a relay balance another machine read is
+                    # nobody's edit, so it cannot manufacture a conflict.
+                    plan = webdav_core.smart_sync_plan(
+                        local_manifest,
+                        remote_manifest,
+                        base_manifest,
+                        local_digests=local_digests,
+                        remote_digests=remote_digests,
+                        base_digests=base_digests,
+                    )
+                    record_missing = remote_digests is None
+                    if plan == "conflict" and record_missing and remote_manifest is not None:
+                        # The remote was published by a version that wrote no
+                        # digest record, so the byte comparison above cannot
+                        # tell an observation from an edit.  The bundle answers
+                        # it, and the conflict branch would download that same
+                        # bundle to keep the comparison anyway -- one download
+                        # is what not asking the reader costs.
+                        bundle_digests = webdav_operations.remote_digests_from_bundle(
+                            client, settings, remote_manifest
+                        )
+                        if bundle_digests is not None:
+                            remote_digests = bundle_digests
+                            plan = webdav_core.smart_sync_plan(
+                                local_manifest,
+                                remote_manifest,
+                                base_manifest,
+                                local_digests=local_digests,
+                                remote_digests=remote_digests,
+                                base_digests=base_digests,
+                            )
                     if plan == "unchanged":
-                        webdav_core.save_sync_state(state_path, settings, local_manifest, "sync")
+                        if remote_digests is None:
+                            # Byte equality proved the remote holds these same
+                            # digests, so they can be stated for it.
+                            remote_digests = local_digests
+                        webdav_core.save_sync_state(state_path, settings, local_manifest, "sync", remote_digests)
+                        if record_missing:
+                            webdav_operations.publish_remote_digests(
+                                client, settings, remote_manifest, remote_digests
+                            )
                         outcome = "unchanged"
                     elif plan == "push":
                         webdav_operations.push_bundle(client, settings, config_path, state_path, "sync-push")

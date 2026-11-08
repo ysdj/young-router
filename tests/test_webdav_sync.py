@@ -283,8 +283,12 @@ class WebDAVConflictRecordTests(unittest.TestCase):
                 command="sync",
             )
             with patch("young_router.webdav.core.WebDAVClient", return_value=object()), patch(
-                "young_router.webdav.commands.build_manifest", return_value=local
+                "young_router.webdav.commands.build_manifest_and_digests", return_value=(local, None)
             ), patch("young_router.webdav.commands.read_remote_manifest", return_value=remote), patch(
+                "young_router.webdav.commands.read_remote_digests", return_value=None
+            ), patch(
+                "young_router.webdav.commands.remote_digests_from_bundle", return_value=None
+            ), patch(
                 "young_router.webdav.commands.baseline_manifest", return_value=base
             ), patch(
                 "young_router.webdav.commands.default_conflict_file", return_value=root / "conflict.json"
@@ -509,7 +513,14 @@ class WebDAVSyncBundleTests(unittest.TestCase):
 
             self.assertEqual([], result["installed"])
             self.assertEqual(
-                ["https://example.com/dav/resource/config.manifest.json"], client.urls
+                [
+                    "https://example.com/dav/resource/config.manifest.json",
+                    # The digest record is read with the manifest; a server
+                    # that has none answers the bytes this test's fake returns,
+                    # which parses as "no record" and falls back to the bytes.
+                    "https://example.com/dav/resource/config.digests.json",
+                ],
+                client.urls,
             )
 
     def test_a_pull_installs_a_remote_that_differs_from_the_local_file(self) -> None:
@@ -768,6 +779,466 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             webdav_core.install_bundle(bundle, local_config)
             merged = json.loads(local_relay.read_text(encoding="utf-8"))
             self.assertEqual(["session=other-mac"], [entry["session"]["cookie"] for entry in merged["accounts"]])
+
+    def _relay_store(self, read_at: str, session: str) -> dict[str, object]:
+        """One relay account whose observations differ from the other machine's."""
+
+        return {
+            "version": 3,
+            "stations": [
+                {"id": "station-nimbus", "name": "nimbus", "origin": "https://relay.example.test", "type": "newapi"}
+            ],
+            "accounts": [
+                {
+                    "id": "account-nimbus",
+                    "station_id": "station-nimbus",
+                    "type": "newapi",
+                    "label": "nimbus",
+                    "origin": "https://relay.example.test",
+                    "username": "person@example.test",
+                    "remember_password": True,
+                    "password": "replace-password",
+                    "auto_grouping": True,
+                    "login_status": "signed_in",
+                    "session": {"cookie": session, "access_token": "", "refresh_token": ""},
+                    "balance": 12.5,
+                    "last_updated_at": read_at,
+                    "login_observed_at": read_at,
+                    "resource_status": "ready",
+                    "resource_error": "none",
+                    "resources": [{"id": "sub2api-1", "api_name": "nimbus"}],
+                    "groups": [{"id": "21", "name": "mixed", "multiplier": 0.15}],
+                }
+            ],
+            "pending_credential_cleanups": [],
+        }
+
+    def test_a_balance_read_is_not_a_change_between_machines(self) -> None:
+        """A station read on one machine must not read as an edit on the other.
+
+        Both machines run their own relay poller, so ``balance``, the balance's
+        timestamp, the session and the station's catalog were rewritten every
+        few minutes.  The bytes differed on every tick, the three-way
+        comparison saw both ends move, and a reader who had just edited one
+        route was told the two sides had both changed -- the other side was a
+        balance nobody had edited.
+        """
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            desktop = root / "desktop"
+            host = root / "host"
+            desktop.mkdir()
+            host.mkdir()
+            desktop_config = self.write_config(desktop)
+            host_config = self.write_config(host)
+            desktop_relay = webdav_core.relay_accounts_path(desktop_config)
+            desktop_relay.parent.mkdir(parents=True, exist_ok=True)
+            desktop_relay.write_text(
+                json.dumps(self._relay_store("2026-11-08T03:11:37Z", "session=desktop")), encoding="utf-8"
+            )
+            host_relay = webdav_core.relay_accounts_path(host_config)
+            host_relay.parent.mkdir(parents=True, exist_ok=True)
+            host_relay.write_text(
+                json.dumps(self._relay_store("2026-11-08T03:07:33Z", "session=host")), encoding="utf-8"
+            )
+
+            desktop_manifest, desktop_digests = webdav_core.build_manifest_and_digests(desktop_config)
+            host_manifest, host_digests = webdav_core.build_manifest_and_digests(host_config)
+
+            # The bytes really do differ -- that is the whole bug.
+            self.assertNotEqual(
+                [entry.get("sha256") for entry in desktop_manifest["files"]],
+                [entry.get("sha256") for entry in host_manifest["files"]],
+            )
+            # The content a reader is responsible for does not.
+            self.assertTrue(
+                webdav_core.manifests_match(desktop_manifest, host_manifest, desktop_digests, host_digests)
+            )
+            self.assertEqual(
+                "unchanged",
+                webdav_core.smart_sync_plan(
+                    desktop_manifest,
+                    host_manifest,
+                    desktop_manifest,
+                    local_digests=desktop_digests,
+                    remote_digests=host_digests,
+                    base_digests=desktop_digests,
+                ),
+            )
+
+    def test_a_route_edit_beside_observation_churn_is_pushed(self) -> None:
+        """The reported bug, end to end at the comparison level.
+
+        The reader edits one route on the desktop while the host only re-read
+        its station.  Without the compared digests both sides look moved and
+        the run stops; with them the route edit is the one move worth carrying.
+        """
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            desktop = root / "desktop"
+            host = root / "host"
+            desktop.mkdir()
+            host.mkdir()
+            desktop_config = self.write_config(desktop)
+            host_config = self.write_config(host)
+            base_dir = root / "base"
+            base_dir.mkdir()
+            base_config = self.write_config(base_dir)
+            for config_path, session, read_at in (
+                (desktop_config, "session=desktop", "2026-11-08T03:11:37Z"),
+                (host_config, "session=host", "2026-11-08T03:07:33Z"),
+                (base_config, "session=base", "2026-11-08T03:00:00Z"),
+            ):
+                relay_path = webdav_core.relay_accounts_path(config_path)
+                relay_path.parent.mkdir(parents=True, exist_ok=True)
+                relay_path.write_text(json.dumps(self._relay_store(read_at, session)), encoding="utf-8")
+
+            base_manifest, base_digests = webdav_core.build_manifest_and_digests(base_config)
+            host_manifest, host_digests = webdav_core.build_manifest_and_digests(host_config)
+            desktop_config.write_text(
+                desktop_config.read_text(encoding="utf-8").replace("default-chat", "edited-chat"),
+                encoding="utf-8",
+            )
+            desktop_manifest, desktop_digests = webdav_core.build_manifest_and_digests(desktop_config)
+
+            # Byte comparison: the relay files moved on both sides since the
+            # baseline, so the run would stop and ask which side to keep.
+            self.assertEqual(
+                "conflict",
+                webdav_core.smart_sync_plan(desktop_manifest, host_manifest, base_manifest),
+            )
+            # Compared content: only the route edit moved.
+            self.assertEqual(
+                "push",
+                webdav_core.smart_sync_plan(
+                    desktop_manifest,
+                    host_manifest,
+                    base_manifest,
+                    local_digests=desktop_digests,
+                    remote_digests=host_digests,
+                    base_digests=base_digests,
+                ),
+            )
+
+    def test_a_real_relay_edit_on_both_sides_still_stops(self) -> None:
+        """Observations are ignored; an account change is still a question."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            desktop = root / "desktop"
+            host = root / "host"
+            desktop.mkdir()
+            host.mkdir()
+            desktop_config = self.write_config(desktop)
+            host_config = self.write_config(host)
+            base_store = self._relay_store("2026-11-08T03:00:00Z", "session=base")
+            desktop_store = self._relay_store("2026-11-08T03:11:37Z", "session=desktop")
+            host_store = self._relay_store("2026-11-08T03:07:33Z", "session=host")
+            desktop_store["accounts"][0]["label"] = "desktop-renamed"  # type: ignore[index]
+            host_store["accounts"][0]["label"] = "host-renamed"  # type: ignore[index]
+            for config_path, store in (
+                (desktop_config, desktop_store),
+                (host_config, host_store),
+            ):
+                relay_path = webdav_core.relay_accounts_path(config_path)
+                relay_path.parent.mkdir(parents=True, exist_ok=True)
+                relay_path.write_text(json.dumps(store), encoding="utf-8")
+
+            base_path = root / "base"
+            base_path.mkdir()
+            base_config = self.write_config(base_path)
+            base_relay = webdav_core.relay_accounts_path(base_config)
+            base_relay.parent.mkdir(parents=True, exist_ok=True)
+            base_relay.write_text(json.dumps(base_store), encoding="utf-8")
+
+            desktop_manifest, desktop_digests = webdav_core.build_manifest_and_digests(desktop_config)
+            host_manifest, host_digests = webdav_core.build_manifest_and_digests(host_config)
+            base_manifest, base_digests = webdav_core.build_manifest_and_digests(base_config)
+            self.assertEqual(
+                "conflict",
+                webdav_core.smart_sync_plan(
+                    desktop_manifest,
+                    host_manifest,
+                    base_manifest,
+                    local_digests=desktop_digests,
+                    remote_digests=host_digests,
+                    base_digests=base_digests,
+                ),
+            )
+
+    def test_a_baseline_saved_without_digests_borrows_the_side_it_holds(self) -> None:
+        """An upgrade must not read the relay store's observations as edits.
+
+        A state file written before digests existed has raw hashes only.  The
+        side whose bytes still equal the baseline's holds exactly the baseline
+        content, so its compared digest is the baseline's -- and that is what
+        lets the first run after an upgrade carry a route edit instead of
+        stopping over a station read that happened on the other machine.
+        """
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            base_dir = root / "base"
+            desktop = root / "desktop"
+            host = root / "host"
+            for directory in (base_dir, desktop, host):
+                directory.mkdir()
+            config_paths = {
+                "base": self.write_config(base_dir),
+                "desktop": self.write_config(desktop),
+                "host": self.write_config(host),
+            }
+            stores = {
+                "base": self._relay_store("2026-11-08T03:00:00Z", "session=base"),
+                "desktop": self._relay_store("2026-11-08T03:00:00Z", "session=base"),
+                "host": self._relay_store("2026-11-08T03:07:33Z", "session=host"),
+            }
+            for name, config_path in config_paths.items():
+                relay_path = webdav_core.relay_accounts_path(config_path)
+                relay_path.parent.mkdir(parents=True, exist_ok=True)
+                relay_path.write_text(json.dumps(stores[name]), encoding="utf-8")
+
+            # The baseline was saved by the version before digests: raw only.
+            base_manifest = webdav_core.build_manifest(config_paths["base"])
+            host_manifest, host_digests = webdav_core.build_manifest_and_digests(config_paths["host"])
+
+            # The desktop edits a route; its relay bytes are still the baseline's.
+            config_paths["desktop"].write_text(
+                config_paths["desktop"].read_text(encoding="utf-8").replace("default-chat", "edited-chat"),
+                encoding="utf-8",
+            )
+            desktop_manifest, desktop_digests = webdav_core.build_manifest_and_digests(config_paths["desktop"])
+
+            # Raw comparison: the host's balance read looks like a second edit.
+            self.assertEqual(
+                "conflict",
+                webdav_core.smart_sync_plan(desktop_manifest, host_manifest, base_manifest),
+            )
+            # With the baseline's digests filled in from the side that still
+            # holds its bytes, only the route edit moved.
+            self.assertEqual(
+                "push",
+                webdav_core.smart_sync_plan(
+                    desktop_manifest,
+                    host_manifest,
+                    base_manifest,
+                    local_digests=desktop_digests,
+                    remote_digests=host_digests,
+                    base_digests=None,
+                ),
+            )
+
+    def test_both_sides_reaching_the_same_route_is_not_a_conflict(self) -> None:
+        """A file both sides converged on is not a question.
+
+        Two machines can both apply the same route edit since the baseline.  A
+        snapshot-level comparison counted that as both ends moving and stopped;
+        the file itself carries nothing to choose, so only the files the two
+        sides disagree on may decide the direction.
+        """
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            base_dir = root / "base"
+            desktop = root / "desktop"
+            host = root / "host"
+            for directory in (base_dir, desktop, host):
+                directory.mkdir()
+            base_config = self.write_config(base_dir)
+            desktop_config = self.write_config(desktop)
+            host_config = self.write_config(host)
+            base_relay = webdav_core.relay_accounts_path(base_config)
+            base_relay.parent.mkdir(parents=True, exist_ok=True)
+            base_relay.write_text(
+                json.dumps(self._relay_store("2026-11-08T03:00:00Z", "session=base")), encoding="utf-8"
+            )
+            desktop_relay = webdav_core.relay_accounts_path(desktop_config)
+            desktop_relay.parent.mkdir(parents=True, exist_ok=True)
+            desktop_relay.write_text(
+                json.dumps(self._relay_store("2026-11-08T03:00:00Z", "session=base")), encoding="utf-8"
+            )
+            host_relay = webdav_core.relay_accounts_path(host_config)
+            host_relay.parent.mkdir(parents=True, exist_ok=True)
+            host_store = self._relay_store("2026-11-08T03:07:33Z", "session=host")
+            host_store["accounts"][0]["label"] = "renamed-on-the-host"  # type: ignore[index]
+            host_relay.write_text(json.dumps(host_store), encoding="utf-8")
+
+            # The same route edit landed on both machines.
+            for config_path in (desktop_config, host_config):
+                config_path.write_text(
+                    config_path.read_text(encoding="utf-8").replace("default-chat", "shared-chat"),
+                    encoding="utf-8",
+                )
+
+            base_manifest, base_digests = webdav_core.build_manifest_and_digests(base_config)
+            desktop_manifest, desktop_digests = webdav_core.build_manifest_and_digests(desktop_config)
+            host_manifest, host_digests = webdav_core.build_manifest_and_digests(host_config)
+
+            # Snapshot-level attribution would have called this a conflict
+            # (both sides differ from the baseline); per file, the route both
+            # sides already hold is skipped and only the host's account rename
+            # is a move -- so either comparison carries it.
+            self.assertEqual(
+                "pull",
+                webdav_core.smart_sync_plan(desktop_manifest, host_manifest, base_manifest),
+            )
+            self.assertEqual(
+                "pull",
+                webdav_core.smart_sync_plan(
+                    desktop_manifest,
+                    host_manifest,
+                    base_manifest,
+                    local_digests=desktop_digests,
+                    remote_digests=host_digests,
+                    base_digests=base_digests,
+                ),
+            )
+
+    def test_the_digest_record_answers_only_for_its_own_manifest(self) -> None:
+        """A record for another snapshot is not evidence about this one."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source"
+            source.mkdir()
+            config_path = self.write_config(source)
+            manifest, digests = webdav_core.build_manifest_and_digests(config_path)
+            record = webdav_core.build_digest_record(manifest, digests)
+
+            self.assertEqual(digests, webdav_core.read_digest_record(record, manifest))
+
+            # A manifest that has since been replaced, malformed JSON, and an
+            # unexpected file set all fall back to comparing bytes.
+            replaced = json.loads(json.dumps(manifest))
+            replaced["created_at"] = "2026-11-08T00:00:00Z"
+            self.assertIsNone(webdav_core.read_digest_record(record, replaced))
+            self.assertIsNone(webdav_core.read_digest_record(b"{not json", manifest))
+            partial = json.loads(record)
+            partial["files"].pop("relay-accounts.json")
+            self.assertIsNone(
+                webdav_core.read_digest_record(json.dumps(partial).encode("utf-8"), manifest)
+            )
+
+    def test_a_push_publishes_the_digests_and_the_baseline_keeps_them(self) -> None:
+        """The remote side and the baseline carry the same comparison."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = self.write_config(root)
+            relay_path = webdav_core.relay_accounts_path(config_path)
+            relay_path.parent.mkdir(parents=True, exist_ok=True)
+            relay_path.write_text(
+                json.dumps(self._relay_store("2026-11-08T03:11:37Z", "session=desktop")),
+                encoding="utf-8",
+            )
+            settings = webdav_core.Settings(url="https://example.com/dav/resource/", remote_name="config.json")
+            state_path = root / "state.json"
+
+            class Client:
+                def __init__(self) -> None:
+                    self.puts: dict[str, bytes] = {}
+
+                def try_mkcol(self, _url: str) -> None:
+                    return None
+
+                def put(self, url: str, data: bytes, _content_type: str) -> None:
+                    self.puts[url] = data
+
+            client = Client()
+            webdav_operations.push_bundle(client, settings, config_path, state_path, "push")
+
+            manifest_data = client.puts[webdav_core.manifest_url(settings)]
+            record_data = client.puts[webdav_core.digests_url(settings)]
+            manifest = json.loads(manifest_data)
+            digests = webdav_core.baseline_digests(state_path)
+
+            self.assertIsNotNone(digests)
+            self.assertEqual(digests, webdav_core.read_digest_record(record_data, manifest))
+            # The record describes content, while the bundle's own manifest
+            # still describes the bytes it shipped.
+            _manifest, files = webdav_core.read_config_bundle(client.puts[webdav_core.bundle_url(settings)])
+            for name, data in files.items():
+                self.assertEqual(webdav_core.content_digest(name, data), digests[name])
+
+    def test_a_crlf_configuration_keeps_the_bytes_its_manifest_hashed(self) -> None:
+        """The bundle carries what the manifest hashed, not newline-folded text."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source"
+            source.mkdir()
+            config_path = self.write_config(source)
+            config_path.write_bytes(config_path.read_bytes().replace(b"\n", b"\r\n"))
+
+            bundle, _manifest = webdav_core.create_bundle(config_path)
+            _manifest, files = webdav_core.read_config_bundle(bundle)
+            self.assertEqual(config_path.read_bytes(), files["config.yaml"])
+
+    def test_a_bundle_answers_for_its_manifest_when_no_record_exists(self) -> None:
+        """A remote published before digests existed is still compared fairly."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source"
+            source.mkdir()
+            config_path = self.write_config(source)
+            relay_path = webdav_core.relay_accounts_path(config_path)
+            relay_path.parent.mkdir(parents=True, exist_ok=True)
+            relay_path.write_text(
+                json.dumps(self._relay_store("2026-11-08T03:11:37Z", "session=desktop")),
+                encoding="utf-8",
+            )
+            bundle, manifest, digests = webdav_core.create_bundle_and_digests(config_path)
+            settings = webdav_core.Settings(url="https://example.com/dav/resource/", remote_name="config.json")
+
+            class Client:
+                def __init__(self, data: bytes) -> None:
+                    self.data = data
+
+                def get(self, _url: str, *, max_bytes: int) -> bytes:
+                    return self.data
+
+            self.assertEqual(
+                digests,
+                webdav_operations.remote_digests_from_bundle(Client(bundle), settings, manifest),
+            )
+
+            # A sidecar manifest that does not describe this bundle is not
+            # answered from it: the digests would name content the caller is
+            # not comparing.
+            other = json.loads(json.dumps(manifest))
+            for entry in other["files"]:
+                if entry.get("path") == "config.yaml":
+                    entry["sha256"] = "0" * 64
+            self.assertIsNone(
+                webdav_operations.remote_digests_from_bundle(Client(bundle), settings, other)
+            )
+
+            # Publishing is best effort: a collection that refuses the file
+            # leaves the byte comparison it always had.
+            class ReadyClient:
+                def __init__(self) -> None:
+                    self.puts: dict[str, bytes] = {}
+
+                def put(self, url: str, data: bytes, _content_type: str) -> None:
+                    self.puts[url] = data
+
+            ready = ReadyClient()
+            self.assertTrue(webdav_operations.publish_remote_digests(ready, settings, manifest, digests))
+            self.assertEqual(
+                digests,
+                webdav_core.read_digest_record(ready.puts[webdav_core.digests_url(settings)], manifest),
+            )
+
+            class RefusingClient:
+                def put(self, _url: str, _data: bytes, _content_type: str) -> None:
+                    raise webdav_core.WebDAVHTTPError("PUT", _url, 403, "Forbidden")
+
+            self.assertFalse(
+                webdav_operations.publish_remote_digests(RefusingClient(), settings, manifest, digests)
+            )
 
     def test_a_bundle_without_a_relay_store_does_not_delete_the_local_one(self) -> None:
         """An absent file in the bundle is not an instruction to delete."""

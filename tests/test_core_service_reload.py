@@ -1180,6 +1180,8 @@ class WebDAVPullReloadTests(unittest.TestCase):
 
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
                 "young_router.webdav.operations.read_remote_manifest", return_value=remote_manifest
+            ), mock.patch(
+                "young_router.webdav.operations.read_remote_digests", return_value=None
             ), mock.patch("young_router.webdav.operations.pull_bundle", side_effect=install):
                 core.run_automatic_webdav_sync()
 

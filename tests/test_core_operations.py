@@ -2070,8 +2070,14 @@ class CoreOperationsTests(unittest.TestCase):
             core.snapshot()
             webdav_core.save_sync_state(root / "webdav-state.json", webdav.sync_settings(), base, "sync")
             with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
-                "young_router.webdav.core.build_manifest", return_value=local
+                "young_router.webdav.core.build_manifest_and_digests", return_value=(local, None)
             ), mock.patch("young_router.webdav.operations.read_remote_manifest", return_value=remote), mock.patch(
+                "young_router.webdav.operations.read_remote_digests", return_value=None
+            ), mock.patch(
+                # No record and no bundle to read it from: the run keeps the
+                # comparison and stops, which is this test's subject.
+                "young_router.webdav.operations.remote_digests_from_bundle", return_value=None
+            ), mock.patch(
                 "young_router.webdav.operations.remember_remote_bundle", side_effect=remember
             ), mock.patch("young_router.webdav.operations.push_bundle") as pushed, mock.patch(
                 "young_router.webdav.operations.pull_bundle"
@@ -2110,6 +2116,176 @@ class CoreOperationsTests(unittest.TestCase):
             # the sync's own validation, so the surface refuses every write.
             with self.assertRaises(CoreError):
                 core.stage_editor_text("webdav", "config", local, revision=core.revision)
+
+    def test_a_route_edit_beside_a_relay_read_is_pushed_not_contested(self) -> None:
+        """The reported false conflict: a host's balance read is not an edit.
+
+        The desktop edited one route; the gateway only re-read its relay
+        stations.  Whole-file comparison said both ends moved and the sync
+        stopped with a dialog whose other side nobody had changed.  The
+        compared digests answer for the relay store without its observations,
+        so this run carries the edit instead of asking a question.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            original = textwrap.dedent(PROVIDER_CONFIG).lstrip()
+            config.write_text(original, encoding="utf-8")
+            providers = ProvidersModelsDomain(config)
+            relay = RelayAccountsDomain(storage_path=root / ".litellm-runtime" / "relay-accounts.json")
+            webdav = self._configured_webdav_domain(root, config)
+            core = CoreStore(domains=[providers, relay, webdav])
+            state_path = root / "webdav-state.json"
+
+            def relay_store(read_at: str) -> dict[str, object]:
+                return {
+                    "version": 3,
+                    "stations": [
+                        {"id": "station-nimbus", "name": "nimbus", "origin": "https://relay.example.test", "type": "newapi"}
+                    ],
+                    "accounts": [
+                        {
+                            "id": "account-nimbus",
+                            "station_id": "station-nimbus",
+                            "type": "newapi",
+                            "label": "nimbus",
+                            "origin": "https://relay.example.test",
+                            "username": "person@example.test",
+                            "remember_password": True,
+                            "password": "replace-relay-password",
+                            "login_status": "signed_in",
+                            "session": {"cookie": "session=this-machine", "access_token": "", "refresh_token": ""},
+                            "balance": 12.5,
+                            "last_updated_at": read_at,
+                            "resource_status": "ready",
+                            "resource_error": "none",
+                            "resources": [],
+                            "groups": [],
+                        }
+                    ],
+                    "pending_credential_cleanups": [],
+                }
+
+            relay_path = root / ".litellm-runtime" / "relay-accounts.json"
+            relay_path.parent.mkdir(parents=True, exist_ok=True)
+            relay_path.write_text(json.dumps(relay_store("2026-11-08T03:07:33Z")), encoding="utf-8")
+            host_manifest, host_digests = webdav_core.build_manifest_and_digests(config)
+
+            # The baseline is the state both ends last agreed on: same route,
+            # an older balance read, and the digests that say so.
+            base_dir = root / "base"
+            base_dir.mkdir()
+            (base_dir / "config.yaml").write_text(original, encoding="utf-8")
+            base_relay = base_dir / ".litellm-runtime" / "relay-accounts.json"
+            base_relay.parent.mkdir(parents=True, exist_ok=True)
+            base_relay.write_text(json.dumps(relay_store("2026-11-08T03:00:00Z")), encoding="utf-8")
+            base_manifest, base_digests = webdav_core.build_manifest_and_digests(base_dir / "config.yaml")
+            webdav_core.save_sync_state(state_path, webdav.sync_settings(), base_manifest, "sync", base_digests)
+
+            # The reader edits a route; this machine's own poller also refreshes
+            # the relay observation, which is exactly what made the bytes of
+            # both sides differ from the baseline.
+            config.write_text(original.replace("replace-me-secret", "edited-secret"), encoding="utf-8")
+            relay_path.write_text(json.dumps(relay_store("2026-11-08T03:11:37Z")), encoding="utf-8")
+            local_manifest, local_digests = webdav_core.build_manifest_and_digests(config)
+            self.assertEqual(
+                "conflict",
+                webdav_core.smart_sync_plan(local_manifest, host_manifest, base_manifest),
+            )
+            self.assertEqual(
+                "push",
+                webdav_core.smart_sync_plan(
+                    local_manifest,
+                    host_manifest,
+                    base_manifest,
+                    local_digests=local_digests,
+                    remote_digests=host_digests,
+                    base_digests=base_digests,
+                ),
+            )
+
+            pushed: list[object] = []
+            with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
+                "young_router.webdav.operations.read_remote_manifest", return_value=host_manifest
+            ), mock.patch(
+                "young_router.webdav.operations.read_remote_digests", return_value=host_digests
+            ), mock.patch(
+                "young_router.webdav.operations.push_bundle",
+                side_effect=lambda *args, **kwargs: pushed.append(args) or (32, host_manifest),
+            ), mock.patch("young_router.webdav.operations.pull_bundle") as pulled:
+                core.run_automatic_webdav_sync()
+
+            self.assertEqual(1, len(pushed))
+            pulled.assert_not_called()
+            self.assertFalse((root / "webdav-conflict.json").exists())
+            status = json.loads((root / "webdav-status.json").read_text(encoding="utf-8"))
+            self.assertTrue(status["ok"])
+            self.assertNotIn("code", status)
+
+    def test_a_remote_without_a_digest_record_is_read_from_its_bundle(self) -> None:
+        """A remote published before digests existed still gets a fair compare.
+
+        The record is new, so the first run after an upgrade finds none.  The
+        byte comparison then sees both relay files moved and would stop; the
+        bundle it would download for the comparison anyway answers what each
+        side holds, and the run carries the one real edit instead.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            providers = ProvidersModelsDomain(config)
+            relay = RelayAccountsDomain(storage_path=root / ".litellm-runtime" / "relay-accounts.json")
+            webdav = self._configured_webdav_domain(root, config)
+            core = CoreStore(domains=[providers, relay, webdav])
+
+            def manifest(config_sha: str, relay_sha: str) -> dict[str, object]:
+                return {
+                    "app": "young-router",
+                    "version": 1,
+                    "format": "json",
+                    "created_at": "2026-11-08T03:00:00Z",
+                    "summary": {},
+                    "files": [
+                        {"path": "config.yaml", "present": True, "sha256": config_sha},
+                        {"path": "config.disabled-models.yaml", "present": False},
+                        {"path": "relay-accounts.json", "present": True, "sha256": relay_sha},
+                    ],
+                }
+
+            base = manifest("base-config", "base-relay")
+            base_digests = {"config.yaml": "base-config", "config.disabled-models.yaml": None, "relay-accounts.json": "same-account"}
+            remote = manifest("base-config", "remote-read")
+            local = manifest("local-config", "local-read")
+            local_digests = {"config.yaml": "local-config", "config.disabled-models.yaml": None, "relay-accounts.json": "same-account"}
+            remote_digests = {"config.yaml": "base-config", "config.disabled-models.yaml": None, "relay-accounts.json": "same-account"}
+            webdav_core.save_sync_state(
+                root / "webdav-state.json", webdav.sync_settings(), base, "sync", base_digests
+            )
+
+            pushed: list[object] = []
+            with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
+                "young_router.webdav.core.build_manifest_and_digests", return_value=(local, local_digests)
+            ), mock.patch(
+                "young_router.webdav.operations.read_remote_manifest", return_value=remote
+            ), mock.patch(
+                "young_router.webdav.operations.read_remote_digests", return_value=None
+            ), mock.patch(
+                "young_router.webdav.operations.remote_digests_from_bundle", return_value=remote_digests
+            ) as from_bundle, mock.patch(
+                "young_router.webdav.operations.publish_remote_digests", return_value=True
+            ), mock.patch(
+                "young_router.webdav.operations.push_bundle",
+                side_effect=lambda *args, **kwargs: pushed.append(args) or (32, local),
+            ), mock.patch("young_router.webdav.operations.pull_bundle") as pulled:
+                core.run_automatic_webdav_sync()
+
+            from_bundle.assert_called_once()
+            self.assertEqual(1, len(pushed))
+            pulled.assert_not_called()
+            self.assertFalse((root / "webdav-conflict.json").exists())
 
     def test_a_sync_that_lands_clears_the_kept_aside_comparison(self) -> None:
         """Once the two ends agree there is no conflict left to show."""
