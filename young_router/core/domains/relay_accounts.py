@@ -4078,11 +4078,18 @@ class RelayAccountsDomain:
         type_value = str(account_type or "")
         if type_value not in ACCOUNT_TYPES:
             raise RelayAccountsError("Relay account type is invalid")
-        cookie_value = _text(cookie, "Relay cookie", limit=32768)
+        # A sub2api-style station authenticates its dashboard with a bearer
+        # token from local storage and sets no cookie at all: measured on
+        # api.sisct2.xyz, whose browser held `auth_token` and an empty jar.
+        # Requiring the cookie first made such a sign-in unverifiable while the
+        # person was, in fact, signed in.
+        cookie_value = _text(cookie, "Relay cookie", limit=32768, required=False)
         token_value = _text(access_token, "Relay access token", limit=32768, required=False)
         station_user_id = _station_user_id(user_id)
         path = "/api/user/self" if type_value == "newapi" else "/api/v1/auth/me"
-        headers: dict[str, str] = {"Cookie": cookie_value}
+        headers: dict[str, str] = {}
+        if cookie_value:
+            headers["Cookie"] = cookie_value
         if token_value:
             headers["Authorization"] = f"Bearer {token_value}"
         if station_user_id and type_value == "newapi":

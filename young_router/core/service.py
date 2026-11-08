@@ -2847,14 +2847,15 @@ class CoreStore:
         except Exception:
             return None
         header = relay_browser.cookie_header(cookies, entry["origin"])
-        if not header:
-            return None
         token = ""
         for key in ("access_token", "token", "accessToken", "auth_token"):
             value = storage.get(key)
             if isinstance(value, str) and value.strip():
                 token = value.strip()
                 break
+        if not header and not token:
+            # Neither credential yet: the page is still the login form.
+            return None
         user_id = _storage_user_id(storage)
         signature = f"{header}\u0000{token}\u0000{user_id}"
         if entry.get("last_cookie") == signature:

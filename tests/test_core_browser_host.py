@@ -1517,6 +1517,24 @@ class MirrorTests(unittest.TestCase):
         self.assertEqual("", _storage_user_id({"user": "not json"}))
         self.assertEqual("", _storage_user_id({"user": '{"quota": 1}'}))
 
+    def test_a_token_only_session_is_still_a_session(self) -> None:
+        """A sub2api-style station sets no cookie; the token is the session.
+
+        Measured on api.sisct2.xyz through the mirror: the browser held
+        `auth_token` in local storage and an **empty cookie jar**, so a verifier
+        that required a cookie first skipped every poll -- the person was signed
+        in, the station said so, and the account never left "waiting".
+        """
+
+        source = (Path(__file__).resolve().parents[1] / "young_router/core/service.py").read_text(encoding="utf-8")
+        jar = source.split('header = relay_browser.cookie_header(cookies, entry["origin"])', 1)[1].split("user_id = _storage_user_id(storage)", 1)[0]
+        self.assertIn('if not header and not token:', jar)
+        self.assertNotIn('if not header:\n            return None', jar)
+        domain = (Path(__file__).resolve().parents[1] / "young_router/core/domains/relay_accounts.py").read_text(encoding="utf-8")
+        verify = domain.split("def verify_browser_session", 1)[1].split("payload = self._http.json", 1)[0]
+        self.assertIn('_text(cookie, "Relay cookie", limit=32768, required=False)', verify)
+        self.assertIn("if cookie_value:\n            headers[\"Cookie\"] = cookie_value", verify)
+
     def test_a_leftover_frame_is_not_sent_twice(self) -> None:
         mirror = relay_mirror.MirrorSession(port=1, origin="https://example.org")
         with mirror._condition:
