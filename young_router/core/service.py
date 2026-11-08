@@ -43,6 +43,12 @@ DOMAIN_FILE_FORMAT = "young-router-domain-settings"
 DOMAIN_FILE_VERSION = 1
 SUBSCRIPTION_QUEUE_LIMIT = 32
 
+# How often the thread that ends abandoned sign-ins looks.  Shorter than the
+# idle timeout by a wide margin so a forgotten browser is closed within a tick
+# or two of going quiet, and cheap enough to run unconditionally: the sweep is
+# one lock and a subtraction per sign-in.
+BROWSER_LOGIN_REAP_SECONDS = 15.0
+
 _SECRET_FIELDS: dict[tuple[str, str], bool] = {
     ("providers_models", "api_key"): True,
     # A Qoder PAT is a real upstream credential, but it belongs to the Qoder
@@ -1155,6 +1161,9 @@ class CoreStore:
         # nothing about it is written down, and a Core that stops takes them
         # with it (see ``_shutdown_browser_logins``).
         self._browser_logins: dict[str, dict[str, Any]] = {}
+        # The thread that ends abandoned sign-ins; see `_reap_browser_logins`.
+        self._browser_reaper: threading.Thread | None = None
+        self._browser_reaper_stop: threading.Event | None = None
         self._disk: dict[str, dict[str, Any]] = {}
         self._disk_identities: dict[str, str | None] = {}
         self._logs: dict[str, dict[str, Any]] = {
@@ -2719,11 +2728,7 @@ class CoreStore:
             # Taken out of the map here and closed *after* the lock: stopping a
             # process and waiting for it is seconds, and every window's snapshot
             # needs this lock.
-            stale = [entry for entry in self._browser_logins.values() if entry["browser"].expired]
-            if stale:
-                self._browser_logins = {
-                    key: entry for key, entry in self._browser_logins.items() if not entry["browser"].expired
-                }
+            stale = self._reap_browser_logins()
             login_id = secrets.token_urlsafe(18)
             profile_root = self._relay_browser_profiles_root()
         for entry in stale:
@@ -2745,6 +2750,7 @@ class CoreStore:
             # window never appeared, so the pane must not pretend one is open.
             # The page says so and offers the credential form instead.
             return {"status": "unsupported", "reason": "launch_failed"}
+        self._start_browser_login_reaper()
         with self._lock:
             self._browser_logins[login_id] = {
                 "browser": browser,
@@ -2778,6 +2784,8 @@ class CoreStore:
 
         with self._lock:
             entry = self._browser_logins.get(str(login_id))
+            if entry is not None:
+                entry["browser"].last_seen_at = time.monotonic()
         if entry is None:
             return None
         browser = entry.get("browser")
@@ -2800,6 +2808,8 @@ class CoreStore:
 
         with self._lock:
             entry = self._browser_logins.get(str(login_id))
+            if entry is not None:
+                entry["browser"].last_seen_at = time.monotonic()
         if entry is None:
             return {"status": "unknown"}
         browser = entry["browser"]
@@ -2938,8 +2948,61 @@ class CoreStore:
         entry["browser"].close()
         return True
 
+    def _reap_browser_logins(self) -> list[dict[str, Any]]:
+        """Take out every sign-in that has expired or gone quiet, to be closed.
+
+        Two ways one ends without anybody asking: the ten-minute lifetime, and
+        a page that stopped polling — closed, crashed, or on a network that
+        dropped, so its cancel never arrived.  A browser left by either is a few
+        hundred megabytes on a host nobody is looking at, and the second one had
+        no bound at all before this: `expired` was only ever read by a poll, and
+        a page that never polls again never reads it.
+
+        Called from every entry point AND from a timer, because the case that
+        matters most is the one where no entry point is reached again.
+        """
+
+        now = time.monotonic()
+        gone: list[dict[str, Any]] = []
+        for key, entry in list(self._browser_logins.items()):
+            browser = entry.get("browser")
+            if browser is None:
+                self._browser_logins.pop(key, None)
+                continue
+            if browser.expired or browser.idle(now):
+                gone.append(self._browser_logins.pop(key))
+        return gone
+
+    def _start_browser_login_reaper(self) -> None:
+        """One daemon thread that closes abandoned sign-ins, whatever the page does."""
+
+        with self._lock:
+            if self._browser_reaper is not None and self._browser_reaper.is_alive():
+                return
+            stop = threading.Event()
+
+            def loop() -> None:
+                while not stop.wait(BROWSER_LOGIN_REAP_SECONDS):
+                    try:
+                        for entry in self._reap_browser_logins():
+                            try:
+                                entry["browser"].close()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+            self._browser_reaper_stop = stop
+            self._browser_reaper = threading.Thread(target=loop, name="yr-browser-reaper", daemon=True)
+            self._browser_reaper.start()
+
     def _close_browser_logins(self) -> None:
         with self._lock:
+            stop = self._browser_reaper_stop
+            if stop is not None:
+                stop.set()
+            self._browser_reaper_stop = None
+            self._browser_reaper = None
             entries = list(self._browser_logins.values())
             self._browser_logins.clear()
         for entry in entries:

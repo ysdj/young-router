@@ -33,6 +33,7 @@ from young_router.core import __main__ as core_main
 from unittest import mock
 
 from young_router.core import ipc, relay_browser, relay_mirror
+from young_router.core.service import BROWSER_LOGIN_REAP_SECONDS
 from urllib.parse import urlsplit
 from young_router.core.domains.relay_accounts import RelayAccountsDomain, RelayAccountsError, RelaySessionLimitError
 from young_router.core.domains.runtime import RuntimeSettingsDomain, WEB_PASSWORD_SETTING
@@ -1554,6 +1555,47 @@ class MirrorTests(unittest.TestCase):
         bridge = leaf.split("const hostBeacon =", 1)[1].split("const hostRoute =", 1)[0]
         self.assertIn("navigator.sendBeacon", bridge)
         self.assertIn('type: "application/json"', bridge)
+
+    def test_an_abandoned_sign_in_is_closed_without_anybody_asking(self) -> None:
+        """A page that stops polling must not leave a browser running for ever.
+
+        The ten-minute lifetime was only ever read *by a poll*: a tab closed
+        without its beacon -- a crash, a killed browser, a network that dropped
+        -- never asked again, so nothing reaped it.  A headless Chrome is a few
+        hundred megabytes, and that leak had no bound at all.
+        """
+
+        from young_router.core import relay_browser as browser_module
+
+        class FakeBrowser:
+            def __init__(self, *, idle: bool) -> None:
+                self.started_at = time.monotonic() - 5
+                self.last_seen_at = time.monotonic() - (browser_module.IDLE_TIMEOUT_SECONDS + 5 if idle else 5)
+                self.closed = False
+
+            @property
+            def expired(self) -> bool:
+                return False
+
+            def idle(self, now=None) -> bool:
+                return browser_module.IDLE_TIMEOUT_SECONDS < (now or time.monotonic()) - self.last_seen_at
+
+            def close(self) -> None:
+                self.closed = True
+
+        core = CoreStore.__new__(CoreStore)
+        core._lock = threading.RLock()
+        live, quiet = FakeBrowser(idle=False), FakeBrowser(idle=True)
+        core._browser_logins = {"live": {"browser": live}, "quiet": {"browser": quiet}}
+        core._browser_reaper = None
+        core._browser_reaper_stop = None
+        reaped = core._reap_browser_logins()
+        # The reaper hands back the entries it took out, so the caller can close
+        # them: closing is seconds of process wait and must not hold the lock.
+        self.assertEqual([{"browser": quiet}], reaped)
+        self.assertEqual({"live"}, set(core._browser_logins))
+        # The sweep's own bound: a thread that runs without any request at all.
+        self.assertEqual(15.0, BROWSER_LOGIN_REAP_SECONDS)
 
     def test_a_leftover_frame_is_not_sent_twice(self) -> None:
         mirror = relay_mirror.MirrorSession(port=1, origin="https://example.org")

@@ -58,6 +58,13 @@ START_TIMEOUT_SECONDS = 20.0
 # window somebody opened and walked away from.
 SESSION_TIMEOUT_SECONDS = 600.0
 
+# How long a sign-in may go without its page touching it before Core ends it.
+# A pane that is open asks for frames about once a second, so silence means the
+# page is gone -- closed, crashed, or on a network that dropped -- and nobody is
+# left to cancel it.  Ninety seconds is far longer than any real gap between two
+# polls and short enough that a forgotten session stops costing a browser.
+IDLE_TIMEOUT_SECONDS = 90.0
+
 
 class BrowserUnavailable(RuntimeError):
     """No Chromium-family browser this host can drive."""
@@ -459,6 +466,9 @@ class LoginBrowser:
     process: subprocess.Popen[bytes]
     profile: Path
     started_at: float = field(default_factory=time.monotonic)
+    # Whenever the page last asked about this sign-in: a poll, a frame, an
+    # input.  Idleness is measured from here, not from the launch.
+    last_seen_at: float = field(default_factory=time.monotonic)
     closed: bool = False
     # Set when this browser runs headless and Core streams its frames to the
     # page (see `relay_mirror`); `None` means a window on this machine's screen.
@@ -467,6 +477,18 @@ class LoginBrowser:
     @property
     def expired(self) -> bool:
         return time.monotonic() - self.started_at > SESSION_TIMEOUT_SECONDS
+
+    def idle(self, now: float | None = None) -> bool:
+        """Whether its page has stopped asking about it.
+
+        The browser outliving the page is the leak this measures: a headless
+        Chrome is a few hundred megabytes, and one left behind by a tab that
+        closed without a beacon would sit there until the ten-minute limit — or
+        for ever when nothing ever asked about it again.
+        """
+
+        moment = time.monotonic() if now is None else now
+        return moment - max(self.started_at, self.last_seen_at) > IDLE_TIMEOUT_SECONDS
 
     def cookies(self) -> list[dict[str, Any]]:
         return read_cookies(self.port)
