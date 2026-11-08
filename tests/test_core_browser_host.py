@@ -1498,6 +1498,25 @@ class MirrorTests(unittest.TestCase):
         # A host that is not Linux ships the faces and has no fc-list to ask.
         self.assertIn("command -v apt-get >/dev/null 2>&1 || return 0", installer)
 
+    def test_the_account_id_is_found_wherever_the_fork_kept_it(self) -> None:
+        """A New API fork's id is not always a flat storage key.
+
+        Measured on pawuvo.com (2026-11-08): the fork writes the whole profile
+        as JSON under `user` and nowhere else.  Reading only `id` meant the
+        `New-Api-User` header never went out, the profile read answered 401, and
+        the mirror sign-in could never complete -- while the person was, in
+        fact, signed in.
+        """
+
+        from young_router.core.service import _storage_user_id
+
+        self.assertEqual("42", _storage_user_id({"user": '{"id": 42, "username": "person"}'}))
+        self.assertEqual("7", _storage_user_id({"id": "7"}))
+        self.assertEqual("7", _storage_user_id({"user_id": " 7 "}))
+        self.assertEqual("", _storage_user_id({}))
+        self.assertEqual("", _storage_user_id({"user": "not json"}))
+        self.assertEqual("", _storage_user_id({"user": '{"quota": 1}'}))
+
     def test_a_leftover_frame_is_not_sent_twice(self) -> None:
         mirror = relay_mirror.MirrorSession(port=1, origin="https://example.org")
         with mirror._condition:

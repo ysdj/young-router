@@ -1012,6 +1012,37 @@ class UnavailableDomain:
         raise CoreError("domain_unavailable", "Settings could not be loaded")
 
 
+
+def _storage_user_id(storage: Mapping[str, str]) -> str:
+    """The station's account id, wherever that fork kept it.
+
+    A New API fork wants its own id as the `New-Api-User` header on every
+    dashboard read, and the id is not in the cookie.  Some forks write it under
+    `id`, and the one measured on 2026-11-08 (pawuvo.com) writes the whole
+    profile as JSON under `user` instead — with `id` nowhere else.  Reading only
+    the flat key left every mirror sign-in on that station unverifiable: the
+    person was signed in, the cookie was right, and the profile read answered
+    401 because the header never went out.
+    """
+
+    for key in ("id", "user_id", "userId"):
+        value = storage.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    raw = storage.get("user")
+    if isinstance(raw, str) and raw.strip().startswith("{"):
+        try:
+            user = json.loads(raw)
+        except ValueError:
+            return ""
+        if isinstance(user, Mapping):
+            for key in ("id", "user_id", "userId"):
+                value = user.get(key)
+                if isinstance(value, (int, str)) and str(value).strip():
+                    return str(value).strip()
+    return ""
+
+
 class CoreStore:
     """One thread-safe, versioned state source for native shells."""
 
@@ -2824,7 +2855,7 @@ class CoreStore:
             if isinstance(value, str) and value.strip():
                 token = value.strip()
                 break
-        user_id = str(storage.get("id") or storage.get("user_id") or storage.get("userId") or "")
+        user_id = _storage_user_id(storage)
         signature = f"{header}\u0000{token}\u0000{user_id}"
         if entry.get("last_cookie") == signature:
             return None
