@@ -517,6 +517,31 @@ function WindowsPicker({ labels, selectedValue, disabled, compact = true, access
   </Pressable>;
 }
 
+/**
+ * A browser draws its own hover label from the host node's `title`.
+ *
+ * React Native Web forwards neither `tooltip` (that is a Windows leaf prop) nor
+ * `title` (it is not among its forwarded props), so on the page an icon-only
+ * button was a glyph with nothing to read under the pointer. The one attribute
+ * a browser already understands is written onto the node, and the caller's ref
+ * still reaches the leaf so anything measuring the button keeps working.
+ */
+function WebHoverLabelButton({ hoverLabel, ...props }: React.ComponentProps<typeof WindowsButton> & { hoverLabel?: string }): React.JSX.Element {
+  const host = React.useRef<any>(null);
+  const forwardedRef = props.ref;
+  const setHost = React.useCallback((node: any) => {
+    host.current = node;
+    if (typeof forwardedRef === "function") forwardedRef(node);
+    else if (forwardedRef) (forwardedRef as React.MutableRefObject<any>).current = node;
+  }, [forwardedRef]);
+  React.useEffect(() => {
+    const node = host.current as { setAttribute?: (name: string, value: string) => void; removeAttribute?: (name: string) => void } | null;
+    if (hoverLabel) node?.setAttribute?.("title", hoverLabel);
+    else node?.removeAttribute?.("title");
+  }, [hoverLabel]);
+  return <WindowsButton {...props} ref={setHost} />;
+}
+
 const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeButtonWithRef({ titleWidth: titleWidthRequest, ...props }, ref): React.JSX.Element {
   const compact = props.compact ?? true;
   const buttonProps = {
@@ -555,7 +580,11 @@ const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeBu
     return <AppKitButton {...buttonProps} ref={ref as never} style={[props.style, titleWidth]} />;
   }
   if (Platform.OS === "web") {
-    return <WindowsButton {...buttonProps} ref={ref as never} style={style} />;
+    // The page's hover label: an explicit hint, or the name of a button that
+    // draws no words of its own.  A button that already shows its title has
+    // said everything a tooltip would repeat.
+    const hoverLabel = (props.toolTip ?? (showsTitle ? undefined : props.title)) || undefined;
+    return <WebHoverLabelButton {...buttonProps} ref={ref as never} hoverLabel={hoverLabel} style={style} />;
   }
   return <Pressable ref={ref as never} disabled={props.disabled} onPress={props.onPress} style={[style, props.busy === true && styles.buttonBusy]} accessibilityRole={props.link ? "link" : "button"}>{props.busy === true ? <ActivityIndicator size="small" style={styles.buttonBusyIndicator} /> : null}<Text style={styles.controlText}>{props.title}</Text></Pressable>;
 });
@@ -607,6 +636,23 @@ type TextFieldProps = TextInputProps & {
   borderless?: boolean;
 };
 
+/**
+ * The ink a browser field draws its hint in.
+ *
+ * React Native for Web paints `::placeholder` as
+ * `color: var(--placeholderTextColor)` and fills that variable from the field's
+ * own `placeholderTextColor`.  Neither browser leaf passed one, so the
+ * declaration was invalid at computed-value time and the hint inherited the
+ * field's own `#1b1b1b`: an empty 配置供应商 read as one that already had
+ * `https://api.example.com/v1` typed into it.  AppKit and WinUI answer this
+ * themselves (`NSColor.placeholderTextColor`, the control's placeholder
+ * foreground), so only this host has to state it.
+ */
+// Read where it is used, not where it is declared: `WINDOWS_CONTROL` is a
+// module constant defined further down this file, and a top-level read of
+// it here evaluated to `undefined` -- the page threw on load and drew
+// nothing at all.
+const webPlaceholderInk = (): string => WINDOWS_CONTROL.textSecondary;
 
 export function NativeTextField({ style, onChangeText, onSubmitEditing, onBlur, onFocus, search = false, borderless = false, ...props }: TextFieldProps): React.JSX.Element {
   const [focused, setFocused] = React.useState(false);
@@ -637,7 +683,7 @@ export function NativeTextField({ style, onChangeText, onSubmitEditing, onBlur, 
     return <AppKitTextField {...props} onBlur={onBlur} search={search} borderless={borderless} style={style} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} />;
   }
   return <View style={[styles.windowsTextField, focused && styles.windowsTextFieldFocused, style, props.editable === false && styles.windowsTextFieldDisabled]}>
-    <TextInput {...props} style={[styles.webTextFieldInput, props.multiline === true && styles.webTextFieldInputMultiline]} onFocus={(event) => { setFocused(true); onFocus?.(event); }} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} onBlur={(event) => { setFocused(false); onBlur?.(event); }} />
+    <TextInput {...props} placeholderTextColor={props.placeholderTextColor ?? webPlaceholderInk()} style={[styles.webTextFieldInput, props.multiline === true && styles.webTextFieldInputMultiline]} onFocus={(event) => { setFocused(true); onFocus?.(event); }} onChangeText={onChangeText} onSubmitEditing={onSubmitEditing} onBlur={(event) => { setFocused(false); onBlur?.(event); }} />
   </View>;
 }
 
@@ -1532,6 +1578,7 @@ function WebSecureTextInput({ domain, field, target, label, placeholder, multili
   return <TextInput
     accessibilityLabel={label}
     placeholder={placeholder}
+    placeholderTextColor={webPlaceholderInk()}
     nativeID={fieldId.current}
     ref={inputRef}
     editable={disabled !== true}
