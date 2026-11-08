@@ -2526,6 +2526,26 @@ class CoreStore:
             try:
                 current = self._adapter_snapshot("relay_accounts")
                 accounts = current.get("accounts", []) if isinstance(current, Mapping) else []
+                if pending_account is True and isinstance(username, str) and username.strip():
+                    # Adding a station asks for a login before the identity is
+                    # known, so the duplicate can only be recognised here, once
+                    # the station has said who it is.  A person signing the same
+                    # account in again is not adding a second one: measured on
+                    # lv, pressing add twice on one station left two rows with
+                    # the same address, one 已登录 and one 未登录, each claiming
+                    # a different balance.
+                    finder = getattr(relay, "account_for_login_identity", None)
+                    twin = finder(origin=str(origin or ""), username=username) if callable(finder) else ""
+                    if isinstance(twin, str) and twin:
+                        account_id = twin
+                        pending_account = False
+                        matching = next(
+                            (item for item in accounts if isinstance(item, Mapping) and item.get("id") == twin),
+                            None,
+                        )
+                        if isinstance(matching, Mapping):
+                            label = matching.get("label", label)
+                            account_type = matching.get("type", account_type)
                 matching = next(
                     (item for item in accounts if isinstance(item, Mapping) and item.get("id") == account_id),
                     None,

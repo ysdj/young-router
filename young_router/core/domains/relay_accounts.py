@@ -377,6 +377,12 @@ def _station_name(value: object, fallback: str = "") -> str:
     return result
 
 
+def _username_key(value: object) -> str:
+    """How two usernames are compared: the same person, whatever the case."""
+
+    return str(value or "").strip().casefold()
+
+
 def _station_origin_key(value: str) -> str:
     """Canonical identity for one relay deployment base URL.
 
@@ -3654,6 +3660,39 @@ class RelayAccountsDomain:
         self._persist()
         self.revision += 1
         return _public_account(account)
+
+    def account_for_login_identity(self, *, origin: object, username: object) -> str:
+        """The account that already *is* this login, or "".
+
+        Adding an account by station asks for a login; the identity it proves
+        arrives later, as the username the station answers with.  A person who
+        signs the same account in again — after a password change, a lost
+        session, or simply by pressing add a second time — is not adding a
+        second account, and a list that shows `someone@example.com` three times
+        for one station is the wrong answer: the rows each claim a different
+        balance and only one of them can be right.
+
+        A signed-in row wins over a signed-out one, and an older row over a
+        newer one, so a re-login lands on the row the person has been using.
+        """
+
+        host = _station_origin_key(_origin(origin))
+        wanted = _username_key(username)
+        if not host or not wanted:
+            return ""
+        candidates: list[tuple[int, int, str]] = []
+        for index, account in enumerate(self._accounts):
+            if _station_origin_key(str(account.get("origin", ""))) != host:
+                continue
+            if _username_key(account.get("username")) != wanted:
+                continue
+            # Signed in first, then the row that has been there longest.
+            signed_in = 0 if str(account.get("login_status", "")) == "signed_in" else 1
+            candidates.append((signed_in, index, str(account.get("id", ""))))
+        if not candidates:
+            return ""
+        candidates.sort()
+        return candidates[0][2]
 
     def accept_login_result(
         self,

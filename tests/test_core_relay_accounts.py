@@ -125,7 +125,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                         "type": "sub2api",
                         "label": "Transfer Account",
                         "origin": "https://relay.example.test",
-                        "username": "person@example.test",
+                        "username": "account-a@example.test",
                         "login_status": "signed_in",
                         "remember_password": True,
                         "password": "replace-package-password",
@@ -145,6 +145,61 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 "pending_credential_cleanups": [],
             },
         }
+
+    def test_signing_in_the_same_account_twice_keeps_one_row(self) -> None:
+        """Adding a station asks for a login before the identity is known.
+
+        So the duplicate can only be recognised once the station answers with a
+        username — and measured on lv, pressing add twice on one station left two
+        rows with the same address, one 已登录 and one 未登录, each claiming a
+        different balance. A re-login belongs on the row the person has been
+        using, not beside it.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            relay = RelayAccountsDomain(directory)
+            core = CoreStore(domains=[relay])
+            core.accept_relay_login(
+                account_id="pending-one",
+                account_type="newapi",
+                label="sisct2",
+                origin="https://relay-one.example.test",
+                username="account-a@example.test",
+                cookie="session=first",
+                pending_account=True,
+            )
+            core.accept_relay_login(
+                account_id="pending-two",
+                account_type="newapi",
+                label="sisct2",
+                origin="https://relay-one.example.test",
+                username="account-a@example.test",
+                cookie="session=second",
+                pending_account=True,
+            )
+            accounts = core.snapshot()["domains"]["relay_accounts"]["accounts"]
+            self.assertEqual(1, len(accounts))
+            self.assertEqual("pending-one", accounts[0]["id"])
+            self.assertEqual("signed_in", accounts[0]["login_status"])
+
+    def test_same_address_on_a_different_station_is_another_account(self) -> None:
+        """The identity is the pair: the address alone does not make it the same."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            relay = RelayAccountsDomain(directory)
+            core = CoreStore(domains=[relay])
+            for index, origin in enumerate(("https://relay-one.example.test", "https://relay-two.example.test")):
+                core.accept_relay_login(
+                    account_id=f"pending-{index}",
+                    account_type="newapi",
+                    label=f"station-{index}",
+                    origin=origin,
+                    username="account-a@example.test",
+                    cookie="session=x",
+                    pending_account=True,
+                )
+            accounts = core.snapshot()["domains"]["relay_accounts"]["accounts"]
+            self.assertEqual(2, len(accounts))
 
     def test_trusted_package_export_stages_private_relay_state_until_apply(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -471,7 +526,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 },
             )["accounts"][0]
             domain.accept_login_result(
-                account["id"], username="person@example.test", access_token="replace-token"
+                account["id"], username="account-a@example.test", access_token="replace-token"
             )
 
             refreshed = domain.refresh_resources(account["id"])
@@ -514,7 +569,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )["accounts"][0]["id"]
             domain.accept_login_result(
                 account_id,
-                username="person@example.test",
+                username="account-a@example.test",
                 access_token="replace-token",
                 remember_password=True,
             )
@@ -573,7 +628,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )["accounts"][0]["id"]
             domain.accept_login_result(
                 account_id,
-                username="person@example.test",
+                username="account-a@example.test",
                 access_token="replace-token",
                 remember_password=True,
             )
@@ -635,7 +690,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )["accounts"][0]["id"]
             domain.accept_login_result(
                 account_id,
-                username="person@example.test",
+                username="account-a@example.test",
                 access_token="replace-token",
                 remember_password=True,
             )
@@ -681,7 +736,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )["accounts"][0]["id"]
             domain.accept_login_result(
                 account_id,
-                username="person@example.test",
+                username="account-a@example.test",
                 access_token="replace-token",
                 remember_password=True,
             )
@@ -1160,7 +1215,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 account_type="newapi",
                 label="nimbus",
                 origin="https://relay.example.test",
-                username="person@example.test",
+                username="account-a@example.test",
                 access_token="replace-token",
                 password="replace-password",
                 user_id="2411",
@@ -1520,13 +1575,13 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )["accounts"][0]
             domain.accept_login_result(
                 account["id"],
-                username="person@example.test",
+                username="account-a@example.test",
                 cookie="session=remembered-cookie",
                 access_token="remembered-token",
             )
             domain.apply()
 
-            fake = FakeRelayHTTPClient({"/api/v1/auth/me": {"data": {"email": "person@example.test"}}})
+            fake = FakeRelayHTTPClient({"/api/v1/auth/me": {"data": {"email": "account-a@example.test"}}})
             restored_domain = RelayAccountsDomain(root, http_client=fake)
             restored = restored_domain.restore_saved_session(account["id"])
 
@@ -1652,7 +1707,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )["accounts"][0]
             domain.accept_login_result(
                 account["id"],
-                username="person@example.test",
+                username="account-a@example.test",
                 access_token="replace-access-token",
                 password="replace-password",
             )
@@ -1689,7 +1744,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )["accounts"][0]
             accepted = domain.accept_login_result(
                 account["id"],
-                username="person@example.test",
+                username="account-a@example.test",
                 access_token="replace-access-token",
                 password="replace-password",
             )
@@ -1704,7 +1759,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             fake = FakeRelayHTTPClient(
                 {},
                 password_login_result={
-                    "username": "person@example.test",
+                    "username": "account-a@example.test",
                     "cookie": "",
                     "access_token": "replace-new-token",
                     "refresh_token": "replace-refresh-token",
@@ -1715,7 +1770,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertEqual("signed_in", restored["login_status"])
             self.assertTrue(restored["password_saved"])
             self.assertEqual(
-                [("https://relay.example.test", "sub2api", "person@example.test", "replace-password")],
+                [("https://relay.example.test", "sub2api", "account-a@example.test", "replace-password")],
                 fake.password_logins,
             )
 
@@ -1733,7 +1788,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
         fake = FakeRelayHTTPClient(
             {},
             password_login_result={
-                "username": "person@example.test",
+                "username": "account-a@example.test",
                 "cookie": "session=replace-page-cookie",
                 "access_token": "replace-page-token",
                 "refresh_token": "",
@@ -1751,7 +1806,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 account_type="newapi",
                 label="Page Station",
                 origin="https://relay.example.test",
-                username="person@example.test",
+                username="account-a@example.test",
                 password="replace-page-password",
                 station_name="Page Station",
                 station_type="newapi",
@@ -1762,7 +1817,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
 
             self.assertEqual("signed_in", result["login_status"])
             self.assertEqual(
-                [("https://relay.example.test", "newapi", "person@example.test", "replace-page-password")],
+                [("https://relay.example.test", "newapi", "account-a@example.test", "replace-page-password")],
                 fake.password_logins,
             )
             account = core.snapshot()["domains"]["relay_accounts"]["accounts"][0]
@@ -1806,7 +1861,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                             account_type="newapi",
                             label="Page Station",
                             origin="https://relay.example.test",
-                            username="person@example.test",
+                            username="account-a@example.test",
                             password="replace-page-password",
                             pending_account=True,
                         )
@@ -1942,12 +1997,12 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )["accounts"][0]
             relay.accept_login_result(
                 account["id"],
-                username="person@example.test",
+                username="account-a@example.test",
                 cookie="session=remembered-cookie",
                 password="replace-password",
             )
             relay.apply()
-            fake = FakeRelayHTTPClient({"/api/v1/auth/me": {"data": {"email": "person@example.test"}}})
+            fake = FakeRelayHTTPClient({"/api/v1/auth/me": {"data": {"email": "account-a@example.test"}}})
             reloaded = RelayAccountsDomain(root, http_client=fake)
             core = CoreStore(
                 metadata_path=root / ".litellm-runtime" / "core-state.json",
@@ -2112,7 +2167,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )["accounts"][0]["id"]
             domain.accept_login_result(
                 account_id,
-                username="person@example.test",
+                username="account-a@example.test",
                 cookie="session=replace-cookie",
                 password="replace-password",
             )
@@ -3058,7 +3113,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )["accounts"][0]
             domain.accept_login_result(
                 account["id"],
-                username="person@example.test",
+                username="account-a@example.test",
                 access_token="replace-access-token",
                 password="replace-password",
             )
@@ -3332,7 +3387,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                         "/v1/models": {"object": "list", "data": [{"id": "model-a"}]},
                     },
                     password_login_result={
-                        "username": "person@example.test",
+                        "username": "account-a@example.test",
                         "cookie": "",
                         "access_token": "replace-renewed-token",
                         "refresh_token": "replace-renewed-refresh",
@@ -3362,7 +3417,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )["accounts"][0]
             domain.accept_login_result(
                 account["id"],
-                username="person@example.test",
+                username="account-a@example.test",
                 access_token="replace-stale-token",
                 refresh_token="replace-stale-refresh",
                 password="replace-password",
@@ -3380,7 +3435,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             # The saved password is what minted the new session, on the same
             # site and for the same account — never a guessed replacement.
             self.assertEqual(
-                [("https://sub.example.test", "sub2api", "person@example.test", "replace-password")],
+                [("https://sub.example.test", "sub2api", "account-a@example.test", "replace-password")],
                 fake.password_logins,
             )
             # The renewed session replaced the stale one on disk.
@@ -3414,7 +3469,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )["accounts"][0]
             domain.accept_login_result(
                 account["id"],
-                username="person@example.test",
+                username="account-a@example.test",
                 access_token="replace-stale-token",
                 password="replace-password",
             )
@@ -3438,7 +3493,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 "add",
                 {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test", "remember_password": False},
             )["accounts"][0]
-            domain.accept_login_result(account["id"], username="person@example.test", access_token="replace-stale-token")
+            domain.accept_login_result(account["id"], username="account-a@example.test", access_token="replace-stale-token")
 
             result = domain.refresh_resources(account["id"])
 
@@ -4726,7 +4781,7 @@ class RelayReadPolicyTests(unittest.TestCase):
             # Even an id the caller wrongly attaches stays off a sub2api read.
             domain.accept_login_result(
                 account_id,
-                username="person@example.test",
+                username="account-a@example.test",
                 access_token="replace-token",
                 user_id="2411",
             )
@@ -4940,7 +4995,7 @@ class RelayReadPolicyTests(unittest.TestCase):
                 "account.add",
                 {"type": "sub2api", "label": "Relay", "origin": "https://relay.example.test"},
             )["accounts"][0]
-            domain.accept_login_result(account["id"], username="person@example.test", cookie="session=fixture")
+            domain.accept_login_result(account["id"], username="account-a@example.test", cookie="session=fixture")
             domain.refresh_resources(account["id"])
 
             domain.update_api_key(account["id"], "sub2api-key-one", "Claude Max (禁蒸馏)")
@@ -5067,7 +5122,7 @@ class RelaySessionLeaseTests(unittest.TestCase):
             account_id = domain.snapshot()["accounts"][0]["id"]
             domain.accept_login_result(
                 account_id,
-                username="person@example.test",
+                username="account-a@example.test",
                 access_token="replace-access-token",
                 refresh_token="replace-refresh-token",
                 user_id="272",
@@ -5081,7 +5136,7 @@ class RelaySessionLeaseTests(unittest.TestCase):
                 {"username", "user_id", "access_token", "refresh_token", "expires_at"},
                 set(payload),
             )
-            self.assertEqual("person@example.test", payload["username"])
+            self.assertEqual("account-a@example.test", payload["username"])
             self.assertEqual("272", payload["user_id"])
             self.assertEqual("replace-access-token", payload["access_token"])
             self.assertEqual("replace-refresh-token", payload["refresh_token"])
