@@ -707,6 +707,37 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("the same commit must build the same page; nothing was uploaded", publisher)
         self.assertIn('gh release upload "$TAG" "$work/$asset" --repo "$REPOSITORY"', publisher)
 
+    def test_the_page_bucket_never_becomes_the_latest_release(self) -> None:
+        """An artifact bucket must not answer as the repository's latest release.
+
+        GitHub marks a release neither draft nor prerelease as a candidate for
+        "Latest", and `scripts/publish-web-page.sh` created `web` with neither
+        flag.  So the page bucket -- fourteen per-commit tarballs, described by
+        its own notes as built per commit -- became the repository's latest
+        release: `/releases/latest` redirected to a page archive instead of the
+        app, and `/releases` opened on the bucket rather than on a version.
+
+        `--prerelease` is what keeps it out of that slot, `--latest=false`
+        states it a second time for the case where GitHub would pick by date,
+        and an existing bucket is repaired on every publish rather than only
+        being created correctly -- the release that was wrong already existed,
+        so a create-only fix could not have corrected it.
+        """
+
+        publisher = (ROOT / "scripts" / "publish-web-page.sh").read_text(encoding="utf-8")
+
+        self.assertIn('gh release create "$TAG" --repo "$REPOSITORY" --title "$RELEASE_TITLE"', publisher)
+        create = publisher[publisher.index('gh release create "$TAG"') :]
+        create = create[: create.index('fi')]
+        self.assertIn("--prerelease", create)
+        self.assertIn("--latest=false", create)
+        # An existing release is edited as well: the flag has to be re-stated on
+        # the bucket that is already published.
+        self.assertIn('gh release edit "$TAG" --repo "$REPOSITORY" --prerelease --latest=false', publisher)
+        # The title says what the thing is, so the releases page does not read
+        # "Browser page (built per commit)" as a product release name.
+        self.assertIn('RELEASE_TITLE="Browser page builds (per-commit artifacts, not a release)"', publisher)
+
     def test_the_page_travels_precompressed_and_without_the_editors_inline_copy(self) -> None:
         """The page is the one thing every browser on a remote host downloads.
 

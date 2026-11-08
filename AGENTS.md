@@ -106,6 +106,7 @@
 
 ## 公开发布卫生
 
+- `web` 是 `scripts/publish-web-page.sh` 的按提交制品桶，**不是一次发布**：它必须以 prerelease 建（`--prerelease --latest=false`），且每次发布都重述这两个标记，因为 GitHub 会把「既非草稿也非 prerelease」的最新一条当 Latest——这个桶曾经就是这样成了仓库的 latest release，`/releases/latest` 指向一个页面 tarball，`/releases` 首屏是「Browser page (built per commit)」而不是 app 的版本。`v<version>` 才是这个仓库发布的东西。
 - 不提交运行目录、虚拟环境、包安装、生成 bundle、日志、含真实数据的截图、本地 trace、WebDAV 设置；这些东西也不该出现在工作树里。
 - 没有 workflow 自己触发：`.github/workflows/` 里没有 `push`、`pull_request`、`schedule`，只有人 dispatch 才会跑（一次提交不是花二十分钟 runner 的请求，自动红牌也不是评审）。在对象产生之前把关的是 `scripts/check-repo-hygiene.py`，跑在 `pre-commit`、`commit-msg`、`pre-push` 三处且必须同步，fail closed（读不到 index 或缺解释器就报错，绝不跳过）——泄漏不能靠后来的提交补救，blob 和对象头按 id 永远可达。新克隆用 `scripts/install-git-hooks.sh` 装；`core.hooksPath` 在克隆里，跳过的克隆还有 `pre-push` 和 dispatch 兜着。误报改 pattern 表，绝不用 `--no-verify` 放过。
 - `tests/` 里可以写真实本地路径（证明路由器学不到它就得拼出来），其他被跟踪文件一律写 `example` 占位；固定凭据是可读的词（`sk-replace-…`），绝不是形状像真值的东西。

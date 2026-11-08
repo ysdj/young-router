@@ -30,7 +30,17 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 REPOSITORY=ysdj/young-router
 TAG=web
-RELEASE_TITLE="Browser page (built per commit)"
+# This release is an artifact bucket, not a product release.  GitHub shows a
+# release on `/releases` and, unless it says otherwise, treats the newest one as
+# "Latest" -- and a `web` release published as ordinary therefore became the
+# repository's latest release: `/releases/latest` redirected to the page
+# tarball, and `/releases` opened on "Browser page (built per commit)" above the
+# app's own release.  The page is a build artifact per commit (fourteen of them
+# at last count); `v<version>` is the thing this repository releases.  A
+# prerelease is left out of "Latest" by GitHub's own rule, so the flag is what
+# keeps the artifact off the releases front page, not a cosmetic marker.
+RELEASE_TITLE="Browser page builds (per-commit artifacts, not a release)"
+RELEASE_NOTES="The browser page Core serves at /ui, one archive per commit it was built from. Artifacts only: this is not a version of Young Router and carries no release notes."
 
 commit_ref=HEAD
 output_dir=""
@@ -193,8 +203,14 @@ command -v gh >/dev/null 2>&1 || {
 }
 if ! gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
   gh release create "$TAG" --repo "$REPOSITORY" --title "$RELEASE_TITLE" \
-    --notes "The browser page Core serves at /ui, one archive per commit it was built from."
+    --prerelease --latest=false --notes "$RELEASE_NOTES"
 fi
+# An existing release is repaired rather than trusted: created before this
+# script passed `--prerelease`, `web` was the repository's Latest release, and
+# an upload path that only creates a missing release would leave it that way.
+# Re-stating both flags on every publish is idempotent and costs one call.
+gh release edit "$TAG" --repo "$REPOSITORY" --prerelease --latest=false \
+  --title "$RELEASE_TITLE" >/dev/null
 
 # Uploading twice is how one commit ends up with two different pages: the host
 # installs by name, so the second upload silently changes what "that commit's
