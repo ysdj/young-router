@@ -1943,13 +1943,20 @@ class ClaudeSettingsDomain:
         """Per-model settings Claude Code needs for the same rows.
 
         ``modelPicker`` carries the id and the behavior model; the context
-        number itself lives in ``modelSettings.<model>``, keyed by the id the
-        client was launched with -- which is the alias the picker names, so one
-        entry serves the terminal and the desktop Code tab.
+        number itself lives in ``modelSettings.<model>``.
         ``autoCompactWindow`` is the only per-model context field in Claude
         Code, and without it a 500k route that behaves as a 1M model would show
-        1M.  Existing entries and every other field (a user's own effort or
-        window) are preserved.
+        1M.  Every other field of an existing entry (a user's own effort or
+        window) is preserved.
+
+        Two ids describe one route, and both are written.  The picker names the
+        row ``<id>[1m]``, but a session runs the suffix-free id: measured on the
+        desktop Code tab, the session behind a ``claude-mythos-eb1394[1m]`` row
+        wrote ``claude-mythos-eb1394`` as its model.  A number stated only under
+        the suffixed spelling therefore reached no session -- the base id kept
+        the ``200000`` this app wrote while the route was on the client's 200k
+        tier, and the session showed 200k for a route published at 1M.  So the
+        row's id carries the number and so does the id a session actually runs.
 
         An entry already written under the public name is kept rather than
         moved: nothing this app generates launches with that spelling any more,
@@ -1971,39 +1978,46 @@ class ClaudeSettingsDomain:
             if window is None:
                 window = route.get("max_input_tokens")
             model_id = self._code_picker_id(name, window)
-            entry = dict(settings.get(model_id) or settings.get(name) or {})
+            base_id = claude_aliases.context_suffix_free(model_id)
             desired = _code_auto_compact_window(window)
-            stored = entry.get("autoCompactWindow", desired)
-            # ``auto`` is this app's marker for "nothing is known about this
-            # route's window", and it is what a pass wrote while the number came
-            # from the listing (which states nothing for a route LiteLLM's cost
-            # map does not carry).  Once the route resolves, the number replaces
-            # it -- otherwise the session keeps the client's 200k default on top
-            # of a route this app publishes at 500k.  A value that is neither
-            # ``auto`` nor the number a person would have to have typed by hand
-            # is theirs and stays.
-            if stored != desired and stored == "auto":
-                entry["autoCompactWindow"] = desired
-            else:
-                entry.setdefault("autoCompactWindow", desired)
-            settings[model_id] = entry
+            seed = settings.get(model_id) or settings.get(base_id) or settings.get(name) or {}
+            for launch_id in dict.fromkeys((model_id, base_id)):
+                entry = dict(settings.get(launch_id) or seed)
+                stored = entry.get("autoCompactWindow", desired)
+                # ``auto`` is this app's marker for "nothing is known about this
+                # route's window", and it is what a pass wrote while the number
+                # came from the listing (which states nothing for a route
+                # LiteLLM's cost map does not carry).  Once the route resolves,
+                # the number replaces it -- otherwise the session keeps the
+                # client's 200k default on top of a route this app publishes at
+                # 500k.
+                if stored == desired or stored == "auto":
+                    entry["autoCompactWindow"] = desired
+                elif launch_id == base_id:
+                    # The id a session runs states what this app publishes for
+                    # the route.  A number this app wrote there while the route
+                    # sat on another tier is its own stale claim, not a choice:
+                    # the row moved, so the window moves with it.
+                    entry["autoCompactWindow"] = desired
+                else:
+                    # A row's own entry holds the user's number, if they set one.
+                    entry.setdefault("autoCompactWindow", desired)
+                settings[launch_id] = entry
         # A key this app wrote under a superseded spelling is not the user's
-        # writing.  One route whose id moved (a public name before the ids were
-        # aliases; an alias before a declared 1M route carried the client's
-        # suffix) would otherwise be described twice, and the file would grow an
-        # entry per model on every change.  Only an entry holding nothing but the
-        # number this app writes is retired, and only when it now agrees: a value
-        # that differs is theirs, because nothing here knows which spelling they
-        # meant.
+        # writing: one route described twice would grow an entry per model on
+        # every change.  Only an entry holding nothing but the number this app
+        # writes is retired, and only when it now agrees -- a value that differs
+        # is theirs.  The ids a current route is launched by are not stale.
         for name in names:
             window = self._published_window(name)
             if window is None:
                 window = (known.get(name) or {}).get("max_input_tokens")
             model_id = self._code_picker_id(name, window)
+            launched = {model_id, claude_aliases.context_suffix_free(model_id)}
             current = settings.get(model_id)
             if not isinstance(current, Mapping):
                 continue
-            for stale_key in {name, self._code_picker_id(name)} - {model_id}:
+            for stale_key in {name, model_id} - launched:
                 stale = settings.get(stale_key)
                 if not isinstance(stale, Mapping):
                     continue

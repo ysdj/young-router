@@ -466,9 +466,9 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
             )
             settings = json.loads(domain.raw_text(include_sensitive=True))["modelSettings"]
             # A Claude-shaped 1M route keeps the number it states, under the id
-            # the row names.
+            # the row names and under the id a session actually runs.
             self.assertEqual(1_000_000, settings["claude-opus-5-5[1m]"]["autoCompactWindow"])
-            self.assertNotIn("claude-opus-5-5", settings)
+            self.assertEqual(1_000_000, settings["claude-opus-5-5"]["autoCompactWindow"])
             self.assertEqual(500_000, settings[alias_claude_desktop("gpt-6.1-sol")]["autoCompactWindow"])
             self.assertEqual(
                 1_000_000,
@@ -880,11 +880,16 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
 
             settings = json.loads(domain.raw_text(include_sensitive=True))["modelSettings"]
             # The entry the user had under the public name follows the route to
-            # the id it is named by now, and the old spelling is retired rather
-            # than left beside it describing one model twice.  ``auto`` was this
+            # the ids it is named by now -- the picker's row and the suffix-free
+            # one a session runs -- and the old spelling is retired rather than
+            # left beside them describing one model twice.  ``auto`` was this
             # app's "window unknown" marker, so the resolved number replaces it.
+            alias = alias_claude_desktop("gemini-3.8-flash")
             self.assertEqual(
-                {f"{alias_claude_desktop('gemini-3.8-flash')}[1m]": {"autoCompactWindow": 1_000_000}},
+                {
+                    f"{alias}[1m]": {"autoCompactWindow": 1_000_000},
+                    alias: {"autoCompactWindow": 1_000_000},
+                },
                 settings,
             )
 
@@ -944,15 +949,22 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
                 ],
                 picker["options"],
             )
-            # The route the user typed under the plain alias is retired onto the
-            # id, not left beside it describing one model twice.
+            # The route the user typed under the plain alias is moved onto the
+            # row's ids, and the suffix-free one is what the session runs.
             settings = json.loads(domain.raw_text(include_sensitive=True))["modelSettings"]
-            self.assertEqual({suffixed: {"autoCompactWindow": 1_000_000}}, settings)
+            self.assertEqual(
+                {
+                    suffixed: {"autoCompactWindow": 1_000_000},
+                    alias_claude_desktop("gemini-3.8-flash"): {"autoCompactWindow": 1_000_000},
+                },
+                settings,
+            )
 
-    def test_a_declared_one_million_route_drops_its_unsuffixed_entry(self) -> None:
-        # The id moved when the declaration arrived, so the entry written under
-        # the old spelling is retired -- otherwise one route is described twice,
-        # which is what the suffix was meant to end.
+    def test_a_declared_one_million_route_states_the_id_a_session_runs(self) -> None:
+        # The suffix names a picker row; the session runs the suffix-free id, so
+        # that entry is the one the client reads its window from.  Dropping it
+        # when the route moved to 1M left the session on the 200k tier this app
+        # had written for the same route earlier.
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             desktop_root = root / "configLibrary"
@@ -985,7 +997,58 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
 
             suffixed = f"{alias_claude_desktop('kimi-k3.1-pro')}[1m]"
             settings = json.loads(domain.raw_text(include_sensitive=True))["modelSettings"]
-            self.assertEqual({suffixed: {"autoCompactWindow": 1_000_000}}, settings)
+            self.assertEqual(
+                {
+                    suffixed: {"autoCompactWindow": 1_000_000},
+                    alias_claude_desktop("kimi-k3.1-pro"): {"autoCompactWindow": 1_000_000},
+                },
+                settings,
+            )
+
+    def test_a_route_that_moved_to_1m_moves_the_window_a_session_reads(self) -> None:
+        # The document a user was left holding: the route's row was named 1M by
+        # an earlier pass while the id a session runs still carried the 200k
+        # tier this app wrote when the window was unknown.  The desktop Code tab
+        # showed 200k for a route published at 1M, and no refresh repaired it
+        # because the suffixed entry already agreed with itself.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(desktop_root, {})
+            alias = alias_claude_desktop("deepseek-v4.1-flash")
+            (root / "settings.json").write_text(
+                json.dumps(
+                    {
+                        "model": f"{alias}[1m]",
+                        "modelPicker": {"replaceBuiltInOptions": True, "options": []},
+                        "modelSettings": {
+                            alias: {"autoCompactWindow": 200_000},
+                            f"{alias}[1m]": {"autoCompactWindow": 1_000_000},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _write_runtime_config(root / "config.yaml", {"deepseek-v4.1-flash": 1_000_000})
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            with (
+                mock.patch.object(domain, "_public_models", return_value=["deepseek-v4.1-flash"]),
+                mock.patch.object(
+                    domain,
+                    "_public_model_rows",
+                    return_value=[{"id": "deepseek-v4.1-flash", "max_input_tokens": 1_000_000}],
+                ),
+            ):
+                self.assertTrue(domain.refresh_model_lists())
+
+            settings = json.loads((root / "settings.json").read_text(encoding="utf-8"))["modelSettings"]
+            self.assertEqual(1_000_000, settings[alias]["autoCompactWindow"])
+            self.assertEqual(1_000_000, settings[f"{alias}[1m]"]["autoCompactWindow"])
 
     def test_desktop_model_list_replaces_its_own_list_and_clears_to_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
