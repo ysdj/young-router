@@ -1,23 +1,22 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 /**
- * Where a relay panel's dialogs are drawn.
+ * Where a relay panel's form surfaces are drawn.
  *
- * 分组管理's questions — 移除中转站连接 and the API-key dialogs — are asked by
- * panels that live inside the provider inspector: a 290 pt column whose editor is
- * a scroll view.  A dialog drawn where its panel sits is therefore clipped by
- * that view and centred in the column, which is how 移除中转站连接 came to render
- * as a small box under the pane while every other confirmation in the app draws
- * as one dialog over the surface that asked it.
+ * 新建 API 密钥 is asked by a panel that lives inside the provider inspector: a
+ * 290 pt column whose editor is a scroll view.  A surface drawn where its panel
+ * sits is therefore clipped by that view and centred in the column instead of
+ * over the surface that asked it.
  *
- * Moving a dialog out of its own clip needs a portal and this build renders none,
- * so a panel hands its dialogs *up* to the route instead: it publishes a render
- * function here and `RelayDialogHost` draws the result beside the panels, outside
- * every column.  The codebase already carries this shape of module-level state
- * for the same reason — see `providerWizardGate`.
+ * Moving a surface out of its own clip needs a portal and this build renders
+ * none, so a panel hands it *up* to the route instead: it publishes a render
+ * function here and `RelayDialogHost` draws the result beside the panels,
+ * outside every column.  The codebase already carries this shape of module-level
+ * state for the same reason — see `providerWizardGate`.
  *
- * Only placement moves.  A dialog keeps its component, its props, and its
- * behaviour, so this cannot change what a question says or how it is answered.
+ * Only placement moves.  This module holds no question and no confirmation: a
+ * confirm is the host's own decision panel (`native.showConfirmation`), which is
+ * presented by the host and not drawn in this page at all.
  */
 type DialogRender = () => React.ReactNode;
 
@@ -63,6 +62,16 @@ export function useRelayDialogSurface(render: DialogRender): boolean {
       notify();
     };
   }, [id]);
+  // The published entry is the panel's *current* render, so the host has to be
+  // told after every render of the panel and not only when it mounts: a form
+  // that opened later republished its closure and nothing redrew the host, so
+  // the surface stayed closed until some unrelated render of the route happened
+  // to draw it — a ＋ that did nothing until the next station read landed.
+  // The entry itself never changes (`renderRef` is read at call time), so the
+  // mount effect above owns it and this one only says "read it again".
+  useLayoutEffect(() => {
+    notify();
+  });
   useEffect(() => subscribeRelayDialogs(() => setHosted(relayDialogSurfaceMounted())), []);
   return hosted;
 }

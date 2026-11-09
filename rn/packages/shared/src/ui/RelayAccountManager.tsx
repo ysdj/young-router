@@ -6,7 +6,6 @@ import { NativeButton, NativeCheckbox, NativePicker, NativeTable, NativeTextFiel
 import { pushPresentation, trapWithin } from "../platform/presentationStack";
 import { usePendingAction } from "./pendingAction";
 import { setGroupManagerOpen } from "./providerWizardGate";
-import { useRelayDialogSurface } from "./relayDialogSurface";
 import { normalizeRelayOrigin } from "./relayOrigin";
 import { multiplierSpelling } from "./rateSpelling";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
@@ -16,7 +15,6 @@ export { normalizeRelayOrigin } from "./relayOrigin";
 type UnknownRecord = Record<string, unknown>;
 type Translate = (key: string, values?: Record<string, string | number>) => string;
 export type RelayType = "newapi" | "sub2api";
-type LocalDependencyPolicy = "delete_models" | "detach";
 type RemoteDeletePolicy = "delete_models" | "detach_disabled" | "detach_only";
 export type RelayGroup = {
   id: string;
@@ -92,7 +90,6 @@ export type RelayApiKeyActions = {
   setAutoGrouping?: (accountID: string, enabled: boolean) => Promise<AutoGroupingUpdateResult>;
   alignAutoGrouping?: (accountID: string) => Promise<void>;
   remove?: (accountID: string, resourceID: string, dependencyPolicy: Exclude<RemoteDeletePolicy, "detach_only">) => Promise<void>;
-  detach?: (accountID: string, resourceID: string) => Promise<void>;
 };
 
 /** Staged relay metadata commits go through this opaque host callback. */
@@ -100,7 +97,6 @@ export type RelayCommit = (type: string, payload?: UnknownRecord) => Promise<voi
 
 type ResourceRefreshTarget = { id: string; resources?: RelayResource[] };
 export type StationDraft = Partial<Pick<RelayStation, "name" | "origin" | "type">>;
-type PolicyOption<T extends string> = { value: T; label: string; hint: string };
 /**
  * How many model names the 分组管理 window lays out for one key, and how much
  * text those names may take.  The window shows the whole list, so these are
@@ -563,46 +559,6 @@ export function ApiKeyCreateDialog({ visible, groups, disabled, onClose, onCreat
   </RelayDialogLayer>;
 }
 
-export function DependencyPolicyDialog<T extends string>({ visible, title, message, options, value, disabled, busy = false, confirmLabel, destructive = false, onValueChange, onClose, onConfirm, translate }: {
-  visible: boolean;
-  title: string;
-  message: string;
-  options: Array<PolicyOption<T>>;
-  value: T;
-  disabled: boolean;
-  /** The confirm action is running: it reports progress in place instead of graying out. */
-  busy?: boolean;
-  confirmLabel: string;
-  /**
-   * The answer cannot be undone: it draws destructive, like every other
-   * destructive answer in the app.  The caller states it instead of the dialog
-   * inferring it from the label, which only a 删除 translation happened to match.
-   */
-  destructive?: boolean;
-  onValueChange: (value: T) => void;
-  onClose: () => void;
-  onConfirm: () => void;
-  translate: Translate;
-}): React.JSX.Element {
-  const selectedOption = options.find((option) => option.value === value) ?? options[0];
-  return <RelayDialogLayer visible={visible} onRequestClose={onClose}>
-    <View style={styles.dialogBackdrop}>
-      {/* Same dismiss target as the key dialog: the scrim belongs to the
-          question it dims, and a click on it is an answer. */}
-      <Pressable accessible={false} onPress={onClose} style={StyleSheet.absoluteFill} />
-      <View style={styles.decisionDialog} accessibilityViewIsModal>
-        <View style={styles.dialogHeader}><Text style={styles.dialogTitle}>{title}</Text><NativeButton title={translate("status.close")} symbol="close" compact disabled={disabled} onPress={onClose} style={styles.dialogClose} /></View>
-        <View style={styles.decisionContent}>
-          <Text style={styles.decisionMessage}>{message}</Text>
-          <View style={styles.decisionField}><Text style={styles.decisionLabel}>{translate("relay.dependencyPolicy")}</Text><NativePicker labels={options.map((option) => option.label)} selectedValue={selectedOption.label} disabled={disabled} accessibilityLabel={translate("relay.dependencyPolicy")} onChange={({ nativeEvent }) => { const option = options[nativeEvent.index]; if (option) onValueChange(option.value); }} style={styles.decisionControl} /></View>
-          <Text style={styles.decisionHint}>{selectedOption.hint}</Text>
-        </View>
-        <View style={styles.dialogFooter}><View style={styles.decisionSpacer} /><View style={styles.dialogActions}><NativeButton title={translate("status.cancel")} compact disabled={disabled} onPress={onClose} /><NativeButton title={confirmLabel} primary destructive={destructive} busy={busy} disabled={disabled && !busy} onPress={onConfirm} /></View></View>
-      </View>
-    </View>
-  </RelayDialogLayer>;
-}
-
 /**
  * The lanes one account's work is reported in.
  *
@@ -706,8 +662,6 @@ export function StationAccountsPanel({
   // land after the sign-in the user made instead — and recording that stale
   // 未登录 retires a login that just succeeded.
   const signInCounts = useRef<Record<string, number>>({});
-  const [removal, setRemoval] = useState<{ account: RelayAccount }>();
-  const [removalPolicy, setRemovalPolicy] = useState<LocalDependencyPolicy>("detach");
   // What a sign-in may save is asked by the native login flow after the
   // webview login succeeds; adding an account goes straight to sign-in.
   const beginAddLogin = async (): Promise<void> => {
@@ -1158,22 +1112,41 @@ export function StationAccountsPanel({
       publish(translate("relay.operationFailed"));
     }
   };
+  // − ends the account the list highlights: one question, drawn by the host's
+  // own decision panel, and then the row, its session and its locally managed
+  // keys are gone from this machine.  The models that follow those keys are
+  // kept as independent models, so the question states that outcome with the
+  // rest of the impact instead of offering a second surface to choose it on.
   const removeSelected = async (): Promise<void> => {
-    if (!removal) return;
+    if (!selected) return;
     if (pendingAction === "remove") return;
+    const account = selected;
+    const models = account.linkedModelCount ?? 0;
+    const confirmed = await native.showConfirmation({
+      title: translate("relay.removeLocalTitle"),
+      // Two sentences, because the question has two facts: what leaves this
+      // machine with the account, and what stays.  A count of zero models is
+      // not a fact worth stating, so that sentence is absent rather than "0".
+      message: [
+        translate("relay.removeAccountBody", { label: accountDisplayName(account, translate), keys: account.resources.length }),
+        models > 0 ? translate("relay.removeAccountModelsKept", { models }) : "",
+      ].filter(Boolean).join("\n"),
+      confirmLabel: translate("relay.removeLocal"),
+      destructive: true,
+    });
+    if (!confirmed) return;
     await runPendingAction("remove", async () => {
       setFormBusy(true);
-        try {
-        await commit("account.delete", { id: removal.account.id, dependency_policy: removalPolicy });
+      try {
+        await commit("account.delete", { id: account.id, dependency_policy: "detach" });
         setSelectedID(undefined);
         try {
-          await native.clearRelayCredentials(removal.account.id);
-          await commit("credential_cleanup_confirm", { id: removal.account.id, kind: "credentials" });
+          await native.clearRelayCredentials(account.id);
+          await commit("credential_cleanup_confirm", { id: account.id, kind: "credentials" });
         } catch {
           // Core retains a secret-free cleanup tombstone for retry.
         }
         await refreshAccounts();
-        setRemoval(undefined);
       } catch {
         publish(translate("relay.operationFailed"));
       } finally {
@@ -1545,8 +1518,6 @@ export function StationAccountsPanel({
   const alertAccountRows = stationAccounts
     .filter((account) => effectiveLoginStatus(account) === "expired")
     .map((account) => account.id);
-  const removalKeys = removal?.account.resources.length ?? 0;
-  const selectedRemovalModels = removal?.account.linkedModelCount ?? 0;
   const retryCleanup = async (cleanup: PendingCredentialCleanup): Promise<void> => {
     if (pendingAction === "cleanup") return;
     await runPendingAction("cleanup", async () => {
@@ -1563,28 +1534,6 @@ export function StationAccountsPanel({
     });
   };
   const stationCleanups = (cleanups ?? []).filter((cleanup) => station.accountIDs.includes(cleanup.accountID));
-  // 移除中转站连接 renders on the route's dialog surface, not here: this panel
-  // lives in the provider inspector, so a dialog drawn here is clipped by that
-  // column's scroll view and centred inside it instead of over the window.
-  const removalDialog = <DependencyPolicyDialog
-      visible={Boolean(removal)}
-      title={translate("relay.removeLocalTitle")}
-      message={removal ? translate("relay.removeAccountBody", { label: accountDisplayName(removal.account, translate), keys: removalKeys, models: selectedRemovalModels }) : ""}
-      options={[
-        { value: "detach", label: translate("relay.policyRelease"), hint: translate("relay.policyReleaseHint") },
-        { value: "delete_models", label: translate("relay.policyDeleteModels"), hint: translate("relay.policyDeleteModelsHint") },
-      ]}
-      value={removalPolicy}
-      disabled={controlsBusy && pendingAction !== "remove"}
-      busy={pendingAction === "remove"}
-      confirmLabel={translate("relay.removeLocal")}
-      destructive
-      onValueChange={setRemovalPolicy}
-      onClose={() => setRemoval(undefined)}
-      onConfirm={() => { void removeSelected(); }}
-      translate={translate}
-    />;
-  const removalDialogHosted = useRelayDialogSurface(() => removalDialog);
   return <View style={styles.accountsPanel}>
     {stationCleanups.map((cleanup) => <View key={`cleanup:${cleanup.accountID}`} style={styles.cleanupRow}>
       <Text numberOfLines={2} style={styles.cleanupText}>{translate("relay.credentialsCleanupPending", { label: cleanup.label })}</Text>
@@ -1594,7 +1543,7 @@ export function StationAccountsPanel({
       title={translate("providers.accounts")}
       actions={<>
         {stationAccounts.length < 8 ? <NativeButton title="" symbol="plus" compact toolTip={translate("relay.addAccount")} accessibilityLabel={translate("relay.addAccount")} busy={pendingAction === "add"} disabled={controlsBusy && pendingAction !== "add"} style={styles.panelActionButton} onPress={() => { void beginAddLogin(); }} /> : null}
-        {selected ? <NativeButton title="" symbol="minus" compact destructive toolTip={translate("relay.removeLocal")} accessibilityLabel={translate("relay.removeLocal")} disabled={controlsBusy} style={styles.panelActionButton} onPress={() => { setRemovalPolicy("detach"); setRemoval({ account: selected }); }} /> : null}
+        {selected ? <NativeButton title="" symbol="minus" compact destructive toolTip={translate("relay.removeLocal")} accessibilityLabel={translate("relay.removeLocal")} busy={pendingAction === "remove"} disabled={controlsBusy && pendingAction !== "remove"} style={styles.panelActionButton} onPress={() => { void removeSelected(); }} /> : null}
       </>}
       columns={[{ label: translate("relay.accounts"), width: accountColumnWidth }, { label: translate("providers.authStatus"), width: statusColumnWidth }, { label: translate("relay.balance"), width: balanceColumnWidth }]}
       rows={accountRows}
@@ -1654,7 +1603,6 @@ export function StationAccountsPanel({
         {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.groupManager")} titleWidth="tight" compact toolTip={native.showGroupManager ? undefined : translate("relay.groupManagerUnavailable")} disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} /> : null}
       </View>
     </View> : null}
-    {removalDialogHosted ? null : removalDialog}
   </View>;
 }
 
@@ -1781,12 +1729,8 @@ const styles = StyleSheet.create({
   dialogTitle: { flex: 1, minWidth: 0, color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   dialogFooter: { minHeight: 44, paddingHorizontal: 12, paddingVertical: 7, flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 6, borderTopWidth: 1, borderTopColor: colors.separator },
   decisionDialog: { width: "94%", maxWidth: 560, minHeight: 220, maxHeight: "86%", borderRadius: 7, overflow: "hidden", backgroundColor: colors.window },
-  decisionContent: { padding: 13, gap: 8 },
-  decisionMessage: { color: colors.text, fontSize: UI_FONT_SIZE, lineHeight: 18 },
-  decisionField: { minWidth: 0, gap: 3 },
   decisionLabel: { color: colors.secondary, fontSize: UI_FONT_SIZE },
   decisionControl: { width: "100%", height: 26 },
-  decisionHint: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
   decisionSpacer: { flex: 1 },
   dialogActions: { flexDirection: "row", alignItems: "center", gap: 6 },
   apiKeyCreateDialog: { maxWidth: 640, minHeight: 300 },
@@ -1819,4 +1763,4 @@ const styles = StyleSheet.create({
   apiKeyPreviewHint: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15 },
 });
 
-export type { LocalDependencyPolicy, RemoteDeletePolicy };
+export type { RemoteDeletePolicy };

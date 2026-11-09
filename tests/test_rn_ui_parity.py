@@ -3262,9 +3262,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # Deletion stages the Core metadata before the native erase.
         self.assertLess(
             removal.index('await commit("account.delete"'),
-            removal.index("await native.clearRelayCredentials(removal.account.id);"),
+            removal.index("await native.clearRelayCredentials(account.id);"),
         )
-        self.assertIn("await native.clearRelayCredentials(removal.account.id);", removal)
+        self.assertIn("await native.clearRelayCredentials(account.id);", removal)
         self.assertIn('kind: "credentials"', removal)
         # Pending logins reserve no slot; what the sign-in may keep is decided
         # by the post-login prompt inside the native browser flow.
@@ -7045,12 +7045,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('if (status === "ready") {', relay)
         self.assertIn("markLoginFailure(target.id, false);", relay)
         self.assertIn("markLocalSignedIn(target.id, true);", relay)
-        # Removal stages the dependency policy before the native erase and
-        # persists a retry tombstone when the erase fails.
+        # Removal asks before it removes, on the host's own decision panel, and
+        # stages the dependency policy before the native erase; a failed erase
+        # persists a retry tombstone.
         removal = relay.split("const removeSelected = async (): Promise<void> => {", 1)[1].split("const setStationDraftValue", 1)[0]
-        self.assertIn('await commit("account.delete", { id: removal.account.id, dependency_policy: removalPolicy });', removal)
-        self.assertIn("await native.clearRelayCredentials(removal.account.id);", removal)
-        self.assertIn('await commit("credential_cleanup_confirm", { id: removal.account.id, kind: "credentials" });', removal)
+        self.assertIn("await native.showConfirmation({", removal)
+        self.assertLess(removal.index("await native.showConfirmation({"), removal.index('await commit("account.delete"'))
+        self.assertIn('await commit("account.delete", { id: account.id, dependency_policy: "detach" });', removal)
+        self.assertIn("await native.clearRelayCredentials(account.id);", removal)
+        self.assertIn('await commit("credential_cleanup_confirm", { id: account.id, kind: "credentials" });', removal)
         # Quietly restore sessions once per account when the panel mounts; a
         # restore that fails leaves the account signed out and never opens the
         # login page on its own (去登录 / + ask for it).  The quiet resource
@@ -7806,11 +7809,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "cells: [`\\t${providedNameDrafts[row.key] ?? row.label}`],",
             "providedRows",
             "ApiKeyCreateDialog",
-            "DependencyPolicyDialog",
             "relay.apiKeyActions.update?.(selectedProvided.account.id, selectedProvided.resource.id, name)",
             "relay.apiKeyActions.create?.(account.id, options)",
-            'relay.apiKeyActions.detach?.(selectedProvided.account.id' if False else 'relay.apiKeyActions.detach?.(account.id, resource.id)',
-            "relay.apiKeyActions.remove?.(account.id, resource.id, remoteDeletePolicy)",
+            'relay.apiKeyActions.remove?.(account.id, resource.id, "detach_disabled")',
             'target={`${selectedProvided.account.id}:${selectedProvided.resource.id}`}',
             'domain="relay_accounts"',
 
@@ -7820,7 +7821,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             "export function providedKeyRows(accounts: RelayAccount[], translate: Translate): ProvidedKeyRow[]",
             "export function ApiKeyCreateDialog(",
-            "export function DependencyPolicyDialog<",
             "accountLabel: accountDisplayName(account, translate),",
             "resourceGroupUnavailable(resource, account.groups)",
         ):
@@ -7892,7 +7892,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('label={`${source.resourceLabel || relaySourceName(source)}${multiplier}`}', self.ui)
         # The account is the selected row, so the key list is that account's.
         self.assertIn('source.accountID === selectedStationAccount.id', self.ui)
-        self.assertIn('label: remoteDelete.label', self.ui)
+        self.assertIn('const { account, resource, label } = selectedProvided;', self.ui)
         # The relay key table already composes the same label from the account.
         self.assertIn('label: `${accountKeyPrefix(account, translate)}/${resourceGroupName(resource, account.groups, translate)}`', self.relay)
 
@@ -7959,43 +7959,61 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("<Modal", relay)
         self.assertNotIn("import { Modal,", relay)
         self.assertIn("function RelayDialogLayer(", relay)
-        self.assertEqual(2, relay.count("<RelayDialogLayer visible={visible} onRequestClose={onClose}>"))
+        # One form (新建 API 密钥) still needs a scrim of its own; no question
+        # does — a confirm is the host's decision panel, presented by the host.
+        self.assertEqual(1, relay.count("<RelayDialogLayer visible={visible} onRequestClose={onClose}>"))
         self.assertIn(
             'relayDialogLayer: { position: "absolute", top: 0, right: 0, bottom: 0, left: 0, zIndex: 100 }',
             relay,
         )
 
     def test_confirmations_state_their_destructive_answer_instead_of_inferring_it(self) -> None:
-        """One confirmation semantic: the caller says the answer cannot be undone."""
+        """One confirmation surface: the host's own decision panel.
+
+        A confirm is asked by the host — ``native.showConfirmation`` — and never
+        drawn in the page.  The relay panels used to draw their two removals
+        themselves, which put one decision on two surfaces: the app's dialog for
+        a provider, a model, an account or a local key, and a hand-made one for
+        these rows, with its own scrim, its own button row and a policy picker
+        the dedicated panel has no room for.  The policy those removals applied
+        is now stated in the question, so the answer needs nothing but the
+        question and its one destructive button.
+        """
         relay = self.relay
         ui = self.ui
 
-        # A React confirmation draws its destructive answer because the caller
-        # states it, never because a translated label happened to read 删除.
-        self.assertNotIn('destructive={confirmLabel === translate("common.delete")}', relay)
-        self.assertIn("  destructive?: boolean;", relay)
-        self.assertIn("destructive={destructive} busy={busy}", relay)
-        self.assertIn("destructive={remoteDeletePolicy !== \"detach_only\"}", ui)
-        # The dialog layer is one component per surface, and 移除本地账号 mounts its
-        # question once: two identical dialogs stacked a second scrim, a second
-        # modal layer, and a second confirm button over one decision.
-        self.assertEqual(2, relay.count("<RelayDialogLayer visible={visible} onRequestClose={onClose}>"))
-        self.assertEqual(1, relay.count('<DependencyPolicyDialog\n      visible={Boolean(removal)}'))
-        self.assertIn('      confirmLabel={translate("relay.removeLocal")}\n      destructive\n', relay)
-        # 移除中转站连接 draws on the route's dialog surface, not inside its own
-        # panel.  These panels live in the provider inspector — a 290 pt column
-        # whose editor is a scroll view — so a dialog rendered where the panel
-        # sits is clipped by that view and centred in the column, which is how it
-        # drew as a small box under the pane while every other confirmation drew
-        # as one dialog over the window that asked.  The placement moves; the
-        # component, its props, and its answers do not.
+        # No component in the shared UI presents a decision: that is not a
+        # component's to draw, and a second one is a second answer to "what
+        # does a confirm look like here".
+        self.assertNotIn("DependencyPolicyDialog", relay)
+        self.assertNotIn("DependencyPolicyDialog", ui)
+        self.assertNotIn("relay.dependencyPolicy", relay)
+        self.assertNotIn("relay.dependencyPolicy", ui)
+        # Both removals ask the host, and both state that the answer is
+        # destructive instead of leaving it to the translated label.
+        self.assertIn('title: translate("relay.removeLocalTitle"),', relay)
+        self.assertIn('      confirmLabel: translate("relay.removeLocal"),\n      destructive: true,\n', relay)
+        self.assertIn('title: translate("relay.apiKeyDeleteTitle"),', ui)
+        self.assertIn('        confirmLabel: translate("common.delete"),\n        destructive: true,\n', ui)
+        # The policy the removal applies is part of the question, because the
+        # dedicated panel answers with one button and holds no picker: models
+        # that follow the keys stay (or are released) as independent models.
+        self.assertIn('translate("relay.removeAccountModelsKept", { models })', relay)
+        self.assertIn('dependency_policy: "detach"', relay)
+        self.assertIn('relay.apiKeyActions.remove?.(account.id, resource.id, "detach_disabled")', ui)
+        # The relay dialog surface still exists for the one form it carries; no
+        # question is published on it.
         surface = (ROOT / "rn/packages/shared/src/ui/relayDialogSurface.tsx").read_text(encoding="utf-8")
         self.assertIn("export function useRelayDialogSurface(", surface)
         self.assertIn("export function RelayDialogHost(", surface)
-        self.assertIn("const removalDialogHosted = useRelayDialogSurface(() => removalDialog);", relay)
-        self.assertIn("{removalDialogHosted ? null : removalDialog}", relay)
+        # The host is told after every render of a publishing panel, not only
+        # when it mounts: the entry it holds is the panel's current render, and
+        # a form opened later redrew nothing, so its ＋ did nothing until some
+        # unrelated render of the route happened to draw the surface.
+        self.assertIn("  useLayoutEffect(() => {\n    notify();\n  });", surface)
         self.assertIn("const dialogsHosted = useRelayDialogSurface(() => dialogs);", ui)
         self.assertEqual(2, ui.count("{dialogsHosted ? null : dialogs}"))
+        self.assertNotIn("removalDialogHosted", relay)
         # The host is a sibling of the inspector, so no column clips it.
         self.assertIn("<RelayDialogHost />", ui)
         self.assertRegex(ui, r"\}\n    <RelayDialogHost />")
@@ -8098,12 +8116,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'alertRowKeys={[...providedRows.filter((row) => Boolean(bindingIssueForProvidedRow(row))).map((row) => `provided:${row.key}`), ...orphanSlots.filter((slot) => bindingIssues?.some((issue) => stringValue(issue.provider_key_id) === slot.id)).map((slot) => `orphan:${slot.id}`)]}',
             self.ui,
         )
-        # Remote-delete policies moved with the keys panel into the ui.
-        for marker in (
-            'value: "detach_disabled"',
-            'value: "detach_only"',
-        ):
-            self.assertIn(marker, self.ui)
+        # The remote delete applies one policy, and the question that asks for
+        # it states that policy instead of offering a picker.
+        self.assertIn('relay.apiKeyActions.remove?.(account.id, resource.id, "detach_disabled")', self.ui)
+        self.assertNotIn('value: "detach_only"', self.ui)
 
         for marker in (
             'translate("relay.bindingStatus")',
@@ -8410,10 +8426,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for locale in (self.zh, self.en):
             self.assertIn('"providers.relayNameTaken"', locale)
             self.assertIn('"providers.reorderSameOrder"', locale)
-        # The dialogs' scrim is a dismiss target, not a click swallower: both
-        # relay dialogs close on an outside press, the way the app's own
+        # The one dialog's scrim is a dismiss target, not a click swallower:
+        # 新建 API 密钥 closes on an outside press, the way the app's own
         # help tip does.
-        self.assertEqual(2, self.relay.count('<Pressable accessible={false} onPress={onClose} style={StyleSheet.absoluteFill} />'))
+        self.assertEqual(1, self.relay.count('<Pressable accessible={false} onPress={onClose} style={StyleSheet.absoluteFill} />'))
         self.assertIn('import { Platform, PlatformColor, Pressable, StyleSheet, Text, View } from "react-native";', self.relay)
         # Leaving a pane commits what it staged and applies it, exactly as
         # closing the window does.

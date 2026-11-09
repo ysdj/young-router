@@ -15,7 +15,6 @@ import {
   accountDisplayName,
   accountsFromSnapshot,
   ApiKeyCreateDialog,
-  DependencyPolicyDialog,
   NativeFormRow,
   NativeWizardProgress,
   normalizeRelayOrigin,
@@ -31,7 +30,6 @@ import {
   type RelayAccount,
   type RelayApiKeyActions,
   type RelayCommit,
-  type RelayResource,
   type RelayStation,
   type RelayType,
   type RelayWorkspaceBridge,
@@ -3862,9 +3860,6 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
         dependency_policy: dependencyPolicy,
       });
     },
-    detach: async (accountId, resourceId) => {
-      await commitRelayMetadata("api_key.detach", { account_id: accountId, resource_id: resourceId });
-    },
   }), [commitRelayMetadata, enqueueDispatch, refresh]);
   // One host-facing bridge carries every staged relay mutation the merged
   // provider workspace and its wizard need; metadata stays secret-free.
@@ -7525,8 +7520,6 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
   const [inlineKeysListWidth, setInlineKeysListWidth] = useState(KEYS_INLINE_LIST_WIDTH);
   const [formBusy, setFormBusy] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
-  const [remoteDelete, setRemoteDelete] = useState<{ account: RelayAccount; resource: RelayResource; label: string }>();
-  const [remoteDeletePolicy, setRemoteDeletePolicy] = useState<"delete_models" | "detach_disabled" | "detach_only">("detach_disabled");
   const selectedCredential = selectedKey.startsWith("account:")
     ? loginCredentials.find((credential) => `account:${credential.ref}` === selectedKey)
     : undefined;
@@ -7713,8 +7706,27 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
   const deleteSelected = (): void => {
     if (selectedProvided) {
       if (autoGrouping) return;
-      setRemoteDeletePolicy("detach_disabled");
-      setRemoteDelete({ account: selectedProvided.account, resource: selectedProvided.resource, label: selectedProvided.label });
+      // One question, drawn by the host's own decision panel — the same panel
+      // this list's local slots use two branches below.  A provided key is a
+      // station resource, so the answer states both halves of what follows: the
+      // remote key is deleted after the automatic save, and the models that
+      // follow it are released as disabled independent models.  That release is
+      // the dependency policy this removal always applied; asking for it in a
+      // second, hand-drawn dialog put one decision on two surfaces, and the
+      // dialog it lived in is the one surface this app does not have.
+      const { account, resource, label } = selectedProvided;
+      const models = resource.linkedModelCount;
+      void native.showConfirmation({
+        title: translate("relay.apiKeyDeleteTitle"),
+        message: models > 0
+          ? translate("relay.apiKeyDeleteModelsMessage", { count: models, label })
+          : translate("relay.apiKeyDeleteMessage", { label }),
+        confirmLabel: translate("common.delete"),
+        destructive: true,
+      }).then((confirmed) => {
+        if (!confirmed) return undefined;
+        return runProvidedAction(() => relay.apiKeyActions.remove?.(account.id, resource.id, "detach_disabled") ?? Promise.resolve(), "relay.apiKeyDeleteStaged");
+      });
       return;
     }
     // A custom key and an orphan relay slot are both slots of this document:
@@ -7949,38 +7961,12 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
         }}
         translate={translate}
       />
-      <DependencyPolicyDialog
-        visible={Boolean(remoteDelete)}
-        title={translate("relay.apiKeyDeleteImpactTitle")}
-        message={remoteDelete ? translate("relay.apiKeyDeleteImpactBody", { count: remoteDelete.resource.linkedModelCount, label: remoteDelete.label }) : ""}
-        options={[
-          { value: "detach_disabled", label: translate("relay.policyReleaseDisabled"), hint: translate("relay.policyReleaseDisabledHint") },
-          { value: "delete_models", label: translate("relay.policyDeleteModels"), hint: translate("relay.policyDeleteModelsHint") },
-          { value: "detach_only", label: translate("relay.apiKeyDetachOnly"), hint: translate("relay.apiKeyDetachOnlyHint") },
-        ]}
-        value={remoteDeletePolicy}
-        disabled={controlsBusy}
-        confirmLabel={remoteDeletePolicy === "detach_only" ? translate("screen.confirm") : translate("common.delete")}
-        destructive={remoteDeletePolicy !== "detach_only"}
-        onValueChange={setRemoteDeletePolicy}
-        onClose={() => setRemoteDelete(undefined)}
-        onConfirm={() => {
-          if (!remoteDelete) return;
-          const { account, resource } = remoteDelete;
-          setRemoteDelete(undefined);
-          void runProvidedAction(
-            () => (remoteDeletePolicy === "detach_only"
-              ? relay.apiKeyActions.detach?.(account.id, resource.id)
-              : relay.apiKeyActions.remove?.(account.id, resource.id, remoteDeletePolicy)) ?? Promise.resolve(),
-            remoteDeletePolicy === "detach_only" ? "relay.apiKeyDetachStaged" : "relay.apiKeyDeleteStaged",
-          );
-        }}
-        translate={translate}
-      />
     </>;
-  // The keys panel lives in the provider inspector, so its dialogs are drawn on
-  // the route's surface: rendered here they would be clipped by this pane's
-  // column and centred inside it rather than over the window that asked.
+  // The keys panel lives in the provider inspector, so the one surface it still
+  // draws itself — 新建 API 密钥's form — is drawn on the route's layer: rendered
+  // here it would be clipped by this pane's column and centred inside it rather
+  // than over the window that asked.  A confirmation is not published here at
+  // all: the host presents that one.
   const dialogsHosted = useRelayDialogSurface(() => dialogs);
   if (variant === "inline") {
     return <View style={styles.keysInline}>
