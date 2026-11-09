@@ -1377,6 +1377,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('labels={accountPickerLabels}')
         self.assert_ui_has('source.accountID === selectedStationAccount.id')
         self.assert_ui_has('label={`${source.resourceLabel || relaySourceName(source)}${multiplier}`}')
+        # A read or the post-login grouping states its wait in the key area;
+        # the empty card is not drawn until both have finished.
+        self.assert_ui_has('(loginBusy || resourcesBusy || autoGroupingBusy) ? <View style={styles.providerWizardKeyEmpty}>')
+        self.assert_ui_has('translate(autoGroupingBusy ? "relay.autoGroupingInProgress" : "relay.keysLoading")')
+        self.assert_ui_has('await relay.apiKeyActions?.alignAutoGrouping?.(landedID);')
+        self.assert_ui_has('await relay.refreshAccounts();')
         zh = (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8")
         en = (ROOT / "rn/packages/shared/src/i18n/en.ts").read_text(encoding="utf-8")
         self.assertIn('"relay.loginAnotherAccount": "登录新账号",', zh)
@@ -5594,10 +5600,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
         # One standalone wheel per branch (the official account's roster, the
-        # lane's roster, the generic listing) plus the sign-in wait, and the
-        # buttons that start those reads draw none of their own for the same
-        # wait.
-        self.assertEqual(4, wizard.count("<NativeBusySpinner"))
+        # lane's roster, the generic listing), the sign-in wait, and the key
+        # read/grouping wait the signed-in key step states.  The buttons that
+        # start those reads draw none of their own for the same wait.
+        self.assertEqual(5, wizard.count("<NativeBusySpinner"))
         self.assertNotIn('busy={modelFetchState === "loading"}', wizard)
         self.assertNotIn("providerWizardModelLoading", wizard)
         self.assertNotIn("providerWizardModelLoading", self.ui)

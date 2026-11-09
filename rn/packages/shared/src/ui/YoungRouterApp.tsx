@@ -4062,6 +4062,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // station for every signed-in account this step lists, so one press can
   // bring back a second account's keys as well as the first's.
   const [resourcesBusy, setResourcesBusy] = useState(false);
+  // The post-login choice may have turned 自动分组 on.  Staging its one-key-per-
+  // group layout is another station-sized wait, and it happens after the sign-in
+  // panel is gone — the key area states it instead of drawing an empty list.
+  const [autoGroupingBusy, setAutoGroupingBusy] = useState(false);
   const loginFeedback = useRef<string | undefined>(undefined);
   const [, forceLoginFeedbackRender] = useState(0);
   const setupLoginRequest = useRef(0);
@@ -5262,6 +5266,13 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         && (result.username ? item.username === result.username : item.loginStatus === "signed_in"))
         ?? accounts.find((item) => item.id === pendingID);
       const landedID = landed?.id ?? pendingID;
+      // The sign-in is verified.  Leave the sign-in panel now: the key step can
+      // show the account and a loading state while Core reads the station and,
+      // when the prompt said so, stages the automatic grouping.  Keeping the
+      // panel up until both finished was a login spinner over a step that had
+      // already succeeded.
+      setSignedInAccountID(landedID);
+      setLoginPhase("idle");
       const status = await relay.refreshResources(landedID, { force: true });
       // The read's status says whether the station answered, while the account
       // says *what* it answered: zero keys is a successful sign-in with an
@@ -5275,8 +5286,20 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       else setLoginFeedbackMessage(translate("relay.loginComplete"));
       // The post-login choice may have turned 自动分组 on.  The refresh above is
       // the read that layout needs, so this is the moment to stage it; the
-      // pane's next Apply settles it with the station.
-      if (refreshed?.autoGrouping) await relay.apiKeyActions?.alignAutoGrouping?.(landedID).catch(() => undefined);
+      // pane's next Apply settles it with the station.  The staged layout is
+      // read back before the spinner clears, or the key list would show the
+      // station's old rows (or nothing) under a switch that is already on.
+      if (refreshed?.autoGrouping) {
+        setAutoGroupingBusy(true);
+        try {
+          await relay.apiKeyActions?.alignAutoGrouping?.(landedID);
+          await relay.refreshAccounts();
+        } catch {
+          setLoginFeedbackMessage(translate("relay.autoGroupingFailed"));
+        } finally {
+          setAutoGroupingBusy(false);
+        }
+      }
       // Bind the vendor to the station so its keys become linkable.
       const boundAccount = accounts.find((item) => stationOriginKey(item.origin) === target);
       const stationID = landed?.stationID ?? boundAccount?.stationID
@@ -5284,8 +5307,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       if (providerID && stationID) {
         await dispatchWithOutcome("provider.select_relay_station", { provider_id: providerID, station_id: stationID });
       }
-      setSignedInAccountID(landedID);
-      setLoginPhase("idle");
     } catch {
       if (request === setupLoginRequest.current) setLoginFeedbackMessage(translate("relay.operationFailed"));
     } finally {
@@ -5697,7 +5718,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // The origin the sign-in window is showing, so the waiting panel names the
   // site the person is looking at in the other window.
   const relayLoginStation = normalizeRelayOrigin(activeProviderBaseURL) || activeProviderBaseURL.trim();
-  const wizardBusy = busy || processing || loginBusy || resourcesBusy;
+  const wizardBusy = busy || processing || loginBusy || resourcesBusy || autoGroupingBusy;
   return <View style={styles.providerWizardSurface} accessibilityViewIsModal>
     <View style={styles.providerWizardSetupContent}>
       <View style={[styles.providerWizardSetupSurface, (step === "model" || (step === "keys" && keyPath === "login")) && styles.providerWizardSetupSurfaceFill]}>
@@ -5783,7 +5804,9 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                     <NativeButton title={translate("relay.loginAnotherAccount")} compact busy={loginBusy} disabled={(wizardBusy && !loginBusy) || !activeProviderBaseURL.trim()} onPress={() => { void beginRelayLogin(true); }} />
                   </View>
                 </View> : null}
-                {providedChoices.length > 0 ? <>
+                {(loginBusy || resourcesBusy || autoGroupingBusy) ? <View style={styles.providerWizardKeyEmpty}>
+                  <NativeBusySpinner label={translate(autoGroupingBusy ? "relay.autoGroupingInProgress" : "relay.keysLoading")} />
+                </View> : providedChoices.length > 0 ? <>
                   <Text style={styles.providerWizardHint}>{translate("providers.wizard.providedKeysHint", { count: providedChoices.length })}</Text>
                   {/* One key goes on to become the provider's, so the choice is
                       a radio list of this account's keys.  The account is the
