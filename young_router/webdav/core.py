@@ -233,41 +233,54 @@ class Settings:
         }
 
 
-def default_root() -> pathlib.Path:
-    root = os.environ.get("LITELLM_RUNTIME_ROOT", "").strip()
-    if not root:
-        root = os.environ.get("YOUNG_ROUTER_HOME", "").strip()
-    if root:
+def default_root(root: pathlib.Path | str | None = None) -> pathlib.Path:
+    """Where this installation keeps the WebDAV identity, unless told.
+
+    A caller that already knows its root passes it.  Otherwise the same two
+    variables ``config_paths.runtime_root`` reads name it, defaulting to
+    ``~/.young-router``.  Passing the root matters for a second Core started
+    with ``--runtime-root``: reading the home directory's settings gave a
+    probe instance this machine's WebDAV account, its bundle baseline and its
+    enabled flag, so its interval loop pushed the probe document over the live
+    remote and every route on the gateway that pulled it disappeared.
+    """
+
+    if root is not None:
         return pathlib.Path(root).expanduser()
+    configured = os.environ.get("LITELLM_RUNTIME_ROOT", "").strip()
+    if not configured:
+        configured = os.environ.get("YOUNG_ROUTER_HOME", "").strip()
+    if configured:
+        return pathlib.Path(configured).expanduser()
     return pathlib.Path.home() / ".young-router"
 
 
-def default_config_yaml() -> pathlib.Path:
+def default_config_yaml(root: pathlib.Path | str | None = None) -> pathlib.Path:
     config_file = os.environ.get("LITELLM_CONFIG_FILE", "").strip()
     if config_file:
         return pathlib.Path(config_file).expanduser()
-    return default_root() / "config.yaml"
+    return default_root(root) / "config.yaml"
 
 
-def default_settings_file() -> pathlib.Path:
+def default_settings_file(root: pathlib.Path | str | None = None) -> pathlib.Path:
     settings = os.environ.get(SETTINGS_ENV, "").strip()
     if settings:
         return pathlib.Path(settings).expanduser()
-    return default_root() / "webdav-sync.json"
+    return default_root(root) / "webdav-sync.json"
 
 
-def default_state_file() -> pathlib.Path:
+def default_state_file(root: pathlib.Path | str | None = None) -> pathlib.Path:
     state = os.environ.get("LITELLM_WEBDAV_SYNC_STATE", "").strip()
     if state:
         return pathlib.Path(state).expanduser()
-    return default_root() / ".litellm-runtime" / "webdav-sync-state.json"
+    return default_root(root) / ".litellm-runtime" / "webdav-sync-state.json"
 
 
-def default_status_file() -> pathlib.Path:
+def default_status_file(root: pathlib.Path | str | None = None) -> pathlib.Path:
     status = os.environ.get("LITELLM_WEBDAV_SYNC_STATUS_FILE", "").strip()
     if status:
         return pathlib.Path(status).expanduser()
-    return default_root() / ".litellm-runtime" / "webdav-sync-status.json"
+    return default_root(root) / ".litellm-runtime" / "webdav-sync-status.json"
 
 
 def disabled_models_path(config_path: pathlib.Path) -> pathlib.Path:
@@ -1354,13 +1367,13 @@ def _stored_digests(state: dict[str, Any]) -> dict[str, str | None] | None:
     return digests
 
 
-def default_conflict_file() -> pathlib.Path:
+def default_conflict_file(root: pathlib.Path | str | None = None) -> pathlib.Path:
     """Where a stopped sync keeps the remote side for the pane to compare."""
 
     configured = os.environ.get("LITELLM_WEBDAV_CONFLICT_FILE", "").strip()
     if configured:
         return pathlib.Path(configured).expanduser()
-    return default_root() / ".litellm-runtime" / "webdav-conflict.json"
+    return default_root(root) / ".litellm-runtime" / "webdav-conflict.json"
 
 
 def save_conflict_record(

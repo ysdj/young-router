@@ -610,6 +610,67 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertEqual(persisted, metadata.read_bytes())
             self.assertEqual([], events)
 
+    def test_a_second_core_root_does_not_inherit_the_homes_webdav_identity(self) -> None:
+        """WebDAV settings, baseline and conflict follow the Core's own root.
+
+        A probe Core started with ``--runtime-root`` used to resolve all four
+        from the home directory, so it read the real installation's WebDAV
+        account and its bundle baseline, and its two-minute interval loop
+        pushed the probe document over the live remote.  The gateway that
+        pulled that bundle served zero models, and every client got
+        ``Invalid model name`` until the real document was pulled back.
+        """
+
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as home:
+            root = Path(directory)
+            config = root / "config.yaml"
+            config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "YOUNG_ROUTER_HOME": home,
+                    "LITELLM_RUNTIME_ROOT": home,
+                    "LITELLM_CONFIG_FILE": "",
+                    "LITELLM_WEBDAV_SYNC_SETTINGS": "",
+                    "LITELLM_WEBDAV_SYNC_STATE": "",
+                    "LITELLM_WEBDAV_SYNC_STATUS_FILE": "",
+                    "LITELLM_WEBDAV_CONFLICT_FILE": "",
+                },
+                clear=False,
+            ), mock.patch("young_router.core.operations.CoreServiceController"):
+                core = CoreStore.with_default_domains(runtime_root=root, config_path=config)
+
+            webdav = core._domains["webdav"]
+            self.assertEqual(root / "webdav-sync.json", webdav.settings_path)
+            self.assertEqual(root / ".litellm-runtime" / "webdav-sync.enabled", webdav.enabled_path)
+            self.assertEqual(root / ".litellm-runtime" / "webdav-sync-state.json", webdav.state_path)
+            self.assertEqual(root / ".litellm-runtime" / "webdav-sync-status.json", webdav.status_path)
+            self.assertEqual(root / ".litellm-runtime" / "webdav-conflict.json", webdav.conflict_path)
+
+    def test_webdav_paths_still_follow_the_root_environment(self) -> None:
+        """No explicit root: the same two variables every other path reads."""
+
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(
+            os.environ,
+            {
+                "YOUNG_ROUTER_HOME": home,
+                "LITELLM_RUNTIME_ROOT": "",
+                "LITELLM_WEBDAV_SYNC_SETTINGS": "",
+                "LITELLM_WEBDAV_SYNC_STATE": "",
+                "LITELLM_WEBDAV_CONFLICT_FILE": "",
+            },
+            clear=False,
+        ):
+            self.assertEqual(Path(home) / "webdav-sync.json", webdav_core.default_settings_file())
+            self.assertEqual(
+                Path(home) / ".litellm-runtime" / "webdav-sync-state.json",
+                webdav_core.default_state_file(),
+            )
+            self.assertEqual(
+                Path(home) / ".litellm-runtime" / "webdav-conflict.json",
+                webdav_core.default_conflict_file(),
+            )
+
     def test_default_core_exposes_stopped_service_before_starting_the_proxy(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(
             "young_router.core.operations.CoreServiceController"

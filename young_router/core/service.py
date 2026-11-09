@@ -1217,6 +1217,7 @@ class CoreStore:
         """
 
         from .domains._shared import _default_provider_config_path, _default_runtime_root, _default_runtime_settings_path
+        from ..webdav import core as webdav_core
         from .domains.claude import ClaudeSettingsDomain
         from .domains.clients import ClientSettingsDomain
         from .domains.codex import CodexSettingsDomain
@@ -1245,6 +1246,23 @@ class CoreStore:
         resolved_runtime_root = (
             Path(runtime_root).expanduser() if runtime_root is not None else _default_runtime_root()
         )
+        # This Core's WebDAV identity belongs to this Core's root.  A process
+        # started with ``--runtime-root`` and no environment naming that root
+        # used to resolve these four paths from the home directory, so it read
+        # another installation's credentials, baseline and enabled flag and its
+        # interval loop pushed its own document over that installation's remote
+        # (2026-11-09: the probe instance at ``/tmp/yrprobe`` replaced the live
+        # gateway bundle, and the gateway served zero models until it was
+        # pulled back).  The ``LITELLM_WEBDAV_*`` variables still win: they name
+        # one file for this process, exactly as ``LITELLM_CONFIG_FILE`` does.
+        resolved_webdav_settings_path = (
+            Path(webdav_settings_path).expanduser()
+            if webdav_settings_path is not None
+            else webdav_core.default_settings_file(resolved_runtime_root)
+        )
+        resolved_webdav_state_path = webdav_core.default_state_file(resolved_runtime_root)
+        resolved_webdav_status_path = webdav_core.default_status_file(resolved_runtime_root)
+        resolved_webdav_conflict_path = webdav_core.default_conflict_file(resolved_runtime_root)
         # One worker per Core process serves both WorkBuddy variants; the
         # service controller and the provider domain must share that instance
         # so the proxy child receives the very base URLs it is serving.
@@ -1348,8 +1366,11 @@ class CoreStore:
             (
                 "webdav",
                 lambda: WebDAVSettingsDomain(
-                    webdav_settings_path,
+                    resolved_webdav_settings_path,
                     enabled_path=webdav_enabled_path,
+                    status_path=resolved_webdav_status_path,
+                    state_path=resolved_webdav_state_path,
+                    conflict_path=resolved_webdav_conflict_path,
                     config_path=config_path,
                 ),
             ),
