@@ -66,20 +66,24 @@ export function AccountsTable({
   </View>;
 }
 
-// The browser host has no AppKit semantic colors, and React Native for Web
-// answers `PlatformColor` with the literal name it was given -- which CSS then
-// ignores, so a pane would paint in the browser's default ink. The third
-// argument is the same sRGB literal the shared `semanticColor` already keeps
-// for exactly this host.
-function color(name: string, fallback: string): ReturnType<typeof PlatformColor> | string {
-  return Platform.OS === "web" ? fallback : PlatformColor(name);
+// Each host has its own semantic colour names, and a name the host does not
+// know paints as nothing: this table passed AppKit names unconditionally, so on
+// Windows every label and rule here resolved to a colour the WinUI leaf has
+// never heard of, and the accounts list beside the same pane's controls read in
+// the wrong ink.  The browser has no semantic colours at all, and React Native
+// for Web answers `PlatformColor` with the literal name it was given -- which
+// CSS then ignores.  The last argument is the sRGB literal the shared
+// `systemColors` keeps for exactly that host.
+function color(macos: string, windows: string, fallback: string): ReturnType<typeof PlatformColor> | string {
+  if (Platform.OS === "web") return fallback;
+  return Platform.OS === "macos" ? PlatformColor(macos) : PlatformColor(windows);
 }
 
 const colors = {
-  text: color("labelColor", "#1d1d1f"),
-  secondary: color("secondaryLabelColor", "#6e6e73"),
-  separator: color("separatorColor", "#d4d4d8"),
-  panel: color("controlBackgroundColor", "#ffffff"),
+  text: color("labelColor", "TextFillColorPrimary", "#1d1d1f"),
+  secondary: color("secondaryLabelColor", "TextFillColorSecondary", "#6e6e73"),
+  separator: color("separatorColor", "ControlStrokeColorDefault", "#d4d4d8"),
+  panel: color("controlBackgroundColor", "ControlFillColorDefault", "#ffffff"),
 };
 
 const styles = StyleSheet.create({

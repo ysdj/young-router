@@ -19,7 +19,7 @@ import React from "react";
 import { Platform, ScrollView, StyleProp, StyleSheet, Text, View, ViewStyle } from "react-native";
 import { NativeBusySpinner, NativeButton, NativeCheckbox, NativeTextField, WINDOWS_CONTROL } from "./NativeControls";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
-import { pushPresentation } from "../platform/presentationStack";
+import { pushPresentation, trapWithin } from "../platform/presentationStack";
 import {
   dismissalFor,
   hostChromeSnapshot,
@@ -47,6 +47,41 @@ const COLOR = {
 /** Where a menu is anchored, in viewport coordinates. */
 const MENU_MIN_WIDTH = 180;
 
+/**
+ * The card of the dialog currently drawn.
+ *
+ * `trapWithin` needs the card element itself, not the scrim around it, and the
+ * surfaces own their own JSX (`DialogFrame`, and the viewer's own frame), so
+ * the element arrives here through a callback ref rather than a prop threaded
+ * through every surface.  Only one surface is drawn at a time, so one slot is
+ * enough.  The assignment ignores React's `null` detach: the effect below
+ * re-reads the slot for every request, so a detached card is never the one a
+ * new trap is installed for.
+ */
+let currentCard: HTMLElement | null = null;
+
+function rememberCard(node: unknown): void {
+  // Only the page mounts this component and only its refs are elements; a
+  // host instance from a native bundle has no `HTMLElement` to test against.
+  if (Platform.OS === "web" && node instanceof HTMLElement) currentCard = node;
+}
+
+const FOCUSABLE = "button, input, select, textarea, [tabindex]:not([tabindex='-1'])";
+
+/**
+ * Put the caret on the card's first control when the dialog opens.
+ *
+ * Without this the opener behind the scrim kept focus, so Return re-fired the
+ * button that asked the question while the question was still up.  A surface
+ * that already focused a field (the prompt, the picker's search) keeps it: its
+ * `autoFocus` runs first, and moving focus away would undo it.
+ */
+function focusFirst(card: HTMLElement): void {
+  if (card.contains(document.activeElement)) return;
+  const control = Array.from(card.querySelectorAll<HTMLElement>(FOCUSABLE)).find((element) => !element.hasAttribute("disabled") && element.tabIndex !== -1);
+  (control ?? card).focus();
+}
+
 export function HostChromeHost(): React.JSX.Element | null {
   const requests = React.useSyncExternalStore(subscribeHostChrome, hostChromeSnapshot, hostChromeSnapshot);
   // Only the topmost surface is drawn: two answers are never asked at once, and
@@ -55,9 +90,29 @@ export function HostChromeHost(): React.JSX.Element | null {
 
   React.useEffect(() => {
     if (request === undefined) return undefined;
+    // A menu is anchored to its opener and is not modal: locking the page
+    // behind it would dim and disable the very control it belongs to.  Every
+    // other surface is a dialog that owns the page while it is up.
+    const modal = request.kind !== "menu";
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const root = modal ? document.getElementById("root") : null;
+    if (root) root.inert = true;
+    const card = modal ? currentCard : null;
+    if (card) focusFirst(card);
     // The same stack the child layers use: Escape answering here is Escape
     // answering the surface on top of whatever is behind it.
-    return pushPresentation({ dismiss: () => settleHostChrome(request, dismissalFor(request)) });
+    const release = pushPresentation({
+      dismiss: () => settleHostChrome(request, dismissalFor(request)),
+      ...(card ? { trap: trapWithin(card) } : {}),
+    });
+    return () => {
+      release();
+      if (root) root.inert = false;
+      // Back to what asked the question, so the dialog closes without dropping
+      // the person at the top of the page.  A surface that was replaced by
+      // another one during this render leaves its own effect in charge.
+      if (opener?.isConnected) opener.focus();
+    };
   }, [request]);
 
   if (request === undefined) return null;
@@ -76,7 +131,9 @@ export function HostChromeHost(): React.JSX.Element | null {
 /** The frame every dialog shares: scrim, card, title, body, footer. */
 function DialogFrame({ title, children, footer, cardStyle }: { title: string; children: React.ReactNode; footer: React.ReactNode; cardStyle?: StyleProp<ViewStyle> }): React.JSX.Element {
   return <View style={styles.scrim} {...({ role: "dialog", "aria-modal": true, "aria-label": title } as object)}>
-    <View style={[styles.card, cardStyle]}>
+    {/* `tabIndex` -1: a card with no focusable control of its own is still the
+        dialog, and focusing it beats leaving the caret on the page behind. */}
+    <View ref={rememberCard} tabIndex={-1} style={[styles.card, cardStyle]}>
       <Text style={styles.cardTitle}>{title}</Text>
       {children}
       <View style={styles.footer}>{footer}</View>
@@ -367,7 +424,9 @@ function NoticeSurface({ request }: { request: Extract<HostChromeRequest, { kind
 
 function ViewerSurface({ request }: { request: Extract<HostChromeRequest, { kind: "viewer" }> }): React.JSX.Element {
   return <View style={styles.scrim} {...({ role: "dialog", "aria-modal": true, "aria-label": request.title } as object)}>
-    <View style={styles.viewerCard}>
+    {/* The viewer states its own frame instead of using `DialogFrame`, so it
+        registers that frame with the same trap the other dialogs use. */}
+    <View ref={rememberCard} tabIndex={-1} style={styles.viewerCard}>
       <View style={styles.viewerHeader}>
         <Text numberOfLines={1} style={styles.viewerTitle}>{request.title}</Text>
         <NativeButton title={request.closeLabel} compact onPress={() => settleHostChrome(request, undefined)} />
@@ -471,17 +530,37 @@ function PickerSurface({ request }: { request: Extract<HostChromeRequest, { kind
 function MenuSurface({ request }: { request: Extract<HostChromeRequest, { kind: "menu" }> }): React.JSX.Element {
   const width = typeof window === "undefined" ? MENU_MIN_WIDTH : Math.max(MENU_MIN_WIDTH, window.innerWidth - 16);
   const left = Math.max(8, Math.min(request.anchor.x, width - MENU_MIN_WIDTH - 8));
+  // The card's height depends on how many rows the caller sent, so it is
+  // measured rather than guessed.  Before this, only the left edge was clamped:
+  // a menu asked for by a control near the bottom of the pane (the model list's
+  // 获取 key rows, the log toolbar) opened downwards past the viewport and the
+  // last rows could not be reached at all.  A menu that does not fit below
+  // flips above its anchor; one that fits in neither direction is capped and
+  // scrolls, so every row stays reachable.
+  const [cardHeight, setCardHeight] = React.useState(0);
+  const viewportHeight = typeof window === "undefined" ? 0 : window.innerHeight;
+  const below = request.anchor.y + request.anchor.height + 2;
+  const above = Math.max(8, request.anchor.y - cardHeight - 2);
+  const opensUpward = viewportHeight > 0 && cardHeight > 0 && below + cardHeight > viewportHeight - 8 && above > 8;
+  const top = opensUpward ? above : below;
+  const maxHeight = viewportHeight > 0 ? Math.max(120, viewportHeight - top - 8) : undefined;
   return <View style={styles.menuScrim} onStartShouldSetResponder={() => true} onResponderRelease={() => settleHostChrome(request, undefined)}>
-    <View style={[styles.menuCard, { left, top: request.anchor.y + request.anchor.height + 2 }]} {...({ role: "menu", "aria-label": request.title } as object)}>
-      {request.items.map((item, index) => <NativeButton
-        key={`${item.title}:${index}`}
-        title={`${item.checked ? "✓ " : ""}${item.title}`}
-        compact
-        link
-        disabled={item.enabled === false}
-        onPress={() => settleHostChrome(request, index)}
-        style={styles.menuRow}
-      />)}
+    <View
+      style={[styles.menuCard, { left, top, maxHeight }]}
+      onLayout={({ nativeEvent }) => { const measured = Math.round(nativeEvent.layout.height); if (measured > 0 && measured !== cardHeight) setCardHeight(measured); }}
+      {...({ role: "menu", "aria-label": request.title } as object)}
+    >
+      <ScrollView style={styles.menuCardScroll} contentContainerStyle={styles.menuCardContent}>
+        {request.items.map((item, index) => <NativeButton
+          key={`${item.title}:${index}`}
+          title={`${item.checked ? "✓ " : ""}${item.title}`}
+          compact
+          link
+          disabled={item.enabled === false}
+          onPress={() => settleHostChrome(request, index)}
+          style={styles.menuRow}
+        />)}
+      </ScrollView>
     </View>
   </View>;
 }
@@ -604,8 +683,11 @@ const styles = StyleSheet.create({
   menuCard: {
     position: "absolute",
     minWidth: MENU_MIN_WIDTH,
-    paddingVertical: 4,
-    paddingHorizontal: 4,
+    // The rows live in a ScrollView whose content carries the padding, so the
+    // card itself must not add any: padding on a clipped box shrinks the
+    // scrollable area and its first and last rows never reach the edge.
+    paddingVertical: 0,
+    paddingHorizontal: 0,
     borderRadius: 6,
     borderWidth: 1,
     borderColor: COLOR.stroke,
@@ -615,5 +697,7 @@ const styles = StyleSheet.create({
     shadowRadius: 10,
     shadowOffset: { width: 0, height: 4 },
   },
+  menuCardScroll: { minWidth: 0, maxWidth: 520 },
+  menuCardContent: { paddingVertical: 4, paddingHorizontal: 4 },
   menuRow: { minHeight: 24, justifyContent: "flex-start" },
 });

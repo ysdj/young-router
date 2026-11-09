@@ -141,7 +141,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "logs.recovery": "恢复 / 冷却",
         "logs.online_usage": "在线用量",
         "error.generic": "发生错误",
-        "common.secureEditorLoading": "正在加载文档...",
+        "common.secureEditorLoading": "正在加载文档…",
         "common.secureEditorReadFailed": "无法加载文档。",
         "service.starting": "启动中",
         "service.running": "运行中",

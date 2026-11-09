@@ -32,7 +32,7 @@ const units: Record<string, string> = {
   MB: "MB",
   workers: "个工作进程",
   rows: "行",
-  tokens: "标记",
+  tokens: "令牌",
   hours: "小时",
   minutes: "分钟",
   bytes: "字节",
@@ -67,7 +67,7 @@ const zh: Record<string, RuntimeCopy> = {
   YOUNG_ROUTER_DSH_VISION_ROUTER_BACKEND: { label: "视觉回退后端", help: "此控件与高级 JSON 中的 backend 会相互更新；自动会尝试本地和 HTTP 提供方，本地仅使用本地提供方 / OCR，API 仅使用配置的 HTTP 提供方。" },
   YOUNG_ROUTER_DSH_VISION_ROUTER_FREE_FALLBACK: { label: "使用免费回退链", help: "在允许的后端中追加内置免密 HTTP 回退链；此控件与高级 JSON 中的 freeFallback 会相互更新。" },
   YOUNG_ROUTER_DSH_VISION_ROUTER_TIMEOUT_SECONDS: { label: "视觉回退超时", help: "每个视觉回退提供方请求允许的最长时间；此控件与高级 JSON 中的 timeoutSeconds 会相互更新。" },
-  YOUNG_ROUTER_DSH_VISION_ROUTER_MAX_TOKENS: { label: "视觉回退标记数", help: "视觉回退请求最多生成的标记数；此控件与高级 JSON 中的 maxTokens 会相互更新。" },
+  YOUNG_ROUTER_DSH_VISION_ROUTER_MAX_TOKENS: { label: "视觉回退令牌数", help: "视觉回退请求最多生成的令牌数；此控件与高级 JSON 中的 maxTokens 会相互更新。" },
   YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_OLLAMA_ENABLED: { label: "启用本地 Ollama", help: "在配置的 HTTP 提供方前尝试本地 Ollama；此控件与高级 JSON 中的 localOllama.enabled 会相互更新，地址和模型仍在高级 JSON 中设置。" },
   YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED: { label: "启用本地 LM Studio", help: "在配置的 HTTP 提供方前尝试本地 LM Studio；此控件与高级 JSON 中的 localLmStudio.enabled 会相互更新，地址和模型仍在高级 JSON 中设置。" },
   YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON: { label: "dsh-vision-router 配置", help: "可直接粘贴 JSON 的多行配置框，设置 backend（auto/local/api/off）、localOllama、localLmStudio、按顺序排列的 httpProviders（支持 apiKeyEnv），或 providers 中的 {provider,model,fallbacks}（vision-http/ovh 会映射到内置 HTTP 链；未知适配器会跳过），以及 freeFallback、prompt、timeoutSeconds 和 maxTokens。上方快捷控件与对应 JSON 字段会相互更新。仅当所选模型拒绝图像输入时运行；明确支持 vision 的模型仍直接收到原图。" },
@@ -108,7 +108,7 @@ const zh: Record<string, RuntimeCopy> = {
   YOUNG_ROUTER_SERVICE_ACCOUNT_RECHECK_SECONDS: { label: "服务商账号复核窗口", help: "同一次账号读取在该时间内会直接回答后续的账号读取。选中 WorkBuddy 或 Qoder 供应商时会读取其账号与目录，而每次进入面板都会重读一次；在此窗口内会沿用刚读到的账号、积分与倍率，不会启动 worker、不重读凭据，也不请求上游。该区块自身的刷新按钮始终真实读取。设为 0 则每次进入都重新读取。" },
   YOUNG_ROUTER_RELAY_LOGIN_BACKOFF_SECONDS: { label: "中转站登录重试等待", help: "被中转站拒绝登录后，本应用等待多久才再次尝试。每次尝试都会让中转站签发一个新会话，而登录被拒最常见的原因就是该账号的同时在线会话数已达上限；因此立刻重试只会再次被拒，并让会话数更糟。已保存的会话始终先被探测，仍然有效就直接复用，所以这个等待只作用于真正要发出的登录。在账号面板中手动登录会立即尝试并清除等待。设为 0 则一旦被拒就立即重试。" },
   YOUNG_ROUTER_RELAY_SESSION_LIMIT_BACKOFF_SECONDS: { label: "中转站会话上限等待", help: "中转站回答“同时在线会话数已达上限”后，本应用多久不再尝试登录。这个拒绝与密码无关，也不会随上面的重试等待到期而消失：它持续到占满上限的那些会话失效为止，而站点签发这类会话大约是按天计算的。把这个等待设得比上限更长，未被人盯着的面板才不会反复请求中转站签发新会话——那正是账号被判定为异常登录的原因。请在其它设备退出登录后，从账号面板手动登录；该次尝试会立即发出并清除等待。设为 0 则回退到上面的重试等待。" },
-  YOUNG_ROUTER_OUR_FREE_MODEL_MAX_TOKENS: { label: "默认输出上限", help: "请求未指定输出上限时，集成运行时提供的最大输出标记数。上游模型目录可以给出更低的上限。修改后需重启漾路由。" },
+  YOUNG_ROUTER_OUR_FREE_MODEL_MAX_TOKENS: { label: "默认输出上限", help: "请求未指定输出上限时，集成运行时提供的最大输出令牌数。上游模型目录可以给出更低的上限。修改后需重启漾路由。" },
   YOUNG_ROUTER_OUR_FREE_MODEL_EXPOSE_REGION_MODELS: { label: "显示地区受限模型", help: "在上游目录中保留当前网络位置不可用的模型。关闭后，这些模型会从供应商及其路由选择器中隐藏。修改后需重启漾路由。" },
   YOUNG_ROUTER_OUR_FREE_MODEL_REFRESH_INTERVAL_MINUTES: { label: "目录刷新间隔", help: "集成运行时刷新可用模型目录的间隔。修改后需重启漾路由。" },
   YOUNG_ROUTER_OUR_FREE_MODEL_PROBE_ON_REFRESH: { label: "探测模型可用性", help: "刷新目录时同时探测各模型的可用性。默认关闭，以免例行刷新消耗上游免费额度。修改后需重启漾路由。" },
@@ -133,7 +133,13 @@ const englishOptions: Record<string, string> = {
 };
 
 function isChinese(translate: Translator): boolean {
-  return translate("runtime.categories") === "运行时分类";
+  // A CJK code point in any translated value, not a copy of one entry: this
+  // probe compared against the exact Chinese spelling of `runtime.categories`,
+  // so rewording that one heading — or fixing its punctuation — silently made
+  // the whole Runtime pane answer in English while the rest of the window
+  // stayed Chinese.  A code point cannot collide with an English dictionary
+  // value, which is what makes this a language test rather than a copy.
+  return /[一-鿿]/u.test(translate("common.empty"));
 }
 
 export function runtimeCategoryLabel(value: string, translate: Translator): string {

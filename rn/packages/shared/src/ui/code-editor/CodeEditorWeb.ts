@@ -319,7 +319,18 @@ document.addEventListener("pointerdown", (event) => {
   if (menuOpen && event.target instanceof Node && !menu.contains(event.target)) hideEditorMenu();
 }, true);
 document.addEventListener("keydown", (event) => {
-  if (menuOpen && event.key === "Escape") hideEditorMenu();
+  if (event.key !== "Escape") return;
+  if (menuOpen) {
+    hideEditorMenu();
+    return;
+  }
+  // The frame is its own document, so the page that hosts it never sees this
+  // key: Escape pressed in the editor would close the menu and nothing else,
+  // while Escape anywhere else in the app closes the layer it is in.  Ask the
+  // host instead; it owns what closing that layer means (including any
+  // question about an unsaved draft).  The native hosts have no parent window
+  // and answer this themselves.
+  if (window.parent !== window) post({ type: "escape" });
 }, true);
 window.addEventListener("blur", hideEditorMenu);
 window.addEventListener("resize", hideEditorMenu);

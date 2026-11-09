@@ -27,6 +27,7 @@
 import type { AppRoute, LanguagePreference, NativeLocalization, NativeMenuAction, NativeMenuAnchor, RelayGroupManagerLabels, RelayGroupManagerResult, RelayGroupManagerSnapshot, ServiceStatus } from "../types";
 import type { NativeIpcBridge, NativeLeafBridge } from "./nativeBridge";
 import { isSettingsShellRoute } from "../routes";
+import { resolveLanguage } from "../i18n";
 import { pushPresentation } from "./presentationStack";
 import { cancelHostChrome, requestHostChrome, type MirrorSurface, type RelaySignInAnswer } from "./hostChrome";
 import {
@@ -453,6 +454,10 @@ let lastBrowserLoginReason = "";
 /** How often the page asks Core whether the browser finished the sign-in. */
 const BROWSER_LOGIN_POLL_MS = 900;
 
+/** The first pause after a refused frame, and the run of them that ends the stream. */
+const MIRROR_RETRY_MS = 400;
+const MIRROR_RETRY_LIMIT = 5;
+
 /** One pause a cancel can cut short: the loop below checks `cancelled` after it. */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => { setTimeout(resolve, ms); });
@@ -485,15 +490,28 @@ function startMirrorSurface(
     for (const listener of listeners) listener();
   };
   const pump = async () => {
+    // A restart of Core, or a session that lapsed and was renewed, refuses one
+    // poll and answers the next: ending the stream on the first refusal left
+    // the last picture on screen forever, under a Cancel button that still
+    // worked.  The run is counted instead, the pause grows with it, and only a
+    // run that outlasts a Core restart ends the stream — and that ending is
+    // published as an empty frame, so the surface reads as a wait again rather
+    // than as a picture of a page that is no longer there.
+    let failures = 0;
     while (!cancelled()) {
       let answer: Record<string, unknown>;
       try {
         answer = await core.hostRoute("/ipc/host/relay/browser/frames", { login_id: loginId, since: seq });
       } catch {
-        // A refused or closed session answers nothing; the poll that follows
-        // the surface's own status decides what happens next.
-        return;
+        failures += 1;
+        if (failures > MIRROR_RETRY_LIMIT) {
+          publish("");
+          return;
+        }
+        await sleep(MIRROR_RETRY_MS * failures);
+        continue;
       }
+      failures = 0;
       const next = Number(answer.seq ?? seq);
       if (Number.isFinite(next)) seq = next;
       if (typeof answer.frame === "string" && answer.frame) {
@@ -721,10 +739,16 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
     const anchor = document.createElement("a");
     anchor.href = url;
     anchor.download = name;
+    // The anchor has to be in the document for a click to count as a download
+    // in every browser, and removing it afterwards keeps the page untouched.
+    document.body.append(anchor);
     anchor.click();
-    // The blob would otherwise live until this document unloads, once per
-    // export press.
-    setTimeout(() => URL.revokeObjectURL(url), 0);
+    anchor.remove();
+    // Revoking on the next tick cancelled any download the browser had not
+    // finished opening — a large export failed with no error, because the blob
+    // was gone before the save began.  A minute is far past the read; the
+    // object is released either way, so nothing is leaked past this window.
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
   };
 
   const downloadCapability = async (token: string, name: string): Promise<void> => {
@@ -736,8 +760,11 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
     const anchor = document.createElement("a");
     anchor.href = url;
     anchor.download = name || "young-router-data.json";
+    document.body.append(anchor);
     anchor.click();
-    setTimeout(() => URL.revokeObjectURL(url), 0);
+    anchor.remove();
+    // Same hold as `download`: a revoked blob cancels a save that has not begun.
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
   };
 
   // The transport this host wraps.  Captured before the override: a wrapper
@@ -845,12 +872,12 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
       // bytes to Core and receives an opaque capability token instead. React
       // then sees the same shape it does on native hosts, and no path ever
       // leaves this page.
-      try {
-        const token = await uploadFileCapability(core, file, "import");
-        return token;
-      } catch {
-        return undefined;
-      }
+      //
+      // A refusal is not a cancel: Core rejects a file by suffix, size or a
+      // length mismatch, and returning `undefined` here made that
+      // indistinguishable from the person dismissing the dialog — the window
+      // went back to 就绪 with nothing said and no way to learn why.
+      return uploadFileCapability(core, file, "import");
     },
     saveFilePicker: async (suggestedName) => {
       try {
@@ -866,6 +893,25 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
       items: items.map((item) => ({ title: item })),
       anchor,
     }),
+    // The page's menu surface has no sections, so a grouped menu is flattened
+    // into one list whose rows carry their group's name.  Without this the
+    // leaf answered nothing at all, and the pane's own guard (`!showGrouped…
+    // → return`) made 使用特定API a button that did nothing on click — the
+    // one control in the External pane that silently did not exist here.
+    // A row is labelled with its group only when the name adds something, so
+    // a single-group menu still reads as a plain list.
+    showGroupedActionMenu: async (title, groups, anchor) => {
+      const rows = groups.flatMap((group, groupIndex) => group.items.map((label, itemIndex) => ({ groupIndex, itemIndex, label, groupTitle: group.title })));
+      const multiGroup = groups.filter((group) => group.items.length > 0).length > 1;
+      const choice = await requestHostChrome<number | undefined>({
+        kind: "menu",
+        title,
+        items: rows.map((row) => ({ title: multiGroup ? `${row.groupTitle}  ${row.label}` : row.label })),
+        anchor,
+      });
+      const picked = choice === undefined ? undefined : rows[choice];
+      return picked ? { group: picked.groupIndex, item: picked.itemIndex } : undefined;
+    },
     showConfirmation: async (title, message, confirmLabel, cancelLabel, destructive) => requestHostChrome<boolean>({
       // The app draws its own decisions; the same panel, in this page.  The
       // caller's two labels and its own destructive accent travel unchanged.
@@ -1092,9 +1138,22 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
           username: options.username ?? "",
           login_status: "signed_out",
         };
-        await core.hostRoute("/ipc/host/relay/restore", body);
-        return undefined;
+        // Core's answer is the whole point of the call: a `signed_out`
+        // observation still probes the password this account already
+        // remembers and answers `signed_in` when the saved session works.
+        // Dropping it made the pane's own success branch unreachable on this
+        // host — a proven session still drew as signed out — and spent a
+        // round trip per row for nothing.
+        const result = await core.hostRoute("/ipc/host/relay/restore", body);
+        if (result.login_status !== "signed_in") return undefined;
+        return {
+          revision: Number(result.revision ?? 0),
+          loginStatus: "signed_in" as const,
+          username: String(result.username ?? options.username ?? ""),
+        };
       } catch {
+        // An unreachable station is not a signed-out account: it says nothing
+        // about the session, so the row keeps whatever it already knew.
         return undefined;
       }
     },
@@ -1121,7 +1180,16 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
     // it would reload into a fresh session and read as a button that did
     // nothing.
     signOutWebSession: isOwnerPage() ? undefined : () => core.signOut(),
-    setLocalization: (next) => { strings = next; },
+    setLocalization: (next) => {
+      strings = next;
+      // The document's `lang` was written once by the build template as
+      // English, while this host resolves the language from the browser and
+      // Core's snapshot can change it again.  A Chinese interface under an
+      // English document is read aloud in English phone.  The native hosts
+      // set this on their own window; a page states it on its root element.
+      const language = next.language ?? resolveLanguage("system", navigator.languages?.[0] ?? navigator.language);
+      if (typeof document !== "undefined") document.documentElement.lang = language === "zh-Hans" ? "zh-Hans" : "en";
+    },
     setShortcuts: () => undefined,
   };
 }
@@ -1140,10 +1208,27 @@ async function chooseFile(): Promise<File | undefined> {
     const input = document.createElement("input");
     input.type = "file";
     input.multiple = false;
-    input.onchange = () => {
-      const file = input.files?.[0];
+    let settled = false;
+    const settle = (file: File | undefined): void => {
+      if (settled) return;
+      settled = true;
+      input.remove();
+      window.removeEventListener("focus", onFocus);
       resolve(file);
     };
+    input.onchange = () => settle(input.files?.[0]);
+    // A cancelled dialog fires `cancel` in current browsers, but not in every
+    // one: the fallback is the window's own focus returning, which is the only
+    // signal a browser gives after the picker closes without a change.  Without
+    // one of these the promise never settled, and the import/export flow that
+    // awaits it stayed busy for the rest of the page's life.
+    input.oncancel = () => settle(undefined);
+    const onFocus = (): void => {
+      // A change event is delivered before focus returns, so a short grace
+      // period lets the chosen file win; a picker that closed empty lands here.
+      setTimeout(() => settle(undefined), 300);
+    };
+    window.addEventListener("focus", onFocus);
     input.click();
   });
 }

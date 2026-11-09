@@ -3,6 +3,7 @@ import { Platform, PlatformColor, Pressable, StyleSheet, Text, View } from "reac
 import type { CoreSnapshot, NativeLeafAdapter, RelayGroupManagerResult } from "../types";
 import { AccountsTable } from "./AccountsTable";
 import { NativeButton, NativeCheckbox, NativePicker, NativeTable, NativeTextField, nativeControlTextWidth } from "./NativeControls";
+import { pushPresentation, trapWithin } from "../platform/presentationStack";
 import { usePendingAction } from "./pendingAction";
 import { setGroupManagerOpen } from "./providerWizardGate";
 import { useRelayDialogSurface } from "./relayDialogSurface";
@@ -434,8 +435,36 @@ function RelayDialogLayer({ visible, onRequestClose, children }: {
   onRequestClose: () => void;
   children: React.ReactNode;
 }): React.JSX.Element | null {
+  // The page has no modal windows, so a relay dialog is one more layer in the
+  // one presentation stack: without this it never joined, and Escape in the
+  // browser did nothing at all while focus stayed on the page behind it.
+  const frame = useRef<HTMLElement | null>(null);
+  // Kept in a ref so a parent render with a new closure does not take the
+  // dialog off the stack and back on, which would install a second trap for
+  // the same question until the first cleanup ran.
+  const close = useRef(onRequestClose);
+  close.current = onRequestClose;
+  useEffect(() => {
+    // Only the page has a document to trap in; the native hosts keep their
+    // own `accessibilityViewIsModal` and `onAccessibilityEscape`.
+    if (!visible || Platform.OS !== "web") return undefined;
+    const card = frame.current;
+    if (!card) return undefined;
+    return pushPresentation({ dismiss: () => close.current(), trap: trapWithin(card) });
+  }, [visible]);
+  // The platform check comes first: there is no `HTMLElement` in the two
+  // native bundles, and naming it there is a throw, not a failed test.
+  const rememberFrame = (node: unknown): void => {
+    if (Platform.OS !== "web") return;
+    if (node instanceof HTMLElement) frame.current = node;
+  };
   if (!visible) return null;
-  return <View style={styles.relayDialogLayer} accessibilityViewIsModal onAccessibilityEscape={onRequestClose}>
+  return <View
+    ref={rememberFrame}
+    style={styles.relayDialogLayer}
+    accessibilityViewIsModal
+    onAccessibilityEscape={onRequestClose}
+  >
     {children}
   </View>;
 }

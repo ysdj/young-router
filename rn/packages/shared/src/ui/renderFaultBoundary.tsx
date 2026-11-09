@@ -1,5 +1,5 @@
 import React from "react";
-import { Pressable, ScrollView, StyleSheet, Text } from "react-native";
+import { Platform, PlatformColor, Pressable, ScrollView, StyleSheet, Text } from "react-native";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
 /**
@@ -89,13 +89,25 @@ export class RenderFaultBoundary extends React.Component<RenderFaultProps, Rende
   }
 }
 
+/**
+ * The fault screen paints the window behind it, so it has to name its own ink:
+ * with no color stated, `Text` falls back to the platform default, and on
+ * macOS the pane behind is `windowBackgroundColor` — near-black in the dark
+ * appearance, where black label text is invisible.  The retry link was
+ * `#0a84ff`, the iOS accent, in an app whose accent is `#005fb8` on Windows
+ * and the browser; one report screen was the one place the colour was wrong.
+ */
+function faultColor(macos: string, web: string): ReturnType<typeof PlatformColor> | string {
+  return Platform.OS === "web" ? web : PlatformColor(macos);
+}
+
 const styles = StyleSheet.create({
   pane: { flex: 1, minWidth: 0, minHeight: 0 },
   content: { padding: 16, gap: 8 },
-  title: { fontSize: UI_FONT_SIZE + 2, fontWeight: "600" },
-  detail: { fontSize: UI_TIP_FONT_SIZE, lineHeight: 18, opacity: 0.7 },
+  title: { color: faultColor("labelColor", "#1b1b1b"), fontSize: UI_FONT_SIZE + 2, fontWeight: "600" },
+  detail: { color: faultColor("secondaryLabelColor", "#808080"), fontSize: UI_TIP_FONT_SIZE, lineHeight: 18, opacity: 0.7 },
   // A quiet link under the cause, not a button: the fault screen is a report,
   // and this is the one action that belongs on it.
   retry: { alignSelf: "flex-start", paddingVertical: 4 },
-  retryText: { fontSize: UI_FONT_SIZE, color: "#0a84ff" },
+  retryText: { color: faultColor("linkColor", "#005fb8"), fontSize: UI_FONT_SIZE },
 });

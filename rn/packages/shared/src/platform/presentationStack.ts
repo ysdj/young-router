@@ -29,7 +29,7 @@ const onKeyDown = (event: KeyboardEvent): void => {
   if (event.key === "Escape") {
     event.preventDefault();
     event.stopImmediatePropagation();
-    top.dismiss();
+    dismissTopPresentation();
     return;
   }
   if (event.key === "Tab") {
@@ -55,5 +55,48 @@ export function pushPresentation(presentation: Presentation): () => void {
   return () => {
     const index = stack.lastIndexOf(presentation);
     if (index >= 0) stack.splice(index, 1);
+  };
+}
+
+/**
+ * Answer Escape on the surface a person is looking at.
+ *
+ * Exported because a key pressed in another document never arrives here: the
+ * raw editor is a frame with its own listener, and it asks for this answer
+ * instead of deciding for itself which layer an Escape closes.  A surface
+ * that states a "may I close?" runs that question, exactly as the key does.
+ */
+export function dismissTopPresentation(): void {
+  stack[stack.length - 1]?.dismiss();
+}
+
+const FOCUSABLE = "button, input, select, textarea, [tabindex]:not([tabindex='-1'])";
+
+/**
+ * Keep Tab inside one element while it is the topmost layer.
+ *
+ * Three surfaces needed the same cycle — the child layers, the host's own
+ * dialogs and the relay dialogs — and each used to answer keys itself, so one
+ * surface's Tab could move focus out of the one a person was looking at.  The
+ * wrap is expressed once here and handed to `pushPresentation`.
+ *
+ * A container with nothing focusable keeps the keys on its first control
+ * (usually the close button) rather than letting focus escape to the page
+ * behind the scrim.
+ */
+export function trapWithin(container: HTMLElement, fallback?: HTMLElement | null): (event: KeyboardEvent) => void {
+  return (event: KeyboardEvent): void => {
+    const controls = Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((element) => !element.hasAttribute("disabled"));
+    const first = controls[0] ?? fallback ?? null;
+    const last = controls[controls.length - 1] ?? fallback ?? null;
+    const active = document.activeElement;
+    if (first === null || last === null) return;
+    if (event.shiftKey && (active === first || !container.contains(active))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (active === last || !container.contains(active))) {
+      event.preventDefault();
+      first.focus();
+    }
   };
 }

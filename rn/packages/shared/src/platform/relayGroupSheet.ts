@@ -153,9 +153,16 @@ export function closeRelayGroupSheet(): void {
   closing.resolveShow(undefined);
 }
 
-/** The layer's "may I close?" — the sheet's own discard question. */
+/**
+ * The layer's "may I close?" — the sheet's own discard question.
+ *
+ * A save in flight is the one time nothing may close the sheet: the pane still
+ * holds the result and states it in this sheet's strip, so the title bar's × and
+ * Escape have to refuse exactly as the footer's Close button (disabled while
+ * `saving`) does.  The save's own answer closes the sheet when it lands.
+ */
 export function askCloseRelayGroupSheet(): void {
-  if (!sheet) return;
+  if (!sheet || sheet.state.saving) return;
   const ask = sheet.askClose;
   if (ask) {
     ask();

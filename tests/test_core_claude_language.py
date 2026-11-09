@@ -929,7 +929,7 @@ class LanguageSettingsDomainTests(unittest.TestCase):
         self.assertEqual("运行时", translator("status.runtime"))
         self.assertEqual("常规", translator("status.general"))
         self.assertEqual("日志 (路由恢复 1, 冷却 2)", translator("status.logsSummary", {"recovering": 1, "cooldown": 2}))
-        self.assertEqual("正在加载文档...", translator("common.secureEditorLoading"))
+        self.assertEqual("正在加载文档…", translator("common.secureEditorLoading"))
         self.assertEqual("provider-custom", translator("provider-custom"))
 
     def test_apply_refuses_an_external_disk_change(self) -> None:

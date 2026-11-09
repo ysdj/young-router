@@ -174,6 +174,12 @@ export function RelayGroupSheet({ translate, copyKey }: {
   const rateFor = (row: KeyRow): string => (row.groupID !== "" && groupNames.has(row.groupID) ? row.multiplier : "");
   const staged = (row: KeyRow): boolean => row.deleted || (row.draft && !row.preview);
 
+  // A key already on the station cannot be saved without a name: Core refuses
+  // `update` with a message that says only that something went wrong.  A name
+  // cleared to nothing is therefore not a change to write but a row to fix, so
+  // it keeps 保存并关闭 dark instead of travelling as an edit.
+  const invalidName = (row: KeyRow): boolean => !row.draft && !row.deleted && row.name.trim() === "";
+
   const hasStagedChanges = React.useMemo(() => {
     if (state === undefined) return false;
     if (autoGrouping !== state.snapshot.autoGrouping) return true;
@@ -182,9 +188,11 @@ export function RelayGroupSheet({ translate, copyKey }: {
       if (row.preview) return false;
       if (row.draft) return row.name.trim() !== "";
       if (autoGrouping && previewKeys?.has(row.id)) return row.enabled !== row.originalEnabled;
-      return row.name !== row.originalName || row.groupID !== row.originalGroupID || row.enabled !== row.originalEnabled;
+      return (!invalidName(row) && row.name !== row.originalName) || row.groupID !== row.originalGroupID || row.enabled !== row.originalEnabled;
     }) || rows.some((row) => row.deleted && !row.draft);
   }, [autoGrouping, rows, state]);
+
+  const hasInvalidName = React.useMemo(() => rows.some(invalidName), [rows]);
 
   /** What 保存并关闭 hands the pane; the preview's own lines are Core's. */
   const stagedResult = (): RelayGroupManagerResult | undefined => {
@@ -287,8 +295,13 @@ export function RelayGroupSheet({ translate, copyKey }: {
   const removeSelected = (): void => {
     if (!selected) return;
     if (selected.draft) {
+      // A removed row leaves no selection, and every control in the detail
+      // column reads the selected row: the next one (else the one above it)
+      // takes over, so the column states a key's facts instead of going blank.
+      const index = rows.findIndex((row) => row.id === selected.id);
+      const neighbour = rows[index + 1] ?? rows[index - 1];
       setRows((current) => current.filter((row) => row.id !== selected.id));
-      setSelectedID("");
+      setSelectedID(neighbour?.id ?? "");
       return;
     }
     updateRow(selected.id, { deleted: !selected.deleted });
@@ -340,7 +353,7 @@ export function RelayGroupSheet({ translate, copyKey }: {
           }))}
           selectedKey={selectedID}
           secondaryRowKeys={rows.filter((row) => staged(row) || (autoGrouping && baseline.current?.keys.has(row.id))).map((row) => row.id)}
-          alertRowKeys={rows.filter((row) => row.deleted).map((row) => row.id)}
+          alertRowKeys={rows.filter((row) => row.deleted || invalidName(row)).map((row) => row.id)}
           compact
           cellHorizontalPadding={8}
           firstColumnHorizontalPadding={8}
@@ -352,7 +365,11 @@ export function RelayGroupSheet({ translate, copyKey }: {
         <NativeCheckbox label={labels.enabledLabel} value={selected?.enabled === true && selected?.deleted !== true} disabled={!detailEditable} onValueChange={(value) => { if (selected) updateRow(selected.id, { enabled: value }); }} />
         <View style={styles.field}>
           <Text style={styles.fieldLabel}>{labels.nameLabel}</Text>
-          <NativeTextField value={selected?.name ?? ""} editable={detailEditable} onChangeText={(value) => { if (selected) updateRow(selected.id, { name: value }); }} style={styles.control} />
+          {/* The row's name is what makes the key addressable, so a cleared one
+              is stated as the field being wrong — React Native's own props
+              have no invalid state, so this is the DOM attribute the page
+              reads (RN for Web forwards it; the native fields ignore it). */}
+          <NativeTextField value={selected?.name ?? ""} editable={detailEditable} onChangeText={(value) => { if (selected) updateRow(selected.id, { name: value }); }} accessibilityLabel={labels.nameLabel} style={selected && invalidName(selected) ? [styles.control, styles.controlInvalid] : styles.control} {...({ ...(selected !== undefined && invalidName(selected) ? { "aria-invalid": true } : {}) } as object)} />
         </View>
         <View style={styles.field}>
           <Text style={styles.fieldLabel}>{labels.groupLabel}</Text>
@@ -401,7 +418,7 @@ export function RelayGroupSheet({ translate, copyKey }: {
         <Text numberOfLines={1} style={styles.status}>{note ?? ""}</Text>
         <View style={styles.footerSpacer} />
         <NativeButton title={labels.closeLabel} compact disabled={state.saving} onPress={askCloseRelayGroupSheet} />
-        <NativeButton title={labels.applyLabel} primary compact disabled={!hasStagedChanges || state.saving || state.loading} onPress={apply} />
+        <NativeButton title={labels.applyLabel} primary compact disabled={!hasStagedChanges || hasInvalidName || state.saving || state.loading} onPress={apply} />
       </View>
     </View>
   </View>;
@@ -420,6 +437,11 @@ const styles = StyleSheet.create({
   field: { flexDirection: "row", alignItems: "center", gap: 8 },
   fieldLabel: { width: 56, flexShrink: 0, color: WINDOWS_CONTROL.textSecondary, fontSize: UI_FONT_SIZE },
   control: { flex: 1, minWidth: 0 },
+  // The panel's own invalid field: the same 1 pt danger frame the runtime pane
+  // draws on a value it will not write.  The frame is a React view on Windows
+  // and the page, so the mark is visible there; the AppKit field draws its own
+  // bezel and keeps the row's warning ink as its share of the mark.
+  controlInvalid: { borderWidth: 1, borderColor: WINDOWS_CONTROL.danger, borderRadius: WINDOWS_CONTROL.radius },
   value: { flexShrink: 1, minWidth: 0, color: WINDOWS_CONTROL.text, fontSize: UI_FONT_SIZE },
   valueRow: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 },
   models: { flex: 1, minHeight: 40, borderWidth: 1, borderColor: WINDOWS_CONTROL.stroke, borderRadius: WINDOWS_CONTROL.radius, paddingHorizontal: 8, paddingVertical: 4 },

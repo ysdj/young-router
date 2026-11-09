@@ -696,6 +696,15 @@ export interface NativeSegmentedControl {
 
 export interface NativeLocalization {
   appTitle: string;
+  /**
+   * The language preference the strings were drawn from.
+   *
+   * A page states this on its document (`lang`), which is what a screen reader
+   * and a browser's own translation prompt read; the native hosts set their
+   * window's language from the system instead. It is the *preference*, not a
+   * resolved language: only the host knows what `system` means on its machine.
+   */
+  language?: LanguagePreference;
   /** Title of the host's own startup-failure dialog. */
   startupFailure: string;
   /** Body of that dialog when the failure carried no message. */

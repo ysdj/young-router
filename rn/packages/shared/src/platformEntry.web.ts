@@ -54,6 +54,11 @@ const DEFAULT_ROUTE: AppRoute = "providers-models";
 
 /** Whether `route` names a surface this host can actually draw. */
 function isKnownRoute(route: AppRoute): boolean {
+  // `home` is on the desktop route list, but on a native host it is the
+  // windowless state (the menu bar and the hidden React host), and in this page
+  // it is one empty frame: accepting it left `#/home` a permanently blank page.
+  // Rejecting it here is what sends that address down the fallback path above.
+  if (route === "home") return false;
   return (DESKTOP_ROUTES as readonly AppRoute[]).includes(route) || CHILD_SURFACES.includes(route);
 }
 
@@ -294,8 +299,19 @@ function adoptAddress(): void {
   adoptRouteAddress();
   if (next === currentRoute) return;
   currentRoute = next;
+  // A child layer sits over the page and the address is the page's state, so
+  // the surface named by the old address must go before the new one is drawn.
+  // The grouping sheet is asked through its own "may I close?": a Back over a
+  // draft must ask before dropping it, and its layer owns that question.
+  if (relayGroupSheetState() !== undefined) askCloseRelayGroupSheet();
+  if (visibleChildRoute !== undefined) dismissChildLayer(visibleChildRoute);
   if (CHILD_SURFACES.includes(next)) {
-    presentChild(next);
+    // Through the host's own stack: `openWindow` pushes the route and calls
+    // back into `presentChild`, so closing the layer returns to the pane
+    // underneath. Presenting it directly left the stack empty, and the layer's
+    // own Close then fell through to `navigate("home")` — a blank page — for
+    // every child surface whose address had been typed.
+    native.window.open(next);
     return;
   }
   presentRoute(next);
@@ -307,11 +323,13 @@ window.addEventListener("popstate", adoptAddress);
 // A launch that arrives on a child surface's address still needs the page
 // underneath it: the layer is drawn over the settings shell, exactly as it is
 // when a pane opens it. Landing the shell on the child route as well would
-// draw a second copy of the surface behind its own layer.
+// draw a second copy of the surface behind its own layer. The presentation goes
+// through the host's window stack for the same reason `adoptAddress` does: the
+// layer's own Close consults that stack, and one left empty sends it home.
 if (CHILD_SURFACES.includes(currentRoute)) {
   const surface = currentRoute;
   presentRoute("providers-models");
-  presentChild(surface);
+  native.window.open(surface);
 } else {
   presentRoute(currentRoute);
 }

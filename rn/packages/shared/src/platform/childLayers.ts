@@ -108,14 +108,22 @@ export function presentChildLayer(options: ChildLayerOptions): void {
   frame.tabIndex = -1;
   frame.style.cssText = [
     `width:min(${size.width}px, calc(100vw - ${MARGIN * 2}px))`,
+    // `vh` first as the fallback, `dvh` second for browsers that know it: on a
+    // phone `100vh` is the viewport with the toolbars already expanded, so a
+    // layer sized from it runs under them.  The later declaration wins where it
+    // parses, and the earlier one keeps the layer centred on everything else.
     `height:min(${size.height}px, calc(100vh - ${MARGIN * 2}px))`,
+    `height:min(${size.height}px, calc(100dvh - ${MARGIN * 2}px))`,
     // Centred by geometry, not by the scrim's flex: a page's own stylesheet can
     // win the cascade over the scrim's `display`, and a layer that loses it then
     // sits in the corner. Absolute offsets do not depend on that.
     "position:absolute", "left:50%", "top:50%",
     "display:flex", "flex-direction:column", "overflow:hidden",
     "border-radius:8px",
-    "background:var(--yr-control, #ffffff)",
+    // Literals, not `var(--yr-*)`: those properties are defined in no
+    // stylesheet, so each one resolved to its own fallback anyway — a layer of
+    // indirection that named nothing.
+    "background:#ffffff",
     // The edge, not just the fill.  A white sheet over a dimmed white page is
     // two light rectangles, and a 1 pt #d4d4d8 separator under the scrim's wash
     // reads as a colour change with no boundary.  The outline is therefore
@@ -134,8 +142,8 @@ export function presentChildLayer(options: ChildLayerOptions): void {
   titleBar.style.cssText = [
     "flex:0 0 auto", "display:flex", "align-items:center", "gap:8px",
     "height:30px", "padding:0 6px 0 12px",
-    "border-bottom:1px solid var(--yr-separator, #d4d4d8)",
-    "background:var(--yr-window, #f3f3f3)", "cursor:grab", "user-select:none",
+    "border-bottom:1px solid #e5e5e5",
+    "background:#f3f3f3", "cursor:grab", "user-select:none",
   ].join(";");
   const title = document.createElement("div");
   title.textContent = options.title;
@@ -144,7 +152,7 @@ export function presentChildLayer(options: ChildLayerOptions): void {
   close.type = "button";
   close.textContent = "\u00d7";
   close.setAttribute("aria-label", options.closeLabel);
-  close.style.cssText = "width:22px;height:22px;display:flex;align-items:center;justify-content:center;border:0;border-radius:4px;background:transparent;color:var(--yr-secondary-label, #5d5d5d);font:16px/18px system-ui, sans-serif;cursor:default";
+  close.style.cssText = "width:22px;height:22px;display:flex;align-items:center;justify-content:center;border:0;border-radius:4px;background:transparent;color:#808080;font:16px/18px system-ui, sans-serif;cursor:default";
   titleBar.append(title, close);
 
   const body = document.createElement("div");
@@ -185,7 +193,6 @@ export function presentChildLayer(options: ChildLayerOptions): void {
     if (event.shiftKey && (document.activeElement === first || !frame.contains(document.activeElement))) { event.preventDefault(); last.focus(); }
     else if (!event.shiftKey && (document.activeElement === last || !frame.contains(document.activeElement))) { event.preventDefault(); first.focus(); }
   };
-  const releasePresentation = pushPresentation({ dismiss, trap });
   const askClose = (): void => {
     if (options.requestClose) {
       options.requestClose();
@@ -193,6 +200,10 @@ export function presentChildLayer(options: ChildLayerOptions): void {
     }
     dismiss();
   };
+  // Escape answers through `askClose`, not `dismiss`: a surface that states a
+  // "may I close?" asks it for the key too, which is what its own documentation
+  // above promises and what the title bar's × already did.
+  const releasePresentation = pushPresentation({ dismiss: askClose, trap });
   close.addEventListener("click", askClose);
 
   // Dragging, the gesture a native child panel accepts on its title bar. The

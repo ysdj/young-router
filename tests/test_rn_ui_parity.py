@@ -3274,7 +3274,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertIn(style, self.ui)
         self.assertIn("routeTraceRequestTextSelected: { color: systemColors.selectedControlText }", self.ui)
-        self.assertIn('secondaryLabel: semanticColor("secondaryLabelColor", "TextFillColorSecondary", "#6e6e73")', self.ui)
+        self.assertIn('secondaryLabel: semanticColor("secondaryLabelColor", "TextFillColorSecondary", webInk.textSecondary)', self.ui)
         self.assertIn("routeTraceTimelineNodeStart: { backgroundColor: systemColors.secondaryLabel }", self.ui)
         # A picked route is a plan the request has not confirmed yet, so it
         # never wears the success ink; only a route that served the answer is
@@ -4165,7 +4165,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const [initialSnapshot] = useState(() => dependencies.ipc.latestSnapshot());", bootstrap)
         self.assertIn("void ipc.snapshot().catch(() => undefined);", platform_entry)
         self.assertIn("const [snapshot, setSnapshot] = useState<CoreSnapshot | undefined>(initialSnapshot);", self.ui)
-        self.assertIn('!error && route !== "home" && snapshot ? (isSettingsShellRoute(route)', self.ui)
+        self.assertIn('route !== "home" && snapshot ? (isSettingsShellRoute(route)', self.ui)
 
     def test_explicit_service_operations_republish_the_latest_snapshot(self) -> None:
         self.assertIn("const refreshSnapshot = useCallback(async (publishUnchanged = true)", self.ui)
@@ -4277,7 +4277,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("numberValue(active?.total) : 0", logs)
         self.assertIn("ONLINE_USAGE_PAGE_ROWS = 300", self.ui.split("function LogsWorkspace(", 1)[0])
         self.assertIn('scrollOnlineUsage(result.log.source_id ?? "", 0)', logs)
-        self.assertIn('scrollToRow={selected === "online-usage" && onlineUsageScrollSourceRef.current === active?.source_id ? onlineUsageScrollToRow : -1}', logs)
+        self.assertIn('scrollRequest={selected === "online-usage" && onlineUsageScrollSourceRef.current === active?.source_id ? onlineUsageScrollRequest : undefined}', logs)
         self.assertIn("onlineUsagePagePending.current = false;", logs)
         self.assertIn("const onlineUsageRemaining = selected === \"online-usage\" ? numberValue(active?.remaining) : 0;", logs)
         self.assertIn("busy={onlineUsageLoadingMore}", logs)
@@ -4301,7 +4301,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # It is the app's own wheel, not a second indicator drawn for this pane.
         self.assertIn("<NativeBusySpinner label={translate(\"logs.onlineUsageLoading\")} />", empty_branch)
         self.assertIn(
-            '"logs.onlineUsageLoading": "正在读取中转站用量..."',
+            '"logs.onlineUsageLoading": "正在读取中转站用量…"',
             (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8"),
         )
         # The wait belongs to the read, and only a current read ends it.
@@ -4351,7 +4351,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"logs.onlineUsageSelectSourceHint": "Select a relay above to read its usage."', self.en)
         self.assertIn('"logs.onlineUsageLoading": "Reading relay usage..."', self.en)
         self.assertIn('"logs.onlineUsageSelectSource": "选择中转站"', self.zh)
-        self.assertIn('"logs.onlineUsageLoading": "正在读取中转站用量..."', self.zh)
+        self.assertIn('"logs.onlineUsageLoading": "正在读取中转站用量…"', self.zh)
         translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
         for key in (
             "logs.onlineUsageSelectSource",
@@ -4807,7 +4807,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn(marker, assistant_i18n)
 
     def test_logs_show_empty_state_after_a_loaded_but_missing_log_source(self) -> None:
-        self.assertIn('active ? translate("logs.empty") : translate("logs.loading")', self.ui)
+        self.assertIn('translate("logs.emptyNoEntries")', self.ui)
+        self.assertIn('translate("logs.loadFailed")', self.ui)
+        self.assertIn('translate("logs.loading")', self.ui)
+        self.assertIn('filterDraft.trim() ? translate("logs.empty")', self.ui)
 
     def test_external_settings_edit_claude_files_without_inventing_saved_defaults(self) -> None:
         # Claude documents are now file rows in the shared listing; the pane
@@ -8238,7 +8241,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # A type that carries no secret of its own has no 密钥 step to walk
         # through: its next step after 供应商 is 模型.
         self.assertIn("const needsKeyStep = !isServiceCatalogType;", wizard)
-        self.assertIn('stepRef.current = step === "provider" ? (needsKeyStep ? "keys" : "model") : "model";', wizard)
+        # The ref moves only inside the two helpers that actually change the
+        # step — never in `goNext` before its validation guard.  Writing it
+        # there left a rejected press pointing at the next step, so the guard
+        # refused every later press for the rest of the wizard's life.
+        self.assertNotIn('stepRef.current = step === "provider" ?', wizard)
+        self.assertIn('stepRef.current = "keys";', wizard)
+        self.assertIn('stepRef.current = "model";\n    setStep("model");', wizard)
         self.assertIn("const advanceFromProviderStep = (): void => {", wizard)
         self.assertIn('...(needsKeyStep ? [{ id: "keys" as WizardStep, title: translate("providers.wizard.stepKeys") }] : []),', wizard)
         self.assertIn("const advanceStepToModel = (): void => {", wizard)

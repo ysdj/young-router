@@ -12,6 +12,7 @@ import {
   type EditorPlatform,
 } from "./codeEditorPage";
 import { requestHostChrome } from "../../platform/hostChrome";
+import { dismissTopPresentation } from "../../platform/presentationStack";
 
 export { editorMenuLabels };
 export type { CodeEditorDiff, CodeEditorLanguage, CodeEditorMenuLabels };
@@ -232,6 +233,13 @@ function WebCodeEditor({
         onErrorRef.current?.();
       } else if (payload.type === "paste") {
         pasteFromClipboard();
+      } else if (payload.type === "escape") {
+        // Escape typed in the frame stays in the frame — the host page's own
+        // keydown never sees it — so the editor hands the key back rather than
+        // leaving a layer that only its title bar can close.  The stack, not
+        // this component, decides which surface answers, and a surface with an
+        // unsaved draft asks before it closes.
+        dismissTopPresentation();
       }
     };
     window.addEventListener("message", onMessage);

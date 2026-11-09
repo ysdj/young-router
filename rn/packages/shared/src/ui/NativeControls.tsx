@@ -244,6 +244,17 @@ type TableProps = {
   followBottom?: boolean;
   /** One explicit table scroll request; -1 keeps the current viewport. */
   scrollToRow?: number;
+  /**
+   * A scroll that is delivered once, when `token` changes.
+   *
+   * `scrollToRow` states where the table should be, so both hosts re-apply it
+   * on every update — which is right for a table that is being rebuilt, and
+   * wrong for a request: the online-usage tab asked to land on row 0 when a
+   * page turned, and then the 15-second poll re-applied that 0 on every refresh,
+   * dragging the reader back to the top of a table they had scrolled.  A token
+   * makes the request an event instead of a state.
+   */
+  scrollRequest?: { row: number; token: number };
   framed?: boolean;
   /** Sidebar source-list chrome: no header, single full-width column. */
   sourceList?: boolean;
@@ -443,6 +454,8 @@ const WindowsSegmentedControl = React.forwardRef<any, SegmentedProps>(function W
         accessibilityRole="tab"
         accessibilityLabel={label}
         accessibilityState={{ selected, disabled: disabled === true }}
+        aria-selected={selected}
+        aria-disabled={disabled === true || undefined}
         style={[styles.windowsSegment, selected && styles.windowsSegmentSelected, index === 0 && styles.windowsSegmentFirst, index === labels.length - 1 && styles.windowsSegmentLast, Platform.OS === "web" && styles.webSegment, Platform.OS === "web" && { minWidth: Math.ceil(nativeControlTextWidth(label)) + 26 }]}
       >
         <Text numberOfLines={1} style={[styles.windowsSegmentText, selected && styles.windowsSegmentTextSelected, disabled && styles.windowsDisabledText]}>{label}</Text>
@@ -462,6 +475,11 @@ function WindowsToggle({ value, disabled, onValueChange, style, accessibilityLab
     accessibilityRole="switch"
     accessibilityLabel={accessibilityLabel}
     accessibilityState={{ checked: value, disabled: disabled === true }}
+    // React Native for Web reads the flat aria names, not `accessibilityState`
+    // (see the row comment below): without these a switch drew its state but
+    // announced none, so every one of them read as "off" to a screen reader.
+    aria-checked={value}
+    aria-disabled={disabled === true || undefined}
   >
     <View style={[styles.windowsToggleTrack, value && styles.windowsToggleTrackOn]}>
       <View style={[styles.windowsToggleKnob, value && styles.windowsToggleKnobOn]} />
@@ -480,6 +498,8 @@ function WindowsCheckbox({ label, value, disabled, compact = true, labelVisible 
     accessibilityRole="checkbox"
     accessibilityLabel={label}
     accessibilityState={{ checked: value, disabled: disabled === true }}
+    aria-checked={value}
+    aria-disabled={disabled === true || undefined}
   >
     <View style={[styles.windowsCheckboxBox, value && styles.windowsCheckboxBoxChecked, disabled && styles.windowsDisabled]}>
       {value ? <Text style={styles.windowsCheckboxMark}>{"\u2713"}</Text> : null}
@@ -713,7 +733,7 @@ export function NativeSelectableRow({ title, detail, selected, disabled, onPress
   if (Platform.OS === "macos") {
     return <AppKitSelectableRow title={title} detail={detail} selected={selected} disabled={disabled} onPress={onPress} style={style} />;
   }
-  return <Pressable style={[styles.selectableRow, selected && styles.selectableRowSelected, style]} disabled={disabled} onPress={onPress} accessibilityRole="button" accessibilityLabel={detail ? `${title}, ${detail}` : title} accessibilityState={{ selected: selected === true, disabled: disabled === true }}><View style={styles.selectableText}><Text style={styles.selectableTitle}>{title}</Text>{detail ? <Text style={styles.selectableDetail}>{detail}</Text> : null}</View></Pressable>;
+  return <Pressable style={[styles.selectableRow, selected && styles.selectableRowSelected, style]} disabled={disabled} onPress={onPress} accessibilityRole="button" accessibilityLabel={detail ? `${title}, ${detail}` : title} accessibilityState={{ selected: selected === true, disabled: disabled === true }} aria-selected={selected === true} aria-disabled={disabled === true || undefined}><View style={styles.selectableText}><Text style={styles.selectableTitle}>{title}</Text>{detail ? <Text style={styles.selectableDetail}>{detail}</Text> : null}</View></Pressable>;
 }
 
 export function NativeCheckbox({ label, value, disabled, compact = true, labelVisible = true, onValueChange, style }: CheckboxProps): React.JSX.Element {
@@ -745,6 +765,8 @@ export function NativeRadio({ label, value, disabled, onValueChange, style }: Ra
     accessibilityRole="radio"
     accessibilityLabel={label}
     accessibilityState={{ checked: value === true, disabled: disabled === true }}
+    aria-checked={value === true}
+    aria-disabled={disabled === true || undefined}
   >
     <View style={[styles.radioBox, value === true && styles.radioBoxChecked, disabled === true && styles.radioBoxDisabled]}>
       {value === true ? <View style={[styles.radioDot, disabled === true && styles.radioDotDisabled]} /> : null}
@@ -789,14 +811,25 @@ function WebPicker({ labels, selectedValue, disabled, accessibilityLabel, onChan
 
 // RNW renders styles as CSS classes; a native `<select>` needs its own, and
 // it must follow the pane's palette rather than the browser's default chrome.
+//
+// The values are literals, not `var(--yr-*)`: those custom properties were
+// referenced here and in `childLayers` and defined in no stylesheet, so every
+// one of them resolved to its own fallback — a variable layer that only ever
+// said "whatever this fallback is". The page has exactly one palette, and it
+// is the shared control table's.
 const WEB_SELECT_STYLE: React.CSSProperties = {
   width: "100%",
   minHeight: 22,
   padding: "1px 4px",
-  border: "1px solid var(--yr-separator, #d4d4d8)",
+  // The shared control table's own values (`WINDOWS_CONTROL.stroke` / `.fill` /
+  // `.text`), restated because that table is declared below this constant.
+  border: "1px solid #d1d1d1",
   borderRadius: 4,
-  background: "var(--yr-control, #ffffff)",
-  color: "inherit",
+  background: "#ffffff",
+  // A `<select>` does not inherit ink from the pane around it; `inherit` gave
+  // it the browser's own text colour, near-black in one place and the page's
+  // body colour in another.
+  color: "#1b1b1b",
   font: "inherit",
 };
 
@@ -1401,7 +1434,7 @@ const windowsTableStyles = StyleSheet.create({
 // with them every mounted row) even when no prop changed.
 const EMPTY_STRINGS: string[] = [];
 
-export function NativeTable({ columns, rows, selectedKey = "", striped = true, compact = true, followBottom = false, scrollToRow = -1, framed = true, sourceList = false, rowSymbols = EMPTY_STRINGS, rowSymbolColors = EMPTY_STRINGS, rowImageNames = EMPTY_STRINGS, cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = EMPTY_STRINGS, secondaryRowKeys = EMPTY_STRINGS, secondaryCellKeys = EMPTY_STRINGS, rowDetails = EMPTY_STRINGS, selectableSpanningRowKeys = EMPTY_STRINGS, onSelectionChange, onRowDoublePress, style, alertRowKeys = EMPTY_STRINGS }: TableProps): React.JSX.Element {
+export function NativeTable({ columns, rows, selectedKey = "", striped = true, compact = true, followBottom = false, scrollToRow = -1, scrollRequest, framed = true, sourceList = false, rowSymbols = EMPTY_STRINGS, rowSymbolColors = EMPTY_STRINGS, rowImageNames = EMPTY_STRINGS, cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = EMPTY_STRINGS, secondaryRowKeys = EMPTY_STRINGS, secondaryCellKeys = EMPTY_STRINGS, rowDetails = EMPTY_STRINGS, selectableSpanningRowKeys = EMPTY_STRINGS, onSelectionChange, onRowDoublePress, style, alertRowKeys = EMPTY_STRINGS }: TableProps): React.JSX.Element {
   // Striped rows belong to the list surface, not to its contents: the native
   // table paints its alternating bands across the whole viewport, so an empty
   // list shows the same stripes and reads as a list that happens to have no
@@ -1416,13 +1449,39 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
     const spanning = new Set(spanningRowKeys);
     return new Set(selectableSpanningRowKeys.filter((key) => spanning.has(key)));
   }, [spanningRowKeys, selectableSpanningRowKeys]);
+  // A scroll *request* is an event, not a state.  `scrollToRow` states where the
+  // table should be, and both hosts honour that on every update — which is
+  // right for a table rebuilt under the reader, and wrong for a request: the
+  // online-usage tab asked to land on the first row of a new page, and the
+  // fifteen-second poll re-applied that row on every refresh, dragging the
+  // reader back to the top.  A request is therefore delivered to the host for
+  // one update and withdrawn afterwards, on both the React and the AppKit path.
+  const [scrollDelivery, setScrollDelivery] = React.useState<{ row: number; token: number } | null>(null);
+  const deliveredScrollToken = React.useRef<number | undefined>(undefined);
+  React.useEffect(() => {
+    if (scrollRequest === undefined) return;
+    if (deliveredScrollToken.current === scrollRequest.token) return;
+    setScrollDelivery(scrollRequest);
+  }, [scrollRequest]);
+  React.useEffect(() => {
+    if (scrollDelivery === null) return undefined;
+    // Long enough for the rows the request names to be in the same commit as
+    // the request (a page turn stages both), and short enough that the next
+    // poll cannot re-apply it.
+    const timer = setTimeout(() => {
+      deliveredScrollToken.current = scrollDelivery.token;
+      setScrollDelivery(null);
+    }, 150);
+    return () => clearTimeout(timer);
+  }, [scrollDelivery]);
+  const effectiveScrollToRow = scrollDelivery !== null ? scrollDelivery.row : scrollRequest !== undefined ? -1 : scrollToRow;
   if (Platform.OS === "windows" || Platform.OS === "web") {
     // This React table is the only Windows table path, and the browser's too:
     // a browser has no AppKit table to delegate to, and the fallback below is a
     // one-line-per-row list that drops every column this app reads.  The
     // Windows leaf is already a virtualized React table, so the browser host
     // gets the same rows, columns, stripes and selection instead of a stub.
-    return <WindowsTable columns={columns} rows={rows} selectedKey={selectedKey} stripedRows={stripedRows} compact={compact} followBottom={followBottom} scrollToRow={scrollToRow} framed={framed} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} rowImageNames={rowImageNames} disabledRowKeys={disabledRowKeys} secondaryRowKeys={secondaryRowKeys} secondaryCellKeys={secondaryCellKeys} rowDetails={rowDetails} selectableSpanningKeys={selectableSpanningKeys}
+    return <WindowsTable columns={columns} rows={rows} selectedKey={selectedKey} stripedRows={stripedRows} compact={compact} followBottom={followBottom} scrollToRow={effectiveScrollToRow} framed={framed} sourceList={sourceList} rowSymbols={rowSymbols} rowSymbolColors={rowSymbolColors} rowImageNames={rowImageNames} disabledRowKeys={disabledRowKeys} secondaryRowKeys={secondaryRowKeys} secondaryCellKeys={secondaryCellKeys} rowDetails={rowDetails} selectableSpanningKeys={selectableSpanningKeys}
       // A caller that names its own inset expects it on the web too: these two
       // reached only the macOS table, so a list that asked for 6 or 0 was drawn
       // at this table's fixed 8 and its header 16 — the pane's own alignment
@@ -1463,7 +1522,9 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
       alternatingRows: stripedRows,
       compact,
       followBottom,
-      scrollToRow,
+      // The request, not the standing target: the native table re-applies a
+      // non-negative row on every prop update, exactly like the React one.
+      scrollToRow: effectiveScrollToRow,
       borderless: !framed,
       sourceList,
       rowSymbols,

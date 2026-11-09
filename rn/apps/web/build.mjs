@@ -125,6 +125,18 @@ const html = `<!doctype html>
       /* A form control does not inherit the page's face by default; it is the
          element the browser styles itself, so it has to be told. */
       button, input, select, textarea { font-family: inherit; font-size: inherit; }
+      /* React Native for Web draws every Pressable as a <button> and gives it no
+         focus ring: the document held no focus rule at all, and a focused
+         button computed outline-style none with no shadow, so tabbing
+         through the page moved focus invisibly.  The native hosts have a
+         system ring to draw; a page has to state one.  The focus-visible
+         selector keeps it off a mouse click, which is what a person expects
+         from a desktop app, and the accent is the shared control table's own
+         (the ink a primary button already uses). */
+      :focus-visible { outline: 2px solid #005fb8; outline-offset: 1px; }
+      /* A scroll container that is focusable for keyboard scrolling still gets
+         the ring above only when it is actually tabbed to, not on every pane. */
+      [tabindex="-1"]:focus { outline: none; }
       #root { height: 100%; display: flex; }
       /* The host's surfaces own the viewport above every pane and child layer;
          the container itself must not swallow clicks meant for the app. */
