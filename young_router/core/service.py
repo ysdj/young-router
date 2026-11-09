@@ -4363,6 +4363,17 @@ class CoreStore:
                 # the pane's own debounced Apply then reads a revision it never
                 # caused and reports the user's work back as "settings changed
                 # outside this window".
+                # A station binding is cosmetic only when the provider draft
+                # it edits was already clean.  A provider the wizard just added
+                # is still staged: its add lives in this same draft, and clearing
+                # the dirty flag here made the binding look like the whole draft
+                # was applied.  The wizard then closed, the staged provider was
+                # gone, and the station account the native login had already
+                # stored had no provider row left to reach it.
+                provider_was_dirty = (
+                    name == "providers_models"
+                    and self._drafts.get("providers_models", {}).get("dirty") is True
+                )
                 action_draft_before = self._adapter_draft_state(name)
                 payload = data.get("payload")
                 if name == "providers_models" and action_type.replace("-", "_").replace(".", "_") in {
@@ -4648,6 +4659,7 @@ class CoreStore:
                 cosmetic_binding = bool(
                     name == "providers_models"
                     and normalized_action == "provider_select_relay_station"
+                    and not provider_was_dirty
                     and getattr(adapter, "_cosmetic_binding", False)
                 )
                 if cosmetic_binding:

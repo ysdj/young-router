@@ -219,28 +219,33 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
         station_id = relay.snapshot()["stations"][0]["id"]
         return directory, providers, relay, core, station_id
 
-    def test_station_binding_preserves_a_matching_api_base_and_stays_clean(self) -> None:
-        """Binding a same-name, same-site provider must not dirty the draft.
+    def test_station_binding_keeps_a_new_provider_staged_until_apply(self) -> None:
+        """A binding must not certify the provider add that preceded it.
 
-        The provider keeps its ``/v1`` spelling and the hidden source
-        metadata change stays clean, so closing the window never asks the
-        user to discard a change that altered nothing visible.
+        The wizard stages a new provider and then binds it to the station in a
+        second dispatch.  The binding changes only hidden source metadata, so it
+        was treated as cosmetic and the whole draft was marked clean.  The
+        provider was never applied; the wizard closed and the station account
+        the native sign-in had already stored was left without a provider row.
         """
 
         directory, providers, _relay, core, station_id = self._relay_core()
         with directory:
-            added = providers.dispatch(
-                "provider.add",
+            core.dispatch(
                 {
-                    "provider": {
-                        "name": "atlas",
-                        "api_base": "https://atlas.example/v1",
-                        "models": [],
-                        "create_default_api_key": True,
-                    }
+                    "domain": "providers_models",
+                    "type": "provider.add",
+                    "payload": {
+                        "provider": {
+                            "name": "atlas",
+                            "api_base": "https://atlas.example/v1",
+                            "models": [],
+                        }
+                    },
                 },
+                expected_revision=core.revision,
             )
-            provider_id = added["providers"][0]["id"]
+            provider_id = providers.snapshot()["providers"][0]["id"]
             result = core.dispatch(
                 {
                     "domain": "providers_models",
@@ -252,6 +257,46 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             provider = providers.draft_state()["providers"][0]
             self.assertEqual("https://atlas.example/v1", provider["api_base"])
             self.assertEqual("relay", provider["provider_type"])
+            self.assertEqual(station_id, provider["relay_station_id"])
+            self.assertTrue(core.snapshot()["drafts"]["providers_models"]["dirty"])
+            self.assertEqual(core.revision, result["revision"])
+
+            applied = core.apply(domains=["providers_models"], revision=core.revision)
+            self.assertEqual("applied", applied["status"])
+            self.assertIn("atlas", providers.config_path.read_text(encoding="utf-8"))
+
+    def test_station_binding_of_an_applied_provider_stays_clean(self) -> None:
+        """A binding that only writes source metadata stays clean when nothing
+        else in the provider draft is waiting to be written."""
+
+        directory, providers, _relay, core, station_id = self._relay_core()
+        with directory:
+            added = core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.add",
+                    "payload": {
+                        "provider": {
+                            "name": "atlas",
+                            "api_base": "https://atlas.example/v1",
+                            "models": [],
+                        }
+                    },
+                },
+                expected_revision=core.revision,
+            )
+            provider_id = providers.snapshot()["providers"][0]["id"]
+            core.apply(domains=["providers_models"], revision=core.revision)
+            result = core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.select_relay_station",
+                    "payload": {"provider_id": provider_id, "station_id": station_id},
+                },
+                expected_revision=core.revision,
+            )
+            provider = providers.draft_state()["providers"][0]
+            self.assertEqual("https://atlas.example/v1", provider["api_base"])
             self.assertEqual(station_id, provider["relay_station_id"])
             self.assertFalse(core.snapshot()["drafts"]["providers_models"]["dirty"])
             self.assertEqual(core.revision, result["revision"])
