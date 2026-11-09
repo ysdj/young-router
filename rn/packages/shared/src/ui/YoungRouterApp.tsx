@@ -5777,7 +5777,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                       }}
                       style={styles.providerWizardPicker}
                     /> : <Text numberOfLines={1} style={styles.providerWizardAccountLine}>{translate("providers.authAccount")}: {stationAccountName(selectedStationAccount)}</Text>}
-                    <Text numberOfLines={1} style={styles.providerWizardAccountLine}>{translate("providers.authStatusSignedIn")}{selectedStationAccount.balance === null ? "" : ` · $${selectedStationAccount.balance.toFixed(2)}`}</Text>
                   </View>
                   <View style={styles.providerWizardAccountActions}>
                     <NativeButton title={translate("relay.refreshResources")} compact busy={resourcesBusy} disabled={(wizardBusy && !resourcesBusy) || !activeProviderBaseURL.trim()} onPress={() => { void refreshStationResources(); }} />
