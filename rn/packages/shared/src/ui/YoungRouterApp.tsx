@@ -1242,6 +1242,27 @@ function relaySourceName(source: RelaySourceOption | undefined): string {
   return source ? [source.accountLabel, source.resourceLabel].filter(Boolean).join("/") : "";
 }
 
+/** The name a relay account is known by: its station username first. */
+function stationAccountName(account: RelayAccount): string {
+  return account.username.trim() || account.label.trim() || account.id;
+}
+
+/**
+ * Whether a relay account can be offered as signed in.
+ *
+ * The account pane's 已登录 is partly its own local state — a session probe it
+ * ran in its React root — so a child window reading only `login_status` saw
+ * 未登录 beside the pane's 已登录 after a restart, and the keys the station had
+ * already answered for were hidden.  A successful resource read is the same
+ * fact observed from Core: the station accepted the session and told us what
+ * the account may serve.  An account whose session was explicitly refused is
+ * never signed in, however much stale resource data it still carries.
+ */
+function relayAccountSignedIn(account: RelayAccount): boolean {
+  if (account.resourceError === "login_expired") return false;
+  return account.loginStatus === "signed_in" || account.resourceStatus === "ready" || account.resources.length > 0;
+}
+
 function modelProviderKeyLabel(model: UnknownRecord, provider: UnknownRecord, translate: Translate, keyName?: (keyID: string, name: string) => string, relaySources: RelaySourceOption[] = [], credentials: ProviderCredential[] = []): string {
   // An account-backed route answers with one credential, and naming the other
   // kind would state a key it does not use: an account names the account.
@@ -4037,10 +4058,17 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const [keyPath, setKeyPath] = useState<"login" | "manual">("manual");
   const [loginPhase, setLoginPhase] = useState<"idle" | "sign-in">("idle");
   const [loginBusy, setLoginBusy] = useState(false);
+  // 刷新资源 is the action the empty and unavailable hints name; it reads the
+  // station for every signed-in account this step lists, so one press can
+  // bring back a second account's keys as well as the first's.
+  const [resourcesBusy, setResourcesBusy] = useState(false);
   const loginFeedback = useRef<string | undefined>(undefined);
   const [, forceLoginFeedbackRender] = useState(0);
   const setupLoginRequest = useRef(0);
   const [signedInAccountID, setSignedInAccountID] = useState<string>();
+  // Which account the key step is showing; chosen from the station's accounts.
+  const [selectedAccountID, setSelectedAccountID] = useState("");
+  const appliedSignedInAccount = useRef<string | undefined>(undefined);
   const [providedKeySelection, setProvidedKeySelection] = useState("");
   const [keySelection, setKeySelection] = useState("");
   const [keyName, setKeyName] = useState("");
@@ -4180,38 +4208,72 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     [activeProviderBaseURL, relayStations],
   );
   const relayAccounts = useMemo(() => accountsFromSnapshot(snapshot), [snapshot]);
-  // The account this step speaks for.  A sign-in performed in this run sets it;
-  // otherwise it is the station's own signed-in account.  Reading only the id
-  // this run remembered printed 账号: 未登录 over a station whose account the
-  // pane behind this sheet listed as 已登录 — the step contradicted the window
-  // it was opened from.
-  const stationSignedInAccount = useMemo(() => {
-    if (!stationForProvider) return undefined;
-    const stationKey = stationOriginKey(stationForProvider.baseURL);
-    return relayAccounts.find((item) => item.loginStatus === "signed_in"
-      && (item.stationID === stationForProvider.id || stationOriginKey(item.origin) === stationKey));
-  }, [relayAccounts, stationForProvider]);
-  const activeRelayAccount = useMemo(
-    () => (signedInAccountID ? relayAccounts.find((item) => item.id === signedInAccountID) ?? stationSignedInAccount : stationSignedInAccount),
-    [relayAccounts, signedInAccountID, stationSignedInAccount],
-  );
-  // Provided keys stay scoped to the selected provider's station: either the
-  // account this wizard session signed into, or the station bound to the
-  // provider's base URL. An unscoped fallback would list every station's
-  // keys, which is why unrelated providers once leaked into this list.
+  // Every account this station has, not just the one this run signed in: the
+  // pane behind the wizard lists all of them, and a step that named one
+  // 已登录 while the station's other account sat beside it stated a fact the
+  // window it was opened from contradicted.  The account just signed in comes
+  // first, then the other signed-in accounts, then the rest; the id this run
+  // asked with may not be the station's row, so membership is by station id or
+  // origin, and the landed account is added when the snapshot's binding has not
+  // caught up yet.
+  const stationAccounts = useMemo(() => {
+    const stationID = stationForProvider?.id ?? "";
+    const origin = stationOriginKey(stationForProvider?.baseURL ?? activeProviderBaseURL);
+    const matched = relayAccounts.filter((account) =>
+      (stationID !== "" && account.stationID === stationID)
+      || (origin !== "" && stationOriginKey(account.origin) === origin));
+    const justSignedIn = signedInAccountID
+      ? relayAccounts.find((account) => account.id === signedInAccountID)
+      : undefined;
+    if (justSignedIn && !matched.some((account) => account.id === justSignedIn.id)) matched.push(justSignedIn);
+    const priority = (account: RelayAccount): number => account.id === signedInAccountID ? 0 : relayAccountSignedIn(account) ? 1 : 2;
+    return matched.sort((left, right) => priority(left) - priority(right) || stationAccountName(left).localeCompare(stationAccountName(right)));
+  }, [activeProviderBaseURL, relayAccounts, signedInAccountID, stationForProvider]);
+  const selectableAccounts = useMemo(() => stationAccounts.filter(relayAccountSignedIn), [stationAccounts]);
+  // A fresh sign-in selects the account it landed on; otherwise the selection
+  // stays where the user put it, and falls back only when the row it named is
+  // gone.  The ref makes the sign-in a one-time instruction, so a later
+  // snapshot cannot pull the choice back from the user.
+  useEffect(() => {
+    if (signedInAccountID && appliedSignedInAccount.current !== signedInAccountID
+      && selectableAccounts.some((account) => account.id === signedInAccountID)) {
+      appliedSignedInAccount.current = signedInAccountID;
+      setSelectedAccountID(signedInAccountID);
+      return;
+    }
+    setSelectedAccountID((current) => (current !== "" && selectableAccounts.some((account) => account.id === current))
+      ? current
+      : selectableAccounts[0]?.id ?? "");
+  }, [signedInAccountID, selectableAccounts]);
+  // One account at a time: choosing an account is what scopes the key list, and
+  // adding one is the other action.  Only accounts that can actually serve keys
+  // are choices — a signed-out row cannot, so listing it beside the real ones
+  // was the wall of 未登录 the step kept drawing.  Signing such an account in
+  // is the empty state's own action (and the account pane's), not a key source.
+  const selectedStationAccount = selectableAccounts.find((account) => account.id === selectedAccountID) ?? selectableAccounts[0];
+  const accountPickerLabels = selectableAccounts.map((account) => `${stationAccountName(account)} · ${translate("providers.authStatusSignedIn")}`);
+  const selectedAccountPickerLabel = selectedStationAccount
+    ? accountPickerLabels[selectableAccounts.findIndex((account) => account.id === selectedStationAccount.id)] ?? accountPickerLabels[0] ?? ""
+    : "";
+  // The selected account's keys, and only its keys: a provider is bound to the
+  // station, so switching accounts is how its other keys are reached.  An
+  // account the station refused is not offered its stale key list.
   const providedChoices = useMemo(() => {
-    const scoped = signedInAccountID
-      ? relaySources.filter((source) => source.accountID === signedInAccountID)
-      : stationForProvider
-        ? relaySources.filter((source) => stationOriginKey(source.baseURL) === stationOriginKey(stationForProvider.baseURL))
-        : [];
-    return scoped.filter((source) => source.enabled);
-  }, [relaySources, signedInAccountID, stationForProvider]);
-  const signedInAccountLabel = useMemo(() => {
-    if (!activeRelayAccount) return "";
-    const name = stringValue(activeRelayAccount.username) || stringValue(activeRelayAccount.label) || activeRelayAccount.id;
-    return `${name} · ${translate(activeRelayAccount.loginStatus === "signed_in" ? "providers.authStatusSignedIn" : "providers.authStatusSignedOut")}`;
-  }, [activeRelayAccount, translate]);
+    if (!selectedStationAccount || !relayAccountSignedIn(selectedStationAccount)) return [];
+    return relaySources.filter((source) => source.enabled && source.accountID === selectedStationAccount.id);
+  }, [relaySources, selectedStationAccount]);
+  // What the empty list says: an empty station is not a failed read, and a
+  // session that lapsed is not an empty station.  This is the one sentence the
+  // step has room for, so it names the fact that explains the list.
+  const emptyKeysHint = ((): TranslationKey => {
+    if (!selectedStationAccount) return "providers.wizard.loginFirstHint";
+    if (selectedStationAccount.resourceError === "login_expired") return "providers.wizard.loginExpiredHint";
+    if (!relayAccountSignedIn(selectedStationAccount)) return "providers.wizard.loginFirstHint";
+    if (selectedStationAccount.resourceError === "unavailable") return "relay.resourcesUnavailable";
+    if (selectedStationAccount.resourceError === "no_models") return "providers.wizard.loginNoModelsHint";
+    if (selectedStationAccount.resourceStatus === "idle") return "relay.resourcesNotLoaded";
+    return "providers.wizard.loginNoKeysHint";
+  })();
   const keyChoices = selectedProvider ? providerKeyChoices(selectedProvider, relaySources, activeProviderBaseURL) : [];
   const keyOptions = [
     { value: PROVIDER_WIZARD_NEW_KEY, label: translate("providers.wizard.addApiKey") },
@@ -5143,7 +5205,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       const existingAccounts = signInAnother
         ? relayAccounts.filter((item) => stationOriginKey(item.origin) === stationOriginKey(candidate))
         : accountsFromSnapshot((await relay.refreshAccounts()) ?? undefined).filter((item) => stationOriginKey(item.origin) === stationOriginKey(candidate));
-      const reusable = signInAnother ? undefined : existingAccounts.find((item) => item.loginStatus === "signed_in");
+      const reusable = signInAnother ? undefined : existingAccounts.find(relayAccountSignedIn);
       if (reusable) {
         setSignedInAccountID(reusable.id);
         setLoginBusy(false);
@@ -5201,8 +5263,20 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         ?? accounts.find((item) => item.id === pendingID);
       const landedID = landed?.id ?? pendingID;
       const status = await relay.refreshResources(landedID, { force: true });
-      if (status !== "ready") setLoginFeedbackMessage(translate("relay.loginResourcesUnavailable"));
+      // The read's status says whether the station answered, while the account
+      // says *what* it answered: zero keys is a successful sign-in with an
+      // empty station, not a failed resource read.  Reading the account back is
+      // what lets those two cases say different things.
+      const refreshedSnapshot = await relay.refreshAccounts().catch(() => undefined);
+      const refreshed = refreshedSnapshot ? accountsFromSnapshot(refreshedSnapshot).find((item) => item.id === landedID) : undefined;
+      const resourceError = refreshed?.resourceError ?? "none";
+      if (resourceError === "login_expired") setLoginFeedbackMessage(translate("relay.loginSessionExpired"));
+      else if (status !== "ready" && resourceError === "unavailable") setLoginFeedbackMessage(translate("relay.loginResourcesUnavailable"));
       else setLoginFeedbackMessage(translate("relay.loginComplete"));
+      // The post-login choice may have turned 自动分组 on.  The refresh above is
+      // the read that layout needs, so this is the moment to stage it; the
+      // pane's next Apply settles it with the station.
+      if (refreshed?.autoGrouping) await relay.apiKeyActions?.alignAutoGrouping?.(landedID).catch(() => undefined);
       // Bind the vendor to the station so its keys become linkable.
       const boundAccount = accounts.find((item) => stationOriginKey(item.origin) === target);
       const stationID = landed?.stationID ?? boundAccount?.stationID
@@ -5216,6 +5290,19 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       if (request === setupLoginRequest.current) setLoginFeedbackMessage(translate("relay.operationFailed"));
     } finally {
       if (request === setupLoginRequest.current) setLoginBusy(false);
+    }
+  };
+  const refreshStationResources = async (): Promise<void> => {
+    if (resourcesBusy || !selectedStationAccount) return;
+    setResourcesBusy(true);
+    try {
+      await relay.refreshResources(selectedStationAccount.id, { force: true });
+      await relay.refreshAccounts();
+      setLoginFeedbackMessage(undefined);
+    } catch {
+      setLoginFeedbackMessage(translate("relay.resourcesUnavailable"));
+    } finally {
+      setResourcesBusy(false);
     }
   };
   const cancelRelaySignIn = (): void => {
@@ -5610,10 +5697,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // The origin the sign-in window is showing, so the waiting panel names the
   // site the person is looking at in the other window.
   const relayLoginStation = normalizeRelayOrigin(activeProviderBaseURL) || activeProviderBaseURL.trim();
-  const wizardBusy = busy || processing || loginBusy;
+  const wizardBusy = busy || processing || loginBusy || resourcesBusy;
   return <View style={styles.providerWizardSurface} accessibilityViewIsModal>
     <View style={styles.providerWizardSetupContent}>
-      <View style={[styles.providerWizardSetupSurface, (step === "model" || (step === "keys" && providedChoices.length > 0)) && styles.providerWizardSetupSurfaceFill]}>
+      <View style={[styles.providerWizardSetupSurface, (step === "model" || (step === "keys" && keyPath === "login")) && styles.providerWizardSetupSurfaceFill]}>
         {/* The progress rail already names the wizard, and its active step
             names what this window is configuring: a title restating that plus
             a sentence about the steps the rail itself draws is the redundant
@@ -5652,7 +5739,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           {providerMode === "new" && isOurFreeModelType ? <Text style={styles.providerWizardHint}>{translate("providers.wizard.ourFreeModelHint")}</Text> : null}
           {providerMode === "existing" && selectedProvider ? <Text numberOfLines={1} style={styles.providerWizardHint}>{activeProviderBaseURL || translate("common.notAvailable")}</Text> : null}
         </View> : null}
-        {step === "keys" ? <View style={styles.providerWizardFormSection}>
+        {step === "keys" ? <View style={keyPath === "login" ? styles.providerWizardKeyFormSection : styles.providerWizardFormSection}>
           {/* The hint names what this step is about: the key, not the provider. */}
           <View style={styles.providerWizardSectionHeader}><Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.stepKeys")}</Text><Text numberOfLines={1} style={styles.providerWizardHint}>{selectedProviderName}</Text></View>
           {isOfficialLoginType && keyPath === "login" ? <>
@@ -5669,41 +5756,64 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
             {providerType === "api" ? <NativeFormRow label={translate("providers.wizard.keyPath")}>
               <NativeSegmentedControl labels={[translate("providers.wizard.pathManual"), translate("providers.wizard.pathLogin")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathLogin") : translate("providers.wizard.pathManual")} disabled={wizardBusy} onChange={({ nativeEvent }) => { setKeyPath(nativeEvent.index === 1 ? "login" : "manual"); setValidation(""); }} style={styles.providerWizardModeControl} />
             </NativeFormRow> : null}
-            {keyPath === "login" ? <>
-              {/* Whose keys these are, and the way to a second account.  The
-                  list below only appears once a sign-in has produced keys, so
-                  before this row the step offered no way to sign in anyone
-                  else — and no way to add a second account to one station. */}
-              <View style={styles.providerWizardAuthRow}>
-                <Text numberOfLines={1} style={styles.providerWizardAuthStatus}>{translate("providers.authAccount")}: {signedInAccountLabel || translate("providers.authStatusSignedOut")}</Text>
-                <NativeButton title={translate("relay.loginAnotherAccount")} compact busy={loginBusy} disabled={(wizardBusy && !loginBusy) || !activeProviderBaseURL.trim()} onPress={() => { void beginRelayLogin(true); }} />
-              </View>
-              {providedChoices.length > 0 ? <>
-                <Text style={styles.providerWizardHint}>{translate("providers.wizard.providedKeysHint", { count: providedChoices.length })}</Text>
-                {/* One key goes on to become the provider's, so the choice is a
-                    radio list, and it is the one list on this step that can be
-                    longer than the window: a plain View drew nineteen rows with
-                    no way to reach the ones below the fold. */}
-                <View style={styles.providerWizardModelListFrame}><PersistentScrollView style={styles.providerWizardModelListScroll} contentContainerStyle={styles.providerWizardModelList} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">
-                  {providedChoices.map((source) => {
-                    const value = `relay:${relaySourceSelectionID(source)}`;
-                    return <NativeRadio
-                      key={value}
-                      label={relaySourceName(source) || source.resourceLabel}
-                      value={(selectedProvidedChoice && `relay:${relaySourceSelectionID(selectedProvidedChoice)}`) === value}
+            {keyPath === "login" ? <View style={styles.providerWizardKeyPane}>
+              <View style={styles.providerWizardKeySection}>
+                {/* One account is selected, or one is added.  Listing every
+                    account made the step read as a wall of names, and the key
+                    list beneath it as somebody else's keys; a picker states
+                    both accounts in the only place the choice is made. */}
+                {selectedStationAccount ? <View style={styles.providerWizardAccountRow}>
+                  <View style={styles.providerWizardAccountList}>
+                    {selectableAccounts.length > 1 ? <NativePicker
+                      labels={accountPickerLabels}
+                      selectedValue={selectedAccountPickerLabel}
                       disabled={wizardBusy}
-                      onValueChange={() => setProvidedKeySelection(value)}
-                      style={styles.providerWizardModelCheckbox}
-                    />;
-                  })}
-                </PersistentScrollView></View>
-              </> : <>
-                {/* The row above already says whether anyone is signed in, so
-                    this states only what the press will do. */}
-                <Text style={styles.providerWizardHint}>{activeRelayAccount ? translate("relay.resourcesNotLoaded") : translate("providers.wizard.loginFirstHint")}</Text>
-                <NativeButton title={translate("relay.login")} primary compact busy={loginBusy} disabled={(wizardBusy && !loginBusy) || !activeProviderBaseURL.trim()} onPress={() => { void beginRelayLogin(); }} />
-              </>}
-            </> : <>
+                      accessibilityLabel={translate("providers.authAccount")}
+                      onChange={({ nativeEvent }) => {
+                        const account = selectableAccounts[nativeEvent.index];
+                        if (!account) return;
+                        setSelectedAccountID(account.id);
+                        setProvidedKeySelection("");
+                      }}
+                      style={styles.providerWizardPicker}
+                    /> : <Text numberOfLines={1} style={styles.providerWizardAccountLine}>{translate("providers.authAccount")}: {stationAccountName(selectedStationAccount)}</Text>}
+                    <Text numberOfLines={1} style={styles.providerWizardAccountLine}>{translate("providers.authStatusSignedIn")}{selectedStationAccount.balance === null ? "" : ` · $${selectedStationAccount.balance.toFixed(2)}`}</Text>
+                  </View>
+                  <View style={styles.providerWizardAccountActions}>
+                    <NativeButton title={translate("relay.refreshResources")} compact busy={resourcesBusy} disabled={(wizardBusy && !resourcesBusy) || !activeProviderBaseURL.trim()} onPress={() => { void refreshStationResources(); }} />
+                    <NativeButton title={translate("relay.loginAnotherAccount")} compact busy={loginBusy} disabled={(wizardBusy && !loginBusy) || !activeProviderBaseURL.trim()} onPress={() => { void beginRelayLogin(true); }} />
+                  </View>
+                </View> : null}
+                {providedChoices.length > 0 ? <>
+                  <Text style={styles.providerWizardHint}>{translate("providers.wizard.providedKeysHint", { count: providedChoices.length })}</Text>
+                  {/* One key goes on to become the provider's, so the choice is
+                      a radio list of this account's keys.  The account is the
+                      row above, so the rows carry the group and rate, not the
+                      address repeated 34 times. */}
+                  <View style={styles.providerWizardKeyListGroup}><View style={styles.providerWizardModelListFrame}><PersistentScrollView style={styles.providerWizardModelListScroll} contentContainerStyle={styles.providerWizardModelList} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">
+                    {providedChoices.map((source) => {
+                      const value = `relay:${relaySourceSelectionID(source)}`;
+                      const multiplier = Number.isFinite(source.multiplier) ? ` (${multiplierSpelling(source.multiplier as number)})` : "";
+                      return <NativeRadio
+                        key={value}
+                        label={`${source.resourceLabel || relaySourceName(source)}${multiplier}`}
+                        value={(selectedProvidedChoice && `relay:${relaySourceSelectionID(selectedProvidedChoice)}`) === value}
+                        disabled={wizardBusy}
+                        onValueChange={() => setProvidedKeySelection(value)}
+                        style={styles.providerWizardModelCheckbox}
+                      />;
+                    })}
+                  </PersistentScrollView></View></View>
+                </> : <View style={styles.providerWizardKeyEmpty}>
+                  {/* An empty station is not a failed read: the sentence says
+                      which of the two this is.  With no usable account the
+                      card carries the one action that changes that state, so
+                      the step never shows an unusable account as a choice. */}
+                  <Text style={styles.providerWizardKeyEmptyText}>{translate(emptyKeysHint)}</Text>
+                  {selectedStationAccount ? null : <NativeButton title={translate("relay.login")} primary compact busy={loginBusy} disabled={(wizardBusy && !loginBusy) || !activeProviderBaseURL.trim()} onPress={() => { void beginRelayLogin(true); }} />}
+                </View>}
+              </View>
+            </View> : <>
               <NativeFormRow required label={translate("providers.wizard.selectApiKey")}><NativePicker labels={keyPickerLabels} selectedValue={selectedKeyPickerLabel} disabled={wizardBusy} accessibilityLabel={translate("providers.wizard.selectApiKey")} onChange={({ nativeEvent }) => { const option = keyOptions[nativeEvent.index]; if (!option) return; setKeySelection(option.value); resetStagedKeyField(); setKeyName(""); setValidation(""); }} style={styles.providerWizardPicker} /></NativeFormRow>
               {activeKeySelection === PROVIDER_WIZARD_NEW_KEY ? <>
                 <NativeFormRow required label={translate("providers.wizard.apiKeyName")}><NativeTextField value={keyName} placeholder={translate("providers.wizard.apiKeyNamePlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={setKeyName} accessibilityLabel={translate("providers.wizard.apiKeyName")} style={styles.providerWizardInput} /></NativeFormRow>
@@ -9347,8 +9457,19 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
         ?? accounts.find((item) => item.id === pendingID);
       // Resource discovery is reported, not assumed: the sign-in succeeded
       // either way, but a station whose keys could not be read says so instead
-      // of claiming 登录成功 over an empty key list.
+      // of claiming 登录成功 over an empty key list.  An empty key list is not
+      // that failure: the station answered, so the account's own error says
+      // which case this is.
       const resourceStatus = await relay.refreshResources(landed?.id ?? pendingID, { force: true });
+      const refreshedSnapshot = await relay.refreshAccounts().catch(() => undefined);
+      const refreshed = refreshedSnapshot
+        ? accountsFromSnapshot(refreshedSnapshot).find((item) => item.id === (landed?.id ?? pendingID))
+        : undefined;
+      const resourceError = refreshed?.resourceError ?? "none";
+      if (resourceError === "login_expired") onStatus?.(translate("relay.loginSessionExpired"));
+      else if (resourceStatus !== "ready" && resourceError === "unavailable") onStatus?.(translate("relay.loginResourcesUnavailable"));
+      else onStatus?.(translate("relay.loginComplete"));
+      if (refreshed?.autoGrouping) await relay.apiKeyActions?.alignAutoGrouping?.(refreshed.id).catch(() => undefined);
       // Bind this vendor to the station it just signed in to, the way the
       // wizard binds the vendor it creates: that is what makes the station's
       // keys linkable here, and it is why the pane does not depend on the
@@ -15539,7 +15660,7 @@ const styles = StyleSheet.create({
   // on one x and both rows start on the field labels' own x.
   settingsActionRow: { minHeight: 36, flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 4, paddingLeft: SETTINGS_FIELD_LEAD }, settingsActionRowCopy: { flex: 1, minWidth: 0, gap: 1 }, settingsActionRowTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE }, settingsActionRowFacts: { flexDirection: "row", alignItems: "center", flexWrap: "wrap", gap: 12 }, settingsActionRowFact: { flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }, settingsActionRowFactFailed: { color: systemColors.red }, settingsActionRowNote: { flexShrink: 0, color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE }, settingsActionRowAction: { flexShrink: 0 },
   generalScroll: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, generalServiceAction: { minWidth: 72 }, generalWebAddress: { flex: 1, minWidth: 0 }, generalWebAddressText: { color: systemColors.link }, providerToolbar: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, toolbarSpacer: { flex: 1 }, windowTabsRow: { flex: 1, minWidth: 0, height: 28, flexDirection: "row", alignItems: "center", gap: 8 }, windowTabsToolbarRow: { flex: 1, minWidth: 0, width: "100%", height: 24, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 6, overflow: "hidden" }, windowTabs: { width: 224, height: 24 }, windowTabsWithActions: { flexShrink: 1 }, windowTabsActions: { flex: 1, minWidth: 0, maxWidth: 400, marginLeft: "auto", flexShrink: 0 },
-  providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceFill: { flex: 1, minHeight: 0 }, providerWizardSignInPanel: { width: "100%", minHeight: 160, justifyContent: "center", gap: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, backgroundColor: systemColors.control, paddingHorizontal: 16, paddingVertical: 18 }, providerWizardAuthRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAuthStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE },
+  providerWizardSetupContent: { flex: 1, minHeight: 0, justifyContent: "flex-start", alignItems: "center", paddingHorizontal: 24, paddingTop: 18, paddingBottom: 12 }, providerWizardSetupSurface: { width: "100%", maxWidth: 520, minWidth: 0, gap: 12 }, providerWizardSetupSurfaceFill: { flex: 1, minHeight: 0 }, providerWizardSignInPanel: { width: "100%", minHeight: 160, justifyContent: "center", gap: 8, borderWidth: 1, borderColor: systemColors.separator, borderRadius: 7, backgroundColor: systemColors.control, paddingHorizontal: 16, paddingVertical: 18 }, providerWizardAuthRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAuthStatus: { flex: 1, minWidth: 0, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, providerWizardKeyPane: { flex: 1, minHeight: 0, width: "100%", paddingBottom: 8 }, providerWizardKeySection: { flex: 1, minHeight: 0, width: "100%", gap: 10 }, providerWizardAccountRow: { minHeight: 30, flexDirection: "row", alignItems: "center", gap: 8 }, providerWizardAccountList: { flex: 1, minWidth: 0, gap: 1 }, providerWizardAccountLine: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, providerWizardAccountActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardKeyListGroup: { flex: 1, minHeight: 0, width: "100%" }, providerWizardKeyEmpty: { flex: 1, minHeight: 120, width: "100%", borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.textBackground, alignItems: "center", justifyContent: "center", gap: 12, paddingHorizontal: 24, paddingVertical: 16 }, providerWizardKeyEmptyText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 18, textAlign: "center" },
   providerMiddlePane: { flex: 1, minWidth: 0, gap: 6 }, // The empty pane reads as the top of a list that has no rows yet, not as a
   // poster centred in a large window: it keeps the column's width and the
   // window's whole height (a `flex: 1` the sibling panes rely on), but packs its
@@ -15564,7 +15685,7 @@ const styles = StyleSheet.create({
   // then 状态 and the session action, wrapping before anything overlaps.
   accountEditor: { minWidth: 0, gap: 5 },
   fieldRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" },
-  providerWizardSectionHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardPanelTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardFormSection: { width: "100%", maxWidth: 520, minHeight: 0, paddingVertical: 0, gap: 10 }, providerWizardModelFormSection: { flex: 1, minHeight: 0, width: "100%", maxWidth: 520, paddingVertical: 0, gap: 10 }, // The model step scrolls in exactly one place: the roster box.  The step body is an
+  providerWizardSectionHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerWizardPanelTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerWizardFormSection: { width: "100%", maxWidth: 520, minHeight: 0, paddingVertical: 0, gap: 10 }, providerWizardKeyFormSection: { flex: 1, minHeight: 0, width: "100%", maxWidth: 520, paddingVertical: 0, gap: 10 }, providerWizardModelFormSection: { flex: 1, minHeight: 0, width: "100%", maxWidth: 520, paddingVertical: 0, gap: 10 }, // The model step scrolls in exactly one place: the roster box.  The step body is an
  // ordinary column, so the pane can never grow a second scroller beside the list.
  providerWizardModelPane: { flex: 1, minHeight: 0, width: "100%", justifyContent: "flex-start", paddingBottom: 8 }, // One row, so the state sentence is the part that gives way: it shrinks and
   // ellipsizes, while the controls beside it keep the width their labels need.

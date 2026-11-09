@@ -1285,7 +1285,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         """
 
         wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
-        self.assertIn('<NativeRadio\n                      key={value}', wizard)
+        self.assertIn('key={value}', wizard)
+        self.assertIn('onValueChange={() => setProvidedKeySelection(value)}', wizard)
         self.assertIn('<PersistentScrollView style={styles.providerWizardModelListScroll} contentContainerStyle={styles.providerWizardModelList} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">', wizard)
         # The control itself is a radio to a screen reader, and a radio is what
         # the drawn box says.
@@ -1309,26 +1310,40 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("setSignedInAccountID(landedID);", wizard)
         self.assertNotIn("relay.refreshResources(pendingID", wizard)
 
-    def test_the_login_step_names_the_account_the_station_already_has(self) -> None:
-        """账号: 未登录 cannot sit above a 已登录 row for the same station.
+    def test_the_login_step_chooses_an_account_or_adds_one(self) -> None:
+        """One account is selected, or one is added: never a wall of 未登录.
 
         The step read only the id *this run* had signed in, so opening it for a
-        station whose account the pane behind it listed as 已登录 printed
-        未登录, and 登录 then asked for a sign-in that was already done.
+        station whose accounts the pane behind it listed as 已登录 printed one
+        address — and when a sign-in had just landed it listed only that
+        account's keys.  Listing every account under that correction was the
+        other failure: a signed-out row read as a key source.  The choices are
+        the accounts that can serve keys; with none, the step offers the one
+        action that changes that state.
         """
 
         wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
-        self.assertIn("const stationSignedInAccount = useMemo(() => {", wizard)
-        self.assertIn('item.loginStatus === "signed_in"', wizard)
-        self.assertIn("const activeRelayAccount = useMemo(", wizard)
-        self.assertIn("relayAccounts.find((item) => item.id === signedInAccountID) ?? stationSignedInAccount", wizard)
-        # The label and the hint follow that account, not the run's own id.
-        # The label is built one level up, where the snapshot lives.
-        self.assertIn('if (!activeRelayAccount) return "";', self.ui)
-        self.assertIn(
-            '{activeRelayAccount ? translate("relay.resourcesNotLoaded") : translate("providers.wizard.loginFirstHint")}',
-            wizard,
-        )
+        self.assertIn("const stationAccounts = useMemo(() => {", wizard)
+        self.assertIn("const priority = (account: RelayAccount): number =>", wizard)
+        self.assertIn("relayAccountSignedIn(account) ? 1 : 2", wizard)
+        # The choices are usable accounts, not every row the station has.
+        self.assertIn("const selectableAccounts = useMemo(() => stationAccounts.filter(relayAccountSignedIn), [stationAccounts]);", wizard)
+        self.assertIn("const selectedStationAccount = selectableAccounts.find((account) => account.id === selectedAccountID) ?? selectableAccounts[0];", wizard)
+        self.assertIn("labels={accountPickerLabels}", wizard)
+        self.assertIn("selectableAccounts.length > 1 ? <NativePicker", wizard)
+        self.assertIn("const account = selectableAccounts[nativeEvent.index];", wizard)
+        self.assertIn("{selectedStationAccount ? <View style={styles.providerWizardAccountRow}>", wizard)
+        # With no usable account the card carries 登录 instead of a row of
+        # names that cannot serve a key.
+        self.assertIn('selectedStationAccount ? null : <NativeButton title={translate("relay.login")} primary compact', wizard)
+        # The empty statement names the fact that explains it instead of
+        # claiming the read failed.
+        self.assertIn("const emptyKeysHint = ((): TranslationKey => {", wizard)
+        self.assertIn('if (!selectedStationAccount) return "providers.wizard.loginFirstHint";', wizard)
+        self.assertIn("{translate(emptyKeysHint)}", wizard)
+        # The run's own id is a priority, not the scope of the list.
+        self.assertNotIn("activeRelayAccount", wizard)
+        self.assertNotIn("signedInAccountLabel", wizard)
         # And the reuse decision reads the account list it is deciding about,
         # because this window's snapshot can predate the pane behind it.
         self.assertIn("accountsFromSnapshot((await relay.refreshAccounts()) ?? undefined)", wizard)
@@ -1336,6 +1351,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'if (step !== "keys" || keyPath !== "login" || isOfficialLoginType) return;',
             wizard,
         )
+        zh = (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8")
+        en = (ROOT / "rn/packages/shared/src/i18n/en.ts").read_text(encoding="utf-8")
+        for key in ("providers.wizard.loginNoKeysHint", "providers.wizard.loginNoModelsHint", "providers.wizard.loginExpiredHint"):
+            self.assertIn(f'"{key}"', zh)
+            self.assertIn(f'"{key}"', en)
 
     def test_the_login_step_can_sign_in_a_second_account(self) -> None:
         """A station with an account already signed in still offers another.
@@ -1345,12 +1365,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
         after the first account the step had no way to add a second one.
         """
 
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
         self.assert_ui_has('const beginRelayLogin = async (signInAnother = false): Promise<void> => {')
-        self.assert_ui_has('const reusable = signInAnother ? undefined : existingAccounts.find((item) => item.loginStatus === "signed_in");')
-        self.assert_ui_has('translate("relay.loginAnotherAccount")')
+        self.assert_ui_has('const reusable = signInAnother ? undefined : existingAccounts.find(relayAccountSignedIn);')
         self.assert_ui_has('onPress={() => { void beginRelayLogin(true); }}')
-        # The step states whose keys these are before it lists them.
-        self.assert_ui_has('{translate("providers.authAccount")}: {signedInAccountLabel || translate("providers.authStatusSignedOut")}')
+        # Adding one is the row's own action; the 登录 the empty state carries
+        # is not shown beside an account that is already usable.
+        self.assertIn('title={translate("relay.loginAnotherAccount")}', wizard)
+        # Two accounts are a picker, not a wall of rows; the key list belongs
+        # to the selected account.
+        self.assert_ui_has('labels={accountPickerLabels}')
+        self.assert_ui_has('source.accountID === selectedStationAccount.id')
+        self.assert_ui_has('label={`${source.resourceLabel || relaySourceName(source)}${multiplier}`}')
         zh = (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8")
         en = (ROOT / "rn/packages/shared/src/i18n/en.ts").read_text(encoding="utf-8")
         self.assertIn('"relay.loginAnotherAccount": "登录新账号",', zh)
@@ -7796,7 +7822,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('grouped.set(key.id, { label: modelProviderKeyLabel(item, provider ?? {}, translate, undefined, relaySources), models: [item] });', self.ui)
         self.assertIn('modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources, providerCredentials(entry.provider, translate)), order],', self.ui)
         self.assertIn('const sourceName = relaySourceName(choice.source) || name;', self.ui)
-        self.assertIn('label={relaySourceName(source) || source.resourceLabel}', self.ui)
+        self.assertIn('label={`${source.resourceLabel || relaySourceName(source)}${multiplier}`}', self.ui)
+        # The account is the selected row, so the key list is that account's.
+        self.assertIn('source.accountID === selectedStationAccount.id', self.ui)
         self.assertIn('label: remoteDelete.label', self.ui)
         # The relay key table already composes the same label from the account.
         self.assertIn('label: `${accountKeyPrefix(account, translate)}/${resourceGroupName(resource, account.groups, translate)}`', self.relay)
@@ -8298,7 +8326,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # station read it actually got.
         self.assert_ui_has('const resourceStatus = await relay.refreshResources(landed?.id ?? pendingID, { force: true });')
         self.assert_ui_has('const bound = await dispatchWithOutcome("provider.select_relay_station", { provider_id: id, station_id: stationID });')
-        self.assert_ui_has('onStatus?.(translate(resourceStatus === "ready" ? "relay.loginComplete" : "relay.loginResourcesUnavailable"));')
+        self.assert_ui_has('const refreshedSnapshot = await relay.refreshAccounts().catch(() => undefined);')
+        self.assert_ui_has('if (resourceError === "login_expired") onStatus?.(translate("relay.loginSessionExpired"));')
+        self.assert_ui_has('else if (resourceStatus !== "ready" && resourceError === "unavailable") onStatus?.(translate("relay.loginResourcesUnavailable"));')
+        self.assert_ui_has('else onStatus?.(translate("relay.loginComplete"));')
         # An address that cannot bind because its station name is taken says so
         # instead of looking like a lost keystroke.
         self.assert_ui_has('onStatus?.(translate("providers.relayNameTaken", { name: nextStation.name }));')
