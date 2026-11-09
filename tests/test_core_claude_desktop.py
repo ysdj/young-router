@@ -481,6 +481,160 @@ class ClaudeDesktopConfigTests(unittest.TestCase):
             # A public-name entry nobody wrote is not invented beside them.
             self.assertNotIn("gpt-6.1-sol", settings)
 
+    def test_adopting_the_local_api_launches_the_id_the_picker_names(self) -> None:
+        # A client pointed at this proxy has to name a route the way this app
+        # publishes it.  The public name is not that name: a gateway id has no
+        # catalogue entry in the client, so a session launched with it answers
+        # the client's 200k default and drops the effort ladder, however wide
+        # the route is.  The picker id is what the row -- and its
+        # ``autoCompactWindow`` and ``behavesAs`` -- is keyed by, so the launch
+        # spelling is the row's own.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(desktop_root, {})
+            _write_runtime_config(
+                root / "config.yaml",
+                {"gpt-6.1-sol": 500_000, "kimi-k3.1-pro": 1_000_000},
+            )
+            domain = ClaudeSettingsDomain(
+                root / "settings.json",
+                desktop_config_library_path=desktop_root,
+                runtime_config_path=root / "config.yaml",
+                runtime_root=root,
+            )
+            public = ["gpt-6.1-sol", "kimi-k3.1-pro"]
+            rows = [
+                {"id": "gpt-6.1-sol", "max_input_tokens": 500_000},
+                {"id": "kimi-k3.1-pro", "max_input_tokens": 1_000_000},
+            ]
+            one_million = f"{alias_claude_desktop('kimi-k3.1-pro')}[1m]"
+            half_million = alias_claude_desktop("gpt-6.1-sol")
+            with (
+                mock.patch.object(domain, "_public_models", return_value=public),
+                mock.patch.object(domain, "_public_model_rows", return_value=rows),
+                mock.patch(
+                    "young_router.core.domains._shared_api.endpoint",
+                    return_value=("http://127.0.0.1:4100/v1", "sk-local"),
+                ),
+            ):
+                domain.dispatch("claude.models.set", {"client": "claudeCode", "enabled": True})
+                domain.dispatch(
+                    "use_local_api",
+                    {"client": "claudeCode", "model": "kimi-k3.1-pro", "provider": "p", "deployment_id": "d"},
+                )
+                domain.apply()
+                settings = json.loads(domain.raw_text(include_sensitive=True))
+                # One statement in both places the client reads it, and a name
+                # the file itself answers.
+                self.assertEqual(one_million, settings["env"]["ANTHROPIC_MODEL"])
+                self.assertEqual(one_million, settings["model"])
+                self.assertIn(one_million, {row["model"] for row in settings["modelPicker"]["options"]})
+
+                # A route below 1M keeps the plain id: the row states its window
+                # through ``behavesAs`` and the number under ``modelSettings``.
+                domain.dispatch(
+                    "use_local_api",
+                    {"client": "claudeCode", "model": "gpt-6.1-sol", "provider": "p", "deployment_id": "d"},
+                )
+                domain.apply()
+                settings = json.loads(domain.raw_text(include_sensitive=True))
+                self.assertEqual(half_million, settings["env"]["ANTHROPIC_MODEL"])
+                self.assertNotIn(f"{half_million}[1m]", {row["model"] for row in settings["modelPicker"]["options"]})
+
+    def test_a_refresh_moves_the_launch_model_onto_the_row_it_names(self) -> None:
+        # The list is regenerated whenever the router's routes change, and a
+        # route that moves onto (or off) the client's 1M spelling is a new id.
+        # A launch model left behind names a spelling the file no longer
+        # answers -- the session would keep the window it had, which is the
+        # 200k default for a route that is now 1M.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(desktop_root, {})
+            _write_runtime_config(root / "config.yaml", {"kimi-k3.1-pro": 1_000_000})
+            one_million = f"{alias_claude_desktop('kimi-k3.1-pro')}[1m]"
+            (root / "settings.json").write_text(
+                json.dumps(
+                    {
+                        "env": {
+                            "ANTHROPIC_BASE_URL": "http://127.0.0.1:4100",
+                            "ANTHROPIC_MODEL": "kimi-k3.1-pro",
+                        },
+                        "model": "kimi-k3.1-pro",
+                        "modelPicker": {"replaceBuiltInOptions": True, "options": []},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch(
+                "young_router.core.domains._shared_api.endpoint",
+                return_value=("http://127.0.0.1:4100/v1", "sk-local"),
+            ):
+                domain = ClaudeSettingsDomain(
+                    root / "settings.json",
+                    desktop_config_library_path=desktop_root,
+                    runtime_config_path=root / "config.yaml",
+                    runtime_root=root,
+                )
+                public = ["kimi-k3.1-pro"]
+                rows = [{"id": "kimi-k3.1-pro", "max_input_tokens": 1_000_000}]
+                with (
+                    mock.patch.object(domain, "_public_models", return_value=public),
+                    mock.patch.object(domain, "_public_model_rows", return_value=rows),
+                ):
+                    self.assertTrue(domain.refresh_model_lists())
+
+            settings = json.loads((root / "settings.json").read_text(encoding="utf-8"))
+            self.assertEqual(one_million, settings["env"]["ANTHROPIC_MODEL"])
+            self.assertEqual(one_million, settings["model"])
+
+    def test_a_refresh_leaves_a_model_this_app_does_not_serve_alone(self) -> None:
+        # ``model`` is also where a person types a deployment id or a model this
+        # router does not expose.  No row answers for it, so a refresh has
+        # nothing to say about the spelling and must not invent one.
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            desktop_root = root / "configLibrary"
+            _write_desktop_config(desktop_root, {})
+            _write_runtime_config(root / "config.yaml", {"kimi-k3.1-pro": 1_000_000})
+            (root / "settings.json").write_text(
+                json.dumps(
+                    {
+                        "env": {
+                            "ANTHROPIC_BASE_URL": "http://127.0.0.1:4100",
+                            "ANTHROPIC_MODEL": "gpt-5.4",
+                        },
+                        "model": "gpt-5.4",
+                        "modelPicker": {"replaceBuiltInOptions": True, "options": []},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch(
+                "young_router.core.domains._shared_api.endpoint",
+                return_value=("http://127.0.0.1:4100/v1", "sk-local"),
+            ):
+                domain = ClaudeSettingsDomain(
+                    root / "settings.json",
+                    desktop_config_library_path=desktop_root,
+                    runtime_config_path=root / "config.yaml",
+                    runtime_root=root,
+                )
+                with (
+                    mock.patch.object(domain, "_public_models", return_value=["kimi-k3.1-pro"]),
+                    mock.patch.object(
+                        domain,
+                        "_public_model_rows",
+                        return_value=[{"id": "kimi-k3.1-pro", "max_input_tokens": 1_000_000}],
+                    ),
+                ):
+                    domain.refresh_model_lists()
+
+            settings = json.loads((root / "settings.json").read_text(encoding="utf-8"))
+            self.assertEqual("gpt-5.4", settings["env"]["ANTHROPIC_MODEL"])
+            self.assertEqual("gpt-5.4", settings["model"])
+
     def test_claude_code_picker_keeps_a_users_own_row_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)

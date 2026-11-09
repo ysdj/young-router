@@ -1759,6 +1759,104 @@ class ClaudeSettingsDomain:
             return f"{base}{claude_aliases.CONTEXT_SUFFIX}"
         return base
 
+    def _code_route_window(self, name: str) -> object:
+        """The window this app states for one of its own routes.
+
+        ``_published_window`` first, then the ``max_input_tokens`` the app's own
+        model rows carry -- the two readings ``_code_picker`` and
+        ``_code_model_settings`` already take, kept in one place so a launch id
+        cannot be spelled from a third, wider one.
+        """
+
+        window = self._published_window(name)
+        if window is not None:
+            return window
+        for row in self._public_model_rows():
+            if str(row.get("id") or "") == name:
+                return row.get("max_input_tokens")
+        return None
+
+    def _code_published_id(self, name: str) -> str:
+        """The id this app publishes for a route, or ``name`` unchanged.
+
+        A client pointed at this proxy has to name the route the way this app
+        publishes it.  The public name is not that: a gateway id has no
+        catalogue entry in the client, so a session launched with it answers
+        the client's 200k default however wide the route is, and the row that
+        carries the window (``behavesAs`` and the ``[1m]`` name) is looked up
+        by id.  A name this router does not serve -- a deployment id, a model
+        written by hand -- comes back as it was.
+        """
+
+        raw = str(name or "").strip()
+        served = self._public_models() or []
+        if not raw or not served:
+            return name
+        stripped = claude_aliases.context_suffix_free(raw)
+        if stripped in served:
+            route = stripped
+        else:
+            resolved = claude_aliases.resolve_alias(raw, served)
+            if resolved is None:
+                return name
+            route = resolved
+        return self._code_picker_id(route, self._code_route_window(route))
+
+    def _code_launch_model_apply(
+        self,
+        candidate: dict[str, Any],
+        names: Sequence[str],
+        options: object,
+    ) -> bool:
+        """Launch the client with the id this picker names for its route.
+
+        The file names every route by the id the client sends
+        (``_code_picker_id``) and ``behavesAs`` rides on that row, so a client
+        launched with the public name has nothing to look it up by: its session
+        reports the client's 200k default and drops the Effort ladder, however
+        wide the route is.  One id space means the launch spelling is moved
+        onto the row's own id -- a 1M route is launched as ``<id>[1m]``, which
+        is the name stating the window.
+
+        Only while this client's env names this proxy (a client on another
+        provider has no row here), and only onto an id this file actually
+        names: a deployment id or a model written by hand resolves to no row
+        and stays.
+        """
+
+        env = candidate.get("env")
+        if not isinstance(env, Mapping):
+            return False
+        if not self._code_uses_local_api(candidate):
+            return False
+        rows = options if isinstance(options, list) else []
+        published = {
+            name: row["model"]
+            for name, row in zip(names, rows)
+            if isinstance(row, Mapping) and isinstance(row.get("model"), str)
+        }
+        if not published:
+            return False
+        chosen = env.get("ANTHROPIC_MODEL")
+        if not isinstance(chosen, str) or not chosen.strip():
+            chosen = candidate.get("model")
+        if not isinstance(chosen, str) or not chosen.strip():
+            return False
+        current = chosen.strip()
+        stripped = claude_aliases.context_suffix_free(current)
+        route = stripped if stripped in published else claude_aliases.resolve_alias(current, published)
+        wanted = published.get(route) if isinstance(route, str) else None
+        if not wanted or wanted == current:
+            return False
+        if isinstance(env.get("ANTHROPIC_MODEL"), str):
+            env = dict(env)
+            env["ANTHROPIC_MODEL"] = wanted
+            candidate["env"] = env
+        current_model = candidate.get("model")
+        if isinstance(current_model, str) and current_model.strip() == current:
+            candidate["model"] = wanted
+        return True
+
     def _code_picker(self, names: Sequence[str], existing: object = None) -> dict[str, Any]:
         """A picker lineup for one public-model list.
 
@@ -1930,12 +2028,16 @@ class ClaudeSettingsDomain:
         resolved = list(names) if names is not None else self._public_models()
         if not resolved:
             raise DomainError("Young Router is not running or exposes no models")
-        candidate["modelPicker"] = self._code_picker(resolved, candidate.get("modelPicker"))
+        lineup = self._code_picker(resolved, candidate.get("modelPicker"))
+        candidate["modelPicker"] = lineup
         settings = self._code_model_settings(resolved, candidate.get("modelSettings"))
         if settings:
             candidate["modelSettings"] = settings
         else:
             candidate.pop("modelSettings", None)
+        # The client's own launch model is part of this list: a session started
+        # from the public name has no row to read its window from.
+        self._code_launch_model_apply(candidate, resolved, lineup.get("options"))
         return candidate
 
     def _desktop_model_list_apply(self, enabled: bool, names: Sequence[str] | None = None) -> None:
@@ -2027,7 +2129,7 @@ class ClaudeSettingsDomain:
                     raise ClaudeSettingsError("Claude Settings contains invalid values")
                 stale = names_changed or any(
                     candidate.get(key) != self._draft.get(key)
-                    for key in ("modelPicker", "modelSettings")
+                    for key in ("modelPicker", "modelSettings", "model", "env")
                 )
                 if stale:
                     self._draft = candidate
@@ -2092,9 +2194,16 @@ class ClaudeSettingsDomain:
     def code_uses_local_api(self) -> bool:
         """True when Claude Code's own ``env`` already names this proxy."""
 
+        return self._code_uses_local_api(self._draft)
+
+    def _code_uses_local_api(self, document: Mapping[str, Any]) -> bool:
+        """The same question for a document that is still a candidate."""
+
         if not self._local_api_base_url:
             return False
-        return on_local_api(self._code_env().get("ANTHROPIC_BASE_URL"), versioned=False)
+        env = document.get("env")
+        base_url = env.get("ANTHROPIC_BASE_URL") if isinstance(env, Mapping) else None
+        return on_local_api(base_url, versioned=False)
 
     def desktop_uses_local_api(self) -> bool:
         if self._desktop is None or not self._local_api_base_url:
@@ -2383,11 +2492,20 @@ class ClaudeSettingsDomain:
             # credential and would be sent as a second identity.
             env.pop("ANTHROPIC_API_KEY", None)
             env["ANTHROPIC_AUTH_TOKEN"] = key
+            # The route is named the way this app publishes it, not by its
+            # public name: a gateway id has no catalogue entry in the client, so
+            # a session launched with the public name reports the client's 200k
+            # default and drops the effort ladder (see ``_code_published_id``).
+            # Only while the picker is this app's list is there a row to name,
+            # so a client on the proxy with its own catalogue is left as it is.
+            named = self.code_model_list_enabled()
             model = str(data.get("model") or "").strip()
             if model:
-                env["ANTHROPIC_MODEL"] = model
-                candidate["model"] = model
+                env["ANTHROPIC_MODEL"] = self._code_published_id(model) if named else model
+                candidate["model"] = env["ANTHROPIC_MODEL"]
             elif isinstance(env.get("ANTHROPIC_MODEL"), str):
+                if named:
+                    env["ANTHROPIC_MODEL"] = self._code_published_id(env["ANTHROPIC_MODEL"])
                 candidate["model"] = env["ANTHROPIC_MODEL"]
             candidate["env"] = env
             errors = validate_settings(candidate)
