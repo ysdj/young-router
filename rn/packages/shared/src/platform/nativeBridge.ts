@@ -124,6 +124,8 @@ export interface NativeLeafBridge {
     username?: string;
     /** The account's own remember-password preference, so a re-sign-in does not silently clear it. */
     rememberPassword?: boolean;
+    /** The account's own 自动分组 switch, so a re-sign-in need not ask again. */
+    autoGrouping?: boolean;
     embedded?: boolean;
     /** Pending login: Core creates the account shell only after sign-in succeeds. */
     pendingAccount?: boolean;

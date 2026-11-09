@@ -75,7 +75,7 @@ export type RelayStation = {
   linkedModelCount: number;
   pendingOperationCount: number;
 };
-export type AddedRelayAccount = Pick<RelayAccount, "id" | "type" | "label" | "origin" | "username" | "rememberPassword">;
+export type AddedRelayAccount = Pick<RelayAccount, "id" | "type" | "label" | "origin" | "username" | "rememberPassword" | "autoGrouping">;
 type AutoGroupingUpdateResult = { draftStaged: boolean };
 
 /**
@@ -950,9 +950,11 @@ export function StationAccountsPanel({
         origin: account.origin,
         language,
         username: account.username || undefined,
-        // The page's form opens on this answer; the native hosts ask after the
-        // sign-in instead, so the option is theirs to ignore.
+        // The page's form opens on this answer; the native hosts use the two
+        // stored preferences to decide whether the post-login prompt is still
+        // a question at all.
         rememberPassword: account.rememberPassword,
+        autoGrouping: account.autoGrouping,
       });
       if (!result) {
         // A cancelled or failed sign-in only surfaces as the stale brown

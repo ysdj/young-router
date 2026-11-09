@@ -1221,14 +1221,24 @@ winrt::fire_and_forget ProbeLogin(
     bool remember_password = false;
     bool auto_grouping = false;
     if (password && !password->empty() && password != state->restored_password) {
-      co_await DispatcherQueueAwaiter{dispatcher};
-      if (state->canceled.load()) co_return;
-      HideLoginDialog(state);
-      const RememberPasswordChoice remember_choice = co_await ShowRememberPasswordPrompt(state);
-      remember_password = remember_choice != RememberPasswordChoice::SessionOnly;
-      auto_grouping = remember_choice == RememberPasswordChoice::RememberAndAutoGroup;
-      if (state->canceled.load()) co_return;
-      co_await winrt::resume_background();
+      // An account that already keeps the password, or already owns its
+      // automatic layout, answered this question when the switch was turned
+      // on.  Updating a kept password is not a new decision; a session-only
+      // row (and a pending account) is the one that is asked.
+      if (state->options.remember_password_preference == true) {
+        remember_password = true;
+      } else if (state->options.auto_grouping_preference == true) {
+        remember_password = false;
+      } else {
+        co_await DispatcherQueueAwaiter{dispatcher};
+        if (state->canceled.load()) co_return;
+        HideLoginDialog(state);
+        const RememberPasswordChoice remember_choice = co_await ShowRememberPasswordPrompt(state);
+        remember_password = remember_choice != RememberPasswordChoice::SessionOnly;
+        auto_grouping = remember_choice == RememberPasswordChoice::RememberAndAutoGroup;
+        if (state->canceled.load()) co_return;
+        co_await winrt::resume_background();
+      }
     }
     auto prior_session = ReadChunkedCredential(state->options.account_id, L"session");
     auto prior_password = ReadChunkedCredential(state->options.account_id, L"password");

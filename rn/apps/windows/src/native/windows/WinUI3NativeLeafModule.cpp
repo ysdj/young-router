@@ -1044,9 +1044,16 @@ void WinUI3NativeLeafModule::RelayLogin(
   auto pending_entry = options.find("pendingAccount");
   std::optional<bool> pending_account;
   if (pending_entry != options.end()) pending_account = pending_entry->second.TryGetBoolean();
+  auto boolean = [&options](char const* name) -> std::optional<bool> {
+    auto found = options.find(name);
+    if (found == options.end()) return std::nullopt;
+    return found->second.TryGetBoolean();
+  };
+  auto remember_password = boolean("rememberPassword");
+  auto auto_grouping = boolean("autoGrouping");
   // "embedded" is a macOS sheet hint; Windows always opens its own login
   // window, so the flag is accepted and ignored here.
-  static std::set<std::string> const allowed{"accountId", "type", "label", "origin", "language", "username", "embedded", "pendingAccount", "stationId", "stationName", "stationType", "stationOrigin"};
+  static std::set<std::string> const allowed{"accountId", "type", "label", "origin", "language", "username", "embedded", "pendingAccount", "stationId", "stationName", "stationType", "stationOrigin", "rememberPassword", "autoGrouping"};
   auto station_id = field("stationId");
   auto station_name = field("stationName");
   auto station_type = field("stationType");
@@ -1086,6 +1093,8 @@ void WinUI3NativeLeafModule::RelayLogin(
   if (station_name) native_options.station_name = station_name;
   if (station_type) native_options.station_type = station_type;
   if (station_origin) native_options.station_origin = station_origin;
+  native_options.remember_password_preference = remember_password;
+  native_options.auto_grouping_preference = auto_grouping;
   // One decision surface for the whole app: the sign-in browser asks its
   // post-login question through the host's own window instead of a dialog of
   // its own.

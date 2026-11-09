@@ -1780,6 +1780,8 @@ private enum NativeRelayOriginPolicy {
         stationName: String? = nil,
         stationType: String? = nil,
         stationOrigin: String? = nil,
+        rememberPassword: Bool? = nil,
+        autoGrouping: Bool? = nil,
         completion: @escaping (CoreIPCBridge.RelayLoginResult?) -> Void
     ) {
         guard Thread.isMainThread else {
@@ -1797,6 +1799,8 @@ private enum NativeRelayOriginPolicy {
                     stationName: stationName,
                     stationType: stationType,
                     stationOrigin: stationOrigin,
+                    rememberPassword: rememberPassword,
+                    autoGrouping: autoGrouping,
                     completion: completion
                 )
             }
@@ -1860,7 +1864,9 @@ private enum NativeRelayOriginPolicy {
             stationID: stationID,
             stationName: stationName,
             stationType: stationType,
-            stationOrigin: stationOrigin
+            stationOrigin: stationOrigin,
+            rememberPasswordPreference: rememberPassword,
+            autoGroupingPreference: autoGrouping
         )
         activeRelayLoginController = controller
         controller.start { [weak self] result in
@@ -6070,6 +6076,13 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     private let stationName: String?
     private let stationType: String?
     private let stationOrigin: String?
+    /// The account's stored answers, when the caller is signing in an existing
+    /// row.  A row that already keeps the password, or already owns its
+    /// automatic layout, has answered this question; asking it again on every
+    /// sign-in is the prompt this stands down.  A pending account has neither,
+    /// so the question is still the one that sets its preference.
+    private let rememberPasswordPreference: Bool?
+    private let autoGroupingPreference: Bool?
     private var embeddedContent: NSView?
     private var embeddedCloseObserver: NSObjectProtocol?
     private let webView: WKWebView
@@ -6154,6 +6167,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         stationName: String? = nil,
         stationType: String? = nil,
         stationOrigin: String? = nil,
+        rememberPasswordPreference: Bool? = nil,
+        autoGroupingPreference: Bool? = nil,
         mode: NativeRelayBrowserMode = .login,
         handoff: NativeHandoffSignIn? = nil
     ) {
@@ -6176,6 +6191,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         self.stationName = stationName
         self.stationType = stationType
         self.stationOrigin = stationOrigin
+        self.rememberPasswordPreference = rememberPasswordPreference
+        self.autoGroupingPreference = autoGroupingPreference
 
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
@@ -7339,6 +7356,39 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             // was first saved, and asking again on a sign-in they did not type
             // would put a question in front of a form they never touched.
             if let restoredPassword, restoredPassword == capturedPassword {
+                commitVerifiedLogin(
+                    username: username,
+                    cookie: cookie,
+                    accessToken: accessToken,
+                    refreshToken: refreshToken,
+                    userID: userID,
+                    rememberPassword: nil,
+                    autoGrouping: nil,
+                    capturedPassword: nil,
+                    attempt: attempt
+                )
+                return
+            }
+            // An account that already keeps the password, or already owns its
+            // automatic layout, answered this question when it was turned on.
+            // A typed password is then not a new decision: keep the stored
+            // preference (and update the password it keeps) without a prompt.
+            // Only a session-only account — and a pending one — is asked.
+            if rememberPasswordPreference == true {
+                commitVerifiedLogin(
+                    username: username,
+                    cookie: cookie,
+                    accessToken: accessToken,
+                    refreshToken: refreshToken,
+                    userID: userID,
+                    rememberPassword: true,
+                    autoGrouping: nil,
+                    capturedPassword: capturedPassword,
+                    attempt: attempt
+                )
+                return
+            }
+            if autoGroupingPreference == true {
                 commitVerifiedLogin(
                     username: username,
                     cookie: cookie,

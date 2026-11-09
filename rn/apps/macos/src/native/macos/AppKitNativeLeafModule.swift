@@ -579,7 +579,7 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         resolver resolve: @escaping RCTPromiseResolveBlock,
         rejecter reject: @escaping RCTPromiseRejectBlock
     ) {
-        guard Set(options.keys).isSubset(of: ["accountId", "type", "label", "origin", "language", "username", "embedded", "pendingAccount", "stationId", "stationName", "stationType", "stationOrigin"]),
+        guard Set(options.keys).isSubset(of: ["accountId", "type", "label", "origin", "language", "username", "embedded", "pendingAccount", "stationId", "stationName", "stationType", "stationOrigin", "rememberPassword", "autoGrouping"]),
               let accountID = options["accountId"] as? String,
               let type = options["type"] as? String,
               let label = options["label"] as? String,
@@ -610,6 +610,26 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
             embedded = suppliedEmbedded
         } else {
             embedded = false
+        }
+        let rememberPassword: Bool?
+        if let value = options["rememberPassword"] {
+            guard let supplied = value as? Bool else {
+                reject("E_NATIVE_RELAY_INPUT", "The relay account is invalid.", nil)
+                return
+            }
+            rememberPassword = supplied
+        } else {
+            rememberPassword = nil
+        }
+        let autoGrouping: Bool?
+        if let value = options["autoGrouping"] {
+            guard let supplied = value as? Bool else {
+                reject("E_NATIVE_RELAY_INPUT", "The relay account is invalid.", nil)
+                return
+            }
+            autoGrouping = supplied
+        } else {
+            autoGrouping = nil
         }
         let pendingAccount: Bool
         if let value = options["pendingAccount"] {
@@ -647,7 +667,9 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
                 stationID: options["stationId"] as? String,
                 stationName: options["stationName"] as? String,
                 stationType: stationType,
-                stationOrigin: options["stationOrigin"] as? String
+                stationOrigin: options["stationOrigin"] as? String,
+                rememberPassword: rememberPassword,
+                autoGrouping: autoGrouping
             ) { result in
                 DispatchQueue.main.async {
                     guard let result else {

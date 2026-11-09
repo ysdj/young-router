@@ -1117,6 +1117,13 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         windows_relay = (WIN_NATIVE / "WindowsRelayLogin.cpp").read_text(encoding="utf-8")
         self.assertIn("const int answer = state->options.decide(title, message, session_only, remember, auto_group);", windows_relay)
         self.assertIn("if (answer == 2) co_return RememberPasswordChoice::RememberAndAutoGroup;", windows_relay)
+        # An existing row that already keeps the password or the automatic
+        # layout is not asked again; only a session-only row is.
+        self.assertIn("if rememberPasswordPreference == true {", leaf)
+        self.assertIn("if autoGroupingPreference == true {", leaf)
+        self.assertIn("state->options.remember_password_preference == true", windows_relay)
+        self.assertIn("state->options.auto_grouping_preference == true", windows_relay)
+        self.assertIn('"rememberPassword", "autoGrouping"', module)
         self.assertNotIn("controls::ContentDialog prompt;", windows_relay)
         self.assertIn("int WinUI3NativeLeaf::DecideRememberChoice(", windows_leaf)
         self.assertIn("native_options.decide = [leaf = leaf_](", windows_module)

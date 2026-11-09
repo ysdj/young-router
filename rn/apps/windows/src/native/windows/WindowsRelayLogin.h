@@ -21,6 +21,11 @@ struct WindowsRelayLoginOptions {
   std::optional<std::string> station_name;
   std::optional<std::string> station_type;
   std::optional<std::string> station_origin;
+  // The existing account's stored answers.  A row that already keeps the
+  // password, or already owns its automatic layout, has answered the post-login
+  // question; only a session-only row (and a pending account) is asked again.
+  std::optional<bool> remember_password_preference;
+  std::optional<bool> auto_grouping_preference;
   // The host's own decision surface: the sign-in surface asks its post-login
   // question (keep the typed password? remember it and auto-group?) through the
   // one decision window the app uses for every question, instead of a
