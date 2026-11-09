@@ -352,7 +352,6 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.routesEmptyHint": "先在某个供应商下添加模型，它会作为一条线路出现在这里。",
   "providers.emptyTitle": "添加第一个供应商",
   "providers.modelsEmpty": "还没有模型",
-  "providers.modelsEmptyHint": "用下方“抓取模型”导入，或用 ＋ 手动添加。",
   "providers.selectToEdit": "选择一个供应商、模型或路由进行编辑。",
   "providers.emptyHint": "连接一个上游供应商后，即可在漾路由中管理和路由模型。",
   "providers.newModel": "新建模型",
