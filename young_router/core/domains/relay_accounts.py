@@ -5198,6 +5198,11 @@ class RelayAccountsDomain:
             for resource in previous_resources
             if isinstance(resource, Mapping)
         }
+        # The group catalog is independent of the key list.  It is also what
+        # 自动分组 needs when the account currently holds no keys: alignment
+        # creates one key per current group, so discarding the group answer on
+        # a no_api_keys read left a checked switch with nothing to align to.
+        groups = previous_groups
         # A refresh needs usable credentials, not a fresh browser sign-in: a
         # remembered session still reads the station, and an account without
         # any session fails in the first read below with the same unavailable
@@ -5297,7 +5302,15 @@ class RelayAccountsDomain:
                 account["resources"] = resources
             else:
                 account["resources"] = previous_resources
-            account["groups"] = previous_groups
+            # no_api_keys and no_models are answers, not failed reads: the
+            # station answered the key question and the group read beside it is
+            # just as usable.  Keep the groups it stated so automatic grouping
+            # can create its one-key-per-group layout from an empty key list.
+            account["groups"] = (
+                groups
+                if resource_error in ("no_api_keys", "no_models")
+                else previous_groups
+            )
             self._accounts[index] = _private_account(account)
             if not _for_apply:
                 self._persist()

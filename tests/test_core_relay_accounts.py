@@ -4947,6 +4947,53 @@ class RelayReadPolicyTests(unittest.TestCase):
                 [resource["name"] for resource in again["resources"]],
             )
 
+    def test_auto_grouping_can_create_keys_when_the_account_has_none(self) -> None:
+        """A checked switch must align to the station's groups, not to no keys.
+
+        A no_api_keys read raises from the key-list leg, and the exception path
+        used to put the *previous* groups back and discard the group catalog the
+        same read had just fetched.  With no keys and no groups, alignment
+        returned early; the switch looked on while the station's groups never
+        received their one key each.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake = FakeRelayHTTPClient(
+                {
+                    "/api/user/models": {"data": ["gpt-test"]},
+                    "/api/token/?p=1&size=100": {"data": {"items": []}},
+                    "/api/user/self/groups": {
+                        "data": {"gpt-pro": {"ratio": 1.0}, "claude-kiro": {"ratio": 2.0}}
+                    },
+                }
+            )
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account = domain.dispatch(
+                "account.add",
+                {"type": "newapi", "label": "EMPTY", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            domain.accept_login_result(account["id"], username="person", access_token="replace-token")
+
+            refreshed = domain.refresh_resources(account["id"])
+            self.assertEqual("no_api_keys", refreshed["resource_error"])
+            self.assertEqual([], refreshed["resources"])
+            self.assertEqual({"gpt-pro", "claude-kiro"}, {group["id"] for group in refreshed["groups"]})
+
+            aligned = domain.set_auto_grouping(account["id"], True)
+            self.assertTrue(aligned["auto_grouping"])
+            self.assertEqual(
+                {"gpt-pro", "claude-kiro"},
+                {resource["group_id"] for resource in aligned["resources"]},
+            )
+            self.assertEqual(
+                {"gpt-pro", "claude-kiro"},
+                {resource["name"] for resource in aligned["resources"]},
+            )
+            self.assertEqual(
+                2,
+                sum(1 for operation in domain._pending_operations if operation["kind"] == "api_key_create"),
+            )
+
     def test_an_apply_time_read_still_reports_the_station_itself(self) -> None:
         """The read that decides "did my write land?" keeps the station's answer.
 
