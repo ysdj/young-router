@@ -706,6 +706,10 @@ class ReactNativeReleaseTests(unittest.TestCase):
         # directory, and no release call exists to put the page on GitHub.
         self.assertIn('output_dir="$ROOT/output"', page_build)
         self.assertIn('mkdir -p "$output_dir"', page_build)
+        # The destination keeps one page: the commit a host runs.  An older
+        # tarball is a page no host asks for, and leaving it would accumulate.
+        self.assertIn('for stale in "$output_dir"/web-*.tar.gz; do', page_build)
+        self.assertIn('rm -f "$stale"', page_build)
         self.assertNotIn("gh release", page_build)
 
     def test_the_page_travels_precompressed_and_without_the_editors_inline_copy(self) -> None:

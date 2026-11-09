@@ -176,6 +176,13 @@ else
 fi
 
 mkdir -p "$output_dir"
+# The destination holds the page of one commit: a host installs the page named
+# by the commit it runs, so a tarball for any other commit is an artifact
+# nothing reads.  Pruning here is also what keeps repeated builds from
+# accumulating pages nobody can install.
+for stale in "$output_dir"/web-*.tar.gz; do
+  [[ -e "$stale" && "$stale" != "$output_dir/$asset" ]] && rm -f "$stale"
+done
 mv "$work/$asset" "$output_dir/$asset"
 echo "$output_dir/$asset"
 echo "page $digest"
