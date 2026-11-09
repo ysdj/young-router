@@ -3320,6 +3320,15 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   // disabled for it is the same unexplained freeze the navigation flush used
   // to produce.
   const applyStagedQuietly = (): Promise<void> => apply({ quiet: true });
+  // The provider wizard's one create can happen before its 完成 (a relay
+  // sign-in stores the account first).  That create is applied immediately:
+  // a provider left in the closed child's draft was discarded with the window,
+  // and the station account it belonged to stayed behind with no provider row.
+  const applyProvidersQuietly = async (): Promise<boolean> => {
+    const outcome = await applyOutcome({ quiet: true });
+    if (!outcome || "cancelled" in outcome) return false;
+    return outcome.status === "applied" || outcome.status === "partial";
+  };
   // The settings shell commits as the user changes controls. Wait for the
   // route's serial dispatch queue, then apply the staged domains; the debounce
   // coalesces a burst of toggles into one Core apply. A failed apply keeps its
@@ -3931,7 +3940,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     {route === "providers-models" || route === "provider-wizard" || route === "file-editor" || route === "webdav-settings" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, (route === "provider-wizard" || route === "webdav-settings") && styles.childRouteContent, (settingsRoute || route === "runtime-settings" || route === "data-management" || route === "general-settings") && SETTINGS_PANE_ROUTE, route === "logs" && styles.logsContent]}>
     {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { native.window.open("provider-wizard"); native.window.focus("provider-wizard"); }} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
-    {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} status={result} /> : null}
+    {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} applyProviders={applyProvidersQuietly} status={result} /> : null}
     {route === "webdav-settings" ? <WebDavSettingsPanel snapshot={snapshot} busy={busy} status={dataManagementStatuses.webdav} translate={translate} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onProbe={probeWebDavDetails} onSave={saveWebDavDetails} onSync={syncWebDavAndReadState} onCompareConflict={compareWebDavConflict} onResolveConflict={resolveWebDavConflictAndReadState} onSetContentSize={(width, height) => { void native.window.setContentSize?.("webdav-settings", width, height); }} onClose={closeRoute} /> : null}
     {settingsRoute ? <AssistantSettingsWorkspace initialClient={initialClient} busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} codexRoute={codexDesignatedRoute ? { model: stringValue(codexDesignatedRoute.model), provider: stringValue(codexDesignatedRoute.provider), deployment_id: stringValue(codexDesignatedRoute.deployment_id), label: clientRouteLabel(stringValue(codexDesignatedRoute.provider), stringValue(codexDesignatedRoute.model)) } : undefined} standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} claudeClients={{ claudeCode: asRecord(claudeClients.claudeCode), claudeDesktop: asRecord(claudeClients.claudeDesktop) }} claudeModels={claudeModelRows} onClaudeUseLocalApi={(app, selection) => dispatch("use_local_api", { ...selection, client: app }, "claude")} onClaudeUseSavedModel={(app, selection) => dispatch("use_saved_model", { ...selection, client: app }, "claude")} onToggleClaudeModelList={(app, enabled) => dispatch("claude.models.set", { client: app, enabled }, "claude")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} onStatus={setResult} /> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} onStatusBar={setStatusBarControls} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
@@ -4042,7 +4051,7 @@ function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProvid
   return `${base} ${suffix}`;
 }
 
-function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayStations, busy, translate, dispatchWithOutcome, onSecretState, onStatus, onClose, onKeyToken, relay, addOfficialAccount, status }: { snapshot?: CoreSnapshot; native: NativeLeafAdapter; providers: UnknownRecord[]; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onStatus: (status?: string) => void; onClose: () => void; onKeyToken: (token: string) => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind, name?: string) => Promise<string>; /** The window's own result: a child window keeps no strip, so its footer states it. */ status?: string }): React.JSX.Element {
+function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayStations, busy, translate, dispatchWithOutcome, onSecretState, onStatus, onClose, onKeyToken, relay, addOfficialAccount, applyProviders, status }: { snapshot?: CoreSnapshot; native: NativeLeafAdapter; providers: UnknownRecord[]; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onStatus: (status?: string) => void; onClose: () => void; onKeyToken: (token: string) => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind, name?: string) => Promise<string>; /** Commit the provider this step creates before the account it belongs to is stored. */ applyProviders: () => Promise<boolean>; /** The window's own result: a child window keeps no strip, so its footer states it. */ status?: string }): React.JSX.Element {
   type WizardStep = "provider" | "keys" | "model";
   type WizardType = "api" | "openai" | "workbuddy" | "workbuddyGlobal" | "qoder" | "qoderGlobal" | "ourFreeModel" | "ourFreeModelKilo";
   const [step, setStep] = useState<WizardStep>("provider");
@@ -4051,6 +4060,14 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const [providerType, setProviderType] = useState<WizardType>("api");
   const [providerMode, setProviderMode] = useState<"new" | "existing">("new");
   const [providerSelection, setProviderSelection] = useState(PROVIDER_WIZARD_NEW_PROVIDER);
+  // A relay account is never stored without the provider it belongs to.  The
+  // native sign-in writes the account before the model step's 完成 would create
+  // the provider, so this wizard creates that provider as soon as the sign-in
+  // (or the key step showing an existing station account) needs one.  The ref
+  // is the create's identity: a second render, a retry, or 完成 must join it
+  // instead of minting a second provider for the same station.
+  const ensuredProvider = useRef("");
+  const ensuringProvider = useRef<Promise<string | undefined> | undefined>(undefined);
   const [providerName, setProviderName] = useState("");
   const [providerBaseURL, setProviderBaseURL] = useState("");
   const [typeDetection, setTypeDetection] = useState<"checking" | RelayType | "unknown" | undefined>(undefined);
@@ -4278,6 +4295,80 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     if (selectedStationAccount.resourceStatus === "idle") return "relay.resourcesNotLoaded";
     return "providers.wizard.loginNoKeysHint";
   })();
+  /**
+   * The provider this station's accounts belong to, created before the account
+   * exists.
+   *
+   * A relay sign-in is accepted by the native host before the wizard reaches
+   * 完成, while the provider is normally created on that last press.  A window
+   * closed at 密钥 therefore left a station account no provider row could
+   * reach: the account pane lists providers, and the wizard's own type
+   * detection read the missing row.  This is the one create that closes that
+   * gap; it is idempotent, binds the station in the same pass, and 完成 joins
+   * the row it made instead of minting a second one.
+   */
+  const ensureRelayProviderForStation = async (): Promise<string | undefined> => {
+    if (providerID) return providerID;
+    if (ensuredProvider.current) return ensuredProvider.current;
+    if (ensuringProvider.current) return ensuringProvider.current;
+    if (providerMode !== "new") return undefined;
+    const baseURL = providerBaseURL.trim();
+    if (!baseURL) return undefined;
+    const station = stationForProvider;
+    const targetOrigin = stationOriginKey(baseURL);
+    const existing = providers.find((entry) => {
+      const bound = stringValue(entry.relay_station_id).trim();
+      return (station !== undefined && bound === station.id)
+        || (targetOrigin !== "" && stationOriginKey(stringValue(entry.endpoint) || stringValue(entry.api_base)) === targetOrigin);
+    });
+    if (existing) {
+      const id = editorIdentifier(existing);
+      ensuredProvider.current = id;
+      setProviderMode("existing");
+      setProviderSelection(id);
+      if (station && stringValue(existing.relay_station_id).trim() !== station.id) {
+        await dispatchWithOutcome("provider.select_relay_station", { provider_id: id, station_id: station.id });
+      }
+      return id;
+    }
+    const name = uniqueProviderName(
+      providers,
+      providerName.trim() || station?.name || suggestedRelayStationName(baseURL) || baseURL,
+    );
+    ensuringProvider.current = (async () => {
+      const next = await dispatchWithOutcome("provider.add", {
+        provider: { name, api_base: baseURL, auth_kind: "api_key", enabled: true, models: [] },
+      });
+      if (!next) return undefined;
+      const records = snapshotProviderRecords(next);
+      const added = records.find((entry) => stringValue(entry.name).trim() === name)
+        ?? records.find((entry) => targetOrigin !== "" && stationOriginKey(stringValue(entry.endpoint) || stringValue(entry.api_base)) === targetOrigin);
+      if (!added) return undefined;
+      const id = editorIdentifier(added);
+      if (station) {
+        await dispatchWithOutcome("provider.select_relay_station", { provider_id: id, station_id: station.id });
+      }
+      // The child window's close discards its provider draft; the native
+      // sign-in does not.  Commit the provider (and its station binding) now,
+      // before the caller can store an account against it.
+      if (!await applyProviders()) return undefined;
+      ensuredProvider.current = id;
+      setProviderMode("existing");
+      setProviderSelection(id);
+      return id;
+    })().finally(() => { ensuringProvider.current = undefined; });
+    return ensuringProvider.current;
+  };
+  useEffect(() => {
+    // Opening 密钥 for a station that already has an account must not show it
+    // beside no provider at all.  The create needs only the station, so it is
+    // raised as the step appears, not on the first press of 登录.
+    if (step !== "keys" || keyPath !== "login" || isOfficialLoginType) return;
+    if (providerID || ensuredProvider.current) return;
+    if (!stationForProvider || stationAccounts.length === 0) return;
+    void ensureRelayProviderForStation();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, keyPath, isOfficialLoginType, providerID, stationForProvider, stationAccounts.length]);
   const keyChoices = selectedProvider ? providerKeyChoices(selectedProvider, relaySources, activeProviderBaseURL) : [];
   const keyOptions = [
     { value: PROVIDER_WIZARD_NEW_KEY, label: translate("providers.wizard.addApiKey") },
@@ -4731,6 +4822,13 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const resolveRelayType = async (): Promise<RelayType | undefined> => {
     if (typeDetection === "newapi" || typeDetection === "sub2api") return typeDetection;
     if (stationForProvider?.type) return stationForProvider.type;
+    // A station that already holds an account has answered this question:
+    // its account row carries the family the sign-in was filed under.  Probing
+    // the live site instead turned an account the user could see into
+    // 无法识别中转站类别 whenever /api/status was slow or the provider's URL was
+    // a variant of the station origin.
+    const accountType = stationAccounts.find((account) => account.type === "newapi" || account.type === "sub2api")?.type;
+    if (accountType) return accountType;
     return detectRelayType();
   };
   const addManualModel = (): void => {
@@ -5038,6 +5136,9 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
    * create itself, because the model step is where the user chose them.
    */
   const commitWizardProvider = async (): Promise<string | undefined> => {
+    // A relay sign-in already created the provider it belongs to.  完成 joins
+    // that row rather than creating a second provider for the same station.
+    if (ensuredProvider.current) return ensuredProvider.current;
     const name = providerName.trim();
     if (!name || !providerStepValid()) return undefined;
     if (isWorkBuddyType || isQoderType) {
@@ -5209,6 +5310,17 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       const existingAccounts = signInAnother
         ? relayAccounts.filter((item) => stationOriginKey(item.origin) === stationOriginKey(candidate))
         : accountsFromSnapshot((await relay.refreshAccounts()) ?? undefined).filter((item) => stationOriginKey(item.origin) === stationOriginKey(candidate));
+      // A station that already holds an account must already have a provider,
+      // even when every one of those accounts is signed out: the provider is
+      // what the pane lists, and the account is what the sign-in is about.
+      // Create it before the native flow can store another account.
+      const accountsAtStation = existingAccounts.length > 0 || stationAccounts.length > 0;
+      let targetProviderID = accountsAtStation ? await ensureRelayProviderForStation() : undefined;
+      if (accountsAtStation && !targetProviderID) {
+        setLoginBusy(false);
+        setLoginFeedbackMessage(translate("relay.operationFailed"));
+        return;
+      }
       const reusable = signInAnother ? undefined : existingAccounts.find(relayAccountSignedIn);
       if (reusable) {
         setSignedInAccountID(reusable.id);
@@ -5221,6 +5333,17 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         setLoginBusy(false);
         setLoginFeedbackMessage(translate("relay.typeNotDetected"));
         return;
+      }
+      // A new station has no account yet, so the provider is created once the
+      // family is known: a sign-in that never starts reserves nothing.  The
+      // account this flow is about to store will still find a provider row.
+      if (!targetProviderID) {
+        targetProviderID = await ensureRelayProviderForStation();
+        if (!targetProviderID) {
+          setLoginBusy(false);
+          setLoginFeedbackMessage(translate("relay.operationFailed"));
+          return;
+        }
       }
       // Pending login: Core creates the account shell only after sign-in
       // succeeds, so a cancelled flow reserves nothing and can no longer
@@ -5304,8 +5427,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       const boundAccount = accounts.find((item) => stationOriginKey(item.origin) === target);
       const stationID = landed?.stationID ?? boundAccount?.stationID
         ?? stationsFromSnapshot(next ?? undefined, accounts).find((station) => stationOriginKey(station.origin) === target)?.id;
-      if (providerID && stationID) {
-        await dispatchWithOutcome("provider.select_relay_station", { provider_id: providerID, station_id: stationID });
+      if (targetProviderID && stationID) {
+        await dispatchWithOutcome("provider.select_relay_station", { provider_id: targetProviderID, station_id: stationID });
       }
     } catch {
       if (request === setupLoginRequest.current) setLoginFeedbackMessage(translate("relay.operationFailed"));

@@ -1414,6 +1414,42 @@ class ReactNativeUiParityTests(unittest.TestCase):
         wizard = self.ui.split("const detectRelayType = useCallback(", 1)[1].split("}, [enqueueDispatch, refresh]);", 1)[0]
         self.assertIn("await refresh()", wizard)
 
+    def test_a_station_account_never_exists_without_its_provider(self) -> None:
+        """A relay account belongs to a provider, not to a station alone.
+
+        The native sign-in stores the account before 完成 creates the provider.
+        Closing the wizard at 密钥, or a create that failed after the sign-in,
+        left an account the provider list could not reach; the wizard then read
+        the missing row as 无法识别中转站类别.  The provider is now created before
+        the account can exist, the key step raises it as soon as it shows an
+        existing station's account, and 完成 joins that row instead of minting a
+        second one.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        self.assertIn('const ensuredProvider = useRef("");', wizard)
+        self.assertIn("const ensureRelayProviderForStation = async (): Promise<string | undefined> => {", wizard)
+        self.assertIn("let targetProviderID = accountsAtStation ? await ensureRelayProviderForStation() : undefined;", wizard)
+        login = wizard.split("const beginRelayLogin = async (signInAnother = false): Promise<void> => {", 1)[1]
+        self.assertLess(
+            login.index("await ensureRelayProviderForStation()"),
+            login.index("await native.relayLogin("),
+            "the provider must exist before the native sign-in can store an account",
+        )
+        self.assertIn('if (targetProviderID && stationID) {', wizard)
+        self.assertIn("if (ensuredProvider.current) return ensuredProvider.current;", wizard)
+        # The step repairs an account that is already there, even when no sign-in
+        # follows: the station's stored family answers the type question and the
+        # provider is raised as the key step appears.
+        self.assertIn("const accountType = stationAccounts.find((account) => account.type === \"newapi\" || account.type === \"sub2api\")?.type;", wizard)
+        self.assertIn("if (!stationForProvider || stationAccounts.length === 0) return;", wizard)
+        # The child window's close discards its provider draft; the native
+        # sign-in does not.  The provider is applied before the account can be
+        # stored, so a closed wizard cannot leave the account behind alone.
+        self.assertIn("if (!await applyProviders()) return undefined;", wizard)
+        self.assertIn("const applyProvidersQuietly = async (): Promise<boolean> => {", self.ui)
+        self.assertIn("applyProviders={applyProvidersQuietly}", self.ui)
+
     def test_loading_buttons_keep_their_title_width_and_color_with_a_spinner(self) -> None:
         """A working button reports progress; it never disables, renames, or resizes itself."""
 
