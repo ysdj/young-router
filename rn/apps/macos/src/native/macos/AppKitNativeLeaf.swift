@@ -3058,6 +3058,54 @@ private final class NativeListFrameView: NSView {
     }
 }
 
+/// The 分组管理 key list's scroll view.
+///
+/// AppKit's overlay scroller is invisible while the list is idle, so an
+/// overflowing key list looked like a list that simply ended at the fold.  The
+/// list therefore asks its own document on every layout pass whether the rows
+/// overflow, exactly like the shared tables and 模型列表: a list that fits keeps
+/// AppKit's overlay chrome, and a list with rows past the fold takes the app's
+/// persistent capsule.  The table reloads and the window resize both end in a
+/// layout pass, so the answer follows the live row count instead of the rows the
+/// window opened on.
+private final class NativeGroupManagerScrollView: NSScrollView {
+    override func layout() {
+        super.layout()
+        applyOverflowScrollerPolicy()
+    }
+
+    /// AppKit tiles the scroller outside a layout pass too (a focus change, a
+    /// live resize), and the capsule's zero measured width lets that pass size
+    /// it back to nothing.  Every tiling keeps the capsule on its strip while
+    /// the list is in the overflowing branch.
+    override func tile() {
+        super.tile()
+        if scrollerStyle == .legacy && hasVerticalScroller {
+            usePersistentScrollers(horizontal: false, vertical: true)
+        }
+    }
+
+    /// The table's own rows are the thing that overflows: its frame excludes the
+    /// header, while the clip view covers it, so the header has to come off the
+    /// viewport before the two heights are compared.
+    private func applyOverflowScrollerPolicy() {
+        guard let table = documentView as? NSTableView else { return }
+        let rowCount = table.numberOfRows
+        let rowsHeight = rowCount > 0 ? NSMaxY(table.rect(ofRow: rowCount - 1)) : 0
+        let headerHeight = table.headerView.map { NSHeight($0.frame) } ?? 0
+        let viewportHeight = max(0, NSHeight(contentView.bounds) - headerHeight)
+        let overflows = rowsHeight > viewportHeight + 0.5
+        let style: NSScroller.Style = overflows ? .legacy : .overlay
+        if scrollerStyle != style || autohidesScrollers != !overflows {
+            scrollerStyle = style
+            autohidesScrollers = !overflows
+            tile()
+        }
+        guard overflows else { return }
+        usePersistentScrollers(horizontal: false, vertical: true)
+    }
+}
+
 /// The 模型列表 view: the selected key's models, one aligned line each, in the
 /// detail column.  The window sizes it for the longest list it shows, and the
 /// persistent scroller takes over when the list is taller than that.
@@ -3113,6 +3161,12 @@ private final class NativeModelsListView: NSScrollView {
         textView.string = names.isEmpty ? emptyText : names.joined(separator: "\n")
         textView.textColor = names.isEmpty ? .secondaryLabelColor : .labelColor
         refitDocument()
+        // The document changed but this scroll view's own frame did not, so
+        // AppKit has no reason to lay it out again.  Without this pass the
+        // scroller policy kept answering for the model list the window opened
+        // on, and a key with more models than its box shows kept AppKit's
+        // idle-fading overlay bar: the list looked complete at the fold.
+        needsLayout = true
     }
 
     /// The text view grows with its text so the scroll view scrolls the list
@@ -3237,6 +3291,21 @@ private final class NativeRelayKeyMemo {
 /// right pane edits the selected key, and the bottom bar applies or discards
 /// the staged edits.  Manual edits follow the auto-grouping switch because
 /// Core rejects them while automatic grouping owns the layout.
+private final class NativeGroupManagerTableView: NSTableView {
+    /// Control-A selects every key as well as the platform's Command-A: the
+    /// sheet is a key list, and the shortcut users reach for is the one their
+    /// keyboard habit names.  Command-A still travels through the menu's 全选.
+    override func keyDown(with event: NSEvent) {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if flags.contains(.control), !flags.contains(.command), !flags.contains(.option),
+           event.charactersIgnoringModifiers?.lowercased() == "a" {
+            selectAll(nil)
+            return
+        }
+        super.keyDown(with: event)
+    }
+}
+
 private final class NativeGroupManagerController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     struct GroupOption {
         let id: String
@@ -3350,6 +3419,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
 
     private weak var panel: NSPanel?
     private weak var table: NSTableView?
+    private weak var listScrollView: NativeGroupManagerScrollView?
     private weak var accountField: NSTextField?
     private weak var addButton: NSButton?
     private weak var removeButton: NSButton?
@@ -3630,17 +3700,17 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         addButton.setAccessibilityLabel(label("addLabel"))
         self.addButton = addButton
 
-        // The key list is the shared striped native table.
+        // The key list is the shared striped native table.  Its scroll view
+        // keeps AppKit's overlay chrome only while the rows fit; an overflowing
+        // list takes the persistent capsule from its own layout pass.
         let listFrame = NativeListFrameView()
-        let scrollView = NSScrollView()
+        let scrollView = NativeGroupManagerScrollView()
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
-        // Overlay: the shared capsule floats over the key list instead of
-        // reserving a legacy gutter.
         scrollView.scrollerStyle = .overlay
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
-        scrollView.usePersistentScrollers(horizontal: false, vertical: true)
+        self.listScrollView = scrollView
         let nameColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("key-name"))
         nameColumn.width = 160
         nameColumn.minWidth = 120
@@ -3664,7 +3734,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         multiplierColumn.headerCell.attributedStringValue = groupManagerHeaderTitle(multiplierColumn.title)
         multiplierColumn.headerCell.isBordered = false
         multiplierColumn.headerCell.isBezeled = false
-        let table = NSTableView()
+        let table = NativeGroupManagerTableView()
         table.style = .plain
         // The window list labels its columns like every other native table so
         // 名称 / 分组 / 倍率 stay readable while 自动分组 disables the detail pane.
@@ -3677,7 +3747,12 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         table.gridStyleMask = []
         table.usesAlternatingRowBackgroundColors = true
         table.allowsColumnReordering = false
-        table.allowsMultipleSelection = false
+        // The key list is a batch surface: Shift-click extends the selection,
+        // Cmd-click toggles one row, and Cmd+A (or the menu's 全选) selects the
+        // account.  A single selected row keeps the detail pane a full editor;
+        // several rows share 启用, 分组 and −, which are the edits that make
+        // sense for more than one key at once.
+        table.allowsMultipleSelection = true
         table.allowsEmptySelection = true
         table.focusRingType = .none
         table.dataSource = self
@@ -3946,6 +4021,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         if initialAutoGrouping {
             stageAutoGroupingRows(true)
             table.reloadData()
+            listScrollView?.needsLayout = true
         }
         // The selection drives the detail column, so the window opens on the
         // first key instead of a blank form.
@@ -4000,6 +4076,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         // there; otherwise the window opens on the first row of the new list.
         let index = previousID.flatMap { id in rows.firstIndex { $0.id == id } } ?? (rows.isEmpty ? -1 : 0)
         table?.reloadData()
+        listScrollView?.needsLayout = true
         if index >= 0 && index < rows.count {
             table?.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
         } else {
@@ -4067,11 +4144,25 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         }
     }
 
+    /// The rows the table is showing as selected, in row order.  An index the
+    /// last reload removed is dropped, so a batch edit never acts on a row the
+    /// list no longer carries.
+    private var selectedRowIndexes: [Int] {
+        guard let table else { return [] }
+        return table.selectedRowIndexes.compactMap { index in
+            index >= 0 && index < rows.count ? index : nil
+        }
+    }
+
     /// The detail pane follows the list selection and the auto-grouping switch.
+    /// One selected row is the full editor; several rows share 启用, 分组 and −,
+    /// while the fields that belong to a single key's identity (name, value,
+    /// models) are stated but not editable.
     private func loadDetail() {
-        guard let table else { return }
-        let index = table.selectedRow
-        let hasRow = index >= 0 && index < rows.count
+        let indexes = selectedRowIndexes
+        let hasRow = !indexes.isEmpty
+        let single = indexes.count == 1
+        let index = indexes.first ?? -1
         let editable = editingEnabled && hasRow
         // The list header keeps only the ＋ / － it can perform: no group to
         // place a key in, or no selected key, hides the control instead of
@@ -4082,10 +4173,13 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         removeButton?.isEnabled = editable
         removeButton?.isHidden = !editable
         enabledCheckbox?.isEnabled = editable
-        nameField?.isEnabled = editable
+        // A name is one key's identity: several selected keys cannot share one.
+        // 分组 and 启用 are the edits that do apply to a whole selection.
+        nameField?.isEnabled = editable && single
         groupPopUp?.isEnabled = editable && !groups.isEmpty
         let empty = label("emptyLabel")
         guard hasRow else {
+            enabledCheckbox?.allowsMixedState = false
             enabledCheckbox?.state = .off
             nameField?.stringValue = ""
             multiplierField?.stringValue = empty
@@ -4099,7 +4193,36 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             syncingSelection = false
             return
         }
+        if !single {
+            let selectedRows = indexes.map { rows[$0] }
+            let allEnabled = selectedRows.allSatisfy { $0.enabled }
+            let allDisabled = selectedRows.allSatisfy { !$0.enabled }
+            enabledCheckbox?.allowsMixedState = !allEnabled && !allDisabled
+            enabledCheckbox?.state = allEnabled ? .on : (allDisabled ? .off : .mixed)
+            // Several keys do not have one name, one value or one model list to
+            // show: blank fields that cannot be edited state that the selection
+            // is a batch, while the controls above still act on every row.
+            nameField?.stringValue = ""
+            multiplierField?.stringValue = empty
+            multiplierField?.toolTip = nil
+            valueField?.stringValue = empty
+            valueField?.toolTip = nil
+            modelsList?.setModels([])
+            copyButton?.isEnabled = false
+            let groupIDs = Set(selectedRows.map { $0.groupID })
+            syncingSelection = true
+            if groupIDs.count == 1, let groupID = groupIDs.first,
+               let groupIndex = groups.firstIndex(where: { $0.id == groupID }) {
+                groupPopUp?.selectItem(at: groupIndex)
+            } else {
+                groupPopUp?.selectItem(at: -1)
+            }
+            syncingSelection = false
+            fitPanelToContent()
+            return
+        }
         let row = rows[index]
+        enabledCheckbox?.allowsMixedState = false
         enabledCheckbox?.state = row.enabled ? .on : .off
         multiplierField?.stringValue = row.multiplier.isEmpty ? empty : row.multiplier
         multiplierField?.toolTip = row.multiplier.isEmpty ? nil : row.multiplier
@@ -4117,15 +4240,28 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         fitPanelToContent()
     }
 
-    private func reloadAndSelect(_ index: Int) {
+    private func reloadAndSelect(_ indexes: IndexSet) {
         table?.reloadData()
-        if index >= 0 && index < rows.count {
-            table?.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
-        } else {
+        // The row count may have crossed the fold either way: ask the list for
+        // the scroller policy its new content needs instead of leaving the
+        // chrome the list had before the edit.
+        listScrollView?.needsLayout = true
+        let valid = IndexSet(indexes.filter { $0 >= 0 && $0 < rows.count })
+        if valid.isEmpty {
             table?.deselectAll(nil)
+        } else {
+            table?.selectRowIndexes(valid, byExtendingSelection: false)
         }
         loadDetail()
         refreshApplyButton()
+    }
+
+    private func reloadAndSelect(_ indexes: [Int]) {
+        reloadAndSelect(IndexSet(indexes.filter { $0 >= 0 && $0 < rows.count }))
+    }
+
+    private func reloadAndSelect(_ index: Int) {
+        reloadAndSelect(index >= 0 && index < rows.count ? IndexSet(integer: index) : IndexSet())
     }
 
     private func refreshApplyButton() {
@@ -4178,7 +4314,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     }
 
     private func commitNameField() {
-        guard let table, let index = table.selectedRow as Int?, index >= 0, index < rows.count else { return }
+        guard selectedRowIndexes.count == 1, let index = selectedRowIndexes.first else { return }
         let value = (nameField?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else {
             nameField?.stringValue = rows[index].name
@@ -4227,40 +4363,56 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     }
 
     @objc private func removeSelectedKey(_ sender: NSButton) {
-        guard let table, let index = table.selectedRow as Int?, index >= 0, index < rows.count else { return }
-        if rows[index].isDraft {
-            rows.remove(at: index)
-            reloadAndSelect(-1)
-            return
+        let indexes = selectedRowIndexes
+        guard !indexes.isEmpty else { return }
+        let selectedIDs = Set(indexes.map { rows[$0].id })
+        // A draft − made leaves the list; a key the station owns is staged for
+        // deletion (or restored), and doing that for every selected key is what
+        // makes a multi-row selection useful.
+        rows.removeAll { selectedIDs.contains($0.id) && $0.isDraft }
+        let ownedRows = rows.filter { selectedIDs.contains($0.id) && !$0.isDraft }
+        let restore = !ownedRows.isEmpty && ownedRows.allSatisfy { $0.deleted }
+        for index in rows.indices where selectedIDs.contains(rows[index].id) && !rows[index].isDraft {
+            rows[index].deleted = !restore
         }
-        rows[index].deleted.toggle()
         stagedDeleteCount = rows.filter { !$0.isDraft && $0.deleted }.count
-        reloadAndSelect(index)
+        let surviving = rows.indices.filter { selectedIDs.contains(rows[$0].id) }
+        if surviving.isEmpty {
+            // The rows that took the removed drafts' place keep the column
+            // pointing at a key, exactly like removing one draft did.
+            reloadAndSelect(min(indexes.first ?? 0, rows.count - 1))
+        } else {
+            reloadAndSelect(surviving)
+        }
     }
 
     @objc private func toggleSelectedEnabled(_ sender: NSButton) {
-        guard let table, let index = table.selectedRow as Int?, index >= 0, index < rows.count else { return }
-        rows[index].enabled = sender.state == .on
-        reloadAndSelect(index)
+        let indexes = selectedRowIndexes
+        guard !indexes.isEmpty else { return }
+        let enabled = sender.state != .off
+        for index in indexes { rows[index].enabled = enabled }
+        reloadAndSelect(indexes)
     }
 
     @objc private func changeSelectedGroup(_ sender: NSPopUpButton) {
         // loadDetail() also selects an item; only a user choice edits a row.
         guard !syncingSelection else { return }
-        guard let table, let index = table.selectedRow as Int?, index >= 0, index < rows.count else { return }
-        guard let groupID = selectedGroupID(from: sender) else { return }
-        rows[index].groupID = groupID
-        rows[index].groupLabel = groupLabel(for: groupID)
-        // Re-grouping changes what the key costs, so 倍率 follows the choice.
-        rows[index].multiplier = groupRate(for: groupID)
-        reloadAndSelect(index)
+        let indexes = selectedRowIndexes
+        guard !indexes.isEmpty, let groupID = selectedGroupID(from: sender) else { return }
+        for index in indexes {
+            rows[index].groupID = groupID
+            rows[index].groupLabel = groupLabel(for: groupID)
+            // Re-grouping changes what the key costs, so 倍率 follows the choice.
+            rows[index].multiplier = groupRate(for: groupID)
+        }
+        reloadAndSelect(indexes)
     }
 
-    /// The key id of the current selection, or nil while nothing is selected.
+    /// The key id of a one-key selection, or nil while the selection is empty
+    /// or a batch.  The value row belongs to one key only.
     private var selectedRowID: String? {
-        guard let table else { return nil }
-        let index = table.selectedRow
-        guard index >= 0, index < rows.count else { return nil }
+        let indexes = selectedRowIndexes
+        guard indexes.count == 1, let index = indexes.first else { return nil }
         return rows[index].id
     }
 
@@ -4366,7 +4518,8 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     /// Copy the selected key through Core's plaintext capability — the same
     /// target the provider workspace uses — and report the outcome in place.
     @objc private func copySelectedKey(_ sender: NSButton) {
-        guard let table, let index = table.selectedRow as Int?, index >= 0, index < rows.count else { return }
+        let indexes = selectedRowIndexes
+        guard indexes.count == 1, let index = indexes.first else { return }
         let row = rows[index]
         guard canCopy(row) else { return }
         // A key the window already revealed copies from what it holds, so the
@@ -4454,6 +4607,9 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     private func stageAutoGroupingLayout(_ enabled: Bool) {
         stageAutoGroupingRows(enabled)
         table?.reloadData()
+        // The switch replaces the whole list, so the rows may cross the fold in
+        // either direction and the capsule has to follow the new row count.
+        listScrollView?.needsLayout = true
     }
 
     /// The layout itself, so the rows can be staged by a caller that has no
@@ -4922,6 +5078,14 @@ extension NSScrollView {
             var frame = scroller.frame
             frame.origin.x = bounds.maxX - strip
             frame.size.width = strip
+            // The knob's travel is the viewport's, not the one AppKit measured
+            // when it last tiled: a table's vertical scroller starts below the
+            // header it floats over, and the track has to reach the bottom edge
+            // or the knob ends short exactly where the content reaches its end.
+            let trackHeight = max(0, bounds.maxY - frame.minY)
+            if trackHeight > 0, abs(frame.height - trackHeight) > 0.5 {
+                frame.size.height = trackHeight
+            }
             scroller.frame = frame
         }
         if hasHorizontalScroller, let scroller = horizontalScroller {
@@ -4935,6 +5099,15 @@ extension NSScrollView {
                                width: bounds.width, height: bounds.height)
         if contentView.frame != clipFrame {
             contentView.frame = clipFrame
+        }
+        // The track grew or shrank with the viewport, so the knob's share of it
+        // is stale until AppKit re-reads the document: ask for a redraw without
+        // re-entering this function through `tile`.
+        if hasVerticalScroller, let scroller = verticalScroller {
+            scroller.needsDisplay = true
+        }
+        if hasHorizontalScroller, let scroller = horizontalScroller {
+            scroller.needsDisplay = true
         }
     }
 }

@@ -1973,14 +1973,21 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   append_column_label(2, labels.multiplier_label);
   list_body.Children().Append(list_columns);
   controls::ListView list;
-  list.SelectionMode(controls::ListViewSelectionMode::Single);
+  // Extended is the list's own multi-selection: Ctrl-click toggles one row,
+  // Shift-click extends the range, and Ctrl+A selects the account.  The detail
+  // pane keeps the one-row editor for a single selection and turns 启用, 分组
+  // and − into batch edits for several rows.
+  list.SelectionMode(controls::ListViewSelectionMode::Extended);
   list.IsItemClickEnabled(true);
   list.Height(300);
   list.Padding(xaml::Thickness{0, 0, 0, 0});
   list.BorderThickness(xaml::Thickness{0, 0, 0, 0});
   list.Background(theme_brush(
       L"ControlFillColorDefaultBrush", winrt::Windows::UI::Color{255, 255, 255, 255}));
-  controls::ScrollViewer::SetVerticalScrollBarVisibility(list, controls::ScrollBarVisibility::Auto);
+  // The key list is a data list: its scrollbar is the only thing saying the
+  // station has more keys below the fold, so it stays on screen instead of
+  // fading out while the list is idle.
+  controls::ScrollViewer::SetVerticalScrollBarVisibility(list, controls::ScrollBarVisibility::Visible);
   controls::ScrollViewer::SetHorizontalScrollBarVisibility(list, controls::ScrollBarVisibility::Disabled);
   controls::Grid::SetRow(list, 1);
   list_body.Children().Append(list);
@@ -2034,7 +2041,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   models_title.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
   models_title.Text(winrt::hstring(labels.models_label));
   controls::ScrollViewer models_scroll;
-  controls::ScrollViewer::SetVerticalScrollBarVisibility(models_scroll, controls::ScrollBarVisibility::Auto);
+  controls::ScrollViewer::SetVerticalScrollBarVisibility(models_scroll, controls::ScrollBarVisibility::Visible);
   controls::ScrollViewer::SetHorizontalScrollBarVisibility(models_scroll, controls::ScrollBarVisibility::Disabled);
   models_scroll.BorderThickness(xaml::Thickness{0, 0, 0, 0});
   models_scroll.Background(nullptr);
@@ -2209,6 +2216,38 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   dialog.Content(root);
 
   auto selected_index = [&list]() -> int32_t { return list.SelectedIndex(); };
+  // The list's selected rows, in row order.  Extended selection gives the
+  // platform's own Ctrl-click / Shift-click / Ctrl+A, so every batch edit reads
+  // the whole set instead of only the row the detail pane happens to show.
+  auto selected_indexes = [&list, &rows]() -> std::vector<int32_t> {
+    std::vector<int32_t> indexes;
+    try {
+      auto items = list.Items();
+      auto selected = list.SelectedItems();
+      for (uint32_t i = 0; i < selected.Size(); ++i) {
+        uint32_t index = 0;
+        if (items.IndexOf(selected.GetAt(i), index) && index < rows->size()) {
+          indexes.push_back(static_cast<int32_t>(index));
+        }
+      }
+    } catch (...) {
+    }
+    std::sort(indexes.begin(), indexes.end());
+    indexes.erase(std::unique(indexes.begin(), indexes.end()), indexes.end());
+    return indexes;
+  };
+  // Put a selection back after a rebuild.  The list has already had its items
+  // replaced at that point, so the indexes are the new rows' own.
+  auto select_rows = [&list, &rows](std::vector<int32_t> const& indexes) {
+    try {
+      auto items = list.Items();
+      for (int32_t index : indexes) {
+        if (index < 0 || static_cast<uint32_t>(index) >= items.Size() || static_cast<size_t>(index) >= rows->size()) continue;
+        list.SelectedItems().Append(items.GetAt(static_cast<uint32_t>(index)));
+      }
+    } catch (...) {
+    }
+  };
 
   // Save and Close stays disabled until the draft would change the account:
   // the auto-grouping switch, a staged create, or an edit the user made.  With
@@ -2304,9 +2343,13 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     status_timer->Stop();
     if (!message.empty()) status_timer->Start();
   };
-  copy_button.Click([rows, list, account_id, copy_button, show_copy_status, can_copy, revealed_values,
+  copy_button.Click([rows, list, selected_indexes, account_id, copy_button, show_copy_status, can_copy, revealed_values,
                      failed_label = labels.failed_label](auto const&, auto const&) {
-    const int32_t selected = list.SelectedIndex();
+    // The value and the copy belong to one key: a batch selection has no one
+    // key to put on the clipboard.
+    const auto indexes = selected_indexes();
+    if (indexes.size() != 1) return;
+    const int32_t selected = indexes.front();
     if (selected < 0 || static_cast<size_t>(selected) >= rows->size()) return;
     auto row = std::make_shared<SheetRow>((*rows)[static_cast<size_t>(selected)]);
     if (!can_copy(*row)) return;
@@ -2384,7 +2427,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   auto reveal_pass_running = std::make_shared<bool>(false);
   auto drain_reveal_queue = std::make_shared<std::function<void()>>();
   *drain_reveal_queue = [reveal_queue, reveal_in_flight, reveal_pass_running, drain_reveal_queue,
-                         account_id, rows, list, value_text, revealed_values,
+                         account_id, rows, selected_indexes, value_text, revealed_values,
                          failed_label = labels.failed_label, show_copy_status]() {
     if (*reveal_pass_running || reveal_queue->empty()) return;
     const std::wstring key_id = reveal_queue->front();
@@ -2403,7 +2446,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     // instead of leaving the row without its value.  One read runs at a time:
     // this is background work for rows the user may not look at.
     std::thread([target, key_id, dispatcher, value_text, revealed_values, reveal_queue, reveal_in_flight,
-                 reveal_pass_running, drain_reveal_queue, rows, list, account_id,
+                 reveal_pass_running, drain_reveal_queue, rows, selected_indexes, account_id,
                  failed_label, show_copy_status] {
       std::optional<std::wstring> value;
       for (int attempt = 0; attempt < 3 && !value; ++attempt) {
@@ -2416,13 +2459,16 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
       auto revealed_value = value ? std::make_shared<std::wstring>(*value) : std::shared_ptr<std::wstring>();
       if (value) value->clear();
       dispatcher.TryEnqueue([key_id, revealed_value, value_text, revealed_values, reveal_queue, reveal_in_flight,
-                             reveal_pass_running, drain_reveal_queue, rows, list, account_id,
+                             reveal_pass_running, drain_reveal_queue, rows, selected_indexes, account_id,
                              failed_label, show_copy_status] {
         reveal_in_flight->erase(key_id);
         *reveal_pass_running = false;
-        const int32_t selected = list.SelectedIndex();
-        const bool is_selected = selected >= 0 && static_cast<size_t>(selected) < rows->size() &&
-            (*rows)[static_cast<size_t>(selected)].id == key_id;
+        // The value row belongs to a one-key selection: a read that lands
+        // while a batch is selected must not print one key's value under it.
+        const auto selection = selected_indexes();
+        const bool is_selected = selection.size() == 1 &&
+            static_cast<size_t>(selection.front()) < rows->size() &&
+            (*rows)[static_cast<size_t>(selection.front())].id == key_id;
         if (revealed_value) {
           (*revealed_values)[key_id] = *revealed_value;
           RememberRelayKey(account_id, key_id, *revealed_value);
@@ -2483,8 +2529,10 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   };
 
   auto load_detail = [&]() {
-    const int32_t selected = selected_index();
-    const bool has_row = selected >= 0 && static_cast<size_t>(selected) < rows->size();
+    const auto indexes = selected_indexes();
+    const bool has_row = !indexes.empty();
+    const bool single = indexes.size() == 1;
+    const int32_t selected = has_row ? indexes.front() : -1;
     const bool editable = !toggle_on() && has_row;
     // The list header keeps only the +/- it can perform: no group to place a
     // key in, or no selected key, hides the control instead of greying it out.
@@ -2494,10 +2542,13 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     remove_button.IsEnabled(editable);
     remove_button.Visibility(editable ? xaml::Visibility::Visible : xaml::Visibility::Collapsed);
     enabled_box.IsEnabled(editable);
-    name_box.IsEnabled(editable);
+    // A name is one key's identity: several selected keys cannot share one.
+    // 分组 and 启用 are the edits that do apply to a whole selection.
+    name_box.IsEnabled(editable && single);
     group_picker.IsEnabled(editable && !groups.empty());
     *syncing = true;
     if (!has_row) {
+      enabled_box.IsThreeState(false);
       enabled_box.IsChecked(false);
       name_box.Text(L"");
       group_picker.SelectedIndex(-1);
@@ -2507,8 +2558,37 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
       rebuild_models({});
       copy_button.IsEnabled(false);
       show_copy_status(L"");
+    } else if (!single) {
+      bool all_enabled = true;
+      bool all_disabled = true;
+      for (int32_t index : indexes) {
+        if ((*rows)[static_cast<size_t>(index)].enabled) all_disabled = false;
+        else all_enabled = false;
+      }
+      const bool mixed = !all_enabled && !all_disabled;
+      enabled_box.IsThreeState(mixed);
+      if (mixed) enabled_box.IsChecked(nullptr);
+      else enabled_box.IsChecked(all_enabled);
+      // Several keys do not have one name, one value or one model list to show:
+      // blank fields that cannot be edited state that the selection is a batch,
+      // while the controls above still act on every row.
+      name_box.Text(L"");
+      multiplier_value.Text(winrt::hstring(labels.empty_label));
+      value_text.Text(winrt::hstring(labels.empty_label));
+      rebuild_models({});
+      copy_button.IsEnabled(false);
+      show_copy_status(L"");
+      std::wstring common_group;
+      bool same_group = true;
+      for (size_t index = 0; index < indexes.size(); ++index) {
+        auto const& group_id = (*rows)[static_cast<size_t>(indexes[index])].group_id;
+        if (index == 0) common_group = group_id;
+        else if (group_id != common_group) same_group = false;
+      }
+      group_picker.SelectedIndex(same_group ? group_index_for(common_group) : -1);
     } else {
       auto const& row = (*rows)[static_cast<size_t>(selected)];
+      enabled_box.IsThreeState(false);
       enabled_box.IsChecked(row.enabled);
       name_box.Text(winrt::hstring(row.name));
       group_picker.SelectedIndex(group_index_for(row.group_id));
@@ -2523,8 +2603,8 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   };
 
   auto rebuild = [&]() {
+    const auto selection = selected_indexes();
     *syncing = true;
-    const int32_t selected = selected_index();
     list.Items().Clear();
     for (size_t index = 0; index < rows->size(); ++index) {
       auto const& row = (*rows)[index];
@@ -2582,18 +2662,17 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
       grid.Children().Append(detail_text);
       list.Items().Append(grid);
     }
-    if (selected >= 0 && static_cast<size_t>(selected) < rows->size()) {
-      list.SelectedIndex(selected);
-    } else {
-      list.SelectedIndex(-1);
-    }
+    list.SelectedIndex(-1);
+    select_rows(selection);
     *syncing = false;
     load_detail();
     refresh_apply();
   };
 
   auto commit_name = [&]() {
-    const int32_t selected = selected_index();
+    const auto indexes = selected_indexes();
+    if (indexes.size() != 1) return;
+    const int32_t selected = indexes.front();
     if (selected < 0 || static_cast<size_t>(selected) >= rows->size()) return;
     std::wstring value(name_box.Text());
     const auto first = value.find_first_not_of(L" \t");
@@ -2644,45 +2723,70 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
     name_box.Focus(winrt::Microsoft::UI::Xaml::FocusState::Programmatic);
   });
   remove_button.Click([&](auto const&, auto const&) {
-    const int32_t selected = selected_index();
-    if (selected < 0 || static_cast<size_t>(selected) >= rows->size()) return;
-    if ((*rows)[static_cast<size_t>(selected)].draft) {
-      rows->erase(rows->begin() + selected);
-      rebuild();
-      list.SelectedIndex(-1);
-      load_detail();
-    } else {
-      (*rows)[static_cast<size_t>(selected)].deleted = !(*rows)[static_cast<size_t>(selected)].deleted;
-      *staged_deletes = 0;
-      for (auto const& row : *rows) {
-        if (!row.draft && row.deleted) ++*staged_deletes;
-      }
-      rebuild();
-      list.SelectedIndex(selected);
-      load_detail();
+    const auto indexes = selected_indexes();
+    if (indexes.empty()) return;
+    const std::set<std::wstring> selected_ids = [&]() {
+      std::set<std::wstring> ids;
+      for (int32_t index : indexes) ids.insert((*rows)[static_cast<size_t>(index)].id);
+      return ids;
+    }();
+    // A draft − made leaves the list; a key the station owns is staged for
+    // deletion (or restored), and doing that for every selected key is what
+    // makes a multi-row selection useful.
+    rows->erase(std::remove_if(rows->begin(), rows->end(), [&](SheetRow const& row) {
+      return row.draft && selected_ids.count(row.id) > 0;
+    }), rows->end());
+    std::vector<SheetRow*> owned_rows;
+    for (auto& row : *rows) {
+      if (!row.draft && selected_ids.count(row.id) > 0) owned_rows.push_back(&row);
     }
+    const bool restore = !owned_rows.empty() &&
+        std::all_of(owned_rows.begin(), owned_rows.end(), [](SheetRow const* row) { return row->deleted; });
+    for (auto* row : owned_rows) row->deleted = !restore;
+    *staged_deletes = 0;
+    for (auto const& row : *rows) {
+      if (!row.draft && row.deleted) ++*staged_deletes;
+    }
+    std::vector<int32_t> selection;
+    for (size_t index = 0; index < rows->size(); ++index) {
+      if (selected_ids.count((*rows)[index].id) > 0) selection.push_back(static_cast<int32_t>(index));
+    }
+    if (selection.empty()) {
+      int32_t fallback = indexes.front();
+      if (fallback >= static_cast<int32_t>(rows->size())) fallback = static_cast<int32_t>(rows->size()) - 1;
+      if (fallback >= 0) selection.push_back(fallback);
+    }
+    rebuild();
+    *syncing = true;
+    list.SelectedIndex(-1);
+    select_rows(selection);
+    *syncing = false;
+    load_detail();
+    refresh_apply();
   });
   enabled_box.Click([&](auto const& sender, auto const&) {
     if (*syncing) return;
-    const int32_t selected = selected_index();
-    if (selected < 0 || static_cast<size_t>(selected) >= rows->size()) return;
+    const auto indexes = selected_indexes();
+    if (indexes.empty()) return;
     auto checked = sender.as<controls::CheckBox>().IsChecked();
-    (*rows)[static_cast<size_t>(selected)].enabled = checked && checked.Value();
+    const bool enabled = checked && checked.Value();
+    for (int32_t index : indexes) (*rows)[static_cast<size_t>(index)].enabled = enabled;
     rebuild();
-    list.SelectedIndex(selected);
   });
   group_picker.SelectionChanged([&](auto const&, auto const&) {
     if (*syncing) return;
-    const int32_t selected = selected_index();
+    const auto indexes = selected_indexes();
     const auto group_index = group_picker.SelectedIndex();
-    if (selected < 0 || static_cast<size_t>(selected) >= rows->size()) return;
+    if (indexes.empty()) return;
     if (group_index < 0 || static_cast<size_t>(group_index) >= groups.size()) return;
-    (*rows)[static_cast<size_t>(selected)].group_id = groups[static_cast<size_t>(group_index)].id;
-    (*rows)[static_cast<size_t>(selected)].group_label = groups[static_cast<size_t>(group_index)].name;
-    // Re-grouping changes what the key costs, so 倍率 follows the choice.
-    (*rows)[static_cast<size_t>(selected)].multiplier = groups[static_cast<size_t>(group_index)].rate;
+    for (int32_t index : indexes) {
+      auto& row = (*rows)[static_cast<size_t>(index)];
+      row.group_id = groups[static_cast<size_t>(group_index)].id;
+      row.group_label = groups[static_cast<size_t>(group_index)].name;
+      // Re-grouping changes what the key costs, so 倍率 follows the choice.
+      row.multiplier = groups[static_cast<size_t>(group_index)].rate;
+    }
     rebuild();
-    list.SelectedIndex(selected);
   });
   name_box.LostFocus([&](auto const&, auto const&) {
     if (*syncing) return;

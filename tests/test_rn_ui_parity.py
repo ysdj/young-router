@@ -7551,6 +7551,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("let style: NSScroller.Style = overflows ? .legacy : .overlay", mac_leaf)
         self.assertIn("autohidesScrollers = !overflows", mac_leaf)
         self.assertIn("applyOverflowScrollerPolicy()\n    }", mac_leaf)
+        # A new key's models change the document but not this scroll view's own
+        # frame; without an explicit layout pass the policy kept answering for the
+        # model list the window opened on and the overflowing list showed no
+        # capsule.
+        set_models = mac_leaf.split("func setModels(_ names: [String]) {", 1)[1].split("\n    }", 1)[0]
+        self.assertIn("refitDocument()", set_models)
+        self.assertIn("needsLayout = true", set_models)
         # The models view must not pin the fitting-case chrome as its only state.
         models_view = mac_leaf.split("private final class NativeModelsListView: NSScrollView {", 1)[1].split("\n/// ", 1)[0]
         self.assertIn("hasVerticalScroller = true", models_view)
@@ -7582,7 +7589,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("controls::StackPanel detail;", windows_leaf)
         # The Windows sheet lays the same models out in its own grid section.
         self.assertIn("controls::ScrollViewer models_scroll;", windows_leaf)
-        self.assertIn("controls::ScrollViewer::SetVerticalScrollBarVisibility(models_scroll, controls::ScrollBarVisibility::Auto);", windows_leaf)
+        self.assertIn("controls::ScrollViewer::SetVerticalScrollBarVisibility(models_scroll, controls::ScrollBarVisibility::Visible);", windows_leaf)
         self.assertIn("models_scroll.Height(models_height);", windows_leaf)
         self.assertIn("auto rebuild_models = ", windows_leaf)
         self.assertIn("rebuild_models(row.models);", windows_leaf)

@@ -581,12 +581,32 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("func usePersistentScrollers(horizontal: Bool, vertical: Bool)", leaf)
         # Every native scroll view that keeps a scroller on screen draws it with
         # that class: the declaration plus the model chooser's overflow policy, the
-        # read-only text editor (install and layout pass), the key list the group
-        # manager sheet hosts, and that sheet's 模型列表 list (its install, its
-        # layout pass, and the overflow policy that re-asserts the capsule while it
-        # overflows).
-        self.assertEqual(8, leaf.count("usePersistentScrollers("))
-        self.assertIn("scrollView.usePersistentScrollers(horizontal: false, vertical: true)", leaf)
+        # read-only text editor (install and layout pass), the 分组管理 key list's
+        # overflow-aware scroll view, and that sheet's 模型列表 list (its install,
+        # its layout pass, and the overflow policy that re-asserts the capsule while
+        # it overflows).
+        self.assertEqual(9, leaf.count("usePersistentScrollers("))
+        group_scroll = leaf.split("private final class NativeGroupManagerScrollView: NSScrollView {", 1)[1].split(
+            "private final class NativeModelsListView: NSScrollView {", 1
+        )[0]
+        # The key list used to pin overlay+autohide and then install the capsule,
+        # so an overflowing list hid its only affordance while idle.  Its own
+        # layout pass now asks the table's rows whether they overflow and keeps the
+        # capsule exactly while they do.
+        self.assertIn("applyOverflowScrollerPolicy()", group_scroll)
+        self.assertIn("let rowCount = table.numberOfRows", group_scroll)
+        self.assertIn("let rowsHeight = rowCount > 0 ? NSMaxY(table.rect(ofRow: rowCount - 1)) : 0", group_scroll)
+        self.assertIn("let headerHeight = table.headerView.map { NSHeight($0.frame) } ?? 0", group_scroll)
+        self.assertIn("let viewportHeight = max(0, NSHeight(contentView.bounds) - headerHeight)", group_scroll)
+        self.assertIn("let overflows = rowsHeight > viewportHeight + 0.5", group_scroll)
+        self.assertIn("let style: NSScroller.Style = overflows ? .legacy : .overlay", group_scroll)
+        self.assertIn("autohidesScrollers = !overflows", group_scroll)
+        self.assertIn("guard overflows else { return }", group_scroll)
+        self.assertIn("usePersistentScrollers(horizontal: false, vertical: true)", group_scroll)
+        # AppKit tiles the scroller outside a layout pass too, and the capsule's
+        # zero measured width lets that pass size it back to nothing.
+        self.assertIn("override func tile() {", group_scroll)
+        self.assertIn("if scrollerStyle == .legacy && hasVerticalScroller {", group_scroll)
         self.assertIn("usePersistentScrollers(horizontal: true, vertical: true)", leaf)
 
     def test_the_add_account_button_opens_the_sign_in_window_at_once(self) -> None:
@@ -703,6 +723,51 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "remove_button.Visibility(editable ? xaml::Visibility::Visible : xaml::Visibility::Collapsed);",
             windows,
         )
+
+    def test_native_group_manager_selects_and_edits_more_than_one_key(self) -> None:
+        # The key list is a batch surface: Shift-click extends, Cmd/Ctrl-click
+        # toggles, and Cmd-A or Ctrl-A selects the account.  A single selection
+        # keeps the full detail editor; several share 启用, 分组 and −, while the
+        # one-key fields (name, value, models) stop being editable.
+        leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        windows = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+        self.assertIn("table.allowsMultipleSelection = true", leaf)
+        self.assertIn("private final class NativeGroupManagerTableView: NSTableView {", leaf)
+        self.assertIn('if flags.contains(.control), !flags.contains(.command), !flags.contains(.option),', leaf)
+        self.assertIn("private var selectedRowIndexes: [Int] {", leaf)
+        load_detail = leaf.split("private func loadDetail() {", 1)[1].split("private func reloadAndSelect", 1)[0]
+        self.assertIn("let single = indexes.count == 1", load_detail)
+        self.assertIn("nameField?.isEnabled = editable && single", load_detail)
+        self.assertIn("enabledCheckbox?.allowsMixedState = !allEnabled && !allDisabled", load_detail)
+        self.assertIn("enabledCheckbox?.state = allEnabled ? .on : (allDisabled ? .off : .mixed)", load_detail)
+        self.assertIn("groupIDs.count == 1", load_detail)
+        remove = leaf.split("@objc private func removeSelectedKey", 1)[1].split("@objc private func toggleSelectedEnabled", 1)[0]
+        self.assertIn("rows.removeAll { selectedIDs.contains($0.id) && $0.isDraft }", remove)
+        self.assertIn("rows[index].deleted = !restore", remove)
+        toggle = leaf.split("@objc private func toggleSelectedEnabled", 1)[1].split("@objc private func changeSelectedGroup", 1)[0]
+        self.assertIn("for index in indexes { rows[index].enabled = enabled }", toggle)
+        group = leaf.split("@objc private func changeSelectedGroup", 1)[1].split("/// The key id of a one-key selection", 1)[0]
+        self.assertIn("for index in indexes {", group)
+        self.assertIn("rows[index].multiplier = groupRate(for: groupID)", group)
+        copy = leaf.split("@objc private func copySelectedKey", 1)[1].split("/// State a transient result", 1)[0]
+        self.assertIn("guard indexes.count == 1, let index = indexes.first else { return }", copy)
+
+        # Windows' ListView uses its own Extended selection mode and batch
+        # handlers, and keeps its scrollbar on screen for the same reason.
+        self.assertIn("list.SelectionMode(controls::ListViewSelectionMode::Extended);", windows)
+        self.assertIn("controls::ScrollViewer::SetVerticalScrollBarVisibility(list, controls::ScrollBarVisibility::Visible);", windows)
+        self.assertIn("auto selected_indexes = [&list, &rows]() -> std::vector<int32_t> {", windows)
+        win_load = windows.split("auto load_detail = [&]() {", 1)[1].split("auto rebuild = [&]()", 1)[0]
+        self.assertIn("const auto indexes = selected_indexes();", win_load)
+        self.assertIn("name_box.IsEnabled(editable && single);", win_load)
+        self.assertIn("enabled_box.IsThreeState(mixed);", win_load)
+        win_remove = windows.split("remove_button.Click([&]", 1)[1].split("enabled_box.Click([&]", 1)[0]
+        self.assertIn("rows->erase(std::remove_if(rows->begin(), rows->end(), [&](SheetRow const& row) {", win_remove)
+        self.assertIn("for (auto* row : owned_rows) row->deleted = !restore;", win_remove)
+        win_toggle = windows.split("enabled_box.Click([&]", 1)[1].split("group_picker.SelectionChanged", 1)[0]
+        self.assertIn("for (int32_t index : indexes) (*rows)[static_cast<size_t>(index)].enabled = enabled;", win_toggle)
+        win_group = windows.split("group_picker.SelectionChanged([&]", 1)[1].split("name_box.LostFocus", 1)[0]
+        self.assertIn("for (int32_t index : indexes) {", win_group)
 
     def test_native_group_manager_toggle_stages_the_one_key_per_group_layout(self) -> None:
         # 自动分组 is one key per group, named exactly after its group, and the
