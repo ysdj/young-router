@@ -1481,6 +1481,32 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertTrue(untouched["remember_password"])
             self.assertTrue(untouched["password_saved"])
 
+            # "记住密码并自动分组" carries the second half of the prompt's
+            # answer: the switch is stored with the sign-in, so the resource
+            # read that follows can stage the one-key-per-group layout.
+            auto_grouped = domain.accept_login_result(
+                sessionless["id"],
+                username="sample-user",
+                cookie="session=replace-cookie",
+                auto_grouping=True,
+            )
+            self.assertTrue(auto_grouped["auto_grouping"])
+            # An absent choice keeps an existing switch; an explicit False is
+            # the only thing that turns it off.
+            kept = domain.accept_login_result(
+                sessionless["id"],
+                username="sample-user",
+                cookie="session=replace-cookie",
+            )
+            self.assertTrue(kept["auto_grouping"])
+            off = domain.accept_login_result(
+                sessionless["id"],
+                username="sample-user",
+                cookie="session=replace-cookie",
+                auto_grouping=False,
+            )
+            self.assertFalse(off["auto_grouping"])
+
     def test_remembered_password_is_only_readable_when_the_account_keeps_it(self) -> None:
         """The sign-in page fills back only a password the user chose to keep.
 
@@ -3357,7 +3383,16 @@ class RelayAccountsDomainTests(unittest.TestCase):
 
                 result = domain.refresh_resources(account_id)
 
-                self.assertEqual("unavailable", result["resource_status"])
+                # An empty key list or a key list whose models are empty is a
+                # successful read: the station answered, there is simply
+                # nothing to show.  Only a refused or unreachable read is
+                # ``unavailable``; calling the empty answers unavailable made
+                # the panes report a failed refresh over a station that had
+                # just said it has no keys.
+                self.assertEqual(
+                    "ready" if resource_error in ("no_api_keys", "no_models") else "unavailable",
+                    result["resource_status"],
+                )
                 self.assertEqual(resource_error, result["resource_error"])
                 self.assertEqual("expired" if resource_error == "login_expired" else "signed_in", result["login_status"])
                 if resource_error == "no_models":
@@ -3976,7 +4011,11 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )
 
             self.assertEqual([], materials["resources"])
-            self.assertIn("resource_unavailable", {item["code"] for item in materials["issues"]})
+            # The read succeeded and the station's list does not contain this
+            # key: that is the precise answer, not "nobody could read it".  The
+            # distinction used to be hidden because a key list with no models
+            # was reported as an unavailable read.
+            self.assertIn("resource_removed", {item["code"] for item in materials["issues"]})
 
             # The live key is unaffected: an absence is about one source.
             resolved = domain.binding_materials(

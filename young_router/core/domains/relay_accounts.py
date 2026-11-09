@@ -3705,6 +3705,7 @@ class RelayAccountsDomain:
         password: str = "",
         user_id: object = "",
         remember_password: bool | None = None,
+        auto_grouping: bool | None = None,
         preserve_resources: bool = False,
         quota: object = None,
     ) -> dict[str, Any]:
@@ -3714,6 +3715,9 @@ class RelayAccountsDomain:
         preference (used when no password was typed), while ``True``/``False``
         apply the post-login choice made in the host's subordinate prompt —
         ``False`` also clears an earlier saved password and persisted session.
+        ``auto_grouping`` is the same tri-state for the prompt's third answer:
+        ``True`` turns 自动分组 on with the sign-in, so the resource read that
+        follows it can stage the one-key-per-group layout.
 
         ``user_id`` is the station's own account id, captured by the host from
         the session it just proved.  It is what a New API fork requires as the
@@ -3748,6 +3752,8 @@ class RelayAccountsDomain:
             secrets["refresh_token"] = _text(refresh_token, "Relay refresh token", limit=32768)
         if remember_password is not None:
             account["remember_password"] = remember_password is True
+        if auto_grouping is not None:
+            account["auto_grouping"] = auto_grouping is True
         captured_user_id = _station_user_id(user_id)
         if captured_user_id:
             account["user_id"] = captured_user_id
@@ -5277,7 +5283,12 @@ class RelayAccountsDomain:
                 resource_error = "no_models"
             else:
                 resource_error = "unavailable"
-            account["resource_status"] = "unavailable"
+            # The read answered; only these two answers mean there is nothing
+            # to show.  Calling them ``unavailable`` made every pane state
+            # "API resources could not be loaded" over a station that had
+            # simply reported zero keys, and a fresh sign-in was then told it
+            # failed although it had succeeded.
+            account["resource_status"] = "ready" if resource_error in ("no_api_keys", "no_models") else "unavailable"
             account["last_updated_at"] = _utc_now_iso()
             account["resource_error"] = resource_error
             if resource_error == "no_api_keys":

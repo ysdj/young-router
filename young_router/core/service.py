@@ -2505,6 +2505,7 @@ class CoreStore:
         station_type: object = None,
         station_origin: object = None,
         remember_password: object = None,
+        auto_grouping: object = None,
         pending_account: object = False,
     ) -> dict[str, Any]:
         """Accept one native browser session and expose only public account state.
@@ -2521,6 +2522,7 @@ class CoreStore:
         """
 
         remember_choice = remember_password if isinstance(remember_password, bool) else None
+        auto_group_choice = auto_grouping if isinstance(auto_grouping, bool) else None
         known_secrets = tuple(
             value for value in (cookie, access_token, refresh_token, password) if isinstance(value, str) and value
         )
@@ -2633,6 +2635,7 @@ class CoreStore:
                         password=str(password) if isinstance(password, str) else "",
                         user_id=user_id,
                         remember_password=remember_choice,
+                        auto_grouping=auto_group_choice,
                     )
                 else:
                     # A host with no browser of its own (the page host) sends
