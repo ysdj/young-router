@@ -191,16 +191,18 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
       std::wstring_view confirm_label,
       std::wstring_view cancel_label,
       bool destructive);
-  // A two-answer question on the app's own decision window, for a surface that
-  // hosts its own UI (the relay sign-in browser): `primary_label` is the Return
-  // answer and `secondary_label` the cancel one.  True when the primary answer
-  // was chosen; a window that went away without an answer answers the secondary
-  // one.
-  bool DecideChoice(
+  // The relay sign-in's post-login question on the app's own decision window:
+  // session only, remember the password, or remember it and auto-group.  The
+  // answers run along the trailing edge with the last one outermost, so
+  // `auto_group_label` sits to the right of `remember_label`.  `remember_label`
+  // is the Return answer; Escape and a window closed without an answer are the
+  // session-only answer (0).
+  int DecideRememberChoice(
       std::wstring_view title,
       std::wstring_view message,
-      std::wstring_view primary_label,
-      std::wstring_view secondary_label) const;
+      std::wstring_view session_label,
+      std::wstring_view remember_label,
+      std::wstring_view auto_group_label) const;
   void ShowReadOnlyText(
       std::wstring_view title,
       std::wstring_view text,

@@ -1092,9 +1092,10 @@ void WinUI3NativeLeafModule::RelayLogin(
   native_options.decide = [leaf = leaf_](
                                std::wstring const& title,
                                std::wstring const& message,
-                               std::wstring const& primary_label,
-                               std::wstring const& secondary_label) {
-    return leaf->DecideChoice(title, message, primary_label, secondary_label);
+                               std::wstring const& session_label,
+                               std::wstring const& remember_label,
+                               std::wstring const& auto_group_label) {
+    return leaf->DecideRememberChoice(title, message, session_label, remember_label, auto_group_label);
   };
     context_.UIDispatcher().Post([
         owner, native_options = std::move(native_options), promise, js_dispatcher]() mutable {

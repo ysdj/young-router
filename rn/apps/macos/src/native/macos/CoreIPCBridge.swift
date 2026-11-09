@@ -234,6 +234,7 @@ import Foundation
         stationType: String? = nil,
         stationOrigin: String? = nil,
         rememberPassword: Bool? = nil,
+        autoGrouping: Bool? = nil,
         pendingAccount: Bool = false
     ) throws -> RelayLoginResult {
         var payload: [String: Any] = [
@@ -259,6 +260,7 @@ import Foundation
         if let stationType, !stationType.isEmpty { payload["station_type"] = stationType }
         if let stationOrigin, !stationOrigin.isEmpty { payload["station_origin"] = stationOrigin }
         if let rememberPassword { payload["remember_password"] = rememberPassword }
+        if let autoGrouping { payload["auto_grouping"] = autoGrouping }
         if pendingAccount { payload["pending_account"] = true }
         guard let body = try? JSONSerialization.data(withJSONObject: payload, options: []),
               body.count <= 96 * 1024 else { throw BridgeError.invalidResponse }

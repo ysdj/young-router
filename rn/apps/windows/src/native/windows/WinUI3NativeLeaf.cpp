@@ -1266,23 +1266,30 @@ std::optional<std::wstring> WinUI3NativeLeaf::ShowDecisionWindow(
   return answer;
 }
 
-bool WinUI3NativeLeaf::DecideChoice(
+int WinUI3NativeLeaf::DecideRememberChoice(
     std::wstring_view title,
     std::wstring_view message,
-    std::wstring_view primary_label,
-    std::wstring_view secondary_label) const {
-  DecisionAnswer secondary;
-  secondary.id = L"secondary";
-  secondary.label = std::wstring(secondary_label);
-  secondary.cancel = true;
-  DecisionAnswer primary;
-  primary.id = L"primary";
-  primary.label = std::wstring(primary_label);
-  primary.primary = true;
-  auto answer = ShowDecisionWindow(title, message, {secondary, primary});
-  // A window that went away without an answer is the cancel answer, exactly as
-  // Escape is.
-  return answer.has_value() && *answer == L"primary";
+    std::wstring_view session_label,
+    std::wstring_view remember_label,
+    std::wstring_view auto_group_label) const {
+  DecisionAnswer session;
+  session.id = L"session";
+  session.label = std::wstring(session_label);
+  session.cancel = true;
+  DecisionAnswer remember;
+  remember.id = L"remember";
+  remember.label = std::wstring(remember_label);
+  remember.primary = true;
+  DecisionAnswer auto_group;
+  auto_group.id = L"remember_auto";
+  auto_group.label = std::wstring(auto_group_label);
+  auto answer = ShowDecisionWindow(title, message, {session, remember, auto_group});
+  // A window that went away without an answer is the session-only answer,
+  // exactly as Escape is.
+  if (!answer.has_value()) return 0;
+  if (*answer == L"remember_auto") return 2;
+  if (*answer == L"remember") return 1;
+  return 0;
 }
 
 bool WinUI3NativeLeaf::Confirm(

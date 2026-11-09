@@ -79,6 +79,7 @@ class CoreIPCBridge {
       std::optional<std::string> const& station_type = std::nullopt,
       std::optional<std::string> const& station_origin = std::nullopt,
       bool remember_password = false,
+      std::optional<bool> auto_grouping = std::nullopt,
       bool pending_account = false);
   std::optional<RelaySessionRestoreResult> RestoreRelaySession(
       std::string const& account_id,

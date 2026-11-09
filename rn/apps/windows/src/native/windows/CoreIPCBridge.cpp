@@ -604,6 +604,7 @@ std::optional<CoreIPCBridge::RelayLoginResult> CoreIPCBridge::AcceptRelayLogin(
     std::optional<std::string> const& station_type,
     std::optional<std::string> const& station_origin,
     bool remember_password,
+    std::optional<bool> auto_grouping,
     bool pending_account) {
   if (account_id.empty() || account_id.size() > 96 ||
       (account_type != "newapi" && account_type != "sub2api") ||
@@ -656,6 +657,9 @@ std::optional<CoreIPCBridge::RelayLoginResult> CoreIPCBridge::AcceptRelayLogin(
     }
     if (remember_password) {
       payload.SetNamedValue(L"remember_password", winrt::Windows::Data::Json::JsonValue::CreateBooleanValue(true));
+    }
+    if (auto_grouping.has_value()) {
+      payload.SetNamedValue(L"auto_grouping", winrt::Windows::Data::Json::JsonValue::CreateBooleanValue(*auto_grouping));
     }
     if (pending_account) {
       payload.SetNamedValue(L"pending_account", winrt::Windows::Data::Json::JsonValue::CreateBooleanValue(true));

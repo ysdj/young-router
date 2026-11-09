@@ -7346,14 +7346,18 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                     refreshToken: refreshToken,
                     userID: userID,
                     rememberPassword: nil,
+                    autoGrouping: nil,
                     capturedPassword: nil,
                     attempt: attempt
                 )
                 return
             }
             // The typed password is a decision point, not a default: ask the
-            // user whether to keep it after the sign-in was verified.
-            presentRememberPasswordPrompt { [weak self, weak attempt] rememberPassword in
+            // user whether to keep it after the sign-in was verified.  The
+            // third answer also turns 自动分组 on, because a station with many
+            // groups otherwise needs a second visit to the account pane before
+            // its keys line up one per group.
+            presentRememberPasswordPrompt { [weak self, weak attempt] decision in
                 guard let self, let attempt, self.isCurrentCheck(attempt) else { return }
                 self.commitVerifiedLogin(
                     username: username,
@@ -7361,7 +7365,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                     accessToken: accessToken,
                     refreshToken: refreshToken,
                     userID: userID,
-                    rememberPassword: rememberPassword,
+                    rememberPassword: decision == .sessionOnly ? false : true,
+                    autoGrouping: decision == .rememberAndAutoGroup ? true : nil,
                     capturedPassword: capturedPassword,
                     attempt: attempt
                 )
@@ -7377,6 +7382,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             refreshToken: refreshToken,
             userID: userID,
             rememberPassword: nil,
+            autoGrouping: nil,
             capturedPassword: nil,
             attempt: attempt
         )
@@ -7396,12 +7402,18 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     /// answer because the answer changes nothing about the page: the session is
     /// already read out of it, and `finish` only re-dismisses what is already
     /// gone.
-    private func presentRememberPasswordPrompt(completion: @escaping (Bool) -> Void) {
+    private enum RememberDecision {
+        case sessionOnly
+        case remember
+        case rememberAndAutoGroup
+    }
+
+    private func presentRememberPasswordPrompt(completion: @escaping (RememberDecision) -> Void) {
         let promptParent = presentationParent
             ?? embeddedWindow
             ?? AppKitNativeLeaf.shared.activeWindow()
         guard let promptParent else {
-            completion(false)
+            completion(.sessionOnly)
             return
         }
         // The sign-in browser is no longer needed, and the wizard that opened
@@ -7410,16 +7422,21 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         AppKitNativeLeaf.shared.presentDecisionPanel(
             text("Remember the password?", "是否记住密码？"),
             message: text(
-                "Save the password on this device to enable automatic sign-in next time. Choose “Session only” to keep just the current sign-in state.",
-                "密码将保存到本机，下次可自动登录。选择「仅记住登录态」则只保留本次登录状态。"
+                "Save the password on this device to enable automatic sign-in next time. “Remember Password and Auto-Group” also arranges this station’s keys one per group; “Session Only” keeps just the current sign-in state.",
+                "密码将保存到本机，下次可自动登录。选择「记住密码并自动分组」会同时把该站点的密钥按分组整理；选择「仅记住登录态」只保留本次登录状态。"
             ),
             answers: [
                 NativeDecisionAnswer(id: "session", title: text("Session Only", "仅记住登录态"), isCancel: true),
-                NativeDecisionAnswer(id: "remember", title: text("Remember Password", "记住密码"), isDefault: true)
+                NativeDecisionAnswer(id: "remember", title: text("Remember Password", "记住密码"), isDefault: true),
+                NativeDecisionAnswer(id: "remember_auto", title: text("Remember Password and Auto-Group", "记住密码并自动分组"))
             ],
             in: promptParent
         ) { answer in
-            completion(answer == "remember")
+            switch answer {
+            case "remember_auto": completion(.rememberAndAutoGroup)
+            case "remember": completion(.remember)
+            default: completion(.sessionOnly)
+            }
         }
     }
 
@@ -7477,6 +7494,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         refreshToken: String?,
         userID: String?,
         rememberPassword: Bool?,
+        autoGrouping: Bool?,
         capturedPassword: String?,
         attempt: NativeRelayLoginAttempt
     ) {
@@ -7532,6 +7550,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                     stationType: stationType,
                     stationOrigin: stationOrigin,
                     rememberPassword: rememberPassword,
+                    autoGrouping: autoGrouping,
                     pendingAccount: pendingAccount
                 )
                 DispatchQueue.main.async { [weak self, weak attempt] in

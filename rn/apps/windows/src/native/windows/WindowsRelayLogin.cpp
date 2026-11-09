@@ -1061,24 +1061,33 @@ std::map<std::string, std::string> ParseCookieHeader(std::string const& header) 
   return result;
 }
 
-// Subordinate post-login prompt: keep the typed password on this device, or
-// keep only the current login state. Shown once the sign-in was verified, the
-// sign-in window has been taken off the screen, and the commit has begun, so a
-// closed window simply answers "session only".
+// The three answers to the post-login question: keep nothing, keep the typed
+// password, or keep it and turn 自动分组 on with the same sign-in.
+enum class RememberPasswordChoice { SessionOnly, Remember, RememberAndAutoGroup };
+
+// Subordinate post-login prompt: keep the typed password on this device, keep
+// it and auto-group the station's keys, or keep only the current login state.
+// Shown once the sign-in was verified, the sign-in window has been taken off
+// the screen, and the commit has begun, so a closed window simply answers
+// "session only".
 //
 // The host draws it on the app's own decision window (the same one every
 // confirmation uses on both hosts) rather than a ContentDialog: one question,
 // one surface.
-winrt::Windows::Foundation::IAsyncOperation<bool> ShowRememberPasswordPrompt(
+winrt::Windows::Foundation::IAsyncOperation<RememberPasswordChoice> ShowRememberPasswordPrompt(
     std::shared_ptr<LoginState> const& state) {
   const std::wstring title = Text(state->options, L"Remember the password?", L"是否记住密码？");
   const std::wstring message = Text(state->options,
-      L"Save the password on this device to enable automatic sign-in next time. Choose “Session only” to keep just the current sign-in state.",
-      L"密码将保存到本机，下次可自动登录。选择「仅记住登录态」则只保留本次登录状态。");
+      L"Save the password on this device to enable automatic sign-in next time. “Remember Password and Auto-Group” also arranges this station’s keys one per group; “Session Only” keeps just the current sign-in state.",
+      L"密码将保存到本机，下次可自动登录。选择「记住密码并自动分组」会同时把该站点的密钥按分组整理；选择「仅记住登录态」只保留本次登录状态。");
   const std::wstring remember = Text(state->options, L"Remember Password", L"记住密码");
+  const std::wstring auto_group = Text(state->options, L"Remember Password and Auto-Group", L"记住密码并自动分组");
   const std::wstring session_only = Text(state->options, L"Session Only", L"仅记住登录态");
-  if (!state->options.decide) co_return false;
-  co_return state->options.decide(title, message, remember, session_only);
+  if (!state->options.decide) co_return RememberPasswordChoice::SessionOnly;
+  const int answer = state->options.decide(title, message, session_only, remember, auto_group);
+  if (answer == 2) co_return RememberPasswordChoice::RememberAndAutoGroup;
+  if (answer == 1) co_return RememberPasswordChoice::Remember;
+  co_return RememberPasswordChoice::SessionOnly;
 }
 
 // Take the sign-in browser off the screen without ending its flow.
@@ -1210,11 +1219,14 @@ winrt::fire_and_forget ProbeLogin(
     // answers "session only" when the window is gone, so hiding it here never
     // strands the flow.
     bool remember_password = false;
+    bool auto_grouping = false;
     if (password && !password->empty() && password != state->restored_password) {
       co_await DispatcherQueueAwaiter{dispatcher};
       if (state->canceled.load()) co_return;
       HideLoginDialog(state);
-      remember_password = co_await ShowRememberPasswordPrompt(state);
+      const RememberPasswordChoice remember_choice = co_await ShowRememberPasswordPrompt(state);
+      remember_password = remember_choice != RememberPasswordChoice::SessionOnly;
+      auto_grouping = remember_choice == RememberPasswordChoice::RememberAndAutoGroup;
       if (state->canceled.load()) co_return;
       co_await winrt::resume_background();
     }
@@ -1246,7 +1258,8 @@ winrt::fire_and_forget ProbeLogin(
         verified->user_id.empty() ? std::nullopt : std::optional<std::string>(verified->user_id),
         state->options.station_id, state->options.station_name,
         state->options.station_type, state->options.station_origin,
-        remember_password, state->options.pending_account) : std::nullopt;
+        remember_password, auto_grouping ? std::optional<bool>(true) : std::nullopt,
+        state->options.pending_account) : std::nullopt;
     // Once Core accepted the login, preserve the matching native credentials
     // even if the user closed the dialog while that synchronous IPC call ran.
     if (credentials_saved && !accepted) {

@@ -1069,6 +1069,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # The post-login password question is that panel too, not an attached
         # sheet on a window that may go away underneath it.
         self.assertIn("NativeDecisionAnswer(id: \"remember\", title: text(\"Remember Password\", \"记住密码\"), isDefault: true)", leaf)
+        # The post-login prompt's third answer keeps the password and turns
+        # 自动分组 on with the same sign-in.
+        self.assertIn("NativeDecisionAnswer(id: \"remember_auto\", title: text(\"Remember Password and Auto-Group\", \"记住密码并自动分组\"))", leaf)
 
         # The version acknowledgement is the same panel with one answer.
         version = leaf.split("func showVersion() {", 1)[1].split("/// Version strings", 1)[0]
@@ -1112,9 +1115,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # The sign-in browser asks its post-login question through the host's own
         # window too, so one question has one surface on each host.
         windows_relay = (WIN_NATIVE / "WindowsRelayLogin.cpp").read_text(encoding="utf-8")
-        self.assertIn("co_return state->options.decide(title, message, remember, session_only);", windows_relay)
+        self.assertIn("const int answer = state->options.decide(title, message, session_only, remember, auto_group);", windows_relay)
+        self.assertIn("if (answer == 2) co_return RememberPasswordChoice::RememberAndAutoGroup;", windows_relay)
         self.assertNotIn("controls::ContentDialog prompt;", windows_relay)
-        self.assertIn("bool WinUI3NativeLeaf::DecideChoice(", windows_leaf)
+        self.assertIn("int WinUI3NativeLeaf::DecideRememberChoice(", windows_leaf)
         self.assertIn("native_options.decide = [leaf = leaf_](", windows_module)
         self.assertIn("bool destructive,", windows_module)
         self.assertIn("self.leaf.presentDecisionPanel(", module)
@@ -1891,6 +1895,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("showRelayLoginChoice", mac_bridge)
         self.assertNotIn("showRelayLoginChoice", mac_leaf)
         self.assertIn('text("Remember Password", "记住密码")', mac_leaf)
+        self.assertIn('text("Remember Password and Auto-Group", "记住密码并自动分组")', mac_leaf)
         self.assertIn('text("Session Only", "仅记住登录态")', mac_leaf)
         self.assertIn("presentRememberPasswordPrompt", mac_leaf)
         self.assertIn("ShowRememberPasswordPrompt", windows_relay)
@@ -1900,7 +1905,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # that dismissal takes the page probes off the clock so the answer
         # cannot commit into a check the login watcher already dropped.
         self.assertIn("private func dismissBrowserSurface() {", mac_leaf)
-        prompt = mac_leaf.split("private func presentRememberPasswordPrompt(completion: @escaping (Bool) -> Void) {", 1)[1].split("\n    }", 1)[0]
+        prompt = mac_leaf.split("private func presentRememberPasswordPrompt(completion: @escaping (RememberDecision) -> Void) {", 1)[1].split("\n    }", 1)[0]
         self.assertIn("dismissBrowserSurface()", prompt)
         # Order matters inside the prompt: the browser goes away first.
         self.assertLess(prompt.index("dismissBrowserSurface()"), prompt.index("presentDecisionPanel("))
@@ -1915,6 +1920,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         probe_login = windows_relay.split("winrt::fire_and_forget ProbeLogin", 1)[1].split("winrt::fire_and_forget InitializeBrowser", 1)[0]
         self.assertLess(probe_login.index("HideLoginDialog(state);"), probe_login.index("co_await ShowRememberPasswordPrompt(state);"))
         self.assertIn('L"Remember Password", L"记住密码"', windows_relay)
+        self.assertIn('L"Remember Password and Auto-Group", L"记住密码并自动分组"', windows_relay)
         self.assertIn('L"Session Only", L"仅记住登录态"', windows_relay)
         self.assertIn('payload["pending_account"] = true', mac_core)
         self.assertIn('payload.SetNamedValue(L"pending_account"', windows_core)
@@ -2193,7 +2199,8 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         probe_login = windows_relay.split("winrt::fire_and_forget ProbeLogin", 1)[1].split("winrt::fire_and_forget InitializeBrowser", 1)[0]
         self.assertNotIn("state->captured_password.reset();", probe_login)
         self.assertIn("if (!password) password = state->captured_password;", windows_relay)
-        self.assertIn("remember_password = co_await ShowRememberPasswordPrompt(state);", windows_relay)
+        self.assertIn("const RememberPasswordChoice remember_choice = co_await ShowRememberPasswordPrompt(state);", windows_relay)
+        self.assertIn("auto_grouping = remember_choice == RememberPasswordChoice::RememberAndAutoGroup;", windows_relay)
         self.assertIn("std::map<std::string, std::string> ParseCookieHeader(std::string const& header);", windows_relay)
         self.assertIn("if (credentials_saved && !accepted)", windows_relay)
         self.assertIn("class RelayLoginAttempt", windows_relay)

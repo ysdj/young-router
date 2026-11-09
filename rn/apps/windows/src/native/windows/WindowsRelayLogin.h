@@ -22,11 +22,14 @@ struct WindowsRelayLoginOptions {
   std::optional<std::string> station_type;
   std::optional<std::string> station_origin;
   // The host's own decision surface: the sign-in surface asks its post-login
-  // question (keep the typed password?) through the one decision window the app
-  // uses for every question, instead of a ContentDialog of its own.  Empty when
-  // the host has none, and then the question answers "session only".
-  std::function<bool(std::wstring const& title, std::wstring const& message,
-                     std::wstring const& primary_label, std::wstring const& secondary_label)> decide;
+  // question (keep the typed password? remember it and auto-group?) through the
+  // one decision window the app uses for every question, instead of a
+  // ContentDialog of its own.  Empty when the host has none, and then the
+  // question answers "session only".  The result is 0 for session only, 1 for
+  // remember, 2 for remember and auto-group.
+  std::function<int(std::wstring const& title, std::wstring const& message,
+                    std::wstring const& session_label, std::wstring const& remember_label,
+                    std::wstring const& auto_group_label)> decide;
 };
 
 struct WindowsRelayLoginResult {
