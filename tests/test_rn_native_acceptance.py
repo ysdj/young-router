@@ -580,10 +580,11 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("let alpha = hitPart == .knob", leaf)
         self.assertIn("func usePersistentScrollers(horizontal: Bool, vertical: Bool)", leaf)
         # Every native scroll view that keeps a scroller on screen draws it with
-        # that class: the declaration plus the model chooser, the read-only text
-        # editor (install and layout pass), the key list the group manager sheet
-        # hosts, and that sheet's 模型列表 list (its install, its layout pass, and
-        # the overflow policy that re-asserts the capsule while it overflows).
+        # that class: the declaration plus the model chooser's overflow policy, the
+        # read-only text editor (install and layout pass), the key list the group
+        # manager sheet hosts, and that sheet's 模型列表 list (its install, its
+        # layout pass, and the overflow policy that re-asserts the capsule while it
+        # overflows).
         self.assertEqual(8, leaf.count("usePersistentScrollers("))
         self.assertIn("scrollView.usePersistentScrollers(horizontal: false, vertical: true)", leaf)
         self.assertIn("usePersistentScrollers(horizontal: true, vertical: true)", leaf)
@@ -2472,6 +2473,43 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('modelChooserButton(title: "+"', mac_leaf)
         self.assertIn("NSButton(checkboxWithTitle:", mac_leaf)
         self.assertNotIn("let checkbox = NSBezierPath", mac_leaf)
+        # The chooser's list keeps a scroller exactly while its rows overflow.  It
+        # used to install the persistent capsule from its layout pass with no
+        # overflow test, so a request whose models all fit (three rows in a box
+        # that holds eight) still drew a full-length knob down the whole track: a
+        # scroll nothing could perform, over empty space under the last row.
+        chooser_scroll = mac_leaf.split("private final class NativeModelChooserScrollView: NSScrollView {", 1)[1].split(
+            "private final class NativeModelChooserListView: NSView {", 1
+        )[0]
+        self.assertIn("applyOverflowScrollerPolicy()", chooser_scroll)
+        self.assertIn("private func applyOverflowScrollerPolicy() {", chooser_scroll)
+        self.assertIn("let overflows = listView.frame.height > contentView.bounds.height + 0.5", chooser_scroll)
+        self.assertIn("let style: NSScroller.Style = overflows ? .legacy : .overlay", chooser_scroll)
+        self.assertIn("autohidesScrollers = !overflows", chooser_scroll)
+        self.assertIn("guard overflows else { return }", chooser_scroll)
+        # The capsule is installed in the overflowing branch only, never before
+        # the list has been asked whether it overflows.
+        self.assertEqual(1, chooser_scroll.count("usePersistentScrollers("))
+        self.assertIn("scroll.autohidesScrollers = true", mac_leaf)
+        self.assertIn("scroll.scrollerStyle = .overlay", mac_leaf)
+        # The document is never shorter than the clip view and never taller than
+        # its rows: that is what makes the policy's question (is the document
+        # taller than the clip view?) the honest one, and it is also the list a
+        # three-row chooser draws at the top of a full-height box.
+        self.assertIn("listView.fitDocumentHeight(atLeast: contentView.bounds.height)", chooser_scroll)
+        self.assertIn("func fitDocumentHeight(atLeast height: CGFloat) {", mac_leaf)
+        self.assertIn("let target = max(needed, height)", mac_leaf)
+        # A filter that leaves only the rows that fit has to run one layout pass,
+        # or the capsule the list no longer needs stays until the next resize.
+        self.assertIn("enclosingScrollView?.needsLayout = true", mac_leaf)
+        self.assertNotIn("setMinimumDocumentHeight", mac_leaf)
+        # The window is as tall as the chrome the layout measures plus the list:
+        # a fixed `chrome + listHeight` was six points short of its own
+        # constraints, and the squeezed list is what reported the overflow.
+        self.assertNotIn("132 + listHeight + 52", mac_leaf)
+        self.assertIn("let preferredListHeight = scroll.heightAnchor.constraint(equalToConstant: listHeight)", mac_leaf)
+        self.assertIn("let contentHeight = content.fittingSize.height", mac_leaf)
+        self.assertIn("panel.setContentSize(NSSize(width: contentWidth, height: contentHeight))", mac_leaf)
         self.assertIn("@objc func chooseModelsToAdd(_ models: [String]", mac_module)
         self.assertIn("RCT_EXTERN_METHOD(chooseModelsToAdd:", mac_bridge)
 

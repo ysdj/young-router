@@ -2243,9 +2243,14 @@ private enum NativeRelayOriginPolicy {
         listHeight: CGFloat,
         controller: NativeModelChooserController
     ) -> NSPanel {
-        let contentHeight: CGFloat = 132 + listHeight + 52
+        // The window's height is measured once the layout below exists (see the
+        // preferred list height at the end of this method), not guessed here: a
+        // fixed `chrome + listHeight` was six points short of what the same
+        // constraints asked for, so the list was squeezed into a scroll view
+        // shorter than the height it was given and reported an overflow over
+        // empty space.
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: contentWidth, height: contentHeight),
+            contentRect: NSRect(x: 0, y: 0, width: contentWidth, height: 0),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
@@ -2299,11 +2304,15 @@ private enum NativeRelayOriginPolicy {
         resultCountLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
         selectionControls.addArrangedSubview(resultCountLabel)
 
+        // A list that fits keeps AppKit's overlay scroller, which fades out when
+        // idle; the scroll view's own layout pass swaps in the app's persistent
+        // capsule exactly while the rows overflow the box.
         let scroll = NativeModelChooserScrollView()
         scroll.wantsLayer = true
         scroll.borderType = .bezelBorder
         scroll.hasVerticalScroller = true
-        scroll.autohidesScrollers = false
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
         scroll.hasHorizontalScroller = false
         scroll.usesPredominantAxisScrolling = true
         scroll.verticalScrollElasticity = .none
@@ -2327,8 +2336,7 @@ private enum NativeRelayOriginPolicy {
             resultCountLabel: resultCountLabel,
             selectAllButton: selectAllButton,
             invertSelectionButton: invertButton,
-            addButton: addButton,
-            minimumListHeight: listHeight
+            addButton: addButton
         )
 
         for view in [titleLabel, subtitleLabel, searchField, selectionControls, scroll, cancelButton, addButton] {
@@ -2359,6 +2367,16 @@ private enum NativeRelayOriginPolicy {
             cancelButton.trailingAnchor.constraint(equalTo: addButton.leadingAnchor, constant: -8),
             cancelButton.centerYAnchor.constraint(equalTo: addButton.centerYAnchor),
         ])
+        // Reserve the list's own height and let the chrome above and below it be
+        // whatever those steps measure.  Pinning the height for the measurement
+        // only, then releasing it, keeps the window resizable: a grown window
+        // gives the list the extra room, and a shrunk one makes the list overflow
+        // for the scroller policy to answer.
+        let preferredListHeight = scroll.heightAnchor.constraint(equalToConstant: listHeight)
+        preferredListHeight.isActive = true
+        let contentHeight = content.fittingSize.height
+        preferredListHeight.isActive = false
+        panel.setContentSize(NSSize(width: contentWidth, height: contentHeight))
         panel.initialFirstResponder = searchField
         panel.center()
         return panel
@@ -5060,7 +5078,6 @@ private final class NativeModelChooserScrollView: NSScrollView {
 
     override func layout() {
         super.layout()
-        usePersistentScrollers(horizontal: false, vertical: true)
         guard let listView = (documentView as? NativeModelChooserListView) ?? modelListView else { return }
         let viewportWidth = contentView.bounds.width
         if viewportWidth > 0, abs(listView.frame.width - viewportWidth) > 0.5 {
@@ -5068,7 +5085,32 @@ private final class NativeModelChooserScrollView: NSScrollView {
             frame.size.width = viewportWidth
             listView.frame = frame
         }
+        listView.fitDocumentHeight(atLeast: contentView.bounds.height)
         listView.updateVisibleRows()
+        applyOverflowScrollerPolicy()
+    }
+
+    /// Keep the app's capsule scroller exactly while this list overflows.
+    ///
+    /// The chooser used to install the persistent capsule unconditionally, so a
+    /// request whose models all fit - three rows in a box that holds eight - still
+    /// drew a full-length knob over the whole track: a scroll nothing could
+    /// perform, over empty space below the last row.  The list therefore keeps
+    /// AppKit's overlay scroller while it fits and takes the translucent capsule
+    /// the moment the document is taller than the clip view, which is also what
+    /// answers a window the user shrinks: the same rule as the shared table and
+    /// the group manager's 模型列表.
+    private func applyOverflowScrollerPolicy() {
+        guard let listView = (documentView as? NativeModelChooserListView) ?? modelListView else { return }
+        let overflows = listView.frame.height > contentView.bounds.height + 0.5
+        let style: NSScroller.Style = overflows ? .legacy : .overlay
+        if scrollerStyle != style || autohidesScrollers != !overflows {
+            scrollerStyle = style
+            autohidesScrollers = !overflows
+            tile()
+        }
+        guard overflows else { return }
+        usePersistentScrollers(horizontal: false, vertical: true)
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -5095,7 +5137,6 @@ private final class NativeModelChooserListView: NSView {
     private var rows: [Row]
     private var visibleRowIndexes: [Int]
     private var searchQuery = ""
-    private var minimumDocumentHeight: CGFloat = 0
     private let emptyLabel: String
     private let noMatchesLabel: String
     private var rowButtons: [Int: NSButton] = [:]
@@ -5124,18 +5165,32 @@ private final class NativeModelChooserListView: NSView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    func setMinimumDocumentHeight(_ height: CGFloat) { minimumDocumentHeight = max(0, height); updateDocumentHeight() }
+    /// Size the document to the rows it shows, but never shorter than the box
+    /// that shows them: three rows in the chooser's minimum box are a document
+    /// as tall as the clip view, so the box reads as one list with room to grow
+    /// rather than a short document floating in it - and, because the scroller
+    /// policy asks whether the document is taller than the clip view, it is also
+    /// what keeps a list that fits from reporting an overflow.
+    func fitDocumentHeight(atLeast height: CGFloat) {
+        let needed = max(rowHeight, CGFloat(max(1, visibleRowIndexes.count)) * rowHeight)
+        let target = max(needed, height)
+        guard abs(frame.height - target) > 0.5 else { return }
+        setFrameSize(NSSize(width: frame.width, height: target))
+    }
     func setSearchQuery(_ query: String) {
         searchQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let terms = searchQuery.split(whereSeparator: { $0.isWhitespace }).map { String($0).folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: .current) }
         visibleRowIndexes = terms.isEmpty ? Array(rows.indices) : rows.indices.filter { index in terms.allSatisfy(rows[index].foldedTitle.contains) }
-        updateDocumentHeight()
         updateVisibleRows()
+        // The document's height is the scroll view's business (it is the clip view
+        // that a filtered list has to fit into), and the scroller policy is read
+        // from that height: a filter that leaves only the rows that fit has to run
+        // one layout pass before the capsule can go away.
+        enclosingScrollView?.needsLayout = true
         stateDidChange?()
     }
     func selectAll() { for index in visibleRowIndexes { rows[index].selected = true }; updateVisibleRows(); stateDidChange?() }
     func invertSelection() { for index in visibleRowIndexes { rows[index].selected.toggle() }; updateVisibleRows(); stateDidChange?() }
-    private func updateDocumentHeight() { setFrameSize(NSSize(width: frame.width, height: max(minimumDocumentHeight, CGFloat(max(1, visibleRowIndexes.count)) * rowHeight))) }
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         updateVisibleRows()
@@ -5243,7 +5298,7 @@ private final class NativeModelChooserController: NSObject, NSWindowDelegate, NS
         listView.stateDidChange = { [weak self] in self?.refreshControls() }
     }
 
-    func configureControls(searchField: NativeInstantFocusSearchField, scrollView: NSScrollView, resultCountLabel: NSTextField, selectAllButton: NSButton, invertSelectionButton: NSButton, addButton: NSButton, minimumListHeight: CGFloat) {
+    func configureControls(searchField: NativeInstantFocusSearchField, scrollView: NSScrollView, resultCountLabel: NSTextField, selectAllButton: NSButton, invertSelectionButton: NSButton, addButton: NSButton) {
         self.searchField = searchField
         self.scrollView = scrollView
         self.resultCountLabel = resultCountLabel
@@ -5251,7 +5306,6 @@ private final class NativeModelChooserController: NSObject, NSWindowDelegate, NS
         self.invertSelectionButton = invertSelectionButton
         self.addButton = addButton
         searchField.delegate = self
-        listView.setMinimumDocumentHeight(minimumListHeight)
         refreshControls()
     }
 
