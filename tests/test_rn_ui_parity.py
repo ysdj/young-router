@@ -1450,6 +1450,23 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const applyProvidersQuietly = async (): Promise<boolean> => {", self.ui)
         self.assertIn("applyProviders={applyProvidersQuietly}", self.ui)
 
+    def test_a_keyless_provider_shows_no_model_empty_state_or_fetch(self) -> None:
+        """No key and no signed-in account means no roster and no fetch action.
+
+        The model pane drew 还没有模型 and 获取模型 for every provider, including
+        a relay station whose account held no keys: the empty sentence described
+        work the row could not do, and the action could only fail.  The table's
+        own headers and the ＋ that adds a key or model stay; the empty state
+        and the fetch row appear only once a key or a signed-in login account
+        exists.
+        """
+
+        self.assertIn("const providerHasModelCredential = useMemo(() => {", self.ui)
+        self.assertIn("choice.kind === \"account\" || choice.kind === \"relay\" || choice.state?.configured === true", self.ui)
+        self.assertIn("modelRows.length === 0 && providerHasModelCredential", self.ui)
+        self.assertIn("provider && providerHasModelCredential ? <View style={styles.tableBottomRow}>", self.ui)
+        self.assertNotIn("providers.modelsEmptyHint", self.ui)
+
     def test_loading_buttons_keep_their_title_width_and_color_with_a_spinner(self) -> None:
         """A working button reports progress; it never disables, renames, or resizes itself."""
 
@@ -7023,6 +7040,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # just landed); the pane's mount read stays implicit so 分组管理 can join
         # it instead of paying for the same station round trip twice.
         self.assertIn("await refreshAccountResources({ id: account.id }, { silent: true, force: true });", relay)
+        # A ready key read is the later proof of the same session the mount
+        # probe may have failed to renew: it clears 未登录 and keeps 已登录.
+        self.assertIn('if (status === "ready") {', relay)
+        self.assertIn("markLoginFailure(target.id, false);", relay)
+        self.assertIn("markLocalSignedIn(target.id, true);", relay)
         # Removal stages the dependency policy before the native erase and
         # persists a retry tombstone when the erase fails.
         removal = relay.split("const removeSelected = async (): Promise<void> => {", 1)[1].split("const setStationDraftValue", 1)[0]
@@ -7420,7 +7442,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # to them, so the rows and the switch can never disagree.
         self.assertIn("const align = current.autoGrouping ? alignAutoGroupingAction : undefined;", relay)
         self.assertIn("const readsStation = !groupManagerHasUsableFacts(current) || Boolean(align);", relay)
-        self.assertIn("if (align) await align(current.id);", relay)
+        self.assertIn("if (align) {", relay)
+        self.assertIn("await align(current.id);", relay)
+        self.assertIn("await applyStagedQuietly();", relay)
         self.assertIn("const shown = native.showGroupManager({ ...groupManagerRequest(current), loading: Boolean(pending) });", relay)
         self.assertIn("if (!update) current = await loadGroupManagerAccount(account);", relay)
         # The update carries the sheet's content alone, which is exactly the
@@ -7588,7 +7612,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('current.resourceStatus === "ready" && current.resources.length > 0;', relay)
         self.assertIn('if (await refreshResources(current.id) !== "ready") return current;', relay)
         self.assertIn("if (!readsStation) return current;", relay)
-        self.assertIn("if (align) await align(current.id);", relay)
+        self.assertIn("if (align) {", relay)
+        self.assertIn("await applyStagedQuietly();", relay)
         self.assertIn("pendingDelete: entry.pending_delete === true,", relay)
         # The list is the account's own keys and only those; 自动分组 checked is
         # a *preview* the window draws over them itself, and unchecking it puts

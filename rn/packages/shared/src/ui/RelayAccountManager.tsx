@@ -859,6 +859,15 @@ export function StationAccountsPanel({
     if (!silent) onStatus?.(undefined);
     try {
       const status = await refreshResources(target.id, { force });
+      // The station answered this account's key question.  That is the same
+      // session the mount probe just questioned, so a probe that failed marks
+      // the row 未登录 beside a key list the account has plainly read.  A ready
+      // read is the later, stronger answer: it clears the probe's failure and
+      // keeps the row 已登录 through the next restart.
+      if (status === "ready") {
+        markLoginFailure(target.id, false);
+        markLocalSignedIn(target.id, true);
+      }
       // A checked 自动分组 is the user's standing instruction to keep one key per
       // group, and this read is the station saying whether it still does.  The
       // pane already draws that key list as the aligned layout, so a key whose
@@ -1236,9 +1245,15 @@ export function StationAccountsPanel({
     try {
       if (await refreshResources(current.id) !== "ready") return current;
       // The refresh reported what the station serves; alignment then stages the
-      // one-key-per-group layout against those keys, and the read below carries
-      // both back as one account shape.
-      if (align) await align(current.id);
+      // one-key-per-group layout against those keys.  A checked switch is a
+      // standing instruction, so the layout it stages is applied here: leaving
+      // it as a draft under the open sheet made the window show keys that were
+      // never written, and closing the sheet dropped them because the sheet's
+      // own 保存并关闭 had no local edit to send.
+      if (align) {
+        await align(current.id);
+        await applyStagedQuietly();
+      }
       const snapshot = await refreshAccounts();
       return (snapshot ? accountsFromSnapshot(snapshot) : []).find((entry) => entry.id === current.id) ?? current;
     } catch {

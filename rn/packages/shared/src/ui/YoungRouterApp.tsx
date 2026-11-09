@@ -6377,6 +6377,25 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     })),
     [fetchKeyChoices, translate],
   );
+  // A provider with no usable credential has nothing to fetch and no roster to
+  // show.  A keyless relay station still has an account, but an account is not
+  // a key: 获取模型 would only fail.  Keep the table's own headers and the ＋
+  // that adds a key or model; do not draw 还没有模型 or a fetch action that
+  // cannot run until a key (or a signed-in login account) exists.
+  const providerHasModelCredential = useMemo(() => {
+    if (!provider) return false;
+    if (providerKindSelected === "ourFreeModel") return false;
+    if (fetchKeyChoices.some((choice) =>
+      choice.kind === "account" || choice.kind === "relay" || choice.state?.configured === true
+    )) return true;
+    return (
+      providerKindSelected === "openai"
+      || providerKindSelected === "workbuddy"
+      || providerKindSelected === "workbuddyGlobal"
+      || providerKindSelected === "qoder"
+      || providerKindSelected === "qoderGlobal"
+    ) && providerAuthStatus(provider) === "signed_in";
+  }, [fetchKeyChoices, provider, providerKindSelected]);
   const selectedFetchKey = fetchKeyID ?? fetchKeyChoices[0]?.id ?? "";
   const workspaceService = provider ? providerService(provider) : undefined;
   // The 倍率 column reads the catalog through `peekServiceRate`, which is a
@@ -7437,10 +7456,10 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
           <View style={styles.providerMiddlePane} onLayout={({ nativeEvent }) => setModelTableWidth(nativeEvent.layout.width)}>
             <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteModel} /> : null}</>}>
               <View style={styles.nativeModelTable}><NativeTable columns={modelTableColumns(modelTableWidth, translate)} rows={modelRows} secondaryRowKeys={offModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange={(key) => { if (!key) { /* a click that names no model row leaves the provider — the row these models belong to — as the selection, so the inspector shows it instead of emptying */ setSelectedModel(undefined); setSelectedModelRow(undefined); setProviderSourceModel(undefined); return; } const modelID = modelIDFromRowKey(key); if (modelID === undefined) return; setSelectedModel(modelID); setSelectedModelRow(key); setProviderSourceModel(undefined); }} style={styles.modelTable} /></View>
-              {modelRows.length === 0 ? <View style={styles.routesEmpty}>
+              {modelRows.length === 0 && providerHasModelCredential ? <View style={styles.routesEmpty}>
                 <Text style={styles.routesEmptyTitle}>{translate("providers.modelsEmpty")}</Text>
               </View> : null}
-              {provider ? <View style={styles.tableBottomRow}>{fetchKeyChoices.length > 0 ? <NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy} accessibilityLabel={translate("providers.providerKey")} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /> : null}<ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || (fetchKeyChoices.length > 0 && !selectedFetchKey)} onPress={() => { void fetchModels(); }} /></View> : null}
+              {provider && providerHasModelCredential ? <View style={styles.tableBottomRow}>{fetchKeyChoices.length > 0 ? <NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy} accessibilityLabel={translate("providers.providerKey")} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /> : null}<ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || (fetchKeyChoices.length > 0 && !selectedFetchKey)} onPress={() => { void fetchModels(); }} /></View> : null}
             </TablePane>
           </View>
         </View>
