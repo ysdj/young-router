@@ -109,7 +109,7 @@ downloads, so the build spends its effort on size without changing what runs:
   browser's `Accept-Encoding` admits with `Content-Encoding` + `Vary`. Doing
   this here rather than in Core keeps a worker thread off the first page load
   of every browser, and the sibling cannot go stale: it is named after the file
-  it was built from. The publisher's `MANIFEST.json` names the page by what it
+  it was built from. The build's `MANIFEST.json` names the page by what it
   decodes to, not by its encoding.
 
 The last two matter most on the host this page exists for: a headless machine

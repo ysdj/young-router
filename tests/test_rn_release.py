@@ -668,99 +668,45 @@ class ReactNativeReleaseTests(unittest.TestCase):
             self.assertNotIn('test -f "$CORE/web/bundle.js"', script)
             self.assertNotIn('&& -f "$CORE/web/bundle.js"', script)
 
-    def test_the_browser_page_is_published_per_commit_and_names_its_script(self) -> None:
-        """A headless host installs the page by commit, so a page is published by commit.
+    def test_the_browser_page_is_built_per_commit_and_names_its_script(self) -> None:
+        """The page is built from the commit, not from the tree, and stays local.
 
-        The host with no window cannot build the page: it asks for
-        `releases/download/web/web-<commit>.tar.gz`, and a commit whose page was
-        never published leaves it serving the previous one.  On 2026-11-08 that
-        was a page built for 3153fa3 in front of a Core running 15ca916 -- a
-        provider list with no Qoder row, and a tab title the page had already
-        stopped saying.  Publishing is one command, and it builds from a clean
-        checkout of the commit rather than from a working tree, because the
-        asset's name is the commit.
+        A host with no window cannot build the page, so the build produces the
+        page of the commit it is about to run as an archive named by that
+        commit.  The archive is written under the ignored `output/` directory
+        and is never uploaded: sending it to the host is the operator's step.
+        On 2026-11-08 a host running 15ca916 served the page built for 3153fa3
+        for an hour -- a provider list with no Qoder row, and a tab title the
+        page had already stopped saying -- which is why the build reads a clean
+        checkout of the commit rather than a working tree.
         """
 
-        publisher = (ROOT / "scripts" / "publish-web-page.sh").read_text(encoding="utf-8")
+        page_build = (ROOT / "scripts" / "build-web-page.sh").read_text(encoding="utf-8")
         builder = (ROOT / "rn" / "apps" / "web" / "build.mjs").read_text(encoding="utf-8")
 
         # Built from the named commit, never from the tree that happens to be
         # checked out.
-        self.assertIn('git -C "$ROOT" worktree add --detach "$tree" "$commit"', publisher)
-        self.assertIn('git -C "$ROOT" rev-parse --verify --quiet "$commit_ref^{commit}"', publisher)
+        self.assertIn('git -C "$ROOT" worktree add --detach "$tree" "$commit"', page_build)
+        self.assertIn('git -C "$ROOT" rev-parse --verify --quiet "$commit_ref^{commit}"', page_build)
         # The page's one script is content-addressed, and a fixed name is a
         # browser frozen on whichever build it first saw.
         self.assertIn("await rm(resolve(outdir, \"bundle.js\"));", builder)
         self.assertIn('const bundleName = `bundle.${digest}.js`;', builder)
         self.assertIn('<script type="module" src="./${bundleName}"></script>', builder)
-        self.assertIn('[[ ! -e "$dist/bundle.js" ]]', publisher)
-        self.assertIn('[[ "$bundle_name" =~ ^bundle\\.[0-9a-f]{16}\\.js$ ]]', publisher)
-        self.assertIn('grep -q "src=', publisher)
-        self.assertIn('"$dist/index.html" || {', publisher)
-        # The asset's name is the commit, and the manifest states it: that is
+        self.assertIn('[[ ! -e "$dist/bundle.js" ]]', page_build)
+        self.assertIn('[[ "$bundle_name" =~ ^bundle\\.[0-9a-f]{16}\\.js$ ]]', page_build)
+        self.assertIn('grep -q "src=', page_build)
+        self.assertIn('"$dist/index.html" || {', page_build)
+        # The archive's name is the commit, and the manifest states it: that is
         # what the host compares before it restarts onto a commit.
-        self.assertIn('asset="web-$commit.tar.gz"', publisher)
-        self.assertIn('{ built_from: process.argv[3], files }', publisher)
-        self.assertIn('MANIFEST.json', publisher)
-        self.assertIn('gh release upload "$TAG" "$work/$asset" --repo "$REPOSITORY"', publisher)
-
-    def test_the_page_bucket_holds_one_commit_and_is_replaced_each_publish(self) -> None:
-        """The bucket is one page, not an archive of every page ever built.
-
-        Nothing removed an asset: each publish uploaded `web-<commit>.tar.gz`
-        beside the ones already there, so the release grew to fourteen public
-        tarballs -- thirteen of which no host could install, because a host asks
-        for the page of the commit it is about to run.  The bucket is now
-        replaced on every publish, and the delete happens before the create so
-        the release the repository shows is never the stale one.
-        """
-
-        publisher = (ROOT / "scripts" / "publish-web-page.sh").read_text(encoding="utf-8")
-
-        # The whole cycle, in order: delete what is there, create the bucket,
-        # upload this commit's page.
-        delete = publisher.index('gh release delete "$TAG" --repo "$REPOSITORY" --cleanup-tag --yes')
-        create = publisher.index('gh release create "$TAG" --repo "$REPOSITORY"')
-        upload = publisher.index('gh release upload "$TAG" "$work/$asset" --repo "$REPOSITORY"')
-        self.assertLess(delete, create)
-        self.assertLess(create, upload)
-        # The tag travels with the release: a leftover `web` tag would point at a
-        # release that no longer exists and be moved by the next create anyway.
-        self.assertIn("--cleanup-tag", publisher)
-        # The replacement is announced, with what it is replacing: a publish that
-        # silently swaps a public asset is the failure this cannot repeat.
-        self.assertIn('echo "replacing release $TAG (${previous:-no assets})" >&2', publisher)
-        # No upload path compares-against-published-then-exits any more: that
-        # branch was what let the bucket accumulate ("already published: ..."
-        # returned early, and a different page refused to overwrite, so the only
-        # outcome that added an asset was a new commit's page).
-        self.assertNotIn('already published: $asset', publisher)
-        self.assertNotIn('the same commit must build the same page; nothing was uploaded', publisher)
-
-    def test_the_page_bucket_never_becomes_the_latest_release(self) -> None:
-        """An artifact bucket must not answer as the repository's latest release.
-
-        GitHub marks a release neither draft nor prerelease as a candidate for
-        "Latest", and `scripts/publish-web-page.sh` created `web` with neither
-        flag.  So the page bucket -- fourteen per-commit tarballs, described by
-        its own notes as built per commit -- became the repository's latest
-        release: `/releases/latest` redirected to a page archive instead of the
-        app, and `/releases` opened on the bucket rather than on a version.
-
-        `--prerelease` is what keeps it out of that slot, and `--latest=false`
-        states it a second time for the case where GitHub would pick by date.
-        """
-
-        publisher = (ROOT / "scripts" / "publish-web-page.sh").read_text(encoding="utf-8")
-
-        self.assertIn('gh release create "$TAG" --repo "$REPOSITORY" --title "$RELEASE_TITLE"', publisher)
-        create = publisher[publisher.index('gh release create "$TAG"') :]
-        create = create[: create.index('\n\n')]
-        self.assertIn("--prerelease", create)
-        self.assertIn("--latest=false", create)
-        # The title says what the thing is, so the releases page does not read
-        # "Browser page (built per commit)" as a product release name.
-        self.assertIn('RELEASE_TITLE="Browser page builds (latest commit only)"', publisher)
+        self.assertIn('asset="web-$commit.tar.gz"', page_build)
+        self.assertIn('{ built_from: process.argv[3], files }', page_build)
+        self.assertIn('MANIFEST.json', page_build)
+        # The build is local: the default destination is the ignored output
+        # directory, and no release call exists to put the page on GitHub.
+        self.assertIn('output_dir="$ROOT/output"', page_build)
+        self.assertIn('mkdir -p "$output_dir"', page_build)
+        self.assertNotIn("gh release", page_build)
 
     def test_the_page_travels_precompressed_and_without_the_editors_inline_copy(self) -> None:
         """The page is the one thing every browser on a remote host downloads.
@@ -775,13 +721,13 @@ class ReactNativeReleaseTests(unittest.TestCase):
           through the platform extension Metro uses (`.web.ts`).
         - every text asset ships beside `.br` and `.gz` siblings, which Core
           picks from by `Accept-Encoding` and states in `Vary`.  They are
-          derived bytes, so the published manifest identifies a page by what it
+          derived bytes, so the archive's manifest identifies a page by what it
           decodes to: a different brotli library must not read as a different
           page.
         """
 
         better = (ROOT / "rn" / "apps" / "web" / "build.mjs").read_text(encoding="utf-8")
-        publisher = (ROOT / "scripts" / "publish-web-page.sh").read_text(encoding="utf-8")
+        page_build = (ROOT / "scripts" / "build-web-page.sh").read_text(encoding="utf-8")
         web_only = ROOT / "rn/packages/shared/src/ui/code-editor/CodeEditorWebBundle.web.ts"
 
         # The editor's script is the only file the shell's script may not have:
@@ -799,10 +745,10 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertIn("await writeFile(resolve(outdir, `${name}${suffix}`), encoded);", better)
 
         # A page shipped without them costs every browser the whole file, so
-        # the publisher refuses it -- and does not call the encoding content.
-        self.assertIn('[[ -s "$dist/$name.$codec" ]]', publisher)
-        self.assertIn('if (name.endsWith(".br") || name.endsWith(".gz")) continue;', publisher)
-        self.assertIn(r'grep -q "src=\"\./$editor_name\"" "$dist/editor.html"', publisher)
+        # the build refuses it -- and does not call the encoding content.
+        self.assertIn('[[ -s "$dist/$name.$codec" ]]', page_build)
+        self.assertIn('if (name.endsWith(".br") || name.endsWith(".gz")) continue;', page_build)
+        self.assertIn(r'grep -q "src=\"\./$editor_name\"" "$dist/editor.html"', page_build)
 
     def test_the_portable_smoke_relocates_instead_of_copying_a_gigabyte(self) -> None:
         # The smoke exists to prove the bundle works from somewhere other than
