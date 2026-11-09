@@ -1450,21 +1450,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const applyProvidersQuietly = async (): Promise<boolean> => {", self.ui)
         self.assertIn("applyProviders={applyProvidersQuietly}", self.ui)
 
-    def test_a_keyless_provider_shows_no_model_empty_state_or_fetch(self) -> None:
-        """No key and no signed-in account means no roster and no fetch action.
+    def test_the_model_pane_states_no_empty_roster_and_no_keyless_fetch(self) -> None:
+        """A blank model table is the empty state; only its actions are gated.
 
-        The model pane drew 还没有模型 and 获取模型 for every provider, including
-        a relay station whose account held no keys: the empty sentence described
-        work the row could not do, and the action could only fail.  The table's
-        own headers and the ＋ that adds a key or model stay; the empty state
-        and the fetch row appear only once a key or a signed-in login account
+        The pane drew 还没有模型 plus a hint for every provider, including a
+        relay station whose account held no keys: the sentence described work
+        the row could not do, and 获取模型 could only fail.  Neither sentence is
+        drawn now.  The table's own headers and the ＋ stay, and the fetch row
+        appears once a configured or relay key, or a signed-in login account,
         exists.
         """
 
         self.assertIn("const providerHasModelCredential = useMemo(() => {", self.ui)
         self.assertIn("choice.kind === \"account\" || choice.kind === \"relay\" || choice.state?.configured === true", self.ui)
-        self.assertIn("modelRows.length === 0 && providerHasModelCredential", self.ui)
         self.assertIn("provider && providerHasModelCredential ? <View style={styles.tableBottomRow}>", self.ui)
+        self.assertNotIn("providers.modelsEmpty", self.ui)
         self.assertNotIn("providers.modelsEmptyHint", self.ui)
 
     def test_loading_buttons_keep_their_title_width_and_color_with_a_spinner(self) -> None:

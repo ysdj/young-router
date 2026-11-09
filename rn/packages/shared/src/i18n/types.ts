@@ -348,7 +348,6 @@ export type TranslationKey =
   | "service.reload"
   | "providers.newProvider"
   | "providers.emptyTitle"
-  | "providers.modelsEmpty"
   | "providers.selectToEdit"
   | "providers.routesEmpty"
   | "providers.routesEmptyHint"

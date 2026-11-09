@@ -349,7 +349,6 @@ export const en: Record<TranslationKey, string> = {
   "providers.routesEmpty": "No routes yet",
   "providers.routesEmptyHint": "Add a model under a provider, and it appears here as a route.",
   "providers.emptyTitle": "Add your first provider",
-  "providers.modelsEmpty": "No models yet",
   "providers.selectToEdit": "Select a provider, model, or route to edit it.",
   "providers.emptyHint": "Connect an upstream provider to start routing models through Young Router.",
   "providers.newModel": "New model",
