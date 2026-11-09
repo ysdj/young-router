@@ -5316,6 +5316,12 @@ class RelayAccountsDomain:
             and str(resource.get("id", ""))
             and str(resource.get("name", ""))
         }
+        # A key read the station answered is the session being accepted: the
+        # account is signed in even when the separate balance/profile read
+        # failed.  Marking it only from the balance read left the pane saying
+        # 未登录 beside a key list the same session had just read.
+        account["login_status"] = "signed_in"
+        account["login_observed_at"] = _utc_now_iso()
         account["resource_status"] = "ready"
         account["last_updated_at"] = _utc_now_iso()
         account["resource_error"] = "none"

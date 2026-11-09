@@ -2611,7 +2611,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             # for it again either.
             self.assertNotIn("/api/status", [path for _, path, _ in fake.requests])
 
-    def test_an_authenticated_balance_read_is_also_the_login_observation(self) -> None:
+    def test_an_authenticated_read_is_also_the_login_observation(self) -> None:
         """A station that answered an authenticated read has accepted the session.
 
         Core holds the session, so the balance read is a login check that was
@@ -2662,15 +2662,17 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertLess(account["login_observed_seconds_ago"], 5.0)
             self.assertEqual(3.0, account["balance"])
 
-            # A read that did not answer is not a login observation: the note
-            # the last real answer left behind stands, and so does the balance.
+            # The balance read did not answer, so the balance stays what the
+            # last real answer said.  The key read did answer, and that is the
+            # station accepting the same session: the account is signed in even
+            # though the profile summary is stale.
             domain.set_login_status(account_id, "expired")
             station.balance_answers = False
             domain._balance_observations.clear()
             domain.refresh_resources(account_id)
 
             account = domain.snapshot()["accounts"][0]
-            self.assertEqual("expired", account["login_status"])
+            self.assertEqual("signed_in", account["login_status"])
             self.assertEqual(3.0, account["balance"])
 
     def test_a_refused_sign_in_starts_a_wait_instead_of_repeating(self) -> None:
