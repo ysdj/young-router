@@ -58,6 +58,9 @@ from .base import (
 _ANTHROPIC_UNVERSIONED_ENDPOINT_PATCH_ATTR = (
     "_young_router_anthropic_unversioned_endpoint_patch"
 )
+_ANTHROPIC_RESPONSES_TOOL_ARGUMENTS_PATCH_ATTR = (
+    "_young_router_anthropic_responses_tool_arguments_patch"
+)
 # LiteLLM treats these top-level request keys as caller-supplied credentials and
 # pins them on whatever deployment it selects next
 # (``get_dynamic_litellm_params``); a fallback hop may only present the next
@@ -383,6 +386,117 @@ def _enable_anthropic_prompt_caching() -> None:
     except Exception:
         return
     litellm.enable_anthropic_prompt_caching = True
+
+
+def _install_anthropic_responses_tool_arguments_patch() -> None:
+    """Let a function call state its arguments on the item, not only in deltas.
+
+    LiteLLM's Anthropic-to-Responses bridge opens a ``tool_use`` block from
+    ``response.output_item.added`` and forwards arguments only from
+    ``response.function_call_arguments.delta``.  The Responses wire also allows
+    a function call to state its complete ``arguments`` on the item itself
+    (``added`` or ``done``) without ever emitting a delta, and a relay that
+    does so is not violating the schema.  Such a call reached Claude as
+    ``tool_use`` with ``input: {}``: observed 2026-11-10 through
+    ``/v1/messages`` on a Responses-pinned GPT route, where two parallel calls
+    in one turn arrived -- one streamed its arguments and stayed intact, the
+    other stated only the finished item and arrived empty.  Claude Code's Bash
+    tool then answered ``InputValidationError: the required parameter command
+    is missing`` on every attempt, and the model retried the same empty call
+    until the client gave up and the turn was closed on disconnect.
+
+    The accumulated delta text is the authoritative partial JSON, so this only
+    appends the suffix the item states beyond it: a relay that streams a
+    truncated call and finishes with the whole one is repaired too, while a
+    relay whose deltas already carry the full arguments gets no duplicate
+    bytes.  A call whose deltas and item disagree in the middle is left as the
+    stream stated it -- reconciling two different JSON documents is not this
+    patch's call.
+    """
+
+    try:
+        from litellm.llms.anthropic.pass_through.responses_adapters.streaming_iterator import (
+            AnthropicResponsesStreamWrapper,
+        )
+    except Exception:
+        return
+
+    original_process_event = getattr(
+        AnthropicResponsesStreamWrapper, "_process_event", None
+    )
+    if not callable(original_process_event) or getattr(
+        original_process_event,
+        _ANTHROPIC_RESPONSES_TOOL_ARGUMENTS_PATCH_ATTR,
+        False,
+    ):
+        return
+
+    def _field(source: Any, name: str) -> Any:
+        return source.get(name) if isinstance(source, dict) else getattr(source, name, None)
+
+    def _item_id(event: Any, item: Any = None) -> str:
+        # The wrapper keys its open block by the item's own id and closes it the
+        # same way, so the item is the first answer when the event carries one.
+        value = _field(item, "id") if item is not None else None
+        if not isinstance(value, str) or not value:
+            value = _field(event, "item_id")
+        return value if isinstance(value, str) else ""
+
+    def patched_process_event(self: Any, event: Any) -> Any:
+        event_type = _field(event, "type")
+        streamed = getattr(self, "_young_router_tool_argument_text", None)
+        if streamed is None:
+            streamed = {}
+            setattr(self, "_young_router_tool_argument_text", streamed)
+
+        if event_type == "response.function_call_arguments.delta":
+            item_id = _item_id(event)
+            delta = _field(event, "delta")
+            if item_id and isinstance(delta, str) and delta:
+                streamed[item_id] = streamed.get(item_id, "") + delta
+        elif event_type == "response.output_item.done":
+            item = _field(event, "item")
+            if item is not None and _field(item, "type") == "function_call":
+                item_id = _item_id(event, item)
+                arguments = _field(item, "arguments")
+                already = streamed.get(item_id, "") if item_id else ""
+                if (
+                    item_id
+                    and item_id in getattr(self, "_item_id_to_block_index", {})
+                    and isinstance(arguments, str)
+                    and arguments
+                    and arguments != already
+                ):
+                    if arguments.startswith(already):
+                        suffix = arguments[len(already):]
+                    elif already:
+                        suffix = ""
+                    else:
+                        suffix = arguments
+                    if suffix:
+                        original_process_event(
+                            self,
+                            {
+                                "type": "response.function_call_arguments.delta",
+                                "item_id": item_id,
+                                "delta": suffix,
+                            },
+                        )
+                        streamed[item_id] = already + suffix
+
+        return original_process_event(self, event)
+
+    setattr(
+        patched_process_event,
+        _ANTHROPIC_RESPONSES_TOOL_ARGUMENTS_PATCH_ATTR,
+        True,
+    )
+    setattr(
+        patched_process_event,
+        "_original_process_event",
+        original_process_event,
+    )
+    AnthropicResponsesStreamWrapper._process_event = patched_process_event
 
 
 def _browser_compatible_headers_retry_kwargs(
@@ -3418,6 +3532,9 @@ def install_all() -> None:
     # Anthropic caches only what the request marks, and a Responses turn has no
     # place to mark it: without this every Codex thread pays full input price.
     _enable_anthropic_prompt_caching()
+    # A Responses function call may state its arguments on the item instead of
+    # streaming deltas; without this the Messages bridge sends ``input: {}``.
+    _install_anthropic_responses_tool_arguments_patch()
     _install_model_listing_efforts_patch()
     # Claude Desktop's picker discovers from /v1/models; the view is installed
     # beside the listing patch so both listing branches publish it.
