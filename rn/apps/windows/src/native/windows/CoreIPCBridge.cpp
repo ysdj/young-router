@@ -365,6 +365,20 @@ using WinHttpHandle = std::unique_ptr<std::remove_pointer_t<HINTERNET>, WinHttpH
 
 }  // namespace
 
+// What requests to one Core share: a WinHTTP session and a connection to its
+// control endpoint.  Both were opened per request before this existed, so every
+// settings control paid a fresh TCP handshake and threw away the keep-alive
+// connection Core already answers with (``_CoreRequestHandler`` serves
+// HTTP/1.1 for exactly that reason).
+struct CoreIPCBridge::Transport {
+  // Declared session first so it is destroyed last: WinHTTP requires a
+  // connection handle to be closed before the session it came from.
+  WinHttpHandle session;
+  WinHttpHandle connection;
+  std::wstring address;
+  unsigned short port = 0;
+};
+
 CoreIPCBridge& CoreIPCBridge::Shared() {
   static CoreIPCBridge instance;
   return instance;
@@ -1002,15 +1016,22 @@ CoreIPCBridge::HttpResult CoreIPCBridge::Request(
     std::string const& body,
     std::wstring const& token,
     int receive_timeout_ms) {
-  WinHttpHandle session{WinHttpOpen(L"YoungRouterCore/1", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0)};
-  if (!session) throw std::runtime_error("core unavailable");
-  // Server long-poll is bounded at 20 seconds; 30 seconds keeps an ordinary
-  // `event: null` heartbeat from invalidating the one-shot Core session.
-  WinHttpSetTimeouts(session.get(), 5000, 5000, 5000, receive_timeout_ms);
-  WinHttpHandle connection{WinHttpConnect(session.get(), endpoint.address.c_str(), endpoint.port, 0)};
+  // Only the request handle is per request; the session and the connection to
+  // this Core are reused.  The shared_ptr keeps both handles open until this
+  // request returns, even when a Core replacement drops the cache meanwhile.
+  std::shared_ptr<Transport> transport = SharedTransport(endpoint);
   std::wstring target = L"/ipc" + (route.empty() ? L"" : L"/" + route);
-  WinHttpHandle request{connection ? WinHttpOpenRequest(connection.get(), method.c_str(), target.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0) : nullptr};
+  // WinHTTP documents that WinHttpOpenRequest may be called concurrently on one
+  // connection handle, creating separate requests tied to it.
+  WinHttpHandle request{WinHttpOpenRequest(transport->connection.get(), method.c_str(), target.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0)};
   if (!request) throw std::runtime_error("core unavailable");
+  // No longer the session's timeouts: with the session cached, a receive bound
+  // set for one request would bound every other request on it, so a 900 s probe
+  // and a 30 s long poll would keep lowering each other's wait.  This handle
+  // belongs to this request alone, and WinHttpSetTimeouts is documented to take
+  // the handle WinHttpOpenRequest returned.  (WinHTTP's own receive default is
+  // 60 s, which is why an ordinary request has always stated its bound.)
+  WinHttpSetTimeouts(request.get(), 5000, 5000, 5000, receive_timeout_ms);
   std::wstring headers = L"Authorization: Bearer " + token + L"\r\nContent-Type: application/json\r\n";
   BOOL sent = WinHttpSendRequest(request.get(), headers.c_str(), static_cast<DWORD>(-1L),
       body.empty() ? WINHTTP_NO_REQUEST_DATA : const_cast<char*>(body.data()), static_cast<DWORD>(body.size()), static_cast<DWORD>(body.size()), 0);
@@ -1041,6 +1062,39 @@ CoreIPCBridge::HttpResult CoreIPCBridge::Request(
     result.body.resize(offset + read);
   }
   return result;
+}
+
+std::shared_ptr<CoreIPCBridge::Transport> CoreIPCBridge::SharedTransport(Endpoint const& endpoint) {
+  std::lock_guard guard(transport_mutex_);
+  if (transport_ && transport_->address == endpoint.address && transport_->port == endpoint.port) {
+    return transport_;
+  }
+  // Another address or port is another Core: these handles belong to the process
+  // that answered them, so they are dropped rather than reused.  A request that
+  // still holds one keeps its handles open until it returns.
+  transport_.reset();
+  auto transport = std::make_shared<Transport>();
+  transport->session.reset(WinHttpOpen(L"YoungRouterCore/1", WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+  if (!transport->session) throw std::runtime_error("core unavailable");
+  // The session carries the ordinary request's bounds.  The 30 s receive bound
+  // is what keeps a 20 s long poll's `event: null` heartbeat from being read as
+  // a dead Core; a request that needs a longer one states it on its own handle
+  // (see Request).
+  WinHttpSetTimeouts(transport->session.get(), 5000, 5000, 5000, 30000);
+  transport->connection.reset(WinHttpConnect(transport->session.get(), endpoint.address.c_str(), endpoint.port, 0));
+  if (!transport->connection) throw std::runtime_error("core unavailable");
+  transport->address = endpoint.address;
+  transport->port = endpoint.port;
+  transport_ = transport;
+  return transport_;
+}
+
+void CoreIPCBridge::DiscardTransports() {
+  // Resetting under the mutex only ever closes an idle session and connection:
+  // a request in flight holds its own reference, so WinHttpCloseHandle runs
+  // after it returns (Transport destroys the connection before the session).
+  std::lock_guard guard(transport_mutex_);
+  transport_.reset();
 }
 
 void CoreIPCBridge::StartPollingIfSubscription(
@@ -1214,6 +1268,10 @@ void CoreIPCBridge::InvalidateCoreLocked(bool preserve_subscription) {
   session_token_.clear();
   session_expires_at_tick_ = 0;
   subscription_id_.clear();
+  // Every Core teardown lands here, so this is where the pooled connection to
+  // the old process goes: a fresh Core answers on its own endpoint, and a stale
+  // connection must not be reused against it.
+  DiscardTransports();
   if (!preserve_subscription) {
     subscription_request_.clear();
     // A full teardown drops every window's event handler: the class keeps one

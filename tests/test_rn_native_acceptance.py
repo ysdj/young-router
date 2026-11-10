@@ -414,7 +414,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
 
     def test_macos_core_bootstrap_waits_only_for_the_control_endpoint(self) -> None:
         mac = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
-        start = mac.split("    private func startCoreLocked() throws -> Endpoint {", 1)[1].split(
+        start = mac.split("    private func startCore() throws -> LaunchedCore {", 1)[1].split(
             "    private func previewProfileEnvironment", 1
         )[0]
 
@@ -426,7 +426,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
     def test_macos_core_never_mutates_the_signed_bundle_with_bytecode(self) -> None:
         mac = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
 
-        start = mac.split("    private func startCoreLocked() throws -> Endpoint {", 1)[1].split(
+        start = mac.split("    private func startCore() throws -> LaunchedCore {", 1)[1].split(
             "    private func previewProfileEnvironment", 1
         )[0]
         self.assertIn('childEnvironment["YOUNG_ROUTER_PYCACHE_DIR"]', start)
@@ -435,6 +435,61 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             'childEnvironment["PYTHONDONTWRITEBYTECODE"] = "1"',
             start,
         )
+
+    def test_macos_session_renewal_and_core_start_release_the_bridge_lock(self) -> None:
+        mac = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
+        ensure = mac.split("    private func ensureSession() throws -> (Endpoint, String, Int, Bool) {", 1)[1].split(
+            "    private func startSession(", 1
+        )[0]
+        start = mac.split("    private func startSession(", 1)[1].split(
+            "    private func startCore() throws -> LaunchedCore {", 1
+        )[0]
+
+        # The snapshot is the only work under the bridge lock: a renewal is a
+        # loopback round trip and a Core start waits ten seconds for a process,
+        # and both used to be held against every window's next request.
+        self.assertNotIn("defer { lock.unlock() }", ensure)
+        self.assertLess(
+            ensure.index("lock.unlock()"),
+            ensure.index("renewedSession(endpoint: endpoint, credential: sessionToken, generation: generation)"),
+        )
+        self.assertIn("let current = self.generation == generation", mac)
+        self.assertIn("return try startSession(observedGeneration: generation)", ensure)
+
+        self.assertIn("startLock.lock()", start)
+        self.assertLess(start.index("lock.unlock()"), start.index("stopCoreProcess(staleProcess, directory: staleDirectory)"))
+        self.assertLess(start.index("lock.unlock()"), start.index("let launched = try startCore()"))
+        # Whoever loses the start re-reads the session instead of spawning a
+        # second Core, and an endpoint registered after a stop is not adopted.
+        self.assertIn("if let live = usableSessionLocked(observedGeneration: observedGeneration) {", start)
+        self.assertIn("let registered = !isStopping() && generation == sessionGeneration", start)
+        self.assertNotIn("defer { lock.unlock() }", start)
+
+    def test_windows_ipc_reuses_the_session_and_connection_per_core(self) -> None:
+        windows = (WIN_NATIVE / "CoreIPCBridge.cpp").read_text(encoding="utf-8")
+        request = windows.split("CoreIPCBridge::HttpResult CoreIPCBridge::Request(", 1)[1].split(
+            "std::shared_ptr<CoreIPCBridge::Transport> CoreIPCBridge::SharedTransport(", 1
+        )[0]
+        shared = windows.split("std::shared_ptr<CoreIPCBridge::Transport> CoreIPCBridge::SharedTransport(", 1)[1].split(
+            "void CoreIPCBridge::DiscardTransports()", 1
+        )[0]
+
+        # Per request: a request handle and its own timeouts. The session and the
+        # connection belong to the cached transport, so they are opened once per
+        # endpoint instead of once per settings control.
+        self.assertNotIn("WinHttpOpen(", request)
+        self.assertNotIn("WinHttpConnect(", request)
+        self.assertIn("WinHttpOpenRequest(transport->connection.get()", request)
+        self.assertIn("WinHttpSetTimeouts(request.get(), 5000, 5000, 5000, receive_timeout_ms)", request)
+        self.assertIn("WinHttpOpen(", shared)
+        self.assertIn("WinHttpConnect(transport->session.get()", shared)
+        self.assertIn("transport_->address == endpoint.address && transport_->port == endpoint.port", shared)
+        # A Core replacement (which clears the endpoint and bumps the generation)
+        # drops the handles instead of pointing them at the process that is gone.
+        invalidate = windows.split("void CoreIPCBridge::InvalidateCoreLocked(", 1)[1].split(
+            "void CoreIPCBridge::TakeCoreLocked(", 1
+        )[0]
+        self.assertIn("DiscardTransports();", invalidate)
 
     def test_macos_event_poll_retries_without_replacing_core(self) -> None:
         mac = (MAC_NATIVE / "CoreIPCBridge.swift").read_text(encoding="utf-8")
@@ -455,7 +510,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         windows = (WIN_NATIVE / "CoreIPCBridge.cpp").read_text(encoding="utf-8")
 
         self.assertIn("private func exchangeSession", mac)
-        self.assertIn("exchangeSession(endpoint: endpoint, credential: sessionToken)", mac)
+        self.assertIn("renewedSession(endpoint: endpoint, credential: sessionToken, generation: generation)", mac)
         self.assertIn("if let endpoint, let sessionToken,", mac)
         self.assertIn("renewal_token = session_token_", windows)
         self.assertIn('Request(renewal_endpoint, L"hello", L"POST", "", renewal_token)', windows)

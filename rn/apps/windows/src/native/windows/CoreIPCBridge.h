@@ -5,6 +5,7 @@
 #include <exception>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -118,6 +119,12 @@ class CoreIPCBridge {
     unsigned long generation = 0;
   };
 
+  // One WinHTTP session and one connection to a Core endpoint, shared by the
+  // requests that follow it.  Defined in the .cpp because its handles are
+  // WinHTTP types; requests hold it through a shared_ptr so a Core replacement
+  // can drop the cache without closing handles a request is still using.
+  struct Transport;
+
   CoreIPCBridge() = default;
   ~CoreIPCBridge();
   CoreIPCBridge(CoreIPCBridge const&) = delete;
@@ -125,6 +132,8 @@ class CoreIPCBridge {
 
   Session EnsureSession();
   Endpoint StartCoreLocked();
+  std::shared_ptr<Transport> SharedTransport(Endpoint const& endpoint);
+  void DiscardTransports();
   HttpResult Request(
       Endpoint const& endpoint,
       std::wstring const& route,
@@ -170,6 +179,11 @@ class CoreIPCBridge {
   std::atomic<bool> stopping_{false};
   std::mutex poll_mutex_;
   std::thread poll_thread_;
+  // Guards the cached transport only, and is never held across a request: it is
+  // a separate mutex from `mutex_` so a settings control is not queued behind a
+  // 20 s event poll, and the lock order is always mutex_ then this one.
+  std::mutex transport_mutex_;
+  std::shared_ptr<Transport> transport_;
 };
 
 }  // namespace YoungRouter
