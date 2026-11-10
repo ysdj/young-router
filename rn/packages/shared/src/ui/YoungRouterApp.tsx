@@ -6435,7 +6435,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     return station ? relayAccounts.filter((account) => station.accountIDs.includes(account.id)) : [];
   }, [relayAccounts, stationForProvider]);
   const selectedStation = provider ? stationForProvider(provider) : undefined;
-  const selectedStationAccounts = stationAccountsFor(provider);
+  const selectedStationAccounts = useMemo(() => stationAccountsFor(provider), [provider, stationAccountsFor]);
   // The station keys this provider's pickers offer: the rows the key table
   // draws under its accounts, built from the same accounts and the same
   // visibility rule, so an entry in 获取模型 always has the row above it that

@@ -31,7 +31,7 @@ class ProviderKeyConsistencyTests(unittest.TestCase):
 
     def test_the_picker_offers_the_providers_own_station_keys(self) -> None:
         workspace = section(UI, "function ProviderWorkspace(", "function ProviderKeysPanel(")
-        self.assertIn("const selectedStationAccounts = stationAccountsFor(provider);", workspace)
+        self.assertIn("const selectedStationAccounts = useMemo(() => stationAccountsFor(provider), [provider, stationAccountsFor]);", workspace)
         # Built from the accounts the table draws, with the table's own
         # visibility rule, so every offered entry has a row above it.
         self.assertIn("selectedStationAccounts.flatMap((account) =>", workspace)
