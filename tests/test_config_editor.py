@@ -1330,13 +1330,88 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             config_schema.infer_upstream_fallback_surface("openai/kimi-k3"),
         )
         self.assertEqual(
-            "openai/chat",
+            "openai/responses",
             config_schema.infer_upstream_fallback_surface("openai/gpt-5"),
         )
         self.assertEqual(
             "anthropic",
             config_schema.infer_upstream_fallback_surface("anthropic/claude-sonnet"),
         )
+        # An Images name states the one wire such a route serves, so it stays
+        # on the Chat inference its probe never contradicts.
+        for image_model in (
+            "openai/gpt-image-2",
+            "openai/gpt-image-2.6-flare",
+        ):
+            with self.subTest(model=image_model):
+                self.assertEqual(
+                    "openai/chat",
+                    config_schema.infer_upstream_fallback_surface(image_model),
+                )
+
+    def test_a_gpt_route_defaults_to_responses_pinned(self) -> None:
+        """A GPT route starts pinned to Responses, its native wire.
+
+        Responses is the wire the gpt family was built for; a route left on
+        ``fallback`` pays the Chat bridge's rewrite on every request.  The
+        pin is the same decision a Claude route makes for Messages, so a
+        probe that finds Responses unsupported can still rewrite the surface
+        and this mode keeps that answer pinned.  Every other family -- and
+        every Images route, which answers neither chat wire -- keeps the old
+        default: follow the client, fall back to Chat.
+        """
+
+        for model in ("openai/gpt-5", "gpt-5.1", "openai/gpt-5.1-codex"):
+            with self.subTest(model=model):
+                self.assertEqual(
+                    "openai/responses",
+                    config_schema.infer_upstream_fallback_surface(model),
+                )
+                self.assertEqual(
+                    "fixed",
+                    config_schema.inferred_upstream_protocol_mode(model),
+                )
+        self.assertEqual(
+            "fixed",
+            config_schema.default_upstream_protocol_mode("openai/responses", "openai/gpt-5"),
+        )
+        for model in (
+            "openai/kimi-k3",
+            "openai/qwen3.8-max",
+            "azure/gpt-4o",
+            "openai/gpt-image-2",
+        ):
+            with self.subTest(model=model):
+                self.assertEqual(
+                    "fallback",
+                    config_schema.inferred_upstream_protocol_mode(model),
+                )
+
+        # A document that states no protocol fields reads back with the same
+        # defaults the pane would have written, so the next save keeps them.
+        path = self.write_config(
+            """
+            providers:
+              gpt_channel:
+                api_base: "https://example.com/v1"
+                api_keys:
+                  - name: default
+                    value: "sk-test"
+            model_list:
+              - model_name: gpt-5
+                litellm_params:
+                  model: openai/gpt-5
+                  api_base: "https://example.com/v1"
+                  api_key: "sk-test"
+                model_info:
+                  id: "00000029"
+                  provider: gpt_channel
+            """
+        )
+        payload = config_load.load_config(path)
+        model = payload["providers"][0]["models"][0]
+        self.assertEqual("openai/responses", model["upstream_url_surface"])
+        self.assertEqual("fixed", model["upstream_protocol_mode"])
 
     def test_a_claude_route_defaults_to_the_wire_it_serves(self) -> None:
         """A Claude route starts pinned to Messages, not on the client's wire.
@@ -1350,8 +1425,8 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         failure a whole model group was producing.
 
         The mode follows the route's own surface, so a route the user pinned to
-        another protocol keeps its choice, and a non-Claude route still follows
-        the client.
+        another protocol keeps its choice, and a non-Claude, non-GPT route still
+        follows the client.
         """
 
         self.assertEqual(
@@ -1361,7 +1436,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         for surface in ("openai/chat", "openai/responses", ""):
             self.assertEqual(
                 "fallback",
-                config_schema.default_upstream_protocol_mode(surface),
+                config_schema.default_upstream_protocol_mode(surface, "openai/kimi-k3"),
             )
         self.assertEqual(
             "fixed",
@@ -1369,7 +1444,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         )
         self.assertEqual(
             "fallback",
-            config_schema.inferred_upstream_protocol_mode("openai/gpt-5"),
+            config_schema.inferred_upstream_protocol_mode("openai/kimi-k3"),
         )
 
         # The same default is what a document that states no mode is read back

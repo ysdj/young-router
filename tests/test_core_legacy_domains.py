@@ -760,8 +760,8 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 {
                     "provider_id": provider_id,
                     "model": {
-                        "name": "gpt-5",
-                        "upstream_model": "gpt-5",
+                        "name": "kimi-k3",
+                        "upstream_model": "kimi-k3",
                         "api_key_name": "default",
                         "order": 2,
                         "enabled": True,
@@ -771,7 +771,47 @@ class ProvidersModelsDomainTests(unittest.TestCase):
 
             model = domain.snapshot()["providers"][0]["models"][1]
             self.assertEqual("openai/chat", model["upstream_url_surface"])
-            self.assertEqual("openai/gpt-5", model["litellm_model"])
+            self.assertEqual("openai/kimi-k3", model["litellm_model"])
+            self.assertEqual("fallback", model["upstream_protocol_mode"])
+
+    def test_new_gpt_model_defaults_to_responses_surface(self) -> None:
+        """A GPT route starts on Responses, pinned like a Claude route.
+
+        Responses is that family's native wire, and the Images member of it is
+        excluded: ``gpt-image-*`` answers the Images wire alone, so a chat
+        surface there would name a wire the route refuses.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            provider_id = domain.snapshot()["providers"][0]["editor_id"]
+
+            for order, name in ((2, "gpt-5"), (3, "gpt-image-2")):
+                domain.dispatch(
+                    "model.add",
+                    {
+                        "provider_id": provider_id,
+                        "model": {
+                            "name": name,
+                            "upstream_model": name,
+                            "api_key_name": "default",
+                            "order": order,
+                            "enabled": True,
+                        },
+                    },
+                )
+
+            models = {
+                model["model_name"]: model
+                for model in domain.snapshot()["providers"][0]["models"]
+            }
+            self.assertEqual("openai/responses", models["gpt-5"]["upstream_url_surface"])
+            self.assertEqual("openai/gpt-5", models["gpt-5"]["litellm_model"])
+            self.assertEqual("fixed", models["gpt-5"]["upstream_protocol_mode"])
+            self.assertEqual("openai/chat", models["gpt-image-2"]["upstream_url_surface"])
+            self.assertEqual("fallback", models["gpt-image-2"]["upstream_protocol_mode"])
 
     def test_upstream_model_is_displayed_without_prefix_and_saved_canonically(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1540,6 +1580,60 @@ class ProvidersModelsDomainTests(unittest.TestCase):
         )
         self.assertTrue(result["available"])
         self.assertEqual("ok", result["status"])
+
+    def test_a_probed_gpt_route_recommends_chat_when_responses_is_refused(self) -> None:
+        """A GPT route starts pinned to Responses; the probe is how that moves.
+
+        The pin means a refused Responses wire is not retried per request, so
+        probing is the only place the route can learn otherwise: a route that
+        answers Chat alone must recommend it.  What the pane writes is the
+        surface, and the mode it keeps pins the answer it just measured.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(PROVIDER_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            provider_id = domain.snapshot()["providers"][0]["editor_id"]
+            domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {
+                        "name": "gpt-5",
+                        "upstream_model": "openai/gpt-5",
+                        "api_key_name": "default",
+                        "order": 2,
+                        "enabled": True,
+                    },
+                },
+            )
+            route = next(
+                model
+                for model in domain.snapshot()["providers"][0]["models"]
+                if model["model_name"] == "gpt-5"
+            )
+            self.assertEqual("openai/responses", route["upstream_url_surface"])
+            self.assertEqual("fixed", route["upstream_protocol_mode"])
+
+            def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
+                answered = surface == "openai/chat"
+                return {
+                    "surface": surface,
+                    "available": answered,
+                    "status": "ok" if answered else "unsupported",
+                }
+
+            with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe):
+                result = domain.probe(
+                    {"provider_id": provider_id, "model_id": route["editor_id"]}
+                )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual("openai/chat", result["recommended_surface"])
+            surfaces = {entry["surface"]: entry for entry in result["surfaces"]}
+            self.assertTrue(surfaces["openai/chat"]["available"])
+            self.assertFalse(surfaces["openai/responses"]["available"])
 
     def test_model_probe_reports_recommendation_without_staging_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

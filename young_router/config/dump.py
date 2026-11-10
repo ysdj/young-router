@@ -448,7 +448,7 @@ def _entry_from_editor(
     upstream_protocol_mode = _upstream_protocol_mode(
         model.get("upstream_protocol_mode")
     ) if str(model.get("upstream_protocol_mode") or "").strip() else default_upstream_protocol_mode(
-        upstream_url_surface
+        upstream_url_surface, model.get("litellm_model")
     )
     auth = _provider_auth(
         {

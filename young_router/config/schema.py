@@ -554,12 +554,21 @@ def _upstream_protocol_mode(value: Any) -> str:
     return value.strip().lower()
 
 
-def infer_upstream_fallback_surface(value: Any) -> str:
-    """Infer the fallback protocol from the exact upstream model identifier.
+#: Model-name tokens that state the route generates images instead of
+#: answering a conversation.  Such a route serves the Images wire alone, so it
+#: is the one gpt family the Responses-first default must not claim: the probe
+#: asks it the Images question only, and a chat surface there would name a wire
+#: the route refuses by design.
+_IMAGE_MODEL_TOKENS = frozenset({"image", "imagen", "dall", "dalle"})
 
-    The public model alias is deliberately not accepted here.  A route may
-    expose a Claude-shaped public name while targeting a Kimi or GPT model,
-    and that alias must not change the adapter used as the fallback.
+
+def _upstream_model_tokens(value: Any) -> list[str]:
+    """The upstream model's name tokens, with this app's own prefix removed.
+
+    ``openai/`` and ``anthropic/`` are prefixes this app writes itself (the
+    surface picks them), so they say nothing about which model is behind the
+    route.  Any other first segment is LiteLLM's adapter and stays part of the
+    name: ``azure/gpt-4o`` is not the same route as ``openai/gpt-4o``.
     """
 
     model = _string_value(value).strip().lower()
@@ -567,16 +576,50 @@ def infer_upstream_fallback_surface(value: Any) -> str:
         prefix, raw_model = model.split("/", 1)
         if prefix in {"openai", "anthropic"}:
             model = raw_model.strip()
-    tokens = [token for token in re.split(r"[^a-z0-9]+", model) if token]
+    return [token for token in re.split(r"[^a-z0-9]+", model) if token]
+
+
+def names_openai_native_model(value: Any) -> bool:
+    """Whether this upstream name is an OpenAI model answered natively on Responses.
+
+    The name is the evidence, not the public alias and not the configured
+    surface: a route may expose a Claude-shaped public name while targeting a
+    GPT model.  ``gpt`` as the model's first token (after this app's own
+    adapter prefix) is the family whose native wire is ``/v1/responses`` -- its
+    reasoning, summary frames and tool calls stream there without the Chat
+    bridge rewriting them.  An Images name is excluded because that wire is the
+    only endpoint such a route serves.
+    """
+
+    tokens = _upstream_model_tokens(value)
+    if not tokens or tokens[0] != "gpt":
+        return False
+    return not _IMAGE_MODEL_TOKENS.intersection(tokens)
+
+
+def infer_upstream_fallback_surface(value: Any) -> str:
+    """Infer the fallback protocol from the exact upstream model identifier.
+
+    The public model alias is deliberately not accepted here.  A route may
+    expose a Claude-shaped public name while targeting a Kimi or GPT model,
+    and that alias must not change the adapter used as the fallback.
+
+    Three families, three defaults: a Claude model is served by relay channels
+    that mount Messages, a GPT model's native wire is Responses, and everything
+    else falls back to Chat Completions -- the one wire every OpenAI-compatible
+    relay answers, and a fallback is only consulted after the upstream refused
+    the protocol the client used.
+    """
+
+    tokens = _upstream_model_tokens(value)
     if any(token in {"claude", "anthropic"} for token in tokens):
         return "anthropic"
-    # Everything else falls back to Chat Completions: it is the one wire every
-    # OpenAI-compatible relay answers, and a fallback is only consulted after the
-    # upstream refused the protocol the client used.
+    if names_openai_native_model(value):
+        return "openai/responses"
     return "openai/chat"
 
 
-def default_upstream_protocol_mode(surface: Any) -> str:
+def default_upstream_protocol_mode(surface: Any, model: Any = None) -> str:
     """The protocol mode a route starts with, decided by its own surface.
 
     A route whose surface is the Anthropic Messages wire starts *pinned* to it.
@@ -588,17 +631,30 @@ def default_upstream_protocol_mode(surface: Any) -> str:
     alternate surface is tried, so the wire the route can actually serve is the
     one it must start on.
 
+    A GPT model pinned to Responses is the same decision for the same reason:
+    Responses is that family's native wire, so a relay that answers it must not
+    be reached through a Chat bridge first.  The name is passed in because the
+    surface alone cannot tell a GPT route from any other route a user pointed
+    at Responses; a route whose model is not an OpenAI one keeps following the
+    client (``fallback``).  When probing finds Responses unsupported, its
+    recommendation rewrites the surface and this mode keeps that answer pinned.
+
     A route that has *chosen* a mode keeps it: the pane offers 协议方式 on every
     route, and re-deciding for the user would discard the field he came to edit.
     """
 
-    return "fixed" if _string_value(surface).strip() == "anthropic" else "fallback"
+    wire = _string_value(surface).strip()
+    if wire == "anthropic":
+        return "fixed"
+    if wire == "openai/responses" and names_openai_native_model(model):
+        return "fixed"
+    return "fallback"
 
 
 def inferred_upstream_protocol_mode(value: Any) -> str:
     """The protocol mode for a route that states none of its own."""
 
-    return default_upstream_protocol_mode(infer_upstream_fallback_surface(value))
+    return default_upstream_protocol_mode(infer_upstream_fallback_surface(value), value)
 
 
 # LiteLLM adapter prefixes this app does not manage.  The first segment of a

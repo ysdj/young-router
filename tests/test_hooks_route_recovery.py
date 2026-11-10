@@ -4434,28 +4434,44 @@ class HookNativeRouteRecoveryExhaustionTests(HookTestCase):
 
 
 class DefaultFallbackProtocolTests(unittest.TestCase):
-    """The default fallback names the wire every relay answers.
+    """The default fallback names the wire each family is served on.
 
-    A route that states nothing gets ``openai/chat``, or ``anthropic`` when the
-    upstream model is a Claude one.  The fallback is only consulted once the
-    upstream refuses the protocol the client used, so it must name the protocol
-    most likely to answer there.
+    A route that states nothing gets ``openai/responses`` for a GPT model,
+    ``anthropic`` for a Claude one, and ``openai/chat`` for everything else.
+    The fallback is only consulted once the upstream refuses the protocol the
+    client used, so it must name the protocol most likely to answer there --
+    and a GPT route is pinned to Responses instead, because that is its native
+    wire rather than a bridge this app has to rewrite.
     """
 
-    def test_a_non_claude_model_defaults_to_chat(self) -> None:
+    def test_a_non_openai_model_defaults_to_chat(self) -> None:
         from young_router.config import schema as config_schema
 
         for model in (
             "openai/deepseek-v4.1-flash",
             "openai/kimi-k3",
             "openai/glm-5.2",
-            "openai/gpt-5",
-            "gpt-5.1",
+            "azure/gpt-4o",
+            "openai/gpt-image-2",
         ):
             with self.subTest(model=model):
                 self.assertEqual(
                     "openai/chat",
                     config_schema.infer_upstream_fallback_surface(model),
+                )
+
+    def test_an_openai_model_defaults_to_responses(self) -> None:
+        from young_router.config import schema as config_schema
+
+        for model in ("openai/gpt-5", "gpt-5.1", "openai/gpt-5.1-codex"):
+            with self.subTest(model=model):
+                self.assertEqual(
+                    "openai/responses",
+                    config_schema.infer_upstream_fallback_surface(model),
+                )
+                self.assertEqual(
+                    "fixed",
+                    config_schema.inferred_upstream_protocol_mode(model),
                 )
 
     def test_a_claude_model_defaults_to_anthropic(self) -> None:

@@ -366,7 +366,9 @@ def _model_to_editor(
     upstream_protocol_mode = (
         _upstream_protocol_mode(model_info.get(UPSTREAM_PROTOCOL_MODE_KEY))
         if model_info.get(UPSTREAM_PROTOCOL_MODE_KEY) is not None
-        else default_upstream_protocol_mode(upstream_url_surface)
+        else default_upstream_protocol_mode(
+            upstream_url_surface, params.get("model")
+        )
     )
     entry_extra = {
         key: _jsonable(value)

@@ -4935,7 +4935,8 @@ class ProvidersModelsDomain:
                 # client.
                 model["upstream_protocol_mode"] = (
                     default_mode if default_surface else default_upstream_protocol_mode(
-                        model.get("upstream_url_surface")
+                        model.get("upstream_url_surface"),
+                        model.get("litellm_model"),
                     )
                 )
             model["litellm_model"] = cls._canonical_upstream_model(
@@ -6691,7 +6692,10 @@ class ProvidersModelsDomain:
             model["upstream_protocol_mode"] = (
                 account_mode
                 if account_surface
-                else default_upstream_protocol_mode(model.get("upstream_url_surface"))
+                else default_upstream_protocol_mode(
+                    model.get("upstream_url_surface"),
+                    model.get("litellm_model"),
+                )
             )
         if "litellm_model" in model:
             model["litellm_model"] = self._canonical_upstream_model(

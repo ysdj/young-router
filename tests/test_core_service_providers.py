@@ -1527,7 +1527,8 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
         Claude model, so a route left on ``fallback`` first pays that refusal on
         every request before the alternate surface is tried.  The mode therefore
         follows the route's own surface for a plain-key provider, while a route
-        the user already decided keeps its choice.
+        the user already decided keeps its choice.  A family with no native wire
+        of its own -- here a Qwen model -- still follows the client.
         """
 
         directory, domain = self._domain()
@@ -1559,14 +1560,16 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             self.assertEqual("anthropic", claude_route["upstream_url_surface"])
             self.assertEqual("fixed", claude_route["upstream_protocol_mode"])
 
-            # A non-Claude route on the same provider still follows the client.
+            # A route of another family on the same provider still follows the
+            # client: Chat is the wire every relay answers, and nothing about
+            # this model makes one protocol its own.
             snapshot = domain.dispatch(
                 "model.add",
                 {
                     "provider_id": provider_id,
                     "model": {
-                        "name": "gpt-compatible",
-                        "upstream_model": "openai/gpt-5",
+                        "name": "qwen-compatible",
+                        "upstream_model": "openai/qwen3.8-max",
                         "enabled": True,
                         "order": 1,
                     },
@@ -1576,7 +1579,8 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
                 model["model_name"]: model
                 for model in snapshot["providers"][0]["models"]
             }
-            self.assertEqual("fallback", models["gpt-compatible"]["upstream_protocol_mode"])
+            self.assertEqual("openai/chat", models["qwen-compatible"]["upstream_url_surface"])
+            self.assertEqual("fallback", models["qwen-compatible"]["upstream_protocol_mode"])
             self.assertEqual("fixed", models["claude-opus-5-5"]["upstream_protocol_mode"])
 
             # The user's own choice survives every later edit of the group.
@@ -1607,6 +1611,96 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             }
             self.assertEqual("fallback", models["claude-opus-5-5"]["upstream_protocol_mode"])
             self.assertEqual("fixed", models["another-claude"]["upstream_protocol_mode"])
+
+    def test_a_new_gpt_route_is_pinned_to_responses(self) -> None:
+        """A GPT route starts pinned to Responses, its native wire.
+
+        Responses is the wire this family was built for; left on ``fallback``,
+        every request first gets bridged to Chat and its reasoning summary comes
+        back aggregated.  The pin is the same decision a Claude route makes, and
+        a probe that finds Responses unsupported rewrites the surface -- the
+        route then keeps that answer pinned instead of re-trying a wire the
+        station already refused.  An Images model is not in this family: it
+        answers neither chat wire, so it keeps the Chat inference.
+        """
+
+        directory, domain = self._domain()
+        with directory:
+            provider_id = domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "OpenAI Channel",
+                        "api_base": "https://api.example.test/v1",
+                        "create_default_api_key": True,
+                    }
+                },
+            )["providers"][0]["id"]
+
+            snapshot = domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {
+                        "name": "gpt-5",
+                        "upstream_model": "openai/gpt-5",
+                        "enabled": True,
+                        "order": 0,
+                    },
+                },
+            )
+            route = snapshot["providers"][0]["models"][0]
+            self.assertEqual("openai/responses", route["upstream_url_surface"])
+            self.assertEqual("fixed", route["upstream_protocol_mode"])
+
+            snapshot = domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {
+                        "name": "gpt-image-2",
+                        "upstream_model": "openai/gpt-image-2",
+                        "enabled": True,
+                        "order": 1,
+                    },
+                },
+            )
+            models = {
+                model["model_name"]: model
+                for model in snapshot["providers"][0]["models"]
+            }
+            self.assertEqual("openai/chat", models["gpt-image-2"]["upstream_url_surface"])
+            self.assertEqual("fallback", models["gpt-image-2"]["upstream_protocol_mode"])
+
+            # The user's own choice survives every later edit of the group.
+            gpt_id = models["gpt-5"]["editor_id"]
+            domain.dispatch(
+                "model.patch",
+                {
+                    "provider_id": provider_id,
+                    "model_id": gpt_id,
+                    "changes": {"upstream_protocol_mode": "fallback"},
+                },
+            )
+            snapshot = domain.dispatch(
+                "model.add",
+                {
+                    "provider_id": provider_id,
+                    "model": {
+                        "name": "gpt-5.1",
+                        "upstream_model": "openai/gpt-5.1",
+                        "enabled": True,
+                        "order": 2,
+                    },
+                },
+            )
+            models = {
+                model["model_name"]: model
+                for model in snapshot["providers"][0]["models"]
+            }
+            self.assertEqual("fallback", models["gpt-5"]["upstream_protocol_mode"])
+            self.assertEqual("fixed", models["gpt-5.1"]["upstream_protocol_mode"])
+            self.assertEqual("openai/responses", models["gpt-5.1"]["upstream_url_surface"])
 
 
 class RuntimeOwnedStateRootTests(unittest.TestCase):
