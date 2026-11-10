@@ -331,6 +331,7 @@ export const en: Record<TranslationKey, string> = {
   "common.ready": "Ready",
   "common.working": "Working…",
   "common.notApplied": "Changes not applied",
+  "common.notAppliedRetry": "This save did not go through; your draft is still here — save again.",
   "common.notAppliedPartial": "Some changes not applied",
   "common.discard": "Discard changes",
   "common.moveUp": "Move up",

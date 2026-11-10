@@ -333,6 +333,7 @@ export const zhHans: Record<TranslationKey, string> = {
   // it while a counted run is in flight and nothing has answered yet.
   "common.working": "处理中…",
   "common.notApplied": "更改未生效",
+  "common.notAppliedRetry": "这次没保存上，改动还在草稿里；再保存一次即可。",
   "common.notAppliedPartial": "部分更改未生效",
   "common.discard": "放弃更改",
   "common.moveUp": "上移",

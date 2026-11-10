@@ -1454,7 +1454,10 @@ function errorMessage(reason: unknown, translate: Translate): string {
     // naming it only reported the write as failed without saying whether it
     // took effect.  Say what they can observe instead — the change is not in
     // effect — the same way every other rolled-back write reports itself.
-    revision_conflict: "common.notApplied",
+    // A conflict is not a verdict on the change: the draft is still staged, and
+    // saving again is the whole remedy.  The bare "changes not applied" left a
+    // user with a staged edit and nothing to do about it.
+    revision_conflict: "common.notAppliedRetry",
     validation_failed: "error.validationFailed",
     // Both of these are raised by this app, not by Core: a write that named
     // no settings document, and a probe whose recommended surface arrived
@@ -3423,6 +3426,16 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
               result = { revision: settled.revision, applied: true, status: "applied", domains: [...domains], completed_operations: 0, pending_operations: 0, issues: [] };
               break;
             }
+            // A conflict that survived every rebase is the one failure the
+            // debounce can still fix: the draft is staged, Core has merely
+            // moved, and the next attempt reads a fresh revision.  Clearing the
+            // applied key lets that attempt happen by itself instead of leaving
+            // a staged change the user cannot get written.  A validation
+            // failure keeps the old rule and stays put rather than looping.
+            if (autoRetriedKey.current !== autoApplyKey) {
+              autoRetriedKey.current = autoApplyKey;
+              autoAppliedKey.current = "";
+            }
             throw reason;
           }
           await settleBeforeRetry(attempt);
@@ -3481,6 +3494,10 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   // still namespaces the key, so one draft cannot apply twice and a failed
   // apply stays failed until the revision moves.
   const autoAppliedKey = useRef("");
+  // The newest draft key an Apply has already retried by itself.  A conflict is
+  // the one failure a retry can fix, and it must fix it at most once: a draft
+  // that keeps conflicting would otherwise turn the debounce into a loop.
+  const autoRetriedKey = useRef("");
   const immediateApplyBlocked = useImmediateApplyBlocked();
   const autoApplyKey = shell && actionSnapshot && !immediateApplyBlocked
     ? (() => {

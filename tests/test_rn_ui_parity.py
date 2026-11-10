@@ -390,8 +390,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"error.validationFailed": "Validation failed; changes not applied."', self.en)
         self.assertIn('"error.validationFailed": "校验未通过，更改未生效。"', self.zh)
         translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
-        for key in ("common.notApplied", "common.notAppliedPartial"):
+        for key in ("common.notApplied", "common.notAppliedPartial", "common.notAppliedRetry"):
             self.assertIn(f'| "{key}"', translation_keys)
+        self.assertIn('"common.notAppliedRetry": "This save did not go through; your draft is still here — save again."', self.en)
+        self.assertIn('"common.notAppliedRetry": "这次没保存上，改动还在草稿里；再保存一次即可。"', self.zh)
         # A revision conflict is this app racing itself, not a cause the user
         # can act on: it must not name a second writer or announce what the
         # router did about it.  Every surface that can meet one already rebases
@@ -399,7 +401,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # dispatch, the raw editor, the child surfaces), so one that still
         # arrives reports the outcome the pane can show, exactly like any other
         # rolled-back write.
-        self.assertIn('revision_conflict: "common.notApplied",', self.ui)
+        # A conflict that survives every rebase states the outcome *and* the
+        # one thing that fixes it: the draft is still staged and saving again
+        # is the remedy.  It still names no second writer and no router step —
+        # a user with a staged edit and no way forward is what the bare
+        # 更改未生效 left behind.
+        self.assertIn('revision_conflict: "common.notAppliedRetry",', self.ui)
+        self.assertIn('// A conflict is not a verdict on the change', self.ui)
         # A draft that Core refused during Apply is a validation failure too, and
         # it has to name the row that blocked it: a bare 更改未生效 left the row
         # the user had just touched (the ＋ that started the write) looking like
@@ -730,6 +738,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # the strip states a save that did not happen.
         self.assertIn('const settled = await ipc.snapshot();', apply_body)
         self.assertIn('if (domains.every((name) => !currentDomains.includes(name))) {', apply_body)
+        # A conflict that survives every rebase leaves a staged draft and
+        # nothing that would try again — the debounce remembers the key it
+        # already applied.  The Apply re-arms it once, so the retry the user
+        # would have to discover happens by itself; a second failure for the
+        # same draft stops there instead of looping.
+        self.assertIn('const autoRetriedKey = useRef("");', self.ui)
+        self.assertIn("if (autoRetriedKey.current !== autoApplyKey) {", apply_body)
+        self.assertIn("autoRetriedKey.current = autoApplyKey;", apply_body)
+        self.assertIn('autoAppliedKey.current = "";', apply_body)
         # A different section staying dirty is not evidence this write failed.
         self.assertIn("const currentDomains = stagedDomainsForRoute(current);", apply_body)
         self.assertIn('throw reason;', apply_body)

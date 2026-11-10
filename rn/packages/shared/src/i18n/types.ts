@@ -333,6 +333,7 @@ export type TranslationKey =
   | "common.working"
   | "common.notApplied"
   | "common.notAppliedPartial"
+  | "common.notAppliedRetry"
   | "common.discard"
   | "common.moveUp"
   | "common.moveDown"
