@@ -722,9 +722,20 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # later, and the write was lost with it.  The retry is bounded, and
         # the disk/domain guards still refuse a draft somebody else changed.
         self.assertIn('const APPLY_ATTEMPTS = 3;', apply_body)
-        self.assertIn('result = await applyOnce(attempt === 0 ? refreshed.revision : (revision.current ?? refreshed.revision));', apply_body)
-        self.assertIn('if (!sameDomains || !sameDiskState || attempt + 1 >= APPLY_ATTEMPTS) throw reason;', apply_body)
-        self.assertIn('await new Promise<void>((resolve) => setTimeout(resolve, 40 * (attempt + 1)));', apply_body)
+        self.assertIn('let nextRevision = refreshed.revision;', apply_body)
+        self.assertIn('result = await applyOnce(nextRevision);', apply_body)
+        self.assertIn('nextRevision = (await ipc.snapshot()).revision;', apply_body)
+        self.assertIn('if (!sameDomains || !sameDiskState) throw reason;', apply_body)
+        # The retries are spent: ask once more whether the write landed before
+        # the strip states a save that did not happen.
+        self.assertIn('const settled = await ipc.snapshot();', apply_body)
+        self.assertIn('if (stagedDomainsForRoute(settled).length === 0) {', apply_body)
+        self.assertIn('throw reason;', apply_body)
+        # The replacement that moved the revision is still landing; the
+        # retry waits for it and reads the revision again rather than
+        # resending the one it already lost.
+        self.assertIn('const settleBeforeRetry = (attempt: number): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, 40 * (attempt + 1)));', apply_body)
+        self.assertIn('await settleBeforeRetry(attempt);', apply_body)
         # A conflict whose rebase finds nothing left staged is the pane's own
         # background Apply having already committed the edit. The user asked
         # for a write that exists, so it is reported applied instead of failing
@@ -736,6 +747,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("if (currentDomains.length === 0) {", apply_body)
         self.assertIn("if (!sameDiskState || current.revision < refreshed.revision) throw reason;", apply_body)
         self.assertIn('status: "applied", domains: [...domains]', apply_body)
+        # Two Applies for one edit move the revision under each other, and the
+        # one that loses reports a save that happened as 更改未生效.  The
+        # second caller joins the write already in flight instead.
+        self.assertIn("const applyInFlight = useRef<Promise<IpcResults[\"apply\"] | { cancelled: true } | undefined> | undefined>(undefined);", self.ui)
+        self.assertIn("if (running) return running;", apply_body)
+        self.assertIn("applyInFlight.current = started;", apply_body)
+        self.assertIn("if (applyInFlight.current === started) applyInFlight.current = undefined;", apply_body)
         self.assertNotIn('appliedRevision.current', self.ui)
 
     def test_compatibility_claude_route_reuses_the_combined_native_window(self) -> None:

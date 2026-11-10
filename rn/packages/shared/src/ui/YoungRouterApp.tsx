@@ -3314,9 +3314,17 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   // absent from this signature.  Every edit made while an Apply runs queues
   // behind it and stages on the revision it produces; taking the lock here is
   // what left the destination pane disabled while the strip read 就绪.
+  // One Apply at a time.  The pane's debounced flush and a button's own Apply
+  // can both start for the same edit, and two Applies taken from the same
+  // snapshot move the revision under each other: one lands, the other meets a
+  // moving revision through every retry and reports the save it just made as
+  // 更改未生效.  A second caller joins the write already in flight.
+  const applyInFlight = useRef<Promise<IpcResults["apply"] | { cancelled: true } | undefined> | undefined>(undefined);
   const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string }): Promise<IpcResults["apply"] | { cancelled: true } | undefined> => {
     if ((!settingsRoute && !domain) || domain === "logs") return Promise.resolve(undefined);
-    return runOutcome<IpcResults["apply"] | { cancelled: true }>(async () => {
+    const running = applyInFlight.current;
+    if (running) return running;
+    const started = runOutcome<IpcResults["apply"] | { cancelled: true }>(async () => {
       await flushPendingFields();
       // Inline relay edits stage through the shared dispatch queue when their
       // fields lose focus. Wait for that queue before taking the apply
@@ -3347,22 +3355,21 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       // Every providers Apply restarts the managed proxy, and that restart is
       // itself a state change; relay discovery and the official-account status
       // are live projections with the same effect.  So the revision a window
-      // read can move before its write arrives, and one rebase is not always
-      // enough while a replacement is still landing.  The write re-reads and
-      // tries again, a bounded number of times; the attempt that lands is the
-      // one the pane reports, and a refusal that survives every attempt is
-      // still shown.
+      // read can move before its write arrives, and one rebase was not enough
+      // while a replacement was still landing: the retry reused a revision it
+      // had read before that replacement finished, met the same moving state,
+      // and reported 更改未生效 over an edit that had landed.  Each attempt
+      // therefore waits for the replacement to settle and reads the revision
+      // again, and the loop is bounded; a refusal that survives it is shown.
       const APPLY_ATTEMPTS = 3;
+      const settleBeforeRetry = (attempt: number): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, 40 * (attempt + 1)));
       let result: IpcResults["apply"] | undefined;
+      let nextRevision = refreshed.revision;
       for (let attempt = 0; result === undefined; attempt += 1) {
         try {
-          result = await applyOnce(attempt === 0 ? refreshed.revision : (revision.current ?? refreshed.revision));
+          result = await applyOnce(nextRevision);
         } catch (reason: unknown) {
           if (!isRevisionConflict(reason)) throw reason;
-          // The rebase only ever answers for the same staged edit: a different
-          // set of domains or a different disk generation is another writer,
-          // and reporting that as applied would claim a save that did not
-          // happen.
           const current = await ipc.snapshot();
           const currentDomains = stagedDomainsForRoute(current);
           const sameDomains = currentDomains.length === domains.length
@@ -3387,10 +3394,31 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
             result = { revision: current.revision, applied: true, status: "applied", domains: [...domains], completed_operations: 0, pending_operations: 0, issues: [] };
             break;
           }
-          if (!sameDomains || !sameDiskState || attempt + 1 >= APPLY_ATTEMPTS) throw reason;
-          // A replacement that is still landing moves the revision once more
-          // a moment later; give it that moment instead of losing the write.
-          await new Promise<void>((resolve) => setTimeout(resolve, 40 * (attempt + 1)));
+          // The rebase only ever answers for the same staged edit: a different
+          // set of domains or a different disk generation is another writer,
+          // and reporting that as applied would claim a save that did not
+          // happen.  Nor is there anything left to wait for once the attempts
+          // are spent.
+          if (!sameDomains || !sameDiskState) throw reason;
+          if (attempt + 1 >= APPLY_ATTEMPTS) {
+            // The retries are spent.  Before the strip states a save that did
+            // not happen, ask once more whether it did: a write this window
+            // was racing can land on the last attempt and its own event can
+            // arrive after the reply that lost the revision.  A draft that is
+            // no longer staged is the outcome the user asked for.
+            const settled = await ipc.snapshot();
+            revision.current = settled.revision;
+            latestSnapshot.current = settled;
+            onSnapshot(settled);
+            if (stagedDomainsForRoute(settled).length === 0) {
+              result = { revision: settled.revision, applied: true, status: "applied", domains: [...domains], completed_operations: 0, pending_operations: 0, issues: [] };
+              break;
+            }
+            throw reason;
+          }
+          await settleBeforeRetry(attempt);
+          nextRevision = (await ipc.snapshot()).revision;
+          revision.current = nextRevision;
         }
       }
       if (domains.includes("codex") || domains.includes("claude") || domains.includes("clients")) {
@@ -3402,6 +3430,11 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       if (diskConflicts.length > 0) setKeptDiskGeneration({});
       return result;
     }, options?.silent ? null : (options?.message ?? "common.saved"), true, true, undefined, options?.quiet === true);
+    applyInFlight.current = started;
+    void started.finally(() => {
+      if (applyInFlight.current === started) applyInFlight.current = undefined;
+    });
+    return started;
   };
   const apply = async (options?: { silent?: boolean; quiet?: boolean; message?: string }): Promise<void> => {
     await applyOutcome(options);
