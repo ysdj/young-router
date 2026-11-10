@@ -1753,8 +1753,11 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
   // uses the pair to decide whether an action still owes it a full read.
   const eventChannel = useRef<EventChannelState>({ received: 0, revision: initialSnapshot?.revision ?? -1 });
   // The last job event, kept for the slice that draws long-running operations.
-  // Until then recording it is the whole contract: a job event must not be
-  // treated as a patch, and must not be dropped as an unknown shape either.
+  // A job is one caller's operation, not a revision of the state: it must never
+  // be applied as a patch, and must not be dropped as an unknown shape either.
+  // The probe paths already receive their result through `ipc.probe`, which
+  // joins this event's `done` payload back into the promise that started the
+  // job -- so the pane draws it exactly where it always did.
   const lastJobEvent = useRef<IpcEvent | undefined>(undefined);
 
   const recordMenuAction = useCallback(async (action: string): Promise<void> => {
@@ -1829,8 +1832,11 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
         void refreshSnapshot().catch(() => undefined);
         return;
       case "job":
-        // Job progress is consumed by a later slice; recording it keeps the
-        // event from being mistaken for state or silently dropped.
+        // Job progress is consumed by the caller that started the job; keeping
+        // the last one is what lets a later pane draw a running operation, and
+        // it keeps the event from being mistaken for state or silently
+        // dropped.  Its `done` result reaches the probe panes through the
+        // promise `ipc.probe` resolves from this same event.
         lastJobEvent.current = event;
         return;
     }

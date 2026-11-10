@@ -532,7 +532,7 @@ export interface IpcResults {
     baseline: string;
   };
   files: { revision: number; files: ClientFile[] };
-  dispatch: { revision: number; action_summary?: Record<string, unknown>; changed?: string[] };
+  dispatch: { revision: number; action_summary?: Record<string, unknown>; changed?: string[]; job_id?: string };
   subscribe: { subscription_id: string };
   validate: { validate: ValidationSummary };
   apply: {
@@ -680,6 +680,14 @@ export interface IpcClient {
   apply(domain: ConfigDomain, revision: number, confirmation?: string | string[]): Promise<IpcResults["apply"]>;
   applyDomains(domains: ConfigDomain[], revision: number, confirmation?: string | string[]): Promise<IpcResults["apply"]>;
   reload(domain?: ConfigDomain, revision?: number): Promise<{ revision: number }>;
+  /**
+   * Start a probe and wait for the job that answers it.
+   *
+   * A probe reads the upstream and can take minutes, so Core answers the
+   * request with a job id at once and publishes the result as a `job` event.
+   * This method is the one place that pair is joined back into the probe
+   * result every caller here already draws.
+   */
   probe(providerId?: string, modelId?: string, domain?: "providers_models" | "webdav", values?: Record<string, unknown>): Promise<IpcResults["probe"]>;
   export(sections: ConfigDomain[], destinationToken: string): Promise<IpcResults["export"]>;
   previewImport(sourceToken: string, revision: number): Promise<IpcResults["import_preview"]>;
