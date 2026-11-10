@@ -1546,6 +1546,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # the Qoder account row while its worker was answering.
         self.assertIn("{symbol && !symbolTrailing && !(busy === true && !showsTitle) ? <ButtonGlyph symbol={symbol} ink={ink} /> : null}", self.native_controls)
         self.assertIn("{symbol && symbolTrailing && !(busy === true && !showsTitle) ? <ButtonGlyph symbol={symbol} ink={ink} /> : null}", self.native_controls)
+        # The button asks one wheel for its slot instead of a host's progress
+        # view, so each host draws the wait it has (`BusyWheel`).
+        self.assertIn("{busy === true ? <BusyWheel ink={ink} /> : null}", self.native_controls)
         # Every loading button reports its own progress and keeps its label;
         # the disabled state is left for controls that merely wait on a sibling.
         for marker in (
@@ -1598,6 +1601,44 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'title={loginBusy ? translate("relay.stepSignIn")',
         ):
             self.assert_ui_not_has(marker)
+
+    def test_the_page_draws_the_apps_own_wheel_in_the_slot_it_reserves(self) -> None:
+        """A browser wait is this app's wheel, at 12 pt, not the system's 20 pt ring.
+
+        React Native for Web's `ActivityIndicator` paints a 20 pt system ring
+        inside the 12 pt slot a busy button reserves, so the ring spilled over
+        the bezel: the 中转站关联 account row drew a 56 pt box with a ring in it
+        while the same row read 24 pt at rest.  The page therefore draws
+        `AppKitBusySpinner`'s own wheel (`WebBusyWheel`), and the geometry below
+        is the Swift frame geometry -- a page wheel that drifted from it would
+        be a third kind of wait in one application.
+        """
+
+        # One wait per branch: macOS mounts the native view, the page draws the
+        # same wheel in CSS, Windows keeps its one busy affordance (AGENTS.md).
+        self.assertIn('if (Platform.OS === "web") return <WebBusyWheel ink={ink} accessibilityLabel={accessibilityLabel} style={style} />;', self.native_controls)
+        self.assertIn('return <ActivityIndicator accessibilityLabel={accessibilityLabel} size="small" color={ink} style={[styles.busySpinner, style]} />;', self.native_controls)
+        self.assertIn('return <AppKitBusySpinner accessibilityLabel={label} running style={[styles.busySpinner, style]} />;', self.native_controls)
+        # The wheel's own frame: twelve graded spokes, and its box is the slot
+        # the caller reserved (`BUSY_SPINNER_SIZE`), never a size of its own.
+        for marker in (
+            "const BUSY_WHEEL_SPOKES = 12;",
+            "const BUSY_WHEEL_RIM_INSET = 0.75;",
+            "const BUSY_WHEEL_INNER_RATIO = 0.42;",
+            "const BUSY_WHEEL_STROKE_RATIO = 0.3;",
+            'style={[styles.webWheel, { width: size, height: size }, WEB_WHEEL_TURN, style]}',
+            "animationTimingFunction: `steps(${BUSY_WHEEL_SPOKES}, end)`",
+        ):
+            self.assertIn(marker, self.native_controls)
+        # The numbers are the Swift wheel's, so a change to either side has to
+        # be a change to both.
+        for marker in (
+            "public static let stepCount = 12",
+            "let outer = size / 2 - 0.75",
+            "let inner = outer * 0.42",
+            "path.lineWidth = max(1.1, outer * 0.3)",
+        ):
+            self.assertIn(marker, self.macos_leaf)
 
     def test_provider_selection_and_new_models_keep_independent_stable_state(self) -> None:
         self.assert_ui_has('onSelectionChange={(key) => { if (key) onSelect(key); }}')

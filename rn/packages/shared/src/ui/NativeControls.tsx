@@ -157,6 +157,94 @@ const BUSY_SPINNER_GAP = 3;
 const BUSY_SPINNER_BEZEL_ROOM = 4;
 const BUSY_SPINNER_SLOT = 2 * (BUSY_SPINNER_SIZE + BUSY_SPINNER_GAP + BUSY_SPINNER_BEZEL_ROOM);
 
+// The wheel's own geometry, mirrored from `AppKitBusySpinner.drawWheel`
+// (`rn/apps/macos/src/native/macos/AppKitNativeLeaf.swift`): twelve round-capped
+// spokes from an inner to an outer radius, graded from a faint tail to the head.
+// The page draws the same wheel rather than the system one, so a wait looks like
+// the app's wait on the page too.
+const BUSY_WHEEL_SPOKES = 12;
+const BUSY_WHEEL_RIM_INSET = 0.75;
+const BUSY_WHEEL_INNER_RATIO = 0.42;
+const BUSY_WHEEL_STROKE_RATIO = 0.3;
+
+/**
+ * The page's animation compiler only exists in React Native for Web, and its
+ * style sheet is the only place a CSS animation can be declared (`inline` drops
+ * `animationKeyframes`).  React Native's own style types describe native layout,
+ * so this is the one cast that lets the page's wheel state its own keyframes
+ * beside its geometry instead of in the page template (`apps/web/build.mjs`),
+ * where the two would drift.
+ */
+const webStyleSheet = StyleSheet.create as unknown as (
+  entries: Record<string, Record<string, unknown>>,
+) => Record<string, ViewStyle>;
+
+/**
+ * One turn of the wheel, in the app's own steps.
+ *
+ * AppKit draws twelve pre-rotated frames and swaps one per `1/12` s, so the
+ * wheel turns 30° at a time rather than gliding.  `steps(12)` is that same swap:
+ * the browser holds each rotation for a frame's worth of time and never
+ * interpolates between two of them.
+ */
+const WEB_WHEEL_TURN = Platform.OS === "web"
+  ? webStyleSheet({
+      turn: {
+        animationKeyframes: [
+          { "0%": { transform: "rotate(0deg)" }, "100%": { transform: "rotate(-360deg)" } },
+        ],
+        // One turn is one second: twelve steps of 1/12 s, the same budget
+        // `AppKitBusySpinner.stepInterval` gives each frame.
+        animationDuration: "1s",
+        animationTimingFunction: `steps(${BUSY_WHEEL_SPOKES}, end)`,
+        animationIterationCount: "infinite",
+      },
+    }).turn
+  : undefined;
+
+/**
+ * The app's busy wheel as the page draws it.
+ *
+ * React Native for Web's `ActivityIndicator` is not this app's wheel: it paints
+ * a 20 pt system ring that ignores the 12 pt slot a button reserves for it, so
+ * it painted 8 pt past the bezel — the 中转站关联 account row showed a box with
+ * a ring spilling out of both its ends where a 24 pt control belongs.  This
+ * draws `AppKitBusySpinner`'s twelve graded spokes at the size the caller
+ * reserved, in the ink of the control the wheel belongs to.
+ */
+function WebBusyWheel({ ink, size = BUSY_SPINNER_SIZE, accessibilityLabel, style }: { ink: string; size?: number; accessibilityLabel?: string; style?: StyleProp<ViewStyle> }): React.JSX.Element {
+  const outer = size / 2 - BUSY_WHEEL_RIM_INSET;
+  const inner = outer * BUSY_WHEEL_INNER_RATIO;
+  const stroke = Math.max(1.1, outer * BUSY_WHEEL_STROKE_RATIO);
+  // AppKit strokes one line from the inner to the outer radius with a round cap,
+  // so the cap's own radius reaches past both ends: the spoke stands out from
+  // the hub by half a stroke and meets the rim at the box's own edge.  A capsule
+  // that stopped at those two points left the hole too small and the wheel read
+  // as a filled ring.
+  const bar = {
+    left: (size - stroke) / 2,
+    top: size / 2 - outer - stroke / 2,
+    width: stroke,
+    height: outer - inner + stroke,
+    borderRadius: stroke / 2,
+  };
+  const spokes = Array.from({ length: BUSY_WHEEL_SPOKES }, (_, step) => ({
+    // The tail is faint and the head is solid: the grade is what makes a wheel
+    // of identical spokes read as turning.
+    alpha: 0.16 + 0.84 * (step / (BUSY_WHEEL_SPOKES - 1)),
+    rotation: (step * 360) / BUSY_WHEEL_SPOKES,
+  }));
+  return <View
+    accessibilityRole="progressbar"
+    accessibilityLabel={accessibilityLabel}
+    style={[styles.webWheel, { width: size, height: size }, WEB_WHEEL_TURN, style]}
+  >
+    {spokes.map((spoke) => <View key={spoke.rotation} style={[styles.webWheelSpoke, { width: size, height: size, transform: [{ rotate: `${spoke.rotation}deg` }] }]}>
+      <View style={[styles.webWheelBar, bar, { backgroundColor: ink, opacity: spoke.alpha }]} />
+    </View>)}
+  </View>;
+}
+
 function nativeButtonBusyMinimumWidth(title: string, reservation: number, plainLink: boolean): number {
   if (plainLink) return reservation;
   return Math.max(reservation, Math.ceil(nativeControlTextWidth(title)) + BUSY_SPINNER_SLOT);
@@ -415,7 +503,9 @@ function WindowsButton({ title, symbol, symbolWithTitle, symbolTrailing, toolTip
     {...({ tooltip: toolTip ?? title } as { tooltip: string })}
     style={[styles.windowsButton, compact && styles.windowsButtonCompact, link && styles.windowsButtonLink, plainLink && styles.windowsButtonPlainLink, primary && styles.windowsButtonPrimary, destructive && styles.windowsButtonDestructive, disabled && styles.windowsButtonDisabled, busy && styles.buttonBusy, style]}
   >
-    {busy === true ? <ActivityIndicator size="small" color={ink} style={styles.buttonBusyIndicator} /> : null}
+    {/* The wheel is the app's own on the page and the platform's ring on
+        Windows; both are 12 pt, because that is the slot the button reserves. */}
+    {busy === true ? <BusyWheel ink={ink} /> : null}
     {/* A symbol-only button *is* its glyph, so a busy one draws the wheel in
         that glyph's place.  Drawing both put two circles in a 24 pt bezel --
         the refresh arrow behind a spinner -- which is what the Qoder row's
@@ -643,9 +733,17 @@ export function NativeBusySpinner({ label, style }: { label: string; style?: Sty
   if (Platform.OS === "macos") {
     return <AppKitBusySpinner accessibilityLabel={label} running style={[styles.busySpinner, style]} />;
   }
-  // Windows draws the same wait with the platform's own ring; the host's
-  // `ProgressRing` is its one busy affordance (AGENTS.md).
-  return <ActivityIndicator accessibilityLabel={label} size="small" style={[styles.busySpinner, style]} />;
+  // A page draws the app's own wheel (`WebBusyWheel`); Windows draws its one
+  // busy affordance, the host's `ProgressRing` (AGENTS.md).  Neither is allowed
+  // to be bigger than the slot the caller reserved, because that slot is what
+  // keeps a row of controls on one line while something is loading.
+  return <BusyWheel ink={WINDOWS_CONTROL.text} accessibilityLabel={label} style={[styles.busySpinner, style]} />;
+}
+
+/** One 12 pt busy wheel, drawn by the host that can draw this app's own. */
+function BusyWheel({ ink, accessibilityLabel, style }: { ink: string; accessibilityLabel?: string; style?: StyleProp<ViewStyle> }): React.JSX.Element {
+  if (Platform.OS === "web") return <WebBusyWheel ink={ink} accessibilityLabel={accessibilityLabel} style={style} />;
+  return <ActivityIndicator accessibilityLabel={accessibilityLabel} size="small" color={ink} style={[styles.busySpinner, style]} />;
 }
 
 const NativeSegmentedControlWithRef = React.forwardRef<any, SegmentedProps>(function NativeSegmentedControlWithRef({ labels, selectedValue, disabled, compact = true, onChange, style }, ref): React.JSX.Element {
@@ -1773,6 +1871,12 @@ const styles = StyleSheet.create({
   buttonBusy: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: BUSY_SPINNER_GAP },
   buttonBusyIndicator: { width: BUSY_SPINNER_SIZE, height: BUSY_SPINNER_SIZE },
   busySpinner: { width: BUSY_SPINNER_SIZE, height: BUSY_SPINNER_SIZE },
+  // The page's own wheel: a fixed box whose spokes are laid out from its centre
+  // and turned as one group, so the slot a caller reserved is the box the wheel
+  // occupies — never the system ring's own 20 pt.
+  webWheel: { position: "relative", pointerEvents: "none" },
+  webWheelSpoke: { position: "absolute", top: 0, left: 0 },
+  webWheelBar: { position: "absolute" },
   controlText: { fontSize: UI_FONT_SIZE },
   windowsButton: { minHeight: WINDOWS_CONTROL.controlHeight, minWidth: 28, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 4, paddingHorizontal: 8, borderRadius: WINDOWS_CONTROL.radius, borderWidth: 1, borderColor: WINDOWS_CONTROL.stroke, backgroundColor: WINDOWS_CONTROL.fill },
   windowsButtonCompact: { minHeight: WINDOWS_CONTROL.controlHeight, paddingHorizontal: 6 },

@@ -756,6 +756,9 @@ class BrowserPageAddressTests(unittest.TestCase):
       its sidebar over a pane that does not exist.
     - The tab title read `${app}: running` — the protocol's own spelling of the
       service state, beside a Chinese app title.
+    - The tab was titled "Young Router" by the template before the page knew
+      which language it was speaking: a name a Chinese reader then watched
+      change to its own.
     """
 
     def setUp(self) -> None:
@@ -776,9 +779,26 @@ class BrowserPageAddressTests(unittest.TestCase):
 
     def test_the_tab_title_uses_the_localized_service_word(self) -> None:
         leaf = (self.shared / "platform/browserLeaf.ts").read_text(encoding="utf-8")
-        self.assertIn("serviceStateWord(strings, status.state)", leaf)
+        # A title is a sentence in the app's language, and the language reaches
+        # this host only through `setLocalization`.  Writing one from this file's
+        # English fallbacks first is what a Chinese browser read in its tab and
+        # then watched change, so the write sits behind the table (and a state
+        # to word), and the table's own arrival states the title again.
+        self.assertIn("const writeDocumentTitle = (): void => {", leaf)
+        self.assertIn('if (!strings || !routeStatus || typeof document === "undefined") return;', leaf)
+        self.assertIn("serviceStateWord(strings, routeStatus.state)", leaf)
+        self.assertGreaterEqual(leaf.count("writeDocumentTitle();"), 2)
         for word in ("serviceStarting", "serviceRunning", "serviceUnhealthy", "serviceStopped", "serviceUnknown"):
-            self.assertIn(f"strings?.{word}", leaf)
+            self.assertIn(f"strings.{word}", leaf)
+
+    def test_the_shipped_page_has_no_title_before_the_language_arrives(self) -> None:
+        # The tab is named by the host, in the language of the snapshot that
+        # chose it.  A `<title>` in the template is a name stated before the
+        # page knows which language it speaks -- and a browser shows it, so a
+        # Chinese reader saw an English name in the tab until the table replaced
+        # it.  The template states no title; the address is a fact until then.
+        builder = (Path(__file__).resolve().parents[1] / "rn/apps/web/build.mjs").read_text(encoding="utf-8")
+        self.assertNotIn("<title>", builder)
 
 
 class WebLaunchURLTests(unittest.TestCase):

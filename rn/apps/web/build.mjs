@@ -91,7 +91,12 @@ const html = `<!doctype html>
     <!-- No icon request: this page is served under /ui, and a browser asking
          the origin's /favicon.ico reaches the proxy's own routes, not ours. -->
     <link rel="icon" href="data:,">
-    <title>Young Router</title>
+    <!-- No title: a title is words in the language the app is speaking, and
+         this template cannot know that language.  A literal "Young Router" stayed
+         in the tab of a Chinese browser until the snapshot chose 漾路由 -- a name
+         in a language the page was about to stop speaking.  The host writes the
+         title from the localization table (writeDocumentTitle in browserLeaf);
+         until then the tab shows its address, which is a fact. -->
     <style>
       /* The shared panes paint their own palette — the literals every host
          falls back to — so this page is a light surface in both system

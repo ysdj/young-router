@@ -367,13 +367,13 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
 }
 
 /** The service state in the app's words, as the title bar states it. */
-function serviceStateWord(strings: NativeLocalization | undefined, state: ServiceStatus["state"]): string {
+function serviceStateWord(strings: NativeLocalization, state: ServiceStatus["state"]): string {
   switch (state) {
-    case "starting": return strings?.serviceStarting || "Starting";
-    case "running": return strings?.serviceRunning || "Running";
-    case "unhealthy": return strings?.serviceUnhealthy || "Unhealthy";
-    case "stopped": return strings?.serviceStopped || "Stopped";
-    default: return strings?.serviceUnknown || "Unknown";
+    case "starting": return strings.serviceStarting;
+    case "running": return strings.serviceRunning;
+    case "unhealthy": return strings.serviceUnhealthy;
+    case "stopped": return strings.serviceStopped;
+    default: return strings.serviceUnknown;
   }
 }
 
@@ -699,7 +699,9 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
 }): NativeLeafBridge {
   let strings: NativeLocalization | undefined;
   let menuActions: NativeMenuAction[] = [];
-  let routeStatus: ServiceStatus = { state: "unknown" };
+  // The last service state this host was told.  The tab's title is that state
+  // in the app's words, so the state is held here until the words arrive.
+  let routeStatus: ServiceStatus | undefined;
   // The document the raw editor layer was last asked to show. The native hosts
   // hand it to the child window's root through this one query, and the shared
   // pane reads it the same way.
@@ -713,6 +715,23 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
     } catch {
       return undefined;
     }
+  };
+
+  /**
+   * The tab's title, once there are words to say it in.
+   *
+   * A title is a sentence in the language this document speaks, and the only
+   * statement of that language is `setLocalization`: before it arrives this
+   * host knows no words at all, so a title written then is a guess, and a guess
+   * in the wrong language is what a Chinese browser showed in its tab before
+   * the table replaced it.  The title is therefore held until Core's answer is
+   * here -- and re-stated whenever that answer changes, so the 常规 language row
+   * reaches the tab in the same commit as the panes instead of waiting for the
+   * service state to move.
+   */
+  const writeDocumentTitle = (): void => {
+    if (!strings || !routeStatus || typeof document === "undefined") return;
+    document.title = `${strings.appTitle}: ${serviceStateWord(strings, routeStatus.state)}`;
   };
 
   /**
@@ -860,7 +879,7 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
       // spelling beside a Chinese title was the one place in this host that
       // spoke the protocol instead of the app.  The words are the localization
       // table's, which is what the native hosts put in their status menu.
-      document.title = `${strings?.appTitle ?? "Young Router"}: ${serviceStateWord(strings, status.state)}`;
+      writeDocumentTitle();
     },
     setMenuBarActions: (actions) => { menuActions = actions; },
     setTrayStatus: (status) => { routeStatus = status; },
@@ -1189,6 +1208,9 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
       // set this on their own window; a page states it on its root element.
       const language = next.language ?? resolveLanguage("system", navigator.languages?.[0] ?? navigator.language);
       if (typeof document !== "undefined") document.documentElement.lang = language === "zh-Hans" ? "zh-Hans" : "en";
+      // The service state may already have arrived while this page had no words
+      // for it: state the title now, and re-state it on a later language choice.
+      writeDocumentTitle();
     },
     setShortcuts: () => undefined,
   };
