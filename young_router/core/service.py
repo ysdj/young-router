@@ -35,7 +35,7 @@ from typing import Any, Protocol, runtime_checkable
 from .log_tabs import LOG_TABS
 from .oplog import note as _note
 from .persistence import AtomicJSONStore, PersistenceError, atomic_write_bytes, atomic_write_json, read_bytes, read_json
-from .protocol import MAX_EDITOR_DOCUMENT_BYTES, PROTOCOL_VERSION, ProtocolError, is_error_code, make_event
+from .protocol import MAX_EDITOR_DOCUMENT_BYTES, PROTOCOL_VERSION, ProtocolError, _encode_json, is_error_code, make_event
 from .security import REDACTED, _key_text, redact, safe_exception_message, safe_error_message
 
 
@@ -1945,9 +1945,10 @@ class CoreStore:
         # same bytes: a window that mutates its copy must not reach another's,
         # and a deepcopy of the whole projection was slower than the JSON the
         # event is about to become anyway.
+        encoded = _encode_json(event)
         for callback in callbacks:
             try:
-                callback(copy.deepcopy(event))
+                callback(json.loads(encoded))
             except Exception:
                 # A disconnected UI must not break a state transition.
                 continue

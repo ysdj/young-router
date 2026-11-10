@@ -408,6 +408,84 @@ class IpcLatencyTests(unittest.TestCase):
 
         self.assertLess(worst, IPC_BUDGET_MS, "a staged commit exceeded the IPC budget")
 
+    def test_runtime_snapshot_has_no_duplicate_catalogue(self) -> None:
+        """The settings catalogue travels once, under one name.
+
+        ``fields`` and ``settings`` were the same list, so the snapshot carried
+        the 47 KB catalogue twice and every window parsed it twice.  The panes
+        read ``settings`` only, so the duplicate had no consumer left.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RuntimeSettingsDomain(Path(directory) / "runtime-settings.env")
+            snapshot = domain.snapshot()
+
+        self.assertNotIn("fields", snapshot)
+        self.assertGreater(len(snapshot["settings"]), 0)
+
+    def test_snapshot_payload_budget(self) -> None:
+        """An empty installation's snapshot stays under 64 KB.
+
+        The window re-reads this payload after every commit, and the duplicate
+        runtime catalogue was most of it.  The size is pinned here because a
+        payload that grows back is latency the person at the window feels.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / ".litellm-runtime" / "config.yaml"
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "YOUNG_ROUTER_HOME": str(root),
+                    "LITELLM_RUNTIME_ROOT": str(root),
+                    "LITELLM_CONFIG_FILE": "",
+                },
+                clear=False,
+            ), mock.patch(
+                "young_router.core.operations.CoreServiceController"
+            ) as controller_type:
+                controller_type.return_value.status.return_value = {"state": "stopped"}
+                controller_type.return_value.dispatch.return_value = {"state": "stopped"}
+                core = CoreStore.with_default_domains(
+                    runtime_root=root,
+                    config_path=config,
+                    codex_home=root / "codex",
+                    runtime_settings_path=root / "runtime-settings.env",
+                )
+                payload = json.dumps(core.snapshot(), separators=(",", ":"))
+
+        self.assertLess(
+            len(payload), 64 * 1024, f"the empty snapshot is {len(payload)} bytes"
+        )
+
+    def test_emit_encodes_once_for_every_subscriber(self) -> None:
+        """Three windows cost one serialization, not three.
+
+        ``_emit`` used to deepcopy the event per subscriber, and each copy was
+        encoded on its own way out.  The bytes are identical for every window,
+        so encode once and give each subscriber its own parse: a window that
+        mutates its copy still cannot reach another's.
+        """
+
+        from young_router.core import service as service_module
+
+        received: list[dict] = []
+        for _ in range(3):
+            self.addCleanup(self.core.subscribe(received.append))
+
+        with mock.patch.object(
+            service_module, "_encode_json", side_effect=service_module._encode_json
+        ) as encode:
+            self.core._emit()
+
+        self.assertEqual(3, len(received))
+        self.assertEqual(1, encode.call_count, "the event was encoded per subscriber")
+        received[0]["snapshot"]["domains"]["runtime"]["settings"].clear()
+        self.assertNotEqual(received[0]["snapshot"], received[1]["snapshot"])
+
 
 if __name__ == "__main__":
     unittest.main()
