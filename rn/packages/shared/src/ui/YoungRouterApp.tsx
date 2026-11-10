@@ -37,6 +37,8 @@ import {
 } from "./RelayAccountManager";
 import { suggestedProviderName, suggestedRelayStationName } from "./relayOrigin";
 import { multiplierSpelling, rateNumber, rateSpelling } from "./rateSpelling";
+import { applyPatch } from "./applyPatch";
+import { postActionRefreshNeeded, publishSnapshot, useDomainRecord, type EventChannelState } from "./snapshotStore";
 import { isAssistantEditorOpen, isGroupManagerOpen, isProviderWizardOpen, isWebDavSettingsOpen, setAssistantEditorOpen, setGroupManagerOpen, setProviderWizardOpen, setWebDavSettingsOpen, subscribeProviderWizard } from "./providerWizardGate";
 import { RelayDialogHost, useRelayDialogSurface } from "./relayDialogSurface";
 import { SOURCE_LIST_FONT_SIZE, UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
@@ -1745,6 +1747,15 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
   // The newest snapshot this host accepted, readable from a callback that must
   // keep its identity: see ``runServiceOperation``.
   const latestSnapshot = useRef<CoreSnapshot | undefined>(initialSnapshot);
+  // What the event channel has told this window: ``received`` is the proof that
+  // patches are really arriving (an idle channel may simply not be connected),
+  // and ``revision`` is the revision of the state this window holds.  A pane
+  // uses the pair to decide whether an action still owes it a full read.
+  const eventChannel = useRef<EventChannelState>({ received: 0, revision: initialSnapshot?.revision ?? -1 });
+  // The last job event, kept for the slice that draws long-running operations.
+  // Until then recording it is the whole contract: a job event must not be
+  // treated as a patch, and must not be dropped as an unknown shape either.
+  const lastJobEvent = useRef<IpcEvent | undefined>(undefined);
 
   const recordMenuAction = useCallback(async (action: string): Promise<void> => {
     try {
@@ -1762,6 +1773,11 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
     if (next.revision < acceptedSnapshotRevision.current) return;
     acceptedSnapshotRevision.current = next.revision;
     latestSnapshot.current = next;
+    eventChannel.current.revision = next.revision;
+    // Hand the per-domain layer the state before React renders it, so a pane
+    // subscribed to one domain is notified once for this state and not again
+    // when the root's commit reaches it.
+    publishSnapshot(next);
     setSnapshot(next);
     setError(undefined);
     if (isPrimaryHost) {
@@ -1774,6 +1790,58 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
     if (publishUnchanged || next.revision !== acceptedSnapshotRevision.current) receiveSnapshot(next);
     return next;
   }, [ipc, receiveSnapshot]);
+
+  /**
+   * One event from Core, applied the way the event states it.
+   *
+   * A snapshot is the whole state; a patch is the rows and top-level fields an
+   * action moved, applied locally; a resync is Core saying no patch can
+   * describe the change; a job is progress on an operation whose result is not
+   * this window's state yet.  A patch that does not chain onto the revision
+   * this window holds is not an error — it is the one case the full snapshot
+   * exists for.
+   */
+  const receiveEvent = useCallback((event: IpcEvent): void => {
+    // Any event proves the channel is connected.  This is what lets a pane skip
+    // the post-action read: a patch is owed for every moved revision, and a
+    // channel that has never spoken may simply not be wired up.
+    eventChannel.current.received += 1;
+    switch (event.event) {
+      case "snapshot":
+        receiveSnapshot(event.snapshot);
+        return;
+      case "patch": {
+        // A patch at or below the state this window holds is an event it has
+        // already applied; reading again would ship a second copy of it.
+        if (event.revision <= acceptedSnapshotRevision.current) return;
+        const current = latestSnapshot.current;
+        const applied = current ? applyPatch(current, event) : undefined;
+        if (!applied) {
+          // A gap, an unknown domain, or an op this build cannot reduce: read
+          // the projection instead of keeping a state the rows do not describe.
+          void refreshSnapshot().catch(() => undefined);
+          return;
+        }
+        receiveSnapshot(applied);
+        return;
+      }
+      case "resync":
+        void refreshSnapshot().catch(() => undefined);
+        return;
+      case "job":
+        // Job progress is consumed by a later slice; recording it keeps the
+        // event from being mistaken for state or silently dropped.
+        lastJobEvent.current = event;
+        return;
+    }
+  }, [receiveSnapshot, refreshSnapshot]);
+
+  // A launch can begin with a snapshot the host already read, before this
+  // component ever subscribed: publish it so a domain subscriber renders its
+  // pane on the first frame instead of waiting for the next event.
+  useEffect(() => {
+    if (snapshot) publishSnapshot(snapshot);
+  }, [snapshot]);
 
   const runServiceOperation = useCallback((operation: ServiceOperation): Promise<CoreSnapshot | undefined> => {
     if (operation === "stop") serviceShouldBeRunning.current = false;
@@ -1884,26 +1952,11 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       if (!mounted) return;
       receiveSnapshot(next);
     };
-    const receiveEvent = (event: IpcEvent): void => {
+    const onEvent = (event: IpcEvent): void => {
       if (!mounted) return;
-      switch (event.event) {
-        case "snapshot":
-          receive(event.snapshot);
-          return;
-        case "patch":
-        case "resync":
-          // Applying ops locally is the next slice; reading the projection is
-          // the answer that is correct for both today.  A patch that cannot be
-          // chained is exactly what a resync says, so one path covers them.
-          void refreshSnapshot().catch(() => undefined);
-          return;
-        case "job":
-          // Long-running operations report through their own response today;
-          // their events carry no state this window applies yet.
-          return;
-      }
+      receiveEvent(event);
     };
-    const unsubscribe = ipc.subscribe(receiveEvent);
+    const unsubscribe = ipc.subscribe(onEvent);
     const latest = ipc.latestSnapshot();
     if (latest && latest !== initialSnapshot) receive(latest);
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1930,7 +1983,7 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       if (retryTimer !== undefined) clearTimeout(retryTimer);
       unsubscribe();
     };
-  }, [hostTranslate, initialSnapshot, ipc, isPrimaryHost, native, receiveSnapshot, refreshSnapshot]);
+  }, [hostTranslate, initialSnapshot, ipc, isPrimaryHost, native, receiveEvent, receiveSnapshot, refreshSnapshot]);
 
   useEffect(() => {
     if (!isPrimaryHost || !snapshot || launchPresented.current) return;
@@ -2218,8 +2271,8 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
         <NativeButton title={translate("error.renderFaultRetry")} compact onPress={() => { setError(undefined); void refreshSnapshot().catch(() => undefined); }} />
       </View> : error ? <Text style={styles.error}>{error}</Text> : null}
       {route !== "home" && snapshot ? (isSettingsShellRoute(route)
-        ? <SettingsShell route={route} windowRoute={settingsWindowRoute.current ?? canonicalWindowRoute(route)} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} nativeAction={nativeAction} onSnapshot={receiveSnapshot} onNavigate={setRoute} onClose={() => setRoute("home")} />
-        : <RouteSurface route={route} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} fileIdRequest={fileIdRequest} nativeAction={nativeAction} onSnapshot={receiveSnapshot} onNavigate={setRoute} onClose={() => setRoute(route === "provider-wizard" && Platform.OS === "windows" ? "providers-models" : "home")} />) : null}
+        ? <SettingsShell route={route} windowRoute={settingsWindowRoute.current ?? canonicalWindowRoute(route)} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} nativeAction={nativeAction} eventChannel={eventChannel} onSnapshot={receiveSnapshot} onNavigate={setRoute} onClose={() => setRoute("home")} />
+        : <RouteSurface route={route} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} fileIdRequest={fileIdRequest} nativeAction={nativeAction} eventChannel={eventChannel} onSnapshot={receiveSnapshot} onNavigate={setRoute} onClose={() => setRoute(route === "provider-wizard" && Platform.OS === "windows" ? "providers-models" : "home")} />) : null}
       {route === "home" ? (isWindowsShell && !snapshot
         // Windows keeps one visible window from launch, so "home" is a real
         // surface here and an empty host reads as a blank app. State the wait
@@ -2293,7 +2346,7 @@ function SignOutControl({ native, translate, onSignOut }: {
   />;
 }
 
-function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, logTabRequest, nativeAction, onSnapshot, onNavigate, onClose, onRegisterFlush }: {
+function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, logTabRequest, nativeAction, eventChannel, onSnapshot, onNavigate, onClose, onRegisterFlush }: {
   route: AppRoute;
   windowRoute: AppRoute;
   snapshot: CoreSnapshot;
@@ -2302,6 +2355,8 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
   translate: Translate;
   logTabRequest?: LogTab;
   nativeAction?: { id: string; sequence: number };
+  /** Proof the event channel is delivering, shared with every pane's actions. */
+  eventChannel: React.MutableRefObject<EventChannelState>;
   onSnapshot: (next: CoreSnapshot) => void;
   onNavigate: (route: AppRoute) => void;
   onClose: () => void;
@@ -2381,7 +2436,7 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
   // `codex-settings`.  A deep link or a restored Claude window therefore
   // opened on Codex with Claude a rail click away: the route said which client
   // it was for, and nothing carried that to the pane.
-  const paneSurface = <RouteSurface route={pane} shell initialClient={route === "claude-settings" ? "claude" : undefined} windowRoute={windowRoute} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} nativeAction={nativeAction} onSnapshot={onSnapshot} onNavigate={onNavigate} onClose={onClose} onRegisterFlush={registerFlush} />;
+  const paneSurface = <RouteSurface route={pane} shell initialClient={route === "claude-settings" ? "claude" : undefined} windowRoute={windowRoute} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} nativeAction={nativeAction} eventChannel={eventChannel} onSnapshot={onSnapshot} onNavigate={onNavigate} onClose={onClose} onRegisterFlush={registerFlush} />;
   const signingOut = useRef(false);
   /**
    * 退出登录, for the one host that signs in with a key.
@@ -2638,7 +2693,7 @@ function WindowTabs({ values, selected, disabled, onSelect, style, nativeRef }: 
   return <NativeSegmentedControl ref={nativeRef} labels={labels} selectedValue={selectedValue} disabled={disabled} overlayLayer={Boolean(nativeRef)} onChange={({ nativeEvent }) => { const next = values[nativeEvent.index]; if (next) onSelect(next.id); }} style={[styles.windowTabs, style]} />;
 }
 
-function RouteSurface({ route, shell = false, initialClient, windowRoute, snapshot, ipc, native, translate, logTabRequest, fileIdRequest, nativeAction, onSnapshot, onNavigate, onClose, onRegisterFlush }: { route: AppRoute; shell?: boolean; initialClient?: ClientFile["client"]; windowRoute?: AppRoute; snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; translate: Translate; logTabRequest?: LogTab; fileIdRequest?: string; nativeAction?: { id: string; sequence: number }; onSnapshot: (next: CoreSnapshot) => void; onNavigate: (route: AppRoute) => void; onClose: () => void; onRegisterFlush?: (flush?: () => Promise<boolean>) => void }): React.JSX.Element {
+function RouteSurface({ route, shell = false, initialClient, windowRoute, snapshot, ipc, native, translate, logTabRequest, fileIdRequest, nativeAction, eventChannel, onSnapshot, onNavigate, onClose, onRegisterFlush }: { route: AppRoute; shell?: boolean; initialClient?: ClientFile["client"]; windowRoute?: AppRoute; snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; translate: Translate; logTabRequest?: LogTab; fileIdRequest?: string; nativeAction?: { id: string; sequence: number }; eventChannel: React.MutableRefObject<EventChannelState>; onSnapshot: (next: CoreSnapshot) => void; onNavigate: (route: AppRoute) => void; onClose: () => void; onRegisterFlush?: (flush?: () => Promise<boolean>) => void }): React.JSX.Element {
   const settingsRoute = isAssistantSettingsRoute(route);
   // The Codex and Claude settings routes are aliases for one shared surface.
   // Both domains stay visible and staged together, so there is no active tab
@@ -2846,6 +2901,9 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       setBusy(true);
     }
     publishResult(undefined);
+    // The revision this pane held before the action.  A moved revision is
+    // published as a patch; an unchanged one means no event is owed.
+    const revisionBefore = revision.current;
     try {
       const value = await operation();
       if (asRecord(value).cancelled === true) {
@@ -2865,7 +2923,12 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       } else {
         publishResult(message === null ? undefined : translate(message));
       }
-      if (refreshAfter) await refresh();
+      const answered = asRecord(value).revision;
+      const revisionAfter = typeof answered === "number" && Number.isInteger(answered) ? answered : undefined;
+      // One action, one answer: when the channel is delivering and the answer
+      // is the revision this pane holds, Core's patch for that revision is the
+      // read.  Everything else keeps the read as the fallback it always was.
+      if (refreshAfter && postActionRefreshNeeded({ channel: eventChannel.current, revisionBefore, revisionAfter, localRevision: revision.current })) await refresh();
       return value as T;
     } catch (reason: unknown) {
       const validationStatus = await validationStatusAfterFailure(reason);
@@ -6194,6 +6257,51 @@ function presentProviderAuthChallenge(native: NativeLeafAdapter, translate: Tran
   }
 }
 
+/**
+ * The provider list, subscribed to its own domain instead of the root state.
+ *
+ * The workspace around it draws the selected provider, its routes and its
+ * inspector, so it redraws whenever any of that moves.  The list itself only
+ * depends on `domains.providers_models`, and `applyPatch` keeps every other
+ * domain's object reference, so a patch that touches codex, logs or the service
+ * row neither notifies this table nor re-renders it.  That is what the memo
+ * boundary is for: the props are the slow-moving drafts and validation rows,
+ * and the fast-moving rows come from the store.
+ */
+const ProviderListTable = React.memo(function ProviderListTable({ translate, selectedProviderId, providerNameDrafts, validationIssues, onSelect }: {
+  translate: Translate;
+  selectedProviderId: string;
+  providerNameDrafts: Record<string, string>;
+  /** Validation issues for this domain, from the staged draft beside it. */
+  validationIssues: UnknownRecord[];
+  onSelect: (key: string) => void;
+}): React.JSX.Element {
+  const state = useDomainRecord("providers_models");
+  const providers = useMemo(() => asRecords(state?.providers), [state]);
+  const bindingIssues = useMemo(() => asRecords(state?.binding_issues), [state]);
+  const rows = useMemo(
+    () => providers.map((item) => {
+      const id = editorIdentifier(item);
+      const name = providerNameDrafts[id] !== undefined
+        ? providerNameDrafts[id]
+        : displayLabel(item.display_name, displayLabel(item.name, translate("providers.newProvider")));
+      return { key: id, cells: [name] };
+    }),
+    [providerNameDrafts, providers, translate],
+  );
+  const secondaryRowKeys = useMemo(
+    () => providers.filter((item) => !booleanValue(item.enabled, true)).map(editorIdentifier),
+    [providers],
+  );
+  const alertRowKeys = useMemo(
+    () => providers.filter((item) => validationIssues.some((issue) => validationIssueMatchesProvider(issue, item))
+      || bindingIssues.some((issue) => stringValue(issue.provider) === editorIdentifier(item))
+      || asRecords(item.models).some((model) => modelNeedsAttention(model, translate) || bindingIssueRow(bindingIssues, model) !== undefined)).map(editorIdentifier),
+    [bindingIssues, providers, translate, validationIssues],
+  );
+  return <NativeTable columns={[{ label: translate("providers.provider"), width: 112 }]} rows={rows} secondaryRowKeys={secondaryRowKeys} alertRowKeys={alertRowKeys} selectedKey={selectedProviderId} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { if (key) onSelect(key); }} style={styles.nativeProviderTable} />;
+});
+
 function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate, dispatch, dispatchWithOutcome, onStatus, onSecretState, applyProbedSurface, onOpenWizard, relay, addOfficialAccount }: { snapshot?: CoreSnapshot; ipc: IpcClient; onSnapshot: (next: CoreSnapshot) => void; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onStatus: (status?: string) => void; onSecretState: (state: SecretState) => void; applyProbedSurface: ApplyProbedSurface; onOpenWizard: () => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind) => Promise<string> }): React.JSX.Element {
   const [modelTableWidth, setModelTableWidth] = useState(0);
   const [routeTableWidth, setRouteTableWidth] = useState(0);
@@ -6205,7 +6313,10 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const providers = useMemo(() => snapshotProviderRecords(snapshot), [snapshot?.providers_models.providers, state.providers]);
   const validationIssues = useMemo(
     () => asRecords(snapshot?.drafts.providers_models?.validation.issues).filter((issue) => stringValue(issue.severity, "error") === "error"),
-    [snapshot],
+    // The draft's issue list is what this memo reads; keying on the whole
+    // snapshot gave it a new array for every unrelated patch, and the provider
+    // table below is memoized on this prop.
+    [snapshot?.drafts.providers_models?.validation.issues],
   );
   const [selectedProvider, setSelectedProvider] = useState<string>();
   const [providerNameDrafts, setProviderNameDrafts] = useState<Record<string, string>>({});
@@ -7160,20 +7271,6 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     const modelId = editorIdentifier(model);
     runMutationOnce(`model.delete:${providerId}:${modelId}`, () => native.showConfirmation({ title: translate("providers.deleteModel"), message: modelDisplayName(providerId, model) || modelId, confirmLabel: translate("common.delete"), destructive: true }).then((confirmed) => confirmed ? dispatch("model.delete", { provider_id: providerId, model_id: modelId }).then(() => setSelectedModel(undefined)) : undefined));
   };
-  const providerRows = useMemo(
-    () => providers.map((item) => ({
-      key: editorIdentifier(item),
-      cells: [providerDisplayName(item)],
-    })),
-    [providerDisplayName, providers],
-  );
-  // A provider that is turned off still dims — the list states the switch it
-  // is about — but it stays selectable: that click is the only way back to the
-  // 启用 box the row exists to open.  It is secondary ink, not a disabled row.
-  const offProviderKeys = useMemo(
-    () => providers.filter((item) => !booleanValue(item.enabled, true)).map(editorIdentifier),
-    [providers],
-  );
   // A login row serves its models on its credentials, not on a key: every
   // signed-in account and every custom key is a group of its own, and the model
   // list states that hierarchy instead of dropping every row into one column.
@@ -7309,16 +7406,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // needs the name is marked where it is edited — and a linked route the relay
   // could not resolve is marked on the row Core named, because that key or
   // route, not the pane, is what refused the write.
-  const bindingIssueFor = useCallback((model: UnknownRecord): UnknownRecord | undefined => {
-    const modelID = editorIdentifier(model);
-    const keyID = stringValue(model.provider_key_id);
-    return bindingIssues.find((issue) => {
-      const issueModel = stringValue(issue.model_id);
-      if (issueModel && issueModel === modelID) return true;
-      const issueKey = stringValue(issue.provider_key_id);
-      return Boolean(issueKey) && issueKey === keyID;
-    });
-  }, [bindingIssues]);
+  const bindingIssueFor = useCallback((model: UnknownRecord): UnknownRecord | undefined => bindingIssueRow(bindingIssues, model), [bindingIssues]);
   const alertModelKeys = useMemo(
     () => modelRowKeys(models.filter((item) => modelNeedsAttention(item, translate) || Boolean(bindingIssueFor(item))).map(editorIdentifier)),
     [bindingIssueFor, modelRowKeys, models, translate],
@@ -7347,14 +7435,15 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const showProviderInspector = viewMode === "routes"
     ? Boolean(activePublicGroup || activeRoute)
     : Boolean(provider || model);
-  const alertProviderKeys = useMemo(
-    () => providers.filter((item) => {
-      if (validationIssues.some((issue) => validationIssueMatchesProvider(issue, item))) return true;
-      if (bindingIssues.some((issue) => stringValue(issue.provider) === editorIdentifier(item))) return true;
-      return asRecords(item.models).some((model) => modelNeedsAttention(model, translate) || Boolean(bindingIssueFor(model)));
-    }).map(editorIdentifier),
-    [bindingIssueFor, bindingIssues, providers, translate, validationIssues],
-  );
+  // A click on the provider list is the only way back to the 启用 box a
+  // disabled row exists to open, so a dimmed row stays selectable; the table
+  // itself is subscribed to the domain, and this callback keeps its identity so
+  // an unrelated re-render does not reach it.
+  const selectProviderRow = useCallback((key: string): void => {
+    setSelectedProvider(key);
+    setSelectedModel(undefined);
+    setProviderSourceModel(undefined);
+  }, []);
   const routeRows = useMemo(() => {
     const rows: Array<{ key: string; cells: string[]; spanning?: boolean }> = [];
     for (const group of routeGroups) {
@@ -7527,7 +7616,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       </View> : <View style={styles.providerWorkspace}>
         <View style={styles.providerModelColumns}>
           <TablePane style={styles.providerListPane} title={translate("providers.providers")} actions={<><IconButton label="+" title={translate("providers.newProvider")} disabled={busy} onPress={addProvider} />{provider ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteProvider} /> : null}</>}>
-            <NativeTable columns={[{ label: translate("providers.provider"), width: 112 }]} rows={providerRows} secondaryRowKeys={offProviderKeys} alertRowKeys={alertProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { if (!key) return; setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }} style={styles.nativeProviderTable} />
+            <ProviderListTable translate={translate} selectedProviderId={providerId} providerNameDrafts={providerNameDrafts} validationIssues={validationIssues} onSelect={selectProviderRow} />
           </TablePane>
           <View style={styles.providerMiddlePane} onLayout={({ nativeEvent }) => setModelTableWidth(nativeEvent.layout.width)}>
             <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteModel} /> : null}</>}>
@@ -8804,6 +8893,24 @@ function modelNeedsAttention(model: UnknownRecord, translate: Translate): boolea
   if (!name) return true;
   if (isDraftModel(model, translate)) return true;
   return !(stringValue(model.litellm_model).trim() || stringValue(model.upstream_model).trim());
+}
+
+/**
+ * The binding issue a route row carries, if any.
+ *
+ * A relay-bound key Core could not resolve names the route or the key slot it
+ * affected; the provider table and the inspector must mark the same row, so the
+ * lookup lives here instead of being written twice.
+ */
+function bindingIssueRow(bindingIssues: UnknownRecord[], model: UnknownRecord): UnknownRecord | undefined {
+  const modelID = editorIdentifier(model);
+  const keyID = stringValue(model.provider_key_id);
+  return bindingIssues.find((issue) => {
+    const issueModel = stringValue(issue.model_id);
+    if (issueModel && issueModel === modelID) return true;
+    const issueKey = stringValue(issue.provider_key_id);
+    return Boolean(issueKey) && issueKey === keyID;
+  });
 }
 
 function validationProviderLabel(provider: UnknownRecord): string {
