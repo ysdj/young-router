@@ -195,6 +195,54 @@ class DomainLockTests(unittest.TestCase):
         self.assertLess(elapsed, 0.3, f"snapshot waited {elapsed:.3f}s for the write")
         self.assertEqual(committed, view["revision"])
 
+    def test_a_blocked_write_does_not_freeze_the_revision_a_reader_sees(self) -> None:
+        """The projection may lag a write; the revision may not.
+
+        A snapshot answered while another thread holds the lane carries the last
+        committed projection — that is the point of it.  It used to carry that
+        projection's revision too, so a reader believed Core still sat where the
+        projection did.  A pane re-sent that number as its Apply for as long as
+        a proxy reload held the lane, and every attempt was refused as a
+        conflict for a change that had already happened: the strip reported
+        更改未生效 over a write that landed before the first retry.
+        """
+
+        providers = _BlockingDomain("providers_models")
+        runtime = MemoryDomain("runtime", {"theme": "system"})
+        core = _store(providers, runtime)
+        self.addCleanup(core.stop_jobs)
+        committed = core.revision
+
+        blocked = threading.Thread(
+            target=lambda: core.dispatch(
+                {"domain": "providers_models", "type": "slow_write", "payload": {"n": 1}}
+            ),
+            name="slow-providers-write",
+            daemon=True,
+        )
+        blocked.start()
+        self.assertTrue(providers.entered.wait(2.0), "the slow write never started")
+        try:
+            # A write on another domain still advances the shared revision.
+            core.dispatch({"domain": "runtime", "type": "set", "payload": {"theme": "dark"}})
+            view = core.snapshot()
+            # The blocked write may still land after this; compare against the
+            # revision Core stated while the reader was answered.
+            during = core.revision
+        finally:
+            providers.release.set()
+            blocked.join(timeout=5.0)
+
+        self.assertGreater(during, committed)
+        # The reader is told where Core is now, not where the projection it was
+        # answered with had stopped.
+        self.assertEqual(during, view["revision"])
+        # The projection itself still lags the write in flight — that is what
+        # this view is for — while the draft state carried beside it is the
+        # current one.
+        self.assertEqual("system", view["domains"]["runtime"]["state"]["theme"])
+        self.assertTrue(view["drafts"]["runtime"]["dirty"])
+
     def test_cross_domain_declared(self) -> None:
         """A relay removal still releases the provider slots, in one transaction."""
 

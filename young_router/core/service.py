@@ -2713,7 +2713,20 @@ class CoreStore:
                 )
                 if (foreign_lane or foreign_domain) and self._snapshot_view is not None:
                     view = copy.deepcopy(self._snapshot_view)
+                    # The domains in this view are the last committed
+                    # projection; the revision is a fact about Core now, and so
+                    # are the live fields below.  Answering the old number made
+                    # a reader believe it held state Core had already left: a
+                    # pane re-sent that revision as its Apply for as long as a
+                    # proxy reload held the lane, and every attempt was refused
+                    # as a conflict for a change that had already happened — the
+                    # strip reported 更改未生效 over a write that landed before
+                    # the first retry.
                     view["service"] = copy.deepcopy(_safe_public(self._service))
+                    view["drafts"] = copy.deepcopy(self._drafts)
+                    view["disk"] = copy.deepcopy(self._disk)
+                    view["action_summaries"] = copy.deepcopy(self._last_actions)
+                    view["revision"] = self._revision
                     return view
                 return None
 
