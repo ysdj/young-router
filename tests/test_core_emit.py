@@ -76,6 +76,9 @@ def _apply_patch(client: dict[str, Any], event: dict[str, Any]) -> dict[str, Any
         if field in event:
             applied[field] = copy.deepcopy(event[field])
     applied["revision"] = event["revision"]
+    # A patch describes state, and the state it leaves behind is its revision:
+    # the projection a window then holds is exactly this one.
+    applied["projected_revision"] = event["revision"]
     return applied
 
 
@@ -444,6 +447,53 @@ class CoreEmitTests(unittest.TestCase):
         client = _apply_patch(client, event)
         self.assertEqual(core.snapshot(), client, "the patched copy diverged after the Apply")
         self.assertIs(False, client["drafts"]["runtime"]["dirty"])
+
+    def test_a_patch_published_from_a_lagging_view_names_the_projection(self) -> None:
+        """A patch is labelled by the state its ops describe, not by the head.
+
+        The emitter can run while another thread holds the projection lane, so
+        the state it publishes is the last committed projection under a newer
+        head.  Labelling that diff with the head told a window its copy was at a
+        revision the ops had never reached; the next patch then chained from
+        that label.  The event's ``revision`` is the projection's, and the head
+        stays in the snapshot's own ``revision``.
+        """
+
+        core, events = self._baseline()
+        committed = core.revision
+        with mock.patch.object(core._emitter, "request", lambda: None):
+            core.dispatch({"domain": "runtime", "type": "set", "payload": {"choice": "en"}})
+            changed = core.snapshot()
+            self.assertEqual(changed["revision"], changed["projected_revision"])
+            projection = changed["revision"]
+            # A live projection advances the head without a new assembly.
+            core._advance_projection_revision()
+            head = core.revision
+            self.assertLess(projection, head)
+
+            entered = threading.Event()
+            release = threading.Event()
+
+            def hold_projection() -> None:
+                with core._projection_scope():
+                    entered.set()
+                    release.wait(10.0)
+
+            holder = threading.Thread(target=hold_projection, name="foreign-projection", daemon=True)
+            holder.start()
+            self.assertTrue(entered.wait(2.0), "the projection lane was never held")
+            try:
+                core._emit()
+            finally:
+                release.set()
+                holder.join(timeout=5.0)
+
+        self.assertEqual(1, len(events) - 1, "the held projection published no event")
+        event = events[-1]
+        self.assertEqual("patch", event["event"])
+        self.assertEqual(committed, event["base_revision"])
+        self.assertEqual(projection, event["revision"], "the patch was labelled with the head")
+        self.assertLess(event["revision"], head)
 
     def test_patch_carries_service_row_when_it_moves(self) -> None:
         """The service row moves without a revision, so a patch cannot skip it.

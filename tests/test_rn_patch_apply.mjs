@@ -10,7 +10,7 @@
  * one domain, and the rule that removes the third full read after an action.
  */
 import assert from "node:assert/strict";
-import { applyPatch } from "../rn/packages/shared/src/ui/applyPatch.ts";
+import { applyPatch, mergeSnapshot, snapshotProjectionRevision } from "../rn/packages/shared/src/applyPatch.ts";
 import {
   getDomain,
   postActionRefreshNeeded,
@@ -212,6 +212,62 @@ assert.notEqual(added, base, "applyPatch returned the same object");
 assert.notEqual(added.domains, base.domains, "applyPatch reused the domains map");
 assert.notEqual(added.domains.providers_models, base.domains.providers_models, "applyPatch mutated the domain");
 assert.deepEqual(base, original, "applyPatch mutated the snapshot it was given");
+
+// ---------------------------------------------------------------------------
+// A snapshot states the write head and the revision its projection is at.
+// While another thread holds a write lane, Core answers the last committed
+// projection under the current head.  A patch chains on the projection, so the
+// numbers must not be read as one: a window that chained on the head refused
+// the patch that carried the very state its projection lacked, and a stale
+// projection that arrived after that patch walked the state back.
+// ---------------------------------------------------------------------------
+const staleView = {
+  ...snapshotAt(9, [provider]),
+  projected_revision: 7,
+  drafts: { providers_models: { dirty: true, base_revision: 9, validation: { valid: true, issues: [] } } },
+};
+assert.equal(snapshotProjectionRevision(staleView), 7, "the projection stated its own revision");
+assert.equal(
+  snapshotProjectionRevision({ ...staleView, projected_revision: undefined }),
+  9,
+  "a Core without the field was read as head == projection",
+);
+
+const chained = applyPatch(staleView, patch(7, [
+  { domain: "providers_models", kind: "upsert", id: "model:public-route-2", value: model("public-route-2") },
+]));
+assert.ok(chained, "a patch was refused because the window's head had moved first");
+assert.equal(chained.projected_revision, 8, "the applied patch did not move the projection");
+assert.equal(chained.revision, 9, "applying the patch moved the window's head backwards");
+assert.deepEqual(chained.drafts, staleView.drafts, "an older patch replaced the live drafts of a newer head");
+assert.equal(
+  chained.domains.providers_models.providers[0].models.length,
+  2,
+  "the patch did not reach the projection it chained on",
+);
+
+// A snapshot whose projection already moved is the newer state even when its
+// head is the older number: the two halves are independent, and neither may
+// walk back.
+const newerProjectionOlderHead = { ...snapshotAt(8, [provider, { ...provider, id: "second", editor_id: "provider-second" }]), projected_revision: 8 };
+const merged = mergeSnapshot(staleView, newerProjectionOlderHead);
+assert.equal(merged.revision, 9, "the merged state lost the newer head");
+assert.equal(merged.projected_revision, 8, "the merged state lost the newer projection");
+assert.equal(merged.domains.providers_models.providers.length, 2, "the merged state kept the older projection");
+assert.deepEqual(merged.drafts, staleView.drafts, "the merged state lost the live drafts of the newer head");
+
+// The late answer to a read taken mid-write carries the old projection under a
+// current head.  It must not replace a projection this window already applied.
+const applied = applyPatch(snapshotAt(7, [provider]), patch(7, [
+  { domain: "providers_models", kind: "upsert", id: "model:public-route-2", value: model("public-route-2") },
+]));
+assert.ok(applied);
+const lateStale = { ...snapshotAt(applied.revision, [provider]), projected_revision: 7 };
+const kept = mergeSnapshot(applied, lateStale);
+assert.equal(kept.domains, applied.domains, "a late stale projection replaced a newer one");
+assert.equal(kept.projected_revision, 8, "the newer projection gave up its revision");
+assert.equal(kept.revision, applied.revision, "the head moved without a newer read");
+assert.equal(mergeSnapshot(applied, applied), applied, "an unchanged state was rebuilt");
 
 // ---------------------------------------------------------------------------
 // The per-domain store: one reference per domain, one notify per moved domain.

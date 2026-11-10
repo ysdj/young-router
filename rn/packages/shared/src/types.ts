@@ -446,7 +446,15 @@ export interface LogView extends LogSummary {
 
 export interface CoreSnapshot {
   protocol_version: typeof IPC_PROTOCOL_VERSION;
+  /** Where Core's write head is: the revision an edit is made on. */
   revision: number;
+  /**
+   * The revision `domains` describes.  It trails `revision` only while Core
+   * answers the last committed projection during another thread's write;
+   * patches chain on this number, never on the head.  Absent from a Core that
+   * predates the field, where the two are always the same.
+   */
+  projected_revision?: number;
   service: ServiceStatus;
   providers_models: ProvidersModelsSummary;
   drafts: Partial<Record<ConfigDomain, DraftState>>;

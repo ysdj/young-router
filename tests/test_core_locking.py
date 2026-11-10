@@ -239,9 +239,21 @@ class DomainLockTests(unittest.TestCase):
         self.assertEqual(during, view["revision"])
         # The projection itself still lags the write in flight — that is what
         # this view is for — while the draft state carried beside it is the
-        # current one.
+        # current one.  Its own revision travels beside the head: a window
+        # chains patches on the state it holds, and that state is committed.
         self.assertEqual("system", view["domains"]["runtime"]["state"]["theme"])
         self.assertTrue(view["drafts"]["runtime"]["dirty"])
+        self.assertEqual(committed, view["projected_revision"])
+        self.assertLess(view["projected_revision"], view["revision"])
+        # A view with no foreign write in the way is its own projection, and
+        # the two numbers agree again.
+        self.assertTrue(
+            _wait_for(lambda: core.projected_revision == core.revision),
+            "the projection never caught up with the head it had already stated",
+        )
+        settled = core.snapshot()
+        self.assertEqual(settled["revision"], settled["projected_revision"])
+        self.assertEqual("dark", settled["domains"]["runtime"]["state"]["theme"])
 
     def test_cross_domain_declared(self) -> None:
         """A relay removal still releases the provider slots, in one transaction."""

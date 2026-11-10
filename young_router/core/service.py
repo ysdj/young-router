@@ -2225,6 +2225,35 @@ class CoreStore:
             return self._revision
 
     @property
+    def projected_revision(self) -> int:
+        """The revision a snapshot answered right now would carry for its domains.
+
+        A snapshot's ``revision`` states where Core's write head is; its
+        domains may be the last committed projection, assembled while another
+        thread held a write lane.  That projection has this revision, and a
+        window chains patches on it — a patch is a change from the state a
+        window holds, not from the head Core has moved to.
+
+        A reader with no foreign write in the way would be answered a fresh
+        projection at the head, so that is what this answers.  The IPC snapshot
+        cache keys its bytes on the pair: the head alone let a stale body
+        outlive the write that had held the lane.
+        """
+
+        with self._lock:
+            view = self._snapshot_view
+            if view is not None:
+                foreign_lane = self._mutation_owner not in (None, threading.get_ident())
+                foreign_domain = any(
+                    holder != threading.get_ident() for holder in self._domain_holds
+                )
+                if foreign_lane or foreign_domain:
+                    revision = view.get("revision")
+                    if type(revision) is int and 0 <= revision <= self._revision:
+                        return revision
+            return self._revision
+
+    @property
     def domains(self) -> tuple[str, ...]:
         with self._lock:
             return tuple(self._domains)
@@ -2392,7 +2421,14 @@ class CoreStore:
         # Publishing under the guard keeps the recorded chain ordered; a
         # projection that lost the race is refused by the revision check below.
         projected = self.snapshot() if snapshot is None else snapshot
-        revision = projected.get("revision")
+        # The event describes the state in ``domains``, and that state has its
+        # own revision.  While another thread holds a write lane the projection
+        # is the last committed one under a newer head; publishing it under the
+        # head would label a diff of the old state with a revision the diff
+        # never reached.  A window chains the next patch on this number, so it
+        # is the one the ops describe.
+        projection_revision = projected.get("projected_revision")
+        revision = projection_revision if type(projection_revision) is int else projected.get("revision")
         if type(revision) is not int:
             return
         with self._publish_guard:
@@ -2470,7 +2506,8 @@ class CoreStore:
 
         domains = projected.get("domains")
         previous_domains = previous.get("domains")
-        revision = projected.get("revision")
+        projection_revision = projected.get("projected_revision")
+        revision = projection_revision if type(projection_revision) is int else projected.get("revision")
         if not isinstance(domains, Mapping) or not isinstance(previous_domains, Mapping) or type(revision) is not int:
             raise _PatchUnavailable
         ops: list[dict[str, Any]] = []
@@ -2722,11 +2759,25 @@ class CoreStore:
                     # as a conflict for a change that had already happened — the
                     # strip reported 更改未生效 over a write that landed before
                     # the first retry.
+                    #
+                    # The domains still have a revision of their own, and it
+                    # travels as ``projected_revision``: a window chains the
+                    # next patch on the state it actually holds, never on the
+                    # newer number that only says where Core's head is.  Two
+                    # numbers because they are two facts; a window that read
+                    # one as the other dropped the patch that described this
+                    # very change.
+                    projection_revision = view.get("revision")
                     view["service"] = copy.deepcopy(_safe_public(self._service))
                     view["drafts"] = copy.deepcopy(self._drafts)
                     view["disk"] = copy.deepcopy(self._disk)
                     view["action_summaries"] = copy.deepcopy(self._last_actions)
                     view["revision"] = self._revision
+                    view["projected_revision"] = (
+                        projection_revision
+                        if type(projection_revision) is int and projection_revision <= self._revision
+                        else self._revision
+                    )
                     return view
                 return None
 
@@ -2970,7 +3021,12 @@ class CoreStore:
         # timeout.
         return {
             "protocol_version": PROTOCOL_VERSION,
+            # Where Core's write head is, and where the projection beside it
+            # is.  They differ only in the view answered while another thread
+            # holds a write lane; a window sends the first as its expected
+            # revision and chains patches on the second.
             "revision": self._revision,
+            "projected_revision": self._revision,
             "service": copy.deepcopy(_safe_public(self._service)),
             "providers_models": copy.deepcopy(domains["providers_models"]),
             "drafts": copy.deepcopy(self._drafts),

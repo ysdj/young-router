@@ -38,7 +38,7 @@ import {
 } from "./RelayAccountManager";
 import { suggestedProviderName, suggestedRelayStationName } from "./relayOrigin";
 import { multiplierSpelling, rateNumber, rateSpelling } from "./rateSpelling";
-import { applyPatch } from "./applyPatch";
+import { applyPatch, mergeSnapshot, snapshotProjectionRevision } from "../applyPatch";
 import { postActionRefreshNeeded, publishSnapshot, useDomainRecord, type EventChannelState } from "./snapshotStore";
 import { providerCredentialKeys, relayCredentialKey } from "./providerCredentials";
 import { isAssistantEditorOpen, isGroupManagerOpen, isProviderWizardOpen, isWebDavSettingsOpen, setAssistantEditorOpen, setGroupManagerOpen, setProviderWizardOpen, setWebDavSettingsOpen, subscribeProviderWizard } from "./providerWizardGate";
@@ -1781,13 +1781,21 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
     }
   }, [ipc]);
 
-  const receiveSnapshot = useCallback((next: CoreSnapshot): void => {
-    // The Core revision orders mutations.  Same-revision snapshots remain
-    // useful for live log projections, so only discard stale responses.
-    if (next.revision < acceptedSnapshotRevision.current) return;
-    acceptedSnapshotRevision.current = next.revision;
+  const receiveSnapshot = useCallback((incoming: CoreSnapshot): void => {
+    // A snapshot states the write head and the revision its projection is at.
+    // A read answered while another thread held a write lane advances the head
+    // but carries the last committed projection, so accepting it whole would
+    // walk this window's domains back over a patch it had already applied (and
+    // move its head past the patch that is still coming).  Merge instead: the
+    // newer projection wins the domains, the newer head wins the live fields.
+    const held = latestSnapshot.current;
+    const next = mergeSnapshot(held, incoming);
+    // Held is returned only when the incoming state is older in both halves:
+    // an answer that advances neither is not a state this window can move to.
+    if (next === held) return;
+    acceptedSnapshotRevision.current = Math.max(acceptedSnapshotRevision.current, next.revision);
     latestSnapshot.current = next;
-    eventChannel.current.revision = next.revision;
+    eventChannel.current.revision = Math.max(eventChannel.current.revision, next.revision);
     // Hand the per-domain layer the state before React renders it, so a pane
     // subscribed to one domain is notified once for this state and not again
     // when the root's commit reaches it.
@@ -1825,10 +1833,13 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
         receiveSnapshot(event.snapshot);
         return;
       case "patch": {
-        // A patch at or below the state this window holds is an event it has
-        // already applied; reading again would ship a second copy of it.
-        if (event.revision <= acceptedSnapshotRevision.current) return;
+        // A patch at or below the projection this window holds is state it has
+        // already applied.  Compare with the projection, not the head: a read
+        // answered mid-write moves the head past a patch that is still
+        // arriving, and dropping that patch left the window drawing the state
+        // before it with no event left to correct it.
         const current = latestSnapshot.current;
+        if (event.revision <= (snapshotProjectionRevision(current) ?? -1)) return;
         const applied = current ? applyPatch(current, event) : undefined;
         if (!applied) {
           // A gap, an unknown domain, or an op this build cannot reduce: read
@@ -2819,11 +2830,11 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
 
 
   const refresh = async (): Promise<CoreSnapshot> => {
-    const next = await ipc.snapshot();
+    const next = mergeSnapshot(latestSnapshot.current, await ipc.snapshot());
     revision.current = Math.max(revision.current ?? -1, next.revision);
     latestSnapshot.current = next;
     onSnapshot(next);
-    return next;
+    return latestSnapshot.current ?? next;
   };
   const validationStatusAfterFailure = async (reason: unknown): Promise<string | undefined> => {
     const code = validationFailureCode(reason);

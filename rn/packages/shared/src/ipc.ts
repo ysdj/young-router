@@ -16,6 +16,7 @@ import {
   type CoreSnapshot,
   type ValidationSummary,
 } from "./types";
+import { mergeSnapshot } from "./applyPatch";
 
 export class IpcProtocolError extends Error {
   readonly code: string;
@@ -139,9 +140,12 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
   }
 
   function rememberSnapshot(next: CoreSnapshot): CoreSnapshot {
-    // Snapshot revisions order mutations. Keep same-revision projections too:
-    // they may carry newer live log data.
-    if (!latestSnapshot || next.revision >= latestSnapshot.revision) latestSnapshot = next;
+    // Snapshot revisions order mutations.  The head orders the live fields and
+    // the projection orders the domains, and a snapshot answered mid-write can
+    // advance one without the other; merging keeps the newer half of each, so
+    // a slow answer to an earlier read cannot walk the state back.  Same-
+    // revision projections are still kept: they may carry newer live log data.
+    latestSnapshot = mergeSnapshot(latestSnapshot, next);
     return latestSnapshot;
   }
 

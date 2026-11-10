@@ -4288,8 +4288,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
     def test_snapshot_revisions_drop_stale_responses_without_suppressing_live_log_updates(self) -> None:
         self.assertIn("const acceptedSnapshotRevision = useRef<number>(initialSnapshot?.revision ?? -1);", self.ui)
-        self.assertIn("if (next.revision < acceptedSnapshotRevision.current) return;", self.ui)
-        self.assertIn("Same-revision snapshots remain", self.ui)
+        # A snapshot states the write head and the revision its projection is
+        # at; the root merges on both axes instead of taking whichever answer
+        # arrived last.  Dropping by head alone let a read answered mid-write
+        # overwrite a projection a patch had already advanced.
+        self.assertIn("const next = mergeSnapshot(held, incoming);", self.ui)
+        self.assertIn("if (next === held) return;", self.ui)
+        self.assertIn("if (event.revision <= (snapshotProjectionRevision(current) ?? -1)) return;", self.ui)
+        self.assertIn("import { applyPatch, mergeSnapshot, snapshotProjectionRevision } from \"../applyPatch\";", self.ui)
         self.assertNotIn("acceptedSnapshotFingerprint", self.ui)
 
     def test_route_windows_render_from_the_shared_snapshot_on_the_first_frame(self) -> None:

@@ -26,7 +26,79 @@ import type {
   ProvidersModelsSummary,
   ProviderSummary,
   WebDavStatus,
-} from "../types";
+} from "./types";
+
+/**
+ * A snapshot states two moments, and a window needs both.
+ *
+ * ``revision`` is where Core's write head is; it is the number a window sends
+ * back as the revision its edit was made on.  ``projected_revision`` is the
+ * revision the ``domains`` beside it describe: while another thread holds a
+ * write lane, Core answers with the last committed projection under the
+ * current head.  The two differ only in that case, and a client that reads
+ * one as the other breaks its own state:
+ *
+ * - A patch is a change *from* ``projected_revision``, so chaining it on the
+ *   head refuses a patch that describes exactly the state the window lacks.
+ * - A stale projection arriving with a current head must not replace a newer
+ *   projection the window already holds.
+ *
+ * The IPC cache and the root component both merge through these two helpers,
+ * so the rule has one home.
+ */
+
+/** The revision a window's ``domains`` are at. */
+export function snapshotProjectionRevision(snapshot: CoreSnapshot | undefined): number | undefined {
+  if (!snapshot) return undefined;
+  const projected = snapshot.projected_revision;
+  if (
+    typeof projected === "number"
+    && Number.isInteger(projected)
+    && projected >= 0
+    && projected <= snapshot.revision
+  ) {
+    return projected;
+  }
+  // A snapshot from a Core that predates the field carries its projection and
+  // its head as the same number, so the fallback is exactly that Core's
+  // meaning.
+  return snapshot.revision;
+}
+
+/**
+ * The state a window holds after seeing ``next``, given what it already holds.
+ *
+ * Neither half moves backwards: the domains (and the summaries derived from
+ * them) come from whichever snapshot has the newer projection, while the live
+ * fields — the service row, staged drafts, disk markers, action summaries —
+ * come from whichever has the newer head.  The result is the same state a
+ * full read at the newer of the two moments would have answered, so a late
+ * answer to an earlier read cannot undo a patch this window just applied.
+ *
+ * ``held`` is returned unchanged when ``next`` advances neither half; that is
+ * the common keep-alive case and it keeps every domain subscriber quiet.
+ */
+export function mergeSnapshot(held: CoreSnapshot | undefined, next: CoreSnapshot): CoreSnapshot {
+  if (!held) return next;
+  const heldProjection = snapshotProjectionRevision(held) ?? held.revision;
+  const nextProjection = snapshotProjectionRevision(next) ?? next.revision;
+  const heldHasNewerProjection = heldProjection > nextProjection;
+  const heldHasNewerHead = held.revision > next.revision;
+  if (!heldHasNewerProjection && !heldHasNewerHead) return next;
+  if (heldHasNewerProjection && heldHasNewerHead) return held;
+  const projection = heldHasNewerProjection ? held : next;
+  const live = heldHasNewerHead ? held : next;
+  return {
+    ...projection,
+    protocol_version: next.protocol_version,
+    revision: live.revision,
+    projected_revision: Math.max(heldProjection, nextProjection),
+    service: live.service,
+    drafts: live.drafts,
+    disk: live.disk,
+    action_summaries: live.action_summaries,
+  };
+}
 
 /** The queue depth Core uses when a log tab states an unusable limit. */
 const SUBSCRIPTION_QUEUE_LIMIT = 32;
@@ -49,7 +121,11 @@ export function applyPatch(snapshot: CoreSnapshot, event: PatchEvent): CoreSnaps
   if (!event || typeof event !== "object") return undefined;
   if (event.event !== "patch") return undefined;
   if (!isRecord(snapshot) || !isRecord(snapshot.domains)) return undefined;
-  if (event.base_revision !== snapshot.revision) return undefined;
+  // The patch is a change from the state this window holds, not from the head
+  // Core has moved to.  A snapshot answered during another thread's write
+  // states both numbers; chaining on the head refused the patch that carried
+  // the very state the projection lacked.
+  if (event.base_revision !== snapshotProjectionRevision(snapshot)) return undefined;
   if (!Number.isInteger(event.revision) || event.revision <= event.base_revision) return undefined;
   if (!Array.isArray(event.domains) || !Array.isArray(event.ops) || event.ops.length === 0) return undefined;
 
@@ -90,16 +166,24 @@ export function applyPatch(snapshot: CoreSnapshot, event: PatchEvent): CoreSnaps
     nextDomains[domain] = updated;
   }
 
+  // Which moment the live fields in this event belong to.  A patch can chain
+  // onto a projection older than the head this window already holds (a read
+  // answered mid-write moved the head first).  The event's drafts, disk row,
+  // service state and summaries are then older than the ones in hand, so they
+  // stay; its domains are still newer than the projection, which is why this
+  // patch is being applied at all.
+  const eventIsHead = event.revision >= snapshot.revision;
   const next: CoreSnapshot = {
     ...snapshot,
     // A field the patch did not carry is unchanged; one it carried is the
     // authority, even when it is an empty action-summary map.  Each is copied
     // out, so the state a window holds never aliases the event object.
-    ...(event.service === undefined ? {} : { service: cloneValue(event.service) }),
-    ...(event.drafts === undefined ? {} : { drafts: cloneValue(event.drafts) }),
-    ...(event.disk === undefined ? {} : { disk: cloneValue(event.disk) }),
-    ...(event.action_summaries === undefined ? {} : { action_summaries: cloneValue(event.action_summaries) }),
-    revision: event.revision,
+    ...(event.service === undefined || !eventIsHead ? {} : { service: cloneValue(event.service) }),
+    ...(event.drafts === undefined || !eventIsHead ? {} : { drafts: cloneValue(event.drafts) }),
+    ...(event.disk === undefined || !eventIsHead ? {} : { disk: cloneValue(event.disk) }),
+    ...(event.action_summaries === undefined || !eventIsHead ? {} : { action_summaries: cloneValue(event.action_summaries) }),
+    revision: Math.max(snapshot.revision, event.revision),
+    projected_revision: event.revision,
     domains: nextDomains,
   };
 

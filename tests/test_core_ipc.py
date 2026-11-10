@@ -117,6 +117,57 @@ class SnapshotPollCacheTests(unittest.TestCase):
                 server.handle_request(request, session_token=token)
             self.assertEqual(1, len(calls))
 
+    def test_a_mid_write_snapshot_body_is_not_cached_for_the_catching_up_head(self) -> None:
+        """The cached bytes belong to a projection, not just to a head.
+
+        A snapshot answered while another thread holds the projection lane is
+        the last committed projection under a newer head.  Caching those bytes
+        by the head alone outlived the lane: the head stayed put when the
+        projection caught up, so the next poll was handed the state before the
+        write it had just missed.  The cache is keyed by both revisions.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            core = CoreStore(domains=[MemoryDomain("probe")])
+            server = CoreIPCServer(core)
+            server.start()
+            self.addCleanup(server.stop)
+            core.snapshot()
+            committed = core.revision
+            # The head moves for a live projection; the committed view here is
+            # still the one assembled at ``committed``.
+            core._advance_projection_revision()
+            self.assertEqual(committed + 1, core.revision)
+
+            entered = threading.Event()
+            release = threading.Event()
+
+            def hold_projection() -> None:
+                with core._projection_scope():
+                    entered.set()
+                    release.wait(10.0)
+
+            holder = threading.Thread(target=hold_projection, name="foreign-projection", daemon=True)
+            holder.start()
+            self.assertTrue(entered.wait(2.0), "the projection lane was never held")
+            try:
+                mid = core.snapshot()
+                self.assertEqual(core.revision, mid["revision"])
+                self.assertEqual(committed, mid["projected_revision"])
+                server.remember_snapshot_result({"snapshot": mid})
+            finally:
+                release.set()
+                holder.join(timeout=5.0)
+
+            # The lane is free: a fresh read states the head as its projection.
+            self.assertEqual(core.revision, core.projected_revision)
+            self.assertIsNone(
+                server._prepared_snapshot("catching-up"),
+                "the head alone served a body from before the write it missed",
+            )
+            fresh = core.snapshot()
+            self.assertEqual(fresh["revision"], fresh["projected_revision"])
+
 class CoreProtocolTests(unittest.TestCase):
     def test_ipc_server_uses_a_short_shutdown_poll_interval(self) -> None:
         core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])

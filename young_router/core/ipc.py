@@ -1303,8 +1303,12 @@ class CoreIPCServer:
         self._bootstrap_consumed = False
         self._sessions: dict[str, _Session] = {}
         self._subscriptions: dict[str, _Subscription] = {}
-        #: ``(revision, result bytes)`` of the last snapshot answered to a poll.
-        self._snapshot_body: tuple[int, bytes] | None = None
+        #: ``(revision, projected_revision, result bytes)`` of the last
+        #: snapshot answered to a poll.  Both revisions are part of the key: a
+        #: body answered while a write lane was held carries the last committed
+        #: projection under the current head, and serving it after the lane
+        #: freed would hand a window state Core had already left.
+        self._snapshot_body: tuple[int, int, bytes] | None = None
         self._editor_capabilities: dict[str, _EditorCapability] = {}
         self._secret_capabilities: dict[str, _SecretCapability] = {}
         self._secret_read_capabilities: dict[str, _SecretReadCapability] = {}
@@ -2531,18 +2535,25 @@ class CoreIPCServer:
         return subscription_id
 
     def _prepared_snapshot(self, request_id: str) -> "_PreparedResponse | None":
-        """The cached answer for this revision, or ``None`` to build one.
+        """The cached answer for this state, or ``None`` to build one.
 
-        The cache is by revision because that is the store's own statement
-        about its projection: the same revision is the same snapshot, so the
-        bytes beside it are still its bytes.  A miss leaves the caller to build
-        and validate one, and the next call to ``_remember_snapshot`` stores it.
+        The cache is keyed by the pair the store states about a snapshot: the
+        write head and the revision the projection beside it describes.  The
+        same pair is the same snapshot, so the bytes beside it are still its
+        bytes.  Keying on the head alone made a body answered mid-write
+        outlive the write that held the lane — the head stayed put when the
+        projection caught up.  A miss leaves the caller to build and validate
+        one, and the next call to ``remember_snapshot_result`` stores it.
         """
 
         cached = self._snapshot_body
-        if cached is None or cached[0] != self.core.revision:
+        if (
+            cached is None
+            or cached[0] != self.core.revision
+            or cached[1] != self.core.projected_revision
+        ):
             return None
-        return _PreparedResponse(200, self._snapshot_envelope(request_id, cached[1]))
+        return _PreparedResponse(200, self._snapshot_envelope(request_id, cached[2]))
 
     def _snapshot_envelope(self, request_id: str, result: bytes) -> bytes:
         prefix = (
@@ -2555,9 +2566,15 @@ class CoreIPCServer:
         return prefix + result + b"}"
 
     def remember_snapshot_result(self, result: Mapping[str, Any]) -> None:
-        """Keep this revision's encoded result, so its next poll is a copy."""
+        """Keep this state's encoded result, so its next poll is a copy."""
 
-        self._snapshot_body = (self.core.revision, _encode_json(result))
+        projected = result.get("snapshot")
+        projected_revision = projected.get("projected_revision") if isinstance(projected, Mapping) else None
+        self._snapshot_body = (
+            self.core.revision,
+            projected_revision if type(projected_revision) is int else self.core.projected_revision,
+            _encode_json(result),
+        )
 
     def next_event(self, subscription_id: str, *, session_token: str, timeout: float) -> dict[str, Any] | None:
         with self._lock:
