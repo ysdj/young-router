@@ -93,6 +93,13 @@ METHODS = frozenset(SUPPORTED_METHODS)
 # The domains the event contract can name.  A patch whose domain is not one of
 # them is an event no client can type, so it is refused where it is built.
 EVENT_DOMAINS = frozenset(_PROTOCOL_SCHEMA.get("$defs", {}).get("domain", {}).get("enum", ()))
+# The top-level snapshot fields a patch may carry.  They are the halves of a
+# projection that are not keyed by domain -- a staged draft's dirty flag, a
+# file that appeared, a service row that moved -- so a window cannot derive
+# them from the ops it applied, and a patch that leaves them out leaves the
+# reader believing a state the store has already left.  Every one is optional
+# on the wire: an unchanged field is omitted rather than restated.
+PATCH_TOP_LEVEL_FIELDS = ("service", "drafts", "disk", "action_summaries")
 
 
 def _safe_text(value: object, label: str, *, maximum: int) -> str:
@@ -670,6 +677,7 @@ def make_patch_event(
     revision: int,
     domains: list[str] | tuple[str, ...],
     ops: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+    top_level: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build an incremental event for the changes since ``base_revision``.
 
@@ -677,6 +685,11 @@ def make_patch_event(
     ops belong to so a window can tell which panes owe a repaint.  A patch that
     names no domain or carries no op describes nothing a window could apply, so
     it is refused here instead of arriving as a no-op the reader has to explain.
+
+    ``top_level`` carries the snapshot fields that are not keyed by domain and
+    did change, by name: a staged draft, the disk markers, the service row, an
+    action summary.  A field that did not move is left out, so a patch stays the
+    size of the edit instead of becoming a snapshot with ops attached.
     """
 
     base = _event_revision(base_revision, "patch base revision")
@@ -720,6 +733,13 @@ def make_patch_event(
         "domains": names,
         "ops": payload_ops,
     }
+    if top_level is not None:
+        for field, value in top_level.items():
+            if field not in PATCH_TOP_LEVEL_FIELDS:
+                raise ProtocolError("invalid_event", "patch event carries an unknown top-level field")
+            if not isinstance(value, Mapping):
+                raise ProtocolError("invalid_event", f"patch event {field} must be an object")
+            payload[field] = dict(value)
     _validate_json_value(payload)
     return payload
 
@@ -784,6 +804,7 @@ __all__ = [
     "METHODS",
     "MAX_EDITOR_DOCUMENT_BYTES",
     "MAX_MESSAGE_BYTES",
+    "PATCH_TOP_LEVEL_FIELDS",
     "PROTOCOL_VERSION",
     "ProtocolError",
     "RequestEnvelope",

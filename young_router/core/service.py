@@ -39,6 +39,7 @@ from .oplog import note as _note
 from .persistence import AtomicJSONStore, PersistenceError, atomic_write_bytes, atomic_write_json, read_bytes, read_json
 from .protocol import (
     MAX_EDITOR_DOCUMENT_BYTES,
+    PATCH_TOP_LEVEL_FIELDS,
     PROTOCOL_VERSION,
     ProtocolError,
     _encode_json,
@@ -1286,11 +1287,15 @@ class CoreStore:
         # adapter state that mutation is rewriting; the adapter projections
         # are only consistent under the mutation that owns them.
         self._snapshot_view: dict[str, Any] | None = None
-        # What the last published event handed to the windows, and the revision
+        # What the last published event left a window holding, and the revision
         # it carried: the next event is the patch that takes a window from here
-        # to the store's current state.  ``None`` means no window has received
-        # a full state from this store yet, so the next event must be one
-        # (first subscription, or a gap that reset the chain).
+        # to the store's current state.  It is the whole projection, not only
+        # its domains, because the fields a window cannot derive from an op (a
+        # staged draft, the disk markers, the service row, an action summary)
+        # have to be compared against what the windows already hold.  ``None``
+        # means no window has received a full state from this store yet, so the
+        # next event must be one (first subscription, or a gap that reset the
+        # chain).
         self._last_published_projection: dict[str, Any] | None = None
         self._last_published_revision = 0
         # One send at a time, so two publishers cannot both compute a patch
@@ -2030,8 +2035,18 @@ class CoreStore:
             # and a deepcopy of the whole projection was slower than the JSON the
             # event is about to become anyway.
             encoded = _encode_json(event)
+            # The whole projection, not just its domains: the next patch has to
+            # say whether a staged draft, the disk markers, the service row, or
+            # an action summary moved as well, and "equal to what the windows
+            # already hold" is exactly what this copy answers.  It is taken
+            # before the lock for the same reason the event was encoded there:
+            # an action summary can carry every model a station answered, and a
+            # copy of that inside the critical section is a hold the budget
+            # measures (see ``snapshot``).  Only a publisher reads this copy,
+            # and ``_publish_guard`` is already serializing publishers.
+            published = copy.deepcopy(dict(projected))
             with self._lock:
-                self._last_published_projection = copy.deepcopy(projected.get("domains"))
+                self._last_published_projection = published
                 self._last_published_revision = revision
             for callback in callbacks:
                 try:
@@ -2054,18 +2069,24 @@ class CoreStore:
         the caller sends a resync instead: a patch that leaves a row out is a
         row the window keeps drawing, so an incomplete answer is worse than a
         full one.
+
+        The ops describe the domains; the top-level fields a window cannot
+        derive from them (a staged draft's dirty flag, the disk markers, the
+        service row, an action summary) travel beside them, and only when they
+        actually moved.
         """
 
         domains = projected.get("domains")
+        previous_domains = previous.get("domains")
         revision = projected.get("revision")
-        if not isinstance(domains, Mapping) or type(revision) is not int:
+        if not isinstance(domains, Mapping) or not isinstance(previous_domains, Mapping) or type(revision) is not int:
             raise _PatchUnavailable
         ops: list[dict[str, Any]] = []
         changed: list[str] = []
         for name, current in domains.items():
             if not isinstance(name, str):
                 raise _PatchUnavailable
-            before = previous.get(name)
+            before = previous_domains.get(name)
             if before == current:
                 continue
             adapter = self._domains.get(name)
@@ -2088,7 +2109,15 @@ class CoreStore:
             if revision == base_revision:
                 return None
             raise _PatchUnavailable
-        return make_patch_event(base_revision, revision, changed, ops)
+        # The fields a window cannot derive from the ops it just applied.  An
+        # equal field is omitted: restating an unchanged draft or disk marker
+        # would make every patch a snapshot with ops attached.
+        top_level = {
+            name: copy.deepcopy(projected.get(name))
+            for name in PATCH_TOP_LEVEL_FIELDS
+            if previous.get(name) != projected.get(name)
+        }
+        return make_patch_event(base_revision, revision, changed, ops, top_level)
 
     def _request_emit(self) -> None:
         """Mark one state event pending for the emitter.

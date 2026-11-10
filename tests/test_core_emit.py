@@ -9,11 +9,13 @@ last of them.
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 import tempfile
 import threading
 import time
+from typing import Any
 import unittest
 from unittest import mock
 
@@ -55,7 +57,39 @@ def _dispatch_provider_add(core: CoreStore) -> dict[str, object]:
     )
 
 
+def _apply_patch(client: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    """Apply one patch to a window's copy, the way a window does.
+
+    Only the whole-domain ``replace`` fallback is reduced here.  It is the one
+    op shape whose reconstruction is a plain assignment, which is what lets the
+    guard test compare the patched copy with the store's own projection exactly
+    instead of approximately.
+    """
+
+    applied = copy.deepcopy(client)
+    for op in event["ops"]:
+        if op.get("kind") != "replace":
+            raise AssertionError(f"this guard cannot reduce a {op.get('kind')} op")
+        applied["domains"][op["domain"]] = copy.deepcopy(op.get("value"))
+    for field in ("service", "drafts", "disk", "action_summaries"):
+        if field in event:
+            applied[field] = copy.deepcopy(event[field])
+    applied["revision"] = event["revision"]
+    return applied
+
+
 class CoreEmitTests(unittest.TestCase):
+    def _baseline(self) -> tuple[CoreStore, list[dict[str, Any]]]:
+        """A subscribed store whose first event is the full state."""
+
+        core = CoreStore(domains=[MemoryDomain("runtime", {"choice": "system"})])
+        events: list[dict[str, Any]] = []
+        unsubscribe = core.subscribe(events.append)
+        self.addCleanup(unsubscribe)
+        core._emit()
+        self.assertEqual("snapshot", events[0]["event"])
+        return core, events
+
     def test_emit_outside_mutation_lane(self) -> None:
         """A slow publish never reaches the dispatch that asked for it.
 
@@ -151,8 +185,16 @@ class CoreEmitTests(unittest.TestCase):
             self.assertEqual(1, len(provider_upserts), f"the added provider was not named: {event['ops']}")
             self.assertEqual("provider:primary", provider_upserts[0]["id"])
             self.assertEqual("primary", provider_upserts[0]["value"]["name"])
+            # The ops are the edit: two rows with their whole values, ~2.9 KB.
+            # The rest of the patch is the dispatch's own action summary, which
+            # the event contract carries beside the ops and which this domain
+            # answers with its whole projection.  The projection a window would
+            # otherwise read is ~60 KB on a real installation, so this is still
+            # the smaller answer.
             payload = json.dumps(event, separators=(",", ":")).encode("utf-8")
-            self.assertLess(len(payload), 4 * 1024, f"the add patch is {len(payload)} bytes")
+            ops = json.dumps(event["ops"], separators=(",", ":")).encode("utf-8")
+            self.assertLess(len(ops), 4 * 1024, f"the add ops are {len(ops)} bytes")
+            self.assertLess(len(payload), 6 * 1024, f"the add patch is {len(payload)} bytes")
 
     def test_patch_contains_remove(self) -> None:
         """A deleted row is named, so no window keeps drawing it."""
@@ -180,6 +222,102 @@ class CoreEmitTests(unittest.TestCase):
             removed = [op for op in event["ops"] if op["kind"] == "remove"]
             self.assertIn("provider:primary", [op.get("id") for op in removed])
             self.assertNotIn("value", removed[0], "a removed row still carried a value")
+
+    def test_patch_carries_changed_drafts(self) -> None:
+        """A staged edit travels with the dirty flag that stages it.
+
+        The pane decides whether to auto-apply, flush on close, or ask before
+        discarding on ``snapshot.drafts``.  A patch that described only the
+        domain left that flag at ``dirty: false``, so a window closed over
+        unsaved changes without a word.
+        """
+
+        core, events = self._baseline()
+        self.assertIs(False, events[0]["snapshot"]["drafts"]["runtime"]["dirty"])
+
+        core.dispatch({"domain": "runtime", "type": "set", "payload": {"choice": "en"}})
+        _wait_for_events(core, events, 2)
+
+        event = events[-1]
+        self.assertEqual("patch", event["event"])
+        self.assertIn("drafts", event, "the patch left the staged draft out")
+        self.assertEqual(core.snapshot()["drafts"], event["drafts"])
+        self.assertIs(True, event["drafts"]["runtime"]["dirty"])
+
+    def test_patch_omits_unchanged_top_level(self) -> None:
+        """A field that did not move is absent, not restated.
+
+        Carrying every top-level field on every patch would make each event a
+        snapshot with ops attached, which is the size this channel exists to
+        avoid.
+        """
+
+        core, events = self._baseline()
+        core.dispatch({"domain": "runtime", "type": "set", "payload": {"choice": "en"}})
+        _wait_for_events(core, events, 2)
+        # The draft is already staged and its baseline already recorded, so this
+        # second edit moves the domain's own state and nothing about staging.
+        core.dispatch({"domain": "runtime", "type": "set", "payload": {"choice": "zh"}})
+        _wait_for_events(core, events, 3)
+
+        event = events[-1]
+        self.assertEqual("patch", event["event"])
+        self.assertIn("drafts", events[-2], "the first edit staged nothing")
+        self.assertNotIn("drafts", event, "an unchanged draft was carried anyway")
+        self.assertNotIn("disk", event)
+        self.assertNotIn("service", event)
+
+    def test_patch_client_state_matches_snapshot(self) -> None:
+        """The guard: a window that applies the patch holds the real state.
+
+        One dispatch at a time, the patched copy must equal the projection the
+        store answers with, every top-level field included.  Asserting the ops
+        alone let a patch omit ``drafts`` and ``action_summaries`` while the
+        suite stayed green, so the reader believed a state the store had left.
+        """
+
+        core, events = self._baseline()
+        client = copy.deepcopy(events[0]["snapshot"])
+        for choice in ("en", "zh"):
+            core.dispatch({"domain": "runtime", "type": "set", "payload": {"choice": choice}})
+            _wait_for_events(core, events, len(events) + 1)
+            event = events[-1]
+            self.assertEqual("patch", event["event"])
+            client = _apply_patch(client, event)
+            self.assertEqual(core.snapshot(), client, f"the patched copy diverged after {choice}")
+
+        # An Apply is the other shape: it moves the draft back to clean and
+        # leaves the action summary alone, so one event has to carry the first
+        # and omit the second.
+        core.apply(domain="runtime", revision=core.revision)
+        _wait_for_events(core, events, len(events) + 1)
+        event = events[-1]
+        self.assertEqual("patch", event["event"])
+        self.assertIn("drafts", event)
+        self.assertNotIn("action_summaries", event, "an unchanged action summary was carried anyway")
+        client = _apply_patch(client, event)
+        self.assertEqual(core.snapshot(), client, "the patched copy diverged after the Apply")
+        self.assertIs(False, client["drafts"]["runtime"]["dirty"])
+
+    def test_patch_carries_service_row_when_it_moves(self) -> None:
+        """The service row moves without a revision, so a patch cannot skip it.
+
+        A restart publishes ``starting``/``running`` outside the revision the
+        windows key on.  When the next patch arrives it is the only event that
+        can carry the row, and a menu bar left on 启动中 is what its absence
+        looks like.
+        """
+
+        core, events = self._baseline()
+        core._set_service_from_result({"state": "running", "port": 4001}, increment=False)
+        core.dispatch({"domain": "runtime", "type": "set", "payload": {"choice": "en"}})
+        _wait_for_events(core, events, 2)
+
+        event = events[-1]
+        self.assertEqual("patch", event["event"])
+        self.assertIn("service", event, "the patch left the moved service row out")
+        self.assertEqual(core.snapshot()["service"], event["service"])
+        self.assertEqual({"state": "running", "port": 4001}, event["service"])
 
     def test_patch_base_revision_chain(self) -> None:
         """Each patch starts where the previous one ended."""

@@ -110,6 +110,10 @@
           "base_revision": {"$ref": "#/$defs/revision"},
           "revision": {"$ref": "#/$defs/revision"},
           "domains": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/domain"}},
+          "service": {"type": "object"},
+          "drafts": {"type": "object"},
+          "disk": {"type": "object"},
+          "action_summaries": {"type": "object"},
           "ops": {
             "type": "array",
             "items": {

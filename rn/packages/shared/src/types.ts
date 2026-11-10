@@ -616,13 +616,24 @@ export interface SnapshotEvent {
   snapshot: CoreSnapshot;
 }
 
-/** Incremental changes against ``base_revision``. */
+/**
+ * Incremental changes against ``base_revision``.
+ *
+ * ``ops`` moves the named domains; the top-level fields beside them carry the
+ * parts of a snapshot no op can describe (a staged draft's dirty flag, the disk
+ * markers, the service row, an action summary).  Each is present only when it
+ * changed, so a patch is the size of the edit and not a snapshot with ops.
+ */
 export interface PatchEvent {
   protocol_version: typeof IPC_PROTOCOL_VERSION;
   event: "patch";
   base_revision: number;
   revision: number;
   domains: ConfigDomain[];
+  service?: CoreSnapshot["service"];
+  drafts?: CoreSnapshot["drafts"];
+  disk?: CoreSnapshot["disk"];
+  action_summaries?: CoreSnapshot["action_summaries"];
   ops: IpcEventOp[];
 }
 
