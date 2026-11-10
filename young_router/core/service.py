@@ -6914,14 +6914,36 @@ class CoreStore:
                     # operations are not this edit's validation.
                     continue
                 if not self.validate(name)["valid"]:
+                    if name == "relay_accounts" and "providers_models" in adapters:
+                        # The relay's preflight is the journal: pending key
+                        # creates, a session that needs a sign-in, a target
+                        # that moved.  None of it is a fact about the provider
+                        # document this Apply is writing, and none of it can
+                        # refuse that write — the keys it materializes are the
+                        # ones this Core already holds.  So a provider edit
+                        # leaves the journal exactly where it is, retryable
+                        # from the relay's own surface, instead of turning
+                        # "add a model" into 中转站还有待处理的操作.
+                        relay_dependency_only = True
+                        continue
                     raise CoreError("relay_preflight_failed", "Fix the validation errors")
             prepared = {"ready": True, "operations": ()} if relay_dependency_only else prepare()
             if not isinstance(prepared, Mapping) or prepared.get("ready") is not True:
                 # The relay is what is not ready here: pending operations, a
-                # session that needs a sign-in, or a target that moved.  Say so
-                # with its own code instead of reporting the user's edit as a
-                # generic validation failure.
-                raise CoreError("relay_not_ready", "Fix the relay connection or binding issues")
+                # session that needs a sign-in, or a target that moved.  When
+                # this Apply is *also* writing a provider document, that
+                # backlog is not the edit's business: the journal belongs to
+                # the relay's own surface, and it stays exactly where it is,
+                # retryable from there.  Refusing the edit made "add a model"
+                # wait on a sign-in the edit never needed and answer
+                # 更改未生效 whenever the station could not be reached — the
+                # model itself is written from the keys this Core already
+                # holds, with no station involved.  A relay-only Apply still
+                # says its own code, because there the backlog *is* the work.
+                if relay_dependency_only or "providers_models" not in adapters:
+                    raise CoreError("relay_not_ready", "Fix the relay connection or binding issues")
+                relay_dependency_only = True
+                prepared = {"ready": True, "operations": ()}
             operations = prepared.get("operations", ())
             if isinstance(operations, Sequence) and not isinstance(operations, (str, bytes, bytearray)):
                 operation_total = len(operations)
@@ -6952,7 +6974,19 @@ class CoreStore:
                 # and that is the relay's own outstanding work, which the relay
                 # message names, never the edit the user just made.
                 if self._relay_public_issue_count(reconciled):
-                    raise CoreError("relay_not_ready", "Fix the relay connection or binding issues")
+                    if non_destructive or "providers_models" not in adapters:
+                        raise CoreError("relay_not_ready", "Fix the relay connection or binding issues")
+                    # Nothing this Apply staged was sent to the station: every
+                    # unresolved entry is work an earlier attempt left behind,
+                    # and the reconciliation could not answer for it because
+                    # the session or the station is not there.  That backlog
+                    # belongs to the relay's own surface; it must not refuse
+                    # the provider document this Apply is writing, whose keys
+                    # are already on their slots.  It stays journaled and
+                    # retryable where it is.
+                    relay_dependency_only = True
+                    prepared = {"ready": True, "operations": ()}
+                    operations = ()
 
             providers = adapters.get("providers_models")
             if providers is not None and not relay_dependency_only:

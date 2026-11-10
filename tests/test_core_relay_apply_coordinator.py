@@ -1503,19 +1503,34 @@ class LocalEditBesideARelayBacklogTests(unittest.TestCase):
             self.assertEqual("applied", result["status"])
             self.assertEqual(["providers_models"], result["domains"])
 
-    def test_a_relay_bound_edit_still_states_the_relay_itself(self) -> None:
+    def test_a_provider_edit_leaves_the_relays_backlog_to_the_relay(self) -> None:
+        """A provider write is not the relay's journal run.
+
+        The pane applies every dirty section at once, so an edit arrives beside
+        a relay draft that is dirty from an earlier attempt.  That backlog — a
+        pending key create, a session that needs a sign-in — used to refuse the
+        provider write outright, which is how "add a model" came back as
+        中转站还有待处理的操作.  It is not a fact about the document being
+        written: the keys the document materializes are the ones this Core
+        already holds, and the journal stays exactly where it is, retryable
+        from the relay's own surface.
+        """
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             core, relay, providers, _http, account_id, resource_id = RelayApplyCoordinatorIntegrationTests()._linked_core(root)
             self.assertTrue(providers.dependency_summary()["provider_key_count"] > 0)
             with patch.object(RelayAccountsDomain, "prepare_apply", return_value={"ready": False, "issues": []}):
-                try:
-                    core.apply(domains=["providers_models", "relay_accounts"], revision=core.revision)
-                except CoreError as exc:
-                    self.assertIn(exc.code, {"relay_not_ready", "relay_preflight_failed"})
-                else:
-                    self.fail("the relay's own backlog must be reported as a relay failure")
+                result = core.apply(domains=["providers_models", "relay_accounts"], revision=core.revision)
+
+            self.assertTrue(result["applied"], result)
+            self.assertEqual("applied", result["status"])
+            # The provider document landed; the relay ran no journal work.
+            self.assertTrue((root / "config.yaml").exists())
+            self.assertEqual(0, result["pending_operations"])
             del account_id, resource_id, relay
+
+
 class LinkedEditResolvesFromTheKeyItAlreadyHolds(unittest.TestCase):
     """A model edit on a linked key is not a station round trip.
 
@@ -1560,6 +1575,49 @@ class LinkedEditResolvesFromTheKeyItAlreadyHolds(unittest.TestCase):
             # No station read at all: the answer was already on the slot.
             self.assertEqual([], http.calls)
             del account_id, provider, key
+
+    def test_a_model_edit_lands_though_the_relay_backlog_needs_a_sign_in(self) -> None:
+        """Adding a model never waits on a station, logged in or not.
+
+        The key this route answers with is on the provider slot, so the edit
+        needs nothing from the station; the relay's journal — a pending create,
+        a session that needs a sign-in — is its own work and its own surface.
+        Refusing the edit made the ＋ in the model chooser depend on a login it
+        never used, and it read as 更改未生效 with the model never written.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            http = RelayCoordinatorHTTP()
+            relay = RelayAccountsDomain(root, http_client=http)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(domains=[relay, providers])
+            self._linked_provider_core(core, relay)
+            self._add_linked_model(core, providers, "model-a", "model-a")
+            core.apply("providers_models", revision=core.revision)
+            # The first Apply wrote the key onto its slot; that value is what a
+            # later edit materializes from.
+            self.assertTrue(providers.relay_slot_credentials())
+
+            http.calls.clear()
+            self._add_linked_model(core, providers, "model-b", "model-b")
+            # The relay's own work cannot run here: its journal wants a sign-in.
+            with patch.object(
+                RelayAccountsDomain,
+                "prepare_apply",
+                return_value={"ready": False, "issues": [{"code": "login_required"}]},
+            ):
+                result = core.apply(
+                    domains=["providers_models", "relay_accounts"],
+                    revision=core.revision,
+                )
+
+            self.assertTrue(result["applied"], result)
+            self.assertEqual("applied", result["status"])
+            # Not one station request: the answer was already on the slot.
+            self.assertEqual([], http.calls)
+            written = (root / "config.yaml").read_text(encoding="utf-8")
+            self.assertIn("model-b", written)
 
     def test_a_relay_edits_own_apply_does_not_re_read_held_linked_keys(self) -> None:
         """The relay's own Apply reads a held key from the document, not the station.
