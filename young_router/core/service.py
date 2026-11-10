@@ -5947,9 +5947,20 @@ class CoreStore:
                             # for this action.
                             providers_domain = self._domains.get("providers_models")
                             slot_reader = getattr(providers_domain, "relay_slot_credentials", None)
+                            # A key the document already carries resolves without
+                            # any request, which is what makes 获取模型 exactly the
+                            # one listing the user asked for.  A slot carrying no
+                            # value is read as the one credential it is: the
+                            # domain's own key read (one page on a sub2api
+                            # station, one token read on New API), never an
+                            # account refresh that also lists every other key.
+                            # ``catalogs=False`` says this caller needs the
+                            # credential and nothing else -- the listing is the
+                            # catalog read.
                             materials = materializer(
                                 {"resources": [source]},
                                 slot_credentials=slot_reader() if callable(slot_reader) else None,
+                                catalogs=False,
                             )
                             rows = materials.get("resources") if isinstance(materials, Mapping) else None
                             material = next(

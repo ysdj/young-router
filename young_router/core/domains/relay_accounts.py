@@ -15,7 +15,7 @@ import hashlib
 import json
 import math
 import os
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 import re
 import ssl
@@ -149,6 +149,20 @@ class RelayTransportError(RelayAccountsError):
 
     def __init__(self) -> None:
         super().__init__("Relay is unavailable")
+
+
+class RelayResourceRemoved(RelayAccountsError):
+    """The station answered its key list, and this key is not on it.
+
+    Kept apart from every other unreadable key because the answers are
+    opposite: a read nobody could make leaves a credential the app already
+    holds usable, while a successful read that omits the key is the station
+    stating the key is gone.  Reusing the stored value there keeps a dead route
+    linked and reports success while every request fails upstream.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("Relay API key is unavailable")
 
 
 class RelayLoginRefusedError(RelayAccountsError):
@@ -1360,6 +1374,11 @@ class RelayAccountsDomain:
         # Raw API keys remain process-local. They are populated from an
         # authenticated refresh/read and never enter snapshots or storage.
         self._resource_secret_cache: dict[str, str] = {}
+        # The keys whose catalog the last read of an account actually answered
+        # for, per account.  A read that could not be made keeps the stored list
+        # and is deliberately absent here: a resolution must not treat that list
+        # as the station's current answer and skip its own retry.
+        self._fresh_catalogs: dict[str, set[str]] = {}
         # When this app last had a sign-in refused, per account.  A refused
         # sign-in is the station's answer about this moment, and asking again a
         # second later cannot change it -- while each attempt asks the station
@@ -3031,7 +3050,13 @@ class RelayAccountsDomain:
             return False
         return True
 
-    def _refresh_resources_for_apply(self, account_id: str, *, keys_only: bool = True) -> dict[str, Any]:
+    def _refresh_resources_for_apply(
+        self,
+        account_id: str,
+        *,
+        keys_only: bool = True,
+        only_resources: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
         """Read one account once per Apply, remembering which read it was.
 
         Two callers ask this domain for account facts during an Apply, and they
@@ -3055,18 +3080,30 @@ class RelayAccountsDomain:
         the reverse).  A full read satisfies either caller: it contains
         everything the key-only read does.  Every remote writer drops the
         account's entries, so a pass after a mutation still observes the change.
+        ``only_resources`` is part of that key: a read that learned one key's
+        catalog cannot answer a caller asking about another.
         """
 
         memo = self._apply_read_memo
         entry = memo.get(account_id)
+        requested_scope = frozenset(only_resources) if only_resources is not None else None
         if entry is not None and (entry.get("keys_only") is False or keys_only):
-            return entry["value"]
+            covered = entry.get("resources")
+            if covered is None or (
+                requested_scope is not None and requested_scope <= frozenset(covered)
+            ):
+                return entry["value"]
         value = self.refresh_resources(
             account_id,
             _for_apply=True,
             keys_only=keys_only,
+            only_resources=requested_scope,
         )
-        memo[account_id] = {"keys_only": keys_only, "value": value}
+        memo[account_id] = {
+            "keys_only": keys_only,
+            "resources": None if requested_scope is None else sorted(requested_scope),
+            "value": value,
+        }
         return value
 
     def _mark_account_written(self, account_id: str) -> None:
@@ -4540,6 +4577,7 @@ class RelayAccountsDomain:
         account: Mapping[str, Any],
         *,
         keys_only: bool = False,
+        only_resources: frozenset[str] | None = None,
     ) -> list[dict[str, Any]]:
         """The token page, plus each group's catalog unless only the keys are asked.
 
@@ -4583,11 +4621,16 @@ class RelayAccountsDomain:
             raise RelayAccountsError("Relay API key list is invalid")
         # One read per distinct group, never one per key: the keys in a group
         # share its catalog, so a station with ten keys across ten groups costs
-        # ten reads and not one per key.
+        # ten reads and not one per key.  A caller that names the resources it
+        # is resolving (an Apply) pays for those groups only: one new binding
+        # on an eleven-group account used to read all eleven catalogs for a key
+        # that lives in one of them.
         if not keys_only:
             groups = {}
-            for item in tokens:
+            for index, item in enumerate(tokens):
                 if not isinstance(item, Mapping):
+                    continue
+                if only_resources is not None and self._resource_label(item, index, prefix="newapi")[0] not in only_resources:
                     continue
                 group_id = _group_id(item.get("group"))
                 if group_id and group_id not in groups:
@@ -4596,12 +4639,24 @@ class RelayAccountsDomain:
             # One pool for every read this key list still needs: the group
             # catalogs and the key values New API does not carry in the list
             # itself.  They are independent requests on the same station, so
-            # the refresh waits once instead of once per concern.
+            # the refresh waits once instead of once per concern.  A caller
+            # that names the resources it is resolving reads the values of
+            # those keys only: an Apply for one new binding used to read the
+            # credentials of every key on the account to find one.
+            value_ids = [
+                item.get("id")
+                for index, item in enumerate(tokens)
+                if isinstance(item, Mapping)
+                and (
+                    only_resources is None
+                    or self._resource_label(item, index, prefix="newapi")[0] in only_resources
+                )
+            ]
             with ThreadPoolExecutor(max_workers=RESOURCE_REFRESH_MAX_WORKERS) as executor:
                 values_future = executor.submit(
                     self._newapi_key_values,
                     account,
-                    [item.get("id") for item in tokens],
+                    value_ids,
                 )
                 for group_id, group_models in zip(
                     list(groups),
@@ -4650,6 +4705,13 @@ class RelayAccountsDomain:
             for candidate in (group_list, stored_list, models):
                 if candidate is not None:
                     resource_models = list(candidate)
+                    # Only the group read is this key's own fresh answer; the
+                    # stored list and the account-wide union are not, and a
+                    # resolution seeing one must ask the key itself.
+                    if candidate is group_list:
+                        self._fresh_catalogs.setdefault(str(account.get("id", "")), set()).add(
+                            str(resource_id)
+                        )
                     break
             else:
                 resource_models = []
@@ -4674,6 +4736,7 @@ class RelayAccountsDomain:
         *,
         for_apply: bool = False,
         keys_only: bool = False,
+        only_resources: frozenset[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Load the key list and each group's models.
 
@@ -4766,16 +4829,29 @@ class RelayAccountsDomain:
                 # key's own: read the key once to learn what its group serves.
                 if names and names != models:
                     previous_models[_resource_id(resource.get("id"))] = names
-        # A station whose page described no group at all publishes no group
-        # catalog, so its keys keep being read individually (the long-standing
-        # fallback); once a page describes groups, only a group it omits and a
-        # key with no list of its own needs a read.
-        stable_group_catalog = bool(group_models) and not for_apply
-        gateway_items = [] if keys_only else [
-            entry for entry in key_items
-            if entry[2] and entry[5] not in group_models
-            and (not stable_group_catalog or entry[3] not in previous_models)
-        ]
+        # Which keys' catalogs this read has to ask the gateway for.  Three
+        # different questions share this one read, and the answer is the keys
+        # the caller is about:
+        #
+        # * a caller naming resources (an Apply) reads exactly those, because
+        #   it is judging those keys and may not use a stored list;
+        # * a pane refresh reads only the keys it has no catalog for -- an
+        #   answer that describes no group is still an answer, and re-reading
+        #   every key on every open was one gateway request per key (19 of them
+        #   on a 19-key account);
+        # * a key whose group the page described keeps the page's answer.
+        if keys_only:
+            gateway_items = []
+        else:
+            named = frozenset(only_resources or ())
+            gateway_items = [
+                entry for entry in key_items
+                if entry[2] and entry[5] not in group_models
+                and (
+                    (only_resources is not None and entry[3] in named)
+                    or (only_resources is None and entry[3] not in previous_models)
+                )
+            ]
         if gateway_items:
             def fetch_gateway_models(entry: tuple[int, str, bool, str, str, str, str]) -> tuple[int, list[str] | None]:
                 index, key, _enabled, _resource_id, _name, _group_id_value, _group_name = entry
@@ -4806,6 +4882,14 @@ class RelayAccountsDomain:
             ):
                 if candidate is not None:
                     resource_models = candidate
+                    # The page's own answer and this key's own gateway read are
+                    # both answers from this read; a stored list is not, and a
+                    # resolution that sees it must ask the key itself rather
+                    # than trust a catalog nobody just confirmed.
+                    if candidate is group_list or candidate is gateway_list:
+                        self._fresh_catalogs.setdefault(str(account.get("id", "")), set()).add(
+                            str(resource_id)
+                        )
                     break
             else:
                 resource_models = []
@@ -5150,6 +5234,7 @@ class RelayAccountsDomain:
         _for_apply: bool = False,
         keys_only: bool = False,
         force: bool = False,
+        only_resources: Iterable[str] | None = None,
     ) -> dict[str, Any]:
         """Load selectable metadata after native login without staging providers.
 
@@ -5170,6 +5255,12 @@ class RelayAccountsDomain:
         not answer this.  Without it the first presses of 刷新 within
         ``BALANCE_REUSE_SECONDS`` redrew the number the entry had just read
         instead of the one the station was holding now.
+
+        ``only_resources`` names the keys whose catalogs this read has to ask
+        for -- an Apply that resolves one binding needs that key's answer, not
+        the whole account's.  Everything else the round carries (the key list,
+        the groups, the balance) is one answer for the account and is read once
+        either way.
         """
 
         # A read replaces this account's whole resource list, so any read a
@@ -5180,7 +5271,11 @@ class RelayAccountsDomain:
         # it and report a write as not applied.
         self._apply_read_memo.pop(str(self._accounts[self._index(account_id)]["id"]), None)
         result = self._refresh_resources_once(
-            account_id, _for_apply=_for_apply, keys_only=keys_only, force=force
+            account_id,
+            _for_apply=_for_apply,
+            keys_only=keys_only,
+            force=force,
+            only_resources=only_resources,
         )
         if result.get("resource_error") != "login_expired":
             return result
@@ -5202,7 +5297,11 @@ class RelayAccountsDomain:
             return result
         if renewed:
             result = self._refresh_resources_once(
-                account_id, _for_apply=_for_apply, keys_only=keys_only, force=force
+                account_id,
+                _for_apply=_for_apply,
+                keys_only=keys_only,
+                force=force,
+                only_resources=only_resources,
             )
         return result
 
@@ -5213,6 +5312,7 @@ class RelayAccountsDomain:
         _for_apply: bool = False,
         keys_only: bool = False,
         force: bool = False,
+        only_resources: Iterable[str] | None = None,
     ) -> dict[str, Any]:
         """Read the station's key list and group catalog in one round.
 
@@ -5230,6 +5330,7 @@ class RelayAccountsDomain:
 
         index = self._index(account_id)
         account = self._accounts[index]
+        catalog_scope = frozenset(only_resources) if only_resources is not None else None
         previous_resources = copy.deepcopy(account.get("resources", []))
         previous_groups = copy.deepcopy(account.get("groups", []))
         previous_balance = account.get("balance")
@@ -5249,6 +5350,7 @@ class RelayAccountsDomain:
         # result instead of refusing here on its login observation.
         try:
             self._clear_resource_cache(account_id)
+            self._fresh_catalogs.pop(account_id, None)
             if keys_only:
                 private_resources = (
                     self._newapi_resources(account, keys_only=True)
@@ -5271,9 +5373,11 @@ class RelayAccountsDomain:
                         account,
                     )
                     resources_future = executor.submit(
-                        lambda: self._newapi_resources(account)
+                        lambda: self._newapi_resources(account, only_resources=catalog_scope)
                         if account["type"] == "newapi"
-                        else self._sub2api_resources(account, for_apply=_for_apply)
+                        else self._sub2api_resources(
+                            account, for_apply=_for_apply, only_resources=catalog_scope
+                        )
                     )
                     try:
                         account["balance"] = balance_future.result()
@@ -6192,25 +6296,45 @@ class RelayAccountsDomain:
             raise RelayAccountsError("The selected relay API resource is unavailable")
         return dict(resource)
 
-    def _read_key(self, account: Mapping[str, Any], resource: Mapping[str, Any]) -> str:
+    def _read_key(
+        self,
+        account: Mapping[str, Any],
+        resource: Mapping[str, Any],
+        *,
+        fresh: bool = False,
+    ) -> str:
         """Read one station API key value, renewing an aged-out session once.
 
         This is the read a provider-key materialization depends on, and it is
         authenticated by the same dashboard session as the rest of the station
         API: a session that expired since the last refresh must mint a new one
         here rather than report the key as unavailable.
+
+        ``fresh`` is the caller that is about to *use* the value to materialize a
+        binding.  This process's cache answers "the key existed when it was last
+        read", which is not the same fact: a station that dropped the key since
+        then would keep a dead route linked.  One read of the account's key page
+        (sub2api) or of the token itself (New API) is that fact, and it is the
+        only one this caller needs — never the account-wide refresh that also
+        lists every other key's catalog.
         """
 
         account_id = str(account.get("id", ""))
         return self._with_renewed_session(
             account_id,
-            lambda: self._read_key_once(account, resource),
+            lambda: self._read_key_once(account, resource, fresh=fresh),
         )
 
-    def _read_key_once(self, account: Mapping[str, Any], resource: Mapping[str, Any]) -> str:
+    def _read_key_once(
+        self,
+        account: Mapping[str, Any],
+        resource: Mapping[str, Any],
+        *,
+        fresh: bool = False,
+    ) -> str:
         cache_key = self._resource_cache_key(account["id"], resource["id"])
         cached = self._resource_secret_cache.get(cache_key)
-        if isinstance(cached, str) and cached:
+        if not fresh and isinstance(cached, str) and cached:
             return cached
         if account["type"] == "sub2api":
             keys = _json_data(self._http.json(account["origin"], "/api/v1/keys?page=1&page_size=100", headers=self._headers(account)))
@@ -6259,7 +6383,7 @@ class RelayAccountsDomain:
             # unavailable instead.
             key = candidate.get("key") if isinstance(candidate, Mapping) else None
             if not isinstance(key, str) or not key.strip():
-                raise RelayAccountsError("Relay API key is unavailable")
+                raise RelayResourceRemoved()
             value = key.strip()
             self._resource_secret_cache[cache_key] = value
             return value
@@ -6314,6 +6438,7 @@ class RelayAccountsDomain:
         resource: Mapping[str, Any],
         *,
         include_key: bool = False,
+        fresh_key: bool = False,
     ) -> dict[str, Any]:
         """Build one stable source descriptor; keys stay private by default."""
 
@@ -6337,7 +6462,7 @@ class RelayAccountsDomain:
         if multiplier is not None:
             source["multiplier"] = multiplier
         if include_key:
-            source["api_key"] = self._read_key(account, resource)
+            source["api_key"] = self._read_key(account, resource, fresh=fresh_key)
         return source
 
     def binding_source(self, source: object) -> dict[str, Any]:
@@ -6405,6 +6530,12 @@ class RelayAccountsDomain:
 
         This is an Apply-time read-only step. It deliberately reuses stable
         account/resource IDs and never guesses a replacement by display name.
+
+        The catalog read is scoped to the resources ``sources`` names: an Apply
+        resolves the keys its own edit touches, so reading every other key's
+        gateway catalog is a request per key for an answer nobody here uses.
+        The account-level pages (key list, groups, balance) are still one read,
+        because they answer for the account as a whole.
         """
 
         raw_sources = self._binding_source_rows(sources)
@@ -6416,6 +6547,11 @@ class RelayAccountsDomain:
         if not isinstance(raw_sources, Sequence) or isinstance(raw_sources, (str, bytes, bytearray)):
             raise RelayAccountsError("Relay binding sources are invalid")
         account_ids: list[str] = []
+        # The keys this read is *for*.  A dependency-only Apply names one key,
+        # and reading the rest of the account's catalogs on its behalf is what
+        # turned one new binding into one gateway request per key (19 of them on
+        # a 19-key account) for keys no route of this Apply touches.
+        resources_by_account: dict[str, set[str]] = {}
         issues: list[dict[str, str]] = []
         for raw in raw_sources:
             if not isinstance(raw, Mapping):
@@ -6430,19 +6566,37 @@ class RelayAccountsDomain:
                 continue
             if account_id not in account_ids:
                 account_ids.append(account_id)
+            resource_id = raw.get("resource_id")
+            if resource_id:
+                resources_by_account.setdefault(account_id, set()).add(_resource_id(resource_id))
         refreshed = 0
+        refreshed_resources: list[list[str]] = []
         for account_id in account_ids:
+            only_resources = resources_by_account.get(account_id)
             try:
                 # A binding is judged against what its key can call, so this
-                # caller needs the catalogs the reconciliation skips.
-                result = self._refresh_resources_for_apply(account_id, keys_only=False)
+                # caller needs the catalogs the reconciliation skips -- of the
+                # keys it names, and of no others.
+                result = self._refresh_resources_for_apply(
+                    account_id,
+                    keys_only=False,
+                    only_resources=only_resources,
+                )
             except Exception:
                 issues.append(self._apply_issue("refresh_failed", account_id=account_id))
                 continue
             refreshed += 1
+            refreshed_resources.extend(
+                [account_id, resource_id]
+                for resource_id in sorted(self._fresh_catalogs.get(account_id, ()))
+            )
             if result.get("resource_status") != "ready":
                 issues.append(self._apply_issue("refresh_failed", account_id=account_id))
-        return {"refreshed_accounts": refreshed, "issues": issues}
+        return {
+            "refreshed_accounts": refreshed,
+            "refreshed_resources": refreshed_resources,
+            "issues": issues,
+        }
 
     def _gateway_catalog(self, account: Mapping[str, Any], api_key: object) -> list[str] | None:
         """Return the model list one relay key can actually call.
@@ -6529,6 +6683,7 @@ class RelayAccountsDomain:
         *,
         refresh: bool = False,
         slot_credentials: object | None = None,
+        catalogs: bool = True,
     ) -> dict[str, Any]:
         """Resolve private relay binding material for the Core Apply coordinator.
 
@@ -6562,6 +6717,10 @@ class RelayAccountsDomain:
         report success while its requests fail upstream.  A station that could
         not be *read* stays deferred, exactly as before, because an answer
         nobody received is not evidence that a key is gone.
+
+        ``catalogs`` is false for a caller that wants the credential alone (the
+        listing 获取模型 asks for): that caller's own read *is* the catalog, so
+        resolving one here would ask the same key twice.
         """
 
         raw_sources = self._binding_source_rows(sources)
@@ -6631,6 +6790,10 @@ class RelayAccountsDomain:
                     covered_by_slots = False
                     break
         refresh_issues: list[dict[str, str]] = []
+        # The keys this call's own station read already answered for.  Their
+        # catalogs are in the account state below, so asking the gateway for the
+        # same key again is the duplicate this set exists to skip.
+        refreshed_sources: set[tuple[str, str]] = set()
         # A source the document already covers needs nothing from the station.
         # Asking anyway is what made an Apply a station transaction: the caller
         # resolves *every* linked key in the document, so one model edit — or
@@ -6662,6 +6825,12 @@ class RelayAccountsDomain:
                 raw_issues = refresh_result.get("issues")
                 if isinstance(raw_issues, Sequence) and not isinstance(raw_issues, (str, bytes, bytearray)):
                     refresh_issues = [dict(item) for item in raw_issues if isinstance(item, Mapping)]
+                raw_refreshed = refresh_result.get("refreshed_resources")
+                if isinstance(raw_refreshed, Sequence) and not isinstance(raw_refreshed, (str, bytes, bytearray)):
+                    for entry in raw_refreshed:
+                        if not isinstance(entry, Sequence) or isinstance(entry, (str, bytes, bytearray)) or len(entry) != 2:
+                            continue
+                        refreshed_sources.add((str(entry[0]), str(entry[1])))
         # A source the station itself answered about: the account was read and
         # this key is not among its resources.  Derived from the account's own
         # resource list rather than from an issue code, because that list is
@@ -6746,10 +6915,31 @@ class RelayAccountsDomain:
             # its credential is the document's own persisted data.  Only a
             # source the slots do not cover is read from the station.
             reads_allowed = (account_id, resource_id) not in held_sources
+            # A source this call's own station read just answered for already
+            # has its credential and catalog on the account; asking for either
+            # again is the duplicate that made one Apply key cost two requests.
+            just_read = (account_id, resource_id) in refreshed_sources
             try:
                 if not reads_allowed:
                     raise RelayTransportError()
-                material = self._relay_source(account, resource, include_key=True)
+                material = self._relay_source(
+                    account,
+                    resource,
+                    include_key=True,
+                    fresh_key=not just_read,
+                )
+            except RelayResourceRemoved:
+                # The station answered and this key is not on it; the value a
+                # slot or a cache still holds is the residue of a key nobody can
+                # revoke, so it must not resolve the binding.
+                issues.append(
+                    self._apply_issue(
+                        "resource_removed",
+                        account_id=account_id,
+                        resource_id=resource_id,
+                    )
+                )
+                continue
             except Exception:
                 # The station could not hand over the key value.  A key this
                 # Core already holds is that value: using it keeps a local
@@ -6763,11 +6953,15 @@ class RelayAccountsDomain:
             # The linked model is judged against what this key can call, so the
             # key's own catalog joins the group page's list here.  The page's
             # narrower list stays the fallback when that read cannot be made,
-            # and the union keeps every model the page already allowed.
+            # and the union keeps every model the page already allowed.  A key
+            # this call's own station read already answered for needs no second
+            # request, and a caller that wants the credential alone (a listing)
+            # says so with ``catalogs=False`` -- its one read is the listing
+            # itself.
             catalog = (
-                self._gateway_catalog(account, material.get("api_key", ""))
-                if reads_allowed
-                else None
+                None
+                if not catalogs or just_read or not reads_allowed
+                else self._gateway_catalog(account, material.get("api_key", ""))
             )
             # Whether this resolution could judge what the key may call, which is
             # whether the station was consulted about this key at all.  A
@@ -6777,7 +6971,7 @@ class RelayAccountsDomain:
             # consult the station keeps judging against its answer, and that
             # answer includes the page's catalog when the key's own extra read
             # could not be made: the page is still the station speaking.
-            material["catalog_authoritative"] = reads_allowed
+            material["catalog_authoritative"] = reads_allowed and catalogs
             if catalog:
                 listed = _model_names(material.get("models", []))
                 merged = [*listed, *(model for model in catalog if model not in listed)]

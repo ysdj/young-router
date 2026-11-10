@@ -1637,6 +1637,20 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("providers.modelsEmpty", self.ui)
         self.assertNotIn("providers.modelsEmptyHint", self.ui)
 
+    def test_the_fetch_press_sends_only_the_listing(self) -> None:
+        """获取模型 asks for one roster; the station refresh it ran first is gone.
+
+        That pre-step read every key's own catalog before the selected key's
+        listing — 24 requests and almost six seconds on a 19-key account, all
+        to relearn what the document already carries.  Core resolves the
+        credential from the slot (one station read of its own only when the
+        slot carries none), so the press sends the listing and nothing else.
+        """
+
+        self.assertNotIn("await relay.refreshResources(relaySource.accountID)", self.ui)
+        self.assertIn('const action = relaySource ? "provider.fetch_relay_resource_models" : "providers.fetch_models";', self.ui)
+        self.assertIn('const next = await dispatchWithOutcome(action, payload, "providers_models", true);', self.ui)
+
     def test_loading_buttons_keep_their_title_width_and_color_with_a_spinner(self) -> None:
         """A working button reports progress; it never disables, renames, or resizes itself."""
 
@@ -1708,6 +1722,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "if (cooldownClearPending) return;",
             "if (relayAddBusy) return;",
             "if (authPending !== undefined) return;",
+        ):
+            self.assert_ui_has(marker)
+        # A listing belongs to the credential it was asked for.  Selecting
+        # another key hands the button back and drops the answer that is still
+        # in flight, instead of holding 获取模型 until the old station round trip
+        # ends -- the new key could not be listed before the old one finished.
+        for marker in (
+            "const fetchModelsGeneration = useRef(0);",
+            "if (id === fetchKeyIDRef.current) return;",
+            "if (request !== fetchModelsGeneration.current) return;",
+            "if (request === fetchModelsGeneration.current) setFetchModelsBusy(false);",
         ):
             self.assert_ui_has(marker)
         # No loading button renames itself any more.
@@ -5246,14 +5271,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         # Native pickers expose labels to users but continue returning an
         # index. Resolve that index through the raw value so "默认" never
-        # becomes the persisted API-key identifier.
+        # becomes the persisted API-key identifier; the selection is handed
+        # to the same helper that abandons a listing for the old key.
         for marker in (
             'function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[]): ProviderKeyChoice[] {',
             'if (choices.length > 0) return choices;',
             'const slot = providerKeyStates(provider).find((key) => key.managed && managedServiceForSlot(key.managed, providerAuthKind(provider)));',
             'return slot ? [{ id: slot.id, name: slot.name, kind: "independent" as const, state: slot }] : [];',
             'label: providerKeyChoiceLabel({ ...choice, name: choice.name }, translate),',
-            'const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value);',
+            'const option = fetchKeyOptions[nativeEvent.index]; if (option) chooseFetchKey(option.value);',
             'const providerKeyOptions = [...keyStates.map((key) => ({',
             'value={selectedProviderKey?.id ?? ""} values={[{ value: "", label: translate("providers.undefinedKey") }, ...providerKeyOptions]} disabled={busy} onSelect={selectProviderKey}',
             'cells: (credentials ?? []).length > 0 && variant !== "inline"',

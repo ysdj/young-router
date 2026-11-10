@@ -4350,6 +4350,292 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertEqual([["model-own"]], [resource["models"] for resource in second])
             self.assertEqual(1, len([path for _, path, _ in fake.requests if path == "/v1/models"]))
 
+    def test_sub2api_an_answered_page_with_no_groups_does_not_re_read_every_key(self) -> None:
+        """A station that serves `data: []` keeps the catalogs it already reported.
+
+        Several deployments protect the dashboard-only channel catalog and
+        answer an empty list to everyone else.  That answer used to read as "no
+        group answered", so every refresh — including the one the pane used to
+        run in front of 获取模型 — sent one `/v1/models` per key: 19 requests on a
+        19-key account, all to relearn what the account already stored.  An
+        answer is an answer even when it describes nothing.
+        """
+
+        fake = FakeRelayHTTPClient(
+            {
+                "/api/v1/keys?page=1&page_size=100": {
+                    "code": 0,
+                    "data": {
+                        "items": [
+                            {"id": 7, "name": "Fallback", "status": "active", "key": "sk-replace-fallback-key", "group_id": 70},
+                            {"id": 8, "name": "Other", "status": "active", "key": "sk-replace-other-key", "group_id": 71},
+                        ]
+                    },
+                },
+                "/api/v1/channels/available": {"code": 0, "data": []},
+                "/v1/models": {"object": "list", "data": [{"id": "model-own"}]},
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(account_id, username="sample@example.test", cookie="session=replace-cookie")
+
+            first = domain.refresh_resources(account_id)["resources"]
+            self.assertEqual([["model-own"], ["model-own"]], [resource["models"] for resource in first])
+            self.assertEqual(2, len([path for _, path, _ in fake.requests if path == "/v1/models"]))
+
+            second = domain.refresh_resources(account_id)["resources"]
+
+            self.assertEqual([["model-own"], ["model-own"]], [resource["models"] for resource in second])
+            self.assertEqual(2, len([path for _, path, _ in fake.requests if path == "/v1/models"]))
+
+    def test_binding_materials_reads_only_the_keys_it_resolves(self) -> None:
+        """One binding on a 19-key account is one key's catalog, read once.
+
+        The Apply-time read used to list every key's own gateway catalog, and
+        then the resolution read the key it was actually judging a second time:
+        one newly bound key cost 25 requests on a 19-key account, all inside the
+        store lock.  A source the caller names is exactly what the read is for.
+        """
+
+        fake = FakeRelayHTTPClient(
+            {
+                "/api/v1/keys?page=1&page_size=100": {
+                    "code": 0,
+                    "data": {
+                        "items": [
+                            {"id": 4, "name": "Alpha", "status": "active", "key": "sk-replace-alpha-key", "group_id": 70},
+                            {"id": 5, "name": "Beta", "status": "active", "key": "sk-replace-beta-key", "group_id": 71},
+                            {"id": 6, "name": "Gamma", "status": "active", "key": "sk-replace-gamma-key", "group_id": 72},
+                        ]
+                    },
+                },
+                "/api/v1/channels/available": {"code": 0, "data": []},
+                "/v1/models": {"object": "list", "data": [{"id": "model-own"}]},
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(account_id, username="sample@example.test", cookie="session=replace-cookie")
+            domain.refresh_resources(account_id)
+            account = domain.snapshot()["accounts"][0]
+            fake.requests.clear()
+
+            materials = domain.binding_materials(
+                [
+                    {
+                        "station_id": account["station_id"],
+                        "account_id": account_id,
+                        "resource_id": "sub2api-5",
+                    }
+                ],
+                refresh=True,
+                slot_credentials={},
+            )
+
+            self.assertEqual([], materials["issues"])
+            self.assertEqual("sk-replace-beta-key", materials["resources"][0]["api_key"])
+            self.assertEqual(["model-own"], materials["resources"][0]["models"])
+            model_reads = [
+                headers.get("Authorization", "")
+                for _, path, headers in fake.requests
+                if path == "/v1/models"
+            ]
+            # The one key this Apply names, once: not every key, and not the
+            # same key twice (the account read already answered for it).
+            self.assertEqual(["Bearer sk-replace-beta-key"], model_reads)
+
+    def test_a_failed_catalog_read_is_not_mistaken_for_the_answer(self) -> None:
+        """A gateway read that learned nothing is retried, not trusted.
+
+        The account keeps the key's stored list when its own catalog read fails,
+        so a resolution that treated every named key as answered would mark that
+        stale list authoritative and skip the one retry that could still answer.
+        """
+
+        class FlakyGatewayClient(FakeRelayHTTPClient):
+            def __init__(self, responses: dict[str, object]) -> None:
+                super().__init__(responses)
+                self.gateway_attempts = 0
+                self.fail_next_gateway = False
+                self.gateway_models = ["model-old"]
+
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                if path != "/v1/models":
+                    return super().json(origin, path, headers=headers)
+                self.requests.append((origin, path, dict(headers)))
+                self.gateway_attempts += 1
+                if self.fail_next_gateway:
+                    self.fail_next_gateway = False
+                    raise RelayAccountsError("Gateway catalog unavailable")
+                return {"object": "list", "data": [{"id": name} for name in self.gateway_models]}
+
+        fake = FlakyGatewayClient(
+            {
+                "/api/v1/keys?page=1&page_size=100": {
+                    "code": 0,
+                    "data": {
+                        "items": [
+                            {"id": 4, "name": "Alpha", "status": "active", "key": "sk-replace-alpha-key", "group_id": 70},
+                        ]
+                    },
+                },
+                "/api/v1/channels/available": {"code": 0, "data": []},
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(account_id, username="sample@example.test", cookie="session=replace-cookie")
+            domain.refresh_resources(account_id)
+            account = domain.snapshot()["accounts"][0]
+            self.assertEqual(["model-old"], account["resources"][0]["models"])
+
+            fake.gateway_attempts = 0
+            fake.fail_next_gateway = True
+            fake.gateway_models = ["model-new"]
+            materials = domain.binding_materials(
+                [
+                    {
+                        "station_id": account["station_id"],
+                        "account_id": account_id,
+                        "resource_id": "sub2api-4",
+                    }
+                ],
+                refresh=True,
+                slot_credentials={},
+            )
+
+            # The refresh's read failed and left the stored list; the
+            # resolution then asked the key itself, which answered.
+            self.assertEqual(2, fake.gateway_attempts)
+            self.assertEqual([], materials["issues"])
+            self.assertIn("model-new", materials["resources"][0]["models"])
+
+    def test_a_key_the_station_stopped_listing_is_removed_without_a_refresh(self) -> None:
+        """The lazy key read states the same verdict a full refresh did.
+
+        The credential a resolving read needs comes from the key itself (one
+        page), so the account-wide refresh is not what establishes that a key is
+        gone.  When the station's answer omits it, the value still sitting on a
+        slot or in this process's cache must not resolve the binding.
+        """
+
+        fake = FakeRelayHTTPClient(
+            {
+                "/api/v1/keys?page=1&page_size=100": {
+                    "code": 0,
+                    "data": {
+                        "items": [
+                            {"id": 4, "name": "Alpha", "status": "active", "key": "sk-replace-alpha-key", "group_id": 70},
+                        ]
+                    },
+                },
+                "/api/v1/channels/available": {"code": 0, "data": []},
+                "/v1/models": {"object": "list", "data": [{"id": "model-own"}]},
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(account_id, username="sample@example.test", cookie="session=replace-cookie")
+            domain.refresh_resources(account_id)
+            account = domain.snapshot()["accounts"][0]
+            # The station stops listing the key the account still remembers.
+            fake.responses["/api/v1/keys?page=1&page_size=100"] = {
+                "code": 0,
+                "data": {
+                    "items": [
+                        {"id": 5, "name": "Beta", "status": "active", "key": "sk-replace-beta-key", "group_id": 71},
+                    ]
+                },
+            }
+
+            materials = domain.binding_materials(
+                [
+                    {
+                        "station_id": account["station_id"],
+                        "account_id": account_id,
+                        "resource_id": "sub2api-4",
+                    }
+                ],
+                slot_credentials={},
+            )
+
+            self.assertEqual([], materials["resources"])
+            self.assertIn("resource_removed", {item["code"] for item in materials["issues"]})
+
+    def test_newapi_a_single_binding_reads_only_its_own_group(self) -> None:
+        """One key's group is the catalog an Apply needs, not every group's.
+
+        New API answers each group's models separately; reading the whole
+        account's groups to judge one newly bound key is the same fan-out the
+        sub2api page used to cause.
+        """
+
+        fake = FakeRelayHTTPClient(
+            {
+                "/api/user/models": {"data": ["model-glm", "model-ds"]},
+                "/api/token/?p=1&size=100": {
+                    "data": {
+                        "items": [
+                            {"id": 7, "name": "alpha", "status": 1, "group": "glm"},
+                            {"id": 8, "name": "beta", "status": 1, "group": "deepseek"},
+                        ]
+                    }
+                },
+                "/api/user/models?group=glm": {"data": ["model-glm"]},
+                "/api/user/models?group=deepseek": {"data": ["model-ds"]},
+                "/api/token/7/key": {"data": {"key": "sk-replace-alpha"}},
+                "/api/token/8/key": {"data": {"key": "sk-replace-beta"}},
+                "/api/user/self": {"data": {"quota": 1_250_000}},
+                "/api/status": {"data": {"quota_per_unit": 500_000}},
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(account_id, username="person", cookie="session=fixture")
+            domain.refresh_resources(account_id)
+            account = domain.snapshot()["accounts"][0]
+            fake.requests.clear()
+
+            materials = domain.binding_materials(
+                [
+                    {
+                        "station_id": account["station_id"],
+                        "account_id": account_id,
+                        "resource_id": "newapi-7",
+                    }
+                ],
+                refresh=True,
+                slot_credentials={},
+            )
+
+            self.assertEqual([], materials["issues"])
+            group_reads = [path for _, path, _ in fake.requests if path.startswith("/api/user/models?group=")]
+            self.assertEqual(["/api/user/models?group=glm"], group_reads)
+            # The refreshed group answer is the catalog; a second read of the
+            # same key through the gateway would be a duplicate.
+            self.assertEqual([], [path for _, path, _ in fake.requests if path == "/v1/models"])
+
     def test_sub2api_each_key_keeps_its_own_gateway_model_list(self) -> None:
         """A key's group models are its own; the channel catalog is only a fallback.
 

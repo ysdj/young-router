@@ -269,6 +269,199 @@ class RelayApplyCoordinatorIntegrationTests(unittest.TestCase):
             self.assertEqual("https://relay.example.test/v1", private["api_base"])
             self.assertNotIn("replace-materialized-key", json.dumps(core.snapshot()))
 
+    def test_a_fetch_for_a_key_the_document_carries_reads_no_station_page(self) -> None:
+        """获取模型 is the one listing, not a refresh of every key behind it.
+
+        The pane used to run a resource refresh before the listing — five
+        dashboard pages plus, on a station that serves no channel catalog, one
+        `/v1/models` per key.  A credential the provider document already
+        carries needs none of that: Core resolves it from the slot, and the
+        press sends exactly the listing.  A station read here is the regression.
+        """
+
+        class ModelListResponse:
+            status = 200
+
+            def __enter__(self) -> "ModelListResponse":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def read(self, _size: int = -1) -> bytes:
+                return json.dumps({"object": "list", "data": [{"id": "model-a"}]}).encode("utf-8")
+
+            def getcode(self) -> int:
+                return 200
+
+        class ModelListOpener:
+            def __init__(self) -> None:
+                self.requests: list[Any] = []
+
+            def open(self, request: Any, *, timeout: float) -> ModelListResponse:
+                self.requests.append(request)
+                return ModelListResponse()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            core, relay, providers, http, account_id, resource_id = self._linked_core(root)
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.add",
+                    "payload": {
+                        "provider": {
+                            "name": "provider-a",
+                            "enabled": True,
+                            "api_base": "",
+                            "models": [],
+                        }
+                    },
+                },
+                expected_revision=core.revision,
+            )
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.import_relay_key",
+                    "payload": {
+                        "provider_id": "provider-a",
+                        "station_id": relay.snapshot()["accounts"][0]["station_id"],
+                        "account_id": account_id,
+                        "resource_id": resource_id,
+                    },
+                },
+                expected_revision=core.revision,
+            )
+            applied = core.apply(domain="providers_models", revision=core.revision)
+            self.assertTrue(applied["applied"])
+
+            opener = ModelListOpener()
+            calls_before_fetch = list(http.calls)
+            with patch(
+                "young_router.core.domains.providers_models.isolated_http_opener",
+                return_value=opener,
+            ):
+                fetched = core.dispatch(
+                    {
+                        "domain": "providers_models",
+                        "type": "provider.fetch_relay_resource_models",
+                        "payload": {
+                            "provider_id": "provider-a",
+                            "station_id": relay.snapshot()["accounts"][0]["station_id"],
+                            "account_id": account_id,
+                            "resource_id": resource_id,
+                        },
+                    },
+                    expected_revision=core.revision,
+                )
+
+            # The listing asked the gateway once; the station was not read at
+            # all, and no key other than the selected one was listed.
+            self.assertEqual(calls_before_fetch, http.calls)
+            self.assertEqual(1, len(opener.requests))
+            self.assertEqual("https://relay.example.test/v1/models", opener.requests[0].full_url)
+            summary = fetched["revision"] and core.snapshot()["action_summaries"]["providers_models"]["operation_summary"]
+            self.assertEqual("fetch_models", summary["operation"])
+            self.assertEqual(["model-a"], summary["models"])
+
+    def test_a_fetch_for_a_slot_with_no_value_reads_one_credential_and_the_listing(self) -> None:
+        """A slot waiting for its first Apply costs the one key, not the account.
+
+        The pane used to refresh the whole station before every relay listing,
+        and the Apply-side resolver refreshed the whole account to find one
+        credential.  A slot that carries no value can be answered by the key it
+        names — one token read on New API — and the listing itself is the only
+        catalog read this press needs.
+        """
+
+        class ModelListResponse:
+            status = 200
+
+            def __enter__(self) -> "ModelListResponse":
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def read(self, _size: int = -1) -> bytes:
+                return json.dumps({"object": "list", "data": [{"id": "model-a"}]}).encode("utf-8")
+
+            def getcode(self) -> int:
+                return 200
+
+        class ModelListOpener:
+            def __init__(self) -> None:
+                self.requests: list[Any] = []
+
+            def open(self, request: Any, *, timeout: float) -> ModelListResponse:
+                self.requests.append(request)
+                return ModelListResponse()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            core, relay, providers, http, account_id, resource_id = self._linked_core(root)
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.add",
+                    "payload": {
+                        "provider": {
+                            "name": "provider-a",
+                            "enabled": True,
+                            "api_base": "https://relay.example.test/v1",
+                            "models": [],
+                        }
+                    },
+                },
+                expected_revision=core.revision,
+            )
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.import_relay_key",
+                    "payload": {
+                        "provider_id": "provider-a",
+                        "station_id": relay.snapshot()["accounts"][0]["station_id"],
+                        "account_id": account_id,
+                        "resource_id": resource_id,
+                    },
+                },
+                expected_revision=core.revision,
+            )
+
+            opener = ModelListOpener()
+            calls_before_fetch = list(http.calls)
+            with patch(
+                "young_router.core.domains.providers_models.isolated_http_opener",
+                return_value=opener,
+            ):
+                fetched = core.dispatch(
+                    {
+                        "domain": "providers_models",
+                        "type": "provider.fetch_relay_resource_models",
+                        "payload": {
+                            "provider_id": "provider-a",
+                            "station_id": relay.snapshot()["accounts"][0]["station_id"],
+                            "account_id": account_id,
+                            "resource_id": resource_id,
+                        },
+                    },
+                    expected_revision=core.revision,
+                )
+
+            # The credential is the key's own read, and nothing else about the
+            # account is asked: no key list, no group catalog, no balance.
+            self.assertEqual(
+                [("POST", "/api/token/7/key")],
+                http.calls[len(calls_before_fetch):],
+            )
+            self.assertEqual(1, len(opener.requests))
+            summary = fetched["revision"] and core.snapshot()["action_summaries"]["providers_models"]["operation_summary"]
+            self.assertEqual(["model-a"], summary["models"])
+
+
+
     def test_model_selects_a_discovered_relay_key_by_matching_base_url(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -6695,6 +6695,26 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const [publicModelReturn, setPublicModelReturn] = useState<{ routeKey: string; label: string }>();
   const [fetchKeyID, setFetchKeyID] = useState<string>();
   const [fetchModelsBusy, setFetchModelsBusy] = useState(false);
+  // 获取模型 answers for one credential, so a picker that moves while the
+  // station is being read makes that answer belong to a question nobody is
+  // asking any more.  The press that names the new key must not wait for it:
+  // a selection bumps the generation, the waiting listing sees it is stale and
+  // drops its answer, and the button is handed back at the moment of the
+  // selection instead of when the station finally replies.  The counter is a
+  // ref rather than the rendered `fetchModelsBusy` because a promise resolves
+  // between a click and the next render, and an answer read from render state
+  // there is already the wrong one.
+  const fetchModelsGeneration = useRef(0);
+  const fetchKeyIDRef = useRef<string | undefined>(undefined);
+  const chooseFetchKey = (id: string | undefined): void => {
+    // The same credential is not a new question: selecting another row of the
+    // key group a listing is already reading leaves that listing alone.
+    if (id === fetchKeyIDRef.current) return;
+    fetchKeyIDRef.current = id;
+    fetchModelsGeneration.current += 1;
+    setFetchModelsBusy(false);
+    setFetchKeyID(id);
+  };
   // Native command buttons stay pressable while they show progress. CRUD
   // mutations therefore need a semantic single-flight guard as well as the
   // pane's visual busy state, otherwise a fast double-click creates/deletes
@@ -6938,7 +6958,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     setSelectedProvider(editorIdentifier(added));
   }, [providers]);
   useEffect(() => {
-    if (!fetchKeyChoices.some((choice) => choice.id === fetchKeyID)) setFetchKeyID(preferredFetchKeyID);
+    if (!fetchKeyChoices.some((choice) => choice.id === fetchKeyID)) chooseFetchKey(preferredFetchKeyID);
   }, [fetchKeyChoices, fetchKeyID, preferredFetchKeyID, providerId]);
   // 获取模型 asks one credential for its roster, and the row the user is
   // looking at names that credential.  A picker left on whatever key happened
@@ -6951,8 +6971,8 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (followedModelKey.current === selectedModel) return;
     followedModelKey.current = selectedModel;
     const key = fetchKeyChoices.find((choice) => choice.id === selectedModelKeyID);
-    if (key) setFetchKeyID(key.id);
-    else if (selectedModel === undefined) setFetchKeyID(undefined);
+    if (key) chooseFetchKey(key.id);
+    else if (selectedModel === undefined) chooseFetchKey(undefined);
   }, [selectedModel, selectedModelKeyID, fetchKeyChoices]);
   // The model pane's own listing handler, for a provider whose models are read
   // the generic ``/v1/models`` way.
@@ -7127,23 +7147,28 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       provider_id: providerId,
       api_key_name: choice?.name ?? "",
     };
+    // This press owns the button until another credential is selected; a later
+    // selection bumps the generation and this run stops touching the pane (the
+    // `finally` below only clears a busy state it still owns).
+    const request = ++fetchModelsGeneration.current;
     setFetchModelsBusy(true);
     try {
-      // A linked key resolves from the credential this app already holds, so
-      // the listing has to have that credential in hand before it runs.  The
-      // refresh that answers the key list is what records every key's value
-      // (one page, already paid for by the read the pane does on mount), and a
-      // slot that no document carries is the only case that then pays for a
-      // station read of its own.  A station that refuses the refresh still
-      // resolves from what the slot already carries.
-      if (relaySource) {
-        await relay.refreshResources(relaySource.accountID).catch(() => undefined);
-        onSnapshot(await ipc.snapshot());
-      }
+      // The credential is Core's to resolve.  A slot the document already
+      // carries answers without any request, and only a slot carrying none
+      // makes Core read the station for it -- the same fallback an Apply uses,
+      // and the only case this listing ever paid a station round trip for.
+      // Refreshing the account here first read every key's own catalog before
+      // the one this press asked for: 24 requests and almost six seconds for
+      // one listing on a 19-key account.  A press now sends exactly the
+      // listing.
       // 获取模型 reports its own progress (a relay round trip, or the desktop
       // app's live catalog), so the rest of the pane stays usable while it
       // waits.  The row list it stages still applies as a normal write.
       const next = await dispatchWithOutcome(action, payload, "providers_models", true);
+      // A roster that lands after the picker moved is not this pane's answer:
+      // the chooser it would open names a key the user has already left, and
+      // the rows it stages belong to that key.
+      if (request !== fetchModelsGeneration.current) return;
       if (!next) {
         // The dispatch refused, and the run that refused it already published
         // its cause to this same strip.  Guessing "the key could not be
@@ -7158,14 +7183,20 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         return;
       }
       const slotID = stringValue(summary.slot_id);
-      if (slotID) setFetchKeyID(slotID);
+      if (slotID) {
+        // This run is the one the ref points at, so its own slot is not a
+        // selection: recording it keeps a later picker event for the same id a
+        // no-op instead of abandoning the answer that created it.
+        fetchKeyIDRef.current = slotID;
+        setFetchKeyID(slotID);
+      }
       if (laneService && stringValue(summary.operation) === action) {
         handleFetchedServiceModels(summary, laneService);
         return;
       }
       handleFetchedModels(summary, choice);
     } finally {
-      setFetchModelsBusy(false);
+      if (request === fetchModelsGeneration.current) setFetchModelsBusy(false);
     }
   };
   const addModel = (): void => {
@@ -7847,7 +7878,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
           <View style={styles.providerMiddlePane} onLayout={({ nativeEvent }) => setModelTableWidth(nativeEvent.layout.width)}>
             <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteModel} /> : null}</>}>
               <View style={styles.nativeModelTable}><NativeTable columns={modelTableColumns(modelTableWidth, translate)} rows={modelRows} secondaryRowKeys={offModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange={(key) => { if (!key) { /* a click that names no model row leaves the provider — the row these models belong to — as the selection, so the inspector shows it instead of emptying */ setSelectedModel(undefined); setSelectedModelRow(undefined); setProviderSourceModel(undefined); return; } const modelID = modelIDFromRowKey(key); if (modelID === undefined) return; setSelectedModel(modelID); setSelectedModelRow(key); setProviderSourceModel(undefined); }} style={styles.modelTable} /></View>
-              {provider && providerHasModelCredential ? <View style={styles.tableBottomRow}>{fetchKeyChoices.length > 0 ? <NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy} accessibilityLabel={translate("providers.providerKey")} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) setFetchKeyID(option.value); }} style={styles.fetchKeyPicker} /> : null}<ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || (fetchKeyChoices.length > 0 && !selectedFetchKey)} onPress={() => { void fetchModels(); }} /></View> : null}
+              {provider && providerHasModelCredential ? <View style={styles.tableBottomRow}>{fetchKeyChoices.length > 0 ? <NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy} accessibilityLabel={translate("providers.providerKey")} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) chooseFetchKey(option.value); }} style={styles.fetchKeyPicker} /> : null}<ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || (fetchKeyChoices.length > 0 && !selectedFetchKey)} onPress={() => { void fetchModels(); }} /></View> : null}
             </TablePane>
           </View>
         </View>
