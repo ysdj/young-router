@@ -5106,10 +5106,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const dispatchWithOutcome = async (type: string, payload: UnknownRecord = {}, targetDomain = domain, keepControlsEnabled = false): Promise<CoreSnapshot | undefined>',
             'const actionSummary = staged.action_summary;',
             'operation_summary: actionSummary,',
-            'const handleFetchedModels = (summary: UnknownRecord): void => {',
+            'const handleFetchedModels = (summary: UnknownRecord, requested?: ProviderKeyChoice): void => {',
             # The provider may be cleared (no list selection): fall back to no
             # identity so a fetch reply for another provider is still ignored.
             'const providerIdentity = provider ? identifier(provider) : "";',
+            # The roster is the credential that was asked for, not the one the
+            # picker holds when the answer lands: a fetch that lost that race
+            # opened the old key's models under the new key's name.
+            'const keyName = requested\n      ? providerKeyChoiceLabel({ name: requested.name, kind: requested.kind, source: requested.source }, translate)',
+            'const requestedSource = requested?.kind === "relay" ? requested.source : undefined;',
+            'stringValue(answeredSource.resource_id) !== requestedSource.resourceID',
+            'handleFetchedModels(summary, choice);',
+            # The picker follows the route the user selected, so 获取模型 asks
+            # the key that route answers with instead of whichever key is first.
+            'const selectedModelKeyID = model ? (modelProviderKeyState(model, provider ?? {})?.id ?? "") : "";',
+            'if (followedModelKey.current === selectedModel) return;',
             'summaryProviderId !== providerId && summaryProviderId !== providerIdentity',
             'if (summary.available === false)',
             'translate("providers.fetchFailed"',
@@ -7218,8 +7229,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("apiKeyActions?.setGroup?.(account.id, edit.keyID, edit.groupID)", relay)
         self.assertIn("apiKeyActions?.setEnabled?.(account.id, edit.keyID, edit.enabled)", relay)
         self.assertIn("apiKeyActions?.update?.(account.id, edit.keyID, edit.name)", relay)
-        self.assertIn('apiKeyActions?.remove?.(account.id, keyID, "detach_disabled");', relay)
+        self.assertIn('apiKeyActions?.remove?.(account.id, keyID, "delete_models");', relay)
         self.assertIn("await apiKeyActions?.setAutoGrouping?.(account.id, false);", relay)
+        # Turning 自动分组 off restores Core's pre-toggle draft, which can name
+        # a different resource set than the rows on screen.  The pane reads the
+        # account again before matching edits, and a row that is no longer a
+        # key this account holds refuses the save instead of being dropped.
+        self.assertIn("await refreshResources(current.id, { force: true });", relay)
+        self.assertIn("const reloaded = refreshed\n            ? accountsFromSnapshot(refreshed).find((entry) => entry.id === current.id)", relay)
+        self.assertIn("throw new Error(`The relay API key ${edit.keyID} is no longer available`);", relay)
         self.assertNotIn('onStatus?.(translate("relay.apiKeyGroupStaged"));', relay)
         types = (ROOT / "rn/packages/shared/src/types.ts").read_text(encoding="utf-8")
         native_bridge = (ROOT / "rn/packages/shared/src/platform/nativeBridge.ts").read_text(encoding="utf-8")

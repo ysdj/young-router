@@ -2188,6 +2188,11 @@ class ProvidersModelsDomain:
         summary["slot_id"] = imported["slot_id"]
         summary["imported"] = imported["imported"]
         summary["reused"] = imported["reused"]
+        # The source the roster was read for, in the same secret-free shape the
+        # slots carry.  A fetch that lands after the pane moved its key picker
+        # would otherwise be indistinguishable from the key now on screen, and
+        # the chooser showed one group's models under another group's name.
+        summary["source"] = copy.deepcopy(imported["source"])
         self._last_operation = summary
         return summary
 

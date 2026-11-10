@@ -162,7 +162,12 @@ export function RelayGroupSheet({ translate, copyKey }: {
     setSelectedID((current) => (fresh.some((row) => row.id === current) ? current : fresh[0]?.id ?? ""));
   }, [snapshot, state?.accountId]);
 
-  const editing = state !== undefined && !state.loading && !state.saving;
+  // A checked 自动分组 owns the layout, exactly as it does in the native
+  // windows: Core refuses a manual key write while it is on, so the sheet must
+  // not accept one.  The switch itself stays usable — it is the way back to
+  // manual editing — and only the fields it owns are gated here.
+  const composing = state !== undefined && !state.loading && !state.saving;
+  const editing = composing && !autoGrouping;
   const layoutGroups = groups.filter((group) => group.id !== "");
   const groupNames = React.useMemo(() => new Map(groups.filter((group) => group.id !== "").map((group) => [group.id, group.name])), [groups]);
   const selected = rows.find((row) => row.id === selectedID);
@@ -411,7 +416,7 @@ export function RelayGroupSheet({ translate, copyKey }: {
           belongs to the switch: the two travel as one block, so the sentence
           wraps under it instead of squeezing the buttons beside it. */}
       <View style={styles.footerSwitch}>
-        <NativeCheckbox label={labels.autoGroupingLabel} value={autoGrouping} disabled={!editing || layoutGroups.length === 0} onValueChange={toggleAutoGrouping} />
+        <NativeCheckbox label={labels.autoGroupingLabel} value={autoGrouping} disabled={!composing || layoutGroups.length === 0} onValueChange={toggleAutoGrouping} />
         <Text numberOfLines={2} style={styles.help}>{labels.autoGroupingHelp}</Text>
       </View>
       <View style={styles.footerActions}>

@@ -6301,6 +6301,10 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     () => models.find((item) => editorIdentifier(item) === selectedModel),
     [models, selectedModel],
   );
+  // The key the selected route answers with, before any 获取模型 picker choice:
+  // the picker follows the row the user is looking at (see
+  // `preferredFetchKeyID`).
+  const selectedModelKeyID = model ? (modelProviderKeyState(model, provider ?? {})?.id ?? "") : "";
   const [viewMode, setViewMode] = useState<"providers" | "routes">("providers");
   const [selectedRoute, setSelectedRoute] = useState<string>();
   // The routes view selects either one route (its model detail) or one public
@@ -6339,6 +6343,14 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     || providerKindSelected === "ourFreeModel";
   const fetchKeyChoices = useMemo(() => {
     if (!provider) return [];
+    // A relay slot whose source the station no longer lists has no credential
+    // to ask: the station would refuse the roster request, and listing the
+    // slot here put a bare key name (no account, no group, no rate) in a
+    // picker that reads account/group for every other entry.  The key table
+    // still shows the slot as an orphan so it can be repaired or deleted;
+    // 获取模型 only offers credentials that can answer.
+    const fetchable = (choices: ReturnType<typeof providerKeyChoices>): ReturnType<typeof providerKeyChoices> =>
+      choices.filter((choice) => choice.kind !== "relay" || choice.source !== undefined);
     // 获取模型 asks one credential for its roster, so the picker lists the
     // row's credentials: every signed-in account, then every key.
     if (providerKindSelected === "openai") {
@@ -6350,11 +6362,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
             name: providerAuthAccount(account) || translate("providers.authAccount"),
             kind: "account" as const,
           })),
-        ...providerKeyChoices(provider, relaySources, providerBaseURL(provider)),
+        ...fetchable(providerKeyChoices(provider, relaySources, providerBaseURL(provider))),
       ];
     }
     if (providerHoldsNoKey) return [];
-    const choices = providerKeyChoices(provider, relaySources, providerBaseURL(provider));
+    const choices = fetchable(providerKeyChoices(provider, relaySources, providerBaseURL(provider)));
     // A service that mints its own slot carries that slot nowhere in the
     // list above, and this row is how a lane is asked for its roster — so a
     // provider whose only key is the one Core owns has to be able to name it
@@ -6392,7 +6404,21 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       || providerKindSelected === "qoderGlobal"
     ) && providerAuthStatus(provider) === "signed_in";
   }, [fetchKeyChoices, provider, providerKindSelected]);
-  const selectedFetchKey = fetchKeyID ?? fetchKeyChoices[0]?.id ?? "";
+  // The first choice is not always a choice the roster can answer: a relay
+  // slot whose resource the station no longer lists, or an independent slot
+  // with no value, sits in this list for the model inspector but cannot fetch.
+  // Prefer the route's own key, then a credential that can answer, and only
+  // then whatever is first — a stale orphan slot must never be what 获取模型
+  // reaches for on its own.
+  const preferredFetchKeyID = useMemo(() => {
+    const usable = fetchKeyChoices.find((choice) => choice.kind === "account"
+      || (choice.kind === "relay" && choice.source !== undefined)
+      || choice.state?.configured === true);
+    return (selectedModelKeyID && fetchKeyChoices.some((choice) => choice.id === selectedModelKeyID))
+      ? selectedModelKeyID
+      : usable?.id ?? fetchKeyChoices[0]?.id ?? "";
+  }, [fetchKeyChoices, selectedModelKeyID]);
+  const selectedFetchKey = fetchKeyID ?? preferredFetchKeyID;
   const workspaceService = provider ? providerService(provider) : undefined;
   // The 倍率 column reads the catalog through `peekServiceRate`, which is a
   // cache lookup rather than a subscription: a catalog that lands after this
@@ -6536,14 +6562,42 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     setSelectedProvider(editorIdentifier(added));
   }, [providers]);
   useEffect(() => {
-    if (!fetchKeyChoices.some((choice) => choice.id === fetchKeyID)) setFetchKeyID(fetchKeyChoices[0]?.id);
-  }, [fetchKeyChoices, fetchKeyID, providerId]);
+    if (!fetchKeyChoices.some((choice) => choice.id === fetchKeyID)) setFetchKeyID(preferredFetchKeyID);
+  }, [fetchKeyChoices, fetchKeyID, preferredFetchKeyID, providerId]);
+  // 获取模型 asks one credential for its roster, and the row the user is
+  // looking at names that credential.  A picker left on whatever key happened
+  // to be first opened the Gemini group's roster beside a Pro route the user
+  // had just selected; the list was right and the key was not.  The picker
+  // follows the selected model's key until the user picks another one, and a
+  // selection with no key of its own falls back to it again.
+  const followedModelKey = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (followedModelKey.current === selectedModel) return;
+    followedModelKey.current = selectedModel;
+    const key = fetchKeyChoices.find((choice) => choice.id === selectedModelKeyID);
+    if (key) setFetchKeyID(key.id);
+    else if (selectedModel === undefined) setFetchKeyID(undefined);
+  }, [selectedModel, selectedModelKeyID, fetchKeyChoices]);
   // The model pane's own listing handler, for a provider whose models are read
   // the generic ``/v1/models`` way.
-  const handleFetchedModels = (summary: UnknownRecord): void => {
+  const handleFetchedModels = (summary: UnknownRecord, requested?: ProviderKeyChoice): void => {
     const summaryProviderId = stringValue(summary.provider_id);
     const providerIdentity = provider ? identifier(provider) : "";
     if (stringValue(summary.operation) !== "fetch_models" || (summaryProviderId !== providerId && summaryProviderId !== providerIdentity)) return;
+    // A read that answered for another credential must not open this pane's
+    // chooser: the user may have moved the picker while the request was in
+    // flight, and the roster that lands belongs to the key that was asked.
+    // Core answers a relay fetch with the source it read, so the identity is
+    // the stable triple rather than the slot's (deduped) name.
+    const requestedSource = requested?.kind === "relay" ? requested.source : undefined;
+    const answeredSource = asRecord(summary.source);
+    if (
+      requestedSource
+      && Object.keys(answeredSource).length > 0
+      && (stringValue(answeredSource.station_id) !== requestedSource.stationID
+        || stringValue(answeredSource.account_id) !== requestedSource.accountID
+        || stringValue(answeredSource.resource_id) !== requestedSource.resourceID)
+    ) return;
     const candidates = stringList(summary.models);
     if (summary.available === false) {
       // Core's own detail names the cause (the endpoint rejected the request,
@@ -6573,7 +6627,13 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     // label: a key is its own slot, and the name a fetch happened to carry is
     // the weaker identity ("one key is one slot, never one name").
     const apiKeyID = stringValue(summary.slot_id);
-    const keyName = fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? apiKeyDisplayName(apiKeyName, translate);
+    // The chooser names the credential the request actually asked, not the
+    // one the picker holds now: a fetch that lands after the user moved the
+    // picker used to be titled with the new key while listing the old key's
+    // models, which reads as "I selected this group and got another one".
+    const keyName = requested
+      ? providerKeyChoiceLabel({ name: requested.name, kind: requested.kind, source: requested.source }, translate)
+      : fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? apiKeyDisplayName(apiKeyName, translate);
     void native.chooseModelsToAdd({ models: candidates, providerName, keyName }).then(async (selection) => {
       const selectedModels = (selection ?? []).filter((model, index, all) => candidateSet.has(model) && all.indexOf(model) === index);
       if (selectedModels.length === 0) return;
@@ -6727,7 +6787,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         handleFetchedServiceModels(summary, laneService);
         return;
       }
-      handleFetchedModels(summary);
+      handleFetchedModels(summary, choice);
     } finally {
       setFetchModelsBusy(false);
     }

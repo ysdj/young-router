@@ -144,6 +144,12 @@ class IpcLatencyTests(unittest.TestCase):
         )
         self.core.snapshot()
 
+    def tearDown(self) -> None:
+        # The budget is per hold, not per call: a seam that held the state lock
+        # for 300 ms and answered the sampled call just after it would pass the
+        # wall-clock assertions while freezing another window.
+        self.assertEqual((), self.core._lock.overruns())
+
     def _timed(self, operation, *, repeat: int = 5) -> float:
         """The median CPU time of ``repeat`` calls, in milliseconds.
 
