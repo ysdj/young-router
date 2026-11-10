@@ -727,5 +727,162 @@ class RelayApiKeyDomainTests(unittest.TestCase):
             self.assertNotIn("cross_group_retry", create[4])
 
 
+
+    def test_auto_grouping_does_not_refill_a_group_whose_key_is_being_retired(self) -> None:
+        """A retirement is not an empty group.
+
+        The sheet hides a key the moment its retirement is staged, so a later
+        station read shows that key's group with no resource naming it.  That
+        is the state alignment used to read as "this group has no key" and fill
+        with a fresh create: one cleanup pass then produced two keys for the
+        group, the next pass retired one of them and created a third, and the
+        provider slots bound to each generation were left behind.  The staged
+        delete now carries the group it frees, and alignment waits for Apply
+        instead of minting a replacement beside it.
+        """
+
+        class Station(RelayMutationHTTPClient):
+            def __init__(self) -> None:
+                super().__init__({})
+                self.keys = [
+                    {"id": "key-one", "name": "One", "status": "active", "key": "replace-one", "group_id": 1, "group": {"name": "One"}},
+                    {"id": "key-two", "name": "Two", "status": "active", "key": "replace-two", "group_id": 2, "group": {"name": "Two"}},
+                ]
+                self.groups = [
+                    {"id": 1, "name": "One", "rate_multiplier": 1.0},
+                    {"id": 2, "name": "Two", "rate_multiplier": 2.0},
+                ]
+
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                if path == "/api/v1/user/profile":
+                    return {"data": {"balance": 4.5}}
+                if path.startswith("/api/v1/keys"):
+                    return {"data": {"items": [dict(item) for item in self.keys]}}
+                if path == "/api/v1/groups/available":
+                    return {"data": [dict(item) for item in self.groups]}
+                if path == "/api/v1/groups/rates":
+                    return {"data": {}}
+                if path == "/api/v1/channels/available":
+                    return {"data": [{"platforms": [{"supported_models": ["model-test"]}]}]}
+                raise AssertionError(f"unexpected relay path: {path}")
+
+            def post(
+                self,
+                origin: str,
+                path: str,
+                *,
+                headers: dict[str, str],
+                body: dict[str, object] | None = None,
+            ) -> object:
+                payload = super().post(origin, path, headers=headers, body=body)
+                created = {
+                    "id": f"key-new-{len(self.keys)}",
+                    "name": str((body or {}).get("name", "")),
+                    "status": "active",
+                    "key": "replace-new",
+                    "group_id": None,
+                }
+                self.keys.append(created)
+                return {"success": True, "data": {"id": created["id"]}}
+
+            def put(
+                self,
+                origin: str,
+                path: str,
+                *,
+                headers: dict[str, str],
+                body: dict[str, object] | None = None,
+            ) -> object:
+                payload = super().put(origin, path, headers=headers, body=body)
+                target = path.rsplit("/", 1)[-1]
+                for item in self.keys:
+                    if str(item["id"]) != target:
+                        continue
+                    for field in ("name", "group_id", "status"):
+                        if body and field in body:
+                            item[field] = body[field]
+                return payload
+
+            def delete(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                payload = super().delete(origin, path, headers=headers)
+                removed = path.rsplit("/", 1)[-1]
+                self.keys = [item for item in self.keys if str(item["id"]) != removed]
+                return payload
+
+        client = Station()
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=client)
+            account = domain.dispatch(
+                "account.add",
+                {"type": "sub2api", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            domain.accept_login_result(account["id"], username="person@example.test", cookie="session=fixture")
+            domain.refresh_resources(account["id"])
+
+            domain.dispatch(
+                "api_key.delete",
+                {"account_id": account["id"], "resource_id": "sub2api-key-two", "dependency_policy": "delete_models"},
+            )
+            removal = next(
+                operation
+                for operation in domain._pending_operations
+                if operation["kind"] == "api_key_delete"
+            )
+            # The group travels with the retirement: once the refresh hides the
+            # row, this is the only durable record of what the delete frees.
+            self.assertEqual("2", removal["changes"]["group_id"])
+
+            # The read the pane pays for on 刷新 / mount hides the retired row.
+            refreshed = domain.refresh_resources(account["id"])
+            self.assertEqual(
+                ["sub2api-key-one"],
+                [resource["id"] for resource in refreshed["resources"]],
+            )
+
+            aligned = domain.dispatch(
+                "api_key.set_auto_grouping",
+                {"account_id": account["id"], "enabled": True},
+            )["accounts"][0]
+            self.assertEqual([], [
+                operation
+                for operation in domain._pending_operations
+                if operation["kind"] == "api_key_create"
+            ])
+            # Alignment is a derivation, not an accumulation: the periodic pass
+            # after another read stages nothing new either.
+            domain.refresh_resources(account["id"])
+            domain.dispatch("api_key.auto_group_align", {"account_id": account["id"]})
+            self.assertEqual([], [
+                operation
+                for operation in domain._pending_operations
+                if operation["kind"] == "api_key_create"
+            ])
+            self.assertIn(
+                "sub2api-key-two",
+                [operation["resource_id"] for operation in domain.prepare_apply()["destructive"]],
+            )
+
+            applied = domain.apply()
+            self.assertEqual("applied", applied["status"], applied["issues"])
+            # The retirement landed, so the group is genuinely empty now and the
+            # standing layout fills it with exactly one key.
+            domain.refresh_resources(account["id"])
+            refilled = domain.dispatch(
+                "api_key.auto_group_align",
+                {"account_id": account["id"]},
+            )["accounts"][0]
+            creates = [
+                operation
+                for operation in domain._pending_operations
+                if operation["kind"] == "api_key_create"
+            ]
+            self.assertEqual(1, len(creates))
+            self.assertEqual("2", creates[0]["changes"]["group_id"])
+            self.assertEqual(
+                ["One", "Two"],
+                sorted(resource["name"] for resource in refilled["resources"]),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

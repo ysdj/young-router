@@ -2256,6 +2256,25 @@ class RelayAccountsDomain:
             if not resource_id:
                 continue
             if kind == "api_key_delete":
+                # The row leaves the sheet as soon as its retirement is staged,
+                # so the group it owned must travel with the journal: alignment
+                # reads the groups that still have a key to understand the
+                # layout, and a group whose only key is being retired is not an
+                # empty group.  A delete staged before this was recorded gets
+                # its group here, while the resource still names it.
+                retired = next(
+                    (
+                        item
+                        for item in self._accounts[index].get("resources", [])
+                        if isinstance(item, Mapping) and item.get("id") == resource_id
+                    ),
+                    None,
+                )
+                if isinstance(retired, Mapping) and not operation.get("changes", {}).get("group_id"):
+                    self._update_pending_operation(
+                        operation,
+                        changes={**dict(operation.get("changes", {})), "group_id": str(retired.get("group_id", ""))},
+                    )
                 updated = copy.deepcopy(self._accounts[index])
                 updated["resources"] = [
                     item
@@ -5831,6 +5850,21 @@ class RelayAccountsDomain:
             for operation in self._pending_operations
         )
         valid_group_ids = {str(group.get("id", "")) for group in groups}
+        # A group whose only key is staged for retirement is not an empty
+        # group.  The refresh hides that key from the pane, so alignment no
+        # longer sees a resource naming the group — and used to mint a
+        # replacement for a group that was just retired.  One cleanup pass then
+        # left two keys for the same group (the one being deleted and its
+        # replacement), and the next pass retired one of those, which created a
+        # third.  The retirement itself records the group it frees, so wait for
+        # Apply instead of inventing work beside it.
+        retiring_group_ids = {
+            str(operation.get("changes", {}).get("group_id", ""))
+            for operation in self._pending_operations
+            if operation.get("kind") == "api_key_delete"
+            and operation.get("account_id") == account.get("id")
+            and operation.get("state") != "completed"
+        } - {""}
         # Every remote deletion this pass stages, with the policy that governs
         # it.  A retirement is not one call site: a group's duplicates are
         # retired inside the layout loop, and the keys no group adopted are
@@ -5887,6 +5921,10 @@ class RelayAccountsDomain:
                 if str(resource.get("group_id", "")) == group_id
             ]
             if not matching:
+                if group_id in retiring_group_ids:
+                    # The group's key is on its way out; filling the group now
+                    # would put a second key beside the one Apply is removing.
+                    continue
                 # Re-home an orphan before minting a key: the orphan already
                 # holds the credential this group's routes were answered with,
                 # and its resource id is what a provider slot binds.
@@ -6100,6 +6138,7 @@ class RelayAccountsDomain:
                 kind="api_key_delete",
                 account=account,
                 resource_id=selected_id,
+                changes={"group_id": str(self._selected_resource(account, selected_id).get("group_id", ""))},
                 dependency_policy=policy,
             )
         self._draft_staged = True

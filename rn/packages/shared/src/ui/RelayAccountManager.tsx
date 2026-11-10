@@ -1382,6 +1382,25 @@ export function StationAccountsPanel({
       if (turningOff) {
         await apiKeyActions?.setAutoGrouping?.(account.id, false);
         staged.autoGrouping = false;
+        // A toggle-off restores Core's pre-toggle draft (when this Core still
+        // holds one), while the rows this window is showing are the station's
+        // own keys.  Read the account again before any edit is matched: the
+        // restored draft can name a different resource set, and matching edits
+        // against it skipped every key it no longer held — the sheet then
+        // closed on 已保存 having written none of the group changes the user
+        // made after turning the switch off.
+        try {
+          await refreshResources(current.id, { force: true });
+          const refreshed = await refreshAccounts();
+          const reloaded = refreshed
+            ? accountsFromSnapshot(refreshed).find((entry) => entry.id === current.id)
+            : undefined;
+          if (reloaded) current = reloaded;
+        } catch {
+          // The write below still names the keys on screen; a read that fails
+          // leaves the failure to the write itself, which states it in the
+          // sheet's strip.
+        }
       }
       for (const create of edits.creates) {
         if (alreadyCreated.has(`${create.name}\u0000${create.groupID}`)) continue;
@@ -1390,11 +1409,14 @@ export function StationAccountsPanel({
         staged.creates.push(create);
       }
       for (const edit of edits.updates) {
-        // A key the station no longer lists is one the account does not hold:
-        // there is nothing to write against, so the edit is dropped instead of
-        // being reported back as a save that did not happen.
+        // The row the user edited must still be a key this account holds: a
+        // key the station stopped listing has nothing to write against, and
+        // reporting the batch as saved while dropping that edit is the
+        // failure this window exists to avoid.
         const resource = current.resources.find((item) => item.id === edit.keyID);
-        if (!resource) continue;
+        if (!resource) {
+          throw new Error(`The relay API key ${edit.keyID} is no longer available`);
+        }
         let stagedEdit = staged.updates.find((entry) => entry.keyID === edit.keyID);
         if (!stagedEdit) {
           stagedEdit = { keyID: edit.keyID, name: resource.apiName || resource.name, groupID: resource.groupID, enabled: resource.enabled };
@@ -1415,7 +1437,15 @@ export function StationAccountsPanel({
       }
       for (const keyID of edits.deletes) {
         if (alreadyDeleted.has(keyID)) continue;
-        await apiKeyActions?.remove?.(account.id, keyID, "detach_disabled");
+        // The sheet's − removes the key from the layout, and its models go
+        // with it: a route bound to a credential that no longer exists is the
+        // row the model table used to keep as 未定义密钥 — it can neither run
+        // nor be found again after the key is gone.  `delete_models` is the
+        // same policy 自动分组's own retirement applies, so a key removed from
+        // this window and a key retired by the layout leave one document
+        // shape.  The provider pane's own key removal still asks whether its
+        // models should be released, because there a key can be replaced.
+        await apiKeyActions?.remove?.(account.id, keyID, "delete_models");
         alreadyDeleted.add(keyID);
         staged.deletes.push(keyID);
       }
