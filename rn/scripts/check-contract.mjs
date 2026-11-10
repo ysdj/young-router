@@ -64,6 +64,25 @@ function unionStringLiterals(name) {
   });
 }
 
+function unionMemberNames(name) {
+  const node = declaration(name, ts.isTypeAliasDeclaration);
+  if (!ts.isUnionTypeNode(node.type)) fail(`${name} must be a union of named interfaces`);
+  return node.type.types.map((member) => {
+    if (!ts.isTypeReferenceNode(member) || !ts.isIdentifier(member.typeName)) {
+      fail(`${name} members must be named interfaces`);
+    }
+    return member.typeName.text;
+  });
+}
+
+function stringLiteralMember(name, property) {
+  const type = interfaceMembers(name).get(property);
+  if (!type) fail(`${name} must declare ${property}`);
+  const printed = printType(type);
+  if (!/^"[^"]*"$/u.test(printed)) fail(`${name}.${property} must be a string literal`);
+  return printed.slice(1, -1);
+}
+
 function definition(schema) {
   if (schema?.$ref) {
     const prefix = "#/$defs/";
@@ -183,9 +202,40 @@ if (!applyProperties.domain || !applyProperties.domains || !applyProperties.revi
 }
 const importDefinition = definition(coreSchema["x-method-contracts"].import.params);
 if (!importDefinition.required?.includes("revision")) fail("Import must require a revision");
-if (coreSchema.event?.properties?.event?.const !== "snapshot") fail("Python Core IPC event contract is invalid");
-const event = interfaceMembers("IpcEvent").get("event");
-if (!event || printType(event) !== '"snapshot"') fail("TypeScript IPC event contract diverges from schema");
+const eventBranches = coreSchema.event?.oneOf;
+if (!Array.isArray(eventBranches) || eventBranches.length === 0) fail("Python Core IPC event contract must be a union");
+const schemaEventBranches = new Map();
+for (const [index, branch] of eventBranches.entries()) {
+  if (branch?.additionalProperties !== false) fail(`Python Core IPC event branch ${index} must forbid extra properties`);
+  const name = branch?.properties?.event?.const;
+  if (typeof name !== "string") fail(`Python Core IPC event branch ${index} must fix its event name`);
+  if (schemaEventBranches.has(name)) fail(`Python Core IPC event union repeats: ${name}`);
+  schemaEventBranches.set(name, branch);
+}
+const schemaEventTopics = [...schemaEventBranches.keys()];
+const tsEventTopics = unionMemberNames("IpcEvent").map((member) => stringLiteralMember(member, "event"));
+if (new Set(tsEventTopics).size !== tsEventTopics.length) fail("TypeScript IPC event union repeats an event name");
+const missingEventTopics = schemaEventTopics.filter((name) => !tsEventTopics.includes(name));
+const extraEventTopics = tsEventTopics.filter((name) => !schemaEventTopics.includes(name));
+if (missingEventTopics.length > 0 || extraEventTopics.length > 0) {
+  fail(
+    "TypeScript IPC event contract diverges from schema: missing "
+    + `${JSON.stringify(missingEventTopics)}, unexpected ${JSON.stringify(extraEventTopics)}`,
+  );
+}
+for (const member of unionMemberNames("IpcEvent")) {
+  const name = stringLiteralMember(member, "event");
+  const schemaProperties = Object.keys(schemaEventBranches.get(name)?.properties ?? {}).sort();
+  const tsProperties = [...interfaceMembers(member).keys()].sort();
+  if (schemaProperties.join("\u0000") !== tsProperties.join("\u0000")) {
+    fail(`${member} diverges from schema: expected ${JSON.stringify(schemaProperties)}, received ${JSON.stringify(tsProperties)}`);
+  }
+}
+const subscribeTopics = definition(coreSchema.$defs.subscribeParams).properties?.topics?.items?.enum;
+if (!Array.isArray(subscribeTopics)) fail("Python Core IPC subscription topics are missing");
+if (subscribeTopics.slice().sort().join("\u0000") !== schemaEventTopics.slice().sort().join("\u0000")) {
+  fail(`Python Core IPC subscription topics diverge from the event union: ${JSON.stringify(subscribeTopics)}`);
+}
 const routes = unionStringLiterals("AppRoute");
 for (const route of requiredRoutes) {
   if (!routes.includes(route)) fail(`route missing: ${route}`);
