@@ -4,6 +4,7 @@ import {
   type DispatchAction,
   type IpcClient,
   type IpcEndpoint,
+  type IpcEvent,
   type IpcEventTopic,
   type IpcMethod,
   type IpcParams,
@@ -12,7 +13,6 @@ import {
   type IpcResults,
   type IpcTransport,
   type CoreSnapshot,
-  type SnapshotEvent,
   type ValidationSummary,
 } from "./types";
 
@@ -39,7 +39,7 @@ function isProtocolResponse<M extends IpcMethod>(response: IpcResponse<M>, expec
 export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint): IpcClient {
   let latestSnapshot: CoreSnapshot | undefined;
   let initialSnapshotRequest: Promise<CoreSnapshot> | undefined;
-  const snapshotListeners = new Set<(event: SnapshotEvent) => void>();
+  const snapshotListeners = new Set<(event: IpcEvent) => void>();
   let unsubscribeTransport: (() => void) | undefined;
   let subscriptionStarted = false;
 
@@ -90,14 +90,14 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
     files: async (): Promise<IpcResults["files"]> => call("files", {}),
     stageEditor: async (editorToken, text): Promise<IpcResults["editor"]> => call("editor", { editor_token: editorToken, text }),
     dispatch: async (action: DispatchAction, revision?: number): Promise<IpcResults["dispatch"]> => call("dispatch", revision === undefined ? { action } : { action, revision }),
-    subscribe: (listener: (event: SnapshotEvent) => void, topics?: IpcEventTopic[]): (() => void) => {
+    subscribe: (listener: (event: IpcEvent) => void, topics?: IpcEventTopic[]): (() => void) => {
       snapshotListeners.add(listener);
       if (!unsubscribeTransport) {
         unsubscribeTransport = transport.subscribe((event) => {
-          // Only a snapshot is this layer's concern for now: the incremental
-          // event kinds are applied by the UI once it can consume them.
-          if (event.event !== "snapshot") return;
-          rememberSnapshot(event.snapshot);
+          // A snapshot is still the only event this layer reads: patches and
+          // resyncs describe the same state and are handed to the UI, which is
+          // what decides how to apply or replace them.
+          if (event.event === "snapshot") rememberSnapshot(event.snapshot);
           for (const snapshotListener of snapshotListeners) snapshotListener(event);
         });
       }

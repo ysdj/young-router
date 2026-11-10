@@ -664,7 +664,7 @@ export interface IpcClient {
   files(): Promise<IpcResults["files"]>;
   stageEditor(editorToken: string, text: string): Promise<IpcResults["editor"]>;
   dispatch(action: DispatchAction, revision?: number): Promise<IpcResults["dispatch"]>;
-  subscribe(listener: (event: SnapshotEvent) => void, topics?: IpcEventTopic[]): () => void;
+  subscribe(listener: (event: IpcEvent) => void, topics?: IpcEventTopic[]): () => void;
   validate(domain: ConfigDomain, revision?: number): Promise<ValidationSummary>;
   apply(domain: ConfigDomain, revision: number, confirmation?: string | string[]): Promise<IpcResults["apply"]>;
   applyDomains(domains: ConfigDomain[], revision: number, confirmation?: string | string[]): Promise<IpcResults["apply"]>;

@@ -5,6 +5,7 @@ service, inspect user files, or import LiteLLM. Native hosts can construct a
 ``CoreStore`` and register only the domains they are ready to expose.
 """
 
+from .entity_ops import EntityOp
 from .ipc import CoreIPCClient, CoreIPCServer, IPCError, IpcEndpoint
 from .protocol import (
     METHODS,
@@ -35,6 +36,7 @@ __all__ = [
     "ConfirmationNeeded",
     "DomainAdapter",
     "DomainNotFound",
+    "EntityOp",
     "FileCapabilityRegistry",
     "IPCError",
     "IpcEndpoint",

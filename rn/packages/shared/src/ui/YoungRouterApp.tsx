@@ -48,6 +48,7 @@ import type {
   CoreSnapshot,
   DiskState,
   IpcClient,
+  IpcEvent,
   IpcResults,
   LanguagePreference,
   LogTab,
@@ -1883,7 +1884,26 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       if (!mounted) return;
       receiveSnapshot(next);
     };
-    const unsubscribe = ipc.subscribe((event) => receive(event.snapshot));
+    const receiveEvent = (event: IpcEvent): void => {
+      if (!mounted) return;
+      switch (event.event) {
+        case "snapshot":
+          receive(event.snapshot);
+          return;
+        case "patch":
+        case "resync":
+          // Applying ops locally is the next slice; reading the projection is
+          // the answer that is correct for both today.  A patch that cannot be
+          // chained is exactly what a resync says, so one path covers them.
+          void refreshSnapshot().catch(() => undefined);
+          return;
+        case "job":
+          // Long-running operations report through their own response today;
+          // their events carry no state this window applies yet.
+          return;
+      }
+    };
+    const unsubscribe = ipc.subscribe(receiveEvent);
     const latest = ipc.latestSnapshot();
     if (latest && latest !== initialSnapshot) receive(latest);
     let retryTimer: ReturnType<typeof setTimeout> | undefined;

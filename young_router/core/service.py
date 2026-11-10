@@ -33,10 +33,20 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
 from .emitter import CoalescingEmitter
+from .entity_ops import MAX_PATCH_OPS, EntityOp, domain_diff
 from .log_tabs import LOG_TABS
 from .oplog import note as _note
 from .persistence import AtomicJSONStore, PersistenceError, atomic_write_bytes, atomic_write_json, read_bytes, read_json
-from .protocol import MAX_EDITOR_DOCUMENT_BYTES, PROTOCOL_VERSION, ProtocolError, _encode_json, is_error_code, make_event
+from .protocol import (
+    MAX_EDITOR_DOCUMENT_BYTES,
+    PROTOCOL_VERSION,
+    ProtocolError,
+    _encode_json,
+    is_error_code,
+    make_event,
+    make_patch_event,
+    make_resync_event,
+)
 from .security import REDACTED, _key_text, redact, safe_exception_message, safe_error_message
 
 
@@ -46,6 +56,10 @@ PACKAGE_VERSION = 1
 DOMAIN_FILE_FORMAT = "young-router-domain-settings"
 DOMAIN_FILE_VERSION = 1
 SUBSCRIPTION_QUEUE_LIMIT = 32
+
+
+class _PatchUnavailable(Exception):
+    """A revision moved in a way no entity-level patch can describe."""
 
 # How often the thread that ends abandoned sign-ins looks.  Shorter than the
 # idle timeout by a wide margin so a forgotten browser is closed within a tick
@@ -245,6 +259,11 @@ class DomainAdapter(Protocol):
     def apply(self, payload: object | None = None) -> Mapping[str, Any] | None: ...
 
     def reload(self) -> Mapping[str, Any] | None: ...
+
+    # Optional: a domain that can name its own entities implements this and
+    # lightens every event it appears in.  A domain that does not is published
+    # as one ``replace`` op by ``entity_ops.domain_diff``.
+    def diff(self, previous: Mapping[str, Any], current: Mapping[str, Any]) -> list[EntityOp]: ...
 
 
 @dataclass(frozen=True)
@@ -1267,6 +1286,17 @@ class CoreStore:
         # adapter state that mutation is rewriting; the adapter projections
         # are only consistent under the mutation that owns them.
         self._snapshot_view: dict[str, Any] | None = None
+        # What the last published event handed to the windows, and the revision
+        # it carried: the next event is the patch that takes a window from here
+        # to the store's current state.  ``None`` means no window has received
+        # a full state from this store yet, so the next event must be one
+        # (first subscription, or a gap that reset the chain).
+        self._last_published_projection: dict[str, Any] | None = None
+        self._last_published_revision = 0
+        # One send at a time, so two publishers cannot both compute a patch
+        # against the same base and record their answers out of order.  Reentrant
+        # because a subscriber's own callback may publish on this thread.
+        self._publish_guard = threading.RLock()
         self._service: dict[str, Any] = {"state": "unknown"}
         # Post-apply proxy restarts take several seconds; they run on their own
         # thread so the committed edit and every later IPC request stay fast.
@@ -1921,6 +1951,12 @@ class CoreStore:
     def _emit(self, snapshot: Mapping[str, Any] | None = None) -> None:
         """Publish one state event to every subscribed window.
 
+        The event is the change since the last one, not the state itself: a
+        commit names the rows it moved and a window applies those rows, so the
+        payload of an edit is the edit.  The whole projection is sent only when
+        a window has no state to patch from (first subscription, or a gap) or
+        when no entity-level description exists (see ``_patch_event``).
+
         ``snapshot`` lets a caller that just built the projection hand it over
         instead of asking for the same projection twice: Apply already answers
         its caller with one, and rebuilding it under this lock only to serialize
@@ -1953,24 +1989,106 @@ class CoreStore:
         if not callbacks:
             self._service_row_is_live()
             return
+        # Projection happens outside ``_publish_guard``: a projection takes the
+        # mutation lane, and a mutation that publishes directly would then be
+        # waiting for this lock while holding the lane this one waits for.
+        # Publishing under the guard keeps the recorded chain ordered; a
+        # projection that lost the race is refused by the revision check below.
         projected = self.snapshot() if snapshot is None else snapshot
-        # A projection taken while another thread owns the mutation lane is the
-        # last committed view, not the one this send was asked about.  That is
-        # the same answered-by-a-later-commit rule ``snapshot`` gives a window:
-        # the event carries a revision the store has since passed, the window
-        # drops it, and the commit that owns the lane asks for its own event.
-        event = make_event("snapshot", projected["revision"], projected)
-        # One serialization, then each subscriber gets its own parse of the
-        # same bytes: a window that mutates its copy must not reach another's,
-        # and a deepcopy of the whole projection was slower than the JSON the
-        # event is about to become anyway.
-        encoded = _encode_json(event)
-        for callback in callbacks:
-            try:
-                callback(json.loads(encoded))
-            except Exception:
-                # A disconnected UI must not break a state transition.
+        revision = projected.get("revision")
+        if type(revision) is not int:
+            return
+        with self._publish_guard:
+            with self._lock:
+                previous = self._last_published_projection
+                base_revision = self._last_published_revision
+            if previous is None:
+                event = make_event("snapshot", revision, projected)
+            else:
+                # A projection taken while another thread owns the mutation
+                # lane is the last committed view, not the one this send was
+                # asked about.  That is the same answered-by-a-later-commit
+                # rule ``snapshot`` gives a window: publishing it after the
+                # newer event would move the chain backwards, so the commit
+                # that owns the lane asks for its own event instead.
+                if revision < base_revision:
+                    return
+                try:
+                    event = self._patch_event(projected, previous, base_revision)
+                except Exception:
+                    # The revision moved in a way no patch can describe: a diff
+                    # that raised, a domain that cannot say what changed, or an
+                    # op list too large to be worth sending.  Reading the full
+                    # state is the answer that is always correct.
+                    event = make_resync_event(revision)
+                if event is None:
+                    # Nothing about the projection changed, so the windows that
+                    # already hold it owe no repaint and no read.
+                    return
+            # One serialization, then each subscriber gets its own parse of the
+            # same bytes: a window that mutates its copy must not reach another's,
+            # and a deepcopy of the whole projection was slower than the JSON the
+            # event is about to become anyway.
+            encoded = _encode_json(event)
+            with self._lock:
+                self._last_published_projection = copy.deepcopy(projected.get("domains"))
+                self._last_published_revision = revision
+            for callback in callbacks:
+                try:
+                    callback(json.loads(encoded))
+                except Exception:
+                    # A disconnected UI must not break a state transition.
+                    continue
+
+    def _patch_event(
+        self,
+        projected: Mapping[str, Any],
+        previous: Mapping[str, Any],
+        base_revision: int,
+    ) -> dict[str, Any] | None:
+        """Build the patch from ``previous``'s projection to ``projected``.
+
+        ``None`` means nothing changed: a projection at the base revision with
+        no moved rows owes the windows nothing.  A revision that moved but has
+        no honest entity-level description raises ``_PatchUnavailable``, and
+        the caller sends a resync instead: a patch that leaves a row out is a
+        row the window keeps drawing, so an incomplete answer is worse than a
+        full one.
+        """
+
+        domains = projected.get("domains")
+        revision = projected.get("revision")
+        if not isinstance(domains, Mapping) or type(revision) is not int:
+            raise _PatchUnavailable
+        ops: list[dict[str, Any]] = []
+        changed: list[str] = []
+        for name, current in domains.items():
+            if not isinstance(name, str):
+                raise _PatchUnavailable
+            before = previous.get(name)
+            if before == current:
                 continue
+            adapter = self._domains.get(name)
+            if adapter is None:
+                raise _PatchUnavailable
+            try:
+                domain_ops = domain_diff(adapter, before, current)
+            except Exception:
+                # A domain whose diff cannot answer must not take the event
+                # channel down with it: the window reads the state instead.
+                raise _PatchUnavailable from None
+            if not domain_ops:
+                raise _PatchUnavailable
+            for op in domain_ops:
+                if len(ops) >= MAX_PATCH_OPS:
+                    raise _PatchUnavailable
+                ops.append(op.to_mapping())
+            changed.append(name)
+        if not ops:
+            if revision == base_revision:
+                return None
+            raise _PatchUnavailable
+        return make_patch_event(base_revision, revision, changed, ops)
 
     def _request_emit(self) -> None:
         """Mark one state event pending for the emitter.
