@@ -286,6 +286,118 @@ class ProviderWizardStagingTests(unittest.TestCase):
         finally:
             server.shutdown()
 
+    def test_a_provided_key_becomes_the_slot_its_routes_name(self) -> None:
+        """A station resource is not a key name.
+
+        The provided-key step lists a station's resources by their station
+        labels ("Pro分组"), and a route filed on that label names a provider key
+        Core does not carry: the draft is refused at Apply with
+        `model_provider_key_missing`, after the wizard window has already
+        closed.  Core stages the slot from the source and answers with the id
+        and the (deduped) name, and those are what the routes name.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(EMPTY_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            provider_id = domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "station-vendor",
+                        "api_base": "https://station.example.test",
+                        "auth_kind": "api_key",
+                        "enabled": True,
+                        "models": [],
+                    }
+                },
+            )["providers"][0]["id"]
+            source = {
+                "kind": "relay",
+                "station_id": "station-a",
+                "account_id": "account-a",
+                "resource_id": "resource-a",
+            }
+            imported = domain.dispatch(
+                "provider.import_relay_key",
+                {"provider_id": provider_id, "api_key_name": "Pro分组", "source": source},
+            )["operation_summary"]
+            self.assertTrue(imported["slot_id"])
+            self.assertEqual("Pro分组", imported["api_key_name"])
+
+            added = domain.dispatch(
+                "model.add_many",
+                {
+                    "provider_id": provider_id,
+                    "models": [
+                        {
+                            "name": "glm-5.3",
+                            "upstream_model": "glm-5.3",
+                            "api_key_name": imported["api_key_name"],
+                            "provider_key_id": imported["slot_id"],
+                            "imported": True,
+                            "imported_name_case": "lower",
+                            "enabled": True,
+                        }
+                    ],
+                },
+            )
+            model = added["providers"][0]["models"][0]
+            self.assertEqual(imported["api_key_name"], model["api_key_name"])
+            self.assertEqual(imported["slot_id"], model["provider_key_id"])
+            # What the wizard finishes with: the relay credential is
+            # materialized by Apply, so the finished record is the preflight
+            # answer, and it is a record Apply can write.
+            self.assertEqual({"valid": True, "errors": []}, domain.validate_relay_preflight())
+
+    def test_a_route_naming_a_station_label_is_refused_by_name(self) -> None:
+        """The refusal names the key and the model it is about.
+
+        A sentence that says only "the selected key is unavailable" beside a
+        position inside the provider leaves the reader comparing nothing: the
+        label the wizard filed is what has to be shown for the row to be
+        fixable.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(textwrap.dedent(EMPTY_CONFIG).lstrip(), encoding="utf-8")
+            domain = ProvidersModelsDomain(path)
+            provider_id = domain.dispatch(
+                "provider.add",
+                {
+                    "provider": {
+                        "name": "station-vendor",
+                        "api_base": "https://station.example.test",
+                        "auth_kind": "api_key",
+                        "enabled": True,
+                        "models": [],
+                    }
+                },
+            )["providers"][0]["id"]
+            domain.dispatch(
+                "model.add_many",
+                {
+                    "provider_id": provider_id,
+                    "models": [
+                        {
+                            "name": "glm-5.3",
+                            "upstream_model": "glm-5.3",
+                            "api_key_name": "Pro分组",
+                            "enabled": True,
+                        }
+                    ],
+                },
+            )
+            validation = domain.validate()
+            self.assertFalse(validation["valid"])
+            issue = validation["issues"][0]
+            self.assertEqual("model_provider_key_missing", issue["code"])
+            self.assertEqual("providers_models.station-vendor.models[1]", issue["path"])
+            self.assertEqual("Pro分组", issue["key"])
+            self.assertEqual("glm-5.3", issue["model"])
+
     def test_a_provider_target_still_needs_a_provider(self) -> None:
         # Only the wizard's own prefix files a waiting key; a typo stays an
         # invalid secret instead of a value nothing will ever adopt.

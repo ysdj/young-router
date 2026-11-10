@@ -1803,7 +1803,14 @@ class RelayAccountsDomain:
             "station_count": len(stations),
             "accounts": accounts,
             "account_count": len(accounts),
-            "pending_credential_cleanups": pending_cleanups,
+            # The tombstones are secret-free (an id, a label, a kind), and the
+            # *only* half that can erase a native keychain entry is the host, so
+            # this list has to survive the snapshot.  The storage key names the
+            # credential it is about; this one may not — a name carrying
+            # ``credential`` is redacted to the string ``configured`` on the way
+            # out, which is how the pane's 重试清理 row and the host's own
+            # confirmation of a Core-side removal both read an empty list.
+            "pending_cleanups": pending_cleanups,
             "pending_operations": pending_operations,
             "pending_operation_count": len(pending_operations),
             "pending_operation_summary": self._pending_operation_summary(),
@@ -6360,6 +6367,19 @@ class RelayAccountsDomain:
         if resource.get("enabled") is not True:
             raise RelayAccountsError("Enable the relay API key before importing it")
         return self._relay_source(account, resource)
+
+    def station_identities(self) -> list[dict[str, str]]:
+        """Every station's id and origin, for a coordinator that resolves sites.
+
+        The public snapshot carries accounts, resources and binding counts as
+        well; a provider delete only needs to match an address to a station, so
+        it reads this instead of paying for the rest.
+        """
+
+        return [
+            {"id": str(station.get("id", "")), "origin": str(station.get("origin", ""))}
+            for station in self._stations
+        ]
 
     def provider_station_source(self, source: object) -> dict[str, str]:
         """Resolve the one non-secret station identity used by a provider."""

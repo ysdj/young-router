@@ -491,6 +491,14 @@ _PROVIDER_RELAY_RESOURCE_ACTIONS = frozenset(
 #: domain before touching the provider draft.
 _PROVIDER_RELAY_STATION_ACTIONS = frozenset({"provider_select_relay_station"})
 
+#: Provider actions that release the relay stations (and their accounts) the
+#: provider was the last owner of.  A station belongs to the rows that reach it:
+#: the provider bound to it, a key slot sourcing one of its resources, and a
+#: provider whose address is that station's site.  Deleting the last of those
+#: leaves a sign-in no row anywhere names -- it stayed in the store forever,
+#: because the only cleanup lived in the pane and only knew bound providers.
+_PROVIDER_RELAY_RELEASING_ACTIONS = frozenset({"provider_delete", "delete_provider"})
+
 #: Relay actions that stage the account's resources into the provider draft.
 _RELAY_RESOURCE_IMPORT_ACTIONS = frozenset(
     {
@@ -5635,6 +5643,25 @@ class CoreStore:
 
         return self.start_job(work, name=name, on_done=on_done)
 
+    @staticmethod
+    def _relay_reachable_stations(providers: object, relay: object) -> list[str]:
+        """The stations the provider draft still reaches.
+
+        A station is reached by the provider bound to it, by a key slot that
+        sources one of its resources, and by a provider whose address is that
+        station's site.  The relay domain owns the station table and the
+        provider domain owns the references, so each answers its half.
+        """
+
+        reader = getattr(relay, "station_identities", None)
+        resolver = getattr(providers, "relay_reachable_stations", None)
+        if not callable(reader) or not callable(resolver):
+            return []
+        try:
+            return list(resolver(reader()))
+        except Exception as exc:
+            raise CoreError("domain_error", safe_exception_message(exc)) from None
+
     def _dispatch_domain_set(self, name: str, normalized_action: str) -> tuple[str, ...]:
         """The write lanes one dispatch action declares before it starts.
 
@@ -5655,6 +5682,7 @@ class CoreStore:
         elif name == "providers_models" and (
             normalized_action in _PROVIDER_RELAY_RESOURCE_ACTIONS
             or normalized_action in _PROVIDER_RELAY_STATION_ACTIONS
+            or normalized_action in _PROVIDER_RELAY_RELEASING_ACTIONS
         ):
             names.add("relay_accounts")
         return tuple(sorted(names))
@@ -5861,6 +5889,25 @@ class CoreStore:
                 provider_before = self._adapter_draft_state("providers_models") if providers is not None else None
                 relay_checkpoint = _checkpoint_adapter(adapter, error_code="domain_error") if relay_dependency_action else None
                 provider_checkpoint = _checkpoint_adapter(providers, error_code="domain_error") if providers is not None else None
+                # The reverse direction: a provider delete releases the relay
+                # stations only that provider still reached.  The set is read
+                # before and after the delete through the provider draft, so a
+                # station another row still reaches is untouched.
+                releasing_relay = (
+                    name == "providers_models"
+                    and normalized_action in _PROVIDER_RELAY_RELEASING_ACTIONS
+                )
+                released_relay = self._domains.get("relay_accounts") if releasing_relay else None
+                released_relay_checkpoint = (
+                    _checkpoint_adapter(released_relay, error_code="domain_error") if released_relay is not None else None
+                )
+                provider_action_checkpoint = (
+                    _checkpoint_adapter(adapter, error_code="domain_error") if releasing_relay else None
+                )
+                reached_before = (
+                    self._relay_reachable_stations(adapter, released_relay) if released_relay is not None else []
+                )
+                released_station_ids: list[str] = []
                 try:
                     if name == "providers_models" and normalized_action in _PROVIDER_RELAY_RESOURCE_ACTIONS:
                         resource_data = _as_mapping(payload)
@@ -5931,6 +5978,20 @@ class CoreStore:
                             "api_key_name": resolved.get("api_key_name"),
                         }
                     result = adapter.dispatch(action_type, payload)
+                    if released_relay is not None:
+                        # What the delete stopped reaching is what it owned: the
+                        # station and its accounts go through the relay domain's
+                        # own removal, which keeps the durable credential
+                        # tombstones the native host confirms.
+                        reached_after = self._relay_reachable_stations(adapter, released_relay)
+                        released_station_ids = [
+                            station_id for station_id in reached_before if station_id not in reached_after
+                        ]
+                        for station_id in released_station_ids:
+                            released_relay.dispatch(
+                                "station_remove",
+                                {"id": station_id, "dependency_policy": "detach"},
+                            )
                     if relay_dependency_action and providers is not None:
                         relay_snapshot = adapter.snapshot()
                         details = relay_snapshot.get("last_action") if isinstance(relay_snapshot, Mapping) else None
@@ -5962,6 +6023,8 @@ class CoreStore:
                         _restore_adapter(adapter, relay_checkpoint)
                     if providers is not None and provider_checkpoint is not None:
                         _restore_adapter(providers, provider_checkpoint)
+                    if released_relay is not None and released_relay_checkpoint is not None:
+                        _restore_adapter(released_relay, released_relay_checkpoint)
                     raise
                 except Exception as exc:
                     if relay_checkpoint is not None:
@@ -5971,6 +6034,16 @@ class CoreStore:
                                 _restore_adapter(providers, provider_checkpoint)
                         except Exception:
                             raise CoreError("domain_error", "Linked model dependency handling could not be rolled back") from None
+                    if released_relay is not None and released_relay_checkpoint is not None:
+                        # The delete deleted nothing it could not undo: a relay
+                        # removal that failed half way would otherwise leave the
+                        # provider gone and its station standing.
+                        try:
+                            _restore_adapter(released_relay, released_relay_checkpoint)
+                            if provider_action_checkpoint is not None:
+                                _restore_adapter(adapter, provider_action_checkpoint)
+                        except Exception:
+                            raise CoreError("domain_error", "Relay release could not be rolled back") from None
                     # Domain exceptions are authored to be safe; normalize
                     # them into the stable Core protocol error shape.  A cause
                     # the domain named travels as the IPC code, so the window's
@@ -6087,6 +6160,23 @@ class CoreStore:
                             base_revision=(
                                 self._drafts.get("providers_models", {}).get("base_revision", self._revision)
                                 if provider_dirty
+                                else self._revision
+                            ),
+                        )
+                    if released_relay is not None and released_station_ids:
+                        # The station and its accounts went with the provider, so
+                        # this dispatch staged the relay domain too.  Without
+                        # this the removal would sit in a draft nobody marks
+                        # dirty: the Apply that follows would write the deleted
+                        # provider and leave the sign-in behind.
+                        relay_after = self._adapter_draft_state("relay_accounts")
+                        relay_dirty = relay_after != self._baselines.get("relay_accounts")
+                        self._mark_domain(
+                            "relay_accounts",
+                            dirty=relay_dirty,
+                            base_revision=(
+                                self._drafts.get("relay_accounts", {}).get("base_revision", self._revision)
+                                if relay_dirty
                                 else self._revision
                             ),
                         )

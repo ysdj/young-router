@@ -422,7 +422,7 @@ class RelayApplyDomainTests(unittest.TestCase):
             domain.commit_apply()
             reloaded = RelayAccountsDomain(directory, http_client=client)
             self.assertEqual([], reloaded.snapshot()["accounts"])
-            self.assertEqual(1, len(reloaded.snapshot()["pending_credential_cleanups"]))
+            self.assertEqual(1, len(reloaded.snapshot()["pending_cleanups"]))
 
     def test_a_journal_entry_for_a_missing_account_cannot_deadlock_apply(self) -> None:
         """Orphaned journal work is dropped, not left to pin the draft forever.

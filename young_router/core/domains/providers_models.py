@@ -7794,6 +7794,56 @@ class ProvidersModelsDomain:
             for key in ("station_id", "account_id", "resource_id")
         )
 
+    def relay_reachable_stations(self, stations: object = ()) -> list[str]:
+        """The relay stations this draft's providers still reach.
+
+        Three things reach a station: a provider bound to it
+        (``relay_station_id``), a key slot sourcing one of its resources, and a
+        provider whose address *is* that station's site — the address rule the
+        bind itself uses (``_relay_site_key``).  The last one is why a provider
+        whose binding never landed still owns the station's accounts: the pane
+        lists them under it, so deleting that row has to take them with it.
+
+        The coordinator reads this set before and after a delete: a station that
+        leaves it was that provider's last owner, and the relay domain removes
+        it and its accounts.  A station another row still reaches stays put.
+        """
+
+        reached: set[str] = set()
+        site_to_station: dict[tuple[str, str, int | None], str] = {}
+        if isinstance(stations, Sequence) and not isinstance(stations, (str, bytes, bytearray)):
+            for station in stations:
+                if not isinstance(station, Mapping):
+                    continue
+                station_id = str(station.get("id", "")).strip()
+                site = _relay_site_key(station.get("origin", station.get("base_url")))
+                if station_id and site is not None:
+                    site_to_station[site] = station_id
+        providers = self._draft.get("providers")
+        if not isinstance(providers, list):
+            return []
+        for provider in providers:
+            if not isinstance(provider, Mapping):
+                continue
+            bound = str(provider.get("relay_station_id", "")).strip()
+            if bound:
+                reached.add(bound)
+            try:
+                keys = self._provider_api_keys(provider)
+            except DomainError:
+                keys = []
+            for key in keys:
+                source = key.get("source") if isinstance(key, Mapping) else None
+                if not isinstance(source, Mapping) or source.get("kind") != "relay":
+                    continue
+                station_id = str(source.get("station_id", "")).strip()
+                if station_id:
+                    reached.add(station_id)
+            site = _relay_site_key(provider.get("api_base", provider.get("endpoint")))
+            if site is not None and site in site_to_station:
+                reached.add(site_to_station[site])
+        return sorted(reached)
+
     def relay_slot_credentials(self) -> dict[tuple[str, str], str]:
         """The relay credentials this document already persists on its slots.
 
@@ -9325,11 +9375,21 @@ class ProvidersModelsDomain:
                     # The write refuses it rather than answering with another
                     # slot's credential, so the row states which key is missing
                     # instead of the pane failing as a whole.
+                    #
+                    # The name and id travel with the issue: a sentence that
+                    # says only "the selected key is unavailable" beside a
+                    # position inside the provider leaves the reader with nothing
+                    # to compare against the routes it can see.
                     issues.append(
                         {
                             "path": location,
                             "code": "model_provider_key_missing",
                             "message": "The selected provider key is unavailable",
+                            "key": str(model.get("api_key_name", "")).strip()
+                            or str(model.get("provider_key_id", "")).strip(),
+                            "model": str(
+                                model.get("model_name") or model.get("name") or ""
+                            ).strip(),
                             "severity": "error",
                         }
                     )

@@ -823,6 +823,7 @@ export type TranslationKey =
   | "providers.wizard.back"
   | "providers.wizard.next"
   | "providers.wizard.finish"
+  | "providers.wizard.finishWithoutModels"
   | "providers.wizard.creating"
   | "providers.wizard.complete"
   | "providers.wizard.required"

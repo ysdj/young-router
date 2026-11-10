@@ -1470,41 +1470,155 @@ class ReactNativeUiParityTests(unittest.TestCase):
         wizard = self.ui.split("const detectRelayType = useCallback(", 1)[1].split("}, [enqueueDispatch, refresh]);", 1)[0]
         self.assertIn("await refresh()", wizard)
 
-    def test_a_station_account_never_exists_without_its_provider(self) -> None:
-        """A relay account belongs to a provider, not to a station alone.
+    def test_the_wizard_creates_nothing_before_its_finish(self) -> None:
+        """A wizard that has not been finished has no provider in the pane.
 
-        The native sign-in stores the account before 完成 creates the provider.
-        Closing the wizard at 密钥, or a create that failed after the sign-in,
-        left an account the provider list could not reach; the wizard then read
-        the missing row as 无法识别中转站类别.  The provider is now created before
-        the account can exist, the key step raises it as soon as it shows an
-        existing station's account, and 完成 joins that row instead of minting a
-        second one.
+        A relay sign-in stores the station account before 完成, so the provider
+        was raised as soon as 密钥 showed a station account and applied on the
+        spot.  That row then answered the wizard's own name — the URL fills it in
+        — as 供应商名称已存在, and the pane listed a provider for a wizard nobody
+        finished.  The account does not need it: 密钥 matches accounts by origin,
+        and 完成 binds the row it creates to the station in the same pass.
         """
 
         wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
-        self.assertIn('const ensuredProvider = useRef("");', wizard)
-        self.assertIn("const ensureRelayProviderForStation = async (): Promise<string | undefined> => {", wizard)
-        self.assertIn("let targetProviderID = accountsAtStation ? await ensureRelayProviderForStation() : undefined;", wizard)
+        self.assertNotIn("ensureRelayProviderForStation", wizard)
+        self.assertNotIn("ensuredProvider", wizard)
+        self.assertNotIn("applyProviders", self.ui)
         login = wizard.split("const beginRelayLogin = async (signInAnother = false): Promise<void> => {", 1)[1]
-        self.assertLess(
-            login.index("await ensureRelayProviderForStation()"),
-            login.index("await native.relayLogin("),
-            "the provider must exist before the native sign-in can store an account",
-        )
-        self.assertIn('if (targetProviderID && stationID) {', wizard)
-        self.assertIn("if (ensuredProvider.current) return ensuredProvider.current;", wizard)
-        # The step repairs an account that is already there, even when no sign-in
-        # follows: the station's stored family answers the type question and the
-        # provider is raised as the key step appears.
+        login = login.split("const refreshStationResources", 1)[0]
+        self.assertNotIn('dispatchWithOutcome("provider.add"', login)
+        self.assertNotIn('dispatchWithOutcome("provider.select_relay_station"', login)
+        # One create, on 完成, and nothing on the steps before it.
+        commit = wizard.split("const commitWizardProvider = async (): Promise<string | undefined> => {", 1)[1]
+        commit = commit.split("const createKey", 1)[0]
+        self.assertEqual(wizard.count('dispatchWithOutcome("provider.add"'), 1)
+        self.assertIn('const next = await dispatchWithOutcome("provider.add", {', commit)
+        provider_step = wizard.split("if (step === \"provider\") {", 1)[1].split('if (step === "keys") {', 1)[0]
+        self.assertNotIn("provider.add", provider_step)
+        self.assertNotIn("provider.select_relay_station", provider_step)
+        # A name and address the pane already lists are that provider, so the
+        # URL-filled name cannot dead-end its own wizard.
+        self.assertIn("const existingAtAddress = providerType === \"api\"", provider_step)
+        self.assertIn("if (existingAtAddress && providerAuthKind(existingAtAddress) === \"api_key\") {", provider_step)
+        self.assertIn("function providerAtAddress(providers: UnknownRecord[], baseURL: string, name: string): UnknownRecord | undefined {", self.ui)
+        # An account with no provider row still answers the family question and
+        # still lists its keys, because both read the account, not the row.
         self.assertIn("const accountType = stationAccounts.find((account) => account.type === \"newapi\" || account.type === \"sub2api\")?.type;", wizard)
-        self.assertIn("if (!stationForProvider || stationAccounts.length === 0) return;", wizard)
-        # The child window's close discards its provider draft; the native
-        # sign-in does not.  The provider is applied before the account can be
-        # stored, so a closed wizard cannot leave the account behind alone.
-        self.assertIn("if (!await applyProviders()) return undefined;", wizard)
-        self.assertIn("const applyProvidersQuietly = async (): Promise<boolean> => {", self.ui)
-        self.assertIn("applyProviders={applyProvidersQuietly}", self.ui)
+        self.assertIn("const stationAccounts = useMemo(() => {", wizard)
+        self.assertIn("await relay.refreshResources(landedID, { force: true });", wizard)
+
+    def test_a_cleanup_tombstone_is_confirmed_by_the_host_not_by_a_pane(self) -> None:
+        """Core can drop an account no pane is showing.
+
+        A provider delete releases its station inside Core, so the account and
+        its station row are gone before any surface could draw the per-station
+        重试清理 row — the tombstone stayed, and the keychain entry survived every
+        later delete of the same site.  The window that is open confirms every
+        tombstone, whether or not a pane shows the station it names.
+        """
+
+        self.assert_ui_has("const pending = pendingCredentialCleanups(snapshot)")
+        self.assert_ui_has(".filter((cleanup) => !cleanupConfirmedAccounts.current.has(cleanup.accountID));")
+        self.assert_ui_has("if (cleanupConfirmedAccounts.current.has(cleanup.accountID)) continue;")
+        self.assert_ui_has("await native.clearRelayCredentials(cleanup.accountID).catch(() => undefined);")
+        self.assert_ui_has("""            "credential_cleanup_confirm",
+            { id: cleanup.accountID, kind: cleanup.kind },
+            "relay_accounts",""")
+        # One attempt per window keeps a host that cannot erase from looping,
+        # and the tombstone stays for the pane's own retry.
+        self.assert_ui_has("cleanupConfirmedAccounts.current.add(cleanup.accountID);")
+        # Serially: five tombstones fired at once each read the same revision,
+        # and the ones that lost it left their credentials behind for good.
+        self.assert_ui_has("for (const cleanup of pending) {")
+        self.assert_ui_has("cleanupConfirmedAccounts.current.delete(cleanup.accountID);")
+
+    def test_a_wizard_whose_provider_was_deleted_starts_creating_again(self) -> None:
+        """The row can be deleted while the wizard window is open.
+
+        The pane's − applies a delete behind 配置供应商, and a discarded draft
+        takes its rows with it.  The wizard then held a selection that named
+        nothing: 密钥 answered 请填写必填项后继续 over a finished form, with no
+        field left to fill, and 完成 had no provider to write to.  Its own name
+        and address are still in its state, so it becomes the create it would
+        have been without that row — or 供应商, when those are gone as well.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        self.assertIn('if (providerMode !== "existing" || selectedProvider) return;', wizard)
+        fallback = wizard.split('if (providerMode !== "existing" || selectedProvider) return;', 1)[1].split("}, [providerMode", 1)[0]
+        self.assertIn('setProviderMode("new");', fallback)
+        self.assertIn("setProviderSelection(PROVIDER_WIZARD_NEW_PROVIDER);", fallback)
+        self.assertIn("if (providerName.trim() && providerBaseURL.trim()) return;", fallback)
+        self.assertIn('setStep("provider");', fallback)
+        self.assertIn('stepRef.current = "provider";', fallback)
+        # 完成 states why it cannot create; the empty name used to return before
+        # the one check that says so.
+        commit = wizard.split("const commitWizardProvider = async (): Promise<string | undefined> => {", 1)[1]
+        commit = commit.split("const createKey", 1)[0]
+        self.assertLess(
+            commit.index("if (!providerStepValid()) return undefined;"),
+            commit.index("const name = providerName.trim();"),
+        )
+
+    def test_a_provided_key_is_filed_on_the_slot_it_becomes(self) -> None:
+        """A station resource's label is not a provider key.
+
+        The wizard filed the provided-key routes on the resource's station
+        label, which names no slot in the provider it just created: Core
+        refused the whole draft at Apply (`model_provider_key_missing`) after
+        the window had closed, and 完成 read as a press that did nothing.  The
+        slot is staged first and the routes name its id and name; the fragile
+        post-pass that patched each added row is gone with it.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        self.assertIn('const next = await dispatchWithOutcome("provider.import_relay_key", {', wizard)
+        self.assertIn("const providedKey = usingProvidedKey && selectedProvidedChoice", wizard)
+        self.assertIn("const keyNameForModels = usingProvidedKey", wizard)
+        # The reference is the slot, never the station's label.
+        self.assertNotIn("api_key_name: usingProvidedKey ? selectedProvidedChoice?.resourceLabel", wizard)
+        self.assertNotIn('dispatchWithOutcome("model.select_relay_resource"', wizard)
+        # The reply, not a search through the snapshot, names what to file on:
+        # the old pass guessed the new row and bailed silently when it missed.
+        self.assertIn("const id = stringValue(summary.slot_id);", wizard)
+        self.assertIn("const name = stringValue(summary.api_key_name);", wizard)
+        # And a refusal names the key and the model it is about.
+        self.assertIn('const values = { key: stringValue(issue.key), model: stringValue(issue.model) };', self.ui)
+        self.assertIn('"validation.modelProviderKeyMissing": "该模型选择的供应商密钥「{key}」不可用。"', self.zh)
+        self.assertIn(r'"validation.modelProviderKeyMissing": "The key \"{key}\" this model selects is unavailable."', self.en)
+
+    def test_finishing_without_a_model_is_its_own_button(self) -> None:
+        """A wizard may register a supplier without a single route.
+
+        The generic model step's 完成 refused an empty pick with a sentence, so
+        a provider whose roster is not worth adding yet could not be created at
+        all.  Now 完成 writes the picks it shows (and is not lit when there are
+        none), and 不添加模型 is the action that creates the provider, its key,
+        and its station binding while leaving the routes for 获取模型 later.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        # The step whose 完成 writes the rows above it: not a catalog's create,
+        # and not an official account's roster (that one may be skipped whole).
+        self.assertIn('const genericModelStep = !isServiceCatalogType && !(isOfficialLoginType && keyPath === "login");', wizard)
+        self.assertIn("const modelPicksEmpty = selectedModels.length === 0", wizard)
+        self.assertIn("const finishWithoutModels = async (): Promise<void> => {", wizard)
+        self.assertIn('{step === "model" && creatingProvider && genericModelStep', wizard)
+        self.assertIn('title={translate("providers.wizard.finishWithoutModels")}', wizard)
+        # It runs the same one create as 完成, and the key the user signed in
+        # for is kept even when no route names it yet.
+        finish = wizard.split("const finishWithoutModels = async (): Promise<void> => {", 1)[1].split("const goBack", 1)[0]
+        self.assertIn("const targetProviderID = providerID || await commitWizardProvider();", finish)
+        self.assertIn("await importProvidedKey(targetProviderID, selectedProvidedChoice)", finish)
+        self.assertIn('onStatus(translate("providers.wizard.complete"));', finish)
+        # The lit primary that would close over no write stays unlit.
+        self.assertIn("(step === \"model\" && genericModelStep && modelPicksEmpty)", wizard)
+        for locale, sentence in (
+            (self.zh, '"providers.wizard.finishWithoutModels": "不添加模型"'),
+            (self.en, '"providers.wizard.finishWithoutModels": "Finish Without Models"'),
+        ):
+            self.assertIn(sentence, locale)
 
     def test_the_model_pane_states_no_empty_roster_and_no_keyless_fetch(self) -> None:
         """A blank model table is the empty state; only its actions are gated.
@@ -1552,7 +1666,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # Every loading button reports its own progress and keeps its label;
         # the disabled state is left for controls that merely wait on a sibling.
         for marker in (
-            'busy={processing} disabled={wizardBusy && !processing}',
+            # The wizard's own progress stays pressable; the second clause is
+            # content, not busy: 完成 has nothing to write with no model picked.
+            'busy={processing} disabled={(wizardBusy && !processing) || (step === "model" && genericModelStep && modelPicksEmpty)}',
             'busy={loginBusy} disabled={(wizardBusy && !loginBusy)',
             # The toolbar row is the wheel alone while a listing runs, and the
             # control that started it returns with the answer: neither a second
@@ -6103,9 +6219,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('const action = isLoginProviderKind(kind)')
         self.assert_ui_has('? "service_provider.delete"')
         self.assert_ui_has(': "provider.delete";')
-        # Deleting the last provider of a station also removes the station
-        # connection and its native sessions (old station.remove flow).
-        self.assert_ui_has('await relay.commit("station.remove", { id: stationBeingRemoved.id, dependency_policy: "detach" });')
+        # Deleting the last row that reaches a station takes the station and its
+        # accounts with it — in Core's own delete, not by a second write from
+        # this pane: a delete that happens with this window closed must still
+        # clear the sign-in, and the pane's version only knew bound providers.
+        self.assert_ui_not_has('await relay.commit("station.remove", { id: stationBeingRemoved.id, dependency_policy: "detach" });')
+        provider_workspace = self.ui.split("function ProviderWorkspace(", 1)[1].split("function ProviderEditor(", 1)[0]
+        self.assertIn("&& !providers.some((entry) => entry !== provider && providerReachesStation(entry, station))", provider_workspace)
+        self.assertIn("function providerReachesStation(provider: UnknownRecord, station: { id: string; origin: string }): boolean {", self.ui)
         self.assert_ui_has('translate("providers.deleteRelayProviderBody", {')
         self.assertIn('"providers.type.relay": "中转站"', self.zh)
         # 供应商类型 names the service, not one of its model families: the

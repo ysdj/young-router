@@ -183,6 +183,22 @@ function providerKind(provider: UnknownRecord | undefined): ProviderKind {
 }
 
 /**
+ * Whether one provider row reaches a relay station.
+ *
+ * Core's rule, mirrored so the delete confirmation states what the delete will
+ * really take: the row bound to the station, a key slot that sources one of its
+ * resources, or a row whose address is that station's own site.  The address is
+ * the rule the bind itself uses, and it is why a provider whose binding never
+ * landed still owns the station's accounts — the pane lists them under it.
+ */
+function providerReachesStation(provider: UnknownRecord, station: { id: string; origin: string }): boolean {
+  if (stringValue(provider.relay_station_id).trim() === station.id) return true;
+  if (providerKeyStates(provider).some((key) => key.source.kind === "relay" && key.source.stationID === station.id)) return true;
+  const site = stationOriginKey(station.origin);
+  return site !== "" && stationOriginKey(stringValue(provider.endpoint, stringValue(provider.api_base))) === site;
+}
+
+/**
  * The official services this app can configure.
  *
  * `openai` is OpenAI's own subscription service, named OpenAI everywhere it is
@@ -1422,9 +1438,13 @@ function validationSummaryMessage(summary: unknown, translate: Translate): strin
     .map((issue) => {
       const code = stringValue(issue.code);
       const translatedKey = validationIssueMessageKey(code);
+      // A code's sentence names what Core named: the key and the model a
+      // refusal is about travel with the issue, so the line reads as the row
+      // it points at instead of "the selected key is unavailable".
+      const values = { key: stringValue(issue.key), model: stringValue(issue.model) };
       const rawMessage = stringValue(issue.message).trim();
       const message = translatedKey
-        ? translate(translatedKey)
+        ? translate(translatedKey, values)
         : rawMessage && !/^validation failed$|^fix (the )?(validation|provider\/model) issues?$/i.test(rawMessage)
           ? rawMessage
           : translate("validation.invalid_settings");
@@ -3552,15 +3572,6 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   // disabled for it is the same unexplained freeze the navigation flush used
   // to produce.
   const applyStagedQuietly = (): Promise<void> => apply({ quiet: true });
-  // The provider wizard's one create can happen before its 完成 (a relay
-  // sign-in stores the account first).  That create is applied immediately:
-  // a provider left in the closed child's draft was discarded with the window,
-  // and the station account it belonged to stayed behind with no provider row.
-  const applyProvidersQuietly = async (): Promise<boolean> => {
-    const outcome = await applyOutcome({ quiet: true });
-    if (!outcome || "cancelled" in outcome) return false;
-    return outcome.status === "applied" || outcome.status === "partial";
-  };
   // The settings shell commits as the user changes controls. Wait for the
   // route's serial dispatch queue, then apply the staged domains; the debounce
   // coalesces a burst of toggles into one Core apply. A failed apply keeps its
@@ -3889,6 +3900,42 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       "providers_models",
     ).catch(() => undefined);
   };
+  // Core records a secret-free tombstone every time it drops an account, and
+  // only the native host can erase the credential that account left behind.  The
+  // confirmation belongs to the host, not to the account pane: a provider delete
+  // now releases its station from Core, so the account (and its station row) is
+  // gone by the time anything could draw a per-station 重试清理 row — and the
+  // tombstone would sit there forever while the keychain entry survived every
+  // later delete of the same site.  Each tombstone is attempted once per window;
+  // a failure keeps it for the next launch, and the pane still offers the retry
+  // for the stations it shows.
+  const cleanupConfirmedAccounts = useRef(new Set<string>());
+  useEffect(() => {
+    const pending = pendingCredentialCleanups(snapshot)
+      .filter((cleanup) => !cleanupConfirmedAccounts.current.has(cleanup.accountID));
+    if (pending.length === 0) return;
+    void (async () => {
+      for (const cleanup of pending) {
+        if (cleanupConfirmedAccounts.current.has(cleanup.accountID)) continue;
+        cleanupConfirmedAccounts.current.add(cleanup.accountID);
+        try {
+          // A host with no native credential store has nothing to erase; the
+          // tombstone is still Core's to drop.
+          await native.clearRelayCredentials(cleanup.accountID).catch(() => undefined);
+          await enqueueDispatch(
+            "credential_cleanup_confirm",
+            { id: cleanup.accountID, kind: cleanup.kind },
+            "relay_accounts",
+          );
+        } catch {
+          // A refused confirmation keeps the tombstone (Core is the owner of
+          // that record), and dropping the guard lets the next snapshot retry
+          // instead of leaving the credential unerased for the whole session.
+          cleanupConfirmedAccounts.current.delete(cleanup.accountID);
+        }
+      }
+    })();
+  }, [snapshot, native, enqueueDispatch]);
   const closeRoute = (): void => {
     // Keep the React route close independent from the native window registry.
     // A stale/missing native window must not strand the route on screen.
@@ -4179,7 +4226,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     {route === "providers-models" || route === "provider-wizard" || route === "file-editor" || route === "webdav-settings" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, (route === "provider-wizard" || route === "webdav-settings") && styles.childRouteContent, (settingsRoute || route === "runtime-settings" || route === "data-management" || route === "general-settings") && SETTINGS_PANE_ROUTE, route === "logs" && styles.logsContent]}>
     {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { native.window.open("provider-wizard"); native.window.focus("provider-wizard"); }} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
-    {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} applyProviders={applyProvidersQuietly} status={result} /> : null}
+    {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} status={result} /> : null}
     {route === "webdav-settings" ? <WebDavSettingsPanel snapshot={snapshot} busy={busy} status={dataManagementStatuses.webdav} translate={translate} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onProbe={probeWebDavDetails} onSave={saveWebDavDetails} onSync={syncWebDavAndReadState} onCompareConflict={compareWebDavConflict} onResolveConflict={resolveWebDavConflictAndReadState} onSetContentSize={(width, height) => { void native.window.setContentSize?.("webdav-settings", width, height); }} onClose={closeRoute} /> : null}
     {settingsRoute ? <AssistantSettingsWorkspace initialClient={initialClient} busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} codexRoute={codexDesignatedRoute ? { model: stringValue(codexDesignatedRoute.model), provider: stringValue(codexDesignatedRoute.provider), deployment_id: stringValue(codexDesignatedRoute.deployment_id), label: clientRouteLabel(stringValue(codexDesignatedRoute.provider), stringValue(codexDesignatedRoute.model)) } : undefined} standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} claudeClients={{ claudeCode: asRecord(claudeClients.claudeCode), claudeDesktop: asRecord(claudeClients.claudeDesktop) }} claudeModels={claudeModelRows} onClaudeUseLocalApi={(app, selection) => dispatch("use_local_api", { ...selection, client: app }, "claude")} onClaudeUseSavedModel={(app, selection) => dispatch("use_saved_model", { ...selection, client: app }, "claude")} onToggleClaudeModelList={(app, enabled) => dispatch("claude.models.set", { client: app, enabled }, "claude")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} onStatus={setResult} /> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} onStatusBar={setStatusBarControls} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
@@ -4290,7 +4337,7 @@ function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProvid
   return `${base} ${suffix}`;
 }
 
-function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayStations, busy, translate, dispatchWithOutcome, onSecretState, onStatus, onClose, onKeyToken, relay, addOfficialAccount, applyProviders, status }: { snapshot?: CoreSnapshot; native: NativeLeafAdapter; providers: UnknownRecord[]; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onStatus: (status?: string) => void; onClose: () => void; onKeyToken: (token: string) => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind, name?: string) => Promise<string>; /** Commit the provider this step creates before the account it belongs to is stored. */ applyProviders: () => Promise<boolean>; /** The window's own result: a child window keeps no strip, so its footer states it. */ status?: string }): React.JSX.Element {
+function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayStations, busy, translate, dispatchWithOutcome, onSecretState, onStatus, onClose, onKeyToken, relay, addOfficialAccount, status }: { snapshot?: CoreSnapshot; native: NativeLeafAdapter; providers: UnknownRecord[]; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onStatus: (status?: string) => void; onClose: () => void; onKeyToken: (token: string) => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind, name?: string) => Promise<string>; /** The window's own result: a child window keeps no strip, so its footer states it. */ status?: string }): React.JSX.Element {
   type WizardStep = "provider" | "keys" | "model";
   type WizardType = "api" | "openai" | "workbuddy" | "workbuddyGlobal" | "qoder" | "qoderGlobal" | "ourFreeModel" | "ourFreeModelKilo";
   const [step, setStep] = useState<WizardStep>("provider");
@@ -4299,14 +4346,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const [providerType, setProviderType] = useState<WizardType>("api");
   const [providerMode, setProviderMode] = useState<"new" | "existing">("new");
   const [providerSelection, setProviderSelection] = useState(PROVIDER_WIZARD_NEW_PROVIDER);
-  // A relay account is never stored without the provider it belongs to.  The
-  // native sign-in writes the account before the model step's 完成 would create
-  // the provider, so this wizard creates that provider as soon as the sign-in
-  // (or the key step showing an existing station account) needs one.  The ref
-  // is the create's identity: a second render, a retry, or 完成 must join it
-  // instead of minting a second provider for the same station.
-  const ensuredProvider = useRef("");
-  const ensuringProvider = useRef<Promise<string | undefined> | undefined>(undefined);
   const [providerName, setProviderName] = useState("");
   const [providerBaseURL, setProviderBaseURL] = useState("");
   const [typeDetection, setTypeDetection] = useState<"checking" | RelayType | "unknown" | undefined>(undefined);
@@ -4462,6 +4501,27 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const activeProviderBaseURL = selectedProvider
     ? stringValue(selectedProvider.endpoint, stringValue(selectedProvider.api_base))
     : providerBaseURL;
+  // The row this wizard chose can be taken out from under it: the pane's −
+  // applies a delete while the window is open, a second window does the same,
+  // and a discarded draft takes its rows with it.  The steps then held a
+  // selection that named nothing — 密钥 called that "请填写必填项后继续" with no
+  // field left to fill, and 完成 had no provider to write to: a dead end whose
+  // only symptom was a required-field sentence over a finished form.  The
+  // wizard's own fields (the name and the address) are still here, so it goes
+  // back to being the create it was before the row existed; when those are
+  // gone too, 供应商 is the step that can ask for them again.
+  useEffect(() => {
+    if (providerMode !== "existing" || selectedProvider) return;
+    setProviderMode("new");
+    setProviderSelection(PROVIDER_WIZARD_NEW_PROVIDER);
+    setValidation("");
+    if (providerName.trim() && providerBaseURL.trim()) return;
+    setStep("provider");
+    stepRef.current = "provider";
+    // The values it reads are the row's identity and this wizard's own fields;
+    // a selection that is no longer in `providers` is the whole trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [providerMode, selectedProvider, providerName, providerBaseURL]);
   // A vendor is tied to a station purely by its base URL; no vendor type.
   const stationForProvider = useMemo(
     () => relayStations.find((station) => stationOriginKey(station.baseURL) === stationOriginKey(activeProviderBaseURL)),
@@ -4534,80 +4594,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     if (selectedStationAccount.resourceStatus === "idle") return "relay.resourcesNotLoaded";
     return "providers.wizard.loginNoKeysHint";
   })();
-  /**
-   * The provider this station's accounts belong to, created before the account
-   * exists.
-   *
-   * A relay sign-in is accepted by the native host before the wizard reaches
-   * 完成, while the provider is normally created on that last press.  A window
-   * closed at 密钥 therefore left a station account no provider row could
-   * reach: the account pane lists providers, and the wizard's own type
-   * detection read the missing row.  This is the one create that closes that
-   * gap; it is idempotent, binds the station in the same pass, and 完成 joins
-   * the row it made instead of minting a second one.
-   */
-  const ensureRelayProviderForStation = async (): Promise<string | undefined> => {
-    if (providerID) return providerID;
-    if (ensuredProvider.current) return ensuredProvider.current;
-    if (ensuringProvider.current) return ensuringProvider.current;
-    if (providerMode !== "new") return undefined;
-    const baseURL = providerBaseURL.trim();
-    if (!baseURL) return undefined;
-    const station = stationForProvider;
-    const targetOrigin = stationOriginKey(baseURL);
-    const existing = providers.find((entry) => {
-      const bound = stringValue(entry.relay_station_id).trim();
-      return (station !== undefined && bound === station.id)
-        || (targetOrigin !== "" && stationOriginKey(stringValue(entry.endpoint) || stringValue(entry.api_base)) === targetOrigin);
-    });
-    if (existing) {
-      const id = editorIdentifier(existing);
-      ensuredProvider.current = id;
-      setProviderMode("existing");
-      setProviderSelection(id);
-      if (station && stringValue(existing.relay_station_id).trim() !== station.id) {
-        await dispatchWithOutcome("provider.select_relay_station", { provider_id: id, station_id: station.id });
-      }
-      return id;
-    }
-    const name = uniqueProviderName(
-      providers,
-      providerName.trim() || station?.name || suggestedRelayStationName(baseURL) || baseURL,
-    );
-    ensuringProvider.current = (async () => {
-      const next = await dispatchWithOutcome("provider.add", {
-        provider: { name, api_base: baseURL, auth_kind: "api_key", enabled: true, models: [] },
-      });
-      if (!next) return undefined;
-      const records = snapshotProviderRecords(next);
-      const added = records.find((entry) => stringValue(entry.name).trim() === name)
-        ?? records.find((entry) => targetOrigin !== "" && stationOriginKey(stringValue(entry.endpoint) || stringValue(entry.api_base)) === targetOrigin);
-      if (!added) return undefined;
-      const id = editorIdentifier(added);
-      if (station) {
-        await dispatchWithOutcome("provider.select_relay_station", { provider_id: id, station_id: station.id });
-      }
-      // The child window's close discards its provider draft; the native
-      // sign-in does not.  Commit the provider (and its station binding) now,
-      // before the caller can store an account against it.
-      if (!await applyProviders()) return undefined;
-      ensuredProvider.current = id;
-      setProviderMode("existing");
-      setProviderSelection(id);
-      return id;
-    })().finally(() => { ensuringProvider.current = undefined; });
-    return ensuringProvider.current;
-  };
-  useEffect(() => {
-    // Opening 密钥 for a station that already has an account must not show it
-    // beside no provider at all.  The create needs only the station, so it is
-    // raised as the step appears, not on the first press of 登录.
-    if (step !== "keys" || keyPath !== "login" || isOfficialLoginType) return;
-    if (providerID || ensuredProvider.current) return;
-    if (!stationForProvider || stationAccounts.length === 0) return;
-    void ensureRelayProviderForStation();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step, keyPath, isOfficialLoginType, providerID, stationForProvider, stationAccounts.length]);
   const keyChoices = selectedProvider ? providerKeyChoices(selectedProvider, relaySourcesForProvider(selectedProvider, relaySources, activeProviderBaseURL)) : [];
   const keyOptions = [
     { value: PROVIDER_WIZARD_NEW_KEY, label: translate("providers.wizard.addApiKey") },
@@ -4627,6 +4613,16 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   if (stagedKeyField.current.identity !== stagedKeyFieldIdentity) {
     stagedKeyField.current = { identity: stagedKeyFieldIdentity, status: "ready", present: false };
   }
+  // The model step whose 完成 writes the rows above it.  A catalog's create
+  // carries its own roster, and an official login's 完成 may skip its listing,
+  // so neither is the step these two answers are about.
+  const genericModelStep = !isServiceCatalogType && !(isOfficialLoginType && keyPath === "login");
+  // Nothing picked is nothing for 完成 to write: the lit primary that closes
+  // the window over no write reads as a save that did not happen.  不添加模型
+  // is the action that finishes anyway, and it is drawn beside it.
+  const modelPicksEmpty = selectedModels.length === 0
+    && selectedManualModelIDs.length === 0
+    && !(modelName.trim() && upstreamModel.trim());
   /**
    * Wait for the value the key field holds to reach Core.
    *
@@ -5366,6 +5362,39 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [modelFetchTicket, step]);
   /**
+   * The provider key slot one selected station resource becomes.
+   *
+   * A provided key is a station resource, and its label names a *group on the
+   * station* — not a key this provider carries.  A model filed on that label
+   * therefore names a slot Core cannot find, and the whole draft is refused at
+   * Apply with `model_provider_key_missing` while the window has already closed;
+   * the step looked like it did nothing.  Core stages the slot from the source
+   * and answers with the id and the (deduped) name it gave it, and those are
+   * what the routes name.
+   */
+  const importProvidedKey = async (targetProviderID: string, choice: RelaySourceOption): Promise<{ id: string; name: string } | undefined> => {
+    const next = await dispatchWithOutcome("provider.import_relay_key", {
+      provider_id: targetProviderID,
+      api_key_name: choice.resourceLabel,
+      source: {
+        kind: "relay",
+        station_id: choice.stationID,
+        account_id: choice.accountID,
+        resource_id: choice.resourceID,
+      },
+    });
+    // The dispatch already stated its own refusal in the strip; this is the
+    // answer that carries no slot at all, and the step is where it is asked.
+    const summary = asRecord(asRecord(next?.action_summaries?.providers_models).operation_summary);
+    const id = stringValue(summary.slot_id);
+    const name = stringValue(summary.api_key_name);
+    if (!id || !name) {
+      setValidation(translate("providers.fetchKeyUnavailable"));
+      return undefined;
+    }
+    return { id, name };
+  };
+  /**
    * The wizard's one create — 完成 is what mints the provider.
    *
    * Its own steps staged the name, the address, the models, and (for a custom
@@ -5373,13 +5402,22 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
    * closes reserves nothing.  The key value is adopted here through the token
    * the wizard filed it under; a service catalog's picks are carried by the
    * create itself, because the model step is where the user chose them.
+   *
+   * The relay sign-in is not an exception to that: it stores the station
+   * account (a credential the user asked for by pressing 登录), while the row
+   * this step creates is the provider the account's keys will belong to.  A
+   * provider raised earlier — on the way into 密钥, or before the sign-in — is a
+   * provider the user never finished: the pane listed it, and the wizard's own
+   * name check then answered it as 供应商名称已存在, so the early create was the
+   * thing that blocked its wizard.  Nothing is lost by waiting, because 密钥
+   * matches accounts by origin, not by provider row.
    */
   const commitWizardProvider = async (): Promise<string | undefined> => {
-    // A relay sign-in already created the provider it belongs to.  完成 joins
-    // that row rather than creating a second provider for the same station.
-    if (ensuredProvider.current) return ensuredProvider.current;
+    // `providerStepValid` is the one place that states why nothing can be
+    // created, the empty name included: short-circuiting on the name here
+    // returned silently, and 完成 read as a press that did nothing.
+    if (!providerStepValid()) return undefined;
     const name = providerName.trim();
-    if (!name || !providerStepValid()) return undefined;
     if (isWorkBuddyType || isQoderType) {
       // The account publishes the roster this step listed, and the pick is the
       // entries the user ticked.  The create names those entries rather than
@@ -5549,17 +5587,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       const existingAccounts = signInAnother
         ? relayAccounts.filter((item) => stationOriginKey(item.origin) === stationOriginKey(candidate))
         : accountsFromSnapshot((await relay.refreshAccounts()) ?? undefined).filter((item) => stationOriginKey(item.origin) === stationOriginKey(candidate));
-      // A station that already holds an account must already have a provider,
-      // even when every one of those accounts is signed out: the provider is
-      // what the pane lists, and the account is what the sign-in is about.
-      // Create it before the native flow can store another account.
-      const accountsAtStation = existingAccounts.length > 0 || stationAccounts.length > 0;
-      let targetProviderID = accountsAtStation ? await ensureRelayProviderForStation() : undefined;
-      if (accountsAtStation && !targetProviderID) {
-        setLoginBusy(false);
-        setLoginFeedbackMessage(translate("relay.operationFailed"));
-        return;
-      }
       const reusable = signInAnother ? undefined : existingAccounts.find(relayAccountSignedIn);
       if (reusable) {
         setSignedInAccountID(reusable.id);
@@ -5573,17 +5600,19 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         setLoginFeedbackMessage(translate("relay.typeNotDetected"));
         return;
       }
-      // A new station has no account yet, so the provider is created once the
-      // family is known: a sign-in that never starts reserves nothing.  The
-      // account this flow is about to store will still find a provider row.
-      if (!targetProviderID) {
-        targetProviderID = await ensureRelayProviderForStation();
-        if (!targetProviderID) {
-          setLoginBusy(false);
-          setLoginFeedbackMessage(translate("relay.operationFailed"));
-          return;
-        }
-      }
+      // What this press stores is the station account — a credential of its
+      // own, and the thing 登录 asks for.  The provider those keys will belong
+      // to stays the unfinished wizard's, and 完成 is what creates it.  Creating
+      // it here, or on the way into 密钥, put a provider in the pane for a
+      // wizard the user had not finished; that row then answered the wizard's
+      // own name (filled in from the URL) as 供应商名称已存在 — the early create
+      // blocked its own wizard.
+      //
+      // Nothing is lost by waiting: 密钥 matches accounts by origin, so it lists
+      // an account this window signed in even when no provider row exists yet,
+      // and the account's own family answers the type question.  完成 binds the
+      // row it creates to the station in the same pass.
+
       // Pending login: Core creates the account shell only after sign-in
       // succeeds, so a cancelled flow reserves nothing and can no longer
       // cascade an empty station away from its bound provider.
@@ -5662,13 +5691,9 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           setAutoGroupingBusy(false);
         }
       }
-      // Bind the vendor to the station so its keys become linkable.
-      const boundAccount = accounts.find((item) => stationOriginKey(item.origin) === target);
-      const stationID = landed?.stationID ?? boundAccount?.stationID
-        ?? stationsFromSnapshot(next ?? undefined, accounts).find((station) => stationOriginKey(station.origin) === target)?.id;
-      if (targetProviderID && stationID) {
-        await dispatchWithOutcome("provider.select_relay_station", { provider_id: targetProviderID, station_id: stationID });
-      }
+      // The account is stored; binding the provider to its station is 完成's
+      // own step (`commitWizardProvider`), which creates that provider.  A bind
+      // here would need a provider this wizard has not made yet.
     } catch {
       if (request === setupLoginRequest.current) setLoginFeedbackMessage(translate("relay.operationFailed"));
     } finally {
@@ -5801,6 +5826,19 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         // The ref moves inside this call, after the step was accepted: a
         // value written before this guard left a rejected press pointing at
         // the next step, and the next press was then refused.
+        // The name 添加新供应商 fills is derived from the URL, so a site the
+        // pane already lists hands the user a name the same rows hold and the
+        // press ends on 供应商名称已存在 with nothing to do about it.  A name
+        // and an address that already belong to one custom provider are that
+        // provider: the step continues on it, exactly as 选择供应商 would.
+        const existingAtAddress = providerType === "api"
+          ? providerAtAddress(providers, serviceBaseURL, providerName)
+          : undefined;
+        if (existingAtAddress && providerAuthKind(existingAtAddress) === "api_key") {
+          chooseExistingProvider(editorIdentifier(existingAtAddress));
+          advanceFromProviderStep();
+          return;
+        }
         if (!providerStepValid()) return;
         advanceFromProviderStep();
         return;
@@ -6013,45 +6051,50 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       // provider arrives with its key, and the models follow on it.
       const targetProviderID = providerID || await commitWizardProvider();
       if (!targetProviderID) return;
-      const existingModelIDs = selectedProvider ? new Set(asRecords(selectedProvider.models).map(modelRecord).map(editorIdentifier)) : new Set<string>();
-      const transientRelaySource = usingProvidedKey && selectedProvidedChoice ? {
-        stationID: selectedProvidedChoice.stationID,
-        accountID: selectedProvidedChoice.accountID,
-        resourceID: selectedProvidedChoice.resourceID,
-      } : undefined;
+      const providedKey = usingProvidedKey && selectedProvidedChoice
+        ? await importProvidedKey(targetProviderID, selectedProvidedChoice)
+        : undefined;
+      if (usingProvidedKey && !providedKey) return;
       const keyIDForModels = usingProvidedKey
-        ? undefined
+        ? providedKey?.id
         : selectedKeyChoice?.id && selectedKeyChoice.kind === "independent" ? selectedKeyChoice.id : undefined;
-      const modelPayload = uniqueRequestedModels.map((model, index) => ({
+      const keyNameForModels = usingProvidedKey
+        ? providedKey?.name ?? ""
+        : creatingProvider ? finishedProviderKeyName : manualSelectedKeyName;
+      const modelPayload = uniqueRequestedModels.map((model) => ({
         ...model,
-        api_key_name: usingProvidedKey ? selectedProvidedChoice?.resourceLabel ?? "" : creatingProvider ? finishedProviderKeyName : manualSelectedKeyName,
+        api_key_name: keyNameForModels,
         ...(keyIDForModels ? { provider_key_id: keyIDForModels } : {}),
         enabled: true,
       }));
       const next = await dispatchWithOutcome("model.add_many", { provider_id: targetProviderID, models: modelPayload });
       if (!next) return;
-      if (transientRelaySource) {
-        const nextProvider = snapshotProviderRecords(next).find((entry) => editorIdentifier(entry) === targetProviderID);
-        const addedModels = nextProvider ? asRecords(nextProvider.models).map(modelRecord) : [];
-        for (const requested of uniqueRequestedModels) {
-          // The row is the route, not the name: an import files the public name
-          // under the answer it asked for, so the upstream id the pick stated is
-          // what names the row that pick created.
-          const addedModel = addedModels.find((entry) => !existingModelIDs.has(editorIdentifier(entry)) && stringValue(entry.upstream_model, stringValue(entry.name)).trim() === requested.upstream_model);
-          if (!addedModel) return;
-          const relayed = await dispatchWithOutcome("model.select_relay_resource", {
-            provider_id: targetProviderID,
-            model_id: editorIdentifier(addedModel),
-            source: {
-              kind: "relay",
-              station_id: transientRelaySource.stationID,
-              account_id: transientRelaySource.accountID,
-              resource_id: transientRelaySource.resourceID,
-            },
-          });
-          if (!relayed) return;
-        }
-      }
+      onStatus(translate("providers.wizard.complete"));
+      onClose();
+    } finally {
+      setProcessing(false);
+    }
+  };
+  /**
+   * 完成 without a model.
+   *
+   * A provider with no route is a valid row — the pane's own ＋ creates one —
+   * and a wizard that demands a model cannot register a supplier whose roster
+   * is not worth adding yet.  So this is 完成's own create (the provider, its
+   * key, its station binding) minus the routes, which 获取模型 adds later.  It
+   * is drawn only where the create is this step's work: an existing provider has
+   * nothing to write without a model, and 关闭 is that answer.
+   */
+  const finishWithoutModels = async (): Promise<void> => {
+    if (processing || stepRef.current !== step) return;
+    setValidation("");
+    setProcessing(true);
+    try {
+      const targetProviderID = providerID || await commitWizardProvider();
+      if (!targetProviderID) return;
+      // The key the user signed in for is still theirs to keep: a provider
+      // created without routes carries the slot those routes would name.
+      if (usingProvidedKeyPath(keyPath) && selectedProvidedChoice && !await importProvidedKey(targetProviderID, selectedProvidedChoice)) return;
       onStatus(translate("providers.wizard.complete"));
       onClose();
     } finally {
@@ -6372,9 +6415,12 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       <View style={styles.childSurfaceFooterActions}>
         <NativeButton title={translate("status.close")} disabled={processing} onPress={onClose} />
         {step !== "provider" || loginPhase === "sign-in" ? <NativeButton title={translate("providers.wizard.back")} disabled={busy || processing} onPress={goBack} /> : null}
+        {step === "model" && creatingProvider && genericModelStep
+          ? <NativeButton title={translate("providers.wizard.finishWithoutModels")} disabled={wizardBusy && !processing} onPress={() => { void finishWithoutModels(); }} />
+          : null}
         {loginPhase === "sign-in"
           ? null
-          : <NativeButton primary title={step === "model" ? translate("providers.wizard.finish") : translate("providers.wizard.next")} busy={processing} disabled={wizardBusy && !processing} onPress={() => { void goNext(); }} />}
+          : <NativeButton primary title={step === "model" ? translate("providers.wizard.finish") : translate("providers.wizard.next")} busy={processing} disabled={(wizardBusy && !processing) || (step === "model" && genericModelStep && modelPicksEmpty)} onPress={() => { void goNext(); }} />}
       </View>
     </View>
   </View>;
@@ -6576,6 +6622,14 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     const stationID = stringValue(entry.relay_station_id).trim();
     return relayStationsFull.find((station) => station.id === stationID)
       ?? relayStationsFull.find((station) => stationOriginKey(station.origin) === stationOriginKey(providerBaseURL(entry)));
+  }, [providerBaseURL, relayStationsFull]);
+  // The station a provider's address is, whether or not the row ever finished
+  // binding to it.  The delete confirmation asks this one: Core releases the
+  // station of the last row reaching it, and a row whose bind never landed
+  // still owns that station's accounts.
+  const stationAtProviderAddress = useCallback((entry: UnknownRecord): RelayStation | undefined => {
+    const site = stationOriginKey(providerBaseURL(entry));
+    return site === "" ? undefined : relayStationsFull.find((station) => stationOriginKey(station.origin) === site);
   }, [providerBaseURL, relayStationsFull]);
   const stationAccountsFor = useCallback((entry: UnknownRecord | undefined): RelayAccount[] => {
     const station = stationForProvider(entry);
@@ -7416,7 +7470,19 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     const action = isLoginProviderKind(kind)
       ? "service_provider.delete"
       : "provider.delete";
-    const stationBeingRemoved = kind === "relay" ? stationForProvider(provider) : undefined;
+    // The accounts this delete will take with it.  Core releases a station when
+    // the provider being deleted was the last row reaching it — bound to it,
+    // sourcing a key from one of its resources, or addressed at its own site —
+    // so that is the question the confirmation answers.  It used to ask only
+    // about bound providers, and a row whose binding never landed (the wizard's
+    // own create when the bind failed) left its station account behind with no
+    // row anywhere naming it.
+    const station = stationForProvider(provider) ?? stationAtProviderAddress(provider);
+    const stationBeingRemoved = station !== undefined
+      && !isLoginProviderKind(kind)
+      && !providers.some((entry) => entry !== provider && providerReachesStation(entry, station))
+      ? station
+      : undefined;
     const message = stationBeingRemoved
       ? translate("providers.deleteRelayProviderBody", {
           label,
@@ -7427,30 +7493,12 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       : `${label} (${models.length} ${translate("providers.models")})`;
     runMutationOnce(`provider.delete:${providerId}`, () => native.showConfirmation({ title: translate("providers.deleteProvider"), message, confirmLabel: translate("common.delete"), destructive: true }).then((confirmed) => {
       if (!confirmed) return undefined;
-      return dispatch(action, { provider_id: providerId }).then(async () => {
-        // A 中转站 provider owns its station connection: once the last
-        // provider bound to it goes away, remove the station, its accounts,
-        // and their native sessions just like the old workspace did.
-        if (stationBeingRemoved) {
-          const stillBound = providers.some((entry) => entry !== provider
-            && providerKind(entry) === "relay"
-            && stringValue(entry.relay_station_id).trim() === stationBeingRemoved.id);
-          if (!stillBound) {
-            try {
-              await relay.commit("station.remove", { id: stationBeingRemoved.id, dependency_policy: "detach" });
-              for (const accountID of stationBeingRemoved.accountIDs) {
-                try {
-                  await native.clearRelayCredentials(accountID);
-                  await relay.commit("credential_cleanup_confirm", { id: accountID, kind: "credentials" });
-                } catch {
-                  // Core retains a secret-free cleanup tombstone for retry.
-                }
-              }
-            } catch (reason) {
-              onStatus(errorMessage(reason, translate));
-            }
-          }
-        }
+      // The station and its accounts go with the provider inside Core's own
+      // delete: one writer, one transaction, and a caller that deletes without
+      // this pane (another window, an IPC client) gets the same cleanup.  The
+      // native credential leases are released from Core's durable tombstone,
+      // so a delete that happens while this window is closed still clears them.
+      return dispatch(action, { provider_id: providerId }).then(() => {
         setSelectedProvider(undefined);
         setSelectedModel(undefined);
         setProviderSourceModel(undefined);
@@ -9365,6 +9413,23 @@ function uniqueProviderName(providers: UnknownRecord[], name: string, excludeID 
     suffix += 1;
   }
   return candidate;
+}
+
+/**
+ * The provider a typed name and address already are, if they are one.
+ *
+ * Both values are read off the wizard's own step, and the name is usually the
+ * one the URL filled in.  A name is unique per configuration while an address is
+ * not, so the pair — not the address alone — is what identifies the row: two
+ * providers may serve one gateway, and a name taken by a *different* address is
+ * still the duplicate the step reports.
+ */
+function providerAtAddress(providers: UnknownRecord[], baseURL: string, name: string): UnknownRecord | undefined {
+  const address = stationOriginKey(baseURL);
+  const wanted = name.trim().toLocaleLowerCase();
+  if (!address || !wanted) return undefined;
+  return providers.find((entry) => stringValue(entry.display_name, stringValue(entry.name)).trim().toLocaleLowerCase() === wanted
+    && stationOriginKey(stringValue(entry.endpoint) || stringValue(entry.api_base)) === address);
 }
 
 /**

@@ -1749,7 +1749,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                         "kind": "credentials",
                     }
                 ],
-                deleted["pending_credential_cleanups"],
+                deleted["pending_cleanups"],
             )
             self.assertEqual(before_delete, (root / ".litellm-runtime" / "relay-accounts.json").read_bytes())
             domain.apply()
@@ -1758,13 +1758,13 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertNotIn("replace-access-token", persisted)
 
             reloaded = RelayAccountsDomain(root)
-            self.assertEqual(deleted["pending_credential_cleanups"], reloaded.snapshot()["pending_credential_cleanups"])
+            self.assertEqual(deleted["pending_cleanups"], reloaded.snapshot()["pending_cleanups"])
             confirmed = reloaded.dispatch(
                 "credential_cleanup_confirm",
                 {"id": account["id"], "kind": "credentials"},
             )
-            self.assertEqual([], confirmed["pending_credential_cleanups"])
-            self.assertEqual([], RelayAccountsDomain(root).snapshot()["pending_credential_cleanups"])
+            self.assertEqual([], confirmed["pending_cleanups"])
+            self.assertEqual([], RelayAccountsDomain(root).snapshot()["pending_cleanups"])
 
     def test_removing_a_draft_only_account_cancels_out_to_a_clean_draft(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1835,7 +1835,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )
             self.assertFalse(disabled["accounts"][0]["remember_password"])
             self.assertFalse(disabled["accounts"][0]["password_saved"])
-            self.assertEqual([], disabled["pending_credential_cleanups"])
+            self.assertEqual([], disabled["pending_cleanups"])
             persisted = (root / ".litellm-runtime" / "relay-accounts.json").read_text()
             self.assertIn("replace-password", persisted)
             self.assertIn("replace-access-token", persisted)
@@ -1843,7 +1843,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             persisted = (root / ".litellm-runtime" / "relay-accounts.json").read_text()
             self.assertNotIn("replace-password", persisted)
             self.assertNotIn("replace-access-token", persisted)
-            self.assertEqual([], RelayAccountsDomain(root).snapshot()["pending_credential_cleanups"])
+            self.assertEqual([], RelayAccountsDomain(root).snapshot()["pending_cleanups"])
 
     def test_remembered_password_is_private_and_restores_without_a_browser_window(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2010,7 +2010,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                         "kind": "credentials",
                     }
                 ],
-                deleted["pending_credential_cleanups"],
+                deleted["pending_cleanups"],
             )
 
     def test_public_relay_origins_require_https_but_local_loopback_is_allowed(self) -> None:

@@ -397,7 +397,12 @@ export function serviceAccountRecheckSeconds(snapshot?: CoreSnapshot): number | 
 export function pendingCredentialCleanups(snapshot?: CoreSnapshot): PendingCredentialCleanup[] {
   const domain = record(snapshot?.domains.relay_accounts);
   const state = Object.keys(record(domain.state)).length > 0 ? record(domain.state) : domain;
-  const rows = Array.isArray(state.pending_credential_cleanups) ? state.pending_credential_cleanups : [];
+  // ``pending_cleanups`` is the wire name: a key carrying ``credential`` is
+  // redacted to ``configured`` by Core's snapshot, so the old spelling arrived
+  // as a string and this read answered "no tombstones" forever.
+  const rows = Array.isArray(state.pending_cleanups)
+    ? state.pending_cleanups
+    : Array.isArray(state.pending_credential_cleanups) ? state.pending_credential_cleanups : [];
   return rows.flatMap((item) => {
     const value = record(item);
     const accountID = text(value.account_id);
