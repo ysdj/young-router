@@ -6199,7 +6199,16 @@ class CoreStore:
                 # this commit as its follow-up pass.
                 self._service_reload_pending = True
                 return
-            if self._service.get("state") not in {"running", "unhealthy"}:
+            # A replacement that is still owed outranks the cached service row:
+            # the previous pass wrote that row from the failed replacement, so it
+            # can read `stopped` while the controller has already recovered.  The
+            # worker probes the live state off every write lane before it decides
+            # (see ``_reload_service_after_apply``); refusing here would drop the
+            # one pass that can still deliver the environment the commit needs.
+            if (
+                self._service.get("state") not in {"running", "unhealthy"}
+                and not self._service_reload_replace_process
+            ):
                 _note(
                     "an apply wanted a proxy restart, but the service reads %s"
                     % self._service.get("state")
@@ -6272,6 +6281,20 @@ class CoreStore:
         """
 
         reloader = self._service_handlers.get("reload")
+        # The cached row is what the previous pass wrote, and a replacement that
+        # did not come up leaves it reading `stopped` even after the controller
+        # recovered.  This worker holds no write lane and no request waits on it,
+        # so the one real status read that can tell a stale row from a stopped
+        # proxy belongs here -- and only while the row says the proxy is down.
+        if (
+            reloader is not None
+            and not self._service_reload_stopping
+            and self._service.get("state") not in {"running", "unhealthy"}
+        ):
+            try:
+                self._service_row_is_live()
+            except Exception:
+                pass
         replace_process = False
         with self._lock:
             if self._service_reload_stopping:

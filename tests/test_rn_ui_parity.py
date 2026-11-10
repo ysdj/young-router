@@ -1176,7 +1176,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         """
 
         mac_native = MACOS_CONTROLS.read_text(encoding="utf-8")
-        for state_keys in ("offProviderKeys", "offModelKeys", "offRouteKeys"):
+        # The provider list is subscribed to its own domain, so it computes the
+        # secondary rows where it draws them.  The set is the same switched-off
+        # providers, handed to secondaryRowKeys as ink rather than to the
+        # disabled list a click cannot select.
+        provider_list = self.ui.split("const ProviderListTable = React.memo(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        self.assertIn("providers.filter((item) => !booleanValue(item.enabled, true)).map(editorIdentifier)", provider_list)
+        self.assertIn("secondaryRowKeys={secondaryRowKeys}", provider_list)
+        self.assertNotIn("disabledRowKeys", provider_list)
+        for state_keys in ("offModelKeys", "offRouteKeys"):
             self.assert_ui_has(f"secondaryRowKeys={{{state_keys}}}")
             self.assertNotIn(f"disabledRowKeys={{{state_keys}}}", self.ui)
         # Secondary ink is ink alone: the refusal still reads the disabled list.
@@ -1544,7 +1552,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assert_ui_not_has(marker)
 
     def test_provider_selection_and_new_models_keep_independent_stable_state(self) -> None:
-        self.assert_ui_has('onSelectionChange={(key) => { if (!key) return; setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }}')
+        self.assert_ui_has('onSelectionChange={(key) => { if (key) onSelect(key); }}')
+        self.assert_ui_has('const selectProviderRow = useCallback((key: string): void => {\n    setSelectedProvider(key);\n    setSelectedModel(undefined);\n    setProviderSourceModel(undefined);\n  }, []);')
+        self.assert_ui_has('selectedKey={selectedProviderId}')
         self.assert_ui_has('const pendingModelIds = useRef<{ providerId: string; ids: Set<string> } | undefined>(undefined);')
         self.assertNotIn('knownModelIdsByProvider', self.ui)
         self.assertNotIn('Promise.all(added.map(', self.ui)
@@ -1718,7 +1728,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('spanning: true')
         self.assert_ui_has(r'cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model)')
         self.assert_ui_has('rows={routeRows} secondaryRowKeys={offRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact preserveColumnWidths selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => selectRouteTableRow(key)}')
-        self.assert_ui_has('rows={providerRows} secondaryRowKeys={offProviderKeys} alertRowKeys={alertProviderKeys} selectedKey={providerId} compact firstColumnHorizontalPadding={0} onSelectionChange=')
+        self.assert_ui_has('<ProviderListTable translate={translate} selectedProviderId={providerId} providerNameDrafts={providerNameDrafts} validationIssues={validationIssues} onSelect={selectProviderRow} />')
+        provider_list = self.ui.split("const ProviderListTable = React.memo(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        self.assertIn('rows={rows} secondaryRowKeys={secondaryRowKeys} alertRowKeys={alertRowKeys} selectedKey={selectedProviderId} compact firstColumnHorizontalPadding={0} onSelectionChange=', provider_list)
         self.assert_ui_has('rows={modelRows} secondaryRowKeys={offModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange=')
         self.assert_ui_has('columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths')
         self.assert_ui_has('rows={tableRows}')
@@ -2198,8 +2210,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("setSelectedModel(modelID); setSelectedModelRow(key);", model_table)
 
     def test_provider_empty_state_keeps_the_native_table_frames(self) -> None:
+        provider_list = self.ui.split("const ProviderListTable = React.memo(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        self.assertIn("rows={rows}", provider_list)
+        self.assertNotIn("EmptyState", provider_list)
         for marker in (
-            'rows={providerRows}',
             'rows={modelRows}',
             'rows={routeRows}',
         ):
@@ -5158,7 +5172,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("providerNameExists(providers, station.name, providerID)", workspace)
         self.assertIn('dispatch("provider.select_relay_station", { provider_id: providerID, station_id: station.id })', workspace)
         self.assertIn(
-            'onSelectionChange={(key) => { if (!key) return; setSelectedProvider(key); setSelectedModel(undefined); setProviderSourceModel(undefined); }}',
+            'const selectProviderRow = useCallback((key: string): void => {\n    setSelectedProvider(key);\n    setSelectedModel(undefined);\n    setProviderSourceModel(undefined);\n  }, []);',
+            workspace,
+        )
+        self.assertIn(
+            '<ProviderListTable translate={translate} selectedProviderId={providerId} providerNameDrafts={providerNameDrafts} validationIssues={validationIssues} onSelect={selectProviderRow} />',
             workspace,
         )
 
@@ -5981,7 +5999,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "function providerAuthKind(provider: UnknownRecord | undefined): ProviderAuthKind {",
             "function providerKindLabel(kind: ProviderKind, translate: Translate): string {",
             "const providers = useMemo(() => snapshotProviderRecords(snapshot), [snapshot?.providers_models.providers, state.providers]);",
-            "cells: [providerDisplayName(item)]",
+            "const providers = useMemo(() => asRecords(state?.providers), [state]);",
+            "const name = providerNameDrafts[id] !== undefined",
+            "return { key: id, cells: [name] };",
         ):
             self.assert_ui_has(marker)
         # Deleting routes through the kind-specific core action.
@@ -7938,7 +7958,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         service = (ROOT / "young_router/core/service.py").read_text(encoding="utf-8")
         self.assertIn('recorder(materialized.get("issues") if isinstance(materialized, Mapping) else ())', service)
         self.assertIn("const bindingIssues = asRecords(state.binding_issues);", self.ui)
-        self.assertIn("const bindingIssueFor = useCallback((model: UnknownRecord): UnknownRecord | undefined => {", self.ui)
+        # The lookup is shared by the provider list (subscribed to the domain)
+        # and the inspector, so both mark the same row; the callback still
+        # exists for the inspector's own consumers.
+        self.assertIn("const bindingIssueFor = useCallback((model: UnknownRecord): UnknownRecord | undefined => bindingIssueRow(bindingIssues, model), [bindingIssues]);", self.ui)
+        self.assertIn("function bindingIssueRow(bindingIssues: UnknownRecord[], model: UnknownRecord): UnknownRecord | undefined {", self.ui)
+        self.assertIn("if (issueModel && issueModel === modelID) return true;", self.ui)
+        self.assertIn("return Boolean(issueKey) && issueKey === keyID;", self.ui)
         self.assertIn("() => modelRowKeys(models.filter((item) => modelNeedsAttention(item, translate) || Boolean(bindingIssueFor(item))).map(editorIdentifier)),", self.ui)
         self.assertIn("alertRowKeys={alertRouteKeys}", self.ui)
         self.assertIn('<Text style={styles.fieldHint}>{bindingIssueText}</Text>', self.ui)
@@ -7947,7 +7973,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const bindingIssueForProvidedRow = useCallback((row: ProvidedKeyRow): UnknownRecord | undefined => {", self.ui)
         self.assertIn("alertRowKeys={[...providedRows.filter((row) => Boolean(bindingIssueForProvidedRow(row))).map((row) => `provided:${row.key}`), ...orphanSlots.filter((slot) => bindingIssues?.some((issue) => stringValue(issue.provider_key_id) === slot.id)).map((slot) => `orphan:${slot.id}`)]}", self.ui)
         self.assertIn("<Text style={styles.fieldHint}>{relayBindingIssueText(selectedProvidedIssue, selectedProvided.label, translate)}</Text>", self.ui)
-        self.assertIn("if (bindingIssues.some((issue) => stringValue(issue.provider) === editorIdentifier(item))) return true;", self.ui)
+        self.assertIn("|| bindingIssues.some((issue) => stringValue(issue.provider) === editorIdentifier(item))", self.ui)
         self.assertIn('account_unavailable: "providers.bindingIssueAccount",', self.ui)
         self.assertIn('resource_missing: "providers.bindingIssueResource",', self.ui)
         self.assertIn('catalog_model_missing: "providers.bindingIssueCatalog",', self.ui)
@@ -8519,7 +8545,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('enabled: false, order: 0', workspace)
         self.assertIn("if (isDraftModel(model, translate)) return true;", self.ui)
         self.assertIn("(item) => modelNeedsAttention(item, translate) || Boolean(bindingIssueFor(item))", self.ui)
-        self.assertIn("asRecords(item.models).some((model) => modelNeedsAttention(model, translate) || Boolean(bindingIssueFor(model)))", self.ui)
+        self.assertIn("asRecords(item.models).some((model) => modelNeedsAttention(model, translate) || bindingIssueRow(bindingIssues, model) !== undefined)", self.ui)
         for locale in (self.zh, self.en):
             self.assertIn('"providers.draftModelHint"', locale)
 
@@ -8873,7 +8899,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "}, SECRET_INPUT_COMMIT_DEBOUNCE_MS);",
             "state.status === \"saved\" || state.status === \"ready\" || state.status === \"error\"",
             "refreshAfter = true",
-            "if (refreshAfter) await refresh();",
+            "if (refreshAfter && postActionRefreshNeeded({ channel: eventChannel.current, revisionBefore, revisionAfter, localRevision: revision.current })) await refresh();",
             "}, null, true);",
             "function WebDavPasswordField(",
             'isDirty: () => dirtyRef.current',
@@ -8898,7 +8924,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const [providerNameDrafts, setProviderNameDrafts] = useState<Record<string, string>>({});", self.ui)
         self.assertIn("function providerModelDraftKey(providerID: string, modelID: string)", self.ui)
         self.assertIn("key={`model:${providerId}:${editorIdentifier(model)}`}", self.ui)
-        self.assertIn('cells: [providerDisplayName(item)]', self.ui)
+        self.assertIn('const name = providerNameDrafts[id] !== undefined\n        ? providerNameDrafts[id]\n        : displayLabel(item.display_name, displayLabel(item.name, translate("providers.newProvider")));', self.ui)
+        self.assertIn('return { key: id, cells: [name] };', self.ui)
         self.assertIn('const grouped = new Map<string, { label: string; models: UnknownRecord[] }>();', self.ui)
         self.assertIn(r'cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model)', self.ui)
         self.assertIn("modelUpstreamDisplay", self.ui)
@@ -9040,7 +9067,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # name: the pane marks it until the user replaces the name.
         self.assertIn("if (isDraftModel(model, translate)) return true;", self.ui)
         self.assertIn("alertRowKeys={alertModelKeys}", self.ui)
-        self.assertIn("alertRowKeys={alertProviderKeys}", self.ui)
+        provider_list = self.ui.split("const ProviderListTable = React.memo(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        self.assertIn("const alertRowKeys = useMemo(", provider_list)
+        self.assertIn("|| asRecords(item.models).some((model) => modelNeedsAttention(model, translate) || bindingIssueRow(bindingIssues, model) !== undefined)).map(editorIdentifier),", provider_list)
+        self.assertIn("alertRowKeys={alertRowKeys}", provider_list)
 
         domain = (ROOT / "young_router/core/domains/providers_models.py").read_text(encoding="utf-8")
         self.assertIn("def _entry_issues(self, providers: object) -> list[dict[str, Any]]:", domain)
