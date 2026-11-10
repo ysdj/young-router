@@ -7188,11 +7188,23 @@ class CoreStore:
                 and operation.get("kind") == "api_key_delete"
                 and operation.get("state", operation.get("status", "staged")) == "staged"
             ]
+            destructive_failed = False
             if destructive:
                 # Local configuration is now independent of every key marked
                 # for removal; a failed deletion remains journaled for retry.
                 remote_boundary_crossed = True
-                execute(prepared, phase="destructive")
+                try:
+                    execute(prepared, phase="destructive")
+                except Exception:
+                    if not provider_locally_applied:
+                        raise
+                    # The document this Apply is about is written, reloaded, and
+                    # live; what failed is the relay's own remote cleanup, and
+                    # its journal keeps it for the next attempt.  Reporting the
+                    # whole Apply as failed while the model was already serving
+                    # is the lie that made a ＋ which had landed read as
+                    # 更改未生效.
+                    destructive_failed = True
             if relay_dependency_only:
                 # This edit carries no relay work of its own, so the journal's
                 # remaining phases are not part of its result: every pending
@@ -7206,6 +7218,7 @@ class CoreStore:
                 issue_count = (
                     self._relay_public_issue_count(reconciled_after_delete)
                     + self._relay_public_issue_count(finalize_result)
+                    + (1 if destructive_failed else 0)
                 )
                 pending = self._relay_operation_count(relay)
             if issue_count or pending:

@@ -1208,6 +1208,49 @@ class RelayApplyCoordinatorIntegrationTests(unittest.TestCase):
             self.assertEqual("applied", applied["status"])
             self.assertIn(("DELETE", "/api/token/7"), http.calls)
 
+    def test_a_failed_remote_delete_does_not_make_the_written_model_a_failure(self) -> None:
+        """The document is live; only the relay's remote cleanup failed.
+
+        A delete this Apply carried is sent after the local write and the
+        reload, so a station that refuses it leaves the model serving exactly as
+        the edit asked.  Reporting the whole Apply as failed there made a ＋
+        that had landed read as 更改未生效; the truthful answer is the partial
+        one, which names the key that did not go away and keeps it journaled.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            core, _relay, providers, _http, account_id, resource_id = self._linked_core(root)
+            core.dispatch(
+                {
+                    "domain": "relay_accounts",
+                    "type": "api_key.delete",
+                    "payload": {
+                        "account_id": account_id,
+                        "resource_id": resource_id,
+                        "dependency_policy": "delete_models",
+                    },
+                },
+                expected_revision=core.revision,
+            )
+
+            def refuse_destructive(self, prepared=None, *, phase=""):
+                if phase == "destructive":
+                    raise RelayAccountsError("Relay is unavailable")
+
+            with patch.object(RelayAccountsDomain, "execute_pending_operations", refuse_destructive):
+                result = core.apply(
+                    domains=["relay_accounts", "providers_models"],
+                    revision=core.revision,
+                )
+
+            # The local write happened and the model is not described as a
+            # failure; the relay's delete is what is still owed.
+            self.assertFalse(result["applied"])
+            self.assertEqual("partial", result["status"])
+            self.assertGreater(result["pending_operations"], 0)
+            self.assertTrue((root / "config.yaml").exists())
+
     def test_response_loss_is_reconciled_without_replaying_the_remote_update(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
