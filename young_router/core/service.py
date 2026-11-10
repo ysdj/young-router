@@ -32,6 +32,7 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
+from .emitter import CoalescingEmitter
 from .log_tabs import LOG_TABS
 from .oplog import note as _note
 from .persistence import AtomicJSONStore, PersistenceError, atomic_write_bytes, atomic_write_json, read_bytes, read_json
@@ -1251,6 +1252,11 @@ class CoreStore:
         self._baselines: dict[str, object] = {}
         self._drafts: dict[str, dict[str, Any]] = {}
         self._subscribers: dict[str, Callable[[dict[str, Any]], None]] = {}
+        # Publishing is off the mutation lane: a commit marks an event pending
+        # here and the emitter thread projects and fans it out once the burst
+        # settles.  ``_emit`` is still the send itself; the lambda is what
+        # makes it the one a test replaced by the time the window expires.
+        self._emitter = CoalescingEmitter(lambda: self._emit())
         self._revision = 0
         # The last domain projection and the revision it describes: a
         # window that is catching up asks for a revision it already
@@ -1729,6 +1735,7 @@ class CoreStore:
             # Worker shutdown stops child processes: seconds of waiting that
             # no snapshot may be queued behind.
             self._stop_managed_workers()
+            self._emitter.stop()
             return dict(self._service)
         acquired = self._service_transition_guard.acquire(
             timeout=self._SERVICE_TRANSITION_SHUTDOWN_WAIT_SECONDS
@@ -1746,6 +1753,8 @@ class CoreStore:
             self._set_service_from_result(result, increment=False)
             self._persist_metadata(stopped_by=stopped_by)
         self._stop_managed_workers()
+        # A commit that landed just before this quit still owes its event.
+        self._emitter.stop()
         return dict(self._service)
 
     def _stop_managed_workers(self) -> None:
@@ -1924,22 +1933,32 @@ class CoreStore:
         a reader that exists.
 
         The live service row is refreshed either way.  That read is a side effect
-        of the projection rather than of publishing -- the commit's own restart
-        decision asks whether the proxy is running, and it is this refresh that
-        keeps that answer current -- so it is kept explicit here instead of
-        riding along on work nobody consumes.  It is a memoized read, cheap
-        enough to pay on every commit.
+        of the projection rather than of publishing -- a commit's own restart
+        decision asks whether the proxy is running, and the commit refreshes the
+        row where it answers (see ``_request_emit``); this keeps a direct caller
+        of ``_emit`` from publishing over a stale one -- so it is kept explicit
+        here instead of riding along on work nobody consumes.  It is a memoized
+        read, cheap enough to pay on every snapshot.
         """
 
+        # A send outside the emitter thread answers whatever was pending, so
+        # that request must not also produce a second event a window later.
+        self._emitter.claim()
         with self._lock:
             # Subscriptions open and close from the IPC threads; the fan-out
-            # runs on the mutation lane, so the tuple has to be taken under
-            # the state lock or an unsubscribe would resize the dict mid-iteration.
+            # runs on the emitter thread (or on a caller that sends directly),
+            # so the tuple has to be taken under the state lock or an
+            # unsubscribe would resize the dict mid-iteration.
             callbacks = tuple(self._subscribers.values())
         if not callbacks:
             self._service_row_is_live()
             return
         projected = self.snapshot() if snapshot is None else snapshot
+        # A projection taken while another thread owns the mutation lane is the
+        # last committed view, not the one this send was asked about.  That is
+        # the same answered-by-a-later-commit rule ``snapshot`` gives a window:
+        # the event carries a revision the store has since passed, the window
+        # drops it, and the commit that owns the lane asks for its own event.
         event = make_event("snapshot", projected["revision"], projected)
         # One serialization, then each subscriber gets its own parse of the
         # same bytes: a window that mutates its copy must not reach another's,
@@ -1952,6 +1971,23 @@ class CoreStore:
             except Exception:
                 # A disconnected UI must not break a state transition.
                 continue
+
+    def _request_emit(self) -> None:
+        """Mark one state event pending for the emitter.
+
+        Write paths call this instead of ``_emit``: the response returns with
+        its own revision, and the projection plus fan-out happens on the
+        emitter thread once the burst settles.  ``_emit`` stays the
+        synchronous send for a test that drives it and for a transitional
+        claim that must be visible before the next statement runs.
+        """
+
+        # The commit's own restart decision asks whether the proxy is running,
+        # and it is this read -- not the publish -- that keeps that answer
+        # current.  It belongs where the commit answers, because the event it
+        # was riding on may not be published for another window.
+        self._service_row_is_live()
+        self._emitter.request()
 
     def subscribe(self, callback: Callable[[dict[str, Any]], None]) -> Callable[[], None]:
         if not callable(callback):
@@ -2774,6 +2810,7 @@ class CoreStore:
 
         if not isinstance(value, str) or len(value.encode("utf-8")) > _secret_value_limit(_canonical_domain(domain), field, target) or "\x00" in value or (not _allows_multiline_secret(_canonical_domain(domain), field, target) and any(char in value for char in "\r\n")):
             raise CoreError("invalid_secret", "The secret value is invalid")
+        should_emit = False
         with self._mutation_scope():
             self._check_revision(revision)
             descriptor = self.secret_descriptor(domain, field, target)
@@ -2801,8 +2838,11 @@ class CoreStore:
                 ),
             )
             self._persist_metadata()
-            self._emit()
-            return {"revision": self._revision, "present": present}
+            should_emit = True
+            response = {"revision": self._revision, "present": present}
+        if should_emit:
+            self._request_emit()
+        return response
 
     def import_relay_resources(
         self,
@@ -2814,6 +2854,7 @@ class CoreStore:
     ) -> dict[str, Any]:
         """Stage only the API resources explicitly selected by the user."""
 
+        should_emit = False
         with self._mutation_scope():
             self._check_revision(revision)
             relay = self._domains.get("relay_accounts")
@@ -2852,14 +2893,17 @@ class CoreStore:
                 "model_count": int(result.get("model_count", 0)) if isinstance(result, Mapping) else 0,
             }
             self._persist_metadata()
-            self._emit()
-            return {
+            should_emit = True
+            response = {
                 "revision": self._revision,
                 "imported": True,
                 "import_mode": import_mode,
                 "resource_count": int(result.get("resource_count", 0)) if isinstance(result, Mapping) else 0,
                 "model_count": int(result.get("model_count", 0)) if isinstance(result, Mapping) else 0,
             }
+        if should_emit:
+            self._request_emit()
+        return response
 
     def accept_relay_login(
         self,
@@ -2900,6 +2944,7 @@ class CoreStore:
         known_secrets = tuple(
             value for value in (cookie, access_token, refresh_token, password) if isinstance(value, str) and value
         )
+        should_emit = False
         with self._mutation_scope():
             relay = self._domains.get("relay_accounts")
             accepter = getattr(relay, "accept_login_result", None) if relay is not None else None
@@ -3096,12 +3141,15 @@ class CoreStore:
                     "relay_login_failed",
                     safe_exception_message(exc, known_secrets=known_secrets),
                 ) from None
-            self._emit()
-            return {
+            should_emit = True
+            response = {
                 "revision": self._revision,
                 "login_status": "signed_in",
                 "username": str(public.get("username", username)),
             }
+        if should_emit:
+            self._request_emit()
+        return response
 
     def start_relay_browser_login(
         self,
@@ -3462,6 +3510,7 @@ class CoreStore:
     ) -> dict[str, Any]:
         """Refresh selectable relay API metadata without staging providers."""
 
+        should_emit = False
         with self._mutation_scope():
             self._check_revision(revision)
             relay = self._domains.get("relay_accounts")
@@ -3491,13 +3540,16 @@ class CoreStore:
                 "resource_count": resource_count,
             }
             self._persist_metadata()
-            self._emit()
-            return {
+            should_emit = True
+            response = {
                 "revision": self._revision,
                 "account_id": account_id,
                 "resource_status": resource_status,
                 "resource_count": resource_count,
             }
+        if should_emit:
+            self._request_emit()
+        return response
 
     def restore_relay_session(
         self,
@@ -3534,6 +3586,7 @@ class CoreStore:
         known_secrets = tuple(
             value for value in (cookie, access_token, refresh_token) if isinstance(value, str) and value
         )
+        should_emit = False
         with self._mutation_scope():
             relay = self._domains.get("relay_accounts")
             accepter = getattr(relay, "accept_login_result", None) if relay is not None else None
@@ -3690,12 +3743,15 @@ class CoreStore:
                     "relay_restore_failed",
                     safe_exception_message(exc, known_secrets=known_secrets),
                 ) from None
-            self._emit()
-            return {
+            should_emit = True
+            response = {
                 "revision": self._revision,
                 "login_status": str(public.get("login_status", login_status)),
                 "username": str(public.get("username", "")),
             }
+        if should_emit:
+            self._request_emit()
+        return response
 
     @staticmethod
     def _providers_summary(states: Mapping[str, object]) -> dict[str, Any]:
@@ -3937,9 +3993,9 @@ class CoreStore:
             if action_summary is not None:
                 response["action_summary"] = action_summary
         if changed:
-            # Projecting and fanning out a snapshot is not a state transition;
-            # the worker's own answer must not wait behind it.
-            self._emit()
+            # Publishing a snapshot is not a state transition; the worker's own
+            # answer must not wait behind it.
+            self._request_emit()
         return response
 
     def _dispatch_codex_model_catalog_toggle(self, enabled: bool, expected_revision: object | None) -> dict[str, Any]:
@@ -3954,6 +4010,7 @@ class CoreStore:
                 refresh_contexts()
             except Exception:
                 pass
+        should_emit = False
         with self._mutation_scope():
             self._refresh_external_disk_state()
             self._check_revision(expected_revision)
@@ -4010,16 +4067,19 @@ class CoreStore:
                 if isinstance(exc, CoreError):
                     raise
                 raise CoreError("apply_failed", safe_exception_message(exc)) from None
-            self._emit()
+            should_emit = True
             # The dispatch envelope is a revision plus an optional action-scoped
             # summary.  Returning the catalog projection as the whole result
             # adds a top-level field the IPC contract rejects, which fails the
             # call before the switch is reported as applied.
             summary = _safe_public(result)
-            return {
+            response = {
                 "revision": self._revision,
                 "action_summary": dict(summary) if isinstance(summary, Mapping) else {},
             }
+        if should_emit:
+            self._request_emit()
+        return response
 
     # -- WebDAV interval sync ---------------------------------------------
     def quiet_seconds(self) -> float:
@@ -4230,7 +4290,7 @@ class CoreStore:
                     self._persist_metadata()
                 except PersistenceError:
                     pass
-            self._emit()
+            self._request_emit()
 
     def service_supervisor(self, *, initial_delay: float | None = None) -> Any:
         """The loop that restores the proxy without a person's click.
@@ -4329,6 +4389,7 @@ class CoreStore:
         from ..webdav import core as webdav_core
         from ..webdav import operations as webdav_operations
 
+        should_emit = False
         with self._mutation_scope():
             self._refresh_external_disk_state()
             self._check_revision(expected_revision)
@@ -4622,7 +4683,7 @@ class CoreStore:
                     # one-line/512-byte rule the envelope enforces.
                     raise CoreError(cause_code, safe_error_message(exc)) from None
                 raise CoreError(cause_code, "WebDAV sync failed") from None
-            self._emit()
+            should_emit = True
             if pulled:
                 # After the commit, not inside it: the restart runs on its own
                 # thread and a rollback must never leave one scheduled.
@@ -4632,7 +4693,9 @@ class CoreStore:
             result: dict[str, Any] = {"revision": self._revision}
             if action_summary:
                 result["action_summary"] = action_summary
-            return result
+        if should_emit:
+            self._request_emit()
+        return result
 
     def dispatch(
         self,
@@ -4709,13 +4772,17 @@ class CoreStore:
             # ``_dispatch_service``.  Serializing it with panes' edits is what
             # keeps a restart from rewriting the Codex files under a commit;
             # snapshots stay live because they take neither lane.
+            should_emit = False
             with self._mutation_scope():
                 self._check_revision(expected_revision if expected_revision is not None else data.get("expected_revision"))
                 previous_revision = self._revision
                 self._dispatch_service(action_type, _as_mapping(data.get("payload")))
-                if self._revision != previous_revision:
-                    self._emit()
-                return {"revision": self._revision}
+                should_emit = self._revision != previous_revision
+                response = {"revision": self._revision}
+            if should_emit:
+                self._request_emit()
+            return response
+        should_emit = False
         with self._mutation_scope():
             self._check_revision(expected_revision if expected_revision is not None else data.get("expected_revision"))
             previous_revision = self._revision
@@ -5076,11 +5143,13 @@ class CoreStore:
                         )
                     self._persist_metadata()
             if self._revision != previous_revision:
-                self._emit()
+                should_emit = True
             response: dict[str, Any] = {"revision": self._revision}
             if action_summary is not None:
                 response["action_summary"] = action_summary
-            return response
+        if should_emit:
+            self._request_emit()
+        return response
 
     def reject_plaintext_secret_action(self, action: Mapping[str, Any]) -> None:
         """Reject secret-bearing actions received through ordinary IPC."""
@@ -5555,7 +5624,7 @@ class CoreStore:
             # swallowed by the restart already in flight.
             replace_process = self._service_reload_replace_process
             self._service_reload_replace_process = False
-        self._emit()
+        self._request_emit()
         try:
             with self._service_transition_guard:
                 if self._service_reload_stopping:
@@ -5587,7 +5656,7 @@ class CoreStore:
         with self._lock:
             self._set_service_from_result(service_result, increment=False)
             running = service_result.get("state") == "running"
-        self._emit()
+        self._request_emit()
         if running:
             # This reconciliation reads and rewrites the client documents on
             # disk -- the Codex catalog, the Claude picker, the fetch-server
@@ -5599,7 +5668,7 @@ class CoreStore:
             # underneath it) and the state lock only for its bookkeeping.
             with self._mutation_scope():
                 self._reconcile_client_documents_after_reload()
-            self._emit()
+            self._request_emit()
         if self._service_reload_stopping:
             # The host quit while this restart was in flight; shutdown() may
             # have stopped the previous proxy before this one started.
@@ -5712,7 +5781,7 @@ class CoreStore:
                 result if result is not None else {"state": "unhealthy"},
                 increment=False,
             )
-        self._emit()
+        self._request_emit()
 
     def supervise_service_once(self) -> bool:
         """Restore an unwatched proxy instead of leaving 不健康 to a click.
@@ -5752,6 +5821,7 @@ class CoreStore:
         # A pass can replace the proxy, which takes seconds.  It holds the
         # mutation lane so a pane's edit cannot land mid-replacement, while
         # snapshots keep reading the last committed projection.
+        should_emit = False
         with self._mutation_scope():
             with self._lock:
                 if self._service_supervision_stopping or self._service_intent != "running":
@@ -5821,6 +5891,9 @@ class CoreStore:
                     self._persist_metadata()
                     published = True
                 if published:
+                    # Sent here, not requested: the replacement below may take
+                    # minutes, and every window has to see the proxy leave its
+                    # state before it starts rather than after it ends.
                     self._emit()
                 reconcile = False
                 try:
@@ -5879,8 +5952,10 @@ class CoreStore:
             # ``snapshot`` re-reads the controller once no replacement is in
             # flight, so a failed pass publishes the real state instead of
             # leaving the 启动中 it had to claim while it tried.
-            self._emit()
-            return True
+            should_emit = True
+        if should_emit:
+            self._request_emit()
+        return True
 
     def _stop_service_after_reload_shutdown(self) -> None:
         stopper = self._shutdown_handler
@@ -5893,7 +5968,7 @@ class CoreStore:
                         self._set_service_from_result(result, increment=False)
             except Exception:
                 pass
-        self._emit()
+        self._request_emit()
 
     def validate(self, domain: str | None = None, *, revision: int | None = None, payload: object | None = None) -> dict[str, Any]:
         with self._mutation_scope():
@@ -6417,7 +6492,7 @@ class CoreStore:
                 self._drafts["relay_accounts"]["validation"] = {"valid": True, "issues": []}
                 self._advance_revision()
                 self._persist_metadata()
-                self._emit()
+                self._request_emit()
                 return {
                     "revision": self._revision,
                     "applied": False,
@@ -6460,7 +6535,7 @@ class CoreStore:
             pending = self._relay_operation_count(relay)
             self._advance_revision()
             self._persist_metadata()
-            self._emit()
+            self._request_emit()
             return {
                 "revision": self._revision,
                 "applied": False,
@@ -6471,8 +6546,7 @@ class CoreStore:
                 "issues": self._relay_apply_issues(1),
             }
 
-        snapshot = self.snapshot()
-        self._emit(snapshot)
+        self._request_emit()
         return {
             "revision": self._revision,
             "applied": True,
@@ -6519,6 +6593,7 @@ class CoreStore:
         revision: int | None = None,
         confirmation: str | Sequence[str] | None = None,
     ) -> dict[str, Any]:
+        should_emit = False
         with self._mutation_scope():
             # The caller's revision names the projection it read its edit from.
             # A refresh *inside* this Apply can advance the shared revision by
@@ -6767,8 +6842,8 @@ class CoreStore:
                 # write — looked like the one that failed.
                 self._mark_refused_draft(transaction_adapters)
                 raise CoreError("apply_failed", safe_exception_message(exc)) from None
-            self._emit()
-            return {
+            should_emit = True
+            response = {
                 "revision": self._revision,
                 "applied": True,
                 "status": "applied",
@@ -6777,6 +6852,9 @@ class CoreStore:
                 "pending_operations": 0,
                 "issues": [],
             }
+        if should_emit:
+            self._request_emit()
+        return response
 
     def _sync_codex_image_context_mcp(self, applied: Sequence[str]) -> None:
         """Keep Codex's fetch server in step with the image-context switch.
@@ -6818,6 +6896,7 @@ class CoreStore:
         )
 
     def reload(self, domain: str | None = None, *, revision: int | None = None) -> dict[str, Any]:
+        should_emit = False
         with self._mutation_scope():
             self._check_revision(revision)
             names = [_canonical_domain(domain)] if domain is not None else list(self._domains)
@@ -6838,8 +6917,11 @@ class CoreStore:
                 }
             self._advance_revision()
             self._persist_metadata()
-            self._emit()
-            return {"revision": self._revision}
+            should_emit = True
+            response = {"revision": self._revision}
+        if should_emit:
+            self._request_emit()
+        return response
 
     def probe(self, payload: Mapping[str, Any] | None = None, *, domain: str | None = None) -> dict[str, Any]:
         name = _canonical_domain(domain or "providers_models")
@@ -6871,17 +6953,21 @@ class CoreStore:
                     value, changed = commit(prepared, value)
                 except Exception as exc:
                     return {"ok": False, "protocols": [], "detail": safe_exception_message(exc)}
+                should_emit = False
                 if changed:
                     self._advance_revision()
                     self._persist_metadata()
-                    self._emit()
+                    should_emit = True
                 result = _safe_public(value if isinstance(value, Mapping) else {})
                 if not isinstance(result, dict):
                     result = {}
                 result.setdefault("ok", False)
                 result.setdefault("protocols", [])
-                return result
+            if should_emit:
+                self._request_emit()
+            return result
 
+        should_emit = False
         with self._mutation_scope():
             method = getattr(adapter, "probe", None)
             if not callable(method):
@@ -6905,7 +6991,7 @@ class CoreStore:
                     ),
                 )
                 self._persist_metadata()
-                self._emit()
+                should_emit = True
             result = _safe_public(value if isinstance(value, Mapping) else {})
             if not isinstance(result, dict):
                 result = {}
@@ -6920,7 +7006,9 @@ class CoreStore:
                         service_result = None
                     if isinstance(service_result, Mapping):
                         self._set_service_from_result(service_result, increment=False)
-            return result
+        if should_emit:
+            self._request_emit()
+        return result
 
     def export(self, sections: Sequence[str], *, destination_token: str | None = None) -> dict[str, Any]:
         if isinstance(sections, (str, bytes, bytearray)) or not isinstance(sections, Sequence) or not sections:
@@ -7189,6 +7277,7 @@ class CoreStore:
                 raise CoreError("invalid_sections", "Choose only sections detected in the selected file")
             selected = requested
         raw_sections = package["sections"]
+        should_emit = False
         with self._mutation_scope():
             self._check_revision(revision)
             pending: list[tuple[str, DomainAdapter, object]] = []
@@ -7252,8 +7341,11 @@ class CoreStore:
                     raise CoreError("import_failed", safe_exception_message(exc)) from None
                 raise
 
-            self._emit()
-            return {"revision": self._revision, "draft_domains": staged, "preview": preview}
+            should_emit = True
+            response = {"revision": self._revision, "draft_domains": staged, "preview": preview}
+        if should_emit:
+            self._request_emit()
+        return response
 
     def announce_web_endpoint(self, address: str, port: int) -> None:
         """State where this Core answers the browser page and its API.
@@ -7289,7 +7381,7 @@ class CoreStore:
             self._advance_revision()
             self._persist_metadata()
             result = copy.deepcopy(self._service)
-        self._emit()
+        self._request_emit()
         return result
 
 __all__ = [

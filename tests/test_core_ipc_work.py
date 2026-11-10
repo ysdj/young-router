@@ -167,6 +167,10 @@ class OperationWorkTests(unittest.TestCase):
         with work_ledger() as ledger:
             ledger.reset()
             result = action()
+            # A commit answers before its event is published, so publish the
+            # pending one here: an operation's budget is the cost of the whole
+            # operation, not whichever half landed inside this window.
+            self.core._emitter.flush()
         self._assert_within(operation, ledger)
         return ledger, result
 
@@ -399,6 +403,9 @@ class LedgerCatchesRegressionsTests(OperationWorkTests):
             ledger.reset()
             with mock.patch.object(provider, "apply", old_apply):
                 self.core.apply("providers_models", revision=staged["revision"])
+            # The event that answers the commit carries the projection of the
+            # whole configuration; publish it inside this window.
+            self.core._emitter.flush()
 
         self.assertGreater(
             ledger.total(PROVIDER_SNAPSHOT),
