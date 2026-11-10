@@ -638,6 +638,32 @@ def _relay_operation_dependencies(operations: object) -> dict[str, list[dict[str
     return grouped
 
 
+def _relay_projection_without_the_clock(projection: object) -> object:
+    """One relay projection with its observation clock and own revision removed.
+
+    Every login check refreshes *when* the login was observed, which is a
+    timestamp and not a fact about the account, and every domain write moves
+    the domain's own revision.  Comparing projections verbatim therefore
+    reports a change on every check; what a reader can act on is everything
+    else.
+    """
+
+    if not isinstance(projection, Mapping):
+        return projection
+    trimmed = {key: value for key, value in projection.items() if key != "revision"}
+    accounts = trimmed.get("accounts")
+    if isinstance(accounts, Sequence) and not isinstance(accounts, (str, bytes, bytearray)):
+        cleaned: list[object] = []
+        for item in accounts:
+            if isinstance(item, Mapping):
+                account = {key: value for key, value in item.items() if key != "login_observed_seconds_ago"}
+                cleaned.append(account)
+            else:
+                cleaned.append(item)
+        trimmed["accounts"] = cleaned
+    return trimmed
+
+
 def _relay_dependency_sources(
     provider_keys: object,
     slot_credentials: object,
@@ -4235,7 +4261,9 @@ class CoreStore:
             relay_was_dirty = bool(self._drafts.get("relay_accounts", {}).get("dirty"))
             relay_prior_baseline = copy.deepcopy(self._baselines.get("relay_accounts"))
             relay_prior_base_revision = self._drafts.get("relay_accounts", {}).get("base_revision")
-            current = self._adapter_snapshot("relay_accounts")
+            # Copied: the projection compared against below must be the one
+            # this call read, whatever the domain does to its own state.
+            current = copy.deepcopy(self._adapter_snapshot("relay_accounts"))
             accounts = current.get("accounts", []) if isinstance(current, Mapping) else []
             matching = next(
                 (item for item in accounts if isinstance(item, Mapping) and item.get("id") == account_id),
@@ -4352,17 +4380,27 @@ class CoreStore:
                     public = status_settler(str(account_id), str(login_status))
                 else:
                     raise CoreError("relay_restore_failed", "Relay login status is invalid")
-                self._advance_revision()
                 self._record_relay_transient_update(
                     was_dirty=relay_was_dirty,
                     prior_baseline=relay_prior_baseline,
                     prior_base_revision=relay_prior_base_revision,
                 )
-                self._last_actions["relay_accounts"] = {
-                    "session_restored": public.get("login_status") == "signed_in",
-                    "account_id": str(account_id),
-                    "login_status": str(public.get("login_status", login_status)),
-                }
+                # A login check that settles on the status the account already
+                # carried changes no projection.  Advancing the shared revision
+                # for it invalidated every open window's snapshot for nothing:
+                # the pane's own Apply then raced a background check that had
+                # nothing to say, and answered 更改未生效 over a write that had
+                # landed.  A check that did change something still advances it.
+                if relay_was_dirty or (
+                    _relay_projection_without_the_clock(self._adapter_snapshot("relay_accounts"))
+                    != _relay_projection_without_the_clock(current)
+                ):
+                    self._advance_revision()
+                    self._last_actions["relay_accounts"] = {
+                        "session_restored": public.get("login_status") == "signed_in",
+                        "account_id": str(account_id),
+                        "login_status": str(public.get("login_status", login_status)),
+                    }
                 self._persist_metadata()
             except CoreError:
                 raise

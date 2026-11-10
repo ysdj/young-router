@@ -2189,6 +2189,60 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )
             self.assertEqual("signed_out", result["login_status"])
 
+    def test_a_mount_that_learns_nothing_leaves_the_shared_revision_alone(self) -> None:
+        """A login check that settles on the same status changes nothing.
+
+        The pane restores a saved session on every mount, and the host answers
+        from the store Core already holds.  Advancing the shared revision for
+        that answer invalidated every open window's snapshot for a fact they
+        already had — and a pane that had just read the state then raced its
+        own Apply against the background check and reported 更改未生效 over an
+        edit that had landed.  The revision moves only when the projection
+        does.
+        """
+
+        responses = {
+            "/api/user/models": {"success": True, "data": ["chat-a"]},
+            "/api/token/?p=1&size=100": {
+                "success": True,
+                "data": {"items": [{"id": 7, "status": 1, "key": "masked"}]},
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relay = RelayAccountsDomain(root, http_client=FakeRelayHTTPClient(responses))
+            account = relay.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(
+                metadata_path=root / ".litellm-runtime" / "core-state.json",
+                domains=[relay, providers],
+            )
+            core.accept_relay_login(
+                account_id=account["id"],
+                account_type="newapi",
+                label="Relay",
+                origin="https://relay.example.test",
+                username="sample-user",
+                cookie="session=replace-cookie",
+            )
+            mount = {
+                "account_id": account["id"],
+                "account_type": "newapi",
+                "label": "Relay",
+                "origin": "https://relay.example.test",
+                "login_status": "signed_in",
+                "username": "sample-user",
+                "cookie": "session=replace-cookie",
+            }
+            core.restore_relay_session(**mount)
+            settled = core.revision
+            # Every later mount of the same account, with the same session.
+            core.restore_relay_session(**mount)
+            self.assertEqual(settled, core.revision)
+
     def test_a_determined_signed_out_costs_no_station_round_trip_on_the_next_mount(self) -> None:
         """The route settles a determined 未登录 instead of re-probing it.
 
