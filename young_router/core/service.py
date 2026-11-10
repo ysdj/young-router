@@ -387,6 +387,39 @@ def _safe_public(value: object) -> object:
     return copy.deepcopy(value)
 
 
+# What each domain's action answer may leave in the snapshot's
+# ``action_summaries`` slot.  A domain's dispatch answers with its whole
+# projection -- ``providers_models`` includes every provider and route -- and
+# storing that verbatim made the slot a second copy of the domain: one
+# ``provider.add`` patch measured 6,993 B of ``action_summaries`` against 558 B
+# of ops at fourteen providers.  A pane reads the summary a named operation
+# produced (``operation_summary``), and a relay detection reads the type it
+# names; every other key is state the patch already carries as ops.
+_ACTION_SUMMARY_FIELDS: dict[str, frozenset[str]] = {
+    "providers_models": frozenset({"operation_summary"}),
+    # A detection's type and confidence are one answer, and the resource status
+    # is what the refresh pane reads back for the same action.
+    "relay_accounts": frozenset({"detected_type", "confidence", "resource_status"}),
+}
+_DEFAULT_ACTION_SUMMARY_FIELDS = frozenset({"operation_summary"})
+
+
+def _action_summary_entry(name: str, result: object) -> dict[str, Any]:
+    """Keep only the keys a client reads from one dispatch's answer.
+
+    ``action_summaries`` is a slot for the answer to the last action, not a
+    second projection: the state half of the answer already travels as the
+    patch's ops.  The write point is where the distinction is known, so a
+    domain that starts returning something new does not quietly re-inflate
+    every later patch.
+    """
+
+    if not isinstance(result, Mapping):
+        return {}
+    fields = _ACTION_SUMMARY_FIELDS.get(name, _DEFAULT_ACTION_SUMMARY_FIELDS)
+    return {key: value for key, value in result.items() if key in fields}
+
+
 def _relay_binding_projection(state: object) -> list[tuple[str, ...]]:
     """The relay-bound part of a providers draft, for change detection.
 
@@ -4118,7 +4151,7 @@ class CoreStore:
             if isinstance(result, Mapping):
                 safe_result = _safe_public(result)
                 if isinstance(safe_result, Mapping):
-                    self._last_actions[name] = dict(safe_result)
+                    self._last_actions[name] = _action_summary_entry(name, safe_result)
                     summary = safe_result.get("operation_summary")
                     if (
                         isinstance(summary, Mapping)
@@ -5154,7 +5187,9 @@ class CoreStore:
                                         "domain_error",
                                         "Linked model dependency handling could not be completed",
                                     )
-                                self._last_actions["providers_models"] = dict(_safe_public(dependency_result))
+                                self._last_actions["providers_models"] = _action_summary_entry(
+                                    "providers_models", _safe_public(dependency_result)
+                                )
                 except ConfirmationNeeded:
                     if relay_checkpoint is not None:
                         _restore_adapter(adapter, relay_checkpoint)
@@ -5184,7 +5219,7 @@ class CoreStore:
                 if isinstance(result, Mapping):
                     safe_result = _safe_public(result)
                     if isinstance(safe_result, Mapping):
-                        self._last_actions[name] = dict(safe_result)
+                        self._last_actions[name] = _action_summary_entry(name, safe_result)
                         summary = safe_result.get("operation_summary")
                         # The operation a live read answers with.  Every action
                         # that produces a summary names itself in it, so the

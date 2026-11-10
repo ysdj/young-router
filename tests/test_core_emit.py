@@ -20,6 +20,7 @@ import unittest
 from unittest import mock
 
 from young_router.core.domains.providers_models import ProvidersModelsDomain
+from young_router.core.domains.relay_accounts import RelayAccountsDomain
 from young_router.core.emitter import MAX_WINDOW_SECONDS, CoalescingEmitter
 from young_router.core.ipc import MAX_EVENTS, CoreIPCClient, CoreIPCServer
 from young_router.core.service import CoreStore, MemoryDomain
@@ -186,15 +187,160 @@ class CoreEmitTests(unittest.TestCase):
             self.assertEqual("provider:primary", provider_upserts[0]["id"])
             self.assertEqual("primary", provider_upserts[0]["value"]["name"])
             # The ops are the edit: two rows with their whole values, ~2.9 KB.
-            # The rest of the patch is the dispatch's own action summary, which
-            # the event contract carries beside the ops and which this domain
-            # answers with its whole projection.  The projection a window would
-            # otherwise read is ~60 KB on a real installation, so this is still
-            # the smaller answer.
+            # The action summary beside them is the answer to the action, not
+            # the domain's projection (see ``test_patch_stays_small_at_scale``),
+            # so the patch is the rows plus the envelope.
             payload = json.dumps(event, separators=(",", ":")).encode("utf-8")
             ops = json.dumps(event["ops"], separators=(",", ":")).encode("utf-8")
             self.assertLess(len(ops), 4 * 1024, f"the add ops are {len(ops)} bytes")
             self.assertLess(len(payload), 6 * 1024, f"the add patch is {len(payload)} bytes")
+
+    def test_patch_stays_small_at_scale(self) -> None:
+        """An add carries the rows it moved, not a second copy of the domain.
+
+        A domain's dispatch answers with its whole projection, and storing
+        that verbatim put the projection into ``action_summaries`` too.  At
+        fourteen providers one ``provider.add`` patch measured 24.7 KB, of
+        which 21.9 KB was that slot, so the incremental channel had become
+        nearly as expensive as a snapshot.  The slot now keeps only the keys a
+        client reads, and this is the ceiling that keeps it that way.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            core = CoreStore(domains=[ProvidersModelsDomain(Path(directory) / "config.yaml")])
+            events: list[dict[str, object]] = []
+            unsubscribe = core.subscribe(events.append)
+            self.addCleanup(unsubscribe)
+            core._emit()
+
+            for index in range(14):
+                core.dispatch(
+                    {
+                        "domain": "providers_models",
+                        "type": "provider.add",
+                        "payload": {
+                            "provider": {
+                                "name": f"provider-{index:02d}",
+                                "api_base": f"https://provider-{index:02d}.example.test/v1",
+                                "models": [
+                                    {
+                                        "model_name": f"public-route-{index:02d}",
+                                        "litellm_model": f"openai/upstream-route-{index:02d}",
+                                    }
+                                ],
+                            }
+                        },
+                    }
+                )
+                _wait_for_events(core, events, index + 2)
+
+            event = events[-1]
+            self.assertEqual("patch", event["event"])
+            self.assertNotIn(
+                "action_summaries",
+                event,
+                "an unchanged action summary was restated",
+            )
+            first = events[1]
+            self.assertEqual("patch", first["event"])
+            self.assertEqual(
+                {"providers_models": {}},
+                first["action_summaries"],
+                "the action summary carried the provider projection instead of the answer",
+            )
+            payload = json.dumps(event, separators=(",", ":")).encode("utf-8")
+            self.assertLess(len(payload), 4 * 1024, f"the add patch is {len(payload)} bytes at 14 providers")
+
+    def test_action_summary_keeps_operation_summary(self) -> None:
+        """The named operation a pane reads survives the trim.
+
+        ``providers_models`` actions that answer a question put it in
+        ``operation_summary``; a window reads that sub-object, never the
+        projection the trim removed.
+        """
+
+        class ModelListResponse:
+            status = 200
+
+            def read(self, _limit: int) -> bytes:
+                return b'{"data":[{"id":"model-a"}]}'
+
+            def __enter__(self) -> "ModelListResponse":
+                return self
+
+            def __exit__(self, _type: object, _value: object, _traceback: object) -> bool:
+                return False
+
+        class ModelListOpener:
+            def open(self, _request: object, *, timeout: float) -> ModelListResponse:
+                del timeout
+                return ModelListResponse()
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.yaml"
+            config.write_text(
+                "providers:\n"
+                "  openrouter:\n"
+                "    api_base: https://openrouter.ai/api/v1\n"
+                "    api_keys:\n"
+                "      - name: r\n"
+                "        value: synthetic-openrouter-key\n"
+                "model_list: []\n",
+                encoding="utf-8",
+            )
+            providers = ProvidersModelsDomain(config)
+            core = CoreStore(domains=[providers])
+            provider_id = providers.snapshot()["providers"][0]["id"]
+            with mock.patch(
+                "young_router.core.domains.providers_models.isolated_http_opener",
+                return_value=ModelListOpener(),
+            ):
+                staged = core.dispatch(
+                    {
+                        "domain": "providers_models",
+                        "type": "providers.fetch_models",
+                        "payload": {"provider_id": provider_id, "api_key_name": "r"},
+                    },
+                    expected_revision=core.revision,
+                )
+
+            summary = core._last_actions["providers_models"]["operation_summary"]
+            self.assertEqual(staged["action_summary"], summary)
+            self.assertEqual("fetch_models", summary["operation"])
+            self.assertEqual(["model-a"], summary["models"])
+            # The slot is the answer, not a second projection.
+            self.assertEqual({"operation_summary"}, set(core._last_actions["providers_models"]))
+            self.assertNotIn("providers", core.snapshot()["action_summaries"]["providers_models"])
+
+    def test_action_summary_keeps_relay_fields(self) -> None:
+        """A relay detection still reads from the shared slot.
+
+        The detection answer names no operation, so the trim has to keep the
+        type (and the confidence that belongs to it) by name rather than
+        assuming every relay action answers with ``operation_summary``.
+        """
+
+        class ProbeClient:
+            def probe(self, _origin: str, _path: str) -> tuple[int, dict[str, object]]:
+                return 200, {"success": True, "data": {"system_name": "TKEN"}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            core = CoreStore(domains=[RelayAccountsDomain(directory, http_client=ProbeClient())])
+            staged = core.dispatch(
+                {
+                    "domain": "relay_accounts",
+                    "type": "account.detect_type",
+                    "payload": {"origin": "https://relay.example.test"},
+                },
+                expected_revision=core.revision,
+            )
+
+            self.assertEqual("newapi", staged["action_summary"]["detected_type"])
+            slot = core.snapshot()["action_summaries"]["relay_accounts"]
+            self.assertEqual("newapi", slot["detected_type"])
+            self.assertEqual("high", slot["confidence"])
+            self.assertNotIn("accounts", slot)
+            self.assertNotIn("stations", slot)
 
     def test_patch_contains_remove(self) -> None:
         """A deleted row is named, so no window keeps drawing it."""
