@@ -3963,7 +3963,9 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     // — passes ``force``: it always pays for a station round trip, while an
     // implicit caller reuses a read that is running or one that just finished.
     // A failed read is never reused, so the next implicit caller retries the
-    // station instead of inheriting the failure.
+    // station instead of inheriting the failure.  The flag travels with the
+    // action as well: Core's balance reuse answers a pane entry's probe-then-
+    // refresh pair, and pressing 刷新 is a person asking the station again.
     const forced = options?.force === true;
     const inFlight = relayRefreshInFlight.current.get(accountId);
     if (!forced && inFlight) return inFlight;
@@ -3972,7 +3974,11 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       if (fresh && Date.now() - fresh.at < RELAY_RESOURCE_REUSE_MS) return fresh.status;
     }
     const pending = (async (): Promise<"ready" | "unavailable"> => {
-      const staged = await enqueueDispatch("resources.refresh", { account_id: accountId }, "relay_accounts");
+      const staged = await enqueueDispatch(
+        "resources.refresh",
+        forced ? { account_id: accountId, force: true } : { account_id: accountId },
+        "relay_accounts",
+      );
       revision.current = staged.revision;
       // The refresh reports its own projection as the action summary; the
       // dispatch result itself only carries the revision and that summary.

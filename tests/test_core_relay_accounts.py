@@ -533,6 +533,59 @@ class RelayAccountsDomainTests(unittest.TestCase):
 
             self.assertEqual(8.75, refreshed["balance"])
 
+    def test_a_forced_refresh_re_reads_the_balance_the_entry_just_stated(self) -> None:
+        """A person pressing 刷新 is asking the station, not the entry.
+
+        The pane's mount probe and the refresh behind it read the same profile,
+        so a short reuse window answers the second one.  That window is not the
+        answer to the 刷新 control: a user who presses it within the window
+        redrew the number the entry had just read instead of the one the
+        station was holding now.  ``force`` is that control's own read.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake = FakeRelayHTTPClient(
+                {
+                    "/api/v1/user/profile": {"data": {"balance": 8.75}},
+                    "/api/v1/keys?page=1&page_size=100": {
+                        "data": {"items": [{"id": "key-1", "name": "default", "status": "active", "key": "sk-test"}]}
+                    },
+                    "/api/v1/channels/available": {
+                        "data": [{"platforms": [{"supported_models": ["model-test"]}]}]
+                    },
+                }
+            )
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account = domain.dispatch(
+                "account.add",
+                {
+                    "type": "sub2api",
+                    "label": "Sub2API",
+                    "origin": "https://relay.example.test",
+                },
+            )["accounts"][0]
+            domain.accept_login_result(
+                account["id"], username="account-a@example.test", access_token="replace-token"
+            )
+            self.assertEqual(8.75, domain.refresh_resources(account["id"])["balance"])
+
+            # The station states a new number, but an implicit read inside the
+            # window answers what the entry already observed.
+            fake.responses["/api/v1/user/profile"] = {"data": {"balance": 3.25}}
+            self.assertEqual(8.75, domain.refresh_resources(account["id"])["balance"])
+            profile_reads = [
+                path for _origin, path, _headers in fake.requests if path == "/api/v1/user/profile"
+            ]
+            self.assertEqual(1, len(profile_reads), "an implicit read left the reuse window")
+
+            forced = domain.refresh_resources(account["id"], force=True)
+            self.assertEqual(3.25, forced["balance"])
+            self.assertEqual(
+                2,
+                len([path for _origin, path, _headers in fake.requests if path == "/api/v1/user/profile"]),
+                "the forced read was answered by the entry instead of the station",
+            )
+
     def test_relay_key_read_keeps_the_rest_of_the_station_key_list(self) -> None:
         """One station answer caches every key, so the next key is a cache hit.
 

@@ -4863,7 +4863,7 @@ class RelayAccountsDomain:
                     group["multiplier"] = user_multiplier
         return groups
 
-    def _account_balance(self, account: Mapping[str, Any]) -> float:
+    def _account_balance(self, account: Mapping[str, Any], *, force: bool = False) -> float:
         """Read the station's own account summary.
 
         Both paths are documentary (``OPTIONAL_READ_PATHS``): the balance is an
@@ -4873,13 +4873,15 @@ class RelayAccountsDomain:
         A balance the station stated a moment ago is not a question: the entry's
         session probe and the refresh behind it read the same profile, so the
         observation answers here and the second read is not sent
-        (``BALANCE_REUSE_SECONDS``).
+        (``BALANCE_REUSE_SECONDS``).  ``force`` is the person's own 刷新, which
+        is a question: the entry answers with the number the station holds now.
         """
 
         account_id = str(account.get("id", ""))
-        observed = self._recent_balance(account_id)
-        if observed is not None:
-            return observed
+        if not force:
+            observed = self._recent_balance(account_id)
+            if observed is not None:
+                return observed
         headers = self._headers(account)
         path = "/api/v1/user/profile" if account["type"] == "sub2api" else "/api/user/self"
         profile = _json_data(self._http.json(account["origin"], path, headers=headers))
@@ -5140,6 +5142,7 @@ class RelayAccountsDomain:
         *,
         _for_apply: bool = False,
         keys_only: bool = False,
+        force: bool = False,
     ) -> dict[str, Any]:
         """Load selectable metadata after native login without staging providers.
 
@@ -5154,6 +5157,12 @@ class RelayAccountsDomain:
         balance are what the *panes* render, and paying for them here held
         Core's store lock for the ten seconds a channel page can take while the
         user was pressing ＋ in the model chooser.
+
+        ``force`` is the pane's own 刷新: the person asked the station again, so
+        the balance reuse that answers an entry's probe-then-refresh pair does
+        not answer this.  Without it the first presses of 刷新 within
+        ``BALANCE_REUSE_SECONDS`` redrew the number the entry had just read
+        instead of the one the station was holding now.
         """
 
         # A read replaces this account's whole resource list, so any read a
@@ -5163,7 +5172,9 @@ class RelayAccountsDomain:
         # would then compare a staged change against a key list that predates
         # it and report a write as not applied.
         self._apply_read_memo.pop(str(self._accounts[self._index(account_id)]["id"]), None)
-        result = self._refresh_resources_once(account_id, _for_apply=_for_apply, keys_only=keys_only)
+        result = self._refresh_resources_once(
+            account_id, _for_apply=_for_apply, keys_only=keys_only, force=force
+        )
         if result.get("resource_error") != "login_expired":
             return result
         try:
@@ -5183,7 +5194,9 @@ class RelayAccountsDomain:
             # the next entry from asking again.
             return result
         if renewed:
-            result = self._refresh_resources_once(account_id, _for_apply=_for_apply, keys_only=keys_only)
+            result = self._refresh_resources_once(
+                account_id, _for_apply=_for_apply, keys_only=keys_only, force=force
+            )
         return result
 
     def _refresh_resources_once(
@@ -5192,6 +5205,7 @@ class RelayAccountsDomain:
         *,
         _for_apply: bool = False,
         keys_only: bool = False,
+        force: bool = False,
     ) -> dict[str, Any]:
         """Read the station's key list and group catalog in one round.
 
@@ -5244,7 +5258,7 @@ class RelayAccountsDomain:
                     raise RelayAccountsError("Relay has no API keys")
             else:
                 with ThreadPoolExecutor(max_workers=3) as executor:
-                    balance_future = executor.submit(self._account_balance, account)
+                    balance_future = executor.submit(self._account_balance, account, force=force)
                     groups_future = executor.submit(
                         self._newapi_groups if account["type"] == "newapi" else self._sub2api_groups,
                         account,

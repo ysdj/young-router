@@ -4265,8 +4265,13 @@ class CoreStore:
         account_id: object,
         *,
         revision: int,
+        force: bool = False,
     ) -> dict[str, Any]:
-        """Refresh selectable relay API metadata without staging providers."""
+        """Refresh selectable relay API metadata without staging providers.
+
+        ``force`` is the pane's own 刷新: the read asks the station again
+        instead of reusing the balance its session probe stated a moment ago.
+        """
 
         should_emit = False
         with self._domain_scope("relay_accounts"):
@@ -4279,7 +4284,7 @@ class CoreStore:
             relay_prior_baseline = copy.deepcopy(self._baselines.get("relay_accounts"))
             relay_prior_base_revision = self._drafts.get("relay_accounts", {}).get("base_revision")
             try:
-                result = refresher(account_id)
+                result = refresher(account_id, force=force)
             except Exception as exc:
                 raise CoreError("relay_resources_failed", safe_exception_message(exc)) from None
             resources = result.get("resources", []) if isinstance(result, Mapping) else []
@@ -5726,6 +5731,7 @@ class CoreStore:
                         self.refresh_relay_resources(
                             resource_data.get("id", resource_data.get("account_id")),
                             revision=expected_revision if expected_revision is not None else data.get("expected_revision"),
+                            force=resource_data.get("force") is True,
                         )
                     )
                 if name == "providers_models" and normalized_action == "provider_select_relay_station":
