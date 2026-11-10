@@ -68,6 +68,33 @@ SUBSCRIPTION_QUEUE_LIMIT = 32
 JOB_POOL_WORKERS = 2
 
 
+#: The one field a domain projection carries that is not its content.
+#:
+#: Every commit advances it, including a commit that only stages a draft: the
+#: domain was touched, no row moved.  A patch sees two projections that differ
+#: only here, and must not call that "a change I cannot describe" -- that is how
+#: an ordinary toggle became a resync, and a resync is every window reading
+#: every settings document.
+_DOMAIN_REVISION_FIELD = "revision"
+
+
+def _only_revision_moved(before: object, current: object) -> bool:
+    """Whether two projections differ only in their own revision counter."""
+
+    if not isinstance(current, Mapping):
+        return False
+    if not isinstance(before, Mapping):
+        return False
+    if set(before) != set(current):
+        return False
+    for name, value in current.items():
+        if name == _DOMAIN_REVISION_FIELD:
+            continue
+        if before.get(name) != value:
+            return False
+    return True
+
+
 class _PatchUnavailable(Exception):
     """A revision moved in a way no entity-level patch can describe."""
 
@@ -2528,16 +2555,23 @@ class CoreStore:
                 # channel down with it: the window reads the state instead.
                 raise _PatchUnavailable from None
             if not domain_ops:
+                if _only_revision_moved(before, current):
+                    # Every commit advances the domain's own revision counter,
+                    # including one that staged a draft and committed no row.
+                    # Reading that as "a projection moved and cannot say how"
+                    # sent a resync for a plain 启用 toggle: the window then
+                    # re-read every settings document to learn what the event
+                    # should have said -- `drafts`, which travels beside the
+                    # ops.  A counter is not a change a window can draw.
+                    continue
+                # The projection moved beyond its counter and the domain cannot
+                # name the rows: the window reads the state instead.
                 raise _PatchUnavailable
             for op in domain_ops:
                 if len(ops) >= MAX_PATCH_OPS:
                     raise _PatchUnavailable
                 ops.append(op.to_mapping())
             changed.append(name)
-        if not ops:
-            if revision == base_revision:
-                return None
-            raise _PatchUnavailable
         # The fields a window cannot derive from the ops it just applied.  An
         # equal field is omitted: restating an unchanged draft or disk marker
         # would make every patch a snapshot with ops attached.
@@ -2546,6 +2580,13 @@ class CoreStore:
             for name in PATCH_TOP_LEVEL_FIELDS
             if previous.get(name) != projected.get(name)
         }
+        if not ops:
+            # No row moved.  A commit that only staged a draft -- the edit a
+            # person makes before the Apply that writes it -- is exactly this
+            # case, and the draft is a top-level field: the patch carries it
+            # with no ops at all.  An event with nothing to say is no event.
+            if revision == base_revision or not top_level:
+                return None
         return make_patch_event(base_revision, revision, changed, ops, top_level)
 
     def _request_emit(self) -> None:
@@ -3037,6 +3078,69 @@ class CoreStore:
             "action_summaries": copy.deepcopy(self._last_actions),
             "domains": copy.deepcopy(domains["domains"]),
         }
+
+    def commit_plan(self, domains: Sequence[str]) -> dict[str, Any]:
+        """What one Apply would write, sized like the question.
+
+        An Apply needs three facts: the head revision to write on, which domains
+        carry a staged draft, and whether an external edit stands in front of
+        one of them -- plus the confirmation codes a domain requires before its
+        own commit.  Those are a couple of kilobytes.  The path used to read the
+        whole projection for them, and on a real installation that is every
+        settings document at once (183 KB measured on this project's own
+        document): a browser host downloaded and parsed all of it before each
+        edit, which is seconds of wall clock per control on a remote link while
+        the same edit is instant on a loopback host.
+
+        Nothing here is a projection of a settings document.  The drafts state
+        their own dirty flags, the disk markers come from the watcher's own
+        refresh, and ``risks`` is the one domain-level field a commit asks about
+        (Claude's destructive settings) rather than the domain it lives in.
+        """
+
+        if isinstance(domains, (str, bytes, bytearray)) or not isinstance(domains, Sequence):
+            raise CoreError("invalid_domain", "The commit-plan domains are invalid")
+        requested = tuple(dict.fromkeys(_canonical_domain(domain) for domain in domains))
+        if not requested:
+            raise CoreError("invalid_domain", "At least one commit-plan domain is required")
+        risks: dict[str, list[str]] = {}
+        with self._domain_scope(*requested):
+            for name in requested:
+                if name not in self._domains:
+                    raise DomainNotFound(name)
+            # Fresh markers, not the last watcher pass: an Apply that overwrites
+            # a file somebody edited outside this app must be able to see it.
+            self._refresh_external_disk_state(requested)
+            if "claude" in requested:
+                adapter = self._domains.get("claude")
+                try:
+                    snapshot = adapter.snapshot() if adapter is not None else {}
+                except Exception:
+                    snapshot = {}
+                codes = snapshot.get("risk_confirmations") if isinstance(snapshot, Mapping) else None
+                if isinstance(codes, Sequence) and not isinstance(codes, (str, bytes, bytearray)):
+                    risks["claude"] = [str(code) for code in codes if isinstance(code, str)]
+            # Outside the state lock: the projection's own revision answers from
+            # the snapshot view when another lane is writing, and that read
+            # takes the same lock this one is about to.
+            projected_revision = self.projected_revision
+            with self._lock:
+                drafts = {
+                    name: {
+                        "dirty": bool(entry.get("dirty")),
+                        "base_revision": entry.get("base_revision", self._revision),
+                        "validation": copy.deepcopy(entry.get("validation")),
+                    }
+                    for name, entry in self._drafts.items()
+                }
+                return {
+                    "revision": self._revision,
+                    "projected_revision": projected_revision,
+                    "service": copy.deepcopy(_safe_public(self._service)),
+                    "drafts": drafts,
+                    "disk": {name: copy.deepcopy(self._disk[name]) for name in requested},
+                    "risks": risks,
+                }
 
     def disk_state(self, domains: Sequence[str]) -> dict[str, Any]:
         """Refresh only the external-file markers needed by the settings UI."""

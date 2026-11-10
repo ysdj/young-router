@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
   FlatList,
@@ -720,13 +720,14 @@ export function NativeTextField({ style, onChangeText, onSubmitEditing, onBlur, 
 }
 
 export function NativeToggle({ value, disabled, onValueChange, style, accessibilityLabel }: ToggleProps): React.JSX.Element {
+  const [shown, choose] = useChosenValue(value, onValueChange);
   if (Platform.OS === "windows" || Platform.OS === "web") {
-    return <WindowsToggle value={value} disabled={disabled} onValueChange={onValueChange} style={style} accessibilityLabel={accessibilityLabel} />;
+    return <WindowsToggle value={shown} disabled={disabled} onValueChange={choose} style={style} accessibilityLabel={accessibilityLabel} />;
   }
   if (Platform.OS === "macos") {
-    return <AppKitToggle value={value} disabled={disabled} onValueChange={onValueChange} style={style} accessibilityLabel={accessibilityLabel} />;
+    return <AppKitToggle value={shown} disabled={disabled} onValueChange={choose} style={style} accessibilityLabel={accessibilityLabel} />;
   }
-  return <Pressable style={[styles.toggleFallback, style]} disabled={disabled} onPress={() => onValueChange?.(!value)} accessibilityRole="switch" accessibilityLabel={accessibilityLabel} accessibilityState={{ checked: value, disabled }}><StaticBooleanIndicator value={value} /></Pressable>;
+  return <Pressable style={[styles.toggleFallback, style]} disabled={disabled} onPress={() => choose(!value)} accessibilityRole="switch" accessibilityLabel={accessibilityLabel} accessibilityState={{ checked: shown, disabled }}><StaticBooleanIndicator value={shown} /></Pressable>;
 }
 
 export function NativeSelectableRow({ title, detail, selected, disabled, onPress, style }: SelectableRowProps): React.JSX.Element {
@@ -736,15 +737,61 @@ export function NativeSelectableRow({ title, detail, selected, disabled, onPress
   return <Pressable style={[styles.selectableRow, selected && styles.selectableRowSelected, style]} disabled={disabled} onPress={onPress} accessibilityRole="button" accessibilityLabel={detail ? `${title}, ${detail}` : title} accessibilityState={{ selected: selected === true, disabled: disabled === true }} aria-selected={selected === true} aria-disabled={disabled === true || undefined}><View style={styles.selectableText}><Text style={styles.selectableTitle}>{title}</Text>{detail ? <Text style={styles.selectableDetail}>{detail}</Text> : null}</View></Pressable>;
 }
 
+/**
+ * How long a control shows the value a person just chose before the state has
+ * caught up.
+ *
+ * One round trip on a published page, a frame in the native window.  The wait
+ * is what a control must not be frozen on: pressing 启用 and watching the box
+ * stay empty until the write has round-tripped is what made the page feel
+ * broken while the same control in the app was instant.  Two seconds is longer
+ * than any link on which the echo helps, and short enough that a write Core
+ * refused does not leave a control claiming it happened.
+ */
+const CONTROL_ECHO_TIMEOUT_MS = 2000;
+
+/**
+ * The value a person just chose, until the state agrees with it.
+ *
+ * This is not a claim that the write happened: the status strip still says
+ * 正在保存, the row the edit belongs to still draws the projection, and the
+ * echo is withdrawn the moment the state agrees -- or after
+ * ``CONTROL_ECHO_TIMEOUT_MS``, which is the rollback a refusal deserves.  A
+ * control that never shows its own press reads as a dead control, and one that
+ * keeps showing it after a refusal reads as a lie; this is the interval
+ * between the two.
+ */
+function useChosenValue(value: boolean, onValueChange?: (next: boolean) => void): [boolean, (next: boolean) => void] {
+  const [chosen, setChosen] = useState<boolean | undefined>(undefined);
+  useEffect(() => {
+    if (chosen === undefined) return;
+    if (chosen === value) {
+      setChosen(undefined);
+      return;
+    }
+    const timer = setTimeout(() => setChosen(undefined), CONTROL_ECHO_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [chosen, value]);
+  const choose = useCallback((next: boolean) => {
+    setChosen(next);
+    onValueChange?.(next);
+  }, [onValueChange]);
+  return [chosen ?? value, choose];
+}
+
 export function NativeCheckbox({ label, value, disabled, compact = true, labelVisible = true, onValueChange, style }: CheckboxProps): React.JSX.Element {
   const sizedStyle = [{ minWidth: labelVisible ? nativeCheckboxMinimumWidth(label) : 24 }, style];
+  // The press is echoed here, in every host at once: a page and a window draw
+  // the same control, and only one of them has a link between the press and
+  // the state.
+  const [shown, choose] = useChosenValue(value, onValueChange);
   if (Platform.OS === "windows" || Platform.OS === "web") {
-    return <WindowsCheckbox label={label} labelVisible={labelVisible} value={value} disabled={disabled} compact={compact} onValueChange={onValueChange} style={sizedStyle} />;
+    return <WindowsCheckbox label={label} labelVisible={labelVisible} value={shown} disabled={disabled} compact={compact} onValueChange={choose} style={sizedStyle} />;
   }
   if (Platform.OS === "macos") {
-    return <AppKitCheckbox label={label} labelVisible={labelVisible} value={value} disabled={disabled} compact={compact} onValueChange={onValueChange} style={sizedStyle} />;
+    return <AppKitCheckbox label={label} labelVisible={labelVisible} value={shown} disabled={disabled} compact={compact} onValueChange={choose} style={sizedStyle} />;
   }
-  return <Pressable style={[styles.checkboxFallback, sizedStyle]} disabled={disabled} onPress={() => onValueChange?.(!value)} accessibilityRole="checkbox" accessibilityLabel={label} accessibilityState={{ checked: value, disabled }}><StaticBooleanIndicator value={value} />{labelVisible ? <Text style={styles.controlText}>{label}</Text> : null}</Pressable>;
+  return <Pressable style={[styles.checkboxFallback, sizedStyle]} disabled={disabled} onPress={() => choose(!value)} accessibilityRole="checkbox" accessibilityLabel={label} accessibilityState={{ checked: shown, disabled }}><StaticBooleanIndicator value={shown} />{labelVisible ? <Text style={styles.controlText}>{label}</Text> : null}</Pressable>;
 }
 
 /**

@@ -14,6 +14,7 @@ import {
   type IpcTransport,
   type JobEvent,
   type CoreSnapshot,
+  type StagedPlan,
   type ValidationSummary,
 } from "./types";
 import { mergeSnapshot } from "./applyPatch";
@@ -184,6 +185,7 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
       return initialSnapshotRequest;
     },
     diskState: (domains: ConfigDomain[]): Promise<IpcResults["disk_state"]> => call("disk_state", { domains }),
+    staged: (domains: ConfigDomain[]): Promise<StagedPlan> => call("staged", { domains }),
     logs: async (tab, revision) => call("logs", revision === undefined ? { tab } : { tab, revision }),
     editor: async (domain, document): Promise<IpcResults["editor"]> => call("editor", { domain, document }),
     files: async (): Promise<IpcResults["files"]> => call("files", {}),

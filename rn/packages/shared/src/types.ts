@@ -2,6 +2,7 @@ export const IPC_PROTOCOL_VERSION = 1 as const;
 
 export type IpcMethod =
   | "snapshot"
+  | "staged"
   | "disk_state"
   | "logs"
   | "editor"
@@ -168,6 +169,25 @@ export interface DiskState {
   changed: boolean;
   generation: number;
   keep_draft?: boolean;
+}
+
+/**
+ * The screen one Apply reads instead of the whole snapshot.
+ *
+ * An Apply needs three facts: the head revision to write on, which domains
+ * carry a staged draft, and whether an external edit stands in front of one of
+ * them.  Those are a few hundred bytes, while the projection that answers them
+ * beside the settings documents is hundreds of kilobytes on a real
+ * installation -- a browser host pays for that on every edit.  `risks` carries
+ * the confirmation codes a domain requires before its own commit.
+ */
+export interface StagedPlan {
+  revision: number;
+  projected_revision: number;
+  service: ServiceStatus;
+  drafts: Partial<Record<ConfigDomain, DraftState>>;
+  disk: Partial<Record<ConfigDomain, DiskState>>;
+  risks: Partial<Record<ConfigDomain, string[]>>;
 }
 
 export interface ValidationSummary {
@@ -474,6 +494,7 @@ export interface DispatchAction {
 
 export interface IpcParams {
   snapshot: Record<string, never>;
+  staged: { domains: ConfigDomain[] };
   disk_state: { domains: ConfigDomain[] };
   logs: { tab: LogTab; revision?: number };
   editor:
@@ -513,6 +534,7 @@ export interface IpcParams {
 
 export interface IpcResults {
   snapshot: { snapshot: CoreSnapshot };
+  staged: StagedPlan;
   disk_state: { revision: number; disk: Partial<Record<ConfigDomain, DiskState>> };
   logs: { changed: boolean; revision: number; log: LogView | null };
   editor: {
@@ -677,6 +699,15 @@ export interface IpcClient {
   /** The newest snapshot already received by this shared desktop runtime. */
   latestSnapshot(): CoreSnapshot | undefined;
   snapshot(): Promise<CoreSnapshot>;
+  /**
+   * What one Apply would write, in the size of the question.
+   *
+   * The Apply path asks this instead of reading the projection: it is the head
+   * revision, the staged drafts, the disk markers and a domain's confirmation
+   * codes, and nothing else.  Reading `snapshot()` for it meant a browser host
+   * downloaded every settings document before every edit.
+   */
+  staged(domains: ConfigDomain[]): Promise<StagedPlan>;
   diskState(domains: ConfigDomain[]): Promise<IpcResults["disk_state"]>;
   logs(tab: LogTab, revision?: number): Promise<IpcResults["logs"]>;
   editor(domain: EditorDomain, document: EditorDocument): Promise<IpcResults["editor"]>;

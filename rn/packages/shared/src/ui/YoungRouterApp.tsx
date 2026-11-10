@@ -63,6 +63,7 @@ import type {
   ProviderAuthKind,
   ProviderAuthStatus,
   ServiceStatus,
+  StagedPlan,
   ValidationSummary,
 } from "../types";
 
@@ -97,6 +98,13 @@ type ProviderWorkspaceDraftProjection = {
   setProviderKeyNameDraft: (providerID: string, keyID: string, value: string) => void;
 };
 type ServiceOperation = "start" | "stop" | "restart" | "reload" | "health";
+// Every domain an Apply can write, asked of Core's plan read.
+//
+// `stagedDomainsForRoute` names which of them this route owns; the list is the
+// whole set because a staged draft and a disk marker are answered per domain,
+// and one list keeps both questions in a single small round trip instead of a
+// projection that carries every settings document.
+const APPLY_PLAN_DOMAINS: ConfigDomain[] = ["providers_models", "relay_accounts", "runtime", "language", "codex", "claude", "clients", "webdav", "logs"];
 // Launch-time service starts are retried on this backoff: a login-time launch
 // competes with every other start-up item, and a proxy whose workers failed to
 // spawn then must come back without the user relaunching the app.
@@ -1814,6 +1822,40 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
   }, [ipc, receiveSnapshot]);
 
   /**
+   * The service row and the head, without the projection.
+   *
+   * The three reconcile intervals below exist to correct one word in the title
+   * bar and one row in 常规 -- and they ran on the whole snapshot, which on a
+   * published page is every settings document once per second for as long as a
+   * proxy replacement lasts.  That window is exactly the seconds after an edit
+   * that shapes the proxy, so the read meant to make the pane recover is the
+   * one that made it feel frozen.  Core's plan answer carries the service row
+   * and both revision numbers in about a kilobyte; the domains stay the ones
+   * this window already holds, and a real change to them still arrives as its
+   * own patch.
+   */
+  const refreshServiceState = useCallback(async (): Promise<void> => {
+    const held = latestSnapshot.current;
+    if (!held) {
+      await refreshSnapshot();
+      return;
+    }
+    let plan: StagedPlan;
+    try {
+      plan = await ipc.staged(APPLY_PLAN_DOMAINS);
+    } catch {
+      // A Core without the plan read answers the projection; this interval is
+      // the recovery path, so it falls back rather than leaving the pane on a
+      // state nothing can correct.
+      await refreshSnapshot();
+      return;
+    }
+    if (plan.revision < held.revision) return;
+    if (plan.revision === held.revision && plan.service.state === held.service.state) return;
+    receiveSnapshot({ ...held, revision: plan.revision, service: plan.service });
+  }, [ipc, receiveSnapshot, refreshSnapshot]);
+
+  /**
    * One event from Core, applied the way the event states it.
    *
    * A snapshot is the whole state; a patch is the rows and top-level fields an
@@ -2057,9 +2099,9 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
     // An interval, not a single timer: a successful re-read that still answers
     // "starting" leaves the revision unchanged, so a one-shot effect would
     // never run again and the pane would go back to waiting forever.
-    const timer = setInterval(() => { void refreshSnapshot().catch(() => undefined); }, SERVICE_STATE_RECONCILE_MS);
+    const timer = setInterval(() => { void refreshServiceState().catch(() => undefined); }, SERVICE_STATE_RECONCILE_MS);
     return () => clearInterval(timer);
-  }, [refreshSnapshot, snapshot?.revision, snapshot?.service.state]);
+  }, [refreshServiceState, snapshot?.revision, snapshot?.service.state]);
 
   useEffect(() => {
     // The mirror of the effect above: 运行中 is a claim about a process nobody
@@ -2074,29 +2116,18 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
     // without it.
     const settled = snapshot?.service.state;
     if (settled !== "running" && settled !== "unknown") return;
-    const timer = setInterval(() => {
-      void ipc.snapshot().then((next) => {
-        if (next.revision === acceptedSnapshotRevision.current && next.service.state === settled) return;
-        receiveSnapshot(next);
-      }).catch(() => undefined);
-    }, SERVICE_SETTLED_RECONCILE_MS);
+    const timer = setInterval(() => { void refreshServiceState().catch(() => undefined); }, SERVICE_SETTLED_RECONCILE_MS);
     return () => clearInterval(timer);
-  }, [ipc, receiveSnapshot, snapshot?.service.state]);
+  }, [refreshServiceState, snapshot?.service.state]);
 
   useEffect(() => {
     // The same re-read for the failure state, which Core repairs without this
     // window: a recovery can land with no revision this pane asked for, so an
     // unchanged revision must not keep the word on screen.
     if (snapshot?.service.state !== "unhealthy") return;
-    const observed = snapshot.service.state;
-    const timer = setInterval(() => {
-      void ipc.snapshot().then((next) => {
-        if (next.revision === acceptedSnapshotRevision.current && next.service.state === observed) return;
-        receiveSnapshot(next);
-      }).catch(() => undefined);
-    }, SERVICE_UNHEALTHY_RECONCILE_MS);
+    const timer = setInterval(() => { void refreshServiceState().catch(() => undefined); }, SERVICE_UNHEALTHY_RECONCILE_MS);
     return () => clearInterval(timer);
-  }, [ipc, receiveSnapshot, snapshot?.service.state]);
+  }, [refreshServiceState, snapshot?.service.state]);
 
   useEffect(() => {
     if (!isPrimaryHost || !snapshot || !serviceShouldBeRunning.current) return;
@@ -2778,7 +2809,39 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
 
   // Relay CRUD and linked imports are one coordinated draft. The relay route
   // therefore applies both domains together whenever either side is dirty.
-  const stagedDomainsForRoute = useCallback((currentSnapshot: CoreSnapshot | undefined): ConfigDomain[] => {
+  // What this route would write, read from the drafts alone.  A plan answers the
+  // same question the projection did, which is why this takes the draft half
+  // instead of a whole `CoreSnapshot`.
+  /**
+   * What one Apply writes, in the size of the question.
+   *
+   * `ipc.staged` is that answer, and the fallback is for a page that outlived
+   * one rollout: a Core without the plan read still knows the projection, and a
+   * window that cannot save an edit because it outran its Core is worse than a
+   * slow save.  The fallback is also the honest statement of what the plan is --
+   * the same facts, taken out of the whole projection.
+   */
+  const readCommitPlan = async (): Promise<StagedPlan> => {
+      try {
+        return await ipc.staged(APPLY_PLAN_DOMAINS);
+      } catch (reason: unknown) {
+        const code = stringValue(asRecord(reason).code);
+        if (code !== "unsupported_method" && code !== "invalid_domain" && code !== "domain_unavailable") throw reason;
+        const whole = await ipc.snapshot();
+        revision.current = Math.max(revision.current ?? -1, whole.revision);
+        latestSnapshot.current = whole;
+        onSnapshot(whole);
+        return {
+          revision: whole.revision,
+          projected_revision: whole.projected_revision ?? whole.revision,
+          service: whole.service,
+          drafts: whole.drafts,
+          disk: whole.disk,
+          risks: { claude: riskCodes(whole, "claude") },
+        };
+      }
+    };
+  const stagedDomainsForRoute = useCallback((currentSnapshot: { drafts: CoreSnapshot["drafts"] } | undefined): ConfigDomain[] => {
     if (settingsRoute) {
       // The external-settings pane stages the raw client documents of all
       // three owning domains together; one Apply writes every dirty file.
@@ -3125,15 +3188,14 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     // Relay credential cleanup needs the Core acknowledgement itself, not the
     // UI-oriented `dispatch` wrapper: that wrapper deliberately absorbs
     // failures so ordinary controls can display them in the footer.
+    //
+    // The dispatch answer is the commit point.  This used to read the whole
+    // projection after it as well, and a provider delete walks several of these
+    // in a row (the station, then each account's credentials): each read was
+    // every settings document on a host that is reached over a link, which is
+    // why removing one provider read as a frozen window.  What the staged edit
+    // changed reaches the pane as the patch Core publishes for it.
     await enqueueDispatch(type, payload, "relay_accounts");
-    // A successful dispatch is the commit point. Do not turn a subsequent
-    // snapshot refresh failure into a false "not committed" result that would
-    // leave credentials around forever; the subscription will reconcile it.
-    try {
-      await refresh();
-    } catch {
-      // The Core has already accepted the metadata transition.
-    }
   };
   const flushPendingFields = async (): Promise<void> => {
     // Text fields and native secret fields advance the same Core revision, but
@@ -3350,14 +3412,20 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       // fields lose focus. Wait for that queue before taking the apply
       // snapshot so the immediate apply writes the newest value.
       await dispatchQueue.current;
-      const refreshed = await ipc.snapshot();
-      revision.current = refreshed.revision;
-      onSnapshot(refreshed);
-      const domains = stagedDomainsForRoute(refreshed);
+      // The plan, not the projection.  An Apply needs the head revision, which
+      // domains carry a staged draft, and whether an external edit stands in
+      // front of one of them; reading the whole snapshot for those facts cost
+      // every settings document on every edit, which a window reached over a
+      // link pays in seconds while the same edit on a loopback host is instant.
+      // The state this Apply produces reaches the pane through the patch Core
+      // publishes for it, not through this read.
+      const plan = await readCommitPlan();
+      revision.current = plan.revision;
+      const domains = stagedDomainsForRoute(plan);
       if (domains.length === 0) return { cancelled: true };
-      const risks = domains.includes("claude") ? riskCodes(refreshed, "claude") : [];
-      const diskConflicts = domains.filter((name) => refreshed.disk[name]?.changed);
-      const unacknowledgedDiskConflicts = diskConflicts.filter((name) => !isEditableDiskDomain(name) || keptDiskGeneration[name] !== refreshed.disk[name]?.generation);
+      const risks = domains.includes("claude") ? plan.risks.claude ?? [] : [];
+      const diskConflicts = domains.filter((name) => plan.disk[name]?.changed);
+      const unacknowledgedDiskConflicts = diskConflicts.filter((name) => !isEditableDiskDomain(name) || keptDiskGeneration[name] !== plan.disk[name]?.generation);
       if (unacknowledgedDiskConflicts.length > 0) {
         const accepted = await native.showConfirmation({ title: translate("settings.diskChangedTitle"), message: translate("settings.overwriteDiskConfirm"), confirmLabel: translate("settings.keepDraft") });
         if (!accepted) return { cancelled: true };
@@ -3384,23 +3452,24 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       const APPLY_ATTEMPTS = 3;
       const settleBeforeRetry = (attempt: number): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, 40 * (attempt + 1)));
       let result: IpcResults["apply"] | undefined;
-      let nextRevision = refreshed.revision;
+      let nextRevision = plan.revision;
       for (let attempt = 0; result === undefined; attempt += 1) {
         try {
           result = await applyOnce(nextRevision);
         } catch (reason: unknown) {
           if (!isRevisionConflict(reason)) throw reason;
-          const current = await ipc.snapshot();
+          // A rebase asks the same three questions as the first attempt, so it
+          // reads the same plan rather than the projection: the head moved, and
+          // that is all this branch is about.
+          const current = await readCommitPlan();
           const currentDomains = stagedDomainsForRoute(current);
           const sameDomains = currentDomains.length === domains.length
             && domains.every((name) => currentDomains.includes(name));
           const sameDiskState = domains.every((name) => (
-            current.disk[name]?.changed === refreshed.disk[name]?.changed
-            && current.disk[name]?.generation === refreshed.disk[name]?.generation
+            current.disk[name]?.changed === plan.disk[name]?.changed
+            && current.disk[name]?.generation === plan.disk[name]?.generation
           ));
           revision.current = current.revision;
-          latestSnapshot.current = current;
-          onSnapshot(current);
           // The domains this Apply named are no longer staged at the newer
           // revision: the write it was racing already committed them, so the
           // outcome the user asked for exists. Report that instead of failing
@@ -3413,7 +3482,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
             // A revision that did not move forward names no committed write,
             // so the draft leaving staging there is somebody else's decision
             // and must stay visible.
-            if (!sameDiskState || current.revision < refreshed.revision) throw reason;
+            if (!sameDiskState || current.revision < plan.revision) throw reason;
             result = { revision: current.revision, applied: true, status: "applied", domains: [...domains], completed_operations: 0, pending_operations: 0, issues: [] };
             break;
           }
@@ -3429,10 +3498,8 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
             // was racing can land on the last attempt and its own event can
             // arrive after the reply that lost the revision.  A draft that is
             // no longer staged is the outcome the user asked for.
-            const settled = await ipc.snapshot();
+            const settled = await readCommitPlan();
             revision.current = settled.revision;
-            latestSnapshot.current = settled;
-            onSnapshot(settled);
             if (stagedDomainsForRoute(settled).length === 0) {
               result = { revision: settled.revision, applied: true, status: "applied", domains: [...domains], completed_operations: 0, pending_operations: 0, issues: [] };
               break;
@@ -3450,7 +3517,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
             throw reason;
           }
           await settleBeforeRetry(attempt);
-          nextRevision = (await ipc.snapshot()).revision;
+          nextRevision = (await readCommitPlan()).revision;
           revision.current = nextRevision;
         }
       }
@@ -3461,6 +3528,11 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       // applies on its own thread, so the pane never waits for the restart
       // and a later edit is not stuck behind it.
       if (diskConflicts.length > 0) setKeptDiskGeneration({});
+      // The answer names the revision this write produced, and this window now
+      // holds it: the caller's post-action check would otherwise read the whole
+      // projection back to learn a number the write already answered with.
+      // What the commit changed still arrives as its own patch.
+      if (result) revision.current = result.revision;
       return result;
     }, options?.silent ? null : (options?.message ?? "common.saved"), true, true, undefined, options?.quiet === true);
     applyInFlight.current = started;

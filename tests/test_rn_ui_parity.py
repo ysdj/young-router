@@ -562,7 +562,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '<SettingsRail',
             'await flushPendingFields();',
             "<SettingsActionRow",
-            'const stagedDomainsForRoute = useCallback((currentSnapshot: CoreSnapshot | undefined): ConfigDomain[] => {',
+            'const stagedDomainsForRoute = useCallback((currentSnapshot: { drafts: CoreSnapshot["drafts"] } | undefined): ConfigDomain[] => {',
             'if (settingsRoute) {',
             'return (["codex", "claude", "clients"] as const).filter((name) => currentSnapshot?.drafts[name]?.dirty);',
             'const dirtyDomains = stagedDomainsForRoute(current);',
@@ -596,11 +596,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )[0]
         self.assertIn('if ((!settingsRoute && !domain) || domain === "logs")', apply_body)
         self.assertIn('settingsRoute || route === "providers-models" || route === "data-management"', apply_body)
-        self.assertIn("stagedDomainsForRoute(refreshed)", apply_body)
+        # An Apply is planned from the commit screen, not from the projection:
+        # the whole state on every edit is what made a published page wait
+        # seconds for a control the native window applies at once.
+        self.assertIn("const plan = await readCommitPlan();", apply_body)
+        self.assertIn("stagedDomainsForRoute(plan)", apply_body)
+        self.assertNotIn("const refreshed = await ipc.snapshot();", apply_body)
 
     def test_settings_shell_applies_staged_domains_without_an_explicit_footer(self) -> None:
         for marker in (
-            'const stagedDomainsForRoute = useCallback((currentSnapshot: CoreSnapshot | undefined): ConfigDomain[] => {',
+            'const stagedDomainsForRoute = useCallback((currentSnapshot: { drafts: CoreSnapshot["drafts"] } | undefined): ConfigDomain[] => {',
             'const actionSnapshot = latestSnapshot.current && latestSnapshot.current.revision >= (snapshot?.revision ?? -1)',
             'const routeHasStagedChanges = useCallback((currentSnapshot: CoreSnapshot | undefined): boolean => (',
             'return (["providers_models", "relay_accounts"] as const).filter((name) => currentSnapshot?.drafts[name]?.dirty);',
@@ -722,7 +727,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )[0]
         self.assertIn('const applyOnce = (nextRevision: number): Promise<IpcResults["apply"]>', apply_body)
         self.assertIn('if (!isRevisionConflict(reason)) throw reason;', apply_body)
-        self.assertIn('const current = await ipc.snapshot();', apply_body)
+        self.assertIn('const current = await readCommitPlan();', apply_body)
         self.assertIn('const sameDomains = currentDomains.length === domains.length', apply_body)
         self.assertIn('const sameDiskState = domains.every((name) => (', apply_body)
         # One rebase was not enough while a proxy replacement was still
@@ -730,13 +735,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # later, and the write was lost with it.  The retry is bounded, and
         # the disk/domain guards still refuse a draft somebody else changed.
         self.assertIn('const APPLY_ATTEMPTS = 3;', apply_body)
-        self.assertIn('let nextRevision = refreshed.revision;', apply_body)
+        self.assertIn('let nextRevision = plan.revision;', apply_body)
         self.assertIn('result = await applyOnce(nextRevision);', apply_body)
-        self.assertIn('nextRevision = (await ipc.snapshot()).revision;', apply_body)
+        self.assertIn('nextRevision = (await readCommitPlan()).revision;', apply_body)
         self.assertIn('if (!sameDomains || !sameDiskState) throw reason;', apply_body)
         # The retries are spent: ask once more whether the write landed before
         # the strip states a save that did not happen.
-        self.assertIn('const settled = await ipc.snapshot();', apply_body)
+        self.assertIn('const settled = await readCommitPlan();', apply_body)
         self.assertIn('if (domains.every((name) => !currentDomains.includes(name))) {', apply_body)
         # A conflict that survives every rebase leaves a staged draft and
         # nothing that would try again — the debounce remembers the key it
@@ -764,7 +769,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # different section (the relay draft, kept dirty by its own backlog)
         # staying staged is not evidence that this write failed.
         self.assertIn("if (domains.every((name) => !currentDomains.includes(name))) {", apply_body)
-        self.assertIn("if (!sameDiskState || current.revision < refreshed.revision) throw reason;", apply_body)
+        self.assertIn("if (!sameDiskState || current.revision < plan.revision) throw reason;", apply_body)
         self.assertIn('status: "applied", domains: [...domains]', apply_body)
         # Two Applies for one edit move the revision under each other, and the
         # one that loses reports a save that happened as 更改未生效.  The
@@ -6381,13 +6386,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # with no control and no correction.
         self.assertIn("const SERVICE_STATE_RECONCILE_MS = 1_000;", self.ui)
         self.assertIn('if (snapshot.service.state !== "starting") return;', self.ui)
-        self.assertIn("const timer = setInterval(() => { void refreshSnapshot().catch(() => undefined); }, SERVICE_STATE_RECONCILE_MS);", self.ui)
+        # The reconcile exists to correct one word; reading the whole projection
+        # for it, once a second, is the wait it is meant to end.
+        self.assertIn("const timer = setInterval(() => { void refreshServiceState().catch(() => undefined); }, SERVICE_STATE_RECONCILE_MS);", self.ui)
         self.assertIn("return () => clearInterval(timer);", self.ui)
         # Every window that draws the state re-reads it: the 服务 row is drawn by
         # the settings window, which is not the primary host, so gating the
         # reconcile on the primary host made the one surface that shows the word
         # the one surface that could never correct it.
-        self.assertIn("  }, [refreshSnapshot, snapshot?.revision, snapshot?.service.state]);", self.ui)
+        self.assertIn("  }, [refreshServiceState, snapshot?.revision, snapshot?.service.state]);", self.ui)
         # A settled failure is re-read as well.  Core repairs an unhealthy
         # proxy without this window, so a pane that only polled while running
         # kept stating 不健康 (with 重启服务 beside it) over a proxy that had
@@ -6407,8 +6414,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # the same record.
         self.assertIn("const SERVICE_SETTLED_RECONCILE_MS = 15_000;", self.ui)
         self.assertIn('settled !== "running" && settled !== "unknown"', self.ui)
+        # The settled and unhealthy intervals read the plan too: the row they
+        # correct is one field of it, and a projection every 15 s is a page
+        # downloading its own settings for a word that did not change.
         self.assertIn(
-            "if (next.revision === acceptedSnapshotRevision.current && next.service.state === settled) return;",
+            "const timer = setInterval(() => { void refreshServiceState().catch(() => undefined); }, SERVICE_SETTLED_RECONCILE_MS);",
             self.ui,
         )
         self.assertIn('await dispatchServiceAction(serviceRestart ? "service.restart" : "service.start");', general)

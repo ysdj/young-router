@@ -408,7 +408,7 @@ class CoreProtocolTests(unittest.TestCase):
         schema = load_protocol_schema()
         self.assertEqual(1, schema["protocol_version"])
         self.assertEqual(
-            ["snapshot", "disk_state", "logs", "editor", "files", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import_preview", "import", "web_launch_url"],
+            ["snapshot", "staged", "disk_state", "logs", "editor", "files", "dispatch", "subscribe", "validate", "apply", "reload", "probe", "export", "import_preview", "import", "web_launch_url"],
             schema["methods"],
         )
         typescript = (
@@ -462,6 +462,7 @@ class CoreProtocolTests(unittest.TestCase):
     def test_runtime_enforces_every_method_params_schema(self) -> None:
         valid = {
             "snapshot": {},
+            "staged": {"domains": ["codex", "claude"]},
             "disk_state": {"domains": ["codex", "claude"]},
             "logs": {"tab": "requests"},
             "editor": {"domain": "codex", "document": "config"},
@@ -479,6 +480,7 @@ class CoreProtocolTests(unittest.TestCase):
         }
         invalid = {
             "snapshot": {"stale": True},
+            "staged": {"domains": []},
             "disk_state": {"domains": []},
             "logs": {"tab": "unknown"},
             "editor": {"domain": "runtime", "document": "config"},
@@ -533,6 +535,7 @@ class CoreProtocolTests(unittest.TestCase):
     def test_runtime_enforces_every_method_result_schema(self) -> None:
         valid = {
             "snapshot": {"snapshot": {}},
+            "staged": {"revision": 0, "projected_revision": 0, "service": {"state": "running"}, "drafts": {}, "disk": {}, "risks": {}},
             "disk_state": {"revision": 0, "disk": {}},
             "logs": {"changed": True, "revision": 1, "log": {"tab": "requests", "available": False, "paused": False, "line_count": 0, "records": [], "filter": "", "limit": 10000}},
             "editor": {"domain": "codex", "document": "config", "editor_token": "token", "revision": 0, "text": "model = \"example\"\n", "baseline": "model = \"example\"\n"},
@@ -573,6 +576,7 @@ class CoreProtocolTests(unittest.TestCase):
         }
         invalid = {
             "snapshot": {"snapshot": []},
+            "staged": {"revision": 0, "projected_revision": 0, "service": {}, "drafts": {}, "disk": {}, "risks": {"claude": [1]}},
             "disk_state": {"revision": -1, "disk": {}},
             "logs": {"changed": "yes", "revision": 1, "log": None},
             "editor": {"domain": "codex", "document": "config", "editor_token": "token", "revision": 0},

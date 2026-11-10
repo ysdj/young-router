@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import base64
 import binascii
+import gzip
 import hashlib
 import hmac
 import html
@@ -149,6 +150,13 @@ WEB_EDITOR_PAGE = "editor.html"
 #: cannot drift from its source: the script's name is its own digest, and the
 #: page names the editor's script by its own.
 WEB_ENCODINGS = (("br", ".br"), ("gzip", ".gz"))
+#: Smallest protocol answer worth compressing.
+#:
+#: A settings revision, a filtered log page and a commit plan are all smaller
+#: than this; a snapshot and a probe result are much larger.  Compressing the
+#: small ones spends CPU to save a packet, and one extra `\r\n` of framing is
+#: not what makes a window feel slow.
+COMPRESSIBLE_BODY_BYTES = 1024
 # The browser host is one built bundle of static files: the page, its script,
 # and whatever the script imports.  Anything else the listener would have to
 # guess, so it answers 404 instead.
@@ -757,6 +765,18 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         # A body this handler never read would otherwise become the next
         # request line on this kept-alive socket.
         self._consume_unread_body()
+        # A protocol answer is JSON, and the projection one of them carries is
+        # every settings document at once.  The page reaches this listener over
+        # whatever link it was opened from, so an uncompressed 183 KB snapshot
+        # is seconds of transfer where 25 KB is a blink.  A native host on the
+        # same machine sends no `Accept-Encoding` and keeps the plain bytes; a
+        # client that states the codec is the one that pays for decoding.
+        encoding = ""
+        accept_encoding = self.headers.get("Accept-Encoding", "")
+        if len(encoded) >= COMPRESSIBLE_BODY_BYTES and _accepts_encoding(accept_encoding, "gzip"):
+            compressed = gzip.compress(encoded, 6)
+            if len(compressed) < len(encoded):
+                encoded, encoding = compressed, "gzip"
         # An error also leaves the peer free to reuse the connection: the
         # framing is complete either way, and closing on every 4xx is what made
         # a rejected request cost a reconnect.
@@ -764,6 +784,9 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(encoded)))
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
+            self.send_header("Vary", "Accept-Encoding")
         if session_token:
             self.send_header("X-LiteLLM-Core-Session", session_token)
             self.send_header("Set-Cookie", self._browser_session_cookie_header(session_token))
@@ -2619,6 +2642,15 @@ class CoreIPCServer:
                 if url == "":
                     raise CoreError("web_unavailable", "The browser page is not being served")
                 result = {"url": url}
+            elif request.method == "staged":
+                # The screen one Apply reads: the head, the staged drafts, the
+                # disk markers and a domain's confirmation codes.  It exists so
+                # a remote window does not download every settings document to
+                # answer a question about three of them.
+                domains = params.get("domains")
+                if not isinstance(domains, list) or not domains or any(not isinstance(domain, str) for domain in domains):
+                    raise CoreError("invalid_domain", "The commit-plan domains are invalid")
+                result = self.core.commit_plan(domains)
             elif request.method == "disk_state":
                 domains = params.get("domains")
                 if not isinstance(domains, list) or not domains or any(not isinstance(domain, str) for domain in domains):

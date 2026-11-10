@@ -682,14 +682,19 @@ def make_patch_event(
     """Build an incremental event for the changes since ``base_revision``.
 
     ``ops`` is what a window applies; ``domains`` names the projections those
-    ops belong to so a window can tell which panes owe a repaint.  A patch that
-    names no domain or carries no op describes nothing a window could apply, so
-    it is refused here instead of arriving as a no-op the reader has to explain.
+    ops belong to so a window can tell which panes owe a repaint.  ``top_level``
+    carries the snapshot fields that are not keyed by domain and did change, by
+    name: a staged draft, the disk markers, the service row, an action summary.
+    A field that did not move is left out, so a patch stays the size of the edit
+    instead of becoming a snapshot with ops attached.
 
-    ``top_level`` carries the snapshot fields that are not keyed by domain and
-    did change, by name: a staged draft, the disk markers, the service row, an
-    action summary.  A field that did not move is left out, so a patch stays the
-    size of the edit instead of becoming a snapshot with ops attached.
+    Either half can be the whole event.  A commit that only staged a draft
+    names no row -- the draft *is* the projection a window draws -- and that
+    draft is a top-level field; refusing that shape ("no domain, no op") made
+    every ordinary toggle arrive as a resync, which is every window reading every
+    settings document.  A patch with neither half describes nothing a window
+    could apply and is still refused here, instead of arriving as a no-op the
+    reader has to explain.
     """
 
     base = _event_revision(base_revision, "patch base revision")
@@ -703,8 +708,6 @@ def make_patch_event(
             raise ProtocolError("invalid_event", "patch event names an unknown domain")
         if name not in names:
             names.append(name)
-    if not names:
-        raise ProtocolError("invalid_event", "patch event names no domain")
     payload_ops: list[dict[str, Any]] = []
     for op in ops:
         if not isinstance(op, Mapping):
@@ -723,8 +726,6 @@ def make_patch_event(
         if set(entry) - {"domain", "kind", "id", "value"}:
             raise ProtocolError("invalid_event", "patch event op carries an unknown field")
         payload_ops.append(entry)
-    if not payload_ops:
-        raise ProtocolError("invalid_event", "patch event carries no op")
     payload = {
         "protocol_version": PROTOCOL_VERSION,
         "event": "patch",
@@ -740,6 +741,8 @@ def make_patch_event(
             if not isinstance(value, Mapping):
                 raise ProtocolError("invalid_event", f"patch event {field} must be an object")
             payload[field] = dict(value)
+    if not payload_ops and not any(field in payload for field in PATCH_TOP_LEVEL_FIELDS):
+        raise ProtocolError("invalid_event", "patch event carries no change")
     _validate_json_value(payload)
     return payload
 

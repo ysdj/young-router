@@ -114,11 +114,18 @@ export function useDomainRecord(domain: ConfigDomain): Record<string, unknown> |
  * answer is the revision this window holds, that moved the revision, and that
  * arrives on a channel already delivering events needs no read at all.
  *
+ * A window that sat behind the revision its action started from used to count
+ * as another reason to read.  It is not: a patch states the revision it chains
+ * on, and one that does not chain onto the revision this window holds is a gap
+ * `receiveEvent` already answers with a read.  Asking the same question twice
+ * cost a full projection per edit on the host that pays for it over a link --
+ * the browser page downloaded every settings document before painting a toggle
+ * the native window paints in a millisecond.
+ *
  * Every other case keeps the read: a channel that has never delivered an event
  * may not be connected, an action that staged nothing (a read, a probe that
- * changed no state) produces no patch, a rebased answer is not the local head,
- * and a window that was already behind before the action has a gap only a full
- * projection closes.
+ * changed no state) produces no patch, and a rebased answer is not the local
+ * head.
  */
 export function postActionRefreshNeeded({ channel, revisionBefore, revisionAfter, localRevision }: {
   channel: EventChannelState;
@@ -130,6 +137,5 @@ export function postActionRefreshNeeded({ channel, revisionBefore, revisionAfter
   if (revisionBefore === undefined || revisionAfter === undefined || localRevision === undefined) return true;
   if (revisionAfter !== localRevision) return true;
   if (revisionAfter <= revisionBefore) return true;
-  if (channel.revision < revisionBefore) return true;
   return false;
 }

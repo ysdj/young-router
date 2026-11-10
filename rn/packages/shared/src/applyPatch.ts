@@ -127,7 +127,11 @@ export function applyPatch(snapshot: CoreSnapshot, event: PatchEvent): CoreSnaps
   // the very state the projection lacked.
   if (event.base_revision !== snapshotProjectionRevision(snapshot)) return undefined;
   if (!Number.isInteger(event.revision) || event.revision <= event.base_revision) return undefined;
-  if (!Array.isArray(event.domains) || !Array.isArray(event.ops) || event.ops.length === 0) return undefined;
+  // No op is a patch Core sends for a commit that staged a draft and moved no
+  // row: the draft is a top-level field, so `drafts` beside an empty op list is
+  // the whole event.  Refusing it sent every window to a full projection right
+  // after the edit that made the draft -- the read the patch exists to avoid.
+  if (!Array.isArray(event.domains) || !Array.isArray(event.ops)) return undefined;
 
   const domains = snapshot.domains;
   const touched = new Set<string>();
