@@ -1079,7 +1079,7 @@ class CoreOperationsTests(unittest.TestCase):
             enabled_key = "YOUNG_ROUTER_DSH_VISION_ROUTER_ENABLED"
             backend_key = "YOUNG_ROUTER_DSH_VISION_ROUTER_BACKEND"
 
-            fields = {item["key"]: item for item in domain.snapshot()["fields"]}
+            fields = {item["key"]: item for item in domain.snapshot()["settings"]}
             self.assertEqual("on", fields[enabled_key]["value"])
             self.assertEqual("on", fields[enabled_key]["default"])
             self.assertNotIn("inherit", fields[enabled_key]["options"])
@@ -1098,7 +1098,7 @@ class CoreOperationsTests(unittest.TestCase):
                 config_key,
                 json.dumps({"enabled": True, "backend": "local", "timeoutSeconds": 12}),
             )
-            fields = {item["key"]: item for item in domain.snapshot()["fields"]}
+            fields = {item["key"]: item for item in domain.snapshot()["settings"]}
             self.assertEqual("on", fields[enabled_key]["value"])
             self.assertEqual("local", fields[backend_key]["value"])
             self.assertEqual("12", fields["YOUNG_ROUTER_DSH_VISION_ROUTER_TIMEOUT_SECONDS"]["value"])
@@ -1571,7 +1571,7 @@ class CoreOperationsTests(unittest.TestCase):
                 environment = CoreServiceController(root)._runtime_env()
                 self.assertEqual("4401", environment["LITELLM_PORT"])
                 domain = RuntimeSettingsDomain(root / "runtime-settings.env", config_path=config)
-                field = next(item for item in domain.snapshot()["fields"] if item["id"] == "LITELLM_PORT")
+                field = next(item for item in domain.snapshot()["settings"] if item["id"] == "LITELLM_PORT")
                 self.assertEqual("4401", field["value"])
                 self.assertTrue(field["host_stated"])
                 with self.assertRaisesRegex(DomainError, "host states its port"):
@@ -1583,7 +1583,7 @@ class CoreOperationsTests(unittest.TestCase):
                 os.environ.pop("YOUNG_ROUTER_HOST_PROFILE", None)
                 self.assertEqual("12390", CoreServiceController(root)._runtime_env()["LITELLM_PORT"])
                 desktop = RuntimeSettingsDomain(root / "runtime-settings.env", config_path=config)
-                field = next(item for item in desktop.snapshot()["fields"] if item["id"] == "LITELLM_PORT")
+                field = next(item for item in desktop.snapshot()["settings"] if item["id"] == "LITELLM_PORT")
                 self.assertEqual("12390", field["value"])
                 self.assertFalse(field["host_stated"])
                 desktop.dispatch("set_setting", {"key": "LITELLM_PORT", "value": "5000"})

@@ -37,6 +37,11 @@ import Foundation
     }
 
     private let lock = NSLock()
+    // Serializes the whole "replace Core" path.  It is separate from `lock`
+    // because starting a Core waits for a process: holding `lock` there would
+    // stop even a session-renewal write-back.  Nothing takes `lock` before
+    // asking for this one, so the two cannot deadlock.
+    private let startLock = NSLock()
     private let stoppingLock = NSLock()
     private static let relayLoginTimeout: TimeInterval = 60
     private static let coreShutdownTimeout: TimeInterval = 4
@@ -679,59 +684,204 @@ import Foundation
         return (session, Date().addingTimeInterval(expiresIn.doubleValue))
     }
 
-    private func ensureSession() throws -> (Endpoint, String, Int, Bool) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !isStopping() else { throw BridgeError.unavailable }
+    /// The live session, when its lease has more than the renewal margin left.
+    /// Only the fields a caller needs are answered: callers hold `lock` here and
+    /// release it before doing anything that can block.
+    private func freshSessionLocked() -> (endpoint: Endpoint, token: String, generation: Int)? {
         if let endpoint, let sessionToken, let sessionExpiresAt,
            sessionExpiresAt.timeIntervalSinceNow > 15 {
-            return (endpoint, sessionToken, generation, false)
+            return (endpoint, sessionToken, generation)
         }
-        if let endpoint, let sessionToken {
-            if let renewed = try? exchangeSession(endpoint: endpoint, credential: sessionToken) {
-                self.sessionToken = renewed.token
-                self.sessionExpiresAt = renewed.expiresAt
-                return (endpoint, renewed.token, generation, false)
-            }
-            // A renewal is a request like any other, so ask once more before
-            // throwing the process away: the Core may have been busy with the
-            // proxy replacement this app is waiting for, and discarding it here
-            // is what stopped that replacement mid-start.
-            if let renewed = try? exchangeSession(
+        return nil
+    }
+
+    /// The session to answer with, when one is usable without any round trip.
+    /// Callers hold `lock`.  `observedGeneration` is the generation the caller
+    /// already looked at, and `restarted` says whether the Core changed since --
+    /// which is what a subscription has to be re-established for.  A caller that
+    /// has not looked yet passes the current generation and gets `restarted:
+    /// false`.
+    private func usableSessionLocked(observedGeneration: Int) -> (Endpoint, String, Int, Bool)? {
+        guard let live = freshSessionLocked() else { return nil }
+        let restarted = live.generation != observedGeneration && subscriptionRequest != nil
+        return (live.endpoint, live.token, live.generation, restarted)
+    }
+
+    /// Renew `credential` and adopt the result when nothing replaced that Core
+    /// meanwhile.
+    ///
+    /// Called with neither `lock` nor `startLock` held: a renewal is a loopback
+    /// round trip, and ten windows renewing at the same moment must not queue
+    /// behind each other.  Returns nil when the Core this credential belongs to
+    /// is gone, which is the caller's cue to start a new one.
+    private func renewedSession(
+        endpoint: Endpoint,
+        credential: String,
+        generation: Int
+    ) -> (token: String, expiresAt: Date)? {
+        // A renewal is a request like any other, so ask once more with the
+        // liveness bound before throwing the process away: the Core may be busy
+        // with the proxy replacement this app is waiting for, and discarding it
+        // here is what stopped that replacement mid-start.
+        let renewed = (try? exchangeSession(endpoint: endpoint, credential: credential))
+            ?? (try? exchangeSession(
                 endpoint: endpoint,
-                credential: sessionToken,
+                credential: credential,
                 timeoutInterval: Self.coreLivenessTimeout
-            ) {
-                self.sessionToken = renewed.token
-                self.sessionExpiresAt = renewed.expiresAt
-                return (endpoint, renewed.token, generation, false)
-            }
+            ))
+        guard let renewed else { return nil }
+        lock.lock()
+        // Write back only into the session that was renewed: another thread may
+        // have replaced this Core while the round trip ran, and a token minted by
+        // the process that is already gone would fail every later request.
+        let current = self.generation == generation
+        if current {
+            sessionToken = renewed.token
+            sessionExpiresAt = renewed.expiresAt
+        }
+        lock.unlock()
+        return current ? renewed : nil
+    }
+
+    /// One Core session, read under `lock` and used after it is released.
+    ///
+    /// Renewing a session and starting a Core are the two things that used to
+    /// hold the bridge lock across a network round trip and a ten-second
+    /// process launch, which queued every window's next request behind them.
+    /// Both now run with the lock released; `generation` is what decides
+    /// whether the result is still the Core this caller was talking to.
+    private func ensureSession() throws -> (Endpoint, String, Int, Bool) {
+        lock.lock()
+        guard !isStopping() else {
+            lock.unlock()
+            throw BridgeError.unavailable
+        }
+        if let live = usableSessionLocked(observedGeneration: self.generation) {
+            lock.unlock()
+            return live
+        }
+        let endpoint = self.endpoint
+        let sessionToken = self.sessionToken
+        let generation = self.generation
+        lock.unlock()
+
+        if let endpoint, let sessionToken,
+           let renewed = renewedSession(endpoint: endpoint, credential: sessionToken, generation: generation) {
+            return (endpoint, renewed.token, generation, false)
+        }
+        return try startSession(observedGeneration: generation)
+    }
+
+    /// Install a working session, replacing Core when none is left.
+    ///
+    /// Every caller that needs a new Core passes through `startLock` and then
+    /// re-reads the session under `lock`: a window's first request and the
+    /// warm-up arrive here together, and the second to arrive must return the
+    /// Core the first one started instead of starting a second process. Neither
+    /// `lock` nor `startLock` is held across the process launch or the bootstrap
+    /// exchange -- together they are the ten-second startup wait.
+    private func startSession(observedGeneration: Int) throws -> (Endpoint, String, Int, Bool) {
+        startLock.lock()
+        defer { startLock.unlock() }
+
+        lock.lock()
+        guard !isStopping() else {
+            lock.unlock()
+            throw BridgeError.unavailable
+        }
+        // The thread that held `startLock` before us may have produced the
+        // session this caller needed.
+        if let live = usableSessionLocked(observedGeneration: observedGeneration) {
+            lock.unlock()
+            return live
+        }
+        let existingEndpoint = self.endpoint
+        let existingToken = self.sessionToken
+        let existingGeneration = self.generation
+        lock.unlock()
+
+        // A session that is merely near its expiry is renewed, never thrown away
+        // with its Core: this host reads the wall clock while Core counts with a
+        // monotonic one, so an expiry this side has already passed can still be
+        // alive there (a long sleep moves one and not the other).
+        if let existingEndpoint, let existingToken,
+           let renewed = renewedSession(
+               endpoint: existingEndpoint,
+               credential: existingToken,
+               generation: existingGeneration
+           ) {
+            return (existingEndpoint, renewed.token, existingGeneration, false)
         }
 
+        lock.lock()
+        guard !isStopping() else {
+            lock.unlock()
+            throw BridgeError.unavailable
+        }
+        // A renewal another thread completed while ours was failing is still a
+        // session; starting a Core over it would stop one that is answering.
+        if let live = usableSessionLocked(observedGeneration: observedGeneration) {
+            lock.unlock()
+            return live
+        }
         let shouldRecoverSubscription = subscriptionRequest != nil
         pollCancelled = true
         subscriptionID = nil
         let (staleProcess, staleDirectory) = discardCoreLocked()
-        stopCoreProcess(staleProcess, directory: staleDirectory)
         generation += 1
         let sessionGeneration = generation
+        lock.unlock()
+
+        // The old process has to be gone before the new one binds the same
+        // port, and waiting for that plus the launch is exactly what must not
+        // happen under `lock`.
+        stopCoreProcess(staleProcess, directory: staleDirectory)
+        let launched = try startCore()
+        let session: (token: String, expiresAt: Date)
         do {
-            let endpoint = try startCoreLocked()
-            let session = try exchangeSession(endpoint: endpoint, credential: endpoint.bootstrapToken)
-            self.endpoint = endpoint
-            self.sessionToken = session.token
-            self.sessionExpiresAt = session.expiresAt
-            self.pollCancelled = false
-            return (endpoint, session.token, sessionGeneration, shouldRecoverSubscription)
+            session = try exchangeSession(
+                endpoint: launched.endpoint,
+                credential: launched.endpoint.bootstrapToken
+            )
         } catch {
-            let (failedProcess, failedDirectory) = discardCoreLocked()
-            stopCoreProcess(failedProcess, directory: failedDirectory)
+            stopCoreProcess(launched.process, directory: launched.directory)
             throw error
         }
+
+        lock.lock()
+        // `stop()` or a generation bump may have landed while the process was
+        // starting; adopting its endpoint then would leave a Core nothing
+        // points at and no one stops.
+        let registered = !isStopping() && generation == sessionGeneration
+        if registered {
+            endpoint = launched.endpoint
+            process = launched.process
+            coreDirectory = launched.directory
+            sessionToken = session.token
+            sessionExpiresAt = session.expiresAt
+            pollCancelled = false
+        }
+        lock.unlock()
+        guard registered else {
+            stopCoreProcess(launched.process, directory: launched.directory)
+            throw BridgeError.unavailable
+        }
+        return (launched.endpoint, session.token, sessionGeneration, shouldRecoverSubscription)
     }
 
-    private func startCoreLocked() throws -> Endpoint {
-        if let endpoint { return endpoint }
+    /// One launched Core, owned by the caller until it is registered.
+    private struct LaunchedCore {
+        let endpoint: Endpoint
+        let process: Process
+        let directory: URL
+    }
+
+    /// Launch one Core and wait for it to publish its loopback endpoint.
+    ///
+    /// Called with no bridge lock held: the wait is `coreStartupTimeout` and the
+    /// caller registers the result afterwards.  Failure stops whatever this
+    /// function started, so a caller only has to clean up a launch it received.
+    private func startCore() throws -> LaunchedCore {
         let fileManager = FileManager.default
         let directory = fileManager.temporaryDirectory.appendingPathComponent("young-router-core-\(UUID().uuidString)", isDirectory: true)
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -811,9 +961,11 @@ import Foundation
                (1...65535).contains(port),
                let bootstrapToken = raw["bootstrap_token"] as? String,
                !bootstrapToken.isEmpty {
-                self.process = process
-                self.coreDirectory = directory
-                return Endpoint(address: address, port: port, bootstrapToken: bootstrapToken)
+                return LaunchedCore(
+                    endpoint: Endpoint(address: address, port: port, bootstrapToken: bootstrapToken),
+                    process: process,
+                    directory: directory
+                )
             }
             Thread.sleep(forTimeInterval: 0.05)
         }

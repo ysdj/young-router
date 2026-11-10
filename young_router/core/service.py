@@ -13,6 +13,7 @@ in unit tests and from the local IPC server without importing LiteLLM itself.
 from __future__ import annotations
 
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import copy
 from dataclasses import dataclass, field
 import hashlib
@@ -32,10 +33,23 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
+from .emitter import CoalescingEmitter
+from .entity_ops import MAX_PATCH_OPS, EntityOp, domain_diff
 from .log_tabs import LOG_TABS
 from .oplog import note as _note
 from .persistence import AtomicJSONStore, PersistenceError, atomic_write_bytes, atomic_write_json, read_bytes, read_json
-from .protocol import MAX_EDITOR_DOCUMENT_BYTES, PROTOCOL_VERSION, ProtocolError, is_error_code, make_event
+from .protocol import (
+    MAX_EDITOR_DOCUMENT_BYTES,
+    PATCH_TOP_LEVEL_FIELDS,
+    PROTOCOL_VERSION,
+    ProtocolError,
+    _encode_json,
+    is_error_code,
+    make_event,
+    make_job_event,
+    make_patch_event,
+    make_resync_event,
+)
 from .security import REDACTED, _key_text, redact, safe_exception_message, safe_error_message
 
 
@@ -45,6 +59,17 @@ PACKAGE_VERSION = 1
 DOMAIN_FILE_FORMAT = "young-router-domain-settings"
 DOMAIN_FILE_VERSION = 1
 SUBSCRIPTION_QUEUE_LIMIT = 32
+
+#: How many long-running operations may be in flight at once.  They are the
+#: operations that used to hold the write lane across a network round trip --
+#: a probe of one provider, a probe of a station -- so two of them is what a
+#: person actually starts; more would only multiply the requests one station
+#: sees.  A queued job still answers with its id immediately.
+JOB_POOL_WORKERS = 2
+
+
+class _PatchUnavailable(Exception):
+    """A revision moved in a way no entity-level patch can describe."""
 
 # How often the thread that ends abandoned sign-ins looks.  Shorter than the
 # idle timeout by a wide margin so a forgotten browser is closed within a tick
@@ -245,6 +270,11 @@ class DomainAdapter(Protocol):
 
     def reload(self) -> Mapping[str, Any] | None: ...
 
+    # Optional: a domain that can name its own entities implements this and
+    # lightens every event it appears in.  A domain that does not is published
+    # as one ``replace`` op by ``entity_ops.domain_diff``.
+    def diff(self, previous: Mapping[str, Any], current: Mapping[str, Any]) -> list[EntityOp]: ...
+
 
 @dataclass(frozen=True)
 class FileCapability:
@@ -364,6 +394,100 @@ def _safe_public(value: object) -> object:
     if value is None or value is True or value is False or type(value) is int or type(value) is float or type(value) is str:
         return value
     return copy.deepcopy(value)
+
+
+# What each domain's action answer may leave in the snapshot's
+# ``action_summaries`` slot.  A domain's dispatch answers with its whole
+# projection -- ``providers_models`` includes every provider and route -- and
+# storing that verbatim made the slot a second copy of the domain: one
+# ``provider.add`` patch measured 6,993 B of ``action_summaries`` against 558 B
+# of ops at fourteen providers.  A pane reads the summary a named operation
+# produced (``operation_summary``), and a relay detection reads the type it
+# names; every other key is state the patch already carries as ops.
+_ACTION_SUMMARY_FIELDS: dict[str, frozenset[str]] = {
+    "providers_models": frozenset({"operation_summary"}),
+    # A detection's type and confidence are one answer, and the resource status
+    # is what the refresh pane reads back for the same action.
+    "relay_accounts": frozenset({"detected_type", "confidence", "resource_status"}),
+}
+_DEFAULT_ACTION_SUMMARY_FIELDS = frozenset({"operation_summary"})
+
+#: Relay actions whose write also releases linked provider slots.
+#: Removing a station or a key, and aligning a key group, retires the provider
+#: keys and routes that pointed at the retired material, so the transaction
+#: writes both domains and must declare both write lanes.
+_RELAY_DEPENDENCY_ACTIONS = frozenset(
+    {
+        "station_remove",
+        "relay_station_remove",
+        "remove_station",
+        "account_remove",
+        "relay_account_remove",
+        "remove_account",
+        "api_key_delete",
+        "relay_api_key_delete",
+        "account_api_key_delete",
+        "api_key_detach",
+        "relay_api_key_detach",
+        "account_api_key_detach",
+        # Alignment retires the keys whose group the station dropped, exactly
+        # as an explicit delete does, so the linked provider slots and their
+        # routes have to be released before the station is called.  Without
+        # this the remote key was gone while the document still pointed at it:
+        # the pane listed the dangling key and its route kept answering with a
+        # credential the station had already revoked.
+        "api_key_set_auto_grouping",
+        "relay_api_key_set_auto_grouping",
+        "account_api_key_set_auto_grouping",
+        "account_set_auto_grouping",
+        "relay_account_set_auto_grouping",
+        "api_key_auto_group_align",
+        "relay_api_key_auto_group_align",
+        "account_auto_group_align",
+        "relay_account_auto_group_align",
+    }
+)
+
+#: Provider actions that read relay-side material: the binding source of a
+#: key, the key material behind a route, the slot credentials an already-linked
+#: key holds.  They write the provider draft while reading the relay domain, so
+#: they declare both lanes.
+_PROVIDER_RELAY_RESOURCE_ACTIONS = frozenset(
+    {
+        "provider_import_relay_key",
+        "model_select_relay_resource",
+        "provider_fetch_relay_resource_models",
+    }
+)
+
+#: Provider actions that resolve a station's own identity from the relay
+#: domain before touching the provider draft.
+_PROVIDER_RELAY_STATION_ACTIONS = frozenset({"provider_select_relay_station"})
+
+#: Relay actions that stage the account's resources into the provider draft.
+_RELAY_RESOURCE_IMPORT_ACTIONS = frozenset(
+    {
+        "resources_import",
+        "relay_resources_import",
+        "account_resources_import",
+    }
+)
+
+
+def _action_summary_entry(name: str, result: object) -> dict[str, Any]:
+    """Keep only the keys a client reads from one dispatch's answer.
+
+    ``action_summaries`` is a slot for the answer to the last action, not a
+    second projection: the state half of the answer already travels as the
+    patch's ops.  The write point is where the distinction is known, so a
+    domain that starts returning something new does not quietly re-inflate
+    every later patch.
+    """
+
+    if not isinstance(result, Mapping):
+        return {}
+    fields = _ACTION_SUMMARY_FIELDS.get(name, _DEFAULT_ACTION_SUMMARY_FIELDS)
+    return {key: value for key, value in result.items() if key in fields}
 
 
 def _relay_binding_projection(state: object) -> list[tuple[str, ...]]:
@@ -1227,13 +1351,26 @@ class CoreStore:
         our_free_model_runtime: object | None = None,
     ) -> None:
         # ``_lock`` is the state lock: short critical sections only (see
-        # ``_BudgetLock``).  ``_mutation`` serializes whole mutations -- a
-        # dispatch, an Apply, a reload -- and is allowed to span remote work:
-        # it is not the lock every window needs for its next frame.
+        # ``_BudgetLock``).  ``_mutation`` is the cross-domain transaction
+        # lane: a commit that writes more than one domain -- an Apply, a WebDAV
+        # pull, a relay removal that also releases provider slots -- holds it
+        # for the whole transaction, and it is allowed to span remote work.
+        # One domain's ordinary write takes only that domain's lock (see
+        # ``_domain_scope``), so a probe cannot queue an unrelated edit behind
+        # it.  Neither lock is the one every window needs for its next frame.
         self._lock = _BudgetLock()
         self._mutation = threading.RLock()
         self._mutation_owner: int | None = None
         self._mutation_depth = 0
+        # One lock per registered domain: the write lane an edit in that domain
+        # holds, and the only lane an unrelated domain's edit waits on.
+        self._domain_locks: dict[str, threading.RLock] = {}
+        # Which threads are inside a domain write, by ident and nesting depth.
+        # A projection reads all domains at once, so any *other* holder means
+        # the projection must answer the last committed view instead of reading
+        # a domain mid-write -- the same rule ``_mutation_owner`` enforces for
+        # cross-domain transactions.
+        self._domain_holds: dict[int, int] = {}
         self._metadata_store = AtomicJSONStore(metadata_path) if metadata_path else None
         self.file_capabilities = file_capabilities or FileCapabilityRegistry()
         self._service_handlers = dict(service_handlers or {})
@@ -1251,6 +1388,11 @@ class CoreStore:
         self._baselines: dict[str, object] = {}
         self._drafts: dict[str, dict[str, Any]] = {}
         self._subscribers: dict[str, Callable[[dict[str, Any]], None]] = {}
+        # Publishing is off the mutation lane: a commit marks an event pending
+        # here and the emitter thread projects and fans it out once the burst
+        # settles.  ``_emit`` is still the send itself; the lambda is what
+        # makes it the one a test replaced by the time the window expires.
+        self._emitter = CoalescingEmitter(lambda: self._emit())
         self._revision = 0
         # The last domain projection and the revision it describes: a
         # window that is catching up asks for a revision it already
@@ -1261,6 +1403,27 @@ class CoreStore:
         # adapter state that mutation is rewriting; the adapter projections
         # are only consistent under the mutation that owns them.
         self._snapshot_view: dict[str, Any] | None = None
+        # What the last published event left a window holding, and the revision
+        # it carried: the next event is the patch that takes a window from here
+        # to the store's current state.  It is the whole projection, not only
+        # its domains, because the fields a window cannot derive from an op (a
+        # staged draft, the disk markers, the service row, an action summary)
+        # have to be compared against what the windows already hold.  ``None``
+        # means no window has received a full state from this store yet, so the
+        # next event must be one (first subscription, or a gap that reset the
+        # chain).
+        self._last_published_projection: dict[str, Any] | None = None
+        self._last_published_revision = 0
+        # One send at a time, so two publishers cannot both compute a patch
+        # against the same base and record their answers out of order.  Reentrant
+        # because a subscriber's own callback may publish on this thread.
+        self._publish_guard = threading.RLock()
+        # Long-running operations (a probe) run here, off the request thread:
+        # the caller gets a job id at once and the answer arrives as a ``job``
+        # event, so a slow upstream costs its own read rather than the write
+        # lane every window edits on.
+        self._job_guard = threading.Lock()
+        self._job_pool: ThreadPoolExecutor | None = None
         self._service: dict[str, Any] = {"state": "unknown"}
         # Post-apply proxy restarts take several seconds; they run on their own
         # thread so the committed edit and every later IPC request stay fast.
@@ -1351,7 +1514,13 @@ class CoreStore:
 
     @contextlib.contextmanager
     def _mutation_scope(self):
-        """Hold the serialization lock for one whole state mutation.
+        """Hold the cross-domain transaction lane for one whole mutation.
+
+        This is what an Apply, a WebDAV pull, a relay removal that also
+        rewrites provider slots, and a proxy lifecycle operation take: they
+        write several domains as one transaction, so they must exclude every
+        other writer.  A write that touches one domain uses ``_domain_scope``
+        instead and never waits on this lane.
 
         The owner is published under the state lock before the mutation
         touches anything, so a ``snapshot`` either takes its projection first
@@ -1360,12 +1529,16 @@ class CoreStore:
         observe a domain halfway through a dispatch.
         """
 
-        ident = threading.get_ident()
-        self._mutation.acquire()
-        with self._lock:
-            if self._mutation_depth == 0:
-                self._mutation_owner = ident
-            self._mutation_depth += 1
+        if self._holds_domain_locks():
+            # A cross-domain operation nested inside a domain write (a commit
+            # that stages a relay import from inside its own dispatch): the
+            # domain locks it already holds are its serialization, and waiting
+            # for the lane here would take the two locks in the opposite order
+            # from a cross-domain commit -- the one way this design can
+            # deadlock.  Nothing is yielded under a lock it did not already own.
+            yield
+            return
+        self._acquire_mutation_lane()
         try:
             if self._mutation_depth == 1 and self._snapshot_view is None:
                 # The first mutation of a Core's life may land before any
@@ -1376,11 +1549,205 @@ class CoreStore:
                 self._publish_initial_snapshot_view()
             yield
         finally:
+            self._release_mutation_lane()
+
+    def _acquire_mutation_lane(self) -> None:
+        """Take the transaction lane and publish this thread as its owner."""
+
+        ident = threading.get_ident()
+        self._mutation.acquire()
+        with self._lock:
+            if self._mutation_depth == 0:
+                self._mutation_owner = ident
+            self._mutation_depth += 1
+
+    def _release_mutation_lane(self) -> None:
+        """Release the transaction lane and its ownership record."""
+
+        with self._lock:
+            self._mutation_depth -= 1
+            if self._mutation_depth == 0:
+                self._mutation_owner = None
+        self._mutation.release()
+
+    def _domain_lock(self, name: str) -> threading.RLock:
+        """The write lane for one domain, created the first time it is needed.
+
+        ``register_domain`` creates it, so a registered domain always has its
+        own; this also answers for a name a caller declared but never
+        registered (the operation then fails with ``domain_not_found`` while
+        holding it, which is what the single-lane form did too).
+        """
+
+        with self._lock:
+            lock = self._domain_locks.get(name)
+            if lock is None:
+                lock = threading.RLock()
+                self._domain_locks[name] = lock
+            return lock
+
+    def _domain_names(self) -> list[str]:
+        """Every registered domain, in the order scopes declare them."""
+
+        with self._lock:
+            return sorted(self._domains)
+
+    def _ordered_domain_locks(self, names: Iterable[str]) -> list[threading.RLock]:
+        """The locks one scope declares, deduplicated and in the fixed order.
+
+        Every multi-domain scope takes its locks by sorted name.  That is what
+        makes two overlapping cross-domain commits impossible to interleave in
+        opposite orders.
+        """
+
+        ordered = sorted({name for name in names if isinstance(name, str) and name})
+        return [self._domain_lock(name) for name in ordered]
+
+    def _all_domain_locks(self) -> list[threading.RLock]:
+        with self._lock:
+            return [self._domain_locks[name] for name in sorted(self._domain_locks)]
+
+    def _holds_domain_locks(self) -> bool:
+        ident = threading.get_ident()
+        with self._lock:
+            return self._domain_holds.get(ident, 0) > 0
+
+    def _note_domain_hold(self, delta: int) -> None:
+        ident = threading.get_ident()
+        with self._lock:
+            depth = self._domain_holds.get(ident, 0) + delta
+            if depth > 0:
+                self._domain_holds[ident] = depth
+            else:
+                self._domain_holds.pop(ident, None)
+
+    def _foreign_domain_writer(self) -> bool:
+        """Whether another thread is inside a domain write right now."""
+
+        ident = threading.get_ident()
+        with self._lock:
+            return any(holder != ident for holder in self._domain_holds)
+
+    @contextlib.contextmanager
+    def _domain_scope(self, *names: str):
+        """Hold the write lane of every named domain for one mutation.
+
+        One name is the ordinary case: a dispatch, an Apply of one section, a
+        reload, a probe's commit.  It takes exactly that domain's lock, so a
+        slow operation in another domain -- a relay login or a WebDAV round
+        trip, which used to hold the one global lane for their whole network
+        call -- can no longer queue an edit behind it.
+
+        Several names are a cross-domain action, which must declare the whole
+        set it writes (``relay_accounts``, ``providers_models`` for a removal
+        that releases linked slots).  Those also take ``_mutation``, so the
+        transaction is still serialized against every other cross-domain
+        commit, and they take the domain locks in sorted order so two of them
+        can never interleave in opposite orders.
+
+        A scope entered while the thread already holds a domain lock is the
+        nested case (an Apply validating one section, an editor stage whose
+        dispatch is the actual write).  It takes only the locks it names, in
+        the fixed order, and never reaches back for the transaction lane: a
+        thread may hold the lane and then domain locks, never the other way
+        around.
+        """
+
+        ordered = [_canonical_domain(name) for name in names if isinstance(name, str) and name]
+        nested = self._holds_domain_locks()
+        if not nested:
+            # The first write of a Core's life may beat every reader to it.
+            self._publish_snapshot_view_if_absent()
+        lane = False
+        if len(set(ordered)) > 1 and not self._holds_domain_locks():
+            self._acquire_mutation_lane()
+            lane = True
+        locks = self._ordered_domain_locks(dict.fromkeys(ordered)) if ordered else []
+        for lock in locks:
+            lock.acquire()
+        self._note_domain_hold(1)
+        try:
+            yield
+        finally:
+            self._note_domain_hold(-1)
+            for lock in reversed(locks):
+                lock.release()
+            if lane:
+                self._release_mutation_lane()
+
+    @contextlib.contextmanager
+    def _projection_scope(self, *, wait: bool = True):
+        """Hold the read lane one projection needs: no domain mid-write.
+
+        A projection walks every domain, so it must not read one while a
+        writer is halfway through it -- that is exactly the half-written state
+        ``snapshot`` promises never to publish.  It therefore takes the
+        transaction lane and every domain lock, in that order and in the same
+        sorted order every cross-domain commit uses.
+
+        ``wait=False`` is the reader's first attempt: the caller answers the
+        last committed view instead of queueing behind a write.  ``owned`` is
+        false in that case and the caller must not project.
+
+        A caller that already holds domain locks is inside a write (the only
+        such caller is a direct ``_emit`` from a mutation that is about to
+        publish): projecting its own state is the answer, and reaching for the
+        remaining domain locks would invert the lock order.
+        """
+
+        if self._holds_domain_locks():
+            # Already inside a write; the same projection is what its caller
+            # asked for.  Nothing further to take.
+            acquired = self._mutation.acquire(blocking=wait)
+            if not acquired:
+                yield False
+                return
+            ident = threading.get_ident()
+            with self._lock:
+                if self._mutation_depth == 0:
+                    self._mutation_owner = ident
+                self._mutation_depth += 1
+            try:
+                yield True
+            finally:
+                with self._lock:
+                    self._mutation_depth -= 1
+                    if self._mutation_depth == 0:
+                        self._mutation_owner = None
+                self._mutation.release()
+            return
+        if not self._mutation.acquire(blocking=wait):
+            yield False
+            return
+        ident = threading.get_ident()
+        with self._lock:
+            if self._mutation_depth == 0:
+                self._mutation_owner = ident
+            self._mutation_depth += 1
+        locks = self._all_domain_locks()
+        for lock in locks:
+            lock.acquire()
+        self._note_domain_hold(1)
+        try:
+            yield True
+        finally:
+            self._note_domain_hold(-1)
+            for lock in reversed(locks):
+                lock.release()
             with self._lock:
                 self._mutation_depth -= 1
                 if self._mutation_depth == 0:
                     self._mutation_owner = None
             self._mutation.release()
+
+    def _publish_snapshot_view_if_absent(self) -> None:
+        """Give a reader something to answer with before the first write lands."""
+
+        with self._lock:
+            if self._snapshot_view is not None:
+                return
+        with self._projection_scope():
+            self._publish_initial_snapshot_view()
 
     def _publish_initial_snapshot_view(self) -> None:
         """Publish the pre-mutation projection for readers that arrive later."""
@@ -1729,6 +2096,8 @@ class CoreStore:
             # Worker shutdown stops child processes: seconds of waiting that
             # no snapshot may be queued behind.
             self._stop_managed_workers()
+            self.stop_jobs()
+            self._emitter.stop()
             return dict(self._service)
         acquired = self._service_transition_guard.acquire(
             timeout=self._SERVICE_TRANSITION_SHUTDOWN_WAIT_SECONDS
@@ -1746,6 +2115,9 @@ class CoreStore:
             self._set_service_from_result(result, increment=False)
             self._persist_metadata(stopped_by=stopped_by)
         self._stop_managed_workers()
+        self.stop_jobs()
+        # A commit that landed just before this quit still owes its event.
+        self._emitter.stop()
         return dict(self._service)
 
     def _stop_managed_workers(self) -> None:
@@ -1807,6 +2179,9 @@ class CoreStore:
             raise CoreError("invalid_domain", "The settings domain is unavailable")
         with self._lock:
             self._domains[name] = adapter
+            # Every registered domain owns a write lane from registration on, so
+            # a scope declared for it can never race its own creation.
+            self._domain_locks.setdefault(name, threading.RLock())
             current = self._adapter_draft_state(name)
             self._baselines[name] = copy.deepcopy(current)
             self._drafts[name] = {
@@ -1912,6 +2287,12 @@ class CoreStore:
     def _emit(self, snapshot: Mapping[str, Any] | None = None) -> None:
         """Publish one state event to every subscribed window.
 
+        The event is the change since the last one, not the state itself: a
+        commit names the rows it moved and a window applies those rows, so the
+        payload of an edit is the edit.  The whole projection is sent only when
+        a window has no state to patch from (first subscription, or a gap) or
+        when no entity-level description exists (see ``_patch_event``).
+
         ``snapshot`` lets a caller that just built the projection hand it over
         instead of asking for the same projection twice: Apply already answers
         its caller with one, and rebuilding it under this lock only to serialize
@@ -1924,33 +2305,301 @@ class CoreStore:
         a reader that exists.
 
         The live service row is refreshed either way.  That read is a side effect
-        of the projection rather than of publishing -- the commit's own restart
-        decision asks whether the proxy is running, and it is this refresh that
-        keeps that answer current -- so it is kept explicit here instead of
-        riding along on work nobody consumes.  It is a memoized read, cheap
-        enough to pay on every commit.
+        of the projection rather than of publishing -- a commit's own restart
+        decision asks whether the proxy is running, and the commit refreshes the
+        row where it answers (see ``_request_emit``); this keeps a direct caller
+        of ``_emit`` from publishing over a stale one -- so it is kept explicit
+        here instead of riding along on work nobody consumes.  It is a memoized
+        read, cheap enough to pay on every snapshot.
         """
 
+        # A send outside the emitter thread answers whatever was pending, so
+        # that request must not also produce a second event a window later.
+        self._emitter.claim()
         with self._lock:
             # Subscriptions open and close from the IPC threads; the fan-out
-            # runs on the mutation lane, so the tuple has to be taken under
-            # the state lock or an unsubscribe would resize the dict mid-iteration.
+            # runs on the emitter thread (or on a caller that sends directly),
+            # so the tuple has to be taken under the state lock or an
+            # unsubscribe would resize the dict mid-iteration.
             callbacks = tuple(self._subscribers.values())
         if not callbacks:
             self._service_row_is_live()
             return
+        # Projection happens outside ``_publish_guard``: a projection takes the
+        # mutation lane, and a mutation that publishes directly would then be
+        # waiting for this lock while holding the lane this one waits for.
+        # Publishing under the guard keeps the recorded chain ordered; a
+        # projection that lost the race is refused by the revision check below.
         projected = self.snapshot() if snapshot is None else snapshot
-        event = make_event("snapshot", projected["revision"], projected)
-        # One serialization, then each subscriber gets its own parse of the
-        # same bytes: a window that mutates its copy must not reach another's,
-        # and a deepcopy of the whole projection was slower than the JSON the
-        # event is about to become anyway.
+        revision = projected.get("revision")
+        if type(revision) is not int:
+            return
+        with self._publish_guard:
+            with self._lock:
+                previous = self._last_published_projection
+                base_revision = self._last_published_revision
+            if previous is None:
+                event = make_event("snapshot", revision, projected)
+            else:
+                # A projection taken while another thread owns the mutation
+                # lane is the last committed view, not the one this send was
+                # asked about.  That is the same answered-by-a-later-commit
+                # rule ``snapshot`` gives a window: publishing it after the
+                # newer event would move the chain backwards, so the commit
+                # that owns the lane asks for its own event instead.
+                if revision < base_revision:
+                    return
+                try:
+                    event = self._patch_event(projected, previous, base_revision)
+                except Exception:
+                    # The revision moved in a way no patch can describe: a diff
+                    # that raised, a domain that cannot say what changed, or an
+                    # op list too large to be worth sending.  Reading the full
+                    # state is the answer that is always correct.
+                    event = make_resync_event(revision)
+                if event is None:
+                    # Nothing about the projection changed, so the windows that
+                    # already hold it owe no repaint and no read.
+                    return
+            # One serialization, then each subscriber gets its own parse of the
+            # same bytes: a window that mutates its copy must not reach another's,
+            # and a deepcopy of the whole projection was slower than the JSON the
+            # event is about to become anyway.
+            encoded = _encode_json(event)
+            # The whole projection, not just its domains: the next patch has to
+            # say whether a staged draft, the disk markers, the service row, or
+            # an action summary moved as well, and "equal to what the windows
+            # already hold" is exactly what this copy answers.  It is taken
+            # before the lock for the same reason the event was encoded there:
+            # an action summary can carry every model a station answered, and a
+            # copy of that inside the critical section is a hold the budget
+            # measures (see ``snapshot``).  Only a publisher reads this copy,
+            # and ``_publish_guard`` is already serializing publishers.
+            published = copy.deepcopy(dict(projected))
+            with self._lock:
+                self._last_published_projection = published
+                self._last_published_revision = revision
+            for callback in callbacks:
+                try:
+                    callback(json.loads(encoded))
+                except Exception:
+                    # A disconnected UI must not break a state transition.
+                    continue
+
+    def _patch_event(
+        self,
+        projected: Mapping[str, Any],
+        previous: Mapping[str, Any],
+        base_revision: int,
+    ) -> dict[str, Any] | None:
+        """Build the patch from ``previous``'s projection to ``projected``.
+
+        ``None`` means nothing changed: a projection at the base revision with
+        no moved rows owes the windows nothing.  A revision that moved but has
+        no honest entity-level description raises ``_PatchUnavailable``, and
+        the caller sends a resync instead: a patch that leaves a row out is a
+        row the window keeps drawing, so an incomplete answer is worse than a
+        full one.
+
+        The ops describe the domains; the top-level fields a window cannot
+        derive from them (a staged draft's dirty flag, the disk markers, the
+        service row, an action summary) travel beside them, and only when they
+        actually moved.
+        """
+
+        domains = projected.get("domains")
+        previous_domains = previous.get("domains")
+        revision = projected.get("revision")
+        if not isinstance(domains, Mapping) or not isinstance(previous_domains, Mapping) or type(revision) is not int:
+            raise _PatchUnavailable
+        ops: list[dict[str, Any]] = []
+        changed: list[str] = []
+        for name, current in domains.items():
+            if not isinstance(name, str):
+                raise _PatchUnavailable
+            before = previous_domains.get(name)
+            if before == current:
+                continue
+            adapter = self._domains.get(name)
+            if adapter is None:
+                raise _PatchUnavailable
+            try:
+                domain_ops = domain_diff(adapter, before, current)
+            except Exception:
+                # A domain whose diff cannot answer must not take the event
+                # channel down with it: the window reads the state instead.
+                raise _PatchUnavailable from None
+            if not domain_ops:
+                raise _PatchUnavailable
+            for op in domain_ops:
+                if len(ops) >= MAX_PATCH_OPS:
+                    raise _PatchUnavailable
+                ops.append(op.to_mapping())
+            changed.append(name)
+        if not ops:
+            if revision == base_revision:
+                return None
+            raise _PatchUnavailable
+        # The fields a window cannot derive from the ops it just applied.  An
+        # equal field is omitted: restating an unchanged draft or disk marker
+        # would make every patch a snapshot with ops attached.
+        top_level = {
+            name: copy.deepcopy(projected.get(name))
+            for name in PATCH_TOP_LEVEL_FIELDS
+            if previous.get(name) != projected.get(name)
+        }
+        return make_patch_event(base_revision, revision, changed, ops, top_level)
+
+    def _request_emit(self) -> None:
+        """Mark one state event pending for the emitter.
+
+        Write paths call this instead of ``_emit``: the response returns with
+        its own revision, and the projection plus fan-out happens on the
+        emitter thread once the burst settles.  ``_emit`` stays the
+        synchronous send for a test that drives it and for a transitional
+        claim that must be visible before the next statement runs.
+
+        The live service row is **not** refreshed here.  That read is a real
+        health probe of the proxy -- a loopback request with the controller's
+        own timeout -- and doing it before returning from every commit put half
+        a second of network wait on the write path every window shares.
+        The publish already refreshes it: ``_emit`` reads it when nobody is
+        listening and ``snapshot`` reads it for every send that has a reader.
+        A commit whose *own* restart decision needs the answer (``apply``)
+        reads it before it opens its write lane, so it still decides on the
+        proxy it just observed rather than on a row from an earlier commit.
+        """
+
+        self._emitter.request()
+
+    # -- jobs: work too slow to answer inside a request ---------------------
+    def _job_executor(self) -> ThreadPoolExecutor:
+        """The pool long-running operations run on, created on first use."""
+
+        with self._job_guard:
+            if self._job_pool is None:
+                self._job_pool = ThreadPoolExecutor(
+                    max_workers=JOB_POOL_WORKERS,
+                    thread_name_prefix="young-router-core-job",
+                )
+            return self._job_pool
+
+    def start_job(
+        self,
+        work: Callable[[], Mapping[str, Any]],
+        *,
+        name: str,
+        on_done: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Start one long operation and answer with its id, not its result.
+
+        The caller gets ``{revision, job_id}`` before any network work begins.
+        ``running`` is published first -- before the id is returned -- so a
+        subscriber that was already listening learns the job exists, and then
+        ``done`` or ``failed`` carries the result.  The work runs on the job
+        pool, which is what keeps a probe's own budget off the write lane and
+        off the request that started it.
+        """
+
+        job_id = uuid.uuid4().hex
+        with self._lock:
+            revision = self._revision
+        self._publish_job_event(job_id, "running", revision)
+        try:
+            self._job_executor().submit(self._run_job, job_id, name, work, on_done)
+        except RuntimeError:
+            # The pool is gone: this store is shutting down.  A failed job is
+            # still an answer the caller can act on.
+            self._publish_job_event(
+                job_id, "failed", revision, {"detail": "The operation was cancelled"}
+            )
+        return {"revision": revision, "job_id": job_id}
+
+    def _run_job(
+        self,
+        job_id: str,
+        name: str,
+        work: Callable[[], Mapping[str, Any]],
+        on_done: Callable[[Mapping[str, Any]], None] | None,
+    ) -> None:
+        try:
+            result = work()
+        except Exception as exc:
+            self._publish_job_event(
+                job_id, "failed", self._current_revision(), {"detail": safe_exception_message(exc)}
+            )
+            return
+        safe = _safe_public(result if isinstance(result, Mapping) else {})
+        if not isinstance(safe, Mapping):
+            safe = {}
+        if on_done is not None:
+            try:
+                on_done(safe)
+            except Exception:
+                # Recording the answer must never turn it into a failure.
+                pass
+        self._publish_job_event(job_id, "done", self._current_revision(), dict(safe))
+
+    def _current_revision(self) -> int:
+        with self._lock:
+            return self._revision
+
+    def _publish_job_event(
+        self,
+        job_id: str,
+        state: str,
+        revision: int,
+        result: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Send one job event to every subscribed window.
+
+        Job events are not part of the state chain: they describe one caller's
+        operation, not a revision a window has to apply in order, so they never
+        touch ``_last_published_projection`` (the next patch must still be a
+        patch of the state every window holds) and they are encoded once for
+        all subscribers like every other event.
+        """
+
+        try:
+            event = make_job_event(job_id, state, revision, result)
+        except ProtocolError:
+            # A result this wire cannot carry (a value that is not JSON, a
+            # sentence with a newline) still owes the caller an answer.
+            try:
+                event = make_job_event(
+                    job_id,
+                    "failed",
+                    revision,
+                    {"detail": "The operation returned an invalid result"},
+                )
+            except ProtocolError:
+                return
+        try:
+            encoded = _encode_json(event)
+        except Exception:
+            return
+        with self._lock:
+            callbacks = tuple(self._subscribers.values())
         for callback in callbacks:
             try:
-                callback(copy.deepcopy(event))
+                callback(json.loads(encoded))
             except Exception:
-                # A disconnected UI must not break a state transition.
+                # A disconnected UI must not break the operation.
                 continue
+
+    def stop_jobs(self) -> None:
+        """End the job pool; a queued job never starts, a running one is left.
+
+        A quit must not wait for a probe's own upstream budget.  Cancelling the
+        queued work keeps an operation nobody is left to listen to from starting
+        after the windows that asked for it are gone.
+        """
+
+        with self._job_guard:
+            pool = self._job_pool
+            self._job_pool = None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def subscribe(self, callback: Callable[[dict[str, Any]], None]) -> Callable[[], None]:
         if not callable(callback):
@@ -1997,7 +2646,11 @@ class CoreStore:
         # the controller is being replaced.
         def foreign_view() -> dict[str, Any] | None:
             with self._lock:
-                if self._mutation_owner not in (None, threading.get_ident()) and self._snapshot_view is not None:
+                foreign_lane = self._mutation_owner not in (None, threading.get_ident())
+                foreign_domain = any(
+                    holder != threading.get_ident() for holder in self._domain_holds
+                )
+                if (foreign_lane or foreign_domain) and self._snapshot_view is not None:
                     view = copy.deepcopy(self._snapshot_view)
                     view["service"] = copy.deepcopy(_safe_public(self._service))
                     return view
@@ -2015,70 +2668,62 @@ class CoreStore:
         early = foreign_view()
         if early is not None:
             return early
-        # Adopting an external edit reloads a domain adapter and can parse a
-        # whole settings document.  That is not a projection, and it must not
-        # happen with the state lock held: probe here, and take the mutation
-        # lane only when there is actually something to adopt.
-        self._adopt_external_disk_changes()
-        live: dict[str, Any] | None = None
-        with self._lock:
-            if self._mutation_owner not in (None, threading.get_ident()) and self._snapshot_view is not None:
-                view = copy.deepcopy(self._snapshot_view)
-                view["service"] = copy.deepcopy(_safe_public(self._service))
-                return view
-            view = self._snapshot_view
-            cached = self._snapshot_cache
-            if (
-                view is not None
-                and cached is not None
-                and cached[0] == self._revision
-                and view.get("revision") == self._revision
-            ):
-                # Only the small live fields are copied under the lock.  The
-                # domain projection can be hundreds of milliseconds of
-                # deep-copying; it is copied below, with no lock held.
-                live = {
-                    "service": copy.deepcopy(_safe_public(self._service)),
-                    "drafts": copy.deepcopy(self._drafts),
-                    "disk": copy.deepcopy(self._disk),
-                    # A fetch result can carry hundreds of model names.  Every
-                    # writer replaces a domain's entry whole, so the outer dict
-                    # is copied here and the entries are copied below, with no
-                    # lock held.
-                    "action_summaries": dict(self._last_actions),
-                }
-            else:
-                view = None
-        if view is not None and live is not None:
-            result = copy.deepcopy(view)
-            result.update(live)
-            result["action_summaries"] = copy.deepcopy(result["action_summaries"])
-            return result
-        # A projection is not a read of one field: it walks ten domains and
-        # deep-copies what they answer, which measured 270-375 ms on a real
-        # installation.  It runs on the mutation lane, never under the state
-        # lock.  A lane already owned by another thread means a projection is
-        # either in flight or about to be published; wait for it only when
-        # there is no committed view to answer with.
-        if not self._mutation.acquire(blocking=False):
-            fallback = foreign_view()
-            if fallback is not None:
-                return fallback
-            with self._mutation_scope():
+        # A projection is a read of every domain at once, so it holds the
+        # transaction lane and every domain lock (see ``_projection_scope``).
+        # A lane already owned by another thread means a projection is either
+        # in flight or about to be published; answer the last committed view
+        # rather than queueing the reader behind it.
+        with self._projection_scope(wait=False) as owned:
+            if owned:
+                # Adopting an external edit reloads a domain adapter and can
+                # parse a whole settings document.  That is not a projection,
+                # and it happens under this scope -- never under the state
+                # lock -- so a reader sees the file and the state it implies
+                # together.
+                self._adopt_external_disk_changes()
+                live: dict[str, Any] | None = None
+                with self._lock:
+                    view = self._snapshot_view
+                    cached = self._snapshot_cache
+                    if (
+                        view is not None
+                        and cached is not None
+                        and cached[0] == self._revision
+                        and view.get("revision") == self._revision
+                    ):
+                        # Only the small live fields are copied under the lock.
+                        # The domain projection can be hundreds of milliseconds
+                        # of deep-copying; it is copied below, with no lock held.
+                        live = {
+                            "service": copy.deepcopy(_safe_public(self._service)),
+                            "drafts": copy.deepcopy(self._drafts),
+                            "disk": copy.deepcopy(self._disk),
+                            # A fetch result can carry hundreds of model names.
+                            # Every writer replaces a domain's entry whole, so the
+                            # outer dict is copied here and the entries are
+                            # copied below, with no lock held.
+                            "action_summaries": dict(self._last_actions),
+                        }
+                    else:
+                        view = None
+                if view is not None and live is not None:
+                    result = copy.deepcopy(view)
+                    result.update(live)
+                    result["action_summaries"] = copy.deepcopy(result["action_summaries"])
+                    return result
+                # A projection is not a read of one field: it walks ten domains
+                # and deep-copies what they answer, which measured 270-375 ms on
+                # a real installation.  It runs under this scope, never under
+                # the state lock.
                 return self._project_and_publish()
-        ident = threading.get_ident()
-        with self._lock:
-            if self._mutation_depth == 0:
-                self._mutation_owner = ident
-            self._mutation_depth += 1
-        try:
+        fallback = foreign_view()
+        if fallback is not None:
+            return fallback
+        # No committed view exists to answer with yet (the very first read of a
+        # Core's life): this one waits for the write in flight.
+        with self._projection_scope():
+            self._adopt_external_disk_changes()
             return self._project_and_publish()
-        finally:
-            with self._lock:
-                self._mutation_depth -= 1
-                if self._mutation_depth == 0:
-                    self._mutation_owner = None
-            self._mutation.release()
 
     def _project_and_publish(self) -> dict[str, Any]:
         """Build and publish one projection while the caller owns the lane.
@@ -2274,7 +2919,7 @@ class CoreStore:
             raise
         if not requested:
             raise CoreError("invalid_domain", "At least one disk-state domain is required")
-        with self._mutation_scope():
+        with self._domain_scope(*requested):
             for name in requested:
                 if name not in self._domains:
                     raise DomainNotFound(name)
@@ -2287,7 +2932,7 @@ class CoreStore:
     def log_view(self, tab: str, known_revision: int | None = None) -> dict[str, Any]:
         """Load one requested log tab without inflating global snapshots."""
 
-        with self._mutation_scope():
+        with self._domain_scope("logs"):
             adapter = self._domains.get("logs")
             view = getattr(adapter, "view", None) if adapter is not None else None
             if not callable(view):
@@ -2304,7 +2949,16 @@ class CoreStore:
             return dict(safe_result)
 
     def _refresh_external_disk_state(self, domains: Iterable[str] | None = None) -> None:
-        """Auto-reload clean drafts and expose only sanitized conflict state."""
+        """Auto-reload clean drafts and expose only sanitized conflict state.
+
+        This walks every domain, but it owns none of them: a caller holds the
+        write lane of whatever it is actually editing, and the other domains are
+        probed only when their own lane is free.  A domain another thread is
+        writing is left alone until the next pass -- its detector reads the
+        same state the write is rewriting -- which is why this may neither wait
+        nor deadlock: an external edit adopts one pass later instead of queueing
+        a commit behind it.
+        """
 
         selected = None if domains is None else set(domains)
         for name, adapter in self._domains.items():
@@ -2313,41 +2967,52 @@ class CoreStore:
             detector = getattr(adapter, "external_disk_state", None)
             if not callable(detector):
                 continue
-            record = self._disk.setdefault(name, {"changed": False, "generation": 0, "keep_draft": False})
-            try:
-                state = detector()
-            except Exception:
+            lock = self._domain_lock(name)
+            if not lock.acquire(blocking=False):
+                # Another lane owns this domain right now; it settles its own
+                # disk marker, and this pass leaves the record as it found it.
                 continue
-            changed = bool(state.get("changed")) if isinstance(state, Mapping) else False
-            identity = self._external_disk_identity(adapter)
-            identity_changed = identity is not None and identity != self._disk_identities.get(name)
-            if changed and (not record.get("changed") or identity_changed):
-                record["generation"] = int(record.get("generation", 0)) + 1
-                record["keep_draft"] = False
-            if identity is not None:
-                self._disk_identities[name] = identity
-            if changed and not self._drafts.get(name, {}).get("dirty"):
+            self._note_domain_hold(1)
+            try:
+                record = self._disk.setdefault(name, {"changed": False, "generation": 0, "keep_draft": False})
                 try:
-                    adapter.reload()
-                    self._baselines[name] = self._adapter_draft_state(name)
-                    self._mark_domain(name, dirty=False, validation={"valid": True, "issues": []}, base_revision=self._revision + 1)
-                    self._advance_revision()
-                    changed = False
-                    # This reload advances the shared revision without an event,
-                    # so windows learn it from their own responses. Record it for
-                    # the same reason every other bump does: a replacement Core
-                    # must resume at or above every revision a window has seen.
-                    try:
-                        self._persist_metadata()
-                    except PersistenceError:
-                        # The reload itself succeeded; only the ordering record is
-                        # optional. Never fail a disk probe over it.
-                        pass
+                    state = detector()
                 except Exception:
-                    pass
-            record["changed"] = changed
-            if not changed:
-                record["keep_draft"] = False
+                    continue
+                changed = bool(state.get("changed")) if isinstance(state, Mapping) else False
+                identity = self._external_disk_identity(adapter)
+                identity_changed = identity is not None and identity != self._disk_identities.get(name)
+                if changed and (not record.get("changed") or identity_changed):
+                    record["generation"] = int(record.get("generation", 0)) + 1
+                    record["keep_draft"] = False
+                if identity is not None:
+                    self._disk_identities[name] = identity
+                if changed and not self._drafts.get(name, {}).get("dirty"):
+                    try:
+                        adapter.reload()
+                        self._baselines[name] = self._adapter_draft_state(name)
+                        self._mark_domain(name, dirty=False, validation={"valid": True, "issues": []}, base_revision=self._revision + 1)
+                        self._advance_revision()
+                        changed = False
+                        # This reload advances the shared revision without an
+                        # event, so windows learn it from their own responses.
+                        # Record it for the same reason every other bump does: a
+                        # replacement Core must resume at or above every revision
+                        # a window has seen.
+                        try:
+                            self._persist_metadata()
+                        except PersistenceError:
+                            # The reload itself succeeded; only the ordering
+                            # record is optional. Never fail a disk probe over it.
+                            pass
+                    except Exception:
+                        pass
+                record["changed"] = changed
+                if not changed:
+                    record["keep_draft"] = False
+            finally:
+                self._note_domain_hold(-1)
+                lock.release()
 
     @staticmethod
     def _external_disk_identity(adapter: DomainAdapter) -> str | None:
@@ -2405,7 +3070,7 @@ class CoreStore:
         the home-shortened ``display_path`` it shows.
         """
 
-        with self._mutation_scope():
+        with self._domain_scope("codex", "claude", "clients"):
             files: list[dict[str, Any]] = []
             for name in ("codex", "claude", "clients"):
                 adapter = self._domains.get(name)
@@ -2441,7 +3106,7 @@ class CoreStore:
         a self-consistent capability baseline.
         """
 
-        with self._mutation_scope():
+        with self._domain_scope(domain):
             name, _adapter = self._editor_adapter(domain, document)
             return {
                 "domain": name,
@@ -2543,7 +3208,7 @@ class CoreStore:
     def trusted_editor_text(self, domain: str, document: str, *, revision: int) -> str:
         """Read raw text for the authenticated, versioned editor path."""
 
-        with self._mutation_scope():
+        with self._domain_scope(domain):
             self._check_revision(revision)
             return self._trusted_editor_text_unlocked(domain, document)
 
@@ -2562,7 +3227,7 @@ class CoreStore:
             raise CoreError("invalid_editor", "The editor document is invalid")
         if len(text.encode("utf-8")) > MAX_EDITOR_DOCUMENT_BYTES:
             raise CoreError("editor_too_large", "The editor document exceeds the size limit")
-        with self._mutation_scope():
+        with self._domain_scope(domain):
             name, _adapter = self._editor_adapter(domain, document)
             if name == "webdav":
                 # The comparison is a read of two documents, not an editor: a
@@ -2599,7 +3264,7 @@ class CoreStore:
     def secret_descriptor(self, domain: str, field: str, target: object | None = None) -> dict[str, Any]:
         """Validate one native-only secret slot without returning its value."""
 
-        with self._mutation_scope():
+        with self._domain_scope(domain):
             name = _canonical_domain(domain)
             field_name = field.strip() if isinstance(field, str) else ""
             target_required = _SECRET_FIELDS.get((name, field_name))
@@ -2773,7 +3438,8 @@ class CoreStore:
 
         if not isinstance(value, str) or len(value.encode("utf-8")) > _secret_value_limit(_canonical_domain(domain), field, target) or "\x00" in value or (not _allows_multiline_secret(_canonical_domain(domain), field, target) and any(char in value for char in "\r\n")):
             raise CoreError("invalid_secret", "The secret value is invalid")
-        with self._mutation_scope():
+        should_emit = False
+        with self._domain_scope(domain):
             self._check_revision(revision)
             descriptor = self.secret_descriptor(domain, field, target)
             name = str(descriptor["domain"])
@@ -2800,8 +3466,11 @@ class CoreStore:
                 ),
             )
             self._persist_metadata()
-            self._emit()
-            return {"revision": self._revision, "present": present}
+            should_emit = True
+            response = {"revision": self._revision, "present": present}
+        if should_emit:
+            self._request_emit()
+        return response
 
     def import_relay_resources(
         self,
@@ -2813,7 +3482,8 @@ class CoreStore:
     ) -> dict[str, Any]:
         """Stage only the API resources explicitly selected by the user."""
 
-        with self._mutation_scope():
+        should_emit = False
+        with self._domain_scope("relay_accounts", "providers_models"):
             self._check_revision(revision)
             relay = self._domains.get("relay_accounts")
             providers = self._domains.get("providers_models")
@@ -2851,14 +3521,17 @@ class CoreStore:
                 "model_count": int(result.get("model_count", 0)) if isinstance(result, Mapping) else 0,
             }
             self._persist_metadata()
-            self._emit()
-            return {
+            should_emit = True
+            response = {
                 "revision": self._revision,
                 "imported": True,
                 "import_mode": import_mode,
                 "resource_count": int(result.get("resource_count", 0)) if isinstance(result, Mapping) else 0,
                 "model_count": int(result.get("model_count", 0)) if isinstance(result, Mapping) else 0,
             }
+        if should_emit:
+            self._request_emit()
+        return response
 
     def accept_relay_login(
         self,
@@ -2899,7 +3572,8 @@ class CoreStore:
         known_secrets = tuple(
             value for value in (cookie, access_token, refresh_token, password) if isinstance(value, str) and value
         )
-        with self._mutation_scope():
+        should_emit = False
+        with self._domain_scope("relay_accounts"):
             relay = self._domains.get("relay_accounts")
             accepter = getattr(relay, "accept_login_result", None) if relay is not None else None
             relay_checkpoint = getattr(relay, "transaction_checkpoint", None) if relay is not None else None
@@ -3095,12 +3769,15 @@ class CoreStore:
                     "relay_login_failed",
                     safe_exception_message(exc, known_secrets=known_secrets),
                 ) from None
-            self._emit()
-            return {
+            should_emit = True
+            response = {
                 "revision": self._revision,
                 "login_status": "signed_in",
                 "username": str(public.get("username", username)),
             }
+        if should_emit:
+            self._request_emit()
+        return response
 
     def start_relay_browser_login(
         self,
@@ -3461,7 +4138,8 @@ class CoreStore:
     ) -> dict[str, Any]:
         """Refresh selectable relay API metadata without staging providers."""
 
-        with self._mutation_scope():
+        should_emit = False
+        with self._domain_scope("relay_accounts"):
             self._check_revision(revision)
             relay = self._domains.get("relay_accounts")
             refresher = getattr(relay, "refresh_resources", None) if relay is not None else None
@@ -3490,13 +4168,16 @@ class CoreStore:
                 "resource_count": resource_count,
             }
             self._persist_metadata()
-            self._emit()
-            return {
+            should_emit = True
+            response = {
                 "revision": self._revision,
                 "account_id": account_id,
                 "resource_status": resource_status,
                 "resource_count": resource_count,
             }
+        if should_emit:
+            self._request_emit()
+        return response
 
     def restore_relay_session(
         self,
@@ -3533,7 +4214,8 @@ class CoreStore:
         known_secrets = tuple(
             value for value in (cookie, access_token, refresh_token) if isinstance(value, str) and value
         )
-        with self._mutation_scope():
+        should_emit = False
+        with self._domain_scope("relay_accounts"):
             relay = self._domains.get("relay_accounts")
             accepter = getattr(relay, "accept_login_result", None) if relay is not None else None
             status_setter = getattr(relay, "set_login_status", None) if relay is not None else None
@@ -3689,12 +4371,15 @@ class CoreStore:
                     "relay_restore_failed",
                     safe_exception_message(exc, known_secrets=known_secrets),
                 ) from None
-            self._emit()
-            return {
+            should_emit = True
+            response = {
                 "revision": self._revision,
                 "login_status": str(public.get("login_status", login_status)),
                 "username": str(public.get("username", "")),
             }
+        if should_emit:
+            self._request_emit()
+        return response
 
     @staticmethod
     def _providers_summary(states: Mapping[str, object]) -> dict[str, Any]:
@@ -3914,7 +4599,7 @@ class CoreStore:
             if isinstance(result, Mapping):
                 safe_result = _safe_public(result)
                 if isinstance(safe_result, Mapping):
-                    self._last_actions[name] = dict(safe_result)
+                    self._last_actions[name] = _action_summary_entry(name, safe_result)
                     summary = safe_result.get("operation_summary")
                     if (
                         isinstance(summary, Mapping)
@@ -3936,9 +4621,9 @@ class CoreStore:
             if action_summary is not None:
                 response["action_summary"] = action_summary
         if changed:
-            # Projecting and fanning out a snapshot is not a state transition;
-            # the worker's own answer must not wait behind it.
-            self._emit()
+            # Publishing a snapshot is not a state transition; the worker's own
+            # answer must not wait behind it.
+            self._request_emit()
         return response
 
     def _dispatch_codex_model_catalog_toggle(self, enabled: bool, expected_revision: object | None) -> dict[str, Any]:
@@ -3953,7 +4638,8 @@ class CoreStore:
                 refresh_contexts()
             except Exception:
                 pass
-        with self._mutation_scope():
+        should_emit = False
+        with self._domain_scope("codex"):
             self._refresh_external_disk_state()
             self._check_revision(expected_revision)
             adapter = self._domains.get(name)
@@ -4009,16 +4695,19 @@ class CoreStore:
                 if isinstance(exc, CoreError):
                     raise
                 raise CoreError("apply_failed", safe_exception_message(exc)) from None
-            self._emit()
+            should_emit = True
             # The dispatch envelope is a revision plus an optional action-scoped
             # summary.  Returning the catalog projection as the whole result
             # adds a top-level field the IPC contract rejects, which fails the
             # call before the switch is reported as applied.
             summary = _safe_public(result)
-            return {
+            response = {
                 "revision": self._revision,
                 "action_summary": dict(summary) if isinstance(summary, Mapping) else {},
             }
+        if should_emit:
+            self._request_emit()
+        return response
 
     # -- WebDAV interval sync ---------------------------------------------
     def quiet_seconds(self) -> float:
@@ -4229,7 +4918,7 @@ class CoreStore:
                     self._persist_metadata()
                 except PersistenceError:
                     pass
-            self._emit()
+            self._request_emit()
 
     def service_supervisor(self, *, initial_delay: float | None = None) -> Any:
         """The loop that restores the proxy without a person's click.
@@ -4328,7 +5017,8 @@ class CoreStore:
         from ..webdav import core as webdav_core
         from ..webdav import operations as webdav_operations
 
-        with self._mutation_scope():
+        should_emit = False
+        with self._domain_scope("webdav", "providers_models", "relay_accounts"):
             self._refresh_external_disk_state()
             self._check_revision(expected_revision)
             webdav = self._domains.get("webdav")
@@ -4621,7 +5311,7 @@ class CoreStore:
                     # one-line/512-byte rule the envelope enforces.
                     raise CoreError(cause_code, safe_error_message(exc)) from None
                 raise CoreError(cause_code, "WebDAV sync failed") from None
-            self._emit()
+            should_emit = True
             if pulled:
                 # After the commit, not inside it: the restart runs on its own
                 # thread and a rollback must never leave one scheduled.
@@ -4631,7 +5321,64 @@ class CoreStore:
             result: dict[str, Any] = {"revision": self._revision}
             if action_summary:
                 result["action_summary"] = action_summary
-            return result
+        if should_emit:
+            self._request_emit()
+        return result
+
+    def _dispatch_probe_job(self, name: str, payload: object) -> dict[str, Any]:
+        """Start one probe as a job and answer with its id.
+
+        A probe is a network read with the upstream's own budget -- the native
+        hosts grant the old request 900 s for exactly that reason.  Run inside
+        a dispatch it would hold a request, and before the domain lanes it held
+        the one write lock every window's next edit needs.  As a job it answers
+        at once; the read itself runs on the job pool, publishes ``running``
+        and then ``done``, and the write it does make (the stored finding, and
+        the revision that follows it) is what the event's result describes.
+
+        ``action_summary`` keeps its old meaning for callers that read it: a
+        probe whose result names an operation still lands in the domain's
+        summary slot when the job finishes.
+        """
+
+        data = dict(payload) if isinstance(payload, Mapping) else {}
+
+        def work() -> Mapping[str, Any]:
+            return self.probe(data, domain=name)
+
+        def on_done(result: Mapping[str, Any]) -> None:
+            summary = _action_summary_entry(name, _safe_public(result))
+            if not summary:
+                return
+            with self._lock:
+                self._last_actions[name] = summary
+            self._request_emit()
+
+        return self.start_job(work, name=name, on_done=on_done)
+
+    def _dispatch_domain_set(self, name: str, normalized_action: str) -> tuple[str, ...]:
+        """The write lanes one dispatch action declares before it starts.
+
+        A dispatch is usually one domain's write.  The exceptions are the
+        documented cross-domain actions: a relay removal that also releases the
+        provider slots linked to it, and a provider action that resolves the
+        relay's own key material.  Naming them here -- once, before the
+        transaction opens -- is what lets those take both lanes in the fixed
+        order instead of discovering the second one halfway through.
+        """
+
+        names = {name}
+        if name == "relay_accounts" and (
+            normalized_action in _RELAY_DEPENDENCY_ACTIONS
+            or normalized_action in _RELAY_RESOURCE_IMPORT_ACTIONS
+        ):
+            names.add("providers_models")
+        elif name == "providers_models" and (
+            normalized_action in _PROVIDER_RELAY_RESOURCE_ACTIONS
+            or normalized_action in _PROVIDER_RELAY_STATION_ACTIONS
+        ):
+            names.add("relay_accounts")
+        return tuple(sorted(names))
 
     def dispatch(
         self,
@@ -4651,6 +5398,11 @@ class CoreStore:
             raise CoreError("invalid_action", "A Core action is required")
         domain_value = data.get("domain")
         normalized_action = action_type.replace("-", "_").replace(".", "_").lower()
+        if domain_value is not None and normalized_action == "probe":
+            # A probe is the one action whose answer is a job: it reads the
+            # upstream, it can take minutes, and nothing else in the store has
+            # to wait for it.
+            return self._dispatch_probe_job(_canonical_domain(domain_value), data.get("payload"))
         if domain_value is not None and _canonical_domain(domain_value) == "webdav":
             # The switch, the interval, and the direction all reshape the
             # interval loop, so let it re-read instead of waiting out its sleep.
@@ -4708,14 +5460,32 @@ class CoreStore:
             # ``_dispatch_service``.  Serializing it with panes' edits is what
             # keeps a restart from rewriting the Codex files under a commit;
             # snapshots stay live because they take neither lane.
+            should_emit = False
             with self._mutation_scope():
                 self._check_revision(expected_revision if expected_revision is not None else data.get("expected_revision"))
                 previous_revision = self._revision
                 self._dispatch_service(action_type, _as_mapping(data.get("payload")))
-                if self._revision != previous_revision:
-                    self._emit()
-                return {"revision": self._revision}
-        with self._mutation_scope():
+                should_emit = self._revision != previous_revision
+                response = {"revision": self._revision}
+            if should_emit:
+                self._request_emit()
+            return response
+        should_emit = False
+        # Which write lanes this action declares before it touches anything.
+        # A plain domain action takes only its own, so an edit here cannot
+        # queue behind a slow operation in another domain; an action that also
+        # rewrites a second domain -- a relay removal that releases linked
+        # provider slots, a provider action that resolves relay key material --
+        # names both and takes the cross-domain transaction lane as well.
+        # ``service.*`` answers a proxy operation, which touches no domain but
+        # must stay serialized with every writer, so it keeps the whole lane.
+        declared = (
+            self._dispatch_domain_set(_canonical_domain(domain_value), normalized_action)
+            if domain_value is not None
+            else ()
+        )
+        scope = self._domain_scope(*declared) if declared else self._mutation_scope()
+        with scope:
             self._check_revision(expected_revision if expected_revision is not None else data.get("expected_revision"))
             previous_revision = self._revision
             action_summary: dict[str, Any] | None = None
@@ -4762,11 +5532,7 @@ class CoreStore:
                     if file_token is not None:
                         selected_path = self.file_capabilities.resolve(file_token, "import")
                         payload = {"path": str(selected_path)}
-                if name == "relay_accounts" and normalized_action in {
-                    "resources_import",
-                    "relay_resources_import",
-                    "account_resources_import",
-                }:
+                if name == "relay_accounts" and normalized_action in _RELAY_RESOURCE_IMPORT_ACTIONS:
                     resource_data = _as_mapping(payload)
                     # The revision the caller stated is the one this dispatch
                     # checks, exactly as the ordinary path and the codex/webdav
@@ -4808,46 +5574,15 @@ class CoreStore:
                         "provider_id": station_data.get("provider_id"),
                         "source": dict(source),
                     }
-                relay_dependency_action = name == "relay_accounts" and normalized_action in {
-                    "station_remove",
-                    "relay_station_remove",
-                    "remove_station",
-                    "account_remove",
-                    "relay_account_remove",
-                    "remove_account",
-                    "api_key_delete",
-                    "relay_api_key_delete",
-                    "account_api_key_delete",
-                    "api_key_detach",
-                    "relay_api_key_detach",
-                    "account_api_key_detach",
-                    # Alignment retires the keys whose group the station dropped,
-                    # exactly as an explicit delete does, so the linked provider
-                    # slots and their routes have to be released before the
-                    # station is called.  Without this the remote key was gone
-                    # while the document still pointed at it: the pane listed the
-                    # dangling key and its route kept answering with a credential
-                    # the station had already revoked.
-                    "api_key_set_auto_grouping",
-                    "relay_api_key_set_auto_grouping",
-                    "account_api_key_set_auto_grouping",
-                    "account_set_auto_grouping",
-                    "relay_account_set_auto_grouping",
-                    "api_key_auto_group_align",
-                    "relay_api_key_auto_group_align",
-                    "account_auto_group_align",
-                    "relay_account_auto_group_align",
-                }
+                relay_dependency_action = (
+                    name == "relay_accounts" and normalized_action in _RELAY_DEPENDENCY_ACTIONS
+                )
                 providers = self._domains.get("providers_models") if relay_dependency_action else None
                 provider_before = self._adapter_draft_state("providers_models") if providers is not None else None
                 relay_checkpoint = _checkpoint_adapter(adapter, error_code="domain_error") if relay_dependency_action else None
                 provider_checkpoint = _checkpoint_adapter(providers, error_code="domain_error") if providers is not None else None
                 try:
-                    if name == "providers_models" and normalized_action in {
-                        "provider_import_relay_key",
-                        "model_select_relay_resource",
-                        "provider_fetch_relay_resource_models",
-                    }:
+                    if name == "providers_models" and normalized_action in _PROVIDER_RELAY_RESOURCE_ACTIONS:
                         resource_data = _as_mapping(payload)
                         relay = self._domains.get("relay_accounts")
                         resolver = getattr(relay, "binding_source", None)
@@ -4939,7 +5674,9 @@ class CoreStore:
                                         "domain_error",
                                         "Linked model dependency handling could not be completed",
                                     )
-                                self._last_actions["providers_models"] = dict(_safe_public(dependency_result))
+                                self._last_actions["providers_models"] = _action_summary_entry(
+                                    "providers_models", _safe_public(dependency_result)
+                                )
                 except ConfirmationNeeded:
                     if relay_checkpoint is not None:
                         _restore_adapter(adapter, relay_checkpoint)
@@ -4969,7 +5706,7 @@ class CoreStore:
                 if isinstance(result, Mapping):
                     safe_result = _safe_public(result)
                     if isinstance(safe_result, Mapping):
-                        self._last_actions[name] = dict(safe_result)
+                        self._last_actions[name] = _action_summary_entry(name, safe_result)
                         summary = safe_result.get("operation_summary")
                         # The operation a live read answers with.  Every action
                         # that produces a summary names itself in it, so the
@@ -5075,11 +5812,13 @@ class CoreStore:
                         )
                     self._persist_metadata()
             if self._revision != previous_revision:
-                self._emit()
+                should_emit = True
             response: dict[str, Any] = {"revision": self._revision}
             if action_summary is not None:
                 response["action_summary"] = action_summary
-            return response
+        if should_emit:
+            self._request_emit()
+        return response
 
     def reject_plaintext_secret_action(self, action: Mapping[str, Any]) -> None:
         """Reject secret-bearing actions received through ordinary IPC."""
@@ -5460,7 +6199,16 @@ class CoreStore:
                 # this commit as its follow-up pass.
                 self._service_reload_pending = True
                 return
-            if self._service.get("state") not in {"running", "unhealthy"}:
+            # A replacement that is still owed outranks the cached service row:
+            # the previous pass wrote that row from the failed replacement, so it
+            # can read `stopped` while the controller has already recovered.  The
+            # worker probes the live state off every write lane before it decides
+            # (see ``_reload_service_after_apply``); refusing here would drop the
+            # one pass that can still deliver the environment the commit needs.
+            if (
+                self._service.get("state") not in {"running", "unhealthy"}
+                and not self._service_reload_replace_process
+            ):
                 _note(
                     "an apply wanted a proxy restart, but the service reads %s"
                     % self._service.get("state")
@@ -5533,6 +6281,20 @@ class CoreStore:
         """
 
         reloader = self._service_handlers.get("reload")
+        # The cached row is what the previous pass wrote, and a replacement that
+        # did not come up leaves it reading `stopped` even after the controller
+        # recovered.  This worker holds no write lane and no request waits on it,
+        # so the one real status read that can tell a stale row from a stopped
+        # proxy belongs here -- and only while the row says the proxy is down.
+        if (
+            reloader is not None
+            and not self._service_reload_stopping
+            and self._service.get("state") not in {"running", "unhealthy"}
+        ):
+            try:
+                self._service_row_is_live()
+            except Exception:
+                pass
         replace_process = False
         with self._lock:
             if self._service_reload_stopping:
@@ -5554,7 +6316,7 @@ class CoreStore:
             # swallowed by the restart already in flight.
             replace_process = self._service_reload_replace_process
             self._service_reload_replace_process = False
-        self._emit()
+        self._request_emit()
         try:
             with self._service_transition_guard:
                 if self._service_reload_stopping:
@@ -5586,7 +6348,7 @@ class CoreStore:
         with self._lock:
             self._set_service_from_result(service_result, increment=False)
             running = service_result.get("state") == "running"
-        self._emit()
+        self._request_emit()
         if running:
             # This reconciliation reads and rewrites the client documents on
             # disk -- the Codex catalog, the Claude picker, the fetch-server
@@ -5597,8 +6359,9 @@ class CoreStore:
             # the mutation lane (so an Apply cannot rewrite the same files
             # underneath it) and the state lock only for its bookkeeping.
             with self._mutation_scope():
-                self._reconcile_client_documents_after_reload()
-            self._emit()
+                with self._domain_scope("codex", "claude", "clients"):
+                    self._reconcile_client_documents_after_reload()
+            self._request_emit()
         if self._service_reload_stopping:
             # The host quit while this restart was in flight; shutdown() may
             # have stopped the previous proxy before this one started.
@@ -5711,7 +6474,7 @@ class CoreStore:
                 result if result is not None else {"state": "unhealthy"},
                 increment=False,
             )
-        self._emit()
+        self._request_emit()
 
     def supervise_service_once(self) -> bool:
         """Restore an unwatched proxy instead of leaving 不健康 to a click.
@@ -5751,6 +6514,7 @@ class CoreStore:
         # A pass can replace the proxy, which takes seconds.  It holds the
         # mutation lane so a pane's edit cannot land mid-replacement, while
         # snapshots keep reading the last committed projection.
+        should_emit = False
         with self._mutation_scope():
             with self._lock:
                 if self._service_supervision_stopping or self._service_intent != "running":
@@ -5820,6 +6584,9 @@ class CoreStore:
                     self._persist_metadata()
                     published = True
                 if published:
+                    # Sent here, not requested: the replacement below may take
+                    # minutes, and every window has to see the proxy leave its
+                    # state before it starts rather than after it ends.
                     self._emit()
                 reconcile = False
                 try:
@@ -5870,16 +6637,20 @@ class CoreStore:
                                 pass
                 if reconcile:
                     # Disk work: the Codex endpoint file, the generated client
-                    # lists, and the image-context MCP entry.  It runs on the
-                    # mutation lane, never under the state lock.
-                    self._follow_codex_local_api()
-                    self.refresh_client_model_lists(refresh_contexts=False)
-                    self._sync_codex_image_context_mcp(["codex"])
+                    # lists, and the image-context MCP entry.  It holds the
+                    # document domains it rewrites (nested inside this pass's
+                    # transaction lane) and never the state lock.
+                    with self._domain_scope("codex", "claude", "clients"):
+                        self._follow_codex_local_api()
+                        self.refresh_client_model_lists(refresh_contexts=False)
+                        self._sync_codex_image_context_mcp(["codex"])
             # ``snapshot`` re-reads the controller once no replacement is in
             # flight, so a failed pass publishes the real state instead of
             # leaving the 启动中 it had to claim while it tried.
-            self._emit()
-            return True
+            should_emit = True
+        if should_emit:
+            self._request_emit()
+        return True
 
     def _stop_service_after_reload_shutdown(self) -> None:
         stopper = self._shutdown_handler
@@ -5892,12 +6663,12 @@ class CoreStore:
                         self._set_service_from_result(result, increment=False)
             except Exception:
                 pass
-        self._emit()
+        self._request_emit()
 
     def validate(self, domain: str | None = None, *, revision: int | None = None, payload: object | None = None) -> dict[str, Any]:
-        with self._mutation_scope():
+        names = [_canonical_domain(domain)] if domain is not None else self._domain_names()
+        with self._domain_scope(*names):
             self._check_revision(revision)
-            names = [_canonical_domain(domain)] if domain is not None else list(self._domains)
             summaries: dict[str, Any] = {}
             for name in names:
                 adapter = self._domains.get(name)
@@ -6416,7 +7187,7 @@ class CoreStore:
                 self._drafts["relay_accounts"]["validation"] = {"valid": True, "issues": []}
                 self._advance_revision()
                 self._persist_metadata()
-                self._emit()
+                self._request_emit()
                 return {
                     "revision": self._revision,
                     "applied": False,
@@ -6459,7 +7230,7 @@ class CoreStore:
             pending = self._relay_operation_count(relay)
             self._advance_revision()
             self._persist_metadata()
-            self._emit()
+            self._request_emit()
             return {
                 "revision": self._revision,
                 "applied": False,
@@ -6470,8 +7241,7 @@ class CoreStore:
                 "issues": self._relay_apply_issues(1),
             }
 
-        snapshot = self.snapshot()
-        self._emit(snapshot)
+        self._request_emit()
         return {
             "revision": self._revision,
             "applied": True,
@@ -6510,6 +7280,35 @@ class CoreStore:
                 continue
             self._drafts.setdefault(name, {})["validation"] = summary
 
+    def _apply_domain_hints(self, domain: str | None, domains: Sequence[str] | None) -> tuple[str, ...]:
+        """Which write lanes an Apply may need, from its arguments alone.
+
+        The body can grow its domain set while it runs: a provider draft that
+        binds relay material joins the relay transaction, and a runtime or
+        provider commit rewrites the Codex MCP entry.  The scope has to declare
+        those up front -- a lane discovered halfway through a transaction is a
+        lane taken out of order -- so this is deliberately a superset.  An
+        argument this cannot read (an unknown domain, an empty list) declares
+        everything and lets the body answer with its own error.
+        """
+
+        if domain is None and domains is None:
+            return tuple(self._domain_names())
+        try:
+            if domains is not None:
+                if isinstance(domains, (str, bytes, bytearray)) or not isinstance(domains, Sequence) or not domains:
+                    return tuple(self._domain_names())
+                names = {_canonical_domain(name) for name in domains}
+            else:
+                names = {_canonical_domain(domain)}
+        except CoreError:
+            return tuple(self._domain_names())
+        if names & {"providers_models", "relay_accounts"}:
+            names |= {"providers_models", "relay_accounts"}
+        if names & {"providers_models", "runtime", "codex"}:
+            names.add("codex")
+        return tuple(sorted(names))
+
     def apply(
         self,
         domain: str | None = None,
@@ -6518,7 +7317,20 @@ class CoreStore:
         revision: int | None = None,
         confirmation: str | Sequence[str] | None = None,
     ) -> dict[str, Any]:
-        with self._mutation_scope():
+        should_emit = False
+        # The commit's own restart decision asks whether the proxy is running,
+        # and that answer must be the one observed now, not the row an earlier
+        # commit happened to leave behind.  Probe it here -- outside every write
+        # lane, so a booting controller costs this call its own probe budget and
+        # not a hold on the domains every window edits.
+        self._service_row_is_live()
+        # The lanes this Apply declares before it starts.  A one-section Apply
+        # takes that section's lane plus the domains a coordinated write can
+        # pull in (the relay's key material for a provider draft, the other
+        # half of the relay transaction), and the Codex MCP entry that follows
+        # a runtime or provider commit.  A full Apply -- every dirty draft --
+        # is the cross-domain case and names everything.
+        with self._domain_scope(*self._apply_domain_hints(domain, domains)):
             # The caller's revision names the projection it read its edit from.
             # A refresh *inside* this Apply can advance the shared revision by
             # adopting a clean draft whose file changed since that read, and
@@ -6766,8 +7578,8 @@ class CoreStore:
                 # write — looked like the one that failed.
                 self._mark_refused_draft(transaction_adapters)
                 raise CoreError("apply_failed", safe_exception_message(exc)) from None
-            self._emit()
-            return {
+            should_emit = True
+            response = {
                 "revision": self._revision,
                 "applied": True,
                 "status": "applied",
@@ -6776,6 +7588,9 @@ class CoreStore:
                 "pending_operations": 0,
                 "issues": [],
             }
+        if should_emit:
+            self._request_emit()
+        return response
 
     def _sync_codex_image_context_mcp(self, applied: Sequence[str]) -> None:
         """Keep Codex's fetch server in step with the image-context switch.
@@ -6817,9 +7632,10 @@ class CoreStore:
         )
 
     def reload(self, domain: str | None = None, *, revision: int | None = None) -> dict[str, Any]:
-        with self._mutation_scope():
+        should_emit = False
+        names = [_canonical_domain(domain)] if domain is not None else self._domain_names()
+        with self._domain_scope(*names):
             self._check_revision(revision)
-            names = [_canonical_domain(domain)] if domain is not None else list(self._domains)
             for name in names:
                 adapter = self._domains.get(name)
                 if adapter is None:
@@ -6837,13 +7653,16 @@ class CoreStore:
                 }
             self._advance_revision()
             self._persist_metadata()
-            self._emit()
-            return {"revision": self._revision}
+            should_emit = True
+            response = {"revision": self._revision}
+        if should_emit:
+            self._request_emit()
+        return response
 
     def probe(self, payload: Mapping[str, Any] | None = None, *, domain: str | None = None) -> dict[str, Any]:
         name = _canonical_domain(domain or "providers_models")
         data = dict(payload or {})
-        with self._mutation_scope():
+        with self._domain_scope(name):
             adapter = self._domains.get(name)
             if adapter is None:
                 return {"ok": False, "protocols": [], "detail": "Probe is unavailable"}
@@ -6863,25 +7682,29 @@ class CoreStore:
                 value = perform(prepared)
             except Exception as exc:
                 return {"ok": False, "protocols": [], "detail": safe_exception_message(exc)}
-            with self._mutation_scope():
+            with self._domain_scope(name):
                 if self._domains.get(name) is not adapter:
                     return {"ok": False, "protocols": [], "detail": "Probe is unavailable"}
                 try:
                     value, changed = commit(prepared, value)
                 except Exception as exc:
                     return {"ok": False, "protocols": [], "detail": safe_exception_message(exc)}
+                should_emit = False
                 if changed:
                     self._advance_revision()
                     self._persist_metadata()
-                    self._emit()
+                    should_emit = True
                 result = _safe_public(value if isinstance(value, Mapping) else {})
                 if not isinstance(result, dict):
                     result = {}
                 result.setdefault("ok", False)
                 result.setdefault("protocols", [])
-                return result
+            if should_emit:
+                self._request_emit()
+            return result
 
-        with self._mutation_scope():
+        should_emit = False
+        with self._domain_scope(name):
             method = getattr(adapter, "probe", None)
             if not callable(method):
                 return {"ok": False, "protocols": [], "detail": "Probe is unavailable"}
@@ -6904,7 +7727,7 @@ class CoreStore:
                     ),
                 )
                 self._persist_metadata()
-                self._emit()
+                should_emit = True
             result = _safe_public(value if isinstance(value, Mapping) else {})
             if not isinstance(result, dict):
                 result = {}
@@ -6919,7 +7742,9 @@ class CoreStore:
                         service_result = None
                     if isinstance(service_result, Mapping):
                         self._set_service_from_result(service_result, increment=False)
-            return result
+        if should_emit:
+            self._request_emit()
+        return result
 
     def export(self, sections: Sequence[str], *, destination_token: str | None = None) -> dict[str, Any]:
         if isinstance(sections, (str, bytes, bytearray)) or not isinstance(sections, Sequence) or not sections:
@@ -6990,7 +7815,7 @@ class CoreStore:
             }
         package_sections: dict[str, Any] = {}
         safe_package_sections: dict[str, Any] = {}
-        with self._mutation_scope():
+        with self._domain_scope(*names):
             for name in names:
                 adapter = self._domains.get(name)
                 if adapter is None:
@@ -7188,7 +8013,8 @@ class CoreStore:
                 raise CoreError("invalid_sections", "Choose only sections detected in the selected file")
             selected = requested
         raw_sections = package["sections"]
-        with self._mutation_scope():
+        should_emit = False
+        with self._domain_scope(*selected):
             self._check_revision(revision)
             pending: list[tuple[str, DomainAdapter, object]] = []
             preview: dict[str, dict[str, bool]] = {}
@@ -7251,8 +8077,11 @@ class CoreStore:
                     raise CoreError("import_failed", safe_exception_message(exc)) from None
                 raise
 
-            self._emit()
-            return {"revision": self._revision, "draft_domains": staged, "preview": preview}
+            should_emit = True
+            response = {"revision": self._revision, "draft_domains": staged, "preview": preview}
+        if should_emit:
+            self._request_emit()
+        return response
 
     def announce_web_endpoint(self, address: str, port: int) -> None:
         """State where this Core answers the browser page and its API.
@@ -7288,7 +8117,7 @@ class CoreStore:
             self._advance_revision()
             self._persist_metadata()
             result = copy.deepcopy(self._service)
-        self._emit()
+        self._request_emit()
         return result
 
 __all__ = [

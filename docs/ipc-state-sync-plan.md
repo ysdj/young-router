@@ -107,20 +107,39 @@
   "ops": [
     { "domain": "providers_models", "kind": "upsert", "id": "model:abc", "value": { … } },
     { "domain": "providers_models", "kind": "remove", "id": "model:def" }
-  ] }
+  ],
+  // 以下四个只在真的变了时出现（实现时补上，见 §3.1.1）
+  "service": { … }, "drafts": { … }, "disk": { … }, "action_summaries": { … } }
 
 // 明确要求重同步（队列溢出、diff 不可用）
 { "protocol_version": 1, "event": "resync", "revision": 42 }
 
 // 作业进度与结果
 { "protocol_version": 1, "event": "job", "job_id": "…", "state": "running|done|failed",
-  "result": { … } }
+  "revision": 42, "result": { … } }
 ```
 
 **硬约束**：
 - `ops` **必须**支持 `remove`，否则被删的行在客户端残留——这是增量同步最典型的事故。
 - `base_revision` 与客户端当前 revision 不连续时，客户端丢弃该 patch 并拉全量；`revision` 单调不变。
 - 旧客户端只认 `snapshot`，因此首次订阅与断档仍走全量，**协议不破**。
+- `job` 事件同样携带 `revision`（实现时按契约统一，与上图示例的不同是刻意的：事件的 revision 是它描述的状态版本）。
+
+### 3.1.1 实施中修正的两处设计缺口
+
+计划原文只让 patch 携带 `domains` 与 `ops`，实施后发现两个会让增量失效或让客户端状态悄悄错误的问题，均已修正：
+
+**缺口一：顶层字段不会被推送。** 快照顶层还有 `service`、`drafts`、`disk`、`action_summaries`，客户端直接消费（`drafts[domain].dirty` 驱动自动应用与关窗确认；`service.state` 驱动菜单与状态行）。只 diff `domains` 会让一次普通 commit 之后客户端的「有未保存改动」标记是错的。
+
+验证方式：把 patch 应用到基线快照副本，与真实快照逐字段比较，差异为 `.drafts.runtime.dirty: False -> True` 与 `.action_summaries.runtime: missing in client`。
+
+修正：patch 只在这四个字段**实际变化**时携带它们（相等则省略），体积约 1.4 KB。
+
+**缺口二：action summary 是整份域投影。** `_last_actions[name] = dict(safe_result)` 存的是 dispatch 的完整结果，等于该域投影。一旦 patch 携带摘要，一次 `provider.add` 的 patch 从 2.9 KB 涨到 24.8 KB（14 provider 夹具），几乎回到快照大小。
+
+修正：摘要按客户端实际读取的字段白名单裁剪——`providers_models` 只留 `operation_summary`，`relay_accounts` 留 `detected_type`/`confidence`/`resource_status`。修正后同夹具 patch 为 2,858 B。
+
+**由此产生的测试要求（已经在实施中落地）**：每条 patch 测试除了断言 `ops`，还必须断言「把 patch 应用到基线快照后，与真实快照逐字段零差异」。只断言 ops 的测试在缺口一存在时全绿。
 
 ### 3.2 五个不变量（写进 AGENTS.md）
 

@@ -492,7 +492,7 @@ export interface IpcParams {
     | { editor_token: string; text: string };
   files: Record<string, never>;
   dispatch: { action: DispatchAction; revision?: number };
-  subscribe: { topics?: "snapshot"[] };
+  subscribe: { topics?: ("snapshot" | "patch" | "resync" | "job")[] };
   validate: { domain: ConfigDomain; revision?: number };
   apply: ({ domain: ConfigDomain; domains?: never } | { domains: ConfigDomain[]; domain?: never }) & { revision: number; confirmation?: string | string[] };
   reload: { domain?: ConfigDomain; revision?: number };
@@ -532,7 +532,7 @@ export interface IpcResults {
     baseline: string;
   };
   files: { revision: number; files: ClientFile[] };
-  dispatch: { revision: number; action_summary?: Record<string, unknown> };
+  dispatch: { revision: number; action_summary?: Record<string, unknown>; changed?: string[]; job_id?: string };
   subscribe: { subscription_id: string };
   validate: { validate: ValidationSummary };
   apply: {
@@ -594,19 +594,67 @@ export interface IpcResponse<M extends IpcMethod = IpcMethod> {
 }
 
 /**
- * The event a subscription can ask for.  One topic exists because Core
- * publishes one event kind: a subscriber that names it is sent those events,
- * a subscriber that names none is sent every event, and a subscriber that
- * names an empty list is sent nothing.
+ * The event a subscription can ask for.  A subscriber that names a topic is
+ * sent those events, a subscriber that names none is sent every event, and a
+ * subscriber that names an empty list is sent nothing.
  */
 export type IpcEventTopic = IpcEvent["event"];
 
-export interface IpcEvent {
+/** One entity-level change inside a patch event. */
+export interface IpcEventOp {
+  domain: ConfigDomain;
+  kind: "upsert" | "remove" | "replace";
+  id?: string;
+  value?: unknown;
+}
+
+/** The full projection, sent on first subscription and after a gap. */
+export interface SnapshotEvent {
   protocol_version: typeof IPC_PROTOCOL_VERSION;
   event: "snapshot";
   revision: number;
   snapshot: CoreSnapshot;
 }
+
+/**
+ * Incremental changes against ``base_revision``.
+ *
+ * ``ops`` moves the named domains; the top-level fields beside them carry the
+ * parts of a snapshot no op can describe (a staged draft's dirty flag, the disk
+ * markers, the service row, an action summary).  Each is present only when it
+ * changed, so a patch is the size of the edit and not a snapshot with ops.
+ */
+export interface PatchEvent {
+  protocol_version: typeof IPC_PROTOCOL_VERSION;
+  event: "patch";
+  base_revision: number;
+  revision: number;
+  domains: ConfigDomain[];
+  service?: CoreSnapshot["service"];
+  drafts?: CoreSnapshot["drafts"];
+  disk?: CoreSnapshot["disk"];
+  action_summaries?: CoreSnapshot["action_summaries"];
+  ops: IpcEventOp[];
+}
+
+/** The revision moved in a way no patch could describe: read the full state. */
+export interface ResyncEvent {
+  protocol_version: typeof IPC_PROTOCOL_VERSION;
+  event: "resync";
+  revision: number;
+}
+
+/** Progress and result of a long-running Core operation. */
+export interface JobEvent {
+  protocol_version: typeof IPC_PROTOCOL_VERSION;
+  event: "job";
+  job_id: string;
+  state: "running" | "done" | "failed";
+  revision: number;
+  result?: Record<string, unknown>;
+}
+
+export type IpcEvent = SnapshotEvent | PatchEvent | ResyncEvent | JobEvent;
 
 export interface IpcTransport {
   send<M extends IpcMethod>(request: IpcRequest<M>): Promise<IpcResponse<M>>;
@@ -632,6 +680,14 @@ export interface IpcClient {
   apply(domain: ConfigDomain, revision: number, confirmation?: string | string[]): Promise<IpcResults["apply"]>;
   applyDomains(domains: ConfigDomain[], revision: number, confirmation?: string | string[]): Promise<IpcResults["apply"]>;
   reload(domain?: ConfigDomain, revision?: number): Promise<{ revision: number }>;
+  /**
+   * Start a probe and wait for the job that answers it.
+   *
+   * A probe reads the upstream and can take minutes, so Core answers the
+   * request with a job id at once and publishes the result as a `job` event.
+   * This method is the one place that pair is joined back into the probe
+   * result every caller here already draws.
+   */
   probe(providerId?: string, modelId?: string, domain?: "providers_models" | "webdav", values?: Record<string, unknown>): Promise<IpcResults["probe"]>;
   export(sections: ConfigDomain[], destinationToken: string): Promise<IpcResults["export"]>;
   previewImport(sourceToken: string, revision: number): Promise<IpcResults["import_preview"]>;

@@ -47,6 +47,7 @@ from .protocol import (
     encode_message,
     is_error_code,
     make_request,
+    make_resync_event,
     validate_method_result,
 )
 from .protocol import _encode_json
@@ -555,6 +556,10 @@ class _Subscription:
     # for nothing.
     topics: frozenset[str] | None = None
     queue: queue.Queue[dict[str, Any]] = field(default_factory=lambda: queue.Queue(maxsize=MAX_EVENTS))
+    #: Set when an event arrived that this queue could not hold.  The chain of
+    #: patches is broken, so the next read of this subscription answers with a
+    #: ``resync`` marker instead of the stale patches still queued.
+    needs_resync: bool = False
 
 
 @dataclass
@@ -2502,16 +2507,18 @@ class CoreIPCServer:
                 # The client named the topics it wants: it is not sent the
                 # events it did not ask for.
                 continue
+            if subscription.needs_resync:
+                # This subscription is owed a full read; a patch queued now
+                # would describe a state it is about to replace anyway.
+                continue
             try:
                 subscription.queue.put_nowait(event)
             except queue.Full:
-                # Keep the newest snapshot; a slow UI can always call
-                # ``snapshot`` after receiving the marker.
-                try:
-                    subscription.queue.get_nowait()
-                    subscription.queue.put_nowait(event)
-                except queue.Empty:
-                    pass
+                # A patch cannot be dropped silently: the window would apply
+                # the next one on a revision it never reached, or keep a row
+                # the store already removed.  Mark the gap and let the next
+                # read answer with a resync marker instead.
+                subscription.needs_resync = True
 
     def _new_subscription(self, session_token: str, topics: frozenset[str] | None = None) -> str:
         subscription_id = uuid.uuid4().hex
@@ -2557,6 +2564,18 @@ class CoreIPCServer:
             subscription = self._subscriptions.get(subscription_id)
             if subscription is None or subscription.session_token != session_token:
                 return None
+        if subscription.needs_resync:
+            subscription.needs_resync = False
+            # Whatever this queue still holds predates the gap: a full read is
+            # about to replace it, and applying a patch from before the gap on
+            # the read that follows would leave the two disagreeing.
+            while True:
+                try:
+                    subscription.queue.get_nowait()
+                except queue.Empty:
+                    break
+            if subscription.topics is None or "resync" in subscription.topics:
+                return make_resync_event(self.core.revision)
         try:
             return subscription.queue.get(timeout=timeout)
         except queue.Empty:

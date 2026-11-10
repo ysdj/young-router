@@ -60,6 +60,7 @@ from ...public_names import import_name_case, imported_public_name, public_name_
 from ...values import explicit_bool
 from ...values import int_or_none as _int_or_none
 from ...api_base import api_base_for_surface, isolated_http_opener, service_root
+from ..entity_ops import EntityOp, entity_key, index_entities
 from ..security import (
     REDACT_TEXT,
     redact,
@@ -305,6 +306,34 @@ def _model_is_live(provider: Mapping[str, Any], model: Mapping[str, Any]) -> boo
     provider_enabled = provider.get("enabled") is not False
     model_enabled = model.get("model_enabled", model.get("enabled", True)) is not False
     return provider_enabled and model_enabled
+
+
+def _provider_entities(projection: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    """This projection's providers, keyed by the id the row itself states."""
+
+    return index_entities(projection.get("providers"), "id", "name")
+
+
+def _model_entities(projection: Mapping[str, Any]) -> dict[tuple[str, str], Mapping[str, Any]]:
+    """Every route in this projection, keyed by its provider and its own id.
+
+    A provider's routes are nested in its row, so they are collected from
+    there.  The provider is part of the key because two rows may serve the same
+    public model name: the pair keeps one provider's route from standing in
+    for another's when only one of them changed.
+    """
+
+    entities: dict[tuple[str, str], Mapping[str, Any]] = {}
+    providers = projection.get("providers")
+    if not isinstance(providers, (list, tuple)):
+        return entities
+    for provider in providers:
+        if not isinstance(provider, Mapping):
+            continue
+        provider_key = entity_key(provider, "id", "name")
+        for model in index_entities(provider.get("models"), "id", "editor_id").values():
+            entities[(provider_key, entity_key(model, "id", "editor_id"))] = model
+    return entities
 
 
 class ProvidersModelsDomain:
@@ -1186,6 +1215,39 @@ class ProvidersModelsDomain:
             "service_account_recheck_seconds": self._workbuddy_recheck_seconds(),
             "raw_editor_available": True,
         }
+
+    def diff(
+        self, previous: Mapping[str, Any], current: Mapping[str, Any]
+    ) -> list[EntityOp]:
+        """Name the providers and routes that changed between two snapshots.
+
+        This is the one domain whose rows have their own identity, and the one
+        an ``add`` lands in: a new provider is one ``provider:`` upsert instead
+        of the whole projection.  A changed provider row carries its routes
+        with it, and each changed route is also named on its own so a window
+        that applies ops entity by entity never has to re-read the domain.  A
+        removed provider names no value; a window that kept the row would
+        otherwise show a provider the store deleted.
+        """
+
+        ops: list[EntityOp] = []
+        previous_providers = _provider_entities(previous)
+        current_providers = _provider_entities(current)
+        for key, value in current_providers.items():
+            if previous_providers.get(key) != value:
+                ops.append(EntityOp(self.name, "upsert", f"provider:{key}", value))
+        for key in previous_providers:
+            if key not in current_providers:
+                ops.append(EntityOp(self.name, "remove", f"provider:{key}"))
+        previous_models = _model_entities(previous)
+        current_models = _model_entities(current)
+        for key, value in current_models.items():
+            if previous_models.get(key) != value:
+                ops.append(EntityOp(self.name, "upsert", f"model:{key[1]}", value))
+        for key in previous_models:
+            if key not in current_models:
+                ops.append(EntityOp(self.name, "remove", f"model:{key[1]}"))
+        return ops
 
     def _model_concurrency_default(self) -> int:
         """The runtime's global concurrency limit, as a route inherits it."""

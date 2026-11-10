@@ -444,10 +444,12 @@ class RuntimeSettingsDomain:
             key: (REDACTED if self._is_secret_setting(key) and value != defaults.get(key, "") else value)
             for key, value in projected.items()
         }
+        # One name for the catalogue: ``fields`` and ``settings`` were the same
+        # list, so the snapshot carried it twice and every window parsed both.
+        # Readers use ``settings``.
         return {
             "domain": self.name,
             "revision": self.revision,
-            "fields": fields,
             "settings": fields,
             "values": values,
             "raw_editor_available": True,

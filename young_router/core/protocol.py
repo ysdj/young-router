@@ -90,6 +90,16 @@ PROTOCOL_VERSION = _PROTOCOL_SCHEMA["protocol_version"]
 """The current IPC protocol version."""
 SUPPORTED_METHODS = tuple(_PROTOCOL_SCHEMA["methods"])
 METHODS = frozenset(SUPPORTED_METHODS)
+# The domains the event contract can name.  A patch whose domain is not one of
+# them is an event no client can type, so it is refused where it is built.
+EVENT_DOMAINS = frozenset(_PROTOCOL_SCHEMA.get("$defs", {}).get("domain", {}).get("enum", ()))
+# The top-level snapshot fields a patch may carry.  They are the halves of a
+# projection that are not keyed by domain -- a staged draft's dirty flag, a
+# file that appeared, a service row that moved -- so a window cannot derive
+# them from the ops it applied, and a patch that leaves them out leaves the
+# reader believing a state the store has already left.  Every one is optional
+# on the wire: an unchanged field is omitted rather than restated.
+PATCH_TOP_LEVEL_FIELDS = ("service", "drafts", "disk", "action_summaries")
 
 
 def _safe_text(value: object, label: str, *, maximum: int) -> str:
@@ -656,6 +666,127 @@ def make_event(event: str, revision: int, snapshot: Mapping[str, Any]) -> dict[s
     return payload
 
 
+def _event_revision(value: object, label: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ProtocolError("invalid_event", f"{label} is invalid")
+    return value
+
+
+def make_patch_event(
+    base_revision: int,
+    revision: int,
+    domains: list[str] | tuple[str, ...],
+    ops: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+    top_level: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build an incremental event for the changes since ``base_revision``.
+
+    ``ops`` is what a window applies; ``domains`` names the projections those
+    ops belong to so a window can tell which panes owe a repaint.  A patch that
+    names no domain or carries no op describes nothing a window could apply, so
+    it is refused here instead of arriving as a no-op the reader has to explain.
+
+    ``top_level`` carries the snapshot fields that are not keyed by domain and
+    did change, by name: a staged draft, the disk markers, the service row, an
+    action summary.  A field that did not move is left out, so a patch stays the
+    size of the edit instead of becoming a snapshot with ops attached.
+    """
+
+    base = _event_revision(base_revision, "patch base revision")
+    current = _event_revision(revision, "patch revision")
+    if base > current:
+        raise ProtocolError("invalid_event", "patch base revision is ahead of its revision")
+    names: list[str] = []
+    for value in domains:
+        name = _safe_text(value, "domain", maximum=64)
+        if name not in EVENT_DOMAINS:
+            raise ProtocolError("invalid_event", "patch event names an unknown domain")
+        if name not in names:
+            names.append(name)
+    if not names:
+        raise ProtocolError("invalid_event", "patch event names no domain")
+    payload_ops: list[dict[str, Any]] = []
+    for op in ops:
+        if not isinstance(op, Mapping):
+            raise ProtocolError("invalid_event", "patch event op is invalid")
+        entry = dict(op)
+        kind = entry.get("kind")
+        if kind not in {"upsert", "remove", "replace"}:
+            raise ProtocolError("invalid_event", "patch event op kind is invalid")
+        if not isinstance(entry.get("domain"), str) or entry["domain"] not in EVENT_DOMAINS:
+            raise ProtocolError("invalid_event", "patch event op names no known domain")
+        identifier = entry.get("id")
+        if identifier is not None and (
+            not isinstance(identifier, str) or not identifier or len(identifier.encode("utf-8")) > 512
+        ):
+            raise ProtocolError("invalid_event", "patch event op id is invalid")
+        if set(entry) - {"domain", "kind", "id", "value"}:
+            raise ProtocolError("invalid_event", "patch event op carries an unknown field")
+        payload_ops.append(entry)
+    if not payload_ops:
+        raise ProtocolError("invalid_event", "patch event carries no op")
+    payload = {
+        "protocol_version": PROTOCOL_VERSION,
+        "event": "patch",
+        "base_revision": base,
+        "revision": current,
+        "domains": names,
+        "ops": payload_ops,
+    }
+    if top_level is not None:
+        for field, value in top_level.items():
+            if field not in PATCH_TOP_LEVEL_FIELDS:
+                raise ProtocolError("invalid_event", "patch event carries an unknown top-level field")
+            if not isinstance(value, Mapping):
+                raise ProtocolError("invalid_event", f"patch event {field} must be an object")
+            payload[field] = dict(value)
+    _validate_json_value(payload)
+    return payload
+
+
+def make_resync_event(revision: int) -> dict[str, Any]:
+    """Ask a window to read the full state again.
+
+    Sent when the change cannot be described as a patch (a diff that raised, a
+    patch too large to be worth sending) and when a slow subscription missed
+    events its queue could not hold.
+    """
+
+    payload = {
+        "protocol_version": PROTOCOL_VERSION,
+        "event": "resync",
+        "revision": _event_revision(revision, "resync revision"),
+    }
+    _validate_json_value(payload)
+    return payload
+
+
+def make_job_event(
+    job_id: str,
+    state: str,
+    revision: int,
+    result: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a progress or result event for one long-running Core operation."""
+
+    identifier = _safe_text(job_id, "job id", maximum=256)
+    if state not in {"running", "done", "failed"}:
+        raise ProtocolError("invalid_event", "job state is invalid")
+    payload: dict[str, Any] = {
+        "protocol_version": PROTOCOL_VERSION,
+        "event": "job",
+        "job_id": identifier,
+        "state": state,
+        "revision": _event_revision(revision, "job revision"),
+    }
+    if result is not None:
+        if not isinstance(result, Mapping):
+            raise ProtocolError("invalid_event", "job result must be an object")
+        payload["result"] = dict(result)
+    _validate_json_value(payload)
+    return payload
+
+
 def load_protocol_schema() -> dict[str, Any]:
     """Load the shared JSON Schema used by Python and TypeScript checks.
 
@@ -669,9 +800,11 @@ def load_protocol_schema() -> dict[str, Any]:
 
 
 __all__ = [
+    "EVENT_DOMAINS",
     "METHODS",
     "MAX_EDITOR_DOCUMENT_BYTES",
     "MAX_MESSAGE_BYTES",
+    "PATCH_TOP_LEVEL_FIELDS",
     "PROTOCOL_VERSION",
     "ProtocolError",
     "RequestEnvelope",
@@ -681,7 +814,10 @@ __all__ = [
     "encode_message",
     "is_error_code",
     "make_event",
+    "make_job_event",
+    "make_patch_event",
     "make_request",
+    "make_resync_event",
     "load_protocol_schema",
     "validate_method_result",
 ]
