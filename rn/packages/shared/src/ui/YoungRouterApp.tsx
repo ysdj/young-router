@@ -3004,21 +3004,27 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     const issue = async (): Promise<IpcResults["dispatch"]> => {
       if (revision.current === undefined) await refresh();
       const action = actionDomain === undefined ? { type, payload } : { domain: actionDomain, type, payload };
-      let staged: IpcResults["dispatch"];
-      try {
-        staged = await ipc.dispatch(action, revision.current);
-      } catch (reason: unknown) {
-        if (!isRevisionConflict(reason) || !isRevisionRetryableAction(type)) throw reason;
-        // Every route window observes the same Core revision. Another window
-        // or an official-account status refresh can advance it between this
-        // surface's last snapshot and a semantic action such as Add account.
-        // Rebase that action on the authoritative snapshot once; a second
-        // conflict remains visible instead of hiding a real concurrent edit.
-        const current = await ipc.snapshot();
-        revision.current = current.revision;
-        latestSnapshot.current = current;
-        onSnapshot(current);
-        staged = await ipc.dispatch(action, current.revision);
+      // Every route window observes the same Core revision, and this app writes
+      // settings from more than one place at a time — the pane's debounced
+      // apply, a background relay alignment, the model list a proxy reload
+      // republishes.  So a semantic action can arrive after one of those moved
+      // the revision, and one rebase was not enough: the retry re-read the
+      // snapshot and met another write already in flight.  The rebase is
+      // bounded but repeated, and each attempt takes the revision it just read.
+      const DISPATCH_ATTEMPTS = 3;
+      let staged: IpcResults["dispatch"] | undefined;
+      for (let attempt = 0; staged === undefined; attempt += 1) {
+        try {
+          staged = await ipc.dispatch(action, revision.current as number);
+        } catch (reason: unknown) {
+          if (!isRevisionConflict(reason) || !isRevisionRetryableAction(type)) throw reason;
+          if (attempt + 1 >= DISPATCH_ATTEMPTS) throw reason;
+          await new Promise<void>((resolve) => setTimeout(resolve, 40 * (attempt + 1)));
+          const current = await ipc.snapshot();
+          revision.current = current.revision;
+          latestSnapshot.current = current;
+          onSnapshot(current);
+        }
       }
       revision.current = staged.revision;
       return staged;
@@ -3385,8 +3391,11 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
           // revision: the write it was racing already committed them, so the
           // outcome the user asked for exists. Report that instead of failing
           // the commit — a window whose own background Apply finished first is
-          // the ordinary case here, not a change made outside the window.
-          if (currentDomains.length === 0) {
+          // the ordinary case here, not a change made outside the window.  The
+          // comparison names this Apply's own domains: a *different* section
+          // staying dirty (the relay draft, kept dirty by its own backlog) is
+          // not evidence that this write failed.
+          if (domains.every((name) => !currentDomains.includes(name))) {
             // A revision that did not move forward names no committed write,
             // so the draft leaving staging there is somebody else's decision
             // and must stay visible.

@@ -729,22 +729,24 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The retries are spent: ask once more whether the write landed before
         # the strip states a save that did not happen.
         self.assertIn('const settled = await ipc.snapshot();', apply_body)
-        self.assertIn('if (stagedDomainsForRoute(settled).length === 0) {', apply_body)
+        self.assertIn('if (domains.every((name) => !currentDomains.includes(name))) {', apply_body)
+        # A different section staying dirty is not evidence this write failed.
+        self.assertIn("const currentDomains = stagedDomainsForRoute(current);", apply_body)
         self.assertIn('throw reason;', apply_body)
         # The replacement that moved the revision is still landing; the
         # retry waits for it and reads the revision again rather than
         # resending the one it already lost.
         self.assertIn('const settleBeforeRetry = (attempt: number): Promise<void> => new Promise<void>((resolve) => setTimeout(resolve, 40 * (attempt + 1)));', apply_body)
         self.assertIn('await settleBeforeRetry(attempt);', apply_body)
-        # A conflict whose rebase finds nothing left staged is the pane's own
-        # background Apply having already committed the edit. The user asked
-        # for a write that exists, so it is reported applied instead of failing
-        # with a message about a change made outside the window. That case is
-        # answered before the different-draft refusal: `sameDomains` is false
-        # whenever the newer snapshot stages nothing, so testing it first sent
-        # the pane's own completed commit down the refusal and a provider
-        # toggle that had landed still reported 更改未生效.
-        self.assertIn("if (currentDomains.length === 0) {", apply_body)
+        # A conflict whose rebase finds this Apply's own domains no longer
+        # staged is the pane's own background Apply having already committed
+        # the edit. The user asked for a write that exists, so it is reported
+        # applied instead of failing with a message about a change made outside
+        # the window. That case is answered before the different-draft refusal;
+        # it names this Apply's domains rather than `length === 0`, because a
+        # different section (the relay draft, kept dirty by its own backlog)
+        # staying staged is not evidence that this write failed.
+        self.assertIn("if (domains.every((name) => !currentDomains.includes(name))) {", apply_body)
         self.assertIn("if (!sameDiskState || current.revision < refreshed.revision) throw reason;", apply_body)
         self.assertIn('status: "applied", domains: [...domains]', apply_body)
         # Two Applies for one edit move the revision under each other, and the
@@ -6129,7 +6131,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("revision.current = current.revision;", dispatch)
         self.assertIn("latestSnapshot.current = current;", dispatch)
         self.assertIn("onSnapshot(current);", dispatch)
-        self.assertEqual(2, dispatch.count("await ipc.dispatch(action,"))
+        # One rebase was not enough: the retry re-read the snapshot and met
+        # another of this app's own writes already moving the revision.  The
+        # rebase repeats a bounded number of times, and every attempt takes the
+        # revision it just read rather than resending the one it lost.
+        self.assertEqual(1, dispatch.count("await ipc.dispatch(action,"))
+        self.assertIn("const DISPATCH_ATTEMPTS = 3;", dispatch)
+        self.assertIn("if (attempt + 1 >= DISPATCH_ATTEMPTS) throw reason;", dispatch)
+        self.assertIn("await new Promise<void>((resolve) => setTimeout(resolve, 40 * (attempt + 1)));", dispatch)
         self.assertNotIn("while", dispatch)
         self.assertIn("function isRevisionRetryableAction(type: string): boolean", self.ui)
         self.assertIn("normalized === \"service_provider_add\"", self.ui)
