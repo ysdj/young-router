@@ -717,7 +717,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('const current = await ipc.snapshot();', apply_body)
         self.assertIn('const sameDomains = currentDomains.length === domains.length', apply_body)
         self.assertIn('const sameDiskState = domains.every((name) => (', apply_body)
-        self.assertIn('result = await applyOnce(current.revision);', apply_body)
+        # One rebase was not enough while a proxy replacement was still
+        # landing: the restart itself moves the revision again a moment
+        # later, and the write was lost with it.  The retry is bounded, and
+        # the disk/domain guards still refuse a draft somebody else changed.
+        self.assertIn('const APPLY_ATTEMPTS = 3;', apply_body)
+        self.assertIn('result = await applyOnce(attempt === 0 ? refreshed.revision : (revision.current ?? refreshed.revision));', apply_body)
+        self.assertIn('if (!sameDomains || !sameDiskState || attempt + 1 >= APPLY_ATTEMPTS) throw reason;', apply_body)
+        self.assertIn('await new Promise<void>((resolve) => setTimeout(resolve, 40 * (attempt + 1)));', apply_body)
         # A conflict whose rebase finds nothing left staged is the pane's own
         # background Apply having already committed the edit. The user asked
         # for a write that exists, so it is reported applied instead of failing
@@ -728,7 +735,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # toggle that had landed still reported 更改未生效.
         self.assertIn("if (currentDomains.length === 0) {", apply_body)
         self.assertIn("if (!sameDiskState || current.revision < refreshed.revision) throw reason;", apply_body)
-        self.assertIn("} else if (!sameDomains || !sameDiskState) {\n          throw reason;", apply_body)
         self.assertIn('status: "applied", domains: [...domains]', apply_body)
         self.assertNotIn('appliedRevision.current', self.ui)
 

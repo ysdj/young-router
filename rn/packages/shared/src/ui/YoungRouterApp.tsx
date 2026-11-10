@@ -3344,54 +3344,53 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
           ? ipc.applyDomains([...domains], nextRevision, confirmations.length > 0 ? confirmations : undefined)
           : ipc.apply(domain, nextRevision, confirmations.length > 0 ? confirmations : undefined)
       );
-      let result: IpcResults["apply"];
-      try {
-        result = await applyOnce(refreshed.revision);
-      } catch (reason: unknown) {
-        if (!isRevisionConflict(reason)) throw reason;
-        // Relay login/resource discovery and official-account auth status are
-        // intentionally live projections. They can advance Core's shared
-        // revision between this snapshot and Apply without changing the
-        // staged settings the user is applying. Rebase once on the
-        // authoritative snapshot; a second conflict remains visible instead
-        // of silently overwriting a concurrent edit.
-        const current = await ipc.snapshot();
-        const currentDomains = stagedDomainsForRoute(current);
-        const sameDomains = currentDomains.length === domains.length
-          && domains.every((name) => currentDomains.includes(name));
-        const sameDiskState = domains.every((name) => (
-          current.disk[name]?.changed === refreshed.disk[name]?.changed
-          && current.disk[name]?.generation === refreshed.disk[name]?.generation
-        ));
-        // The rebase only ever answers for the same staged edit: a different
-        // set of domains or a different disk generation is another writer, and
-        // reporting that as applied would claim a save that did not happen.
-        revision.current = current.revision;
-        latestSnapshot.current = current;
-        onSnapshot(current);
-        // The domains this Apply named are no longer staged at the newer
-        // revision: the write it was racing already committed them, so the
-        // outcome the user asked for exists. Report that instead of failing
-        // the commit — a window whose own background Apply finished first is
-        // the ordinary case here, not a change made outside the window.
-        //
-        // This case is answered first because `sameDomains` is false whenever
-        // the newer snapshot stages nothing: asking it first sent the pane's
-        // own completed commit down the refusal below, so a provider toggle
-        // whose Apply had already landed still reported 更改未生效 — the
-        // relay alignment and workbuddy reads a patch kicks off advance the
-        // shared revision inside that window, and the debounced Apply then
-        // met a Core that had nothing left to write.
-        if (currentDomains.length === 0) {
-          // A revision that did not move forward names no committed write, so
-          // the draft leaving staging there is somebody else's decision and
-          // must stay visible.
-          if (!sameDiskState || current.revision < refreshed.revision) throw reason;
-          result = { revision: current.revision, applied: true, status: "applied", domains: [...domains], completed_operations: 0, pending_operations: 0, issues: [] };
-        } else if (!sameDomains || !sameDiskState) {
-          throw reason;
-        } else {
-          result = await applyOnce(current.revision);
+      // Every providers Apply restarts the managed proxy, and that restart is
+      // itself a state change; relay discovery and the official-account status
+      // are live projections with the same effect.  So the revision a window
+      // read can move before its write arrives, and one rebase is not always
+      // enough while a replacement is still landing.  The write re-reads and
+      // tries again, a bounded number of times; the attempt that lands is the
+      // one the pane reports, and a refusal that survives every attempt is
+      // still shown.
+      const APPLY_ATTEMPTS = 3;
+      let result: IpcResults["apply"] | undefined;
+      for (let attempt = 0; result === undefined; attempt += 1) {
+        try {
+          result = await applyOnce(attempt === 0 ? refreshed.revision : (revision.current ?? refreshed.revision));
+        } catch (reason: unknown) {
+          if (!isRevisionConflict(reason)) throw reason;
+          // The rebase only ever answers for the same staged edit: a different
+          // set of domains or a different disk generation is another writer,
+          // and reporting that as applied would claim a save that did not
+          // happen.
+          const current = await ipc.snapshot();
+          const currentDomains = stagedDomainsForRoute(current);
+          const sameDomains = currentDomains.length === domains.length
+            && domains.every((name) => currentDomains.includes(name));
+          const sameDiskState = domains.every((name) => (
+            current.disk[name]?.changed === refreshed.disk[name]?.changed
+            && current.disk[name]?.generation === refreshed.disk[name]?.generation
+          ));
+          revision.current = current.revision;
+          latestSnapshot.current = current;
+          onSnapshot(current);
+          // The domains this Apply named are no longer staged at the newer
+          // revision: the write it was racing already committed them, so the
+          // outcome the user asked for exists. Report that instead of failing
+          // the commit — a window whose own background Apply finished first is
+          // the ordinary case here, not a change made outside the window.
+          if (currentDomains.length === 0) {
+            // A revision that did not move forward names no committed write,
+            // so the draft leaving staging there is somebody else's decision
+            // and must stay visible.
+            if (!sameDiskState || current.revision < refreshed.revision) throw reason;
+            result = { revision: current.revision, applied: true, status: "applied", domains: [...domains], completed_operations: 0, pending_operations: 0, issues: [] };
+            break;
+          }
+          if (!sameDomains || !sameDiskState || attempt + 1 >= APPLY_ATTEMPTS) throw reason;
+          // A replacement that is still landing moves the revision once more
+          // a moment later; give it that moment instead of losing the write.
+          await new Promise<void>((resolve) => setTimeout(resolve, 40 * (attempt + 1)));
         }
       }
       if (domains.includes("codex") || domains.includes("claude") || domains.includes("clients")) {
