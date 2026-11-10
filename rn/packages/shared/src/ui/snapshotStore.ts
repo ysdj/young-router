@@ -137,5 +137,11 @@ export function postActionRefreshNeeded({ channel, revisionBefore, revisionAfter
   if (revisionBefore === undefined || revisionAfter === undefined || localRevision === undefined) return true;
   if (revisionAfter !== localRevision) return true;
   if (revisionAfter <= revisionBefore) return true;
+  // The answer is only this window's state when the channel is at least as new
+  // as the state it held before the action: a channel behind that head has the
+  // patch for what the action staged still in flight (or lost), and skipping
+  // the read then drew the state before the action with no event left to
+  // correct it.
+  if (channel.revision < revisionBefore) return true;
   return false;
 }
