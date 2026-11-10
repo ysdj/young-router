@@ -13,6 +13,7 @@ import { AccountsTable } from "./AccountsTable";
 import { usePendingAction } from "./pendingAction";
 import {
   accountDisplayName,
+  accountKeyPrefix,
   accountsFromSnapshot,
   ApiKeyCreateDialog,
   NativeFormRow,
@@ -39,6 +40,7 @@ import { suggestedProviderName, suggestedRelayStationName } from "./relayOrigin"
 import { multiplierSpelling, rateNumber, rateSpelling } from "./rateSpelling";
 import { applyPatch } from "./applyPatch";
 import { postActionRefreshNeeded, publishSnapshot, useDomainRecord, type EventChannelState } from "./snapshotStore";
+import { providerCredentialKeys, relayCredentialKey } from "./providerCredentials";
 import { isAssistantEditorOpen, isGroupManagerOpen, isProviderWizardOpen, isWebDavSettingsOpen, setAssistantEditorOpen, setGroupManagerOpen, setProviderWizardOpen, setWebDavSettingsOpen, subscribeProviderWizard } from "./providerWizardGate";
 import { RelayDialogHost, useRelayDialogSurface } from "./relayDialogSurface";
 import { SOURCE_LIST_FONT_SIZE, UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
@@ -1117,12 +1119,6 @@ function relayStationsFromSnapshot(snapshot: CoreSnapshot | undefined): RelaySta
   });
 }
 
-function relaySourcesForBaseUrl(value: string, relaySources: RelaySourceOption[]): RelaySourceOption[] {
-  const target = stationOriginKey(value);
-  if (!target) return [];
-  return relaySources.filter((source) => source.enabled && stationOriginKey(source.baseURL) === target);
-}
-
 function relayStationForBaseUrl(value: string, relayStations: RelayStationOption[]): RelayStationOption | undefined {
   const target = stationOriginKey(value);
   if (!target) return undefined;
@@ -1169,35 +1165,47 @@ function relaySourceSelectionID(source: Pick<RelaySourceOption, "stationID" | "a
   return `${source.stationID}\x1f${source.accountID}\x1f${source.resourceID}`;
 }
 
-function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[], baseURL?: string): ProviderKeyChoice[] {
+/**
+ * The station keys a provider's own credentials may come from.
+ *
+ * A provider holds the keys of the station it is bound to.  Matching on the
+ * Base URL alone offered the keys of any station that happened to sit at the
+ * same address, which is how a picker listed groups its pane's key table had
+ * never heard of: the table lists the bound station's accounts, and a provider
+ * that binds none lists nothing.  Callers that hold the provider's accounts
+ * filter by those instead (the provider pane does); this is the rule for the
+ * surfaces that only have the snapshot's stations.
+ */
+function relaySourcesForProvider(provider: UnknownRecord, relaySources: RelaySourceOption[], baseURL?: string): RelaySourceOption[] {
+  if (providerKind(provider) !== "relay") return [];
+  const stationID = stringValue(provider.relay_station_id).trim();
+  if (stationID) return relaySources.filter((source) => source.stationID === stationID);
+  const target = stationOriginKey(baseURL ?? stringValue(provider.endpoint, stringValue(provider.api_base)));
+  return target ? relaySources.filter((source) => stationOriginKey(source.baseURL) === target) : [];
+}
+
+function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[]): ProviderKeyChoice[] {
   // Neither a relay-bound slot nor one Core owns is a credential the user may
-  // pick, name, or replace: the wizard and the model inspector both read their
-  // "existing key" options here, so the exclusion belongs at this one funnel.
-  const keyStates = providerKeyStates(provider).filter((key) => !key.managed);
-  const providerBaseURL = baseURL ?? stringValue(provider.endpoint, stringValue(provider.api_base));
-  const matchingRelaySources = relaySourcesForBaseUrl(providerBaseURL, relaySources);
-  const persistedRelaySourceIDs = new Set(
-    keyStates
-      .filter((key) => key.source.kind === "relay")
-      .map((key) => relaySourceSelectionID(key.source)),
-  );
-  return [
-    ...keyStates.map((key) => ({
-      id: key.id,
-      name: key.name,
-      kind: key.source.kind,
-      state: key,
-      source: relaySourceForKey(key, relaySources),
-    })),
-    ...matchingRelaySources
-      .filter((source) => !persistedRelaySourceIDs.has(relaySourceSelectionID(source)))
-      .map((source) => ({
-        id: `relay:${relaySourceSelectionID(source)}`,
-        name: source.resourceLabel,
-        kind: "relay" as const,
-        source,
-      })),
-  ];
+  // pick, name, or replace, and a station resource is the same credential as
+  // the slot that names it.  Both readings live in one derivation
+  // (`providerCredentialKeys`), which the key table renders into rows and this
+  // funnel renders into choices: a picker that offered a key no row answers for
+  // is exactly what that shared derivation rules out.
+  const keyStates = providerKeyStates(provider);
+  const stateByID = new Map(keyStates.map((key) => [key.id, key]));
+  const sourceByKey = new Map(relaySources.map((source) => [relayCredentialKey(source.accountID, source.resourceID), source]));
+  return providerCredentialKeys(keyStates, relaySources.map((source) => ({
+    stationID: source.stationID,
+    accountID: source.accountID,
+    resourceID: source.resourceID,
+    name: source.resourceLabel,
+  }))).map((entry) => ({
+    id: entry.slotID ?? `relay:${entry.key}`,
+    name: entry.name,
+    kind: entry.kind,
+    state: entry.slotID === undefined ? undefined : stateByID.get(entry.slotID),
+    source: entry.resource === undefined ? undefined : sourceByKey.get(entry.key),
+  }));
 }
 
 function providerKeyChoiceLabel(choice: Pick<ProviderKeyChoice, "name" | "kind" | "source">, translate: Translate): string {
@@ -4453,7 +4461,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     void ensureRelayProviderForStation();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step, keyPath, isOfficialLoginType, providerID, stationForProvider, stationAccounts.length]);
-  const keyChoices = selectedProvider ? providerKeyChoices(selectedProvider, relaySources, activeProviderBaseURL) : [];
+  const keyChoices = selectedProvider ? providerKeyChoices(selectedProvider, relaySourcesForProvider(selectedProvider, relaySources, activeProviderBaseURL)) : [];
   const keyOptions = [
     { value: PROVIDER_WIZARD_NEW_KEY, label: translate("providers.wizard.addApiKey") },
     ...keyChoices.filter((choice) => choice.kind === "independent").map((choice) => ({ value: choice.id, label: providerKeyChoiceLabel(choice, translate) })),
@@ -6415,6 +6423,41 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   );
   const providerId = provider ? editorIdentifier(provider) : "";
   const providerKindSelected = provider ? providerKind(provider) : "apiKey" as ProviderKind;
+  // 账号管理 data for any provider row (used by the detail pane).
+  const stationForProvider = useCallback((entry: UnknownRecord | undefined): RelayStation | undefined => {
+    if (!entry || providerKind(entry) !== "relay") return undefined;
+    const stationID = stringValue(entry.relay_station_id).trim();
+    return relayStationsFull.find((station) => station.id === stationID)
+      ?? relayStationsFull.find((station) => stationOriginKey(station.origin) === stationOriginKey(providerBaseURL(entry)));
+  }, [providerBaseURL, relayStationsFull]);
+  const stationAccountsFor = useCallback((entry: UnknownRecord | undefined): RelayAccount[] => {
+    const station = stationForProvider(entry);
+    return station ? relayAccounts.filter((account) => station.accountIDs.includes(account.id)) : [];
+  }, [relayAccounts, stationForProvider]);
+  const selectedStation = provider ? stationForProvider(provider) : undefined;
+  const selectedStationAccounts = stationAccountsFor(provider);
+  // The station keys this provider's pickers offer: the rows the key table
+  // draws under its accounts, built from the same accounts and the same
+  // visibility rule, so an entry in 获取模型 always has the row above it that
+  // names the same credential.  They used to be matched by Base URL instead,
+  // which offered the keys of a station this provider had never bound.
+  const providerKeySources = useMemo<RelaySourceOption[]>(() => selectedStationAccounts.flatMap((account) =>
+    providedKeyRows([account], translate).map((row) => {
+      const group = account.groups.find((entry) => entry.id === row.resource.groupID);
+      const multiplier = group && typeof group.multiplier === "number" && Number.isFinite(group.multiplier) ? group.multiplier : undefined;
+      return {
+        stationID: account.stationID || selectedStation?.id || "",
+        accountID: account.id,
+        resourceID: row.resource.id,
+        baseURL: row.resource.apiBase || account.origin,
+        stationLabel: account.stationName || account.origin,
+        accountLabel: accountKeyPrefix(account, translate),
+        resourceLabel: row.group,
+        models: row.resource.models,
+        enabled: row.resource.enabled,
+        ...(multiplier === undefined ? {} : { multiplier }),
+      };
+    })), [selectedStationAccounts, selectedStation, translate]);
   const models = useMemo<UnknownRecord[]>(
     () => provider ? asRecords(provider.models).map((entry, index) => ({
       ...modelRecord(entry),
@@ -6480,16 +6523,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     || providerKindSelected === "ourFreeModel";
   const fetchKeyChoices = useMemo(() => {
     if (!provider) return [];
-    // A relay slot whose source the station no longer lists has no credential
-    // to ask: the station would refuse the roster request, and listing the
-    // slot here put a bare key name (no account, no group, no rate) in a
-    // picker that reads account/group for every other entry.  The key table
-    // still shows the slot as an orphan so it can be repaired or deleted;
-    // 获取模型 only offers credentials that can answer.
-    const fetchable = (choices: ReturnType<typeof providerKeyChoices>): ReturnType<typeof providerKeyChoices> =>
-      choices.filter((choice) => choice.kind !== "relay" || choice.source !== undefined);
     // 获取模型 asks one credential for its roster, so the picker lists the
-    // row's credentials: every signed-in account, then every key.
+    // row's credentials: every signed-in account, then every key.  A slot whose
+    // station resource is gone is listed too: the stored key is still in the
+    // document, and the fetch then asks the provider's own address with it,
+    // which is the one request that key can still answer.
     if (providerKindSelected === "openai") {
       return [
         ...asRecords(provider.accounts)
@@ -6499,11 +6537,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
             name: providerAuthAccount(account) || translate("providers.authAccount"),
             kind: "account" as const,
           })),
-        ...fetchable(providerKeyChoices(provider, relaySources, providerBaseURL(provider))),
+        ...providerKeyChoices(provider, providerKeySources),
       ];
     }
     if (providerHoldsNoKey) return [];
-    const choices = fetchable(providerKeyChoices(provider, relaySources, providerBaseURL(provider)));
+    const choices = providerKeyChoices(provider, providerKeySources);
     // A service that mints its own slot carries that slot nowhere in the
     // list above, and this row is how a lane is asked for its roster — so a
     // provider whose only key is the one Core owns has to be able to name it
@@ -6513,7 +6551,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (choices.length > 0) return choices;
     const slot = providerKeyStates(provider).find((key) => key.managed && managedServiceForSlot(key.managed, providerAuthKind(provider)));
     return slot ? [{ id: slot.id, name: slot.name, kind: "independent" as const, state: slot }] : [];
-  }, [provider, providerBaseURL, providerKindSelected, relaySources, providerHoldsNoKey]);
+  }, [provider, providerKeySources, providerKindSelected, providerHoldsNoKey]);
   const fetchKeyOptions = useMemo(
     () => fetchKeyChoices.map((choice) => ({
       value: choice.id,
@@ -7569,19 +7607,6 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     setModelOrderDraft,
     setProviderKeyNameDraft: () => undefined,
   }), [modelDisplayName, modelOrderText, modelUpstreamDisplay, providerBaseURL, providerDisplayName, providers, setModelNameDraft, setModelOrderDraft, setModelUpstreamDraft, setProviderBaseUrlDraft, setProviderNameDraft]);
-  // 账号管理 data for any provider row (used by the detail pane).
-  const stationForProvider = useCallback((entry: UnknownRecord | undefined): RelayStation | undefined => {
-    if (!entry || providerKind(entry) !== "relay") return undefined;
-    const stationID = stringValue(entry.relay_station_id).trim();
-    return relayStationsFull.find((station) => station.id === stationID)
-      ?? relayStationsFull.find((station) => stationOriginKey(station.origin) === stationOriginKey(providerBaseURL(entry)));
-  }, [providerBaseURL, relayStationsFull]);
-  const stationAccountsFor = useCallback((entry: UnknownRecord | undefined): RelayAccount[] => {
-    const station = stationForProvider(entry);
-    return station ? relayAccounts.filter((account) => station.accountIDs.includes(account.id)) : [];
-  }, [relayAccounts, stationForProvider]);
-  const selectedStation = provider ? stationForProvider(provider) : undefined;
-  const selectedStationAccounts = stationAccountsFor(provider);
   return <ProviderWorkspaceDraftContext.Provider value={providerDraftProjection}><View style={styles.providersLayout}>
     <View style={styles.providerLeftColumn}>
       <View style={styles.providerToolbar}>
@@ -7664,9 +7689,25 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
   // panel is the surface that draws the editor, so it refuses the slot itself:
   // a caller that forgot the service, or a second mount point, cannot make
   // Core's own ``os.environ/`` reference look like an editable API key.
-  const customKeys = useMemo(() => provider ? providerKeyStates(provider).filter((key) => key.source.kind === "independent" && !key.managed) : [], [provider]);
+  const keySlots = useMemo(() => provider ? providerKeyStates(provider) : [], [provider]);
   const customKeyNames = useMemo(() => stringList(provider?.api_key_names), [provider?.api_key_names]);
   const providedRows = useMemo(() => providedKeyRows(stationAccounts, translate), [stationAccounts, translate]);
+  // This table and 获取模型's picker read one derivation
+  // (`providerCredentialKeys`), fed the same slots and the same station rows, so
+  // no key can sit in one list and be missing from the other.  The panel asks it
+  // which of the provider's slots are its own keys and which the station no
+  // longer answers for; the picker asks it what it may offer.
+  const credentialKeys = useMemo(() => providerCredentialKeys(keySlots, providedRows.map((row) => ({
+    stationID: row.account.stationID,
+    accountID: row.account.id,
+    resourceID: row.resource.id,
+    name: row.label,
+  }))), [keySlots, providedRows]);
+  const slotByID = useMemo(() => new Map(keySlots.map((key) => [key.id, key])), [keySlots]);
+  const customKeys = useMemo(() => credentialKeys.flatMap((entry) => {
+    const slot = entry.slotID === undefined ? undefined : slotByID.get(entry.slotID);
+    return entry.kind === "independent" && slot ? [slot] : [];
+  }), [credentialKeys, slotByID]);
   // A relay slot whose station no longer lists its source is in no account's
   // key list, so `providedRows` cannot show it, and it is not an independent
   // slot, so the custom rows exclude it.  Without a row of its own the user
@@ -7674,10 +7715,10 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
   // stays in the document and keeps its route's row marked forever.  It is its
   // own kind of row — one that exists only locally, and can therefore only be
   // deleted locally.
-  const orphanSlots = useMemo(() => provider
-    ? providerKeyStates(provider).filter((key) => key.source.kind === "relay"
-      && !stationAccounts.some((account) => account.resources.some((resource) => resource.id === key.source.resourceID)))
-    : [], [provider, stationAccounts]);
+  const orphanSlots = useMemo(() => credentialKeys.flatMap((entry) => {
+    const slot = entry.slotID === undefined ? undefined : slotByID.get(entry.slotID);
+    return entry.kind === "relay" && entry.resource === undefined && slot ? [slot] : [];
+  }), [credentialKeys, slotByID]);
   const loginCredentials = credentials ?? [];
   const firstSelectable = loginCredentials[0]
     ? `account:${loginCredentials[0].ref}`
@@ -8419,7 +8460,7 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   const displayedOrder = followsMultiplier
     ? String(followedRate ?? modelEffectiveOrder(model))
     : drafts?.modelOrderText(providerId, model) ?? String(manualOrder);
-  const matchingRelaySources = providerAuthKind(provider) === "api_key" ? relaySourcesForBaseUrl(providerBaseUrl, relaySources) : [];
+  const matchingRelaySources = providerAuthKind(provider) === "api_key" ? relaySourcesForProvider(provider, relaySources, providerBaseUrl) : [];
   const persistedRelaySourceIDs = new Set(keyStates.filter((key) => key.source.kind === "relay").map((key) => relaySourceSelectionID(key.source)));
   // Every key this provider holds is offered, including a relay slot the
   // station no longer lists: the picker is how a route says which credential

@@ -5037,7 +5037,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # index. Resolve that index through the raw value so "默认" never
         # becomes the persisted API-key identifier.
         for marker in (
-            'function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[], baseURL?: string): ProviderKeyChoice[] {',
+            'function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[]): ProviderKeyChoice[] {',
             'if (choices.length > 0) return choices;',
             'const slot = providerKeyStates(provider).find((key) => key.managed && managedServiceForSlot(key.managed, providerAuthKind(provider)));',
             'return slot ? [{ id: slot.id, name: slot.name, kind: "independent" as const, state: slot }] : [];',
@@ -7908,8 +7908,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'return kind === "openai" || kind === "workbuddy" || kind === "workbuddyGlobal" || kind === "qoder" || kind === "qoderGlobal" || kind === "ourFreeModel";'
         )
         # ...and the panel refuses Core's own slot itself, so the guarantee does
-        # not rest on every caller naming the service correctly.
-        self.assert_ui_has('!key.managed);')
+        # not rest on every caller naming the service correctly.  The panel no
+        # longer filters the slots inline: it reads the same credential
+        # derivation 获取模型's picker reads, and that derivation is where a
+        # managed slot is dropped — for the table's rows and the picker's
+        # choices alike, so neither surface can offer Core's reference as a key.
+        panel = self.ui.split("function ProviderKeysPanel(", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("providerCredentialKeys(keySlots, providedRows.map((row) => ({", panel)
+        credentials = (ROOT / "rn/packages/shared/src/ui/providerCredentials.ts").read_text(encoding="utf-8")
+        self.assertIn('if (slot.managed || slot.source.kind !== "independent") continue;', credentials)
+        self.assertIn('if (slot.managed || slot.source.kind !== "relay") continue;', credentials)
         self.assertNotIn(
             'providerKeyStates(provider).filter((key) => key.source.kind === "independent") : []',
             self.ui,
@@ -8076,20 +8084,27 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('        confirmLabel: translate("status.close"),\n        destructive: true,\n', ui)
         self.assertIn('          confirmLabel: translate("common.discard"),\n          destructive: true,\n', ui)
 
-    def test_relay_keys_are_discovered_by_base_url_without_manual_import_or_linking(self) -> None:
+    def test_relay_keys_are_discovered_from_the_bound_station_without_manual_import_or_linking(self) -> None:
         relay = RELAY_MANAGER.read_text(encoding="utf-8")
         types = (ROOT / "rn/packages/shared/src/types.ts").read_text(encoding="utf-8")
 
         for marker in (
             'return (["providers_models", "relay_accounts"] as const).filter',
-            'function relaySourcesForBaseUrl(',
-            'function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[], baseURL?: string): ProviderKeyChoice[] {',
+            # A provider's station keys come from the station it is bound to.
+            # Matching the Base URL alone offered the keys of any station that
+            # happened to share an address, which the key table never listed —
+            # so discovery is scoped by the binding, and a provider that binds
+            # no station is offered none.
+            'function relaySourcesForProvider(',
+            'if (providerKind(provider) !== "relay") return [];',
+            'return relaySources.filter((source) => source.stationID === stationID);',
+            'function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[]): ProviderKeyChoice[] {',
             'function ProviderIdentityFields(',
             'function relayStationsFromSnapshot(',
             'const nextStation = relayStationForBaseUrl(endpoint, relayStations);',
             'dispatch("provider.select_relay_station", { provider_id: providerID, station_id: station.id })',
-            'const matchingRelaySources = relaySourcesForBaseUrl(',
-            'const keyChoices = selectedProvider ? providerKeyChoices(selectedProvider, relaySources, activeProviderBaseURL) : [];',
+            'const matchingRelaySources = providerAuthKind(provider) === "api_key" ? relaySourcesForProvider(',
+            'const keyChoices = selectedProvider ? providerKeyChoices(selectedProvider, relaySourcesForProvider(selectedProvider, relaySources, activeProviderBaseURL)) : [];',
             'const action = relaySource ? "provider.fetch_relay_resource_models" : "providers.fetch_models";',
             'dispatch("model.select_relay_resource"',
             'const providerKeyName = drafts?.providerKeyDisplayName(providerId, providerKey.id, providerKey.name) ?? providerKey.name;',
