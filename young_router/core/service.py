@@ -1420,6 +1420,9 @@ class CoreStore:
         # makes it the one a test replaced by the time the window expires.
         self._emitter = CoalescingEmitter(lambda: self._emit())
         self._revision = 0
+        # The newest revision a change to a settings document produced.  A
+        # staged write is stale only against this one: see ``_check_revision``.
+        self._settings_advanced_at = 0
         # The last domain projection and the revision it describes: a
         # window that is catching up asks for a revision it already
         # heard about several times per commit.  See ``snapshot``.
@@ -1786,7 +1789,7 @@ class CoreStore:
                 self._snapshot_view = view
 
     def _advance_revision(self) -> int:
-        """Advance the shared revision under the state lock.
+        """Advance the revision for a change a settings draft carries.
 
         Mutations run on the mutation lane, but service supervision and the
         watcher still update the revision from their own threads.  A bare
@@ -1796,14 +1799,40 @@ class CoreStore:
 
         with self._lock:
             self._revision += 1
+            # The newest revision a staged write must have seen.  A caller that
+            # read a snapshot at or after this point is applying over settings
+            # it knows; one that read earlier is applying over a change it does
+            # not, and that is the conflict a revision guards against.
+            self._settings_advanced_at = self._revision
             self._snapshot_cache = None
             return self._revision
 
-    def _restore_revision(self, value: object) -> None:
+    def _advance_projection_revision(self) -> int:
+        """Advance the revision for a change no settings draft carries.
+
+        The proxy moving between states, a login observation, a republished
+        client model list, a probe verdict and the window's own counters are
+        live projections: they move on their own while a pane is mid-edit.  A
+        write that raced one of them used to be refused as
+        ``revision_conflict`` even though the draft it applied was the newest
+        one there was — the pane then reported a save it had made as
+        更改未生效.  These advances keep the snapshot ordering (a reader still
+        sees a newer revision) without claiming a settings change the caller
+        could not have seen.
+        """
+
+        with self._lock:
+            self._revision += 1
+            self._snapshot_cache = None
+            return self._revision
+
+    def _restore_revision(self, value: object, settings_value: object | None = None) -> None:
         """Put the revision back to a checkpoint, under the state lock."""
 
         with self._lock:
             self._revision = int(value)  # type: ignore[arg-type]
+            if settings_value is not None:
+                self._settings_advanced_at = int(settings_value)  # type: ignore[arg-type]
             self._snapshot_cache = None
 
     @classmethod
@@ -2177,6 +2206,12 @@ class CoreStore:
         if type(revision) is not int or revision < 0:
             return
         self._revision = revision
+        # A Core that restarts knows the settings revision only as "whatever
+        # the last writer reached": the record it kept is a revision, and the
+        # drafts it loads were written at or before it.  Treating the restored
+        # revision as the settings one keeps every staged write that survived
+        # the restart writable, while a later settings change still moves it.
+        self._settings_advanced_at = revision
         service = payload.get("service")
         if isinstance(service, Mapping) and service.get("state") in SERVICE_STATES:
             self._service = _safe_public(service)
@@ -4556,8 +4591,32 @@ class CoreStore:
             return
         if type(expected_revision) is not int or expected_revision < 0:
             raise CoreError("invalid_revision", "Revision is invalid")
-        if expected_revision != self._revision:
-            raise RevisionConflict(expected_revision, self._revision)
+        if expected_revision == self._revision:
+            return
+        if self._revision_covers_settings(expected_revision):
+            return
+        raise RevisionConflict(expected_revision, self._revision)
+
+    def _revision_covers_settings(self, expected_revision: int) -> bool:
+        """Whether a caller at this revision has seen every settings change.
+
+        The revision counts everything a window can observe, and most of what
+        moves it is not a settings edit: the proxy leaves and re-enters
+        ``running`` once per Apply, a login observation settles, a client model
+        list is republished, a probe answers.  A write that names a revision
+        taken just before one of those is applying over the newest settings
+        there are, so refusing it as a conflict reported a save that had in fact
+        happened as 更改未生效 — the pane's own restart was the "change" it
+        had supposedly missed.
+
+        A caller older than the last *settings* change is still refused: that
+        is a draft it has not seen, which is the thing a revision protects.
+        """
+
+        return (
+            0 <= expected_revision <= self._revision
+            and expected_revision >= self._settings_advanced_at
+        )
 
     def _check_revision_before_refresh(self, expected_revision: object | None, revision_before_refresh: int, revision_after_refresh: int | None = None) -> None:
         """Accept a revision that only this call's own refresh invalidated.
@@ -4582,6 +4641,10 @@ class CoreStore:
             raise CoreError("invalid_revision", "Revision is invalid")
         current = self._revision if revision_after_refresh is None else revision_after_refresh
         if expected_revision == revision_before_refresh:
+            return
+        # A revision that only misses live projections is not stale: see
+        # ``_revision_covers_settings``.
+        if self._revision_covers_settings(expected_revision):
             return
         if expected_revision != current:
             raise RevisionConflict(expected_revision, current)
@@ -4648,7 +4711,7 @@ class CoreStore:
             # it like every other dispatch rather than hiding the change.
             changed = after != before
             if changed:
-                self._advance_revision()
+                self._advance_projection_revision()
                 self._mark_domain(
                     name,
                     dirty=after != self._baselines.get(name),
@@ -4950,7 +5013,7 @@ class CoreStore:
         }
         if revisions_after != revisions_before:
             with self._lock:
-                self._advance_revision()
+                self._advance_projection_revision()
                 self._snapshot_cache = None
                 try:
                     self._persist_metadata()
@@ -5284,7 +5347,7 @@ class CoreStore:
                         "archived_remote": archived_remote,
                         "sections": list(sections),
                     }
-                self._advance_revision()
+                self._advance_projection_revision()
                 self._persist_metadata()
                 status_handler = self._service_handlers.get("status")
                 if status_handler is not None:
@@ -5957,7 +6020,7 @@ class CoreStore:
                     # controller's mid-replacement reading back over the state
                     # this dispatch just published.
                     self._publish_service_transition()
-                    self._advance_revision()
+                    self._advance_projection_revision()
                     self._persist_metadata()
                     published = True
             except BaseException:
@@ -6074,7 +6137,7 @@ class CoreStore:
         # A manual health check which projects the same public status is not a
         # state transition, so it does not redraw every settings surface.
         if self._service != previous_service:
-            self._advance_revision()
+            self._advance_projection_revision()
             self._persist_metadata()
         return dict(self._service)
 
@@ -6103,7 +6166,7 @@ class CoreStore:
             service["port"] = port
         self._service = service
         if increment:
-            self._advance_revision()
+            self._advance_projection_revision()
 
     def _runtime_document_fingerprint(self) -> str | None:
         """What the running proxy loads, read before a commit rewrites it.
@@ -6618,7 +6681,7 @@ class CoreStore:
                     # is replacing.
                     self._service_proxy_operations += 1
                     self._publish_service_transition()
-                    self._advance_revision()
+                    self._advance_projection_revision()
                     self._persist_metadata()
                     published = True
                 if published:
@@ -7776,7 +7839,7 @@ class CoreStore:
                     return {"ok": False, "protocols": [], "detail": safe_exception_message(exc)}
                 should_emit = False
                 if changed:
-                    self._advance_revision()
+                    self._advance_projection_revision()
                     self._persist_metadata()
                     should_emit = True
                 result = _safe_public(value if isinstance(value, Mapping) else {})
@@ -7801,7 +7864,7 @@ class CoreStore:
             after = self._adapter_draft_state(name)
             if after != before:
                 dirty = after != self._baselines.get(name)
-                self._advance_revision()
+                self._advance_projection_revision()
                 self._mark_domain(
                     name,
                     dirty=dirty,
@@ -8199,7 +8262,7 @@ class CoreStore:
                 self._service["pid"] = pid
             if state == "running" and type(port) is int and 1 <= port <= 65535:
                 self._service["port"] = port
-            self._advance_revision()
+            self._advance_projection_revision()
             self._persist_metadata()
             result = copy.deepcopy(self._service)
         self._request_emit()
