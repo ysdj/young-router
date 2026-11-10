@@ -6146,43 +6146,26 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     })();
     """
 
+    /// The window's own chrome is what this removes: scrollbars (the panel is
+    /// frameless and a bar would carve pixels out of the station's layout),
+    /// entrance animation, smooth scrolling, view transitions.  What the
+    /// station *painted* is left alone.
+    ///
+    /// Flattening gradients used to live here, as "present the page before it
+    /// finishes painting".  It read as a faster first paint and it deleted the
+    /// sign-in button: these forks draw a primary button as a gradient with
+    /// white text and no `background-color` at all, so dropping the gradient
+    /// left white text on a white card — a form whose only visible action was
+    /// a keyboard Enter, on the one page the person is there to answer.
     private static let immediateWebPresentationScript = """
     (() => {
       const styleID = '__young_router_immediate_presentation';
-      const gradientPattern = /gradient[(]/i;
-      const imageProperties = ['background-image', 'border-image-source', 'mask-image'];
-      const splitImageLayers = (value) => {
-        const layers = [];
-        let depth = 0;
-        let start = 0;
-        for (let index = 0; index < value.length; index += 1) {
-          const character = value[index];
-          if (character === '(') depth += 1;
-          else if (character === ')') depth = Math.max(0, depth - 1);
-          else if (character === ',' && depth === 0) {
-            layers.push(value.slice(start, index).trim());
-            start = index + 1;
-          }
-        }
-        layers.push(value.slice(start).trim());
-        return layers;
-      };
-      const stripGradients = (root = document.documentElement) => {
-        const elements = root instanceof Element
-          ? [root, ...root.querySelectorAll('*')]
-          : [...document.querySelectorAll('*')];
-        for (const element of elements) {
-          const computed = getComputedStyle(element);
-          for (const property of imageProperties) {
-            const image = computed.getPropertyValue(property);
-            if (!gradientPattern.test(image)) continue;
-            const retained = splitImageLayers(image).filter((layer) => !gradientPattern.test(layer));
-            element.style.setProperty(property, retained.length ? retained.join(', ') : 'none', 'important');
-          }
-        }
-      };
       const install = () => {
         if (document.getElementById(styleID)) return;
+        // A document-start script can run before there is an element to append
+        // to; the observer below is what covers that case.
+        const target = document.head || document.documentElement;
+        if (!target) return;
         const style = document.createElement('style');
         style.id = styleID;
         style.textContent = `
@@ -6196,23 +6179,14 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             view-transition-name: none !important;
           }
         `;
-        (document.head || document.documentElement).appendChild(style);
+        target.appendChild(style);
       };
       install();
-      stripGradients();
-      document.addEventListener('DOMContentLoaded', () => { install(); stripGradients(); }, { once: true });
-      new MutationObserver((records) => {
-        install();
-        records.forEach((record) => {
-          if (record.type === 'attributes') stripGradients(record.target);
-          else record.addedNodes.forEach((node) => { if (node.nodeType === Node.ELEMENT_NODE) stripGradients(node); });
-        });
-      }).observe(document.documentElement, {
-        attributes: true,
-        attributeFilter: ['class', 'style'],
-        childList: true,
-        subtree: true,
-      });
+      document.addEventListener('DOMContentLoaded', install, { once: true });
+      // A document that had no head yet, or a page that replaces its own, drops
+      // the rules; this is the one lookup that puts them back.  Document, not
+      // documentElement: at document start there may not be one.
+      new MutationObserver(install).observe(document, { childList: true, subtree: true });
     })();
     """
 

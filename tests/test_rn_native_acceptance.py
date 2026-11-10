@@ -2139,8 +2139,16 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("private static let immediateWebPresentationScript", mac_leaf)
         self.assertIn("animation: none !important;", mac_leaf)
         self.assertIn("transition: none !important;", mac_leaf)
-        self.assertIn("const stripGradients", mac_leaf)
-        self.assertNotIn("background-image: none !important;", mac_leaf)
+        # The station's own paints stay.  A fork draws its primary button as a
+        # gradient with white text and no background-color, so rewriting
+        # gradients to flatten the page deleted the one visible way to sign in
+        # (the form then answered only to a keyboard Enter).  Scrollbars and
+        # motion are the window's business; colours are the station's.
+        for host in (mac_leaf, windows_relay):
+            self.assertNotIn("stripGradients", host)
+            self.assertNotIn("gradientPattern", host)
+            self.assertNotIn("mask-image']", host)
+            self.assertIn("new MutationObserver(install).observe(document,", host)
         self.assertIn(': text("Loading sign-in page...", "正在加载登录页面...")', mac_leaf)
         self.assertIn("func webView(_ webView: WKWebView, didStartProvisionalNavigation", mac_leaf)
         self.assertIn("func webView(_ webView: WKWebView, didFailProvisionalNavigation", mac_leaf)
