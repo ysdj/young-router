@@ -14100,6 +14100,11 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
   );
   const cacheHit = formatLogCacheHit(cacheReadTokens, sentTokens);
   const details: string[] = [];
+  // The row's own words state the mode as well as its compact cell: the detail
+  // text is what a reader copies out of the pane and what the route trace
+  // shows beside an attempt, and a reader looking at a failure there must not
+  // have to infer from a wire pair whether the turn streamed.
+  if (mode) details.push(mode);
   const abortedDetail = tab === "requests" ? requestAbortedDetail(value.aborted, translate) : "";
   if (abortedDetail) details.push(abortedDetail);
   const directDetail = value.error === undefined

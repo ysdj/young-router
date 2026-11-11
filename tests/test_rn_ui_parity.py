@@ -7245,6 +7245,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The cell's words are the pane's existing mode vocabulary, not a
         # second spelling of the same two states.
         self.assert_ui_has('translate(value.stream ? "logs.routeTrace.streaming" : "logs.routeTrace.nonStreaming")')
+        # The detail text states it too: that is what the reader copies and
+        # what a route-trace attempt shows beside its own failure.
+        self.assert_ui_has('if (mode) details.push(mode);')
         self.assertIn('"logs.mode": "MODE"', self.en)
         self.assertIn('"logs.mode": "模式"', self.zh)
         translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
