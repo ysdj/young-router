@@ -912,7 +912,11 @@ def _stream_chunk_error_exception(chunk: Any) -> Optional[Exception]:
         status_code = 529
     elif status_code is None and error_type == "api_error":
         status_code = 500
-    elif status_code is None and error_type == "upstream_error":
+    elif (
+        status_code is None
+        and error_type == "upstream_error"
+        and error_code != "stream_read_error"
+    ):
         # The station's own envelope for "my upstream failed" (New API /
         # sub2api): ``{"type":"upstream_error","message":"Upstream access
         # forbidden, please contact administrator"}``.  It is an answer about
