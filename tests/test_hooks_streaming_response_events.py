@@ -3087,6 +3087,69 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         self.assertIn("too old", chunk["error"]["message"])
         self.assertNotIn("retry", chunk["error"]["message"].lower())
 
+    def test_a_station_without_a_price_for_the_model_names_its_cause(
+        self,
+    ) -> None:
+        """The station's missing price entry is a configuration stop.
+
+        Observed live: ``claude-fable-5-2`` on one station answered HTTP 400
+        ``Model ... has not been priced by the administrator yet``.  Nothing in
+        the router classified it, so the raw 400 reached the client as an
+        invalid request and the turn died on the first route -- the exact
+        interruption this branch must name instead, on both wires.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = sys.modules["young_router.proxy.streaming"]
+
+        class BadRequestError(Exception):
+            status_code = 400
+
+        exception = BadRequestError(
+            'litellm.BadRequestError: AnthropicException - {"type":"new_api_error",'
+            '"message":"Model claude-fable-5-2 has not been priced by the '
+            'administrator yet. Please contact the site administrator to enable '
+            'this model. (request id: 20261111040055327528536826bd9d65mx2kKB1)"}'
+        )
+        request_data = {
+            "model": "claude-fable-5-2",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+        }
+
+        event = streaming_module._synthesized_failed_response_event(
+            request_data,
+            exception,
+        )
+        payload = event if isinstance(event, dict) else json.loads(event.data or "{}")
+        error = payload["response"]["error"]
+
+        self.assertEqual("invalid_request_error", error["type"])
+        self.assertEqual("upstream_model_unpriced", error["code"])
+        self.assertIn("price", error["message"].lower())
+        self.assertIn("claude-fable-5-2", error["message"])
+        self.assertNotIn("could not classify the stop", error["message"])
+        lowered = error["message"].lower()
+        for retry_tip in ("send it again", "send the message again", "retry", "try again"):
+            self.assertNotIn(retry_tip, lowered)
+        self.assertTrue(getattr(event, "_young_router_terminal_failure", False))
+        self.assertTrue(
+            streaming_module._is_young_router_terminal_failure_event(event)
+        )
+
+        chunk = streaming_module._synthesized_native_stream_error_chunk(
+            {
+                "model": "claude-fable-5-2",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+            exception,
+        )
+        self.assertEqual("invalid_request_error", chunk["error"]["type"])
+        self.assertEqual("upstream_model_unpriced", chunk["error"]["code"])
+        self.assertIn("price", chunk["error"]["message"].lower())
+        self.assertNotIn("retry", chunk["error"]["message"].lower())
+
     def test_a_route_that_never_answered_names_its_stall_instead(self) -> None:
         """A pre-output stop with a known cause may not read as unclassifiable.
 

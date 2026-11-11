@@ -1236,6 +1236,7 @@ def _is_young_router_terminal_failure_event(chunk: Any) -> bool:
         "router_restarting",
         "upstream_account_restricted",
         "upstream_client_outdated",
+        "upstream_model_unpriced",
         "insufficient_quota",
         "upstream_compaction_failure",
         "upstream_compaction_unsupported",
@@ -2093,6 +2094,17 @@ def _synthesized_failed_response_event(
         )
         error_type = "invalid_request_error"
         error_code = "upstream_client_outdated"
+    elif _routing_module._is_upstream_model_unpriced_error(exception):
+        # The station's price table is the thing that has to change, so this
+        # stop names it and never reads as a transport blip worth resending.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        message = _routing_module._upstream_model_unpriced_message(model_group)
+        error_type = "invalid_request_error"
+        error_code = "upstream_model_unpriced"
     elif _routing_module._is_upstream_tool_history_rejected_error(exception):
         # The route refused this replay because a tool call and its output no
         # longer pair.  The client can only fix that by starting a new task, so
@@ -2485,6 +2497,7 @@ def _synthesized_native_stream_error_chunk(
             "image_generation_tool_unavailable",
             "upstream_account_restricted",
             "upstream_client_outdated",
+            "upstream_model_unpriced",
         }
         else "server_error"
     )
@@ -2532,6 +2545,10 @@ def _native_stream_error_code(exception: Exception) -> str:
         # A code of its own: the route's channel client is stale, which is a
         # configuration change, not a transport hiccup worth reconnecting for.
         return "upstream_client_outdated"
+    if _routing_module._is_upstream_model_unpriced_error(exception):
+        # A code of its own, for the same reason: the station's missing price
+        # entry is a configuration change, not a transport hiccup.
+        return "upstream_model_unpriced"
     if _routing_module._is_thinking_replay_contract_error(exception):
         # The replayed thinking is gone from this history and no resend adds it
         # back, so the client must not reconnect over the same body.
@@ -2628,6 +2645,15 @@ def _native_stream_error_message(
             or "the requested model"
         )
         return _routing_module._upstream_client_version_rejected_message(model_group)
+    if _routing_module._is_upstream_model_unpriced_error(exception):
+        # Same reading: the station has no price for this model, so a resend
+        # carries the identical request to the identical refusal.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        return _routing_module._upstream_model_unpriced_message(model_group)
     if _routing_module._is_thinking_replay_contract_error(exception):
         # Same reading as the Responses branch: the thinking this route needs
         # back is not in the history any more, so a resend carries the same gap.

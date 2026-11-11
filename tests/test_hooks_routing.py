@@ -4406,6 +4406,91 @@ class HookRoutingTests(HookTestCase):
             hooks._is_upstream_client_version_rejected_error(anonymous)
         )
 
+    def test_a_station_without_a_price_for_the_model_is_parked_not_answered(
+        self,
+    ) -> None:
+        """A station's missing price entry is the route's verdict, not ours.
+
+        Observed live: one station answered every request for a model with HTTP
+        400 ``Model claude-fable-5-2 has not been priced by the administrator
+        yet``.  The status alone read as the request's own verdict, so
+        ``recovery_policy`` stayed ``error``: the turn ended on the first route,
+        the raw 400 reached the client as an invalid request, and the route was
+        never parked, so every later turn paid the same refusal while siblings
+        of the same group served the identical model.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_POLICY_REQUEST_ERROR_ENV, None)
+
+        class BadRequestError(Exception):
+            pass
+
+        unpriced = BadRequestError(
+            'litellm.BadRequestError: AnthropicException - {"type":"new_api_error",'
+            '"message":"Model claude-fable-5-2 has not been priced by the '
+            'administrator yet. Please contact the site administrator to enable '
+            'this model. (request id: 20261111040055327528536826bd9d65mx2kKB1)"}'
+        )
+        unpriced.status_code = 400
+
+        self.assertTrue(hooks._is_upstream_model_unpriced_error(unpriced))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(unpriced),
+            "recovery_cooldown",
+        )
+        # The route is parked and this attempt advances to a sibling that can
+        # answer the same model.
+        self.assertTrue(hooks._is_priority_deployment_failover_error(unpriced))
+        self.assertTrue(
+            hooks._should_count_deployment_failure_for_cooldown(unpriced)
+        )
+        self.assertEqual(
+            hooks._trace_exception(unpriced)["reason"],
+            "upstream-model-unpriced",
+        )
+        self.assertEqual(
+            hooks._recovery_diagnostic(unpriced)["kind"],
+            "upstream_model_unpriced",
+        )
+        # A final stop for this cause must name it instead of forwarding the
+        # station's raw 400 as the request's own invalid-request verdict.
+        self.assertTrue(hooks._should_sanitize_final_upstream_route_error(unpriced))
+        sanitized = hooks._sanitized_upstream_route_failure_message(
+            "claude-fable-5-2",
+            unpriced,
+            {"model": "claude-fable-5-2"},
+        )
+        self.assertIn("price", sanitized.lower())
+        self.assertIn("claude-fable-5-2", sanitized)
+        lowered = sanitized.lower()
+        for retry_tip in ("retry", "try again", "send the message again"):
+            self.assertNotIn(retry_tip, lowered)
+
+        # New API's admin branch states the same refusal in Chinese.
+        admin = BadRequestError(
+            'litellm.BadRequestError: AnthropicException - {"error":{"message":'
+            '"模型 claude-fable-5-2 的价格未配置。请前往「系统设置 → 运营设置」开启自用模式；'
+            'Model claude-fable-5-2 price not configured."}}'
+        )
+        admin.status_code = 400
+        self.assertTrue(hooks._is_upstream_model_unpriced_error(admin))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(admin),
+            "recovery_cooldown",
+        )
+
+        # A model this route simply does not serve is a different refusal: it
+        # stays the request's own verdict.
+        unsupported = BadRequestError(
+            'litellm.BadRequestError: AnthropicException - {"error":{"message":'
+            '"this model does not support tool calls"}}'
+        )
+        unsupported.status_code = 400
+        self.assertFalse(hooks._is_upstream_model_unpriced_error(unsupported))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(unsupported), "error"
+        )
 
     async def test_filter_deployments_drops_a_route_whose_address_never_resolved(self) -> None:
         """A worker this host never staged is not a route it can serve.

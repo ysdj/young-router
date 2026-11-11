@@ -1290,6 +1290,23 @@ _LOCAL_GATEWAY_AUTH_REJECTION_TYPES = (
 )
 
 
+# A station can carry a model in its catalogue without having a price for it
+# and then refuse every request for that model with a plain HTTP 400.  New API
+# spells it in ``relay/helper/price.go``: the admin caller reads ``模型 <id> 的价格
+# 未配置`` / ``Model <id> price not configured``, everyone else reads ``模型 <id>
+# 的价格尚未由管理员配置，暂时无法使用`` / ``Model <id> has not been priced by the
+# administrator yet``.  The refusal belongs to the *route's* own price table,
+# not to the bytes: a sibling deployment of the same group answers the identical
+# request, and this one answers nothing until an administrator prices the model.
+# Read as the request's own verdict it ended the turn on the first route (and
+# never parked it), so every turn paid the same refused round trip while a
+# sibling could have answered.  The wording, not the status, is the evidence.
+_UPSTREAM_MODEL_UNPRICED_ERROR_MARKERS = (
+    "has not been priced by the administrator",
+    "price not configured",
+    "价格尚未由管理员配置",
+    "的价格未配置",
+)
 _UPSTREAM_ACCOUNT_RESTRICTED_ERROR_MARKERS = (
     "账号存在异常行为",
     "账户存在异常行为",

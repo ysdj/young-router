@@ -152,6 +152,7 @@ from .base import (
     _SURFACE_TARGET_DEPLOYMENT_ID_KEY,
     _TerminalFailedResponsesStreamResponse,
     _UPSTREAM_ACCOUNT_RESTRICTED_ERROR_MARKERS,
+    _UPSTREAM_MODEL_UNPRICED_ERROR_MARKERS,
     _LOCAL_GATEWAY_AUTH_REJECTION_TYPES,
     _UPSTREAM_CLIENT_VERSION_REJECTION_MARKERS,
     _UPSTREAM_CLIENT_VERSION_REJECTION_PATTERN,
@@ -1192,6 +1193,17 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
         # sibling route of the same group, and leaving this one in front made
         # every request pay the same refused round trip.  A cooldown is what
         # moves the turn to the sibling that can answer.
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_REQUEST_ERROR_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
+        )
+    if _is_upstream_model_unpriced_error(exception):
+        # The station's own price table has no entry for this model, so it
+        # answers every request for it with the same 400 until an administrator
+        # prices it.  That is a fact about the route, not about the bytes: a
+        # sibling deployment of the same group served the identical request.
+        # Read as the request's own verdict this ended the turn on the first
+        # route and never parked it, so every request paid the same refusal.
         return _recovery_policy_setting(
             _RECOVERY_POLICY_REQUEST_ERROR_ENV,
             _RECOVERY_POLICY_COOLDOWN,
@@ -6002,6 +6014,10 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         # A trace that said only ``other`` is exactly why this refusal read as
         # the request's own 400 while the route kept being selected first.
         reason = "upstream-client-version-rejected"
+    elif _is_upstream_model_unpriced_error(exception):
+        # ``other`` is what this 400 read as while the trace kept pointing the
+        # reader at the request instead of the station's missing price entry.
+        reason = "upstream-model-unpriced"
     elif _is_thinking_tool_choice_unsupported_error(exception):
         # Named so triage can tell it from the generic compatibility refusal it
         # used to land in -- that label is what hid a refusal paid on every turn.
@@ -6164,6 +6180,16 @@ def _recovery_diagnostic(exception: Exception) -> dict[str, Any]:
             "detail": (
                 "The route's own channel runs a client too old to serve this "
                 "model, so the route is parked and another route answers."
+            ),
+        }
+    elif _is_upstream_model_unpriced_error(exception):
+        result = {
+            "kind": "upstream_model_unpriced",
+            "title": "Upstream model has no price configured",
+            "detail": (
+                "The station behind this route refuses this model because its "
+                "administrator has not priced it, so the route is parked and "
+                "another route answers."
             ),
         }
     elif _is_upstream_tool_history_rejected_error(exception):
@@ -7737,6 +7763,12 @@ def _is_priority_deployment_failover_error(exception: Exception) -> bool:
         # the same group answered the identical bytes, so the attempt advances
         # instead of ending the turn on the stale route.
         return True
+    if _is_upstream_model_unpriced_error(exception):
+        # The station has no price for this model, so it refuses every attempt
+        # on this route while a sibling of the same group can answer.  The
+        # attempt advances instead of ending the turn on the station's empty
+        # price table.
+        return True
     if _is_upstream_tool_history_rejected_error(exception):
         # This route refuses the replayed tool history; a peer may accept it.
         return True
@@ -8548,6 +8580,44 @@ def _upstream_client_version_rejected_message(model_group: str) -> str:
     )
 
 
+def _is_upstream_model_unpriced_error(exception: Exception) -> bool:
+    """Whether the station refuses this model because nobody priced it.
+
+    A New API station serves a model from its catalogue but refuses every
+    request for it with HTTP 400 ``Model <id> has not been priced by the
+    administrator yet`` (``模型 <id> 的价格尚未由管理员配置``).  The status alone
+    reads as the request's own verdict, yet the sentence belongs to the route:
+    a sibling deployment of the same group answers the identical request, and
+    this route answers nothing until its administrator prices the model.
+
+    Read the pricing sentence, not the status and not the model name -- a real
+    "model not supported" or "model not found" 400 is a different refusal with
+    its own meaning.
+    """
+
+    return any(
+        marker in _exception_text(exception)
+        for marker in _UPSTREAM_MODEL_UNPRICED_ERROR_MARKERS
+    )
+
+
+def _upstream_model_unpriced_message(model_group: str) -> str:
+    """The one sentence for a station that has no price for this model.
+
+    Shared by the Responses terminal event, the native chunk, and the raised
+    final failure so the cause reads the same on every surface.  It names the
+    station's own configuration and never invites a resend: the same bytes meet
+    the same missing price entry.
+    """
+
+    return (
+        "The station behind this route has no price configured for "
+        f"{model_group}, so it refused the request, and no other candidate "
+        "route answered this turn. Ask that station's administrator to enable "
+        "the model there, or choose another model route."
+    )
+
+
 def _is_local_gateway_auth_rejection_error(exception: Exception) -> bool:
     """Whether *this* proxy rejected the caller before any route was chosen.
 
@@ -8761,6 +8831,10 @@ def _sanitized_upstream_route_failure_message(
         # Same rule: every replay meets the same stale client, so a retry tip
         # would send the client back with the identical bytes.
         return _upstream_client_version_rejected_message(model_group)
+    if _is_upstream_model_unpriced_error(exception):
+        # Same rule: the station's price table is the thing that has to change,
+        # so a retry tip would send the client back with the identical bytes.
+        return _upstream_model_unpriced_message(model_group)
     if _is_upstream_tool_history_rejected_error(exception):
         # Same rule: only a new task changes this verdict, so a retry tip would
         # send the client back with the identical history.

@@ -1877,6 +1877,123 @@ class HookRouteRecoveryTests(HookTestCase):
         )
         self.assertEqual(chunks[-1]["response"]["id"], "resp-peer")
 
+    async def test_a_station_without_a_price_for_the_model_advances_to_the_peer(
+        self,
+    ) -> None:
+        """A station's missing price entry never ends the group's turn.
+
+        Observed live: ``claude-fable-5-2`` answered every request on the first
+        route with HTTP 400 ``Model ... has not been priced by the administrator
+        yet``.  The turn ended on that route, the raw 400 reached the client as
+        an invalid request, and the route stayed first in the order, so the next
+        turn paid the same refusal while a peer of the group could serve the
+        model.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        cooldown_file = Path(temp_dir.name) / "deployment-cooldowns.json"
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FILE_ENV, str(cooldown_file))
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+
+        class BadRequestError(Exception):
+            status_code = 400
+
+        async def healthy_peer_stream():
+            yield {"type": "response.output_text.delta", "delta": "peer answered"}
+            yield {"type": "response.completed", "response": {"id": "resp-peer"}}
+
+        deployments = [
+            {
+                "litellm_params": {"order": 1},
+                "model_info": {
+                    "id": "unpriced-station",
+                    "route_key": (
+                        "model=claude-fable-5-2 / provider=relay / "
+                        "upstream=anthropic/claude-fable-5-2 / order=1"
+                    ),
+                },
+            },
+            {
+                "litellm_params": {"order": 1},
+                "model_info": {
+                    "id": "healthy-peer",
+                    "route_key": (
+                        "model=claude-fable-5-2 / provider=peer / "
+                        "upstream=anthropic/claude-fable-5-2 / order=1"
+                    ),
+                },
+            },
+        ]
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return deployments if model_name == "claude-fable-5-2" else []
+
+            async def aresponses(self, **payload):
+                calls.append(payload.copy())
+                return healthy_peer_stream()
+
+        router = FakeRouter()
+        proxy_server.llm_router = router
+        request_data = {
+            "call_type": "aresponses",
+            "model": "claude-fable-5-2",
+            "input": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "model_info": {
+                "id": "unpriced-station",
+                "order": 1,
+                "route_key": (
+                    "model=claude-fable-5-2 / provider=relay / "
+                    "upstream=anthropic/claude-fable-5-2 / order=1"
+                ),
+            },
+        }
+        unpriced = BadRequestError(
+            'litellm.BadRequestError: AnthropicException - {"type":"new_api_error",'
+            '"message":"Model claude-fable-5-2 has not been priced by the '
+            'administrator yet. Please contact the site administrator to enable '
+            'this model. (request id: 20261111040055327528536826bd9d65mx2kKB1)"}'
+        )
+        unpriced.failed_deployment_id = "unpriced-station"
+        unpriced.failed_deployment_order = 1
+        hooks._mark_exception_for_deployment_failover(unpriced, request_data)
+
+        # The route is parked, so the next selection cannot land on it again.
+        cooled, active_cooldowns, cooldown_filtered = (
+            hooks._with_active_deployment_cooldowns(
+                deployments,
+                request_kwargs=request_data,
+            )
+        )
+        self.assertTrue(cooldown_filtered)
+        self.assertEqual(
+            [item["model_info"]["id"] for item in cooled],
+            ["healthy-peer"],
+        )
+        self.assertEqual(len(active_cooldowns), 1)
+
+        # And this turn already advances to the peer that can answer it.
+        chunks = [
+            chunk
+            async for chunk in hooks._stream_route_recovery_poll(
+                request_data,
+                unpriced,
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn(
+            {"type": "response.output_text.delta", "delta": "peer answered"},
+            chunks,
+        )
+        self.assertEqual(chunks[-1]["response"]["id"], "resp-peer")
+
     async def test_route_recovery_poll_reuses_stream_error_fallback_marker(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []

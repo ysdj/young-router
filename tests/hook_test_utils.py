@@ -229,6 +229,7 @@ _CLASSIFIED_TERMINAL_CODES = {
     "upstream_relay_capacity",
     "upstream_account_restricted",
     "upstream_client_outdated",
+    "upstream_model_unpriced",
     "image_generation_tool_unavailable",
     "upstream_compaction_failure",
     "upstream_compaction_unsupported",
