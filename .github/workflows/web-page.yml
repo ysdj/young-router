@@ -1,0 +1,71 @@
+name: Web page
+
+on:
+  # The one automatic workflow here, and the reason a gateway can deploy
+  # itself.  `yr-sync` on the host asks for
+  # `releases/download/web/web-<commit>.tar.gz` and installs the page that
+  # belongs to the commit it just staged; a commit whose page was never
+  # published keeps whatever page the host already serves.  On 2026-11-12 the
+  # gateway ran Core b19f7cc under a page built from 54c479d, so the log pane's
+  # filter never reached the Core it was talking to.
+  #
+  # Publishing was removed once because the artifact "was read by no code path
+  # in this repository" -- the reader lives in the host's ops repository, not
+  # here.  It is a prerelease holding per-commit archives, so it does not put a
+  # release in front of anyone looking for the app.
+  #
+  # Deliberately the smallest job that can exist: Linux, no simulator, no native
+  # build, no test suite.  The macOS/Windows matrices stay manual-dispatch
+  # because a commit is not a request to spend an hour of those runners.
+  push:
+    branches: [main]
+  # A person rebuilding by hand answers the same question, for a commit whose
+  # upload failed.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The build reads the commit's own clean worktree, so the commit has
+          # to be a real object in this clone.
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.10.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: rn/pnpm-lock.yaml
+
+      # `build-web-page.sh` symlinks the app's dependency tree into the worktree
+      # it builds from; that tree is not part of a commit.
+      - name: Install the page's dependencies
+        working-directory: rn
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the page for this commit
+        run: scripts/build-web-page.sh --commit "$GITHUB_SHA"
+
+      - name: Publish the page this commit serves
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: web
+          name: Web page
+          make_latest: false
+          prerelease: true
+          body: |
+            Browser pages for the commits `main` has served, named by the commit
+            each one was built from. A gateway installs
+            `web-<commit>.tar.gz` for the commit it stages.
+          files: output/web-*.tar.gz
+          fail_on_unmatched_files: true

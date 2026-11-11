@@ -769,6 +769,70 @@ class HookTraceLoggingTests(HookTestCase):
             with hooks._PENDING_RECENT_REQUESTS_LOCK:
                 self.assertNotIn("failed-stream-call", hooks._PENDING_RECENT_REQUESTS)
 
+    async def test_a_failed_hop_the_turn_recovered_from_is_still_a_failed_request(self) -> None:
+        """A mid-stream refusal is a logged failure even when a sibling serves.
+
+        LiteLLM's failure callback never runs for a stream that failed after it
+        started, and the turn that recovers on the next route reports only its
+        success.  Without the hop's own row, 请求 showed nothing while 路由跟踪
+        showed the failure -- and the failed attempt's row read 发送中 until the
+        stale window renamed it 已中断.  Closing the attempt where this router
+        abandons it is what keeps the two tabs telling the same story.
+        """
+
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+
+        class UpstreamBadGateway(Exception):
+            status_code = 502
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            first = {
+                "call_type": "amessages",
+                "model": "public-chat",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+                "litellm_call_id": "hop-turn",
+                "model_info": {"id": "hop-a", "model_group": "public-chat"},
+            }
+            await hook.async_pre_call_deployment_hook(first, call_type="amessages")
+            hooks._mark_exception_for_deployment_failover(
+                UpstreamBadGateway("upstream session rejected"),
+                first,
+            )
+
+            # The refusal is kept, not written: a reader closing the body at
+            # this instant is not a route failure, and only a new attempt (or a
+            # terminal stop) proves the router moved on.
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(["pending"], [record["status"] for record in records])
+
+            # The sibling that serves the turn publishes its own row beside the
+            # failed hop instead of replacing it.
+            second = {
+                **first,
+                "model_info": {"id": "hop-b", "model_group": "public-chat"},
+            }
+            await hook.async_pre_call_deployment_hook(second, call_type="amessages")
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(
+                ["pending", "failure", "pending"],
+                [record["status"] for record in records],
+            )
+            self.assertEqual("hop-a", records[1]["deployment_id"])
+            self.assertEqual("upstream-status-502", records[1]["error"]["reason"])
+            self.assertEqual("hop-b", records[-1]["deployment_id"])
+
     def test_the_attempt_row_id_reaches_the_streaming_request(self) -> None:
         """A rebuilt request body keeps the turn's identity.
 
@@ -782,6 +846,13 @@ class HookTraceLoggingTests(HookTestCase):
         """
 
         hooks, _ = load_hook_module()
+        # The selected route is a context variable, and this test runs outside
+        # an isolated task: leaving it set would hand the next test a marker
+        # that belongs to this one's request.
+        previous_deployment = hooks._CURRENT_SELECTED_DEPLOYMENT.get()
+        previous_box = hooks._CURRENT_SELECTED_DEPLOYMENT_BOX.get()
+        self.addCleanup(hooks._CURRENT_SELECTED_DEPLOYMENT.set, previous_deployment)
+        self.addCleanup(hooks._CURRENT_SELECTED_DEPLOYMENT_BOX.set, previous_box)
         deployment = {
             "litellm_params": {
                 "model": "anthropic/kimi-k3",
@@ -846,7 +917,7 @@ class HookTraceLoggingTests(HookTestCase):
                 start,
                 start + timedelta(milliseconds=10),
             )
-            settled = hooks._settle_failed_stream(
+            settled = hooks._settle_failed_attempt(
                 {"call_type": "amessages", "litellm_call_id": "callback-failed-call"},
                 RuntimeError("upstream route failed"),
             )

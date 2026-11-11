@@ -17,9 +17,10 @@
 # this working tree: the archive's name is the commit, so a page carrying
 # uncommitted edits would be a page attributed to code it does not contain.
 #
-# The archive is written under `output/` (git-ignored) and is never uploaded.
-# Send it to the host that serves it and install it there; this repository does
-# not publish a page release.
+# The archive is written under `output/` (git-ignored).  A gateway host installs
+# it from the `web` prerelease, where `.github/workflows/web-page.yml` puts the
+# page of every commit `main` gains; this script is also what that workflow runs,
+# and it is what a person runs to rebuild one by hand.
 #
 # Usage:
 #   scripts/build-web-page.sh                  # HEAD

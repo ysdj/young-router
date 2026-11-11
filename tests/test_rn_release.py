@@ -392,16 +392,26 @@ class ReactNativeReleaseTests(unittest.TestCase):
         self.assertNotRegex(workflow, r"(?m)^\s*(?:run:\s*)?(?:npm|npx)\b")
 
     def test_no_workflow_starts_on_its_own(self) -> None:
-        """A run exists only because a person asked for one.
+        """A run exists because a person asked for one -- but the page publishes.
 
         Nothing in this repository may trigger a workflow automatically: a
         commit is not a request to spend twenty minutes of macOS and Windows
-        runners, and a badge nobody asked for is not a review.  Every trigger
-        an event could add again -- `push`, `pull_request`, `schedule`,
+        runners, and a badge nobody asked for is not a review.  Every trigger an
+        event could add again -- `push`, `pull_request`, `schedule`,
         `workflow_run`, `release`, `create` -- is refused by name rather than by
         checking for one spelling, because the next edit brings its own.
+
+        The one exception is the page publisher, and it is named here rather
+        than left to a comment: a gateway deploys what `main` contains and can
+        only get the page of that commit from something it can fetch, so
+        `web-page.yml` publishes it on push.  It runs Linux only, it builds no
+        native host and it runs no test suite -- the cost this rule exists to
+        prevent.  Any other workflow gaining an automatic trigger still fails.
         """
 
+        automation = {
+            "web-page.yml": {"push"},
+        }
         for path in sorted((ROOT / ".github" / "workflows").glob("*.y*ml")):
             with self.subTest(workflow=path.name):
                 text = path.read_text(encoding="utf-8")
@@ -413,10 +423,15 @@ class ReactNativeReleaseTests(unittest.TestCase):
                     names = triggers
                 else:
                     names = list(triggers or {})
+                self.assertIn(
+                    "workflow_dispatch",
+                    names,
+                    f"{path.name} must stay dispatchable by hand",
+                )
                 self.assertEqual(
-                    ["workflow_dispatch"],
-                    sorted(names),
-                    f"{path.name} must be dispatchable and nothing else",
+                    automation.get(path.name, set()),
+                    set(names) - {"workflow_dispatch"},
+                    f"{path.name} may only start automatically where this test says it may",
                 )
                 for automatic in (
                     "push:",
@@ -427,6 +442,8 @@ class ReactNativeReleaseTests(unittest.TestCase):
                     "release:",
                     "create:",
                 ):
+                    if automatic.rstrip(":") in automation.get(path.name, set()):
+                        continue
                     self.assertNotRegex(text, rf"(?m)^\s*{automatic}")
 
     def test_the_macos_job_cannot_run_below_the_xcode_react_native_requires(self) -> None:

@@ -334,14 +334,74 @@ def _settle_failed_request(
     if entry is None:
         return False
     record = entry.get("record")
+    stashed = entry.get("failure")
+    stashed = stashed if isinstance(stashed, Mapping) else {}
+    stashed_error = stashed.get("error")
+    # The reason the hop itself gave outranks the wrapper a later layer built
+    # around it: ``ServiceUnavailableError`` says "the stream ended", while the
+    # stash names the 502 that ended it.
+    effective_error = stashed_error if isinstance(stashed_error, Mapping) and stashed_error else error
+    effective_deployment = deployment_id or stashed.get("deployment_id")
     _append_recent_request(
         _failed_recent_request_record(
             record if isinstance(record, Mapping) else {},
-            error,
-            deployment_id=deployment_id,
+            effective_error,
+            deployment_id=effective_deployment,
         )
     )
     return True
+
+
+def _remember_failed_attempt(
+    request_id: Any,
+    error: Mapping[str, Any],
+    *,
+    deployment_id: Any = None,
+) -> bool:
+    """Remember how the attempt in flight failed, without writing its row yet.
+
+    A refusal does not end the turn by itself: the router may move this turn to
+    a sibling route, which publishes a new attempt row.  Writing the failure
+    here would do it before anyone knows whether a client stop is what ended the
+    stream; the row is therefore written when the router demonstrably moves on
+    (``_close_abandoned_recent_request``) or when the turn ends in an error.
+    """
+
+    if not isinstance(request_id, str) or not request_id.strip():
+        return False
+    with _PENDING_RECENT_REQUESTS_LOCK:
+        entry = _PENDING_RECENT_REQUESTS.get(request_id.strip())
+        if entry is None:
+            return False
+        entry["failure"] = {
+            "error": dict(error),
+            "deployment_id": deployment_id,
+        }
+    return True
+
+
+def _close_abandoned_recent_request(request_id: Any) -> bool:
+    """Write the failure row of the attempt a new attempt is replacing.
+
+    The router only starts another deployment call because this attempt is over,
+    and its refusal is what ``_remember_failed_attempt`` kept.  Consuming it here
+    is also what keeps a reader's stop from being reported as a route failure:
+    nobody starts a new attempt after a client goes away.
+    """
+
+    if not isinstance(request_id, str) or not request_id.strip():
+        return False
+    request_id = request_id.strip()
+    with _PENDING_RECENT_REQUESTS_LOCK:
+        entry = _PENDING_RECENT_REQUESTS.get(request_id)
+        stashed = dict(entry.get("failure") or {}) if isinstance(entry, Mapping) else {}
+    if not stashed:
+        return False
+    return _settle_failed_request(
+        request_id,
+        stashed.get("error") or {},
+        deployment_id=stashed.get("deployment_id"),
+    )
 
 
 async def _settle_recent_request_after(

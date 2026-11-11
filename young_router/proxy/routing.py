@@ -347,25 +347,32 @@ def _remember_pending_request_log_id(request_id: Any) -> None:
         marker[_PENDING_REQUEST_LOG_ID_KEY] = request_id.strip()
 
 
-def _settle_failed_stream(
+def _settle_failed_attempt(
     request_data: Optional[dict],
     exception: BaseException,
+    *,
+    event: str = "request_log_closed_for_stream_failure",
 ) -> bool:
-    """Record the failure of a turn whose client-facing stream ended in error.
+    """Record an attempt that ended in an error, in the request log's own words.
 
     LiteLLM's streaming generators report a stream that fails through
     ``post_call_failure_hook`` -- the proxy's own callback list -- not through
     the logging callback that writes a request row.  On the Messages and Chat
-    wires no ``async_log_failure_event`` follows, so the row the turn published
-    kept saying 发送中 and the viewer renamed it 已中断 once the stale window
-    expired: a turn that failed with a named upstream refusal was reported as an
-    interruption nobody caused.  This proxy's client-facing generator is the one
-    place that knows the turn ended in an error, and the in-flight row it closes
-    is also what keeps a failure the logging callback already reported from
-    being written twice -- whichever side gets there first finds the entry.
+    wires no ``async_log_failure_event`` follows, so nothing was written for a
+    hop that died mid-stream: the row its pre-call hook published kept saying
+    发送中 until the stale window renamed it 已中断, and a turn that recovered on
+    the next route left no failure in 请求 at all while 路由跟踪 showed the hop.
+
+    Two endings reach this: a hop this router abandons (a fallback, a cooldown
+    move) and a turn whose client-facing stream ends in an error.  The in-flight
+    row is the same join key for both, and the logging callback clears that same
+    entry -- so a failure the callback already reported is never written twice:
+    whichever side gets there first finds it.
 
     A local shutdown is not a route failure: the restart path closes those rows
-    with its own reason (service_restart), so this leaves them alone.
+    with its own reason (service_restart), so this leaves them alone.  Neither
+    is the reader going away: a socket error while writing to the client says
+    nothing about the route.
     """
 
     if not isinstance(request_data, dict) or not isinstance(exception, Exception):
@@ -394,12 +401,37 @@ def _settle_failed_stream(
     ):
         return False
     _trace_module._request_route_trace(
-        "request_log_closed_for_stream_failure",
+        event,
         request_data,
         request=_trace_module._trace_request_summary(request_data),
         exception=_trace_exception(exception),
     )
     return True
+
+
+def _remember_failed_hop(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+) -> bool:
+    """Keep this attempt's refusal until its row is closed."""
+
+    if not isinstance(exception, Exception) or not isinstance(request_kwargs, dict):
+        return False
+    if _proxy_shutdown_in_progress() or _is_local_shutdown_exception(exception):
+        return False
+    request_id = _trace_request_id(request_kwargs)
+    if not request_id:
+        return False
+    error = _request_log_error_summary({"exception": exception}, None)
+    if not error:
+        # A refusal this router could not classify still has to say the route
+        # failed; the row must not fall through to "no terminal callback".
+        error = {"reason": "route_failure"}
+    return _state_module._remember_failed_attempt(
+        request_id,
+        error,
+        deployment_id=_deployment_id_from_request(request_kwargs),
+    )
 
 
 def _remember_request_time(
@@ -7670,6 +7702,13 @@ def _mark_exception_for_deployment_failover(
         request=_trace_module._trace_request_summary(request_kwargs),
         exception=_trace_exception(exception),
     )
+    # This hop's refusal has to reach the request log, and nothing above will
+    # report it: LiteLLM's failure callback never runs for a stream that failed
+    # after it started, and a turn that recovers on the next route reports only
+    # its success.  The reason is kept on the in-flight row here and written
+    # when the router demonstrably moves on -- or when the turn ends in an error.
+    # Writing it now would also do it while a reader is simply closing the body.
+    _remember_failed_hop(exception, request_kwargs)
     if _protocol_fallback_attempt_active(request_kwargs):
         _mark_protocol_fallback_failure(exception, request_kwargs)
         return

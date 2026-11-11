@@ -97,6 +97,11 @@ class YoungRouterHook(CustomLogger):
         # callbacks replace this progress row.  Do not emit an unjoinable
         # pending row that would remain as a duplicate legacy request entry.
         if record.get("request_id"):
+            # A new attempt under this request id means the previous one is
+            # over.  If the router recorded that refusal, that is the row it
+            # gets now: nothing else would ever write it (no callback follows a
+            # stream that failed after it started).
+            _state_module._close_abandoned_recent_request(record["request_id"])
             if _state_module._append_recent_request(record) is not None:
                 # Pin this row on the selected route marker so the stream that
                 # carries the attempt can refresh it, and close it if the
@@ -612,7 +617,7 @@ class YoungRouterHook(CustomLogger):
             # classification the callback would have written.  A turn whose
             # failure the callback did report already closed that row, and this
             # is then a no-op.
-            _routing_module._settle_failed_stream(request_data, exc)
+            _routing_module._settle_failed_attempt(request_data, exc)
             # The reader has nothing to read the end of this body from: this
             # shape ends a turn at its terminal event, so a body that closes
             # without one is a turn left open -- the client waits until a person
