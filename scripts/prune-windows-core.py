@@ -7,6 +7,7 @@ import argparse
 import os
 from pathlib import Path
 import shutil
+import stat
 
 
 NODE_DEVELOPMENT_DIRS = {
@@ -37,10 +38,29 @@ OPTIONAL_RUNTIME_DIST_PREFIXES = (
 )
 
 
+def _make_writable(root: Path) -> None:
+    """Clear the read-only bit Windows keeps on files such as git's packfiles.
+
+    ``shutil.rmtree`` cannot unlink a read-only file there, and a staged
+    upstream that still carries a ``.git`` (see
+    ``prune_vendored_repository_data``) is exactly that: git marks its objects
+    read-only and the copy keeps the attribute, so the prune failed instead of
+    dropping the repository.  POSIX has no such attribute to clear.
+    """
+
+    for directory, _names, files in os.walk(root):
+        for name in files:
+            target = os.path.join(directory, name)
+            mode = os.stat(target).st_mode
+            if not mode & stat.S_IWRITE:
+                os.chmod(target, mode | stat.S_IWRITE)
+
+
 def _remove(path: Path) -> None:
     if path.is_symlink() or path.is_file():
         path.unlink(missing_ok=True)
     elif path.is_dir():
+        _make_writable(path)
         shutil.rmtree(path)
 
 

@@ -263,18 +263,25 @@ try {
         throw "Could not read LiteLLM's Windows ARM64 dependency metadata."
       }
       $LiteLLMRequirements = @(
-        $proxySingle = "extra == '" + "proxy" + "'"
-        $proxyDouble = 'extra == "' + "proxy" + '"'
+        $proxyMarker = 'extra == "proxy"'
         foreach ($line in Get-Content -LiteralPath $metadataFile.FullName) {
           if (-not $line.StartsWith("Requires-Dist:")) { continue }
           $raw = $line.Substring("Requires-Dist:".Length).Trim()
           $parts = $raw.Split(";", 2)
           $head = $parts[0].Trim()
           $marker = if ($parts.Count -eq 2) { $parts[1].Trim() } else { "" }
+          # ``maturin`` writes the extra marker with single quotes
+          # (``extra == 'proxy'``); the setuptools-built wheels this parse was
+          # written against used double quotes.  Match both spellings.
+          $marker = $marker.Replace("'", '"')
           if ($head.StartsWith("litellm-proxy-extras", [System.StringComparison]::OrdinalIgnoreCase)) { continue }
-          if ($marker.Contains($proxySingle) -or $marker.Contains($proxyDouble)) {
-            $marker = $marker.Replace(" and " + $proxySingle, "").Replace($proxySingle + " and ", "")
-            $marker = $marker.Replace(" and " + $proxyDouble, "").Replace($proxyDouble + " and ", "").Trim()
+          if ($marker.Contains($proxyMarker)) {
+            # The marker itself has to go, not just a neighbouring ``and``: a
+            # requirement left as ``websockets>=15.0.1; extra == "proxy"`` is
+            # skipped by an installer that has no such extra active, which is
+            # how 1.109.0's proxy-only dependencies stopped arriving and the
+            # Core import failed on ``websockets``.
+            $marker = ($marker.Replace($proxyMarker, "") -replace '^\s*and\s+', "" -replace '\s+and\s*$', "").Trim()
             if ($marker -eq "") { $head } else { "$head; $marker" }
           } elseif ($marker -notmatch "extra\s*==") {
             $raw
@@ -284,7 +291,17 @@ try {
       if ($LiteLLMRequirements.Count -eq 0) {
         throw "Could not read LiteLLM's Windows ARM64 dependency set."
       }
-      & uv pip install --python $RuntimePython --target "$RuntimeSitePackages" --upgrade @LiteLLMRequirements "fastapi==0.140.3" PyYAML
+      # PyPI publishes no ``win_arm64`` wheel of cryptography from 47.0.0 on
+      # (46.0.3 is the last one); 47 through 50 ship ``win_amd64`` only.  LiteLLM
+      # declares ``cryptography>=49,<51``, so the installer falls back to the
+      # sdist, which needs an ARM64 OpenSSL 3 development tree that this build
+      # does not stage -- the build stopped there instead of producing a payload.
+      # 46.0.3 is installed explicitly, and said so, because it is the newest
+      # release the platform can actually install.
+      $Arm64Override = Join-Path $Core "litellm-arm64-overrides.txt"
+      Set-Content -LiteralPath $Arm64Override -Value "cryptography==46.0.3" -Encoding ascii
+      Write-Warning "Windows ARM64 packages cryptography 46.0.3: 47.0.0 and later publish no win_arm64 wheel, and LiteLLM's declared >=49 cannot be built here without an ARM64 OpenSSL 3 tree."
+      & uv pip install --python $RuntimePython --target "$RuntimeSitePackages" --upgrade --overrides $Arm64Override @LiteLLMRequirements "fastapi==0.140.3" PyYAML
       if ($LASTEXITCODE -ne 0) { throw "Could not install the bundled Windows ARM64 runtime dependencies." }
       Remove-Stale-LiteLLM-Metadata
       return
@@ -519,6 +536,23 @@ print('young-router-veridrop-import-ok')
       Copy-Item -LiteralPath $_.FullName -Destination $PackagePayload -Recurse -Force
     }
   Remove-Item -LiteralPath (Join-Path $PackagePayload "Bundle\Bundle") -Recurse -Force -ErrorAction SilentlyContinue
+
+  # The copy above is additive, so a release that moved leaves the previous
+  # ``litellm-<old>.dist-info`` in the payload beside the new one.  Two
+  # distributions of the same name make ``importlib.metadata.version`` answer
+  # ``None`` (it happened: the payload carried 1.106.4, 1.106.6 and 1.109.0),
+  # and the next build's seed check then reads a version that is not the one
+  # installed and reinstalls the whole runtime every time.  Only the metadata
+  # directory is removed -- the module tree was already overwritten.
+  $PayloadSitePackages = Join-Path $PackagePayload "Core\runtime\bin\Lib\site-packages"
+  if (Test-Path -LiteralPath $PayloadSitePackages) {
+    Get-ChildItem -LiteralPath $PayloadSitePackages -Directory -Filter "litellm-*.dist-info" -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -ne "litellm-$LiteLLMVersion.dist-info" } |
+      ForEach-Object {
+        Write-Output "Removing stale payload metadata: $($_.Name)"
+        Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+      }
+  }
 
   # The wheel fix lives in RNW source that upstream has not taken, so the shipped
   # binary has to be the prepared source-build output rather than the NuGet copy
