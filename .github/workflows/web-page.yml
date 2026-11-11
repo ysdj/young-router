@@ -53,8 +53,10 @@ jobs:
         working-directory: rn
         run: pnpm install --frozen-lockfile
 
+      # Through `bash`: the repository carries the script as data (mode 644), and
+      # a checkout that cannot exec it would only report "exit code 126".
       - name: Build the page for this commit
-        run: scripts/build-web-page.sh --commit "$GITHUB_SHA"
+        run: bash scripts/build-web-page.sh --commit "$GITHUB_SHA"
 
       - name: Publish the page this commit serves
         uses: softprops/action-gh-release@v2
