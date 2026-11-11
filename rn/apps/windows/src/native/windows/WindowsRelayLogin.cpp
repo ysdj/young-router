@@ -1043,8 +1043,12 @@ enum class RememberPasswordChoice { SessionOnly, Remember, RememberAndAutoGroup 
 // The host draws it on the app's own decision window (the same one every
 // confirmation uses on both hosts) rather than a ContentDialog: one question,
 // one surface.
-winrt::Windows::Foundation::IAsyncOperation<RememberPasswordChoice> ShowRememberPasswordPrompt(
-    std::shared_ptr<LoginState> const& state) {
+//
+// Plain, not a coroutine: the decision is taken synchronously on the UI thread
+// the caller already switched to, and ``IAsyncOperation<T>`` only accepts a
+// WinRT type as ``T`` -- an enum there does not compile (C2338 in the C++/WinRT
+// projection) and never did on Windows.
+RememberPasswordChoice ShowRememberPasswordPrompt(std::shared_ptr<LoginState> const& state) {
   const std::wstring title = Text(state->options, L"Remember the password?", L"是否记住密码？");
   const std::wstring message = Text(state->options,
       L"Save the password on this device to enable automatic sign-in next time. “Remember Password and Auto-Group” also arranges this station’s keys one per group; “Session Only” keeps just the current sign-in state.",
@@ -1052,11 +1056,11 @@ winrt::Windows::Foundation::IAsyncOperation<RememberPasswordChoice> ShowRemember
   const std::wstring remember = Text(state->options, L"Remember Password", L"记住密码");
   const std::wstring auto_group = Text(state->options, L"Remember Password and Auto-Group", L"记住密码并自动分组");
   const std::wstring session_only = Text(state->options, L"Session Only", L"仅记住登录态");
-  if (!state->options.decide) co_return RememberPasswordChoice::SessionOnly;
+  if (!state->options.decide) return RememberPasswordChoice::SessionOnly;
   const int answer = state->options.decide(title, message, session_only, remember, auto_group);
-  if (answer == 2) co_return RememberPasswordChoice::RememberAndAutoGroup;
-  if (answer == 1) co_return RememberPasswordChoice::Remember;
-  co_return RememberPasswordChoice::SessionOnly;
+  if (answer == 2) return RememberPasswordChoice::RememberAndAutoGroup;
+  if (answer == 1) return RememberPasswordChoice::Remember;
+  return RememberPasswordChoice::SessionOnly;
 }
 
 // Take the sign-in browser off the screen without ending its flow.
@@ -1202,7 +1206,7 @@ winrt::fire_and_forget ProbeLogin(
         co_await DispatcherQueueAwaiter{dispatcher};
         if (state->canceled.load()) co_return;
         HideLoginDialog(state);
-        const RememberPasswordChoice remember_choice = co_await ShowRememberPasswordPrompt(state);
+        const RememberPasswordChoice remember_choice = ShowRememberPasswordPrompt(state);
         remember_password = remember_choice != RememberPasswordChoice::SessionOnly;
         auto_grouping = remember_choice == RememberPasswordChoice::RememberAndAutoGroup;
         if (state->canceled.load()) co_return;

@@ -2146,6 +2146,13 @@ class CoreStore:
         )
         if isinstance(initial_service, Mapping):
             store._set_service_from_result(initial_service, increment=False)
+        try:
+            store.prune_orphan_relay_stations()
+        except Exception:
+            # Cleanup is a repair, not a precondition for opening settings.  A
+            # malformed provider document or an unavailable relay store must
+            # leave the app readable and be retried on the next start.
+            pass
         return store
 
     def shutdown(self, *, stopped_by: str = "app_exit") -> dict[str, Any]:
@@ -5650,6 +5657,71 @@ class CoreStore:
 
         return self.start_job(work, name=name, on_done=on_done)
 
+    def prune_orphan_relay_stations(self, station_ids: Sequence[str] | None = None) -> list[str]:
+        """Remove stations no provider in the current document reaches.
+
+        A station is durable content only while a provider names it (by the
+        bound source, a slot sourcing one of its resources, or the provider's
+        own address).  The wizard signs in before it creates its provider, so
+        a dismissed wizard can leave exactly such an orphan behind; a provider
+        delete has its own release path, but a station whose provider was
+        never finished has no delete to trigger it.  This is also the startup
+        repair for documents written before that rule existed.
+
+        ``station_ids`` narrows the sweep to the stations one surface created.
+        The caller's ids are intersected with the still-unreached set, so a
+        concurrent provider binding is never removed.  Only a provider domain
+        that actually answers the reachability question is trusted: an
+        unavailable or malformed provider document must not turn into "every
+        station is an orphan".
+        """
+
+        providers = self._domains.get("providers_models")
+        relay = self._domains.get("relay_accounts")
+        resolver = getattr(providers, "relay_reachable_stations", None)
+        reader = getattr(relay, "station_identities", None)
+        if not callable(resolver) or not callable(reader):
+            return []
+        candidates: set[str] = set(str(item) for item in station_ids) if station_ids is not None else set()
+        with self._domain_scope("relay_accounts", "providers_models"):
+            try:
+                identities = reader()
+                reached = set(self._relay_reachable_stations(providers, relay))
+            except Exception:
+                return []
+            available = [
+                str(station.get("id", "")).strip()
+                for station in identities
+                if isinstance(station, Mapping) and str(station.get("id", "")).strip()
+            ]
+            if station_ids is None:
+                candidates = set(available)
+            else:
+                candidates &= set(available)
+            candidates -= reached
+        removed: list[str] = []
+        for station_id in sorted(candidates):
+            try:
+                self.dispatch(
+                    {
+                        "domain": "relay_accounts",
+                        "type": "station_remove",
+                        "payload": {"id": station_id, "dependency_policy": "detach"},
+                    }
+                )
+                removed.append(station_id)
+            except Exception:
+                continue
+        if removed:
+            try:
+                self.apply(domains=["relay_accounts"], revision=self.revision)
+            except Exception:
+                # The staged removal is still the truth for this process; the
+                # next startup retries the write.  Never turn cleanup into a
+                # failed Core start.
+                pass
+        return removed
+
     @staticmethod
     def _relay_reachable_stations(providers: object, relay: object) -> list[str]:
         """The stations the provider draft still reaches.
@@ -5749,6 +5821,20 @@ class CoreStore:
                     data.get("payload"),
                     expected_revision if expected_revision is not None else data.get("expected_revision"),
                 )
+        if (
+            domain_value is not None
+            and _canonical_domain(domain_value) == "relay_accounts"
+            and normalized_action in {"prune_orphans", "prune_orphan_stations"}
+        ):
+            payload = _as_mapping(data.get("payload"))
+            raw_ids = payload.get("station_ids")
+            station_ids = (
+                [str(item) for item in raw_ids]
+                if isinstance(raw_ids, Sequence) and not isinstance(raw_ids, (str, bytes, bytearray))
+                else None
+            )
+            removed = self.prune_orphan_relay_stations(station_ids)
+            return {"revision": self._revision, "removed": removed}
         if (
             domain_value is not None
             and _canonical_domain(domain_value) == "providers_models"

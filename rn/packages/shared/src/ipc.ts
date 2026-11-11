@@ -150,6 +150,21 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
     return latestSnapshot;
   }
 
+  // A snapshot can come back with a request id that is not the one this client
+  // just sent.  The envelope is then unreadable, while the state behind it is
+  // not: a dispatch that landed still landed.  Retrying the read once turns
+  // that into the row the action created instead of an action that looks
+  // refused and is repeated into a duplicate-name error.
+  const fetchSnapshot = async (): Promise<CoreSnapshot> => rememberSnapshot((await call("snapshot", {})).snapshot);
+  const readSnapshot = async (): Promise<CoreSnapshot> => {
+    try {
+      return await fetchSnapshot();
+    } catch (reason) {
+      if (reason instanceof IpcProtocolError && reason.code === "invalid_response") return fetchSnapshot();
+      throw reason;
+    }
+  };
+
   async function call<M extends IpcMethod>(method: M, params: IpcParams[M]): Promise<IpcResults[M]> {
     const request: IpcRequest<M> = {
       protocol_version: IPC_PROTOCOL_VERSION,
@@ -175,9 +190,9 @@ export function createIpcClient(transport: IpcTransport, endpoint?: IpcEndpoint)
     hostRoute: transport.hostRoute ? (path, body) => transport.hostRoute!(path, body) : undefined,
     latestSnapshot: (): CoreSnapshot | undefined => latestSnapshot,
     snapshot: (): Promise<CoreSnapshot> => {
-      if (latestSnapshot) return call("snapshot", {}).then(({ snapshot }) => rememberSnapshot(snapshot));
+      if (latestSnapshot) return readSnapshot();
       if (!initialSnapshotRequest) {
-        const promise = call("snapshot", {}).then(({ snapshot }) => rememberSnapshot(snapshot)).finally(() => {
+        const promise = readSnapshot().finally(() => {
           if (initialSnapshotRequest === promise) initialSnapshotRequest = undefined;
         });
         initialSnapshotRequest = promise;

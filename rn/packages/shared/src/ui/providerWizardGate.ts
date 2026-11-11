@@ -16,6 +16,11 @@
  * which lets the provider workspace apply the finished draft immediately.
  */
 let providerWizardOpen = false;
+// The provider row the wizard just made.  A wizard is its own React root on
+// the native hosts, so a parent-state callback would update the wizard's copy
+// and leave the pane behind on the row it had selected before 完成.  The JS
+// runtime is shared, so the row travels here instead.
+let pendingProviderFocusID = "";
 let assistantEditorOpen = false;
 let groupManagerOpen = false;
 let webDavSettingsOpen = false;
@@ -33,6 +38,17 @@ export function setProviderWizardOpen(open: boolean): void {
 
 export function isProviderWizardOpen(): boolean {
   return providerWizardOpen;
+}
+
+/** Ask the provider pane to open the row the wizard just created. */
+export function focusProviderAfterWizard(providerID: string): void {
+  if (!providerID) return;
+  pendingProviderFocusID = providerID;
+  notify();
+}
+
+export function providerWizardFocusID(): string {
+  return pendingProviderFocusID;
 }
 
 /**

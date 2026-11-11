@@ -787,7 +787,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.serviceKeyHint": "该地址属于官方服务：可以在这里继续使用自定义密钥，或在添加向导中选择对应类型，改用官方账号登录。",
   "providers.wizard.workbuddyUnlimited": "不限",
   "providers.wizard.workbuddyAppHint": "模型通过已安装的 WorkBuddy 桌面应用的登录态调用；下一步会列出该应用的模型目录，勾选后随供应商一起创建。账号在「服务商关联」里维护。",
-  "providers.type.relay": "中转站",
+  "providers.type.apiProvider": "API 供应商",
   "providers.type.openai": "OpenAI",
   "providers.type.apiKey": "API 密钥",
   "providers.type.qoder": "Qoder",
@@ -823,7 +823,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.keysProvided": "供应商提供",
   "providers.orphanKeyHint": "该密钥在中转站上已不存在，只在本地保留。删除它不会影响中转站。",
   "providers.providedKeysNeedAccount": "还没有已登录账号。在右侧“账号管理”中添加并登录账号后，供应商提供的密钥会显示在这里。",
-  // The same association block a 中转站 provider draws, under the name that
+  // The same association block a station-linked provider draws, under the name that
   // service uses: an account row links the accounts it signs in, exactly as a
   // station row links the accounts of its station.
   "providers.accountLinks": "账号关联",
@@ -865,6 +865,8 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.wizard.next": "下一步",
   "providers.wizard.finish": "完成",
   "providers.wizard.finishWithoutModels": "不添加模型",
+  "providers.wizard.saveProviderOnly": "仅保存供应商",
+  "providers.wizard.saveProviderOnlyHint": "只保存供应商和它关联的中转站登录，不导入密钥或模型；中转站不会单独成行，之后可在供应商里继续添加。",
   "providers.wizard.creating": "正在准备供应商…",
   "providers.wizard.complete": "配置已保存。",
   "providers.wizard.required": "请填写必填项后继续。",

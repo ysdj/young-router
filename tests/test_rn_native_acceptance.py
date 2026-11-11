@@ -1236,7 +1236,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # window too, so one question has one surface on each host.
         windows_relay = (WIN_NATIVE / "WindowsRelayLogin.cpp").read_text(encoding="utf-8")
         self.assertIn("const int answer = state->options.decide(title, message, session_only, remember, auto_group);", windows_relay)
-        self.assertIn("if (answer == 2) co_return RememberPasswordChoice::RememberAndAutoGroup;", windows_relay)
+        self.assertIn("if (answer == 2) return RememberPasswordChoice::RememberAndAutoGroup;", windows_relay)
         # An existing row that already keeps the password or the automatic
         # layout is not asked again; only a session-only row is.
         self.assertIn("if rememberPasswordPreference == true {", leaf)
@@ -2045,7 +2045,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("void HideLoginDialog(std::shared_ptr<LoginState> const& state) {", windows_relay)
         self.assertIn("ShowWindow(handle, SW_HIDE);", windows_relay)
         probe_login = windows_relay.split("winrt::fire_and_forget ProbeLogin", 1)[1].split("winrt::fire_and_forget InitializeBrowser", 1)[0]
-        self.assertLess(probe_login.index("HideLoginDialog(state);"), probe_login.index("co_await ShowRememberPasswordPrompt(state);"))
+        self.assertLess(probe_login.index("HideLoginDialog(state);"), probe_login.index("ShowRememberPasswordPrompt(state);"))
         self.assertIn('L"Remember Password", L"记住密码"', windows_relay)
         self.assertIn('L"Remember Password and Auto-Group", L"记住密码并自动分组"', windows_relay)
         self.assertIn('L"Session Only", L"仅记住登录态"', windows_relay)
@@ -2334,7 +2334,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         probe_login = windows_relay.split("winrt::fire_and_forget ProbeLogin", 1)[1].split("winrt::fire_and_forget InitializeBrowser", 1)[0]
         self.assertNotIn("state->captured_password.reset();", probe_login)
         self.assertIn("if (!password) password = state->captured_password;", windows_relay)
-        self.assertIn("const RememberPasswordChoice remember_choice = co_await ShowRememberPasswordPrompt(state);", windows_relay)
+        self.assertIn("const RememberPasswordChoice remember_choice = ShowRememberPasswordPrompt(state);", windows_relay)
         self.assertIn("auto_grouping = remember_choice == RememberPasswordChoice::RememberAndAutoGroup;", windows_relay)
         self.assertIn("std::map<std::string, std::string> ParseCookieHeader(std::string const& header);", windows_relay)
         self.assertIn("if (credentials_saved && !accepted)", windows_relay)

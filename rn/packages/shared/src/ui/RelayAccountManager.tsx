@@ -6,11 +6,11 @@ import { NativeButton, NativeCheckbox, NativePicker, NativeTable, NativeTextFiel
 import { pushPresentation, trapWithin } from "../platform/presentationStack";
 import { usePendingAction } from "./pendingAction";
 import { setGroupManagerOpen } from "./providerWizardGate";
-import { normalizeRelayOrigin } from "./relayOrigin";
+import { normalizeRelayOrigin, stationOriginKey } from "./relayOrigin";
 import { multiplierSpelling } from "./rateSpelling";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
-export { normalizeRelayOrigin } from "./relayOrigin";
+export { normalizeRelayOrigin, stationOriginKey } from "./relayOrigin";
 
 type UnknownRecord = Record<string, unknown>;
 type Translate = (key: string, values?: Record<string, string | number>) => string;
@@ -220,19 +220,6 @@ export function accountsFromSnapshot(snapshot?: CoreSnapshot): RelayAccount[] {
       }),
     }];
   }) : [];
-}
-
-export function stationOriginKey(value: string): string {
-  const normalized = normalizeRelayOrigin(value);
-  if (!normalized) return "";
-  try {
-    const parsed = new URL(normalized);
-    const port = parsed.port && !((parsed.protocol === "https:" && parsed.port === "443") || (parsed.protocol === "http:" && parsed.port === "80")) ? `:${parsed.port}` : "";
-    const path = parsed.pathname.replace(/\/+$/u, "");
-    return `${parsed.protocol.toLowerCase()}//${parsed.hostname.toLowerCase()}${port}${path}`;
-  } catch {
-    return normalized.toLowerCase();
-  }
 }
 
 export function stationsFromSnapshot(snapshot: CoreSnapshot | undefined, accounts: RelayAccount[]): RelayStation[] {

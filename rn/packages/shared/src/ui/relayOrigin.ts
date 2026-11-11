@@ -61,3 +61,55 @@ export function suggestedProviderName(value: string): string {
   const suggestion = suggestedRelayStationName(normalized);
   return suggestion.length > 1 ? suggestion : "";
 }
+
+/**
+ * The one origin key a relay browser session proved.
+ *
+ * Two spellings of the same deployment share a station: the host is
+ * lower-cased, default ports are dropped, and a trailing slash disappears.
+ * The path stays part of the identity, because a deployment base path is a
+ * different site from the origin beside it.
+ */
+export function stationOriginKey(value: string): string {
+  const normalized = normalizeRelayOrigin(value);
+  if (!normalized) return "";
+  try {
+    const parsed = new URL(normalized);
+    const port = parsed.port && !((parsed.protocol === "https:" && parsed.port === "443") || (parsed.protocol === "http:" && parsed.port === "80")) ? `:${parsed.port}` : "";
+    const path = parsed.pathname.replace(/\/+$/u, "");
+    return `${parsed.protocol.toLowerCase()}//${parsed.hostname.toLowerCase()}${port}${path}`;
+  } catch {
+    return normalized.toLowerCase();
+  }
+}
+
+/** The account one sign-in actually landed on, or the pending shell itself. */
+export type RelayLoginIdentity = {
+  id: string;
+  origin: string;
+  username?: string;
+  loginStatus?: string;
+};
+
+/**
+ * A sign-in asks with a pending id and lands on whatever row the station's
+ * answer identifies.
+ *
+ * Core never writes a second account for one site and address, so the id the
+ * browser flow started with is often not the id that exists afterwards.  Both
+ * the wizard and the provider pane must read the account the station actually
+ * answered for; matching the pending id alone reports a successful sign-in as
+ * a failed resource read.
+ */
+export function relayLoginLandedAccount<T extends RelayLoginIdentity>(
+  accounts: readonly T[],
+  pendingID: string,
+  origin: string,
+  username = "",
+): T | undefined {
+  const target = stationOriginKey(origin);
+  const matched = accounts.find((account) => account.id !== pendingID
+    && stationOriginKey(account.origin) === target
+    && (username ? account.username === username : account.loginStatus === "signed_in"));
+  return matched ?? accounts.find((account) => account.id === pendingID);
+}

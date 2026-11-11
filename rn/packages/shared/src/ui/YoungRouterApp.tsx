@@ -36,12 +36,12 @@ import {
   type RelayWorkspaceBridge,
   type StationDraft,
 } from "./RelayAccountManager";
-import { suggestedProviderName, suggestedRelayStationName } from "./relayOrigin";
+import { relayLoginLandedAccount, suggestedProviderName, suggestedRelayStationName } from "./relayOrigin";
 import { multiplierSpelling, rateNumber, rateSpelling } from "./rateSpelling";
 import { applyPatch, mergeSnapshot, snapshotProjectionRevision } from "../applyPatch";
 import { postActionRefreshNeeded, publishSnapshot, useDomainRecord, type EventChannelState } from "./snapshotStore";
 import { providerCredentialKeys, relayCredentialKey } from "./providerCredentials";
-import { isAssistantEditorOpen, isGroupManagerOpen, isProviderWizardOpen, isWebDavSettingsOpen, setAssistantEditorOpen, setGroupManagerOpen, setProviderWizardOpen, setWebDavSettingsOpen, subscribeProviderWizard } from "./providerWizardGate";
+import { focusProviderAfterWizard, isAssistantEditorOpen, isGroupManagerOpen, isProviderWizardOpen, isWebDavSettingsOpen, providerWizardFocusID, setAssistantEditorOpen, setGroupManagerOpen, setProviderWizardOpen, setWebDavSettingsOpen, subscribeProviderWizard } from "./providerWizardGate";
 import { RelayDialogHost, useRelayDialogSurface } from "./relayDialogSurface";
 import { SOURCE_LIST_FONT_SIZE, UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 import type {
@@ -704,8 +704,11 @@ function codexSurfaceName(feature: string, translate: Translate): string | undef
 }
 
 function providerKindLabel(kind: ProviderKind, translate: Translate): string {
+  // A relay source is still an API provider: the provider is the row, and the
+  // station it carries is one of its credentials.  "Relay station" is the name
+  // of the association, never the provider's type.
   return kind === "relay"
-    ? translate("providers.type.relay")
+    ? translate("providers.type.apiProvider")
     : kind === "openai"
       ? translate("providers.type.openai")
         : kind === "workbuddy"
@@ -718,7 +721,7 @@ function providerKindLabel(kind: ProviderKind, translate: Translate): string {
                 ? translate("providers.type.qoderGlobal")
                 : kind === "ourFreeModel"
                   ? translate("providers.type.ourFreeModel")
-                  : translate("providers.type.apiKey");
+                  : translate("providers.type.apiProvider");
 }
 
 /** Whether this provider kind is one of the account-backed login services, whose
@@ -3210,7 +3213,11 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       // Capture the refresh belonging to this action. Reading
       // latestSnapshot.current after run() returns is racy with the
       // authorisation status poll, which can overwrite its operation summary.
-      outcome = await refresh();
+      // The dispatch is the success boundary: a read that fails afterwards
+      // must not turn a row the action created into "nothing happened".
+      const refreshed = await refresh().catch(() => latestSnapshot.current ?? snapshot);
+      if (!refreshed) throw new Error("The settings projection is unavailable");
+      outcome = refreshed;
       const actionSummary = staged.action_summary;
       if (actionSummary && actionDomain) {
         const currentDomainSummary = asRecord(outcome.action_summaries?.[actionDomain]);
@@ -4409,20 +4416,42 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const [step, setStep] = useState<WizardStep>("provider");
   // The step the last advance left, so one press cannot advance twice.
   const stepRef = useRef<WizardStep | undefined>("provider");
+  // A press that starts a step transition or the one create is answered
+  // synchronously, not by render state: 下一步 is the window's default button,
+  // so one Return can deliver the action twice before `processing` repaints.
+  const advanceInFlight = useRef(false);
   const [providerType, setProviderType] = useState<WizardType>("api");
   const [providerMode, setProviderMode] = useState<"new" | "existing">("new");
   const [providerSelection, setProviderSelection] = useState(PROVIDER_WIZARD_NEW_PROVIDER);
   const [providerName, setProviderName] = useState("");
   const [providerBaseURL, setProviderBaseURL] = useState("");
-  const [typeDetection, setTypeDetection] = useState<"checking" | RelayType | "unknown" | undefined>(undefined);
+  // The live relay-family probe, keyed by the origin that answered it.  A
+  // value alone outlived the URL it was probed for: changing the address and
+  // signing in again read the previous site's family, which chose the wrong
+  // login form and filed the account under the wrong station type.
+  const [typeDetection, setTypeDetection] = useState<{ origin: string; state: "checking" | RelayType | "unknown" } | undefined>(undefined);
   // Keys step.
   const [keyPath, setKeyPath] = useState<"login" | "manual">("manual");
   const [loginPhase, setLoginPhase] = useState<"idle" | "sign-in">("idle");
   const [loginBusy, setLoginBusy] = useState(false);
+  // Which sign-in owns the native browser window right now.  Closing this
+  // window must close that browser too: the wizard is the only surface that
+  // can cancel it, and a dismissed window used to leave the sign-in page
+  // running with nothing left to accept its answer.
+  const loginInFlight = useRef(false);
+  // New stations this wizard's sign-in created before the provider row exists.
+  // Closing without finishing hands the ids to Core's reachability check, which
+  // removes only the ones no provider names; startup repair catches the same
+  // shape written by an older build.
+  const pendingLoginStationIDs = useRef(new Set<string>());
   // 刷新资源 is the action the empty and unavailable hints name; it reads the
   // station for every signed-in account this step lists, so one press can
   // bring back a second account's keys as well as the first's.
   const [resourcesBusy, setResourcesBusy] = useState(false);
+  // A station account read once per account: switching to a second signed-in
+  // account must not leave its key list empty behind a 刷新 button while the
+  // first account's keys are still on screen.
+  const autoRefreshedAccountIDs = useRef(new Set<string>());
   // The post-login choice may have turned 自动分组 on.  Staging its one-key-per-
   // group layout is another station-sized wait, and it happens after the sign-in
   // panel is gone — the key area states it instead of drawing an empty list.
@@ -4517,6 +4546,12 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // press that did nothing at all.
   const wizardFooterStatus = wizardStatus || status || "";
   const shownChallenge = useRef<Record<string, string>>({});
+  // Whether this wizard itself created the official provider or changed its
+  // account.  A zero-model 完成 on an already-signed-in existing provider
+  // writes nothing, so it must not claim 已保存; a newly created provider or a
+  // completed sign-in did write something.
+  const officialProviderCreated = useRef(false);
+  const officialLoginAttempted = useRef(false);
   const setLoginFeedbackMessage = (message: string | undefined): void => {
     loginFeedback.current = message;
     forceLoginFeedbackRender((value) => value + 1);
@@ -4637,6 +4672,11 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // was the wall of 未登录 the step kept drawing.  Signing such an account in
   // is the empty state's own action (and the account pane's), not a key source.
   const selectedStationAccount = selectableAccounts.find((account) => account.id === selectedAccountID) ?? selectableAccounts[0];
+  // The key list is the account's; so is every model row it offers.  The
+  // model-draft reset below keys on this id, so moving to another account
+  // cannot carry the previous account's picks onto a step that now belongs to
+  // someone else.
+  const selectedStationAccountID = selectedStationAccount?.id ?? "";
   const accountPickerLabels = selectableAccounts.map((account) => `${stationAccountName(account)} · ${translate("providers.authStatusSignedIn")}`);
   const selectedAccountPickerLabel = selectedStationAccount
     ? accountPickerLabels[selectableAccounts.findIndex((account) => account.id === selectedStationAccount.id)] ?? accountPickerLabels[0] ?? ""
@@ -4738,6 +4778,25 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     const values = [...(selectedProvidedChoice?.models ?? []), ...fetchedModelCandidates];
     return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
   }, [fetchedModelCandidates, selectedProvidedChoice?.models]);
+  /** One checkbox, one answer: every roster above toggles the same way. */
+  const setModelChecked = (name: string, checked: boolean): void => {
+    setSelectedModels((current) => checked
+      ? (current.includes(name) ? current : [...current, name])
+      : current.filter((item) => item !== name));
+    setValidation("");
+  };
+  const setAllModelsChecked = (names: readonly string[], checked: boolean): void => {
+    setSelectedModels(checked ? [...names] : []);
+    setValidation("");
+  };
+  const toggleAllModels = (names: readonly string[]): void => {
+    setSelectedModels((current) => current.length === names.length ? [] : [...names]);
+    setValidation("");
+  };
+  const invertModels = (): void => {
+    setSelectedModels((current) => modelCandidates.filter((name) => !current.includes(name)));
+    setValidation("");
+  };
   // "Select an existing provider" matches by service: an official address
   // typed by hand is the same service as the one the wizard injects.
   const wizardService: ServiceID | undefined = serviceType;
@@ -4966,23 +5025,33 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   }, [activeKeySelection, creatingProvider, selectedKeyChoice, stagedKeyName, step]);
 
   useEffect(() => {
+    // Everything the model step built belongs to this key selection, key path,
+    // provider, and account.  A change to any of them retargets the step: its
+    // catalog, lanes, manual rows, picks, and any fetch still arriving must
+    // not be read as the new target's answer.
     modelFetchRequest.current += 1;
+    modelFetchInFlight.current = false;
     setModelName("");
     setUpstreamModel("");
     setFetchedModelCandidates([]);
     setFetchedModelLabels({});
     setModelFetchDetail("");
     setFetchedModelCapabilities({});
+    setLaneRoutes({});
+    setLaneChannels({});
     setSelectedModels([]);
     setManualModels([]);
     setSelectedManualModelIDs([]);
     setModelFetchState("idle");
-  }, [activeKeySelection, providedKeySelection, providerID]);
+  }, [activeKeySelection, keyPath, providedKeySelection, providerID, selectedStationAccountID]);
 
   const chooseProviderType = (value: WizardType): void => {
     setProviderType(value);
     setProviderMode("new");
     setProviderSelection(PROVIDER_WIZARD_NEW_PROVIDER);
+    officialProviderCreated.current = false;
+    officialLoginAttempted.current = false;
+    setLoginFeedbackMessage(undefined);
     setKeySelection("");
     setKeyName("");
     resetStagedKeyField();
@@ -5018,9 +5087,23 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                   : "");
     setWorkbuddyAccount(undefined);
     setQoderAccount(undefined);
-    setSelectedModels([]);
+    // A type switch retargets the whole model step.  The key-field effect
+    // below only runs when its own identity changes; switching between two
+    // types with the same key identity left the previous catalog's rows,
+    // manual entries, and a fetch still in flight to answer the new step.
+    modelFetchRequest.current += 1;
+    modelFetchInFlight.current = false;
+    setFetchedModelCandidates([]);
+    setFetchedModelCapabilities({});
     setFetchedModelLabels({});
+    setLaneRoutes({});
+    setLaneChannels({});
+    setManualModels([]);
+    setSelectedManualModelIDs([]);
+    setModelName("");
+    setUpstreamModel("");
     setModelFetchDetail("");
+    setSelectedModels([]);
     setModelFetchState("idle");
   };
   useEffect(() => {
@@ -5047,9 +5130,20 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [providers, providerType, providerMode, keyPath, step]);
 
+  /**
+   * Where an existing row's credential already lives.
+   *
+   * A relay provider stores ``auth_kind: api_key`` because the station's keys
+   * ride on API-key slots, but the credential a person manages there is the
+   * station account.  Opening that row on 手动选择 asks for a key it does not
+   * need and hides the accounts the step exists to show.
+   */
+  const existingKeyPath = (entry: UnknownRecord | undefined): "login" | "manual" =>
+    entry && providerKind(entry) !== "relay" && providerAuthKind(entry) === "api_key" ? "manual" : "login";
   /** Switch one official service between its web login and a custom key. */
   const chooseOfficialAuthPath = (path: "login" | "manual"): void => {
     setKeyPath(path);
+    setLoginFeedbackMessage(undefined);
     setKeySelection("");
     setKeyName("");
     resetStagedKeyField();
@@ -5062,10 +5156,16 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const chooseExistingProvider = (value: string): void => {
     setProviderMode("existing");
     setProviderSelection(value);
+    officialProviderCreated.current = false;
+    officialLoginAttempted.current = false;
+    setLoginFeedbackMessage(undefined);
     // An existing account-backed entry keeps its own key path: a login
-    // provider shows the account, a custom-key entry shows its key.
+    // provider shows the account, a custom-key entry shows its key.  A relay
+    // provider is api_key-authenticated too, but its credential is the
+    // station's account — opening it on 手动选择 would hide every account and
+    // every provided key it already has.
     const existing = providers.find((entry) => editorIdentifier(entry) === value);
-    setKeyPath(existing && providerAuthKind(existing) === "api_key" ? "manual" : "login");
+    setKeyPath(existingKeyPath(existing));
     setKeySelection("");
     keyNameSeedSelection.current = "";
     setKeyName("");
@@ -5076,9 +5176,17 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   };
   const chooseProviderMode = (value: "new" | "existing"): void => {
     const first = providerOptions[0];
+    // `providerOptions` holds picker options, not provider records: reading
+    // its first entry as a provider gave every existing entry the default
+    // api_key kind, so 选择供应商 always opened on 手动选择 and hid the station
+    // login path.  Resolve the option back to the record it names.
+    const firstProvider = providers.find((entry) => editorIdentifier(entry) === first?.value);
     setProviderMode(value);
     setProviderSelection(value === "new" ? PROVIDER_WIZARD_NEW_PROVIDER : first?.value ?? PROVIDER_WIZARD_NEW_PROVIDER);
-    setKeyPath(value === "new" ? (providerType === "api" ? "manual" : "login") : first && providerAuthKind(first) === "api_key" ? "manual" : "login");
+    setKeyPath(value === "new" ? (providerType === "api" ? "manual" : "login") : existingKeyPath(firstProvider));
+    officialProviderCreated.current = false;
+    officialLoginAttempted.current = false;
+    setLoginFeedbackMessage(undefined);
     setKeySelection("");
     setKeyName("");
     resetStagedKeyField();
@@ -5093,6 +5201,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const lastSuggestedProviderName = useRef("");
   const updateProviderBaseURL = (value: string): void => {
     if (providerType !== "api") return;
+    setValidation("");
+    setLoginFeedbackMessage(undefined);
     setProviderBaseURL(value);
     const suggested = suggestedProviderName(value);
     const current = providerName.trim();
@@ -5103,25 +5213,30 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   };
   const updateProviderName = (value: string): void => {
     lastSuggestedProviderName.current = "";
+    setValidation("");
     setProviderName(value);
   };
   const detectRelayType = async (): Promise<RelayType | undefined> => {
     const candidate = normalizeRelayOrigin(activeProviderBaseURL);
     if (!candidate) return undefined;
-    setTypeDetection("checking");
+    setTypeDetection({ origin: candidate, state: "checking" });
     try {
       const detected = await relay.detectType(candidate);
-      setTypeDetection(detected ?? "unknown");
+      setTypeDetection({ origin: candidate, state: detected ?? "unknown" });
       return detected;
     } catch {
-      setTypeDetection("unknown");
+      setTypeDetection({ origin: candidate, state: "unknown" });
       return undefined;
     }
   };
   // The relay family always comes from auto-detection: the bound station's
   // type first, then a live probe of the provider URL. No manual select.
   const resolveRelayType = async (): Promise<RelayType | undefined> => {
-    if (typeDetection === "newapi" || typeDetection === "sub2api") return typeDetection;
+    const probeOrigin = normalizeRelayOrigin(activeProviderBaseURL);
+    if (typeDetection?.origin === probeOrigin
+      && (typeDetection.state === "newapi" || typeDetection.state === "sub2api")) {
+      return typeDetection.state;
+    }
     if (stationForProvider?.type) return stationForProvider.type;
     // A station that already holds an account has answered this question:
     // its account row carries the family the sign-in was filed under.  Probing
@@ -5510,6 +5625,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       const createdServiceID = editorIdentifier(added);
       setProviderMode("existing");
       setProviderSelection(createdServiceID);
+      focusProviderAfterWizard(createdServiceID);
       return createdServiceID;
     }
     if (isOurFreeModelType) {
@@ -5551,6 +5667,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       const createdServiceID = editorIdentifier(added);
       setProviderMode("existing");
       setProviderSelection(createdServiceID);
+      focusProviderAfterWizard(createdServiceID);
       return createdServiceID;
     }
     const baseURL = serviceBaseURL.trim();
@@ -5587,11 +5704,12 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     // second one with the same name.
     setProviderMode("existing");
     setProviderSelection(createdID);
+    focusProviderAfterWizard(createdID);
     // A provider that belongs to a relay station is bound to it now, while
     // its provided keys are what its models route through.
     if (usingProvidedKey) {
       const station = stationForProvider
-        ?? relayStations.find((candidate) => candidate.id === (selectedProvidedChoice?.stationID ?? ""));
+        ?? relayStations.find((candidate) => candidate.id === (selectedProvidedChoice?.stationID ?? selectedStationAccount?.stationID ?? ""));
       if (station) await dispatchWithOutcome("provider.select_relay_station", { provider_id: createdID, station_id: station.id });
     }
     setValidation("");
@@ -5642,6 +5760,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       setValidation(translate("providers.wizard.required"));
       return;
     }
+    const knownStationIDs = new Set([
+      ...relayStations.map((item) => item.id),
+      ...stationsFromSnapshot(snapshot, accountsFromSnapshot(snapshot)).map((item) => item.id),
+    ]);
     try {
       // A station that already has a signed-in account is reused, because that
       // is what "get the keys of this station" means when it is already done.
@@ -5685,6 +5807,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       const pendingID = `login-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       setSignedInAccountID(pendingID);
       setLoginPhase("sign-in");
+      loginInFlight.current = true;
       const result = await native.relayLogin({
         accountId: pendingID,
         type: accountType,
@@ -5717,12 +5840,15 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       // sign-in that had just succeeded reported 操作失败.
       const next = await relay.refreshAccounts();
       const accounts = accountsFromSnapshot(next ?? undefined);
-      const target = stationOriginKey(candidate);
-      const landed = accounts.find((item) => item.id !== pendingID
-        && stationOriginKey(item.origin) === target
-        && (result.username ? item.username === result.username : item.loginStatus === "signed_in"))
-        ?? accounts.find((item) => item.id === pendingID);
+      const landed = relayLoginLandedAccount(accounts, pendingID, candidate, result.username);
       const landedID = landed?.id ?? pendingID;
+      const landedStationID = landed?.stationID ?? "";
+      if (landedStationID && !knownStationIDs.has(landedStationID)) {
+        // The account row exists; its station may be the one this login just
+        // created.  Record it now so closing before 完成 can ask Core whether
+        // any provider ended up naming it.
+        pendingLoginStationIDs.current.add(landedStationID);
+      }
       // The sign-in is verified.  Leave the sign-in panel now: the key step can
       // show the account and a loading state while Core reads the station and,
       // when the prompt said so, stages the automatic grouping.  Keeping the
@@ -5763,9 +5889,31 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     } catch {
       if (request === setupLoginRequest.current) setLoginFeedbackMessage(translate("relay.operationFailed"));
     } finally {
-      if (request === setupLoginRequest.current) setLoginBusy(false);
+      if (request === setupLoginRequest.current) {
+        loginInFlight.current = false;
+        setLoginBusy(false);
+      }
     }
   };
+  useEffect(() => () => {
+    // Every dismissal path, including the title bar and the parent's 关闭,
+    // unmounts this window.  The browser flow is keyed by a request counter,
+    // so a late answer cannot repaint a window that is already gone.
+    if (loginInFlight.current) {
+      loginInFlight.current = false;
+      setupLoginRequest.current += 1;
+      native.cancelRelayLogin();
+    }
+    // A sign-in creates its station before this wizard creates the provider.
+    // Closing without 完成 must not leave that station behind; Core intersects
+    // these ids with its live reachability check, so a provider created by any
+    // other path keeps its station.
+    const pending = [...pendingLoginStationIDs.current];
+    pendingLoginStationIDs.current.clear();
+    if (pending.length > 0) {
+      void relay.commit("prune_orphans", { station_ids: pending }).catch(() => undefined);
+    }
+  }, [native, relay]);
   const refreshStationResources = async (): Promise<void> => {
     if (resourcesBusy || !selectedStationAccount) return;
     setResourcesBusy(true);
@@ -5779,9 +5927,29 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       setResourcesBusy(false);
     }
   };
+  useEffect(() => {
+    // Choosing another account is the one action that scopes the key list, so
+    // an account whose resources were never read is read here, once.  The
+    // guard is per account: a failed read is stated by the account itself and
+    // is not retried on every render; 刷新 stays the manual retry.
+    if (step !== "keys" || keyPath !== "login" || isOfficialLoginType) return;
+    if (!selectedStationAccount || selectedStationAccount.resourceStatus !== "idle") return;
+    if (loginBusy || resourcesBusy || autoGroupingBusy) return;
+    if (autoRefreshedAccountIDs.current.has(selectedStationAccount.id)) return;
+    autoRefreshedAccountIDs.current.add(selectedStationAccount.id);
+    setResourcesBusy(true);
+    void relay.refreshResources(selectedStationAccount.id)
+      .then(() => relay.refreshAccounts())
+      .catch(() => undefined)
+      .finally(() => setResourcesBusy(false));
+    // The selected account and its status are the trigger; the station bridge
+    // is stable for the lifetime of this window.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoGroupingBusy, isOfficialLoginType, keyPath, loginBusy, relay, resourcesBusy, selectedStationAccount, step]);
   const cancelRelaySignIn = (): void => {
     if (loginPhase !== "sign-in") return;
     setupLoginRequest.current += 1;
+    loginInFlight.current = false;
     setLoginPhase("idle");
     setLoginBusy(false);
     setLoginFeedbackMessage(undefined);
@@ -5808,12 +5976,19 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       }
       setProviderMode("existing");
       setProviderSelection(target);
+      officialProviderCreated.current = true;
+      focusProviderAfterWizard(target);
       setValidation("");
     }
     const kind: ServiceProviderKind = "openai_login";
     delete shownChallenge.current[target];
-    const next = await dispatchWithOutcome("service_provider.auth_start", { provider_id: target }, "providers_models");
-    presentAuthChallenge(next, kind, selectedProviderName || serviceProviderKindLabel(kind, translate), target);
+    officialLoginAttempted.current = true;
+    try {
+      const next = await dispatchWithOutcome("service_provider.auth_start", { provider_id: target }, "providers_models");
+      presentAuthChallenge(next, kind, selectedProviderName || serviceProviderKindLabel(kind, translate), target);
+    } catch (reason) {
+      setValidation(errorMessage(reason, translate));
+    }
   };
   const cancelOfficialLogin = async (): Promise<void> => {
     if (!providerID) return;
@@ -5853,6 +6028,14 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
    */
   const advanceFromProviderStep = (): void => {
     if (needsKeyStep) {
+      // A station is tied to a provider by its address, not by a type.  When
+      // the typed address is already a station, the credential that provider
+      // will use is that station's sign-in, so start on that path.  A custom
+      // API address keeps the manual key field; the person can switch paths
+      // either way once the step is on screen.
+      if (providerMode === "new" && providerType === "api" && !providerID && keyPath === "manual" && stationForProvider) {
+        setKeyPath("login");
+      }
       setStep("keys");
       stepRef.current = "keys";
       return;
@@ -5872,16 +6055,34 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     // action and the Return key equivalent, and the second delivery would
     // otherwise run against the stale `step` of the render that is already
     // gone — walking 供应商 → 密钥 → 模型 in one press and skipping 密钥 entirely.
-    if (processing || stepRef.current !== step) return;
-    // The guard's ref moves with the step this call is about to take.  A
-    // deferred branch still names its own value through `advanceStepToModel`,
-    // so both routes leave the ref equal to the step that will render.
     //
-    // It moves only once the step has actually been accepted: a value written
-    // here before validation meant a step that failed its own check left the
-    // ref pointing at the next one, so the *next* press — now against a valid
-    // form — was refused by the guard above and 下一步 stayed dead for the
-    // rest of the wizard.
+    // The synchronous ref is what catches the second delivery in the same
+    // tick: `setProcessing` has not painted yet when it arrives.
+    if (processing || advanceInFlight.current || stepRef.current !== step) return;
+    advanceInFlight.current = true;
+    try {
+      await advanceWizard();
+    } catch (reason) {
+      // Every step transition and every finish runs through here.  A dispatch
+      // that throws must land on the wizard's own status line; an unhandled
+      // rejection read as a press that did nothing.
+      setValidation(errorMessage(reason, translate));
+    } finally {
+      advanceInFlight.current = false;
+    }
+  };
+  /**
+   * The step transition itself, called only through the single-press guard.
+   *
+   * The guard's ref moves with the step this call is about to take.  A
+   * deferred branch still names its own value through `advanceStepToModel`,
+   * so both routes leave the ref equal to the step that will render.  It moves
+   * only once the step has actually been accepted: a value written before
+   * validation meant a step that failed its own check left the ref pointing at
+   * the next one, so the *next* press — now against a valid form — was refused
+   * by the guard above and 下一步 stayed dead for the rest of the wizard.
+   */
+  const advanceWizard = async (): Promise<void> => {
     setValidation("");
     if (step === "provider") {
       if (providerMode === "new") {
@@ -6022,6 +6223,15 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       // empty for no reason the wizard ever stated.  Nothing picked is still a
       // finished wizard — the provider pane offers 获取模型 on the account.
       if (selectedModels.length === 0) {
+        const wrote = officialProviderCreated.current
+          || (officialLoginAttempted.current && officialStatus === "signed_in");
+        if (!wrote) {
+          // An existing, already-signed-in provider has nothing to write with
+          // no model picked.  Close without claiming a save that did not
+          // happen; the footer's Close is the same outcome without the lie.
+          onClose();
+          return;
+        }
         onStatus(translate("providers.wizard.complete"));
         onClose();
         return;
@@ -6059,10 +6269,15 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       try {
         const picked = modelCandidates.filter((model) => selectedModels.includes(model));
         if (providerID) {
-          if (picked.length > 0) {
-            const next = await dispatchWithOutcome("model.import_service_catalog", { provider_id: providerID, models: picked });
-            if (!next) return;
+          if (picked.length === 0) {
+            // An existing service provider with no pick has nothing to import.
+            // Close without reporting a save; a newly committed provider below
+            // is a real write and keeps its completion.
+            onClose();
+            return;
           }
+          const next = await dispatchWithOutcome("model.import_service_catalog", { provider_id: providerID, models: picked });
+          if (!next) return;
         } else {
           if (picked.length === 0) {
             setValidation(translate("providers.wizard.selectAtLeastOneModel"));
@@ -6152,7 +6367,12 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
    * nothing to write without a model, and 关闭 is that answer.
    */
   const finishWithoutModels = async (): Promise<void> => {
-    if (processing || stepRef.current !== step) return;
+    // Like 仅保存供应商, this is a create.  An existing provider has nothing to
+    // write without a model, so the footer does not draw it and the function
+    // refuses a caller that reaches it anyway.
+    if (!creatingProvider) return;
+    if (processing || advanceInFlight.current || stepRef.current !== step) return;
+    advanceInFlight.current = true;
     setValidation("");
     setProcessing(true);
     try {
@@ -6163,12 +6383,68 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       if (usingProvidedKeyPath(keyPath) && selectedProvidedChoice && !await importProvidedKey(targetProviderID, selectedProvidedChoice)) return;
       onStatus(translate("providers.wizard.complete"));
       onClose();
+    } catch (reason) {
+      setValidation(errorMessage(reason, translate));
     } finally {
+      advanceInFlight.current = false;
+      setProcessing(false);
+    }
+  };
+  /**
+   * 完成 the provider with its signed-in station, without a key or a route.
+   *
+   * The provider is the row this wizard creates; a station is one of its
+   * credentials and never a row of its own.  So this finish creates the
+   * provider and binds the station it signed in to, then stops: it adopts no
+   * provided key and writes no model.  A provider with no key and no model is
+   * a valid row (the pane's own ＋ creates one), and the station stays visible
+   * only through that provider's 中转站关联 panel.  The key and the models can
+   * be added later from the provider.  This is not a "save station" action:
+   * if the station cannot be associated with the provider, nothing is saved.
+   */
+  const finishProviderOnly = async (): Promise<void> => {
+    // This action creates the provider.  An existing provider already has its
+    // row and its station association, so "save provider only" would save
+    // nothing and then close as if it had; the button is not offered there and
+    // this guard keeps every other path to it honest too.
+    if (!creatingProvider) return;
+    if (processing || advanceInFlight.current || stepRef.current !== step) return;
+    if (step !== "keys" || keyPath !== "login") return;
+    const station = stationForProvider
+      ?? relayStations.find((candidate) => candidate.id === (selectedProvidedChoice?.stationID ?? selectedStationAccount?.stationID ?? ""));
+    if (!station) {
+      setValidation(translate("providers.wizard.loginFirstHint"));
+      return;
+    }
+    advanceInFlight.current = true;
+    setValidation("");
+    setProcessing(true);
+    try {
+      const targetProviderID = providerID || await commitWizardProvider();
+      if (!targetProviderID) return;
+      // Bind the row even when the create already did: the station this step
+      // found may be the account's own station rather than one matched by the
+      // typed URL, and re-binding the same station is Core's no-op.  This
+      // finish is provider-first: the row is created here, then associated, so
+      // pressing it never saves a station on its own.
+      const bound = await dispatchWithOutcome("provider.select_relay_station", { provider_id: targetProviderID, station_id: station.id });
+      if (!bound) return;
+      focusProviderAfterWizard(targetProviderID);
+      onStatus(translate("providers.wizard.complete"));
+      onClose();
+    } catch (reason) {
+      // A create that fails has to say so on this window: the footer belongs
+      // to the pane behind it, and an unhandled rejection left 仅保存供应商
+      // looking like a press that did nothing.
+      setValidation(errorMessage(reason, translate));
+    } finally {
+      advanceInFlight.current = false;
       setProcessing(false);
     }
   };
   const goBack = (): void => {
     setValidation("");
+    setLoginFeedbackMessage(undefined);
     if (loginPhase === "sign-in") {
       cancelRelaySignIn();
       return;
@@ -6211,7 +6487,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         </View> : <>
         {step === "provider" ? <View style={styles.providerWizardFormSection}>
           <NativeFormRow label={translate("providers.wizard.providerType")}>
-            <NativePicker labels={servicePickerLabels} selectedValue={selectedServiceLabel} disabled={wizardBusy} accessibilityLabel={translate("providers.wizard.providerType")} onChange={({ nativeEvent }) => { const kinds: WizardType[] = ["api", "openai", "workbuddy", "workbuddyGlobal", "qoder", "qoderGlobal", "ourFreeModel", "ourFreeModelKilo"]; chooseProviderType(kinds[nativeEvent.index] ?? "api"); }} style={styles.providerWizardPicker} />
+            <NativePicker labels={servicePickerLabels} selectedValue={selectedServiceLabel} disabled={wizardBusy} accessibilityLabel={translate("providers.wizard.providerType")} onChange={({ nativeEvent }) => { chooseProviderType(servicePickerItems[nativeEvent.index]?.type ?? "api"); }} style={styles.providerWizardPicker} />
           </NativeFormRow>
           {providerMode === "new" && isOfficialLoginType ? <NativeFormRow label={translate("providers.wizard.authPath")}>
             <NativePicker labels={[translate("providers.wizard.pathWebLogin"), translate("providers.wizard.pathCustomKey")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathWebLogin") : translate("providers.wizard.pathCustomKey")} disabled={wizardBusy} accessibilityLabel={translate("providers.wizard.authPath")} onChange={({ nativeEvent }) => { chooseOfficialAuthPath(nativeEvent.index === 1 ? "manual" : "login"); }} style={styles.providerWizardPicker} />
@@ -6246,7 +6522,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
             </View>
           </> : <>
             {providerType === "api" ? <NativeFormRow label={translate("providers.wizard.keyPath")}>
-              <NativeSegmentedControl labels={[translate("providers.wizard.pathManual"), translate("providers.wizard.pathLogin")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathLogin") : translate("providers.wizard.pathManual")} disabled={wizardBusy} onChange={({ nativeEvent }) => { setKeyPath(nativeEvent.index === 1 ? "login" : "manual"); setValidation(""); }} style={styles.providerWizardModeControl} />
+              <NativeSegmentedControl labels={[translate("providers.wizard.pathManual"), translate("providers.wizard.pathLogin")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathLogin") : translate("providers.wizard.pathManual")} disabled={wizardBusy} onChange={({ nativeEvent }) => { setKeyPath(nativeEvent.index === 1 ? "login" : "manual"); setValidation(""); setLoginFeedbackMessage(undefined); }} style={styles.providerWizardModeControl} />
             </NativeFormRow> : null}
             {keyPath === "login" ? <View style={styles.providerWizardKeyPane}>
               <View style={styles.providerWizardKeySection}>
@@ -6309,13 +6585,13 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
             </View> : <>
               <NativeFormRow required label={translate("providers.wizard.selectApiKey")}><NativePicker labels={keyPickerLabels} selectedValue={selectedKeyPickerLabel} disabled={wizardBusy} accessibilityLabel={translate("providers.wizard.selectApiKey")} onChange={({ nativeEvent }) => { const option = keyOptions[nativeEvent.index]; if (!option) return; setKeySelection(option.value); resetStagedKeyField(); setKeyName(""); setValidation(""); }} style={styles.providerWizardPicker} /></NativeFormRow>
               {activeKeySelection === PROVIDER_WIZARD_NEW_KEY ? <>
-                <NativeFormRow required label={translate("providers.wizard.apiKeyName")}><NativeTextField value={keyName} placeholder={translate("providers.wizard.apiKeyNamePlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={setKeyName} accessibilityLabel={translate("providers.wizard.apiKeyName")} style={styles.providerWizardInput} /></NativeFormRow>
+                <NativeFormRow required label={translate("providers.wizard.apiKeyName")}><NativeTextField value={keyName} placeholder={translate("providers.wizard.apiKeyNamePlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={(value) => { setKeyName(value); setValidation(""); }} accessibilityLabel={translate("providers.wizard.apiKeyName")} style={styles.providerWizardInput} /></NativeFormRow>
                 {creatingProvider ? (keyReady
                   ? <Text style={styles.providerWizardHint}>{finishedProviderKeyName}</Text>
                   : <NativeFormRow required label={translate("providers.wizard.apiKeyValue")}><NativeSecureTextInput label={translate("providers.wizard.apiKeyValue")} domain="providers_models" field="api_key" target={stagedKeyTarget} plainText autoCommit disabled={wizardBusy} commitRequest={keyCommitToken} onSecretState={handleKeyFieldState} style={styles.providerWizardSecretInput} /></NativeFormRow>) : null}
               </>
                 : selectedKeyChoice?.kind === "independent" ? <>
-                    <NativeFormRow required label={translate("providers.wizard.apiKeyName")}><NativeTextField value={keyName} placeholder={translate("providers.wizard.apiKeyNamePlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={setKeyName} accessibilityLabel={translate("providers.wizard.apiKeyName")} style={styles.providerWizardInput} /></NativeFormRow>
+                    <NativeFormRow required label={translate("providers.wizard.apiKeyName")}><NativeTextField value={keyName} placeholder={translate("providers.wizard.apiKeyNamePlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={(value) => { setKeyName(value); setValidation(""); }} accessibilityLabel={translate("providers.wizard.apiKeyName")} style={styles.providerWizardInput} /></NativeFormRow>
                     {selectedKeyReady ? <Text style={styles.providerWizardHint}>{selectedKeyChoice.name}</Text>
                       : <NativeFormRow required label={translate("providers.wizard.apiKeyValue")}><NativeSecureTextInput label={translate("providers.wizard.apiKeyValue")} domain="providers_models" field="api_key" target={`${providerID}\u001f${selectedKeyChoice.name}`} plainText autoCommit disabled={wizardBusy} commitRequest={keyCommitToken} onSecretState={handleKeyFieldState} style={styles.providerWizardSecretInput} /></NativeFormRow>}
                   </> : <Text style={styles.providerWizardHint}>{translate("providers.wizard.selectApiKey")}</Text>}
@@ -6334,13 +6610,13 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
             <Text style={styles.providerWizardHint}>{translate("providers.wizard.officialModelsHint")}</Text>
             <View style={styles.providerWizardModelToolbar}>
               {modelFetchState === "loading" ? <NativeBusySpinner label={translate("providers.wizard.fetchingModels")} /> : <>
-                {fetchedModelCandidates.length > 0 ? <NativeButton title={translate(selectedModels.length === fetchedModelCandidates.length ? "dataManagement.deselectAll" : "dataManagement.selectAll")} compact link disabled={wizardBusy} onPress={() => { setSelectedModels(selectedModels.length === fetchedModelCandidates.length ? [] : [...fetchedModelCandidates]); setValidation(""); }} /> : null}
+                {fetchedModelCandidates.length > 0 ? <NativeButton title={translate(selectedModels.length === fetchedModelCandidates.length ? "dataManagement.deselectAll" : "dataManagement.selectAll")} compact link disabled={wizardBusy} onPress={() => toggleAllModels(fetchedModelCandidates)} /> : null}
                 <NativeButton title={translate("providers.wizard.refreshModels")} compact link disabled={wizardBusy} onPress={() => { void fetchOfficialAccountModels(); }} />
               </>}
             </View>
           </View>
           <View style={styles.providerWizardModelListFrame}><PersistentScrollView style={styles.providerWizardModelListScroll} contentContainerStyle={styles.providerWizardModelList} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">
-            {fetchedModelCandidates.map((name) => <NativeCheckbox key={`official:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
+            {fetchedModelCandidates.map((name) => <NativeCheckbox key={`official:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => setModelChecked(name, checked)} style={styles.providerWizardModelCheckbox} />)}
             {modelFetchState === "empty" ? <Text style={styles.providerWizardHint}>{translate("providers.fetchEmpty")}</Text> : null}
             {modelFetchState === "unavailable" ? <Text style={styles.providerWizardHint}>{validation || translate("providers.wizard.loginFirstHint")}</Text> : null}
           </PersistentScrollView></View>
@@ -6381,8 +6657,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
             <View style={styles.providerWizardModelToolbar}>
               {modelFetchState === "loading" ? <NativeBusySpinner label={translate("providers.wizard.fetchingModels")} /> : <>
                 {modelCandidates.length > 0 ? <>
-                  <NativeButton title={translate(selectedModels.length === modelCandidates.length ? "dataManagement.deselectAll" : "dataManagement.selectAll")} compact link disabled={wizardBusy} onPress={() => { setSelectedModels(selectedModels.length === modelCandidates.length ? [] : [...modelCandidates]); setValidation(""); }} />
-                  <NativeButton title={translate("modelChooser.invert")} compact link disabled={wizardBusy} onPress={() => { setSelectedModels((current) => modelCandidates.filter((name) => !current.includes(name))); setValidation(""); }} />
+                  <NativeButton title={translate(selectedModels.length === modelCandidates.length ? "dataManagement.deselectAll" : "dataManagement.selectAll")} compact link disabled={wizardBusy} onPress={() => toggleAllModels(modelCandidates)} />
+                  <NativeButton title={translate("modelChooser.invert")} compact link disabled={wizardBusy} onPress={invertModels} />
                 </> : null}
                 <NativeButton title={translate("providers.wizard.refreshModels")} compact link disabled={wizardBusy} onPress={() => { void fetchServiceCatalogModels(); }} />
               </>}
@@ -6421,19 +6697,19 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                         if (routeNames.length === 0) return null;
                         return <View key={`lane-channel:${channel}:route:${route}`} style={styles.providerWizardModelSourceGroup}>
                           <Text numberOfLines={1} style={styles.providerWizardHint}>{translate(route === LANE_ROUTE_REGION ? "providers.laneRoute.region" : "providers.laneRoute.main")} ({routeNames.length})</Text>
-                          {routeNames.map((name) => <NativeCheckbox key={`lane:${name}`} label={fetchedModelLabels[name] ?? name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
+                          {routeNames.map((name) => <NativeCheckbox key={`lane:${name}`} label={fetchedModelLabels[name] ?? name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => setModelChecked(name, checked)} style={styles.providerWizardModelCheckbox} />)}
                         </View>;
-                      }) : names.map((name) => <NativeCheckbox key={`lane:${name}`} label={fetchedModelLabels[name] ?? name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
+                      }) : names.map((name) => <NativeCheckbox key={`lane:${name}`} label={fetchedModelLabels[name] ?? name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => setModelChecked(name, checked)} style={styles.providerWizardModelCheckbox} />)}
                       {/* A producer whose rows the availability split did not
                           mention is still a producer: its rows are listed under
                           it rather than dropped from the picker. */}
-                      {names.filter((name) => !routes.some((route) => (laneRoutes[route] ?? []).includes(name))).map((name) => <NativeCheckbox key={`lane:${name}`} label={fetchedModelLabels[name] ?? name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
+                      {names.filter((name) => !routes.some((route) => (laneRoutes[route] ?? []).includes(name))).map((name) => <NativeCheckbox key={`lane:${name}`} label={fetchedModelLabels[name] ?? name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => setModelChecked(name, checked)} style={styles.providerWizardModelCheckbox} />)}
                     </View>;
                   })}
                   {/* A roster the upstream stated no producer for is still a
                       roster: it is listed whole rather than hidden. */}
-                  {modelCandidates.every((name) => !(name in laneChannels)) ? modelCandidates.map((name) => <NativeCheckbox key={`lane:${name}`} label={fetchedModelLabels[name] ?? name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />) : null}
-                </> : modelCandidates.map((name) => <NativeCheckbox key={`catalog:${name}`} label={fetchedModelLabels[name] ?? name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
+                  {modelCandidates.every((name) => !(name in laneChannels)) ? modelCandidates.map((name) => <NativeCheckbox key={`lane:${name}`} label={fetchedModelLabels[name] ?? name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => setModelChecked(name, checked)} style={styles.providerWizardModelCheckbox} />) : null}
+                </> : modelCandidates.map((name) => <NativeCheckbox key={`catalog:${name}`} label={fetchedModelLabels[name] ?? name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => setModelChecked(name, checked)} style={styles.providerWizardModelCheckbox} />)}
                 {modelFetchState === "empty" ? <Text style={styles.providerWizardHint}>{translate("providers.fetchEmpty")}</Text> : null}
                 {modelFetchState === "unavailable" && serviceCatalogAccountSignedIn ? <Text style={styles.providerWizardHint}>{modelFetchDetail || translate("providers.fetchEmpty")}</Text> : null}
               </PersistentScrollView></View>
@@ -6454,7 +6730,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
             {modelCandidates.length > 0 ? <View style={styles.providerWizardModelGroup}>
               <View style={styles.providerWizardModelGroupHeader}><Text style={styles.providerWizardPanelTitle}>{translate(usingProvidedKeyPath(keyPath) ? "providers.wizard.providedModels" : "providers.wizard.discoveredModels")}</Text></View>
               <View style={styles.providerWizardModelListFrame}><PersistentScrollView style={styles.providerWizardModelListScroll} contentContainerStyle={styles.providerWizardModelList} showsVerticalScrollIndicator keyboardShouldPersistTaps="handled">
-                {modelCandidates.map((name) => <NativeCheckbox key={`discovered:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => { setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation(""); }} style={styles.providerWizardModelCheckbox} />)}
+                {modelCandidates.map((name) => <NativeCheckbox key={`discovered:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => setModelChecked(name, checked)} style={styles.providerWizardModelCheckbox} />)}
               </PersistentScrollView></View>
             </View> : null}
             {!usingProvidedKeyPath(keyPath) ? <View style={styles.providerWizardModelGroup}>
@@ -6464,8 +6740,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                 <Text numberOfLines={1} style={styles.providerWizardManualModelUpstream}>{model.upstream_model}</Text>
                 <NativeButton title={translate("providers.wizard.removeManualModel")} compact link disabled={wizardBusy} onPress={() => removeManualModel(model.id)} />
               </View>)}
-              <NativeFormRow label={translate("providers.wizard.modelName")}><NativeTextField value={modelName} placeholder={translate("providers.wizard.modelNamePlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={setModelName} accessibilityLabel={translate("providers.wizard.modelName")} style={styles.providerWizardInput} /></NativeFormRow>
-              <NativeFormRow label={translate("providers.wizard.upstreamModel")}><NativeTextField value={upstreamModel} placeholder={translate("providers.wizard.upstreamModelPlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={setUpstreamModel} accessibilityLabel={translate("providers.wizard.upstreamModel")} style={styles.providerWizardInput} /></NativeFormRow>
+              <NativeFormRow label={translate("providers.wizard.modelName")}><NativeTextField value={modelName} placeholder={translate("providers.wizard.modelNamePlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={(value) => { setModelName(value); setValidation(""); }} accessibilityLabel={translate("providers.wizard.modelName")} style={styles.providerWizardInput} /></NativeFormRow>
+              <NativeFormRow label={translate("providers.wizard.upstreamModel")}><NativeTextField value={upstreamModel} placeholder={translate("providers.wizard.upstreamModelPlaceholder")} editable={!wizardBusy} autoCapitalize="none" autoCorrect={false} onChangeText={(value) => { setUpstreamModel(value); setValidation(""); }} accessibilityLabel={translate("providers.wizard.upstreamModel")} style={styles.providerWizardInput} /></NativeFormRow>
               <NativeButton title={translate("providers.wizard.addManualModel")} compact link disabled={wizardBusy} onPress={addManualModel} />
             </View> : null}
           </View>
@@ -6483,6 +6759,10 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         {step !== "provider" || loginPhase === "sign-in" ? <NativeButton title={translate("providers.wizard.back")} disabled={busy || processing} onPress={goBack} /> : null}
         {step === "model" && creatingProvider && genericModelStep
           ? <NativeButton title={translate("providers.wizard.finishWithoutModels")} disabled={wizardBusy && !processing} onPress={() => { void finishWithoutModels(); }} />
+          : null}
+        {step === "keys" && creatingProvider && !isOfficialLoginType && keyPath === "login" && loginPhase !== "sign-in"
+          && (stationForProvider || selectedProvidedChoice || selectedStationAccount)
+          ? <NativeButton title={translate("providers.wizard.saveProviderOnly")} toolTip={translate("providers.wizard.saveProviderOnlyHint")} busy={processing} disabled={wizardBusy && !processing} onPress={() => { void finishProviderOnly(); }} />
           : null}
         {loginPhase === "sign-in"
           ? null
@@ -7023,6 +7303,21 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     pendingProviderIds.current = undefined;
     setSelectedProvider(editorIdentifier(added));
   }, [providers]);
+  // A provider created by the wizard is the one the pane should open.  The
+  // wizard is its own React root on the native hosts, so it leaves the row in
+  // the shared gate; the pane consumes it as soon as the snapshot carries it.
+  const [providerFocusRevision, setProviderFocusRevision] = useState(0);
+  useEffect(() => subscribeProviderWizard(() => setProviderFocusRevision((value) => value + 1)), []);
+  const appliedProviderFocus = useRef("");
+  useEffect(() => {
+    const focusID = providerWizardFocusID();
+    if (!focusID || appliedProviderFocus.current === focusID) return;
+    if (!providers.some((item) => editorIdentifier(item) === focusID)) return;
+    appliedProviderFocus.current = focusID;
+    setSelectedProvider(focusID);
+    setSelectedModel(undefined);
+    setProviderSourceModel(undefined);
+  }, [providerFocusRevision, providers]);
   useEffect(() => {
     if (!fetchKeyChoices.some((choice) => choice.id === fetchKeyID)) chooseFetchKey(preferredFetchKeyID);
   }, [fetchKeyChoices, fetchKeyID, preferredFetchKeyID, providerId]);
@@ -9692,7 +9987,7 @@ function ProviderIdentityFields({ provider, providerID, relayStations, station, 
       />
       <View style={styles.officialStatusRow}>
         <Text style={styles.providerAuthStatusLabel}>{translate("providers.providerType")}</Text>
-        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{translate("providers.type.relay")}</Text>
+        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{translate("providers.type.apiProvider")}</Text>
       </View>
       <TextField
         key={`provider-base-url:${station.id}:${sourceResetToken}`}
@@ -9717,7 +10012,7 @@ function ProviderIdentityFields({ provider, providerID, relayStations, station, 
             addressed by nothing any more: editing its address is what makes it
             a plain custom provider again (``commitBaseURL`` does exactly that),
             so that is the type it states. */}
-        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{translate("providers.type.apiKey")}</Text>
+        <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{translate("providers.type.apiProvider")}</Text>
       </View>
       <TextField
         key={`provider-base-url:${sourceResetToken}`}
@@ -10141,10 +10436,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
       const next = await relay.refreshAccounts();
       const accounts = accountsFromSnapshot(next ?? undefined);
       const targetOrigin = stationOriginKey(origin);
-      const landed = accounts.find((item) => item.id !== pendingID
-        && stationOriginKey(item.origin) === targetOrigin
-        && (result.username ? item.username === result.username : item.loginStatus === "signed_in"))
-        ?? accounts.find((item) => item.id === pendingID);
+      const landed = relayLoginLandedAccount(accounts, pendingID, origin, result.username);
       // Resource discovery is reported, not assumed: the sign-in succeeded
       // either way, but a station whose keys could not be read says so instead
       // of claiming 登录成功 over an empty key list.  An empty key list is not

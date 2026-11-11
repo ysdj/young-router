@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { normalizeRelayOrigin, suggestedProviderName, suggestedRelayStationName } from "../rn/packages/shared/src/ui/relayOrigin.ts";
+import { normalizeRelayOrigin, relayLoginLandedAccount, stationOriginKey, suggestedProviderName, suggestedRelayStationName } from "../rn/packages/shared/src/ui/relayOrigin.ts";
 
 assert.equal(normalizeRelayOrigin("aaa.com/"), "https://aaa.com");
 assert.equal(normalizeRelayOrigin("https://x.bbb.com/login"), "https://x.bbb.com");
@@ -26,4 +26,22 @@ assert.equal(suggestedProviderName("https://api.example.co.uk/login"), "example"
 assert.equal(suggestedProviderName("http://localhost:4000"), "");
 assert.equal(suggestedProviderName("http://127.0.0.1:4000"), "");
 
-console.log("RN relay origin regression tests OK (normalization, station-name and provider-name suggestion)");
+// A station is one site whatever the spelling of its base URL: the host is
+// case-insensitive, a default port is not part of the identity, and the
+// dashboard/API leaf is trimmed.  A deployment base path stays.
+assert.equal(stationOriginKey("HTTPS://WWW.Example.test:443/v1/"), "https://www.example.test");
+assert.equal(stationOriginKey("https://example.test:8443/relay/"), "https://example.test:8443/relay");
+
+// A sign-in asks with a pending id; the answer names the row the station
+// actually proved.  Reading only the pending id turns a successful re-login
+// into a failed resource read.
+const landed = [
+  { id: "pending-login", origin: "https://relay.example.test", username: "", loginStatus: "signed_out" },
+  { id: "kept", origin: "https://relay.example.test", username: "person@example.test", loginStatus: "signed_in" },
+];
+assert.equal(relayLoginLandedAccount(landed, "pending-login", "https://relay.example.test/v1", "person@example.test")?.id, "kept");
+assert.equal(relayLoginLandedAccount(landed, "pending-login", "https://relay.example.test", "")?.id, "kept");
+assert.equal(relayLoginLandedAccount(landed, "pending-login", "https://relay.example.test", "other@example.test")?.id, "pending-login");
+assert.equal(relayLoginLandedAccount(landed, "pending-login", "https://other.example.test", "person@example.test")?.id, "pending-login");
+
+console.log("RN relay origin regression tests OK (normalization, station identity, sign-in landing, station-name and provider-name suggestion)");

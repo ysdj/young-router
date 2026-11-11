@@ -1360,7 +1360,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         """
 
         wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
-        self.assertIn("const landed = accounts.find((item) => item.id !== pendingID", wizard)
+        self.assertIn("const landed = relayLoginLandedAccount(accounts, pendingID, candidate, result.username);", wizard)
         self.assertIn("const landedID = landed?.id ?? pendingID;", wizard)
         self.assertIn("await relay.refreshResources(landedID, { force: true })", wizard)
         self.assertIn("setSignedInAccountID(landedID);", wizard)
@@ -1443,6 +1443,261 @@ class ReactNativeUiParityTests(unittest.TestCase):
         en = (ROOT / "rn/packages/shared/src/i18n/en.ts").read_text(encoding="utf-8")
         self.assertIn('"relay.loginAnotherAccount": "登录新账号",', zh)
         self.assertIn('"relay.loginAnotherAccount": "Sign In Another Account",', en)
+
+    def test_the_wizard_can_finish_a_provider_without_a_key_or_model(self) -> None:
+        """The provider is the row; its station is an association of that row.
+
+        The key step required one provided key before 下一步, and the only
+        finish without models still imported that key.  A station has no key
+        of its own to import: its accounts and keys are the station's, and the
+        provider row that owns the association is what 完成 creates.  Saving
+        the provider without a key or model must still bind the station, and
+        must never present the station as the thing being saved.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        self.assert_ui_has('const finishProviderOnly = async (): Promise<void> => {')
+        provider_only = wizard.split("const finishProviderOnly = async (): Promise<void> => {", 1)[1].split("const goBack", 1)[0]
+        self.assertIn("const targetProviderID = providerID || await commitWizardProvider();", provider_only)
+        self.assertNotIn("importProvidedKey", provider_only)
+        self.assertNotIn("model.add_many", provider_only)
+        self.assertIn('const bound = await dispatchWithOutcome("provider.select_relay_station", { provider_id: targetProviderID, station_id: station.id });', provider_only)
+        self.assertIn('if (!bound) return;', provider_only)
+        self.assertIn('focusProviderAfterWizard(targetProviderID);', provider_only)
+        self.assertIn('setValidation(errorMessage(reason, translate));', provider_only)
+        # The pane behind the wizard opens the row that was just created,
+        # instead of leaving the user on the provider that was selected before.
+        # The wizard is its own React root on the native hosts, so the row
+        # travels through the shared gate rather than a parent callback.
+        self.assert_ui_has('focusProviderAfterWizard(createdID);')
+        self.assert_ui_has('const focusID = providerWizardFocusID();')
+        self.assert_ui_has('if (!providers.some((item) => editorIdentifier(item) === focusID)) return;')
+        self.assert_ui_has('const appliedProviderFocus = useRef("");')
+        self.assert_ui_has('if (!focusID || appliedProviderFocus.current === focusID) return;')
+        self.assert_ui_has('setSelectedProvider(focusID);')
+        gate = (ROOT / "rn/packages/shared/src/ui/providerWizardGate.ts").read_text(encoding="utf-8")
+        self.assertIn("let pendingProviderFocusID = \"\";", gate)
+        self.assertIn("export function focusProviderAfterWizard(providerID: string): void {", gate)
+        self.assertIn("export function providerWizardFocusID(): string {", gate)
+        # It is offered only at the step that has a station to associate, and
+        # only while no sign-in or read is holding the window.
+        self.assert_ui_has('step === "keys" && creatingProvider && !isOfficialLoginType && keyPath === "login" && loginPhase !== "sign-in"')
+        self.assert_ui_has('stationForProvider || selectedProvidedChoice || selectedStationAccount')
+        self.assert_ui_has('title={translate("providers.wizard.saveProviderOnly")}')
+        zh = (ROOT / "rn/packages/shared/src/i18n/zh-Hans.ts").read_text(encoding="utf-8")
+        en = (ROOT / "rn/packages/shared/src/i18n/en.ts").read_text(encoding="utf-8")
+        self.assertIn('"providers.wizard.saveProviderOnly": "仅保存供应商"', zh)
+        self.assertIn('"providers.wizard.saveProviderOnly": "Save Provider Only"', en)
+        self.assertIn("中转站不会单独成行", zh)
+        self.assertIn("station is never a row of its own", en)
+
+    def test_save_provider_only_is_not_offered_for_an_existing_provider(self) -> None:
+        """The action saves a new provider; an existing one saves nothing.
+
+        Choosing 选择供应商 edits a row that already exists, so a footer action
+        that creates a provider would close the window after writing nothing.
+        Both create-only finishes therefore read the same predicate, and the
+        save-provider action itself refuses the call rather than trusting the
+        footer to be the only caller.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        provider_only = wizard.split("const finishProviderOnly = async (): Promise<void> => {", 1)[1].split("const goBack", 1)[0]
+        self.assertIn("const creatingProvider = providerMode === \"new\" && !providerID;", wizard)
+        self.assertIn("if (!creatingProvider) return;", provider_only)
+        finish_without = wizard.split("const finishWithoutModels = async (): Promise<void> => {", 1)[1].split("const finishProviderOnly", 1)[0]
+        self.assertIn("if (!creatingProvider) return;", finish_without)
+        self.assert_ui_has('step === "keys" && creatingProvider && !isOfficialLoginType && keyPath === "login" && loginPhase !== "sign-in"')
+        # The other create-only finish already had the same guard; the two
+        # must not drift apart again.
+        self.assert_ui_has('step === "model" && creatingProvider && genericModelStep')
+
+    def test_the_wizard_has_no_relay_station_type(self) -> None:
+        """A station is an association of an API provider, not a sibling type.
+
+        The picker used to offer 中转站 beside API 供应商.  A station has no
+        provider contract of its own: the provider is the row, and the station
+        is reached through the provider's address and 网页登录获取.  Removing
+        the sibling type is what keeps the two from being saved independently.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        self.assertIn('type WizardType = "api" | "openai"', wizard)
+        self.assertNotIn('| "relay"', wizard)
+        self.assertNotIn('{ type: "relay"', self.ui)
+        self.assertNotIn("providers.wizard.typeRelay", self.zh)
+        self.assertNotIn("providers.wizard.typeRelay", self.en)
+        # A known station is recognised by the provider's address, and that is
+        # the only thing that switches a new provider onto the station login
+        # path.  It is not a type the user picks.
+        self.assert_ui_has('if (providerMode === "new" && providerType === "api" && !providerID && keyPath === "manual" && stationForProvider) {')
+        self.assert_ui_has('const stationForProvider = useMemo(')
+        # 选择供应商 resolves the picker option back to the provider record:
+        # reading the option object as a provider gave every existing row the
+        # default api_key kind, so the step always opened on 手动选择.
+        self.assert_ui_has('const firstProvider = providers.find((entry) => editorIdentifier(entry) === first?.value);')
+        self.assert_ui_has('existingKeyPath(firstProvider)')
+        self.assert_ui_has('setKeyPath(existingKeyPath(existing));')
+
+    def test_the_wizard_retargets_detection_and_model_state_with_the_address(self) -> None:
+        """A value probed for one address must not answer for the next one.
+
+        The live relay-family probe, the catalog rows it produced, and the
+        picks made from them all belong to one provider address and account.
+        Changing either leaves the old state on screen unless the step keys
+        each answer by its own origin/account and clears the rest.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        self.assertIn('useState<{ origin: string; state: "checking" | RelayType | "unknown" } | undefined>(undefined)', wizard)
+        self.assertIn("setTypeDetection({ origin: candidate, state: detected ?? \"unknown\" });", wizard)
+        self.assertIn("if (typeDetection?.origin === probeOrigin", wizard)
+        self.assertIn("return typeDetection.state;", wizard)
+        # A type switch is a new model step, not the previous one with a new
+        # type label: its catalog, manual rows, and any fetch still arriving
+        # must not cross over.
+        type_block = wizard.split("const chooseProviderType = (value: WizardType): void => {", 1)[1].split("useEffect(() => {", 1)[0]
+        for marker in (
+            "modelFetchRequest.current += 1;",
+            "modelFetchInFlight.current = false;",
+            "setFetchedModelCandidates([]);",
+            "setFetchedModelCapabilities({});",
+            "setLaneRoutes({});",
+            "setLaneChannels({});",
+            "setManualModels([]);",
+            "setSelectedManualModelIDs([]);",
+        ):
+            self.assertIn(marker, type_block)
+        model_reset = wizard.split("// Everything the model step built belongs to this key selection", 1)[1].split("}, [activeKeySelection", 1)[0]
+        self.assertIn("}, [activeKeySelection, keyPath, providedKeySelection, providerID, selectedStationAccountID]);", wizard)
+        for marker in (
+            "modelFetchRequest.current += 1;",
+            "modelFetchInFlight.current = false;",
+            "setFetchedModelCandidates([]);",
+            "setLaneRoutes({});",
+            "setSelectedModels([]);",
+            "setManualModels([]);",
+            "setModelFetchState(\"idle\");",
+        ):
+            self.assertIn(marker, model_reset)
+
+    def test_editing_a_wizard_field_clears_its_previous_validation(self) -> None:
+        """The error belongs to the value that failed, not to the field forever.
+
+        A required-field or duplicate-name message used to stay on screen while
+        the person typed the correction, and a successful sign-in's message
+        followed the wizard back to the provider step.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        for name in ("updateProviderBaseURL", "updateProviderName"):
+            block = wizard.split(f"const {name} = ", 1)[1].split("};", 1)[0]
+            self.assertIn('setValidation("");', block)
+        self.assertIn('onChangeText={(value) => { setKeyName(value); setValidation(""); }}', wizard)
+        self.assertIn('onChangeText={(value) => { setModelName(value); setValidation(""); }}', wizard)
+        self.assertIn('onChangeText={(value) => { setUpstreamModel(value); setValidation(""); }}', wizard)
+        go_back = wizard.split("const goBack = (): void => {", 1)[1].split("};", 1)[0]
+        self.assertIn("setLoginFeedbackMessage(undefined);", go_back)
+        self.assertIn("setLoginFeedbackMessage(undefined);", wizard.split("const chooseProviderType = ", 1)[1].split("};", 1)[0])
+        self.assertIn("setLoginFeedbackMessage(undefined);", wizard.split("const chooseExistingProvider = ", 1)[1].split("};", 1)[0])
+
+    def test_a_failed_wizard_finish_reports_on_the_wizard(self) -> None:
+        """A dispatch that throws is still a press the person has to see fail.
+
+        下一步 and both create-only finishes used to unwind through `finally`
+        alone.  An exception left the footer saying 就绪/previous status while
+        nothing was written, indistinguishable from a press that did nothing.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        go_next = wizard.split("const goNext = async (): Promise<void> => {", 1)[1].split("const advanceWizard", 1)[0]
+        self.assertIn("catch (reason) {", go_next)
+        self.assertIn("setValidation(errorMessage(reason, translate));", go_next)
+        finish_without = wizard.split("const finishWithoutModels = async (): Promise<void> => {", 1)[1].split("const finishProviderOnly", 1)[0]
+        self.assertIn("catch (reason) {", finish_without)
+        self.assertIn("setValidation(errorMessage(reason, translate));", finish_without)
+        provider_only = wizard.split("const finishProviderOnly = async (): Promise<void> => {", 1)[1].split("const goBack", 1)[0]
+        self.assertIn("setValidation(errorMessage(reason, translate));", provider_only)
+        official = wizard.split("const startOfficialLogin = async (): Promise<void> => {", 1)[1].split("const cancelOfficialLogin", 1)[0]
+        self.assertIn("catch (reason) {", official)
+        self.assertIn("setValidation(errorMessage(reason, translate));", official)
+
+    def test_an_existing_provider_does_not_report_a_model_save_it_did_not_write(self) -> None:
+        """零个模型 for an existing row is a close, not 配置已保存.
+
+        A catalog or official account already had its row before the wizard
+        opened.  Finishing with no pick writes nothing there, so the window
+        closes through the same path as 关闭 instead of claiming a save.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        service = wizard.split("if (isServiceCatalogType) {", 1)[1].split("const draftModelName", 1)[0]
+        self.assertIn("if (picked.length === 0) {", service)
+        self.assertIn("onClose();", service)
+        official = wizard.split("if (isOfficialLoginType && keyPath === \"login\") {", 1)[1].split("// A keyless service", 1)[0]
+        self.assertIn("const wrote = officialProviderCreated.current", official)
+        self.assertIn('|| (officialLoginAttempted.current && officialStatus === "signed_in");', official)
+        self.assertIn("if (!wrote) {", official)
+
+    def test_a_dismissed_wizard_prunes_the_station_its_login_created(self) -> None:
+        """Signing in is not the same as finishing the provider.
+
+        A login stores its station before the wizard creates the provider row.
+        Closing the window at that point used to leave a station and its
+        account with no provider anywhere naming them.  The wizard records the
+        newly created station id and hands it to Core's reachability check on
+        unmount; Core removes only what no provider reaches.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        self.assertIn("const pendingLoginStationIDs = useRef(new Set<string>());", wizard)
+        self.assertIn("const knownStationIDs = new Set([", wizard)
+        self.assertIn("if (landedStationID && !knownStationIDs.has(landedStationID)) {", wizard)
+        self.assertIn("pendingLoginStationIDs.current.add(landedStationID);", wizard)
+        self.assertIn("relay.commit(\"prune_orphans\", { station_ids: pending })", wizard)
+        # The startup repair is the same reachability rule, in Core.
+        service = (ROOT / "young_router/core/service.py").read_text(encoding="utf-8")
+        self.assertIn("def prune_orphan_relay_stations(", service)
+        self.assertIn("if station_ids is None:", service)
+        self.assertIn("candidates -= reached", service)
+        self.assertIn('"type": "station_remove"', service)
+        self.assertIn("store.prune_orphan_relay_stations()", service)
+
+    def test_the_keys_step_reads_a_chosen_accounts_resources_once(self) -> None:
+        """A second signed-in account starts with an empty key list.
+
+        Switching accounts must not leave the first account's keys on screen
+        behind a 刷新 button; the chosen account's own resources are read once,
+        and a failed read is stated by the account instead of retried forever.
+        """
+
+        self.assert_ui_has("const autoRefreshedAccountIDs = useRef(new Set<string>());")
+        self.assert_ui_has('if (autoRefreshedAccountIDs.current.has(selectedStationAccount.id)) return;')
+        self.assert_ui_has('autoRefreshedAccountIDs.current.add(selectedStationAccount.id);')
+        self.assert_ui_has("void relay.refreshResources(selectedStationAccount.id)")
+
+    def test_closing_the_wizard_cancels_its_sign_in_browser(self) -> None:
+        """The wizard owns the native sign-in window it opened.
+
+        A dismissed wizard used to leave that browser running with nothing
+        left to accept its answer; the one surface that can cancel it is the
+        window that started it.
+        """
+
+        self.assert_ui_has("const loginInFlight = useRef(false);")
+        self.assert_ui_has("loginInFlight.current = true;")
+        self.assert_ui_has("if (loginInFlight.current) {")
+        self.assert_ui_has("setupLoginRequest.current += 1;")
+        self.assert_ui_has("native.cancelRelayLogin();")
+        self.assert_ui_has("relay.commit(\"prune_orphans\", { station_ids: pending })")
+
+    def test_the_model_rosters_share_one_checkbox_rule(self) -> None:
+        """Every roster toggles a pick the same way, so the lists cannot drift."""
+
+        self.assert_ui_has("const setModelChecked = (name: string, checked: boolean): void => {")
+        self.assert_ui_has("onValueChange={(checked) => setModelChecked(name, checked)}")
+        self.assert_ui_has("const toggleAllModels = (names: readonly string[]): void => {")
+        self.assertNotIn('setSelectedModels((current) => checked ? (current.includes(name) ? current : [...current, name]) : current.filter((item) => item !== name)); setValidation("");', self.ui)
 
     def test_the_station_picture_keeps_its_own_shape_inside_the_dialog(self) -> None:
         """A 560x820 display drawn at 100% of a wide card overflows the window.
@@ -1713,7 +1968,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "if (loginBusy) return;",
             # The wizard's own 下一步 guard also blocks the second delivery of one
             # press, because the button is the window's default button.
-            "if (processing || stepRef.current !== step) return;",
+            "if (processing || advanceInFlight.current || stepRef.current !== step) return;",
             # The model listing's guard is a ref rather than the render's
             # `modelFetchState`, because a caller that just set that state
             # would read a stale closure and re-enter.
@@ -4504,7 +4759,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         platform_entry = (ROOT / "rn/packages/shared/src/platformEntry.ts").read_text(encoding="utf-8")
         self.assertIn("latestSnapshot(): CoreSnapshot | undefined;", (ROOT / "rn/packages/shared/src/types.ts").read_text(encoding="utf-8"))
         self.assertIn("let initialSnapshotRequest: Promise<CoreSnapshot> | undefined;", ipc)
-        self.assertIn('if (latestSnapshot) return call("snapshot", {})', ipc)
+        self.assertIn('if (latestSnapshot) return readSnapshot();', ipc)
+        self.assertIn('if (reason instanceof IpcProtocolError && reason.code === "invalid_response") return fetchSnapshot();', ipc)
+        self.assertIn('const refreshed = await refresh().catch(() => latestSnapshot.current ?? snapshot);', self.ui)
         self.assertIn("if (!initialSnapshotRequest)", ipc)
         self.assertIn("rememberSnapshot(event.snapshot);", ipc)
         self.assertIn("const snapshotListeners = new Set<(event: IpcEvent) => void>();", ipc)
@@ -5502,14 +5759,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("providers.switchTypeTitle", self.zh)
         self.assertNotIn("providers.switchTypeTitle", self.en)
         # Each kind states its own type: a service provider names its service,
-        # a relay-bound provider names the station that addresses it, and a
-        # custom provider is a key provider.  A type label is longer than its
-        # column, so the value carries the whole name as its hover hint rather
-        # than losing the tail to the ellipsis.
+        # a relay-bound provider is still an API provider (the station is its
+        # association, not its type), and a custom provider is a key provider.
+        # A type label is longer than its column, so the value carries the whole
+        # name as its hover hint rather than losing the tail to the ellipsis.
         self.assertIn('const providerTypeText = providerKindLabel(kind, translate);', identity)
         self.assertIn('tooltip={providerTypeText} accessibilityLabel={providerTypeText}', identity)
-        self.assertIn('{translate("providers.type.relay")}', identity)
-        self.assertIn('{translate("providers.type.apiKey")}', identity)
+        self.assertIn('{translate("providers.type.apiProvider")}', identity)
+        self.assert_ui_has('? translate("providers.type.apiProvider")')
+        self.assertIn('{translate("providers.type.apiProvider")}', identity)
         # A login provider states the address its own service gives it, and
         # falls back to the address Core holds when the service table names
         # none — Our Free Model is served by a Core-owned worker on a
@@ -5975,7 +6233,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # entry: a wizard option that could only fail its import is worse
             # than no option at all.
             '{ type: "ourFreeModelKilo", label: translate("providers.type.ourFreeModelKilo") },',
-            'const kinds: WizardType[] = ["api", "openai", "workbuddy", "workbuddyGlobal", "qoder", "qoderGlobal", "ourFreeModel", "ourFreeModelKilo"];',
+            'chooseProviderType(servicePickerItems[nativeEvent.index]?.type ?? "api");',
             'const ourFreeModelProviderID = ourFreeModelProviderIDFor(providerType);',
             # A channel's entry is named after the channel, because the name is
             # what Core reads to know which one it is.
@@ -6267,7 +6525,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("&& !providers.some((entry) => entry !== provider && providerReachesStation(entry, station))", provider_workspace)
         self.assertIn("function providerReachesStation(provider: UnknownRecord, station: { id: string; origin: string }): boolean {", self.ui)
         self.assert_ui_has('translate("providers.deleteRelayProviderBody", {')
-        self.assertIn('"providers.type.relay": "中转站"', self.zh)
+        self.assertIn('"providers.type.apiProvider": "API 供应商"', self.zh)
         # 供应商类型 names the service, not one of its model families: the
         # OpenAI entry reads OpenAI, the name the wizard's own provider takes.
         self.assertIn('"providers.type.openai": "OpenAI"', self.zh)
@@ -6275,7 +6533,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('"providers.type.openai": "GPT"', self.zh)
         self.assertNotIn('"providers.type.openai": "GPT"', self.en)
         self.assertIn('"providers.type.apiKey": "API 密钥"', self.zh)
-        self.assertIn('"providers.type.relay": "Relay station"', self.en)
+        self.assertIn('"providers.type.apiProvider": "API provider"', self.en)
         self.assertIn('"providers.type.apiKey": "API key"', self.en)
 
     def test_official_account_login_lives_in_the_provider_detail(self) -> None:
@@ -8681,7 +8939,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # One press must advance one step: 下一步 is the window's default button,
         # so its Return key equivalent can deliver the action a second time and
         # would otherwise walk 供应商 → 密钥 → 模型 and skip 密钥.
-        self.assertIn("if (processing || stepRef.current !== step) return;", wizard)
+        self.assertIn("if (processing || advanceInFlight.current || stepRef.current !== step) return;", wizard)
         # A type that carries no secret of its own has no 密钥 step to walk
         # through: its next step after 供应商 is 模型.
         self.assertIn("const needsKeyStep = !isServiceCatalogType;", wizard)
