@@ -202,10 +202,13 @@ def prune_core(core: Path) -> None:
         ):
             shutil.rmtree(target)
 
-    # The Rust tokenizer backend is optional; LiteLLM's Python tokenizer and
-    # tiktoken paths remain available when this native accelerator is absent.
-    for native in (site_packages / "litellm" / "rust_bridge").glob("*.so"):
-        native.unlink()
+    # The Rust bridge is *not* optional payload any more: LiteLLM 1.109.0's
+    # package ``__init__`` imports ``rust_bridge.diagnostics`` -> ``bindings``
+    # -> ``_native`` unconditionally, so deleting the extension made every
+    # packaged Core fail at import with ``cannot import name '_native'``
+    # (2026-11-11 build).  It is 32 MB of the app, and the release runtime is
+    # where that cost belongs: a missing tokenizer backend was an acceptable
+    # trade in 1.108, a Core that cannot import LiteLLM is not.
 
     # The native app never invokes LiteLLM's terminal admin client. Keep the
     # proxy launcher itself, but remove that client command tree.
