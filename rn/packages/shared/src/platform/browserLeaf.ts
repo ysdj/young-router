@@ -100,12 +100,67 @@ function coreRequest(transport: BrowserCoreTransport, path: string, init: Reques
   });
 }
 
-async function hello(transport: BrowserCoreTransport): Promise<void> {
+/**
+ * How long one Core exchange may stay unanswered before this page gives up.
+ *
+ * A `fetch` nobody aborts stays pending for as long as its connection does, and
+ * this page hangs its write queue on the answer.  A gateway replaces the proxy
+ * on every Apply, and a POST in flight while that happens is answered by
+ * nobody: the reverse proxy keeps the socket open, the browser never sees a
+ * response, and the promise it is waiting on never settles.  Every later press
+ * of 启用 or 跟随全局 then queues behind it and never reaches Core, while the
+ * pane still draws 就绪 and the control still looks pressable -- a page where
+ * every checkbox silently stopped working, forever, until a reload.
+ *
+ * Core answers an ordinary edit in milliseconds and runs the post-Apply proxy
+ * restart on its own thread (it never makes the commit wait for it), so an
+ * exchange still unanswered after this budget is a lost connection rather than
+ * a slow commit.  Giving up is what lets the queue move again: the press that
+ * timed out is reported in the strip instead of holding every later one.
+ */
+const CORE_CALL_TIMEOUT_MS = 20_000;
+
+/** A failure with the code the shared UI maps to its own sentence. */
+function codedFailure(code: string, message: string = code): Error & { code: string } {
+  const failure = new Error(message) as Error & { code?: string };
+  failure.code = code;
+  return failure as Error & { code: string };
+}
+
+/** A Core call that outlived its budget, named so the pane can say why. */
+function coreTimeout(): Error & { code: string } {
+  return codedFailure("core_timeout", `Young Router's Core did not answer within ${Math.round(CORE_CALL_TIMEOUT_MS / 1000)} seconds`);
+}
+
+/** A call that never reached Core at all: this page's own connection is gone. */
+function coreUnreachable(): Error & { code: string } {
+  return codedFailure("core_unavailable", "Young Router's Core could not be reached from this page");
+}
+
+/** Whether a rejection is this module's own deadline firing. */
+function isAbort(reason: unknown): boolean {
+  return typeof reason === "object" && reason !== null && (reason as { name?: unknown }).name === "AbortError";
+}
+
+/**
+ * Run one Core exchange with a deadline, in the shape the caller already uses.
+ *
+ * The signal reaches the request *and* the body read, so a response whose
+ * headers arrived and whose bytes never do is covered by the same budget.
+ */
+function withDeadline<T>(operation: (signal: AbortSignal | undefined) => Promise<T>): Promise<T> {
+  if (typeof AbortController !== "function") return operation(undefined);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CORE_CALL_TIMEOUT_MS);
+  return operation(controller.signal).finally(() => clearTimeout(timer));
+}
+
+async function hello(transport: BrowserCoreTransport, signal?: AbortSignal): Promise<void> {
   // No credential is presented here: the browser sends the session cookie Core
   // set when this page signed in with the web password, and that cookie is what
   // Core answers about.  The lease stays in it — a page may read neither the
   // header nor the cookie — so there is nothing to keep on this side.
-  const response = await coreRequest(transport, "/ipc/hello", { method: "POST", body: "{}" });
+  const response = await coreRequest(transport, "/ipc/hello", { method: "POST", body: "{}", signal });
   if (!response.ok) throw new Error("Core IPC authentication failed");
 }
 
@@ -145,13 +200,17 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
   const establish = (): Promise<void> => {
     if (established) return Promise.resolve();
     if (pending !== undefined) return pending;
-    const exchange = (async () => {
-      await hello(transport);
+    const exchange = withDeadline((signal) => hello(transport, signal)).then(() => {
       // One greeting per document: it queues this document behind Core's
       // session, so every later call carries the cookie Core just answered
       // for.  A greeting per call would be one extra round trip per control.
       established = true;
-    })();
+    }, (reason: unknown) => {
+      // The greeting is the first exchange of every later call, so one that
+      // hangs would hold them all: it carries the same deadline, and its
+      // failure is the answer the caller's own strip states.
+      throw isAbort(reason) ? coreTimeout() : reason;
+    });
     // Cleared by identity, and only after the assignment below, so two callers
     // that arrive in the same tick both await the exchange instead of one of
     // them starting a second (and being refused).
@@ -180,26 +239,36 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
     window.location.reload();
   };
 
-  const call = async (path: string, body: string): Promise<Response> => {
+  const call = async (path: string, body: string, signal?: AbortSignal): Promise<Response> => {
     await establish();
-    const response = await coreRequest(transport, path, {
-      method: "POST",
-      body,
-      headers: { "Content-Type": "application/json" },
-    });
+    let response: Response;
+    try {
+      response = await coreRequest(transport, path, {
+        method: "POST",
+        body,
+        headers: { "Content-Type": "application/json" },
+        signal,
+      });
+    } catch (reason: unknown) {
+      // `fetch` rejects for exactly two reasons here: this page's deadline
+      // fired, or the request never reached Core at all.  Both are the pane's
+      // business, and neither may leave a caller waiting on a promise that can
+      // no longer settle.
+      throw isAbort(reason) ? coreTimeout() : coreUnreachable();
+    }
     if (response.status === 401) leaveForSignIn();
     return response;
   };
 
-  const send = async (request: string): Promise<string> => {
-    const response = await call("/ipc", request);
+  const send = async (request: string): Promise<string> => withDeadline(async (signal) => {
+    const response = await call("/ipc", request, signal);
     if (response.status >= 500) throw new Error("The local core is unavailable.");
     // A 400 carries a protocol envelope the shared client renders itself; only
     // a refused credential or an empty body is an error here.
     const text = await response.text();
     if (!text) throw new Error("The local core returned no response.");
     return text;
-  };
+  }).catch((reason: unknown) => { throw isAbort(reason) ? coreTimeout() : reason; });
 
   const request = (method: string, params: Record<string, unknown> = {}): string => JSON.stringify({
     protocol_version: 1,
@@ -218,8 +287,8 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
     }
   };
 
-  const hostRoute = async (path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> => {
-    const response = await call(path, JSON.stringify(body));
+  const hostRoute = async (path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> => withDeadline(async (signal) => {
+    const response = await call(path, JSON.stringify(body), signal);
     const text = await response.text();
     if (!response.ok || !text) {
       // A refused host exchange can carry a reason the caller can act on: the
@@ -239,7 +308,7 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
       throw failure;
     }
     return JSON.parse(text) as Record<string, unknown>;
-  };
+  }).catch((reason: unknown) => { throw isAbort(reason) ? coreTimeout() : reason; });
 
   /**
    * Sign this page out.
@@ -1181,15 +1250,23 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
     clearRelayPassword: async () => undefined,
     clearRelayCredentials: async () => undefined,
     // 开机自启动 on this host.  The desktop apps register their own login item
-    // in their own process; a page has none, but the Core behind it is that
+    // in their own process; a page has none, but the Core behind it can be that
     // app's Core on the same machine, so it writes the OS's login item and
-    // answers whether it could.  A Core from a working tree has no installed
-    // app to point at and answers `registered: false`, which the pane reads as
-    // a failed save and hands the preference back.
-    setLaunchAtLogin: async (enabled) => {
-      const answer = await core.hostRoute("/ipc/host/autostart", { enabled }).catch(() => undefined);
-      if (answer?.registered !== true) throw new Error("The login item could not be updated");
-    },
+    // answers whether it could.  That is only the owner's own page: on a
+    // published page the person reading it is not at the machine Core runs on
+    // (a gateway has no desktop session at all), so offering the switch there
+    // was a control that could only ever fail -- and it failed with a raw
+    // English sentence, after Core had already stored the preference.  Leaving
+    // the method undefined is what selects the pane's own 此页面不提供 sentence
+    // and its disabled switch, which is the truth for every other address.
+    setLaunchAtLogin: isOwnerPage()
+      ? async (enabled) => {
+        const answer = await core.hostRoute("/ipc/host/autostart", { enabled }).catch(() => undefined);
+        if (!answer) throw codedFailure("core_unavailable");
+        if (answer.available === false) throw codedFailure("autostart_unavailable");
+        if (answer.registered !== true) throw codedFailure("autostart_failed");
+      }
+      : undefined,
     versionInfo: async () => ({ app: "web", litellm: "" }),
     openExternalURL: (url) => { window.open(url, "_blank", "noopener"); },
     // This host is the one that signs in with a key, so it is the one host with

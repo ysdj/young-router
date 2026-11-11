@@ -272,6 +272,11 @@ export const zhHans: Record<TranslationKey, string> = {
   "error.renderFaultTitle": "这一页暂时无法显示",
   "error.renderFaultRetry": "重试",
   "error.coreUnavailable": "本地 Core 不可用。",
+  // 页面与 Core 之间的一个请求可以永远不到答：网关换代理时，上一份请求可能
+  // 由谁都不回答，页面于是把之后每一次编辑都排在它后面。到点放弃并说明，
+  // 才是让下一次点击还能到 Core 的那一步。
+  "error.coreTimeout": "漾路由 Core 20 秒内没有回应，这次操作没有生效。请重试。",
+  "error.autoStartFailed": "系统没有接受开机自启动的登记，此设置没有生效。",
   "error.startupFailure": "漾路由启动失败",
   "error.startupUnknownFailure": "未知的启动失败",
   "error.editorTooLarge": "文件过大，内置编辑器无法打开。",
@@ -352,6 +357,8 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.newProvider": "新建供应商",
   "providers.routesEmpty": "还没有线路",
   "providers.routesEmptyHint": "先在某个供应商下添加模型，它会作为一条线路出现在这里。",
+  "providers.unavailableTitle": "无法载入供应商与模型",
+  "providers.unavailableHint": "配置文件无法解析，本页没有可显示的供应商，也不会把任何改动写回它。修正 config.yaml 后重新打开本页。",
   "providers.emptyTitle": "添加第一个供应商",
   "providers.selectToEdit": "选择一个供应商、模型或路由进行编辑。",
   "providers.emptyHint": "连接一个上游供应商后，即可在漾路由中管理和路由模型。",
@@ -965,7 +972,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "relay.loginAnotherAccount": "登录新账号",
   "relay.goLogin": "去登录",
   "relay.refreshResources": "刷新",
-  "relay.loginWorking": "请在当前窗口完成登录，成功后将返回服务商管理。",
+  "relay.loginWorking": "请在站点的登录窗口中完成登录。",
   "relay.signInWindowHint": "站点登录页已在单独的窗口中打开，请在那里完成登录；成功后自动返回。",
   "relay.loginComplete": "登录成功。基础 URL 匹配的供应商会自动显示这些 API 密钥。",
   "relay.loginResourcesUnavailable": "登录成功，但无法加载 API 资源。请点击“刷新”重试。",

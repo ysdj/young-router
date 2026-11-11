@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import math
 import os
@@ -436,12 +437,24 @@ def _schedule_recent_request_settlement(record: Mapping[str, Any]) -> None:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
+    # An empty context, deliberately: a task inherits a snapshot of every
+    # context variable its creator holds, and this one is created from inside a
+    # request whose context carries the replay -- the multi-megabyte body, its
+    # images, and the route marker.  The watch only sleeps for the stale window
+    # (fifteen minutes by default) and reads module state, so it needs none of
+    # it; inheriting it pinned one body per in-flight attempt.  Measured
+    # 2026-11-12 on the gateway: a worker at 380 MB idle held 1.8 GB of
+    # anonymous heap after a few hundred Codex turns, at a rate of one watch per
+    # attempt and a fifteen-minute window -- ~900 live snapshots of a 2 MB
+    # replay.  Eight such workers took the box past its memory (sshd stopped
+    # answering; only a power-cycle from the console brought it back).
     task = loop.create_task(
         _settle_recent_request_after(
             request_id.strip(),
             stale_seconds,
             _in_flight_attempt(request_id),
-        )
+        ),
+        context=contextvars.Context(),
     )
     _PENDING_SETTLEMENT_TASKS.add(task)
     task.add_done_callback(_PENDING_SETTLEMENT_TASKS.discard)

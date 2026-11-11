@@ -1654,7 +1654,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const knownStationIDs = new Set([", wizard)
         self.assertIn("if (landedStationID && !knownStationIDs.has(landedStationID)) {", wizard)
         self.assertIn("pendingLoginStationIDs.current.add(landedStationID);", wizard)
-        self.assertIn("relay.commit(\"prune_orphans\", { station_ids: pending })", wizard)
+        # Through the ref: the bridge is a new object on every render of the
+        # pane behind this window, so an effect that keyed on it re-ran (and its
+        # teardown closed the sign-in browser) on every unrelated repaint.
+        self.assertIn("relayRef.current.commit(\"prune_orphans\", { station_ids: pending })", wizard)
         # The startup repair is the same reachability rule, in Core.
         service = (ROOT / "young_router/core/service.py").read_text(encoding="utf-8")
         self.assertIn("def prune_orphan_relay_stations(", service)
@@ -1674,7 +1677,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has("const autoRefreshedAccountIDs = useRef(new Set<string>());")
         self.assert_ui_has('if (autoRefreshedAccountIDs.current.has(selectedStationAccount.id)) return;')
         self.assert_ui_has('autoRefreshedAccountIDs.current.add(selectedStationAccount.id);')
-        self.assert_ui_has("void relay.refreshResources(selectedStationAccount.id)")
+        self.assert_ui_has("void relayRef.current.refreshResources(selectedStationAccount.id)")
 
     def test_closing_the_wizard_cancels_its_sign_in_browser(self) -> None:
         """The wizard owns the native sign-in window it opened.
@@ -1689,7 +1692,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has("if (loginInFlight.current) {")
         self.assert_ui_has("setupLoginRequest.current += 1;")
         self.assert_ui_has("native.cancelRelayLogin();")
-        self.assert_ui_has("relay.commit(\"prune_orphans\", { station_ids: pending })")
+        self.assert_ui_has("relayRef.current.commit(\"prune_orphans\", { station_ids: pending })")
 
     def test_the_model_rosters_share_one_checkbox_rule(self) -> None:
         """Every roster toggles a pick the same way, so the lists cannot drift."""

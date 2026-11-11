@@ -1475,6 +1475,17 @@ function errorMessage(reason: unknown, translate: Translate): string {
     // document Core refused to hand over because it is past the raw editor's
     // own size budget.  Neither may read as the other.
     core_unavailable: "error.coreUnavailable",
+    // The browser host's own deadline.  A Core exchange that never answered
+    // used to hold every later edit behind it in the pane's queue, so one lost
+    // response turned every checkbox into a control that did nothing; the
+    // transport now gives up and this is the sentence that says so.
+    core_timeout: "error.coreTimeout",
+    // A login item the page asked Core to register: Core states whether this
+    // host has an app to point at (`available`) and whether the system took it
+    // (`registered`).  Neither is a generic failure, and neither may read as a
+    // successful save.
+    autostart_unavailable: "general.autoStartUnavailable",
+    autostart_failed: "error.autoStartFailed",
     editor_too_large: "error.editorTooLarge",
     confirmation_required: "error.confirmationRequired",
     // A rebase already answered every conflict this window could resolve by
@@ -4466,6 +4477,13 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // can cancel it, and a dismissed window used to leave the sign-in page
   // running with nothing left to accept its answer.
   const loginInFlight = useRef(false);
+  // The station bridge is a new object on every render of the pane behind this
+  // window, so the effects below read it through a ref and never key on its
+  // identity.  They did: every repaint behind this window re-ran them, and the
+  // teardown among them closed the sign-in browser — the site's window
+  // vanished a moment after it opened, with the wizard still waiting on it.
+  const relayRef = useRef(relay);
+  relayRef.current = relay;
   // New stations this wizard's sign-in created before the provider row exists.
   // Closing without finishing hands the ids to Core's reachability check, which
   // removes only the ones no provider names; startup repair catches the same
@@ -5772,8 +5790,11 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   useEffect(() => {
     if (step !== "keys" || keyPath !== "login" || isOfficialLoginType) return;
     if (!activeProviderBaseURL.trim()) return;
-    void relay.refreshAccounts();
-  }, [step, keyPath, isOfficialLoginType, activeProviderBaseURL, relay]);
+    void relayRef.current.refreshAccounts();
+    // The step and the address are the trigger.  The bridge is a different
+    // object every render, so keying on it re-read the station on every
+    // repaint this window did for any other reason.
+  }, [step, keyPath, isOfficialLoginType, activeProviderBaseURL]);
   const beginRelayLogin = async (signInAnother = false): Promise<void> => {
     // The button reports progress instead of going dead, so a second press
     // must not start a parallel sign-in.
@@ -5855,6 +5876,11 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       const cancelled = request !== setupLoginRequest.current;
       if (cancelled) return;
       if (!result) {
+        // The browser window is gone and no session came out of it, so the
+        // waiting panel has nothing left to wait for: leaving it up (with a
+        // spinner and one 取消) was the state a sign-in window that closed
+        // itself left behind.  The keys step states the failure in its strip.
+        setLoginPhase("idle");
         setLoginFeedbackMessage(translate("relay.loginNotCompleted"));
         if (signedInAccountID === pendingID) setSignedInAccountID(undefined);
         return;
@@ -5925,7 +5951,9 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   useEffect(() => () => {
     // Every dismissal path, including the title bar and the parent's 关闭,
     // unmounts this window.  The browser flow is keyed by a request counter,
-    // so a late answer cannot repaint a window that is already gone.
+    // so a late answer cannot repaint a window that is already gone.  This is
+    // an unmount teardown and nothing else: it may only run once, when the
+    // window is really gone.
     if (loginInFlight.current) {
       loginInFlight.current = false;
       setupLoginRequest.current += 1;
@@ -5938,9 +5966,9 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     const pending = [...pendingLoginStationIDs.current];
     pendingLoginStationIDs.current.clear();
     if (pending.length > 0) {
-      void relay.commit("prune_orphans", { station_ids: pending }).catch(() => undefined);
+      void relayRef.current.commit("prune_orphans", { station_ids: pending }).catch(() => undefined);
     }
-  }, [native, relay]);
+  }, [native]);
   const refreshStationResources = async (): Promise<void> => {
     if (resourcesBusy || !selectedStationAccount) return;
     setResourcesBusy(true);
@@ -5965,14 +5993,14 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     if (autoRefreshedAccountIDs.current.has(selectedStationAccount.id)) return;
     autoRefreshedAccountIDs.current.add(selectedStationAccount.id);
     setResourcesBusy(true);
-    void relay.refreshResources(selectedStationAccount.id)
-      .then(() => relay.refreshAccounts())
+    void relayRef.current.refreshResources(selectedStationAccount.id)
+      .then(() => relayRef.current.refreshAccounts())
       .catch(() => undefined)
       .finally(() => setResourcesBusy(false));
-    // The selected account and its status are the trigger; the station bridge
-    // is stable for the lifetime of this window.
+    // The selected account and its status are the trigger; the bridge is read
+    // through the ref, and a new object per render is not a reason to run.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoGroupingBusy, isOfficialLoginType, keyPath, loginBusy, relay, resourcesBusy, selectedStationAccount, step]);
+  }, [autoGroupingBusy, isOfficialLoginType, keyPath, loginBusy, resourcesBusy, selectedStationAccount, step]);
   const cancelRelaySignIn = (): void => {
     if (loginPhase !== "sign-in") return;
     setupLoginRequest.current += 1;
@@ -8251,6 +8279,17 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     setModelOrderDraft,
     setProviderKeyNameDraft: () => undefined,
   }), [modelDisplayName, modelOrderText, modelUpstreamDisplay, providerBaseURL, providerDisplayName, providers, setModelNameDraft, setModelOrderDraft, setModelUpstreamDraft, setProviderBaseUrlDraft, setProviderNameDraft]);
+  // A document Core could not parse draws no rows at all, and an empty table
+  // is not the same fact as an empty installation: the pane used to show
+  // 添加第一个供应商 over a broken config.yaml, so a person whose document one
+  // bad field made unreadable saw every provider and route gone, with the
+  // wizard one press away from writing a new document over it.  Core already
+  // answers `available: false` and refuses every write; this is the sentence
+  // that says so where the rows would have been.
+  if (state.available === false) return <View style={styles.providerUnavailableState}>
+    <Text style={styles.providerEmptyTitle}>{translate("providers.unavailableTitle")}</Text>
+    <Text style={styles.providerEmptyHint}>{translate("providers.unavailableHint")}</Text>
+  </View>;
   return <ProviderWorkspaceDraftContext.Provider value={providerDraftProjection}><View style={styles.providersLayout}>
     <View style={styles.providerLeftColumn}>
       <View style={styles.providerToolbar}>
@@ -16816,7 +16855,7 @@ const styles = StyleSheet.create({
   // glyph, title, and action against the top so the space below stays available
   // for the first provider that arrives instead of reading as a blank page.
   emptyBlock: { alignSelf: "stretch", paddingVertical: 12, paddingHorizontal: 2 },
-  routesEmpty: { paddingHorizontal: 12, paddingVertical: 16, gap: 4 }, routesEmptyTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, routesEmptyHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 18 }, providerEmptyState: { flex: 1, minWidth: 0, minHeight: 0, alignItems: "center", justifyContent: "flex-start", paddingHorizontal: 28, paddingTop: 24, paddingBottom: 24, gap: 8, backgroundColor: systemColors.textBackground }, providerEmptyGlyph: { width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center", backgroundColor: systemColors.selectedContent }, providerEmptyGlyphText: { color: systemColors.selectedControlText, fontSize: 28, fontWeight: "300", lineHeight: 34 }, providerEmptyTitle: { color: systemColors.label, fontSize: 17, fontWeight: "600", textAlign: "center" }, providerEmptyHint: { maxWidth: 380, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 18, textAlign: "center" }, providerEmptyActions: { alignSelf: "center", flexDirection: "row", alignItems: "center", gap: 8, paddingTop: 6 },
+  routesEmpty: { paddingHorizontal: 12, paddingVertical: 16, gap: 4 }, routesEmptyTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, routesEmptyHint: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 18 }, providerUnavailableState: { flex: 1, alignItems: "center", justifyContent: "center", paddingHorizontal: 28, paddingVertical: 24, gap: 8, backgroundColor: systemColors.textBackground }, providerEmptyState: { flex: 1, minWidth: 0, minHeight: 0, alignItems: "center", justifyContent: "flex-start", paddingHorizontal: 28, paddingTop: 24, paddingBottom: 24, gap: 8, backgroundColor: systemColors.textBackground }, providerEmptyGlyph: { width: 44, height: 44, borderRadius: 22, alignItems: "center", justifyContent: "center", backgroundColor: systemColors.selectedContent }, providerEmptyGlyphText: { color: systemColors.selectedControlText, fontSize: 28, fontWeight: "300", lineHeight: 34 }, providerEmptyTitle: { color: systemColors.label, fontSize: 17, fontWeight: "600", textAlign: "center" }, providerEmptyHint: { maxWidth: 380, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, lineHeight: 18, textAlign: "center" }, providerEmptyActions: { alignSelf: "center", flexDirection: "row", alignItems: "center", gap: 8, paddingTop: 6 },
   keysPane: { flex: 1, minWidth: 0, minHeight: 0 }, keysInline: { minWidth: 0, gap: 6, paddingTop: 6, borderTopWidth: 1, borderTopColor: systemColors.separator }, keysInlineBody: { minWidth: 0, height: KEYS_INLINE_LIST_HEIGHT, flexDirection: "row", alignItems: "flex-start", gap: 6 }, keysTableInline: { flex: 1, minWidth: 0, height: KEYS_INLINE_LIST_HEIGHT, minHeight: KEYS_INLINE_LIST_HEIGHT }, keysEditorInline: { width: KEYS_INLINE_EDITOR_WIDTH, minWidth: 0, flexGrow: 0, flexShrink: 0, gap: 5 }, keysEditorField: { minWidth: 0, gap: 2 }, keysEditorFieldHeader: { height: 22, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 4 }, keysEditorFieldLabel: { flexShrink: 1, color: systemColors.label, fontSize: UI_FONT_SIZE },
   keysTable: { flex: 1, minHeight: 120 },
   keysEditor: { minWidth: 0, gap: 5, paddingTop: 5, paddingLeft: 8, borderLeftWidth: 2, borderLeftColor: systemColors.separator },

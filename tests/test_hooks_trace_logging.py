@@ -578,6 +578,49 @@ class HookTraceLoggingTests(HookTestCase):
             with hooks._PENDING_RECENT_REQUESTS_LOCK:
                 self.assertIn("retry-call", hooks._PENDING_RECENT_REQUESTS)
 
+    async def test_the_settlement_watch_does_not_pin_the_request_body(self) -> None:
+        """One watch per attempt may not keep that attempt's replay alive.
+
+        ``asyncio`` gives every task a snapshot of the caller's context
+        variables.  The watch is created from inside a request whose context
+        holds the replay -- a multi-megabyte body with its images -- and it
+        sleeps for the whole stale window, so the snapshot kept the body alive
+        for fifteen minutes per attempt.  Measured on the gateway 2026-11-12: a
+        worker at 380 MB idle held 1.8 GB of anonymous heap after a few hundred
+        Codex turns, and eight of them took the host past its memory.
+        """
+
+        hooks, _ = load_hook_module()
+        state = sys.modules["young_router.proxy.state"]
+        big = {"input": ["x" * 200_000], "messages": [{"role": "user", "content": "y" * 200_000}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            self.set_log_env(Path(tmp) / "recent-requests.jsonl")
+            self.set_env("YOUNG_ROUTER_LOG_REQUEST_STALE_SECONDS", "60")
+            token = hooks._CURRENT_ROUTING_REQUEST_KWARGS.set(big)
+            try:
+                inline = asyncio.get_running_loop().create_task(asyncio.sleep(60))
+                hooks._schedule_recent_request_settlement(
+                    {"request_id": "settle-context", "status": "pending"}
+                )
+            finally:
+                hooks._CURRENT_ROUTING_REQUEST_KWARGS.reset(token)
+            watches = [
+                task for task in state._PENDING_SETTLEMENT_TASKS
+                if task is not inline
+            ]
+            self.assertTrue(watches, "the settlement watch was not scheduled")
+            for task in watches + [inline]:
+                task.cancel()
+            if not hasattr(inline, "get_context"):
+                self.skipTest("this interpreter does not expose a task's context")
+            # The control states the mechanism: an ordinary task does carry it.
+            self.assertIs(big, inline.get_context().get(hooks._CURRENT_ROUTING_REQUEST_KWARGS))
+            for task in watches:
+                self.assertIsNone(
+                    task.get_context().get(hooks._CURRENT_ROUTING_REQUEST_KWARGS),
+                    "the settlement watch inherited the request body",
+                )
+
     async def test_a_client_that_stops_reading_closes_its_row_at_once(self) -> None:
         """Pressing stop is an ending no callback reports.
 
