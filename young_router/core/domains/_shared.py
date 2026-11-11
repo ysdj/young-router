@@ -71,9 +71,26 @@ def _default_provider_config_path() -> Path:
     return config_paths.provider_config_path()
 
 
-def _default_runtime_settings_path() -> Path:
+def runtime_settings_path_for(root: Path | str | None = None) -> Path:
+    """The runtime thresholds this installation reads, under its own root.
+
+    ``YOUNG_ROUTER_RUNTIME_SETTINGS_FILE`` names one file outright, exactly as
+    ``LITELLM_CONFIG_FILE`` does for the provider document.  Without it the
+    answer follows ``root`` -- a Core started with ``--runtime-root`` must not
+    resolve the host's file.  It used to: the default was read from the home
+    directory only, so a second Core started for verification wrote another
+    installation's ``runtime-settings.env`` and had its proxy replaced with
+    thresholds nobody typed (2026-11-11, found by an isolated probe instance).
+    """
     configured = os.environ.get("YOUNG_ROUTER_RUNTIME_SETTINGS_FILE", "").strip()
-    return Path(configured).expanduser() if configured else _default_runtime_root() / "runtime-settings.env"
+    if configured:
+        return Path(configured).expanduser()
+    resolved_root = Path(root).expanduser() if root is not None else _default_runtime_root()
+    return resolved_root / "runtime-settings.env"
+
+
+def _default_runtime_settings_path() -> Path:
+    return runtime_settings_path_for(None)
 
 
 def runtime_setting_text(key: str) -> str:

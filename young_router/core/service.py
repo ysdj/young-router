@@ -1893,7 +1893,7 @@ class CoreStore:
         host can still open the remaining settings windows.
         """
 
-        from .domains._shared import _default_provider_config_path, _default_runtime_root, _default_runtime_settings_path
+        from .domains._shared import _default_provider_config_path, _default_runtime_root, runtime_settings_path_for
         from ..webdav import core as webdav_core
         from .domains.claude import ClaudeSettingsDomain
         from .domains.clients import ClientSettingsDomain
@@ -1915,13 +1915,20 @@ class CoreStore:
         if reset_transient_routing_state:
             controller.reset_transient_routing_state()
 
+        resolved_runtime_root = (
+            Path(runtime_root).expanduser() if runtime_root is not None else _default_runtime_root()
+        )
+        # The runtime thresholds belong to this Core's root, for the reason the
+        # WebDAV identity below does.  Resolved from the home directory, a second
+        # Core started with ``--runtime-root`` for verification wrote the host's
+        # own ``runtime-settings.env`` and had the host's proxy replaced with
+        # thresholds nobody typed (2026-11-11: a probe instance's edited request
+        # timeout landed in the live installation's file).  ``--runtime-settings``
+        # and ``YOUNG_ROUTER_RUNTIME_SETTINGS_FILE`` still name one file outright.
         resolved_runtime_settings_path = (
             Path(runtime_settings_path).expanduser()
             if runtime_settings_path is not None
-            else _default_runtime_settings_path()
-        )
-        resolved_runtime_root = (
-            Path(runtime_root).expanduser() if runtime_root is not None else _default_runtime_root()
+            else runtime_settings_path_for(resolved_runtime_root)
         )
         # This Core's WebDAV identity belongs to this Core's root.  A process
         # started with ``--runtime-root`` and no environment naming that root

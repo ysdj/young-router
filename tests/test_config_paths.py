@@ -164,3 +164,42 @@ class ProviderChannelTagTests(unittest.TestCase):
         for rejected in (5, "a b", "x" * 40, ["kilo"]):
             with self.assertRaises(ValueError):
                 _provider_channel(rejected)
+
+
+class RuntimeSettingsPathTests(unittest.TestCase):
+    """The runtime thresholds belong to the installation that reads them.
+
+    The same two-paths failure as the provider document, one file over: the
+    default was resolved from the home directory regardless of the root the Core
+    was started with, so an instance started with ``--runtime-root`` for
+    verification wrote the host's ``runtime-settings.env``.  The host's proxy
+    then restarted with a threshold nobody in that window had typed.
+    """
+
+    def test_a_root_answers_for_its_own_runtime_settings(self) -> None:
+        from young_router.core.domains._shared import runtime_settings_path_for
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("YOUNG_ROUTER_RUNTIME_SETTINGS_FILE", None)
+            self.assertEqual(
+                Path("/tmp/installation/runtime-settings.env"),
+                runtime_settings_path_for("/tmp/installation"),
+            )
+
+    def test_the_default_is_still_the_home_installation(self) -> None:
+        from young_router.core.domains._shared import _default_runtime_settings_path
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("YOUNG_ROUTER_RUNTIME_SETTINGS_FILE", None)
+            os.environ.pop("LITELLM_RUNTIME_ROOT", None)
+            os.environ.pop("YOUNG_ROUTER_HOME", None)
+            self.assertEqual(
+                Path.home() / ".young-router" / "runtime-settings.env",
+                _default_runtime_settings_path(),
+            )
+
+    def test_an_explicit_file_wins_over_the_root(self) -> None:
+        from young_router.core.domains._shared import runtime_settings_path_for
+
+        with mock.patch.dict(os.environ, {"YOUNG_ROUTER_RUNTIME_SETTINGS_FILE": "/tmp/one-file.env"}, clear=False):
+            self.assertEqual(Path("/tmp/one-file.env"), runtime_settings_path_for("/tmp/installation"))
