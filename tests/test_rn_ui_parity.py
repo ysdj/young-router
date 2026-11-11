@@ -3146,6 +3146,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # draws the same 4 pt capsule `PersistentScrollView` draws.
         self.assertIn('tableScrollThumb: { position: "absolute", top: 2, right: 2, width: 4, borderRadius: 2', self.native_controls)
         self.assertIn('scrollMetrics.overflow && scrollMetrics.height > 0', self.native_controls)
+        # The measurement bails out when the thumb did not move: every table a
+        # pane mounts measures itself twice (mount effect + ResizeObserver), and
+        # a fresh object each time re-rendered the whole mounted window for it.
+        self.assertIn('current.overflow === overflow && current.height === height && Math.abs(current.offset - offset) < 0.5', self.native_controls)
         self.assertIn('.getScrollableNode?.();', self.native_controls)
         self.assertIn('windowsTableStyles.sourceCellViewFlex, { paddingLeft: leadingInset, paddingRight: TABLE_MIN_HORIZONTAL_PADDING }', self.native_controls)
         self.assertIn('{sourceList ? body : <ScrollView horizontal showsHorizontalScrollIndicator', self.native_controls)
@@ -3157,9 +3161,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('rowSymbols={paneSymbols}', shell)
         self.assertIn('onSelectionChange={selectPane}', shell)
         self.assertIn('const next = SETTINGS_PANES.find(({ id }) => id === key)?.id;', shell)
-        self.assertIn('native.window.open(next);', shell)
+        # A switch made inside the shared window is not a request to the host
+        # on macOS, where that window already draws every pane: `open` there
+        # emitted an `open-<route>` action (a Core action-log write per click)
+        # and re-fronted the window, ahead of the pane the user asked for.
+        self.assertIn('if (Platform.OS !== "macos") native.window.open(next);', shell)
         self.assertIn('native.window.close(Platform.OS === "windows" ? pane : windowRoute);', shell)
-        self.assertIn('<RouteSurface route={pane} shell', shell)
+        # The row's capsule is painted from the route the press set; the pane it
+        # names is drawn from a deferred value, so a press never waits behind the
+        # mount of the pane before it and presses faster than a mount coalesce
+        # instead of queueing one mount each.
+        self.assertIn('const drawnPane = useDeferredValue(pane);', shell)
+        self.assertIn('<RouteSurface route={drawnPane} shell', shell)
         # Beta Display's native settings layout: an app identity header, a pane
         # source list, and a flexible spacer. About lives in the native
         # application/tray menu instead of the sidebar.
@@ -9168,8 +9181,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "}, SECRET_INPUT_COMMIT_DEBOUNCE_MS);",
             "state.status === \"saved\" || state.status === \"ready\" || state.status === \"error\"",
             "refreshAfter = true",
-            "if (refreshAfter && postActionRefreshNeeded({ channel: eventChannel.current, revisionBefore, revisionAfter, localRevision: revision.current })) await refresh();",
+            "if (refreshAfter && !cancelled && postActionRefreshNeeded({ channel: eventChannel.current, revisionBefore, revisionAfter, localRevision: revision.current })) await refresh();",
             "}, null, true);",
+            # Leaving a pane with nothing to write is not an Apply: the flush
+            # used to cancel after a `staged` read and then read the whole
+            # projection back for it, so every sidebar press paid two round trips
+            # and a second render before the pane it asked for was drawn.
+            "const paneHasNothingToWrite = (): boolean => dispatchGeneration.current === snapshotDispatchGeneration.current",
+            "if (paneHasNothingToWrite()) return true;",
+            "dispatchGeneration.current += 1;",
+            "snapshotDispatchGeneration.current = dispatchGeneration.current;",
             "function WebDavPasswordField(",
             'isDirty: () => dirtyRef.current',
             '<NativeSecretField labelVisible={false} plainText autoCommit label={translate("providers.keyValue")}',

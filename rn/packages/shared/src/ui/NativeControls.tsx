@@ -1351,11 +1351,23 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   const readScrollMetrics = React.useCallback(() => {
     const node = listNode.current;
     if (!node) return;
+    // Reading `scrollHeight` forces the browser to lay the list out, and this
+    // runs from a mount effect *and* from the ResizeObserver the mount installs
+    // -- so every table a pane mounts measured itself twice, before and after
+    // its own first paint.  A measurement that finds the same thumb is not a new
+    // thumb: returning the state it already holds is React's own bailout, and
+    // without it every table re-rendered its whole mounted window (and laid it
+    // out again) for a capsule that had not moved.
     const overflow = node.scrollHeight > node.clientHeight + 1;
     const height = overflow ? Math.max(24, (node.clientHeight * node.clientHeight) / node.scrollHeight) : 0;
     const range = Math.max(1, node.scrollHeight - node.clientHeight);
     const travel = Math.max(0, node.clientHeight - height - 4);
-    setScrollMetrics({ overflow, height, offset: Math.min(travel, (node.scrollTop / range) * travel) });
+    const offset = Math.min(travel, (node.scrollTop / range) * travel);
+    setScrollMetrics((current) => (
+      current.overflow === overflow && current.height === height && Math.abs(current.offset - offset) < 0.5
+        ? current
+        : { overflow, height, offset }
+    ));
   }, []);
   React.useEffect(() => {
     readScrollMetrics();

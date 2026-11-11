@@ -1,5 +1,5 @@
 import type { TranslationKey } from "../i18n/types";
-import React, { createContext, useCallback, useEffect, useMemo, useRef, useState, useContext } from "react";
+import React, { createContext, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, useContext } from "react";
 import { AccessibilityInfo, Animated, AppState, FlatList, Image, Platform, PlatformColor, Pressable, ScrollView, StyleSheet, Text, View, type HostInstance, type ScrollViewProps, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
 import { createTranslator } from "../i18n";
 import { assistantSettingOptions, type AssistantSettingOption } from "../i18n/assistantSettingsI18n";
@@ -2447,6 +2447,21 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
   }, []);
   const closing = useRef(false);
   const pane = canonicalWindowRoute(route);
+  // What the shell is drawing under the source list.
+  //
+  // The row the pointer pressed is urgent: the capsule it asked for is painted
+  // on this frame, out of the route the row just set.  The pane that row names
+  // is the heaviest work this window does — one settings surface is a mount of
+  // several hundred views (the log table alone fills its window with a hundred
+  // rows), at a cost measured in tens of milliseconds per host — so it is drawn
+  // from a deferred value instead.  React keeps the pane that is already there
+  // for the frame the capsule needs and, when rows are pressed faster than a
+  // pane can be built, replaces the intermediate ones instead of mounting every
+  // one of them.  Before this, a switch was one atomic commit: at eight presses
+  // a second the window queued eight full mounts, and the capsule the user was
+  // waiting for arrived behind all of them.  Where the host's renderer cannot
+  // defer (no concurrent root), this is the value itself and nothing changes.
+  const drawnPane = useDeferredValue(pane);
   useEffect(() => {
     if (!nativeAction?.id.startsWith("request-close-") || closing.current) return;
     closing.current = true;
@@ -2506,16 +2521,34 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
     // typed WebDAV password or raw-editor draft was dropped with the unmount.
     void flushActivePane.current?.("navigate").catch(() => undefined);
     onNavigate(next);
-    // Let the native host follow the pane: it retitles the Windows window and
-    // keeps the active route in sync so a later close hides that window.
-    native.window.open(next);
+    // Tell the hosts that track the pane themselves.  Windows keeps the active
+    // route on its one window (it retitles the window and a later close hides
+    // that route), and the page writes the address bar it is drawing.  macOS is
+    // the one host whose settings window already *is* this shell: `open` there
+    // answered a switch made inside the window by emitting an `open-<route>`
+    // menu action -- which the app recorded as a Core action-log write on every
+    // click -- and by activating and re-fronting the window on every row
+    // pressed.  Neither changed what the pane showed, because the route is this
+    // component's own state; both were paid before the new pane was drawn.
+    if (Platform.OS !== "macos") native.window.open(next);
   };
   // The two assistant routes are one window, and this is the only place the
   // raw route still exists — `pane` has already been canonicalised to
   // `codex-settings`.  A deep link or a restored Claude window therefore
   // opened on Codex with Claude a rail click away: the route said which client
   // it was for, and nothing carried that to the pane.
-  const paneSurface = <RouteSurface route={pane} shell initialClient={route === "claude-settings" ? "claude" : undefined} windowRoute={windowRoute} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} nativeAction={nativeAction} eventChannel={eventChannel} onSnapshot={onSnapshot} onNavigate={onNavigate} onClose={onClose} onRegisterFlush={registerFlush} />;
+  // Which assistant the pane should show, as its own value: the raw route that
+  // names it is not a reason to rebuild the pane element, and taking `route` as
+  // a dependency of the memo below rebuilt it on every press.
+  const assistantClient = route === "claude-settings" ? "claude" : undefined;
+  // The pane element is kept while nothing it draws has changed.  Without this
+  // the frame that paints the pressed row also re-rendered the pane about to be
+  // left -- building its whole table again for an element React was about to
+  // unmount -- and that work sat between the press and the capsule it moved.
+  // With it, a press that changes no state the pane reads hands React the same
+  // element, and React skips the subtree: the shell paints alone, and the pane
+  // mounts on the deferred pass that follows.
+  const paneSurface = useMemo(() => <RouteSurface route={drawnPane} shell initialClient={assistantClient} windowRoute={windowRoute} snapshot={snapshot} ipc={ipc} native={native} translate={translate} logTabRequest={logTabRequest} nativeAction={nativeAction} eventChannel={eventChannel} onSnapshot={onSnapshot} onNavigate={onNavigate} onClose={onClose} onRegisterFlush={registerFlush} />, [assistantClient, drawnPane, windowRoute, snapshot, ipc, native, translate, logTabRequest, nativeAction, eventChannel, onSnapshot, onNavigate, onClose, registerFlush]);
   const signingOut = useRef(false);
   /**
    * 退出登录, for the one host that signs in with a key.
@@ -2569,7 +2602,7 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
         />
       </View>
       <View style={[styles.settingsDetail, styles.settingsDetailIntegrated, styles.compactWebDetail]}>
-        <View style={[styles.settingsDetailBody, isWindowsShell && styles.settingsDetailBodyWindows, (pane === "runtime-settings" || pane === "data-management" || isAssistantSettingsRoute(pane)) && styles.settingsDetailBodyBare]}>
+        <View style={[styles.settingsDetailBody, isWindowsShell && styles.settingsDetailBodyWindows, (drawnPane === "runtime-settings" || drawnPane === "data-management" || isAssistantSettingsRoute(drawnPane)) && styles.settingsDetailBodyBare]}>
           <View style={styles.settingsDetailPane}>{paneSurface}</View>
         </View>
       </View>
@@ -2617,7 +2650,7 @@ function SettingsShell({ route, windowRoute, snapshot, ipc, native, translate, l
         <View style={styles.settingsSidebarSpacer} />
       </View>
       <View style={[styles.settingsDetail, styles.settingsDetailIntegrated]}>
-        <View style={[styles.settingsDetailBody, isWindowsShell && styles.settingsDetailBodyWindows, (pane === "runtime-settings" || pane === "data-management" || isAssistantSettingsRoute(pane)) && styles.settingsDetailBodyBare]}>
+        <View style={[styles.settingsDetailBody, isWindowsShell && styles.settingsDetailBodyWindows, (drawnPane === "runtime-settings" || drawnPane === "data-management" || isAssistantSettingsRoute(drawnPane)) && styles.settingsDetailBodyBare]}>
           <View style={styles.settingsDetailPane}>{paneSurface}</View>
         </View>
       </View>
@@ -2908,6 +2941,8 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     if (snapshot) {
       revision.current = snapshot.revision;
       latestSnapshot.current = snapshot;
+      // Everything dispatched before this answer is part of the state it drew.
+      snapshotDispatchGeneration.current = dispatchGeneration.current;
     }
   }, [snapshot]);
 
@@ -3017,7 +3052,13 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     const revisionBefore = revision.current;
     try {
       const value = await operation();
-      if (asRecord(value).cancelled === true) {
+      const cancelled = asRecord(value).cancelled === true;
+      if (cancelled) {
+        // A cancelled action wrote nothing: the picker was dismissed, or the
+        // draft it would have applied was empty.  There is no revision to learn,
+        // so the read the check below exists for is not owed -- and on a settings
+        // pane it was a whole projection read plus the render that applied it,
+        // paid on the way out of every pane the user left without an edit.
         publishResult(undefined);
       } else if (isValidation(value)) {
         // A rejected draft leaves its own rows marked in the pane
@@ -3039,7 +3080,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       // One action, one answer: when the channel is delivering and the answer
       // is the revision this pane holds, Core's patch for that revision is the
       // read.  Everything else keeps the read as the fallback it always was.
-      if (refreshAfter && postActionRefreshNeeded({ channel: eventChannel.current, revisionBefore, revisionAfter, localRevision: revision.current })) await refresh();
+      if (refreshAfter && !cancelled && postActionRefreshNeeded({ channel: eventChannel.current, revisionBefore, revisionAfter, localRevision: revision.current })) await refresh();
       return value as T;
     } catch (reason: unknown) {
       const validationStatus = await validationStatusAfterFailure(reason);
@@ -3098,6 +3139,9 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       missingDomain.code = "missing_domain";
       return Promise.reject(missingDomain);
     }
+    // The action is in flight from here: until a snapshot answers it, the state
+    // this window holds is not the state Core holds (see `paneHasNothingToWrite`).
+    dispatchGeneration.current += 1;
     const issue = async (): Promise<IpcResults["dispatch"]> => {
       if (revision.current === undefined) await refresh();
       const action = actionDomain === undefined ? { type, payload } : { domain: actionDomain, type, payload };
@@ -3640,6 +3684,16 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   // can keep the window open instead of silently discarding the edit.
   const flushAndApply = useRef<(purpose?: "close" | "navigate") => Promise<boolean>>(() => Promise.resolve(true));
   const invalidCloseNotice = useRef(false);
+  // How many actions this pane has started since the snapshot it is drawing.
+  // A dispatch that has not come back as a snapshot yet may have staged a draft
+  // this window cannot see, so leaving the pane has to ask Core then.  Equal
+  // counts mean the drafts in `latestSnapshot` are the drafts Core holds.
+  const dispatchGeneration = useRef(0);
+  const snapshotDispatchGeneration = useRef(0);
+  /** Nothing this pane typed or started is waiting to be written. */
+  const paneHasNothingToWrite = (): boolean => dispatchGeneration.current === snapshotDispatchGeneration.current
+    && !hasPendingFieldEdits()
+    && stagedDomainsForRoute(latestSnapshot.current).length === 0;
   flushAndApply.current = async (purpose: "close" | "navigate" = "close"): Promise<boolean> => {
     await flushPendingFields();
     if (hasPendingFieldEdits()) {
@@ -3651,6 +3705,18 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       return false;
     }
     await dispatchQueue.current;
+    // A pane with nothing staged has already written everything the user said.
+    // A settings pane holds either a field being typed in (committed above, which
+    // is what makes a draft dirty) or that draft, and the debounced Apply below
+    // owns the draft.  An Apply on an empty draft does not answer "nothing to
+    // write": it cancels after a `staged` read and then reads the whole snapshot
+    // back (see `runOutcome`'s `refreshAfter`), so every click on the sidebar paid
+    // two round trips and a second render of the pane it had just mounted -- for
+    // a commit that had nothing to commit, and before the pane the user asked for
+    // was drawn.  "Nothing" is only provable when no action is in flight: a
+    // dispatch whose snapshot has not landed may have staged a draft this window
+    // cannot see, and skipping the Apply would leave that draft to nobody.
+    if (paneHasNothingToWrite()) return true;
     // The commit belongs to the pane being left, but its wait must not follow
     // the user into the pane they opened: the flush runs after navigation has
     // already rendered the destination, and holding the pane-wide flag here

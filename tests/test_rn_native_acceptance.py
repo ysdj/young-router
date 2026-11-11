@@ -3417,7 +3417,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # One RouteSurface stays mounted across pane switches: remounting it
         # rebuilt every native table and secret field on the way to Settings.
         self.assertNotIn("RouteSurface key={pane}", ui)
-        self.assertIn("<RouteSurface route={pane} shell", ui)
+        # Still one instance across switches: the pane prop is deferred, never
+        # keyed, so nothing remounts the shell or its tables on the way over.
+        self.assertIn("<RouteSurface route={drawnPane} shell", ui)
         self.assertIn("height: SETTINGS_TITLEBAR_INSET + 38", ui)
         # The frame outside the client is the extended title bar's resize
         # border; without a background brush it showed the desktop through a
