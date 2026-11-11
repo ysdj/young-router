@@ -638,6 +638,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.authStatus": "状态",
   "providers.authAccount": "账号",
   "providers.authNoAccount": "未登录",
+  "providers.accountUnread": "读不到账号状态，请重试。",
   "providers.authStatusSignedOut": "未登录",
   "providers.authStatusAuthorizing": "正在等待登录",
   "providers.authStatusSignedIn": "已登录",

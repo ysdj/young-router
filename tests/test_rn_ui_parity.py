@@ -6003,6 +6003,32 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertEqual(projection.count("self._managed_account_login_status(auth)"), 1)
         self.assertIn("if allow_live:", projection)
 
+    def test_a_managed_account_row_states_what_core_observed_first(self) -> None:
+        """A managed account row reads Core's observation before its own read.
+
+        The provider summary is what a window reads, so the facts Core keeps for
+        exactly this purpose have to survive it; and a read that never answered
+        must not be rendered as "not signed in".  On lv that pair left the Qoder
+        row saying the desktop app was not signed in over a seeded account the
+        worker was answering ``signed-in`` for (2026-11-12).
+        """
+
+        service_source = (ROOT / "young_router/core/service.py").read_text(encoding="utf-8")
+        summary = service_source.split("def _providers_summary(", 1)[1].split("def _webdav_summary(", 1)[0]
+        self.assertIn('provider_summary["auth_observed"] = dict(observed)', summary)
+        self.assertIn('provider_summary["auth_observed_seconds_ago"] = observed_age', summary)
+        # One window rule for both blocks, one three-state row each, and no UI
+        # deadline that can answer "not signed in" for a read Core would serve.
+        self.assertEqual(1, self.ui.count("function managedObservationIsFresh("))
+        self.assertEqual(2, self.ui.count("if (managedObservationIsFresh(provider, serviceAccountRecheckSeconds("))
+        self.assertIn('translate(qoderUnread ? "providers.accountUnread" : "providers.wizard.qoderSignInRequired")', self.ui)
+        self.assertIn('translate(workbuddyUnread ? "providers.accountUnread" : "providers.wizard.workbuddySignInRequired"', self.ui)
+        self.assertNotIn("QODER_STATUS_TIMEOUT_MS", self.ui)
+        # Both languages state the unanswered read, and neither renders it as a
+        # signed-out account.
+        self.assertIn('"providers.accountUnread"', self.zh)
+        self.assertIn('"providers.accountUnread"', self.en)
+
     def test_workbuddy_provider_types_borrow_the_desktop_app_sign_in(self) -> None:
         """WorkBuddy keeps its sign-in and its model catalog in its own app."""
         for marker in (

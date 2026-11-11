@@ -271,6 +271,10 @@ export interface ProviderSummary {
   relay_station_id?: string;
   auth_kind?: ProviderAuthKind;
   auth_status?: ProviderAuthStatus;
+  /** The secret-free account facts Core last observed in a live read. */
+  auth_observed?: Record<string, unknown>;
+  /** How long ago that observation was made, in seconds. */
+  auth_observed_seconds_ago?: number;
   auth_active?: boolean;
   key_states?: ProviderKeySummary[];
   models?: ProviderModelSummary[];

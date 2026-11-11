@@ -868,6 +868,47 @@ class WorkBuddyProviderTests(unittest.TestCase):
                 self.assertEqual(provider["auth_observed"]["nickname"], "Example User")
             self.assertEqual(len(runtime.calls), before)
 
+    def test_a_service_snapshot_summary_carries_the_account_it_observed(self) -> None:
+        """The summary a window reads states the account Core last observed.
+
+        The provider table in ``CoreStore.snapshot()`` is the *summary*
+        projection, not the domain's detail record, and every field a client
+        acts on has to survive it.  ``auth_observed`` did not: the pane's
+        account row could only state what its own live read landed, so a read it
+        gave up on rendered as "the desktop app is not signed in" while the
+        worker was answering ``signed-in`` -- the shape reported on lv for
+        Qoder, whose sign-in there is a seeded file rather than an app that
+        machine can open.  A provider nothing has read states no observation at
+        all, so the row cannot mistake "never read" for a signed-in account.
+        """
+
+        runtime = StubRuntime()
+        directory, domain, _config = self._domain(runtime)
+        with directory:
+            core = CoreStore(
+                metadata_path=Path(directory.name) / ".litellm-runtime" / "core-state.json",
+                domains=[domain],
+            )
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "service_provider.add",
+                    "payload": {"kind": "workbuddy_login", "name": "wb", "models": []},
+                },
+                expected_revision=core.revision,
+            )
+            row = core.snapshot()["providers_models"]["providers"][0]
+            self.assertEqual(row["auth_observed"]["nickname"], "Example User")
+            self.assertEqual(row["auth_observed"]["state"], "signed-in")
+            self.assertIsInstance(row["auth_observed_seconds_ago"], float)
+            self.assertLess(row["auth_observed_seconds_ago"], 5.0)
+            # A cleared observation is omitted, never published as an empty
+            # record that a caller could read as "read, signed out".
+            domain._managed_accounts_observed.clear()
+            cleared = CoreStore._providers_summary({"providers_models": domain.snapshot()})
+            self.assertNotIn("auth_observed", cleared["providers"][0])
+            self.assertNotIn("auth_observed_seconds_ago", cleared["providers"][0])
+
     def test_a_wizard_created_entry_takes_its_state_from_the_create(self) -> None:
         """Nothing has observed the account yet, so nothing may guess it."""
 

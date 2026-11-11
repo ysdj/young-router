@@ -643,6 +643,7 @@ export type TranslationKey =
   | "providers.authStatus"
   | "providers.authAccount"
   | "providers.authNoAccount"
+  | "providers.accountUnread"
   | "providers.authStatusSignedOut"
   | "providers.authStatusAuthorizing"
   | "providers.authStatusSignedIn"

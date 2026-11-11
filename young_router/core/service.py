@@ -4752,6 +4752,21 @@ class CoreStore:
                 provider_summary["auth_status"] = item.get("auth_status")
             if item.get("auth_active") is not None:
                 provider_summary["auth_active"] = item.get("auth_active")
+            # The account facts a live read last observed ride with the summary
+            # too, and so does how old they are.  The pane states them in the
+            # account row *before* its own read answers (and when that read never
+            # does), which is the whole reason Core keeps them: a row that only
+            # had its own live read rendered every unanswered read as "the
+            # desktop app is not signed in" -- on a gateway whose sign-in is a
+            # seeded file rather than an app this machine can open, that sentence
+            # is exactly wrong.  An empty observation is left out, so a provider
+            # nothing has read states nothing instead of an empty object.
+            observed = item.get("auth_observed")
+            if isinstance(observed, Mapping) and observed:
+                provider_summary["auth_observed"] = dict(observed)
+            observed_age = item.get("auth_observed_seconds_ago")
+            if isinstance(observed_age, (int, float)) and not isinstance(observed_age, bool):
+                provider_summary["auth_observed_seconds_ago"] = observed_age
             providers.append(provider_summary)
         revision = value.get("revision", 0)
         return {"providers": providers, "revision": revision if type(revision) is int else 0}

@@ -630,6 +630,7 @@ export const en: Record<TranslationKey, string> = {
   "providers.authStatus": "Status",
   "providers.authAccount": "Account",
   "providers.authNoAccount": "Not signed in",
+  "providers.accountUnread": "The account could not be read. Try again.",
   "providers.authStatusSignedOut": "Signed out",
   "providers.authStatusAuthorizing": "Waiting for sign-in",
   "providers.authStatusSignedIn": "Signed in",

@@ -379,16 +379,6 @@ function providerService(provider: UnknownRecord | undefined): ServiceID | undef
  */
 const SERVICE_RATE_TTL_MS = 5 * 60 * 1000;
 
-/**
- * How long the Qoder account row waits for the Core-owned worker.
- *
- * The read starts a bridge process: 4.5 s cold on lv, 1.2 s warm.  This is a
- * ceiling on the row's spinner, not on the read -- a late answer still folds
- * into the state it lands in, but nothing may leave the row claiming it is
- * still loading.
- */
-const QODER_STATUS_TIMEOUT_MS = 20_000;
-
 /** How tall the WebDAV child may become, and the least it is ever sized to. */
 const WEBDAV_WINDOW_MIN_HEIGHT = 380;
 const WEBDAV_WINDOW_MAX_HEIGHT = 760;
@@ -646,14 +636,16 @@ function workbuddyAccountFacts(live: UnknownRecord, observed: UnknownRecord): Un
 /**
  * Whether Core's own account read is still inside its window.
  *
- * A WorkBuddy entry reads the desktop-app account and its credit, and each of
- * those may start a worker and read a credential, so the pane applies the same
- * window Core applies (运行时 adjusts it) before it asks: an account Core read
- * seconds ago is not a question to ask again.  The section's own 刷新 button
- * bypasses this, because a user's click is exactly the request to read for
- * real.  An observation with no age — nothing was ever read — is never fresh.
+ * A WorkBuddy or Qoder entry reads the desktop app's account (WorkBuddy adds
+ * its credit), and each of those may start a worker and read a credential or an
+ * upstream catalog, so the pane applies the same window Core applies (运行时
+ * adjusts it) before it asks: an account Core read seconds ago is not a
+ * question to ask again, and the projection beside it already states the
+ * account.  The section's own 刷新 button bypasses this, because a user's click
+ * is exactly the request to read for real.  An observation with no age —
+ * nothing was ever read — is never fresh.
  */
-function workbuddyObservationIsFresh(provider: UnknownRecord, windowSeconds: number | undefined): boolean {
+function managedObservationIsFresh(provider: UnknownRecord, windowSeconds: number | undefined): boolean {
   if (typeof windowSeconds !== "number" || !(windowSeconds > 0)) return false;
   const age = provider.auth_observed_seconds_ago;
   if (typeof age !== "number" || !Number.isFinite(age)) return false;
@@ -10227,7 +10219,7 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     // hand, so an answer that is still not signed in is asked for for real,
     // once and never in a loop.
     if (!workbuddyProviderIDFor(kind)) return;
-    if (workbuddyObservationIsFresh(provider, serviceAccountRecheckSeconds(snapshotForCleanups))) return;
+    if (managedObservationIsFresh(provider, serviceAccountRecheckSeconds(snapshotForCleanups))) return;
     void loadWorkBuddyAccount(true).then((account) => {
       if (account && stringValue(account.state) !== "signed-in") void loadWorkBuddyAccount(true);
     });
@@ -10237,6 +10229,10 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   // links the desktop app's own sign-in here and never asks for a secret.
   const [workbuddyStatusBusy, setWorkbuddyStatusBusy] = useState(false);
   const [workbuddyAccount, setWorkbuddyAccount] = useState<UnknownRecord | undefined>(undefined);
+  // A read that never answered is not a signed-out account.  Only an answer
+  // that said so may ask the person to sign in; a read that failed or was cut
+  // short says that instead (see the account row below).
+  const [workbuddyUnread, setWorkbuddyUnread] = useState(false);
   const loadWorkBuddyAccount = async (refresh: boolean): Promise<UnknownRecord | undefined> => {
     const providerKey = workbuddyProviderIDFor(kind);
     if (!providerKey) return undefined;
@@ -10245,11 +10241,18 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
       // Reading the account is this block's own wait: the name field, the
       // association controls and every other input stay usable throughout.
       const next = await dispatchWithOutcome("workbuddy_status", { refresh }, "providers_models", true);
-      if (!next) return undefined;
+      if (!next) {
+        setWorkbuddyUnread(true);
+        return undefined;
+      }
       const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
       const account = asRecord(asRecord(summary.providers)[providerKey]);
       setWorkbuddyAccount(account);
+      setWorkbuddyUnread(!stringValue(account.state));
       return account;
+    } catch {
+      setWorkbuddyUnread(true);
+      return undefined;
     } finally {
       setWorkbuddyStatusBusy(false);
     }
@@ -10260,7 +10263,10 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     if (workbuddyStatusBusy) return;
     try {
       const account = await loadWorkBuddyAccount(true);
-      if (!account) return;
+      if (!account) {
+        onStatus?.(translate("providers.accountUnread"));
+        return;
+      }
       if (stringValue(account.state) !== "signed-in") {
         onStatus?.(translate("providers.wizard.workbuddySignInRequired"));
         return;
@@ -10328,24 +10334,36 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
   // to it when it is signed out.
   const [qoderStatusBusy, setQoderStatusBusy] = useState(false);
   const [qoderAccount, setQoderAccount] = useState<UnknownRecord | undefined>(undefined);
+  // A read that never answered is not a signed-out account; the row states the
+  // difference (see the account row below).
+  const [qoderUnread, setQoderUnread] = useState(false);
   const loadQoderAccount = async (refresh: boolean): Promise<UnknownRecord | undefined> => {
     const providerKey = qoderProviderIDFor(kind);
     if (!providerKey) return undefined;
     setQoderStatusBusy(true);
     try {
-      // The read goes through the Core-owned worker, which starts the Qoder
-      // bridge: measured on lv at 1.2 s warm and 4.5 s cold.  A worker that
-      // never answers must not leave the row saying 正在加载 for ever, so the
-      // wait has a deadline and a late answer still lands in the state below.
-      const next = await Promise.race([
-        dispatchWithOutcome("qoder_status", { refresh, provider: providerKey }, "providers_models", true),
-        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), QODER_STATUS_TIMEOUT_MS)),
-      ]);
-      if (!next) return undefined;
+      // The wait is Core's own, not a UI deadline: the worker starts (45 s
+      // ceiling), exchanges a jobToken and re-reads both catalogs (60 s
+      // ceiling), and the read either answers or fails inside those.  This row
+      // used to give up after 20 s and render the unanswered read as "the
+      // desktop app is not signed in" -- over a gateway whose Qoder sign-in is
+      // a seeded file that the worker had just reported signed in (2026-11-12,
+      // lv: filtered by the 20 s race, not by the account).  An unanswered read
+      // now states that it could not read, and the account row keeps the facts
+      // Core last observed while it waits.
+      const next = await dispatchWithOutcome("qoder_status", { refresh, provider: providerKey }, "providers_models", true);
+      if (!next) {
+        setQoderUnread(true);
+        return undefined;
+      }
       const summary = asRecord(asRecord(next.action_summaries?.providers_models).operation_summary);
       const account = asRecord(asRecord(summary.providers)[providerKey]);
       setQoderAccount(account);
+      setQoderUnread(!stringValue(account.state));
       return account;
+    } catch {
+      setQoderUnread(true);
+      return undefined;
     } finally {
       setQoderStatusBusy(false);
     }
@@ -10354,7 +10372,10 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     if (qoderStatusBusy) return;
     try {
       const account = await loadQoderAccount(true);
-      if (!account) return;
+      if (!account) {
+        onStatus?.(translate("providers.accountUnread"));
+        return;
+      }
       if (stringValue(account.state) !== "signed-in") {
         onStatus?.(translate("providers.wizard.qoderSignInRequired"));
         return;
@@ -10369,14 +10390,18 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
     if (!isQoderAccount) return;
     // The credential a Qoder account serves with is not this app's to know
     // from a stored token: it comes from the desktop app, which can sign in or
-    // out under the pane.  So the mount read is the credit-carrying one (the
-    // same reason the WorkBuddy block's is), and it is not skipped just because
-    // Core remembers an observation: after a Core restart that memory is gone,
-    // and an account row that says 未登录 over a signed-in app is exactly the
-    // defect this read exists to prevent.
+    // out under the pane -- or, on a gateway (lv), from the session that
+    // machine was handed, which this app never opens.  The mount read is the
+    // credit-carrying one (the same reason the WorkBuddy block's is), and it
+    // applies the same window WorkBuddy applies: Core's own observation states
+    // the account without a worker round trip, so re-entering the pane inside
+    // the window does not repaint an account it already knows.  Outside it the
+    // read is the live one, and it is not skipped just because Core remembers
+    // an observation that has aged out.
     // One read.  A signed-out answer used to be read again at once, which
     // doubled the wait this row spends saying 正在加载 -- two worker round
     // trips instead of one -- for an answer the first read had already given.
+    if (managedObservationIsFresh(provider, serviceAccountRecheckSeconds(snapshotForCleanups))) return;
     void loadQoderAccount(true);
     // The provider id and its kind are the only triggers: a reload on every
     // render would fight the refresh button beside the account.
@@ -10672,7 +10697,8 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
           <Text style={styles.providerAuthStatusLabel}>{translate("providers.workbuddyAccount")}</Text>
           <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{stringValue(workbuddyFacts.state) === "signed-in"
             ? [stringValue(workbuddyFacts.nickname), stringValue(workbuddyFacts.domain)].filter(Boolean).join(" · ") || translate("common.notAvailable")
-            : progressText(workbuddyStatusBusy, translate) ?? translate("providers.wizard.workbuddySignInRequired", { name: workbuddyAppName(kind, translate) })}</Text>
+            : progressText(workbuddyStatusBusy, translate)
+              ?? translate(workbuddyUnread ? "providers.accountUnread" : "providers.wizard.workbuddySignInRequired", { name: workbuddyAppName(kind, translate) })}</Text>
         </View>
         {/* The credit is a row of its own for every signed-in account, and it
             says which of the three things it is: the remaining credit the
@@ -10688,7 +10714,8 @@ function ProviderEditor({ provider, relaySources, relayStations, native, busy, t
           <Text style={styles.providerAuthStatusLabel}>{translate("providers.qoderAccount")}</Text>
           <Text numberOfLines={1} style={styles.providerAuthStatusValue}>{stringValue(qoderFacts.state) === "signed-in"
             ? [stringValue(qoderFacts.nickname), qoderCredentialSourceLabel(qoderFacts, translate)].filter(Boolean).join(" · ") || translate("common.notAvailable")
-            : progressText(qoderStatusBusy, translate) ?? translate("providers.wizard.qoderSignInRequired")}</Text>
+            : progressText(qoderStatusBusy, translate)
+              ?? translate(qoderUnread ? "providers.accountUnread" : "providers.wizard.qoderSignInRequired")}</Text>
         </View>
         {qoderSignedIn ? <View style={styles.officialStatusRow}>
           <Text style={styles.providerAuthStatusLabel}>{translate("providers.wizard.qoderCredits")}</Text>
