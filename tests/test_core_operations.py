@@ -2332,13 +2332,15 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertTrue(status["ok"])
             self.assertNotIn("code", status)
 
-    def test_a_remote_without_a_digest_record_is_read_from_its_bundle(self) -> None:
+    def test_a_remote_without_a_digest_record_still_carries_the_real_edit(self) -> None:
         """A remote published before digests existed still gets a fair compare.
 
         The record is new, so the first run after an upgrade finds none.  The
-        byte comparison then sees both relay files moved and would stop; the
-        bundle it would download for the comparison anyway answers what each
-        side holds, and the run carries the one real edit instead.
+        remote's relay bytes differ from the baseline, which is a move confined
+        to the one file a pull merges: the local route edit is the side to
+        carry, and the run does not have to download the bundle to learn that.
+        A same-file question still reads the bundle (see the plan test in
+        ``test_webdav_sync``).
         """
 
         with tempfile.TemporaryDirectory() as directory:
@@ -2393,7 +2395,7 @@ class CoreOperationsTests(unittest.TestCase):
             ), mock.patch("young_router.webdav.operations.pull_bundle") as pulled:
                 core.run_automatic_webdav_sync()
 
-            from_bundle.assert_called_once()
+            from_bundle.assert_not_called()
             self.assertEqual(1, len(pushed))
             pulled.assert_not_called()
             self.assertFalse((root / "webdav-conflict.json").exists())

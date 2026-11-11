@@ -828,6 +828,16 @@ def _restated_group_name(name: object, spellings: Mapping[str, str]) -> str:
     return spellings.get(public_name_key(text), "")
 
 
+def _joined_targets(existing: list[str], incoming: list[str]) -> list[str]:
+    """One group's target list with a second entry's hops appended, once each."""
+
+    joined = list(existing)
+    for target in incoming:
+        if target not in joined:
+            joined.append(target)
+    return joined
+
+
 def _restated_fallback_list(targets: object, spellings: Mapping[str, str]) -> list[str]:
     """One fallback target list, in order, with gone targets removed."""
 
@@ -895,6 +905,10 @@ def _group_references_restated(
         if not isinstance(stored, list):
             continue
         restated_list: list[Any] = []
+        # A source that already has an entry, and where that entry sits: two
+        # stored entries can restate onto one group name, and their hops are
+        # one group's list rather than two entries that a reader sees twice.
+        restated_sources: dict[str, int] = {}
         for entry in stored:
             if not isinstance(entry, Mapping):
                 restated_list.append(entry)
@@ -916,8 +930,24 @@ def _group_references_restated(
                 for target in targets if isinstance(targets, list) else ():
                     if not _restated_group_name(target, spellings) and isinstance(target, str) and target.strip():
                         dropped.append(target.strip())
+                # Two entries can restate onto one group name: a rename states
+                # a name the document already served, which merges the two
+                # public models.  Their failover lists are joined -- the second
+                # entry is the same group's other hops, not a replacement for
+                # the first -- and the order the document stated is kept.
+                if name in restated_entry:
+                    restated_entry[name] = _joined_targets(restated_entry[name], restated_targets)
+                    continue
+                earlier = restated_sources.get(name)
+                if earlier is not None and isinstance(restated_list[earlier], dict):
+                    prior = restated_list[earlier]
+                    prior[name] = _joined_targets(prior[name], restated_targets)
+                    continue
                 restated_entry[name] = restated_targets
             if restated_entry:
+                index = len(restated_list)
+                for source in restated_entry:
+                    restated_sources[source] = index
                 restated_list.append(restated_entry)
         if restated_list != stored:
             rewritten[table] = restated_list

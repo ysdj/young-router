@@ -874,7 +874,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'upstream_url_surface: nextSurface,',
             'const nextSurface = stringValue(result.recommended_surface);',
             'isProbeSurface(nextSurface)',
-            'dispatch("model.add_many", {',
+            'dispatchWithOutcome("model.add_many", {',
             'const apiKeyID = stringValue(summary.slot_id);',
             'models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, imported: true, imported_name_case: nameCase, api_key_name: apiKeyName, ...(apiKeyID ? { provider_key_id: apiKeyID } : {}), enabled: true, order: 0 }))',
             '<ProtocolPicker providerId={providerId}',
@@ -2379,7 +2379,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # placeholder used to spell out needed ~241 pt where the control column
         # has ~175, so it truncated mid-number.
         self.assertIn('translate("providers.publicModelDefaultHint", { value: publicModelTokensText(customContext ?? defaultContext, translate) })', inspector)
-        self.assertIn('publicModelDefault(modelContexts, group.name)', inspector)
+        self.assertIn('publicModelDefault(modelContexts, savedPublicName)', inspector)
         self.assertNotIn("publicModelCeiling", inspector)
         self.assertIn('accessory={<ContextWindowHelp recommended={defaultContext} translate={translate} />}', inspector)
         self.assertNotIn("max_output_tokens", inspector)

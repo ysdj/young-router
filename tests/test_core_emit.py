@@ -82,6 +82,28 @@ def _apply_patch(client: dict[str, Any], event: dict[str, Any]) -> dict[str, Any
     return applied
 
 
+class PatchEventShapeTests(unittest.TestCase):
+    def test_a_patch_can_carry_fields_beside_a_domain_rows(self) -> None:
+        """A fields-only patch is a change, and no row op has to stand in."""
+
+        from young_router.core.protocol import ProtocolError, make_patch_event
+
+        event = make_patch_event(
+            4,
+            5,
+            ["providers_models"],
+            [],
+            {"domain_fields": {"providers_models": {"model_contexts": {"route-a": {"context_window": 1000}}}}},
+        )
+        self.assertEqual(
+            {"providers_models": {"model_contexts": {"route-a": {"context_window": 1000}}}},
+            event["domain_fields"],
+        )
+        self.assertEqual([], event["ops"])
+        with self.assertRaises(ProtocolError):
+            make_patch_event(4, 5, [], [], None)
+
+
 class CoreEmitTests(unittest.TestCase):
     def _baseline(self) -> tuple[CoreStore, list[dict[str, Any]]]:
         """A subscribed store whose first event is the full state."""
@@ -197,6 +219,46 @@ class CoreEmitTests(unittest.TestCase):
             ops = json.dumps(event["ops"], separators=(",", ":")).encode("utf-8")
             self.assertLess(len(ops), 4 * 1024, f"the add ops are {len(ops)} bytes")
             self.assertLess(len(payload), 6 * 1024, f"the add patch is {len(payload)} bytes")
+
+    def test_a_model_add_carries_the_context_entry_beside_the_row(self) -> None:
+        """The registry table is keyed by name, so no entity op can name it.
+
+        A window that applied only the row ops kept the table it had, and a
+        model Core had just added drew 无 for its public context until some
+        unrelated read replaced the whole state.  The entry travels beside the
+        row, and it is the one entry that changed rather than the table.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            core = CoreStore(domains=[ProvidersModelsDomain(Path(directory) / "config.yaml")])
+            events: list[dict[str, object]] = []
+            unsubscribe = core.subscribe(events.append)
+            self.addCleanup(unsubscribe)
+            core._emit()
+            _dispatch_provider_add(core)
+            _wait_for_events(core, events, 2)
+
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "model.add",
+                    "payload": {
+                        "provider_id": "primary",
+                        "model": {"name": "added-route", "upstream_model": "openai/added-route"},
+                    },
+                }
+            )
+            _wait_for_events(core, events, 3)
+            event = events[-1]
+            self.assertEqual("patch", event["event"])
+            fields = event["domain_fields"]["providers_models"]
+            self.assertEqual({"added-route"}, set(fields["model_contexts"]))
+            self.assertEqual(272000, fields["model_contexts"]["added-route"]["context_window"])
+            self.assertLess(
+                len(json.dumps(fields["model_contexts"], separators=(",", ":")).encode("utf-8")),
+                512,
+                "the table was carried whole instead of the entry that moved",
+            )
 
     def test_patch_stays_small_at_scale(self) -> None:
         """An add carries the rows it moved, not a second copy of the domain.

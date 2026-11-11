@@ -653,6 +653,12 @@ export interface SnapshotEvent {
  * parts of a snapshot no op can describe (a staged draft's dirty flag, the disk
  * markers, the service row, an action summary).  Each is present only when it
  * changed, so a patch is the size of the edit and not a snapshot with ops.
+ *
+ * ``domain_fields`` carries a domain's fields that no entity op names, keyed by
+ * domain: the registry's context table is keyed by public name, not by a row,
+ * and a run that adds or renames a model changes one entry of it.  A field
+ * whose value is an object on both sides is merged one level (the entries the
+ * patch states), so the table costs the entry it moved rather than itself.
  */
 export interface PatchEvent {
   protocol_version: typeof IPC_PROTOCOL_VERSION;
@@ -664,6 +670,7 @@ export interface PatchEvent {
   drafts?: CoreSnapshot["drafts"];
   disk?: CoreSnapshot["disk"];
   action_summaries?: CoreSnapshot["action_summaries"];
+  domain_fields?: Partial<Record<ConfigDomain, Record<string, unknown>>>;
   ops: IpcEventOp[];
 }
 

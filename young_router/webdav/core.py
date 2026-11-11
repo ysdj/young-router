@@ -61,6 +61,13 @@ BUNDLE_MISSING_STATUS = frozenset({403, 404, 405, 409, 410, 501})
 
 RELAY_ACCOUNTS_FILE = "relay-accounts.json"
 """The one synced target whose content exists nowhere else."""
+
+#: The files a pull merges instead of replacing.  ``install_bundle`` installs
+#: the peer's other work and keeps the stations, sessions, and removals this
+#: machine holds in these, so a move here is not a competing edit to the same
+#: content: both sides survive the pull.  A direction that takes the peer's
+#: other files therefore carries its edit without discarding this side's store.
+MERGE_ON_PULL = frozenset({RELAY_ACCOUNTS_FILE})
 SENSITIVE_QUERY_KEYS = {"x-vercel-protection-bypass"}
 SYNC_STATE_VERSION = 1
 SYNC_DIGESTS_VERSION = 1
@@ -1320,6 +1327,20 @@ def smart_sync_plan(
     are a choice the reader has to make.  That rule is the same whether or not
     the two snapshots name the same files, so there is one loop over the union
     of them rather than a bundle-level rule that restates it.
+
+    One move on each side is not yet a choice when the two moves are different
+    files.  The relay store is the file a pull merges rather than replaces: a
+    pull installs the peer's other work and keeps every station, session, and
+    removal this machine holds (``install_bundle``).  A relay-side move -- the
+    residue a pull leaves when it keeps something the bundle did not carry --
+    is therefore not an edit that competes with the peer's: a pull carries the
+    peer's edit and keeps this side's store, and the merge is pushed on a later
+    run.  Reading that pair as a conflict is what stopped a gateway from taking
+    a route added on the desktop because its own store still held a tombstone.
+    The same holds with the sides swapped, where the push carries this side's
+    edit and the peer's store survives on the peer until it merges again.  A
+    move confined to a mergeable file on both sides is still a conflict: two
+    different stores are two edits to reconcile, not a direction to take.
     """
 
     local = as_snapshot(local)
@@ -1341,8 +1362,11 @@ def smart_sync_plan(
     if base.manifest is None or not isinstance(base.manifest, dict):
         return "pull" if newest_snapshot(local.manifest, remote.manifest) == "remote" else "push"
     base_digests = _completed_baseline_digests(base, local, remote)
-    local_moved = False
-    remote_moved = False
+    # Which files each side moved, not merely whether some file moved on each.
+    # The direction is decided by the files, so the same-file conflict and the
+    # disjoint merge are two different questions.
+    local_moved: set[str] = set()
+    remote_moved: set[str] = set()
     for name in sorted(names):
         if _fingerprint_matches(
             local.fingerprints.get(name),
@@ -1369,12 +1393,18 @@ def smart_sync_plan(
             # damaged comparison rather than an edit.  Ask the reader.
             return "conflict"
         if local_unchanged:
-            remote_moved = True
+            remote_moved.add(name)
         elif remote_unchanged:
-            local_moved = True
+            local_moved.add(name)
         else:
+            # One file changed on both sides: neither copy is a version of the
+            # other, and no direction can carry both.
             return "conflict"
     if local_moved and remote_moved:
+        if local_moved <= MERGE_ON_PULL:
+            return "pull"
+        if remote_moved <= MERGE_ON_PULL:
+            return "push"
         return "conflict"
     if local_moved:
         return "push"

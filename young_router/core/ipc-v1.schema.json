@@ -117,6 +117,11 @@
           "drafts": {"type": "object"},
           "disk": {"type": "object"},
           "action_summaries": {"type": "object"},
+          "domain_fields": {
+            "type": "object",
+            "additionalProperties": {"type": "object"},
+            "description": "Per-domain projection fields no entity op names; a table-valued field carries only the entries that changed."
+          },
           "ops": {
             "type": "array",
             "items": {

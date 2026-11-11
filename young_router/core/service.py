@@ -2561,6 +2561,11 @@ class CoreStore:
             raise _PatchUnavailable
         ops: list[dict[str, Any]] = []
         changed: list[str] = []
+        # The fields beside each domain's rows, keyed by domain: a projection
+        # field an entity op cannot name (the registry's context table) travels
+        # here so a window that applies only the row ops is not left drawing
+        # the previous answer for a model this revision added.
+        domain_fields: dict[str, dict[str, Any]] = {}
         for name, current in domains.items():
             if not isinstance(name, str):
                 raise _PatchUnavailable
@@ -2576,7 +2581,16 @@ class CoreStore:
                 # A domain whose diff cannot answer must not take the event
                 # channel down with it: the window reads the state instead.
                 raise _PatchUnavailable from None
-            if not domain_ops:
+            beside_row_changes = getattr(adapter, "beside_row_changes", None)
+            try:
+                fields = beside_row_changes(before, current) if callable(beside_row_changes) else {}
+            except Exception:
+                # A field this revision cannot describe is a reason to read the
+                # state, not a reason to leave a window holding the old one.
+                raise _PatchUnavailable from None
+            if not isinstance(fields, Mapping):
+                raise _PatchUnavailable
+            if not domain_ops and not fields:
                 if _only_revision_moved(before, current):
                     # Every commit advances the domain's own revision counter,
                     # including one that staged a draft and committed no row.
@@ -2593,15 +2607,21 @@ class CoreStore:
                 if len(ops) >= MAX_PATCH_OPS:
                     raise _PatchUnavailable
                 ops.append(op.to_mapping())
+            if fields:
+                domain_fields[name] = copy.deepcopy(dict(fields))
             changed.append(name)
         # The fields a window cannot derive from the ops it just applied.  An
         # equal field is omitted: restating an unchanged draft or disk marker
-        # would make every patch a snapshot with ops attached.
+        # would make every patch a snapshot with ops attached.  ``domain_fields``
+        # is built above from the domains themselves; it is not a snapshot field
+        # this loop could copy.
         top_level = {
             name: copy.deepcopy(projected.get(name))
             for name in PATCH_TOP_LEVEL_FIELDS
-            if previous.get(name) != projected.get(name)
+            if name != "domain_fields" and previous.get(name) != projected.get(name)
         }
+        if domain_fields:
+            top_level["domain_fields"] = domain_fields
         if not ops:
             # No row moved.  A commit that only staged a draft -- the edit a
             # person makes before the Apply that writes it -- is exactly this

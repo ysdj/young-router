@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { providerCredentialKeys, relayCredentialKey } from "../rn/packages/shared/src/ui/providerCredentials.ts";
+import { followedCredentialChoiceID, providerCredentialKeys, relayCredentialKey } from "../rn/packages/shared/src/ui/providerCredentials.ts";
 
 const slot = (id, name, source, managed = false) => ({ id, name, managed, source });
 const relay = (accountID, resourceID, name) => ({
@@ -97,6 +97,28 @@ const relay = (accountID, resourceID, name) => ({
     slot("slot-held", "国模", { kind: "relay", stationID: "station-a", accountID: "login-1", resourceID: "sub2api-1" }),
   ], [relay("login-1", "sub2api-1", "国模")]);
   assert.deepEqual(keys.map((entry) => entry.name), ["r-kiro", "国模", "Claude Max"]);
+}
+
+// A station key Core had no slot for is offered under `relay:<account>\x1f<res>`;
+// the relay fetch stages the slot, and the same key is then offered under the
+// slot's id.  A repair follows the credential, not "the first usable key": the
+// listing that is still answering for that key must not be handed to another
+// one (the pane jumped to r-kiro while reading the group the user chose).
+{
+  const choices = [
+    { id: "slot-custom", credentialKey: "slot:slot-custom" },
+    { id: "provider-slot-gemini", credentialKey: relayCredentialKey("login-1", "sub2api-4036") },
+  ];
+  assert.equal(
+    followedCredentialChoiceID(choices, `relay:${relayCredentialKey("login-1", "sub2api-4036")}`),
+    "provider-slot-gemini",
+    "a slot appearing for the selected station key moved the picker",
+  );
+  assert.equal(followedCredentialChoiceID(choices, "provider-slot-gemini"), "provider-slot-gemini");
+  // A credential that is gone is not another credential.
+  assert.equal(followedCredentialChoiceID(choices, `relay:${relayCredentialKey("login-1", "gone")}`), undefined);
+  assert.equal(followedCredentialChoiceID(choices, "provider-slot-deleted"), undefined);
+  assert.equal(followedCredentialChoiceID(choices, undefined), undefined);
 }
 
 console.log("RN provider credential list regression tests OK");

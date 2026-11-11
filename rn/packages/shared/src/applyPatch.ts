@@ -135,6 +135,9 @@ export function applyPatch(snapshot: CoreSnapshot, event: PatchEvent): CoreSnaps
 
   const domains = snapshot.domains;
   const touched = new Set<string>();
+  const fieldsByDomain: Record<string, Record<string, unknown>> = isRecord(event.domain_fields)
+    ? event.domain_fields as Record<string, Record<string, unknown>>
+    : {};
   for (const op of event.ops) {
     if (!isRecord(op)) return undefined;
     if (op.kind !== "upsert" && op.kind !== "remove" && op.kind !== "replace") return undefined;
@@ -148,24 +151,41 @@ export function applyPatch(snapshot: CoreSnapshot, event: PatchEvent): CoreSnaps
     }
     touched.add(op.domain);
   }
-  // Core lists a domain only when it emits a row for it; a listed domain with
-  // no op means this module would leave a changed projection untouched.
+  // Core lists a domain only when it changed; a listed domain with neither an
+  // op nor a field patch means this module would leave a changed projection
+  // untouched.  A domain's fields beside its rows (the registry's context
+  // table) travel in `domain_fields` because no entity op can name them.
   for (const domain of event.domains) {
-    if (typeof domain !== "string" || !touched.has(domain)) return undefined;
+    if (typeof domain !== "string") return undefined;
+    if (!touched.has(domain) && !isRecord(fieldsByDomain[domain])) return undefined;
+  }
+  for (const domain of Object.keys(fieldsByDomain)) {
+    if (!(event.domains as string[]).includes(domain) || !isRecord(fieldsByDomain[domain])) return undefined;
   }
 
   const nextDomains: Record<string, unknown> = { ...domains };
-  for (const domain of touched) {
+  const domainNames = new Set([...touched, ...Object.keys(fieldsByDomain)]);
+  for (const domain of domainNames) {
     const ops = event.ops.filter((op) => op.domain === domain);
     const replacements = ops.filter((op) => op.kind === "replace");
     if (replacements.length > 0) {
       // `replace` is the whole projection; any other op beside it would be
-      // naming a row of a state that no longer exists.
-      if (ops.length !== 1) return undefined;
+      // naming a row of a state that no longer exists, and fields beside it
+      // would be merging into a projection that is already the authority.
+      if (ops.length !== 1 || fieldsByDomain[domain] !== undefined) return undefined;
       nextDomains[domain] = cloneValue(replacements[0].value);
       continue;
     }
-    const updated = applyEntityOps(domain, domains[domain], ops);
+    // The fields beside the rows are merged first: a row op that names a public
+    // model consults the context table while it is applied, so the entry this
+    // same patch carries has to be in place before the row is placed.
+    let projection: unknown = domains[domain];
+    const fields = fieldsByDomain[domain];
+    if (fields !== undefined) {
+      projection = mergeDomainFields(projection, fields);
+      if (projection === undefined) return undefined;
+    }
+    const updated = ops.length > 0 ? applyEntityOps(domain, projection, ops) : projection;
     if (updated === undefined) return undefined;
     nextDomains[domain] = updated;
   }
@@ -196,6 +216,25 @@ export function applyPatch(snapshot: CoreSnapshot, event: PatchEvent): CoreSnaps
   if (touched.has("logs")) next.logs = logsSummary(snapshot.logs, nextDomains.logs);
   if (touched.has("language")) next.language = languageSummary(nextDomains.language);
   return next;
+}
+
+/**
+ * Merge a domain's fields beside its rows into the projection the window holds.
+ *
+ * An object-valued field (the registry's context table) travels as the entries
+ * that changed, so it is merged one level into the map in hand; every other
+ * field is the whole value.  An entry a patch no longer states is left in
+ * place: the table is read by public name, and no row carries a name that left
+ * it, so a stale entry is unreadable and the next full projection drops it.
+ */
+function mergeDomainFields(projection: unknown, patch: Record<string, unknown>): unknown {
+  if (!isRecord(projection) || !isRecord(patch)) return undefined;
+  const merged: UnknownRecord = { ...projection };
+  for (const [field, value] of Object.entries(patch)) {
+    const held = projection[field];
+    merged[field] = isRecord(value) && isRecord(held) ? { ...held, ...cloneValue(value) } : cloneValue(value);
+  }
+  return merged;
 }
 
 /**
@@ -293,6 +332,26 @@ function applyProvidersModelsOps(projection: unknown, ops: IpcEventOp[]): unknow
   }
   for (const op of removals) {
     if (!removeEntity(providers, op.id as string, writtenModels, removalsLeft)) return undefined;
+  }
+  // A model row's public name is looked up in `model_contexts`; a patch that
+  // adds or renames a row without stating that name's entry would leave the
+  // pane drawing 无 for a model Core just described.  A newer Core carries the
+  // entry beside the row (`domain_fields`), so this only refuses the answers
+  // that cannot -- an older Core, or a field this module failed to merge -- and
+  // the caller reads the projection instead.  A table with no entries at all
+  // is not evidence of a missing row: the whole registry could not resolve a
+  // name, and refusing would ask for the same empty answer forever.
+  const contexts = isRecord(projection.model_contexts) ? projection.model_contexts : undefined;
+  if (contexts && Object.keys(contexts).length > 0) {
+    const described = new Set(Object.keys(contexts).map((name) => name.trim()));
+    for (const provider of providers) {
+      if (!isRecord(provider) || !Array.isArray(provider.models)) continue;
+      for (const model of provider.models) {
+        if (!isRecord(model)) continue;
+        const name = firstString(model.model_name, model.name).trim();
+        if (name && !described.has(name)) return undefined;
+      }
+    }
   }
   return { ...projection, providers, provider_count: providers.length };
 }

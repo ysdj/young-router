@@ -99,7 +99,14 @@ EVENT_DOMAINS = frozenset(_PROTOCOL_SCHEMA.get("$defs", {}).get("domain", {}).ge
 # them from the ops it applied, and a patch that leaves them out leaves the
 # reader believing a state the store has already left.  Every one is optional
 # on the wire: an unchanged field is omitted rather than restated.
-PATCH_TOP_LEVEL_FIELDS = ("service", "drafts", "disk", "action_summaries")
+#
+# ``domain_fields`` carries the part of one domain's projection that no entity
+# op names -- the registry's context table is keyed by public name, not by a
+# row -- as ``{domain: {field: value}}``.  A table-valued field travels as the
+# entries that changed, which the window merges into the table it holds; every
+# other field travels whole.  The service builds it from the domain's own
+# ``beside_row_changes``; see ``_patch_event``.
+PATCH_TOP_LEVEL_FIELDS = ("service", "drafts", "disk", "action_summaries", "domain_fields")
 
 
 def _safe_text(value: object, label: str, *, maximum: int) -> str:
@@ -684,9 +691,10 @@ def make_patch_event(
     ``ops`` is what a window applies; ``domains`` names the projections those
     ops belong to so a window can tell which panes owe a repaint.  ``top_level``
     carries the snapshot fields that are not keyed by domain and did change, by
-    name: a staged draft, the disk markers, the service row, an action summary.
-    A field that did not move is left out, so a patch stays the size of the edit
-    instead of becoming a snapshot with ops attached.
+    name: a staged draft, the disk markers, the service row, an action summary,
+    and the fields beside a domain's rows (``domain_fields``).  A field that did
+    not move is left out, so a patch stays the size of the edit instead of
+    becoming a snapshot with ops attached.
 
     Either half can be the whole event.  A commit that only staged a draft
     names no row -- the draft *is* the projection a window draws -- and that

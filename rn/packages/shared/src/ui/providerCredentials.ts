@@ -147,3 +147,37 @@ export function providerCredentialKeys(
   }
   return keys;
 }
+
+/** One entry of the key picker: its choice id and the credential it names. */
+export type CredentialChoiceIdentity = {
+  id: string;
+  /** `providerCredentialKeys`' own identity for this credential, when it has one. */
+  credentialKey?: string;
+};
+
+/**
+ * The picker entry that names the same credential after its id moved.
+ *
+ * A station key that Core holds no slot for yet is offered under
+ * `relay:<accountID>\x1f<resourceID>`.  A relay fetch stages the slot for the
+ * credential it read, and the same key is then offered under the slot's id --
+ * so a repair that looked only for the old id found nothing, fell back to "the
+ * first usable key", and the pane jumped to another credential while the
+ * listing was still answering for the one the user chose.  The identity here is
+ * the shared derivation's own key, so the two spellings are one credential; an
+ * id that names no credential stays unresolved rather than becoming another
+ * row's selection.
+ */
+export function followedCredentialChoiceID(
+  choices: readonly CredentialChoiceIdentity[],
+  previousID: string | undefined,
+): string | undefined {
+  if (!previousID) return undefined;
+  if (choices.some((choice) => choice.id === previousID)) return previousID;
+  // A relay choice's id carries the credential key it was offered under before
+  // the slot existed: `relay:<accountID>\x1f<resourceID>`.
+  if (!previousID.startsWith("relay:")) return undefined;
+  const credentialKey = previousID.slice("relay:".length);
+  if (!credentialKey) return undefined;
+  return choices.find((choice) => choice.credentialKey === credentialKey)?.id;
+}

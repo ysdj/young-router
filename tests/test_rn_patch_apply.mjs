@@ -332,4 +332,69 @@ assert.equal(
   "a window already behind skipped the read",
 );
 
+// ---------------------------------------------------------------------------
+// The fields beside a domain's rows.  `model_contexts` is keyed by public name,
+// so no entity op names it: a patch that adds a route carries the route's entry
+// and the window merges it into the table it holds.  A patch that adds a route
+// without the entry is refused -- reading the projection is how the pane gets
+// the number instead of drawing 无 for a model Core just described.
+// ---------------------------------------------------------------------------
+const described = snapshotAt(9, [provider]);
+described.domains.providers_models.model_contexts = {
+  "public-route": { context_window: 200000, max_context_window: 200000, recommended_context_window: 200000 },
+};
+const withEntry = applyPatch(described, {
+  protocol_version: 1,
+  event: "patch",
+  base_revision: 9,
+  revision: 10,
+  domains: ["providers_models"],
+  domain_fields: {
+    providers_models: {
+      model_contexts: {
+        "public-route-2": { context_window: 1000000, max_context_window: 1000000, recommended_context_window: 1000000 },
+      },
+    },
+  },
+  ops: [{ domain: "providers_models", kind: "upsert", id: "model:public-route-2", value: model("public-route-2") }],
+});
+assert.ok(withEntry, "a patch that carried the context entry was refused");
+assert.deepEqual(
+  Object.keys(withEntry.domains.providers_models.model_contexts).sort(),
+  ["public-route", "public-route-2"],
+  "the entry beside the row was not merged into the table the window held",
+);
+assert.equal(withEntry.domains.providers_models.model_contexts["public-route-2"].context_window, 1000000);
+assert.equal(withEntry.domains.providers_models.model_contexts["public-route"].context_window, 200000);
+
+const withoutEntry = applyPatch(described, {
+  protocol_version: 1,
+  event: "patch",
+  base_revision: 9,
+  revision: 10,
+  domains: ["providers_models"],
+  ops: [{ domain: "providers_models", kind: "upsert", id: "model:public-route-2", value: model("public-route-2") }],
+});
+assert.equal(withoutEntry, undefined, "a route with no entry in the table was applied as 无");
+
+// A domain listed only for its fields is still a state this module can hold:
+// the context table moved with no row.
+const fieldsOnly = applyPatch(described, {
+  protocol_version: 1,
+  event: "patch",
+  base_revision: 9,
+  revision: 10,
+  domains: ["providers_models"],
+  domain_fields: {
+    providers_models: {
+      model_contexts: {
+        "public-route": { context_window: 210000, max_context_window: 210000, recommended_context_window: 210000 },
+      },
+    },
+  },
+  ops: [],
+});
+assert.ok(fieldsOnly, "a fields-only patch was refused");
+assert.equal(fieldsOnly.domains.providers_models.model_contexts["public-route"].context_window, 210000);
+
 console.log(`RN patch apply tests OK (skipped ${skipped}/${skipped + refreshed} post-action refreshes)`);

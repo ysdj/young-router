@@ -314,6 +314,23 @@ def _provider_entities(projection: Mapping[str, Any]) -> dict[str, Mapping[str, 
     return index_entities(projection.get("providers"), "id", "name")
 
 
+#: The projection fields the provider and route rows already carry.  Everything
+#: else in this domain's snapshot -- the registry's context table, the binding
+#: issues a refused write named, whether the document exists -- is resolved
+#: beside the rows and cannot be named by an entity op.
+_PROJECTION_ROW_FIELDS = frozenset({"domain", "revision", "providers", "provider_count"})
+
+
+def _projection_beside_rows(projection: Mapping[str, Any]) -> dict[str, Any]:
+    """The part of a snapshot that no provider or route op describes."""
+
+    return {
+        key: value
+        for key, value in projection.items()
+        if key not in _PROJECTION_ROW_FIELDS
+    }
+
+
 def _model_entities(projection: Mapping[str, Any]) -> dict[tuple[str, str], Mapping[str, Any]]:
     """Every route in this projection, keyed by its provider and its own id.
 
@@ -1228,6 +1245,14 @@ class ProvidersModelsDomain:
         that applies ops entity by entity never has to re-read the domain.  A
         removed provider names no value; a window that kept the row would
         otherwise show a provider the store deleted.
+
+        Fields beside the rows -- ``model_contexts``, ``binding_issues``, the
+        session window, whether the document exists -- are not carried by any
+        provider or route, so no entity op can name them; they travel through
+        ``beside_row_changes`` instead.  A window that received only the row
+        ops would keep the registry table it had, and a model Core just added
+        (or renamed) would draw 无 for its public context until an unrelated
+        read replaced the whole state.
         """
 
         ops: list[EntityOp] = []
@@ -1248,6 +1273,44 @@ class ProvidersModelsDomain:
             if key not in current_models:
                 ops.append(EntityOp(self.name, "remove", f"model:{key[1]}"))
         return ops
+
+    def beside_row_changes(
+        self, previous: Mapping[str, Any], current: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """The projection fields beside the rows, as the smallest patch for them.
+
+        ``model_contexts`` is keyed by public name and carries three numbers per
+        name: a model add or rename changes one entry, and sending the whole
+        table would make a one-row edit the size of the registry.  A changed
+        entry therefore travels alone (the window merges it into the table it
+        holds), which is also the one field an entity op cannot name.  A name
+        that left the table is not stated: no row carries it any more, so no
+        pane can read it, and the next full projection drops it.
+
+        Every other field beside the rows is small -- the binding issue a
+        refused write named, the concurrency cap, whether the document exists --
+        so it travels whole.  The domain revision is deliberately absent: it
+        moves on every commit, and a commit that moved nothing else is already a
+        no-op to the emitter.
+        """
+
+        changed: dict[str, Any] = {}
+        for key in _projection_beside_rows(current):
+            before = previous.get(key) if isinstance(previous, Mapping) else None
+            value = current.get(key)
+            if before == value:
+                continue
+            if key == "model_contexts" and isinstance(before, Mapping) and isinstance(value, Mapping):
+                entries = {
+                    name: entry
+                    for name, entry in value.items()
+                    if before.get(name) != entry
+                }
+                if entries:
+                    changed[key] = entries
+                continue
+            changed[key] = copy.deepcopy(value)
+        return changed
 
     def _model_concurrency_default(self) -> int:
         """The runtime's global concurrency limit, as a route inherits it."""
@@ -8834,6 +8897,17 @@ class ProvidersModelsDomain:
         ``model_info`` so the managed catalog and the proxy's model metadata
         read the same numbers.  One staged action keeps the group consistent
         instead of leaving the pane to patch its routes one by one.
+
+        Stating a name the document already serves **merges** the two groups:
+        the renamed routes join the group that name already had, which is what
+        the pane shows after the write.  Refusing it left a route that an
+        import filed under its channel spelling (``name (cursor)``) unable to
+        join its own public model at all, and the only other way to do it —
+        deleting and re-creating the routes — costs every route its order,
+        credentials, and probe history.  A name is the group, so the merged
+        table names it once; the fallback tables restate both spellings to it,
+        and their target lists are joined rather than one list replacing the
+        other.
         """
 
         public_model = str(
@@ -8877,28 +8951,11 @@ class ProvidersModelsDomain:
                     matched.append((provider_index, model_index))
         if not matched:
             raise DomainError("The selected public model is unavailable")
-        # A rename is a change of name, so another group is only in the way when
-        # it states the new name.  The import settled the case of every group's
-        # own spelling; a rename is the user stating it, and one public model is
-        # not another group's second spelling.
-        if public_name_key(next_name) != public_name_key(public_model):
-            matched_set = set(matched)
-            for provider_index, provider in enumerate(self._draft["providers"]):
-                if not isinstance(provider, Mapping):
-                    continue
-                models = provider.get("models", [])
-                if not isinstance(models, list):
-                    continue
-                for model_index, model in enumerate(models):
-                    if (
-                        isinstance(model, Mapping)
-                        and (provider_index, model_index) not in matched_set
-                        and public_name_key(model.get("model_name", ""))
-                        == public_name_key(next_name)
-                    ):
-                        raise DomainError(
-                            "A public model with that name already exists"
-                        )
+        # A name the document already serves is where these routes belong, not
+        # a name another group owns: the write merges them into that group and
+        # the pane draws one public model afterwards.  The one rule that stays
+        # is spelling: the name is the identity, so a differently-cased name is
+        # another group unless the user states that case deliberately.
 
         changed_providers: dict[int, dict[str, Any]] = {}
         for provider_index, model_index in matched:

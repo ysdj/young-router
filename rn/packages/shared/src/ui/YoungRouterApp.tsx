@@ -40,7 +40,7 @@ import { relayLoginLandedAccount, suggestedProviderName, suggestedRelayStationNa
 import { multiplierSpelling, rateNumber, rateSpelling } from "./rateSpelling";
 import { applyPatch, mergeSnapshot, snapshotProjectionRevision } from "../applyPatch";
 import { postActionRefreshNeeded, publishSnapshot, useDomainRecord, type EventChannelState } from "./snapshotStore";
-import { providerCredentialKeys, relayCredentialKey } from "./providerCredentials";
+import { followedCredentialChoiceID, providerCredentialKeys, relayCredentialKey } from "./providerCredentials";
 import { focusProviderAfterWizard, isAssistantEditorOpen, isGroupManagerOpen, isProviderWizardOpen, isWebDavSettingsOpen, providerWizardFocusID, setAssistantEditorOpen, setGroupManagerOpen, setProviderWizardOpen, setWebDavSettingsOpen, subscribeProviderWizard } from "./providerWizardGate";
 import { RelayDialogHost, useRelayDialogSurface } from "./relayDialogSurface";
 import { SOURCE_LIST_FONT_SIZE, UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
@@ -1027,6 +1027,13 @@ type ProviderKeyChoice = {
   name: string;
   /** ``account`` is a signed-in login: it is asked as that account, not by key. */
   kind: "independent" | "relay" | "account";
+  /**
+   * The credential this choice names, in ``providerCredentialKeys``' spelling.
+   * A station key is offered as `relay:…` until Core stages its slot and as the
+   * slot's id afterwards: the key is what keeps both spellings one credential
+   * when a selection is repaired, so a picker never falls back to another row.
+   */
+  credentialKey?: string;
   state?: ProviderKeyState;
   source?: RelaySourceOption;
 };
@@ -1230,6 +1237,7 @@ function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOp
     id: entry.slotID ?? `relay:${entry.key}`,
     name: entry.name,
     kind: entry.kind,
+    credentialKey: entry.key,
     state: entry.slotID === undefined ? undefined : stateByID.get(entry.slotID),
     source: entry.resource === undefined ? undefined : sourceByKey.get(entry.key),
   }));
@@ -1574,14 +1582,15 @@ const TRANSIENT_READ_ACTIONS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Actions whose answer is a read of external state rather than a staged edit:
- * the key list a station reported, an official-account authorization poll, a
- * live model fetch.  They change no draft, but each one still advances Core's
- * shared revision, so the shell's debounced Apply cannot key itself on the
- * revision alone — every such read looks like a pending local edit and
- * collects a fresh Core Apply a fraction of a second after the user's own
- * commit already applied.  Retry semantics are unaffected: the retryable set
- * below already covers all of them because it is broader.
+ * Actions whose answer is a read of external state rather than an edit the user
+ * made: the key list a station reported, an official-account authorization
+ * poll, a live model fetch.  They run on their own lane so a worker's cold start
+ * or a station round trip never queues ahead of the user's next edit.  Most of
+ * them stage nothing; a relay fetch does stage the key slot its roster is filed
+ * under, and the pane applies that write itself without a save report
+ * (`fetchModels`) instead of letting the debounce speak for a read.  Retry
+ * semantics are unaffected: the retryable set below already covers all of them
+ * because it is broader.
  */
 const NON_STAGING_ACTIONS: ReadonlySet<string> = new Set([
   ...TRANSIENT_READ_ACTIONS,
@@ -4297,7 +4306,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={[styles.windowSurface, shell && isWindowsShell && styles.windowSurfaceShellWindows]}>
     {!shell && route !== "providers-models" && route !== "logs" && route !== "provider-wizard" && route !== "file-editor" && route !== "data-management" && route !== "webdav-settings" ? <WindowTitle title={windowTitle} /> : null}
     {route === "providers-models" || route === "provider-wizard" || route === "file-editor" || route === "webdav-settings" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, (route === "provider-wizard" || route === "webdav-settings") && styles.childRouteContent, (settingsRoute || route === "runtime-settings" || route === "data-management" || route === "general-settings") && SETTINGS_PANE_ROUTE, route === "logs" && styles.logsContent]}>
-    {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} onOpenWizard={() => { native.window.open("provider-wizard"); native.window.focus("provider-wizard"); }} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
+    {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} applyStagedQuietly={applyStagedQuietly} onOpenWizard={() => { native.window.open("provider-wizard"); native.window.focus("provider-wizard"); }} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
     {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} status={result} /> : null}
     {route === "webdav-settings" ? <WebDavSettingsPanel snapshot={snapshot} busy={busy} status={dataManagementStatuses.webdav} translate={translate} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onProbe={probeWebDavDetails} onSave={saveWebDavDetails} onSync={syncWebDavAndReadState} onCompareConflict={compareWebDavConflict} onResolveConflict={resolveWebDavConflictAndReadState} onSetContentSize={(width, height) => { void native.window.setContentSize?.("webdav-settings", width, height); }} onClose={closeRoute} /> : null}
@@ -6855,7 +6864,7 @@ const ProviderListTable = React.memo(function ProviderListTable({ translate, sel
   return <NativeTable columns={[{ label: translate("providers.provider"), width: 112 }]} rows={rows} secondaryRowKeys={secondaryRowKeys} alertRowKeys={alertRowKeys} selectedKey={selectedProviderId} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { if (key) onSelect(key); }} style={styles.nativeProviderTable} />;
 });
 
-function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate, dispatch, dispatchWithOutcome, onStatus, onSecretState, applyProbedSurface, onOpenWizard, relay, addOfficialAccount }: { snapshot?: CoreSnapshot; ipc: IpcClient; onSnapshot: (next: CoreSnapshot) => void; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onStatus: (status?: string) => void; onSecretState: (state: SecretState) => void; applyProbedSurface: ApplyProbedSurface; onOpenWizard: () => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind) => Promise<string> }): React.JSX.Element {
+function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate, dispatch, dispatchWithOutcome, onStatus, onSecretState, applyProbedSurface, applyStagedQuietly, onOpenWizard, relay, addOfficialAccount }: { snapshot?: CoreSnapshot; ipc: IpcClient; onSnapshot: (next: CoreSnapshot) => void; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onStatus: (status?: string) => void; onSecretState: (state: SecretState) => void; applyProbedSurface: ApplyProbedSurface; applyStagedQuietly: () => Promise<void>; onOpenWizard: () => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind) => Promise<string> }): React.JSX.Element {
   const [modelTableWidth, setModelTableWidth] = useState(0);
   const [routeTableWidth, setRouteTableWidth] = useState(0);
   const state = domainState(snapshot, "providers_models");
@@ -7319,7 +7328,21 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     setProviderSourceModel(undefined);
   }, [providerFocusRevision, providers]);
   useEffect(() => {
-    if (!fetchKeyChoices.some((choice) => choice.id === fetchKeyID)) chooseFetchKey(preferredFetchKeyID);
+    if (fetchKeyID === undefined || fetchKeyChoices.some((choice) => choice.id === fetchKeyID)) return;
+    // A station key that acquired its slot is still the credential the user
+    // chose: the picker's id moved from `relay:…` to the slot's, and following
+    // it is a repair, not a new question.  Repairing through `chooseFetchKey`
+    // bumped the fetch generation, so the listing that was still answering for
+    // that key was discarded and the picker fell back to the first usable row.
+    const followed = followedCredentialChoiceID(fetchKeyChoices, fetchKeyID);
+    if (followed !== undefined) {
+      fetchKeyIDRef.current = followed;
+      setFetchKeyID(followed);
+      return;
+    }
+    // The credential itself is gone (another provider, a deleted key): that is
+    // a new question, and the first usable choice is the only answer left.
+    chooseFetchKey(preferredFetchKeyID);
   }, [fetchKeyChoices, fetchKeyID, preferredFetchKeyID, providerId]);
   // 获取模型 asks one credential for its roster, and the row the user is
   // looking at names that credential.  A picker left on whatever key happened
@@ -7405,13 +7428,19 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       // previously the pane stayed on whatever row happened to be selected, so
       // the new model looked like it had not been added at all.
       pendingModelIds.current = { providerId, ids: new Set(models.map(editorIdentifier)) };
-      void dispatch("model.add_many", {
+      // The import's own answer is the snapshot `settlePendingModels` reads to
+      // tell the new rows from the ones the pane already had.  A fire-and-forget
+      // `dispatch` answers `undefined`, which cleared the pending selection
+      // before the rows arrived, so the pane never opened the route it had just
+      // created (the service-catalog path beside this one already asked for the
+      // snapshot).
+      void dispatchWithOutcome("model.add_many", {
         provider_id: providerId,
         models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, imported: true, imported_name_case: nameCase, api_key_name: apiKeyName, ...(apiKeyID ? { provider_key_id: apiKeyID } : {}), enabled: true, order: 0 })).map((model) => ({
           ...model,
           ...modelRecordCapabilityChanges(modelCapabilities[model.upstream_model]),
         })),
-      }).then((next) => { settlePendingModels(next, providerId); });
+      }, "providers_models").then((next) => { settlePendingModels(next, providerId); }).catch(() => undefined);
     }).catch(() => undefined);
   };
   /**
@@ -7508,6 +7537,12 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       provider_id: providerId,
       api_key_name: choice?.name ?? "",
     };
+    // Whether this press finds a clean draft.  A relay fetch stages the key
+    // slot its roster is filed under, so the answer leaves a draft to write
+    // even though the user only read.  When the draft was clean, that write is
+    // the read's own and the pane applies it quietly; when the user had an edit
+    // pending, the ordinary debounce keeps its report of the save.
+    const draftWasClean = asRecord(asRecord(snapshot?.drafts).providers_models).dirty !== true;
     // This press owns the button until another credential is selected; a later
     // selection bumps the generation and this run stops touching the pane (the
     // `finally` below only clears a busy state it still owns).
@@ -7526,6 +7561,13 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       // app's live catalog), so the rest of the pane stays usable while it
       // waits.  The row list it stages still applies as a normal write.
       const next = await dispatchWithOutcome(action, payload, "providers_models", true);
+      if (next && draftWasClean && asRecord(asRecord(next.drafts).providers_models).dirty === true) {
+        // Apply what the read staged, without the strip claiming a save: the
+        // press asked a station for a roster, and 已保存 is the answer to an
+        // edit.  `applyStagedQuietly` is the shell's ordinary background write
+        // (the same one a child surface uses), so the pane stays usable.
+        void applyStagedQuietly().catch(() => undefined);
+      }
       // A roster that lands after the picker moved is not this pane's answer:
       // the chooser it would open names a key the user has already left, and
       // the rows it stages belong to that key.
@@ -7543,14 +7585,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         onStatus(translate("providers.fetchFailed", { detail: translate("providers.fetchKeyUnavailable") }));
         return;
       }
-      const slotID = stringValue(summary.slot_id);
-      if (slotID) {
-        // This run is the one the ref points at, so its own slot is not a
-        // selection: recording it keeps a later picker event for the same id a
-        // no-op instead of abandoning the answer that created it.
-        fetchKeyIDRef.current = slotID;
-        setFetchKeyID(slotID);
-      }
+      // The answer's `slot_id` names the slot Core staged for the credential
+      // this run read.  It is not a picker selection: the user chose the
+      // credential, and a repair that the slot moved the id follows it (see
+      // the effect above).  Writing it here raced that repair and could re-point
+      // the picker after the answer had already been assembled.
       if (laneService && stringValue(summary.operation) === action) {
         handleFetchedServiceModels(summary, laneService);
         return;
@@ -8894,10 +8933,18 @@ type RouteGroupEntry = {
 
 function PublicModelInspector({ group, modelContexts, backLabel, busy, translate, dispatch, dispatchSnapshot, onBackToModel, onRenamed }: { group: { name: string; entries: RouteGroupEntry[] }; modelContexts: UnknownRecord; backLabel?: string; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchSnapshot: (type: string, payload?: UnknownRecord, domain?: ConfigDomain) => Promise<CoreSnapshot | undefined>; onBackToModel?: () => void; onRenamed: (next: string) => void }): React.JSX.Element {
   const providers = useMemo(() => group.entries.map((entry) => entry.provider), [group.entries]);
+  // The table beside the field is keyed by the name the document serves, not by
+  // the draft the field shows while a rename is being typed: looking a draft up
+  // in it found nothing, and the pane drew 无 for a group whose saved rows state
+  // a window.  The field still edits `group.name`; only the lookups use the
+  // spelling Core has.
+  const savedPublicName = useMemo(() => group.entries
+    .map((entry) => stringValue(entry.model.model_name).trim())
+    .find((name) => Boolean(name)) ?? group.name, [group.entries, group.name]);
   // The group's own value is the smallest one its routes declare, so the field
   // shows what every route can honour and a commit writes it to all of them.
-  const customContext = publicModelCustomLimit(providers, group.name, "max_input_tokens");
-  const defaultContext = publicModelDefault(modelContexts, group.name);
+  const customContext = publicModelCustomLimit(providers, savedPublicName, "max_input_tokens");
+  const defaultContext = publicModelDefault(modelContexts, savedPublicName);
   // This pane is where the context window is *set*: it is the public model's
   // own declaration, written to every route of the group in one staged action,
   // and the model detail states it read-only with a 设置 button that lands

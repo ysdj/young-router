@@ -156,8 +156,13 @@ def _router_settings_restated(
         name = _string_value(item.get("model_name")).strip()
         if deployment_id and name:
             current_by_id[deployment_id] = name
-    # One old name is a rename only when every route it had still exists under
-    # one other name; a group that lost or gained a route was edited, not renamed.
+    # One old name is a rename when every route it had still exists under one
+    # other name; a group that lost or gained a route was edited, not renamed.
+    # The target may hold more routes than the old group did: renaming onto a
+    # name the document already served is a merge, and the group's routes are
+    # now part of a larger one.  Requiring the id sets to be equal read that as
+    # "not a rename", so every fallback reference to the old name was dropped
+    # instead of restated onto the group the routes actually joined.
     previous_ids_by_name: dict[str, set[str]] = {}
     for deployment_id, name in previous_by_id.items():
         previous_ids_by_name.setdefault(name, set()).add(deployment_id)
@@ -171,7 +176,7 @@ def _router_settings_restated(
         candidates = [
             new_name
             for new_name, new_ids in current_ids_by_name.items()
-            if new_ids == ids and new_name not in previous_ids_by_name
+            if new_name != old_name and ids <= new_ids
         ]
         if len(candidates) == 1:
             renames[old_name] = candidates[0]

@@ -163,6 +163,93 @@ class WebDAVSmartSyncPlanTests(unittest.TestCase):
         self.assertEqual("conflict", webdav_core.smart_sync_plan(newer, older, base))
         self.assertEqual("conflict", webdav_core.smart_sync_plan(older, newer, base))
 
+    def _two_file_snapshot(
+        self,
+        *,
+        config: str,
+        relay: str,
+        disabled: str | None = None,
+        stamp: str = "2026-09-25T10:00:00Z",
+    ) -> webdav_core.SyncSnapshot:
+        files: list[dict[str, object]] = [
+            {
+                "path": "config.yaml",
+                "present": True,
+                "bytes": 1,
+                "sha256": config,
+                "mode": 0o600,
+                "modified_at": stamp,
+            },
+            {"path": "config.disabled-models.yaml", "present": disabled is not None},
+            {
+                "path": "relay-accounts.json",
+                "present": True,
+                "bytes": 1,
+                "sha256": relay,
+                "mode": 0o600,
+                "modified_at": stamp,
+            },
+        ]
+        if disabled is not None:
+            files[1] = {
+                "path": "config.disabled-models.yaml",
+                "present": True,
+                "bytes": 1,
+                "sha256": disabled,
+                "mode": 0o600,
+                "modified_at": stamp,
+            }
+        manifest = {
+            "app": webdav_core.APP_NAME,
+            "version": webdav_core.ARCHIVE_VERSION,
+            "format": webdav_core.CONFIG_BUNDLE_FORMAT,
+            "created_at": stamp,
+            "summary": {"providers": 1, "active_models": 1, "disabled_models": 0},
+            "files": files,
+        }
+        digests = {
+            "config.yaml": config,
+            "config.disabled-models.yaml": disabled,
+            "relay-accounts.json": relay,
+        }
+        return webdav_core.SyncSnapshot(manifest, digests)
+
+    def test_a_relay_move_beside_the_peers_route_edit_is_not_a_choice(self) -> None:
+        """The store a pull merges is not an edit competing with the peer's.
+
+        A pull that keeps a station or a tombstone leaves the machine holding
+        more than the bundle did, and its saved baseline still describes the
+        bundle.  The next comparison then reads that machine as moved.  When the
+        peer has since edited a route -- a different file -- nothing competes:
+        a pull installs the route and merge-keeps the store.  Reading the pair
+        as a conflict is what stopped a gateway from taking a desktop's route.
+        """
+
+        base = self._two_file_snapshot(config="route-0", relay="store-0")
+        gateway = self._two_file_snapshot(config="route-0", relay="store-kept")
+        desktop = self._two_file_snapshot(config="route-1", relay="store-0", stamp="2026-09-25T11:00:00Z")
+        self.assertEqual("pull", webdav_core.smart_sync_plan(gateway, desktop, base))
+        # The sides swapped: this Mac's route edit is carried, and the peer's
+        # kept store survives on the peer until it merges again.
+        self.assertEqual("push", webdav_core.smart_sync_plan(desktop, gateway, base))
+
+    def test_two_stores_that_both_moved_are_still_a_choice(self) -> None:
+        base = self._two_file_snapshot(config="route-0", relay="store-0")
+        local = self._two_file_snapshot(config="route-0", relay="store-local")
+        remote = self._two_file_snapshot(config="route-0", relay="store-remote")
+        self.assertEqual("conflict", webdav_core.smart_sync_plan(local, remote, base))
+
+    def test_two_files_that_are_not_merged_are_still_a_choice(self) -> None:
+        """Direction is decided by the files, not by the number of them."""
+
+        base = self._two_file_snapshot(config="route-0", relay="store-0", disabled="disabled-0")
+        local = self._two_file_snapshot(config="route-1", relay="store-0", disabled="disabled-0")
+        remote = self._two_file_snapshot(
+            config="route-0", relay="store-0", disabled="disabled-1", stamp="2026-09-25T11:00:00Z"
+        )
+        self.assertEqual("conflict", webdav_core.smart_sync_plan(local, remote, base))
+        self.assertEqual("conflict", webdav_core.smart_sync_plan(remote, local, base))
+
     def test_without_a_baseline_the_newer_snapshot_still_decides(self) -> None:
         """A lost sync state is not a question for the reader either."""
 
@@ -1098,6 +1185,86 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             self.assertEqual(["station-wawapii"], [row["id"] for row in kept["removed_stations"]])
             self.assertFalse([account for account in kept["accounts"] if account["label"] == "wawapii"])
 
+    def test_a_route_added_while_the_peer_kept_a_tombstone_still_syncs(self) -> None:
+        """A kept relay row is not an edit competing with the peer's route.
+
+        A pull that preserves a tombstone writes a store its saved baseline
+        does not describe, so the pulling machine reads as moved on the next
+        run.  A route added on the other machine lives in a different file:
+        taking it installs the route and merge-keeps the store, and the kept
+        store is carried back on a later run.  This is the pair that stopped a
+        gateway from taking a desktop's new model and asked the reader which
+        unrelated change to keep.
+        """
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mac = root / "mac"
+            peer = root / "peer"
+            mac.mkdir()
+            peer.mkdir()
+            mac_config = self.write_config(mac)
+            peer_config = self.write_config(peer)
+            mac_state = mac / "sync-state.json"
+            peer_state = peer / "sync-state.json"
+            settings = webdav_core.Settings(url="https://dav.example.test/young-router/", remote_name="config.json")
+            server = _MemoryWebDAV()
+
+            def sync(config_path: Path, state_path: Path) -> str:
+                local_snapshot = webdav_core.local_snapshot(config_path)
+                remote_snapshot = webdav_operations.remote_snapshot(
+                    server, settings, webdav_operations.read_remote_manifest(server, settings)
+                )
+                if remote_snapshot.manifest is None:
+                    webdav_operations.push_bundle(server, settings, config_path, state_path, "sync-push")
+                    return "push"
+                plan, remote_snapshot = webdav_operations.decide_sync(
+                    server, settings, local_snapshot, remote_snapshot, webdav_core.baseline_snapshot(state_path)
+                )
+                if plan == "unchanged":
+                    agreed = webdav_core.SyncSnapshot(
+                        remote_snapshot.manifest, remote_snapshot.digests or local_snapshot.digests
+                    )
+                    webdav_core.save_sync_state(state_path, settings, agreed, "sync")
+                    return "unchanged"
+                if plan == "push":
+                    webdav_operations.push_bundle(server, settings, config_path, state_path, "sync-push")
+                    return "push"
+                if plan == "conflict":
+                    return "conflict"
+                webdav_operations.pull_bundle(server, settings, config_path, state_path, "sync-pull", skip_when_unchanged=False)
+                return "pull"
+
+            # The peer holds a tombstone the Mac's store never had.
+            self._write_relay(mac_config, self._two_station_store(removed=False))
+            self._write_relay(peer_config, self._two_station_store(removed=True))
+            self.assertEqual("push", sync(mac_config, mac_state))
+            self.assertEqual("pull", sync(peer_config, peer_state))
+            # The merge kept the tombstone, so this machine no longer matches
+            # the baseline its own pull saved.
+            self.assertFalse(
+                webdav_core.local_snapshot(peer_config).matches(webdav_core.baseline_snapshot(peer_state))
+            )
+
+            # The Mac adds a route and syncs it up.
+            mac_config.write_text(
+                mac_config.read_text(encoding="utf-8").replace("default-chat", "added-chat"),
+                encoding="utf-8",
+            )
+            self.assertEqual("push", sync(mac_config, mac_state))
+            # The peer takes the route; nothing about the two files competes.
+            self.assertEqual("pull", sync(peer_config, peer_state))
+            self.assertIn("added-chat", peer_config.read_text(encoding="utf-8"))
+            kept = json.loads(webdav_core.relay_accounts_path(peer_config).read_text(encoding="utf-8"))
+            self.assertIn("station-wawapii", [row["id"] for row in kept["removed_stations"]])
+
+            # The kept store reaches the Mac on the peer's next run, and the
+            # Mac merges it: both sides end up holding the tombstone.
+            self.assertEqual("push", sync(peer_config, peer_state))
+            self.assertEqual("pull", sync(mac_config, mac_state))
+            mac_kept = json.loads(webdav_core.relay_accounts_path(mac_config).read_text(encoding="utf-8"))
+            self.assertIn("station-wawapii", [row["id"] for row in mac_kept["removed_stations"]])
+
     def test_a_balance_read_is_not_a_change_between_machines(self) -> None:
         """A station read on one machine must not read as an edit on the other.
 
@@ -1297,13 +1464,16 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             desktop_snapshot = webdav_core.local_snapshot(config_paths["desktop"])
             desktop_manifest, desktop_digests = desktop_snapshot.manifest, desktop_snapshot.digests
 
-            # Raw comparison: the host's balance read looks like a second edit.
+            # Raw comparison: the host's balance read moved the relay store,
+            # but a relay move is the one a pull merges, so the route edit is
+            # still the side to carry rather than a choice for the reader.
             self.assertEqual(
-                "conflict",
+                "push",
                 webdav_core.smart_sync_plan(desktop_manifest, host_manifest, base_manifest),
             )
             # With the baseline's digests filled in from the side that still
-            # holds its bytes, only the route edit moved.
+            # holds its bytes, the relay store did not move at all: only the
+            # route edit is left, and it is the side to carry.
             self.assertEqual(
                 "push",
                 webdav_core.smart_sync_plan(
@@ -1535,10 +1705,15 @@ class WebDAVSyncBundleTests(unittest.TestCase):
                 relay_path.write_text(json.dumps(stores[name]), encoding="utf-8")
 
             base = webdav_core.local_snapshot(configs["base"])
-            # The desktop edits a route; its relay bytes are still the
-            # baseline's, and the host only re-read its station.
+            # Both machines edit the same route differently: one file moved on
+            # both sides, which is the question no direction can answer and the
+            # one plan whose download buys a digest record it does not have.
             configs["desktop"].write_text(
                 configs["desktop"].read_text(encoding="utf-8").replace("default-chat", "edited-chat"),
+                encoding="utf-8",
+            )
+            configs["host"].write_text(
+                configs["host"].read_text(encoding="utf-8").replace("default-chat", "host-chat"),
                 encoding="utf-8",
             )
             local = webdav_core.local_snapshot(configs["desktop"])
@@ -1561,7 +1736,7 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             client = Client()
             plan, resolved = webdav_operations.decide_sync(client, settings, local, remote, base)
             self.assertEqual(1, client.gets)
-            self.assertEqual("push", plan)
+            self.assertEqual("conflict", plan)
             self.assertEqual(published.digests, resolved.digests)
 
             # A record the server does hold is never asked for again.
@@ -1570,7 +1745,7 @@ class WebDAVSyncBundleTests(unittest.TestCase):
                 client, settings, local, webdav_core.SyncSnapshot(published.manifest, published.digests), base
             )
             self.assertEqual(0, client.gets)
-            self.assertEqual("push", plan)
+            self.assertEqual("conflict", plan)
 
             # A plan with a direction needs no bundle at all.
             client = Client()

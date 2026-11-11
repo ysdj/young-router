@@ -209,12 +209,35 @@ class PublicModelDomainTests(unittest.TestCase):
         self.assertEqual(2, saved.count("model: openai/gpt-5.6-sol"))
         self.assertEqual("kimi-k3", self.model("00000003")["model_name"])
 
-    def test_rename_refuses_a_name_another_public_model_already_uses(self) -> None:
-        with self.assertRaises(DomainError):
-            self.domain.dispatch(
-                "public.model_patch",
-                {"public_model": "gpt-5.6-sol", "changes": {"name": "kimi-k3"}},
-            )
+    def test_a_rename_onto_a_served_name_merges_the_two_groups(self) -> None:
+        """A name the document already serves is where the routes belong.
+
+        The pane offers one public model per name, and a rename states that name
+        for these routes: the group they came from is not another group's
+        property.  Refusing the write left a route filed under an import's own
+        spelling (``name (cursor)``) unable to join the public model it serves,
+        with no way out but deleting the routes and losing their order, key, and
+        probe history.  The write is one staged action, and the saved table
+        names the merged group once.
+        """
+
+        self.domain.dispatch(
+            "public.model_patch",
+            {"public_model": "gpt-5.6-sol", "changes": {"name": "kimi-k3"}},
+        )
+        self.domain.apply()
+        saved = self.path.read_text(encoding="utf-8")
+        self.assertEqual(3, saved.count("model_name: kimi-k3"))
+        self.assertNotIn("model_name: gpt-5.6-sol", saved)
+        self.assertEqual(
+            ["kimi-k3", "minimax-m3.1-flash", "MiniMax-M3.1-Flash"],
+            self._saved()["litellm_settings"]["public_model_groups"],
+        )
+        # The routes are the ones they were: only the group they join moved.
+        self.assertEqual(
+            {"00000001", "00000002", "00000003"},
+            {entry["model_info"]["id"] for entry in self._saved()["model_list"] if entry["model_name"] == "kimi-k3"},
+        )
 
     def test_public_model_patch_refuses_unknown_changes(self) -> None:
         with self.assertRaises(DomainError):
@@ -640,18 +663,63 @@ class PublicModelDomainTests(unittest.TestCase):
                 self.assertNotIn("imported", model)
                 self.assertNotIn("imported_name_case", model)
 
-    def test_a_rename_refuses_a_name_another_group_already_has(self) -> None:
-        with self.assertRaisesRegex(DomainError, "already exists"):
-            self.domain.dispatch(
-                "public.model_patch",
-                {"public_model": "gpt-5.6-sol", "changes": {"name": "kimi-k3"}},
-            )
-        # Another case is another name, and the user is free to state it.
+    def test_a_rename_merges_the_group_that_already_states_the_name(self) -> None:
+        """Renaming onto a served name joins that group; case is not folding."""
+
+        self.domain.dispatch(
+            "public.model_patch",
+            {"public_model": "gpt-5.6-sol", "changes": {"name": "kimi-k3"}},
+        )
+        self.assertEqual(
+            {"kimi-k3", "minimax-m3.1-flash", "MiniMax-M3.1-Flash"},
+            {
+                model["model_name"]
+                for provider in self.domain.snapshot()["providers"]
+                for model in provider["models"]
+            },
+        )
+        # Another case is another name: the fixture serves both spellings as
+        # two groups, and stating a new case is not a merge.
         self.domain.dispatch(
             "public.model_patch",
             {"public_model": "kimi-k3", "changes": {"name": "Kimi-K3"}},
         )
-        self.assertEqual("Kimi-K3", self.model("00000003")["model_name"])
+        names = [
+            model["model_name"]
+            for provider in self.domain.snapshot()["providers"]
+            for model in provider["models"]
+        ]
+        self.assertEqual(3, names.count("Kimi-K3"))
+        self.assertNotIn("kimi-k3", names)
+
+    def test_a_merge_joins_the_fallback_hops_of_both_groups(self) -> None:
+        """One group's hops are not replaced by the other's when the names merge.
+
+        A rename that states a served name collapses two entries of a fallback
+        table onto the same group.  Taking the later entry alone dropped the
+        hops the first one stated, so a merged group silently lost failover
+        targets it still had.
+        """
+
+        self._with_router_settings(
+            """
+            router_settings:
+              fallbacks:
+                - gpt-5.6-sol:
+                    - MiniMax-M3.1-Flash
+                - kimi-k3:
+                    - minimax-m3.1-flash
+            """
+        )
+        self.domain.dispatch(
+            "public.model_patch",
+            {"public_model": "gpt-5.6-sol", "changes": {"name": "kimi-k3"}},
+        )
+        self.domain.apply()
+        self.assertEqual(
+            [{"kimi-k3": ["MiniMax-M3.1-Flash", "minimax-m3.1-flash"]}],
+            self._saved()["router_settings"]["fallbacks"],
+        )
 
     def test_the_saved_group_table_lists_each_served_name_once(self) -> None:
         """The group table is the names the document serves, each exactly once.
