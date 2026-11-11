@@ -517,35 +517,6 @@ def _atomic_write(path: pathlib.Path, data: bytes) -> None:
     atomic_write_bytes(path, data)
 
 
-def _relay_identity(document: bytes) -> set[tuple[str, str]]:
-    """The (station id, account id) pairs one relay document holds.
-
-    A document that cannot be read is not an identity: the caller treats that
-    as "nothing to merge" and falls back to the configured replacement, so a
-    corrupt remote file is never silently trusted or silently dropped.
-    """
-
-    try:
-        loaded = json.loads(document.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return set()
-    if not isinstance(loaded, dict):
-        return set()
-    stations = loaded.get("stations")
-    accounts = loaded.get("accounts")
-    if not isinstance(stations, list) or not isinstance(accounts, list):
-        return set()
-    pairs: set[tuple[str, str]] = set()
-    for account in accounts:
-        if not isinstance(account, dict):
-            continue
-        account_id = account.get("id")
-        station_id = account.get("station_id")
-        if isinstance(account_id, str) and isinstance(station_id, str):
-            pairs.add((station_id, account_id))
-    return pairs
-
-
 def _relay_session(account: object) -> dict[str, str]:
     """The remembered browser session one account holds, if any.
 
@@ -572,12 +543,52 @@ def _relay_has_session(account: object) -> bool:
     return bool(session.get("cookie") or session.get("access_token"))
 
 
+def _relay_rows_by_id(document: dict[str, Any], key: str) -> dict[str, dict[str, Any]]:
+    """One document's rows of ``key``, keyed by their id; unreadable rows drop."""
+
+    rows = document.get(key)
+    if not isinstance(rows, list):
+        return {}
+    return {
+        row["id"]: row
+        for row in rows
+        if isinstance(row, dict) and isinstance(row.get("id"), str) and row["id"]
+    }
+
+
+def _relay_tombstones(document: dict[str, Any], key: str) -> dict[str, dict[str, Any]]:
+    """One document's removal tombstones, keyed by the id they name."""
+
+    rows = document.get(key)
+    if not isinstance(rows, list):
+        return {}
+    return {
+        row["id"]: row
+        for row in rows
+        if isinstance(row, dict) and isinstance(row.get("id"), str) and row["id"]
+    }
+
+
+def _relay_row_is_removed(
+    row: dict[str, Any],
+    removed_stations: dict[str, dict[str, Any]],
+    removed_accounts: dict[str, dict[str, Any]],
+) -> bool:
+    """Whether a removal tombstone already names this account or its station."""
+
+    account_id = row.get("id")
+    if isinstance(account_id, str) and account_id in removed_accounts:
+        return True
+    station_id = row.get("station_id")
+    return isinstance(station_id, str) and station_id in removed_stations
+
+
 def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
-    """Keep this Mac's accounts and its freshest sessions against the incoming copy.
+    """Keep this Mac's accounts, its freshest sessions, and every removal.
 
     The relay store is the only synced file whose content exists nowhere else:
     it carries the stations, their saved sessions, and the plaintext passwords
-    that make every bound key readable again.  Two kinds of local state the
+    that make every bound key readable again.  Three kinds of local state the
     incoming file would otherwise erase are therefore preserved:
 
     * An account that exists only in the local file is kept — the incoming
@@ -591,10 +602,20 @@ def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
       station's concurrent-session cap.  When neither side has a usable
       session, or the observations cannot be ordered, the incoming copy wins as
       before.
+    * A deletion is content, not the absence of content.  The store names the
+      station and account ids it removed (``removed_stations`` /
+      ``removed_accounts``), because comparing documents cannot tell "this Mac
+      never had it" from "this Mac deleted it" — which is how a deleted station
+      came back from another machine's older bundle, twice over.  A tombstone
+      here drops the incoming rows it names, and a tombstone the incoming copy
+      carries drops the local rows it names, so a removal made on either side
+      lands on the other.  The two lists are kept, not spent once the copies
+      agree: a stale peer is exactly the copy that agrees today and offers the
+      row back tomorrow.
 
-    Returns ``None`` when the incoming file already covers the local accounts
-    and none of its sessions are older than the local ones, so the caller
-    installs it verbatim and this stays a no-op in the ordinary case.
+    Returns ``None`` when the merged document says exactly what the incoming
+    one says, so the caller installs it verbatim and this stays a no-op in the
+    ordinary case.
 
     Nothing is invented: every kept record and every kept session is copied
     from the local file, and the document keeps the local ``version``.  A
@@ -602,9 +623,6 @@ def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
     this can only ever preserve local state, never invent it.
     """
 
-    local_identity = _relay_identity(local)
-    if not local_identity:
-        return None
     try:
         local_document = json.loads(local.decode("utf-8"))
         incoming_document = json.loads(incoming.decode("utf-8"))
@@ -613,24 +631,51 @@ def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
     if not isinstance(local_document, dict) or not isinstance(incoming_document, dict):
         return None
 
-    local_by_id = {
-        account.get("id"): account
-        for account in local_document.get("accounts", [])
-        if isinstance(account, dict) and isinstance(account.get("id"), str)
+    local_accounts = _relay_rows_by_id(local_document, "accounts")
+    incoming_accounts = _relay_rows_by_id(incoming_document, "accounts")
+    local_stations = _relay_rows_by_id(local_document, "stations")
+    incoming_stations = _relay_rows_by_id(incoming_document, "stations")
+    local_removed_stations = _relay_tombstones(local_document, "removed_stations")
+    local_removed_accounts = _relay_tombstones(local_document, "removed_accounts")
+    incoming_removed_stations = _relay_tombstones(incoming_document, "removed_stations")
+    incoming_removed_accounts = _relay_tombstones(incoming_document, "removed_accounts")
+    if not local_accounts and not local_stations and not (local_removed_stations or local_removed_accounts):
+        # Nothing local to preserve and nothing local to defend: the incoming
+        # copy is the answer.
+        return None
+
+    # A removal recorded on one side suppresses that id on the other.  The two
+    # directions are deliberately symmetric: the other machine's deletion is
+    # as final as this one's.
+    kept_incoming_accounts = {
+        account_id: account
+        for account_id, account in incoming_accounts.items()
+        if not _relay_row_is_removed(account, local_removed_stations, local_removed_accounts)
     }
-    incoming_by_id = {
-        account.get("id"): account
-        for account in incoming_document.get("accounts", [])
-        if isinstance(account, dict) and isinstance(account.get("id"), str)
+    kept_local_accounts = {
+        account_id: account
+        for account_id, account in local_accounts.items()
+        if not _relay_row_is_removed(account, incoming_removed_stations, incoming_removed_accounts)
     }
+    kept_incoming_stations = {
+        station_id: station
+        for station_id, station in incoming_stations.items()
+        if station_id not in local_removed_stations
+    }
+    kept_local_stations = {
+        station_id: station
+        for station_id, station in local_stations.items()
+        if station_id not in incoming_removed_stations
+    }
+
     # Accounts this Mac holds that the incoming copy would drop are always kept.
-    locally_only = set(local_by_id) - set(incoming_by_id)
+    locally_only = set(kept_local_accounts) - set(kept_incoming_accounts)
     # An account both sides hold whose local session is the newer one is kept
     # too: replacing it with the incoming copy would throw away a login this
     # client just proved, and force a sign-in the station may refuse.
     fresher_local: set[str] = set()
-    for account_id, local_account in local_by_id.items():
-        incoming_account = incoming_by_id.get(account_id)
+    for account_id, local_account in kept_local_accounts.items():
+        incoming_account = kept_incoming_accounts.get(account_id)
         if incoming_account is None:
             continue
         if not _relay_has_session(local_account):
@@ -645,60 +690,127 @@ def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
             continue
         fresher_local.add(account_id)
 
-    if not locally_only and not fresher_local:
-        # Nothing local is missing, and no local session is newer than the
-        # incoming copy's: install it verbatim, so the ordinary case stays a
-        # plain whole-file replacement.
-        return None
-    incoming_account_ids = set(incoming_by_id)
-    incoming_station_ids = {
-        station.get("id")
-        for station in incoming_document.get("stations", [])
-        if isinstance(station, dict)
-    }
     keep_ids = locally_only | fresher_local
-    kept_accounts = [
+    kept_account_rows = [
         account
         for account in local_document.get("accounts", [])
-        if isinstance(account, dict) and account.get("id") in keep_ids
+        if isinstance(account, dict)
+        and account.get("id") in keep_ids
+        and account.get("id") in kept_local_accounts
     ]
-    # An account kept for its fresher session replaces the incoming copy's row
-    # for the same id, so the merged document never carries two rows for one
-    # account.
-    incoming_accounts = [
+    incoming_account_rows = [
         account
         for account in incoming_document.get("accounts", [])
-        if isinstance(account, dict) and account.get("id") not in fresher_local
+        if isinstance(account, dict)
+        and account.get("id") in kept_incoming_accounts
+        and account.get("id") not in fresher_local
     ]
     kept_station_ids = {
-        account.get("station_id") for account in kept_accounts if isinstance(account.get("station_id"), str)
+        account.get("station_id") for account in kept_account_rows if isinstance(account.get("station_id"), str)
     }
-    kept_stations = [
+    kept_station_rows = [
         station
         for station in local_document.get("stations", [])
         if isinstance(station, dict)
-        and station.get("id") not in incoming_station_ids
+        and station.get("id") in kept_local_stations
+        and station.get("id") not in kept_incoming_stations
         and station.get("id") in kept_station_ids
     ]
-    if not kept_accounts:
-        return None
-    merged = dict(incoming_document)
-    merged["stations"] = [*incoming_document.get("stations", []), *kept_stations]
-    merged["accounts"] = [*incoming_accounts, *kept_accounts]
-    # A cleanup tombstone belongs to the account it names: one whose account is
-    # gone in both copies is dropped, and the local tombstones for accounts the
-    # merge keeps would be a contradiction.
-    kept_account_id_set = {account.get("id") for account in merged["accounts"]}
-    merged["pending_credential_cleanups"] = [
-        cleanup
-        for cleanup in [
-            *local_document.get("pending_credential_cleanups", []),
-            *incoming_document.get("pending_credential_cleanups", []),
-        ]
-        if isinstance(cleanup, dict)
-        and cleanup.get("account_id") in kept_account_id_set
-        and cleanup.get("account_id") not in incoming_account_ids
+    incoming_station_rows = [
+        station
+        for station in incoming_document.get("stations", [])
+        if isinstance(station, dict) and station.get("id") in kept_incoming_stations
     ]
+
+    merged_accounts = [*incoming_account_rows, *kept_account_rows]
+    merged_account_station_ids = {
+        account.get("station_id") for account in merged_accounts if isinstance(account.get("station_id"), str)
+    }
+    # A station the merge emptied is as gone as the account that emptied it:
+    # the peer removed that account, and keeping an account-less station would
+    # leave a group the pane shows as a station nothing reaches.  A station
+    # that was already empty in its own copy is the other side's business and
+    # is left alone.
+    emptied = {
+        account.get("station_id")
+        for account in [*local_accounts.values(), *incoming_accounts.values()]
+        if isinstance(account.get("station_id"), str)
+    }
+
+    def _station_survives(station: dict[str, Any]) -> bool:
+        station_id = station.get("id")
+        return station_id not in emptied or station_id in merged_account_station_ids
+
+    kept_station_rows = [station for station in kept_station_rows if _station_survives(station)]
+    incoming_station_rows = [station for station in incoming_station_rows if _station_survives(station)]
+
+    # Both sides' removals are carried, and neither is ever dropped for the
+    # other copy agreeing: pruning a tombstone the moment both copies stopped
+    # listing the id is exactly what let a stale peer hand it back on the next
+    # run, and a stale peer can appear at any time.  The list is bounded by the
+    # store's own cap, so keeping it costs a row per id ever removed.
+    merged_tombstones: dict[str, list[dict[str, Any]]] = {}
+    for key, tombstones in (
+        ("removed_stations", {**incoming_removed_stations, **local_removed_stations}),
+        ("removed_accounts", {**incoming_removed_accounts, **local_removed_accounts}),
+    ):
+        merged_tombstones[key] = [tombstones[identifier] for identifier in sorted(tombstones)]
+
+    # A cleanup tombstone belongs to the account it names, and the two kinds
+    # sit on opposite sides of it: a ``password`` tombstone is about an account
+    # that is still here, while a ``credentials`` tombstone is only valid once
+    # the account is gone -- it is the instruction that erases the keychain
+    # entry of an account nobody can see any more.  Dropping the second kind is
+    # how a merge left credentials behind for good.
+    merged_account_ids = {account.get("id") for account in merged_accounts}
+    merged_cleanups: list[dict[str, Any]] = []
+    for cleanup in [
+        *local_document.get("pending_credential_cleanups", []),
+        *incoming_document.get("pending_credential_cleanups", []),
+    ]:
+        if not isinstance(cleanup, dict):
+            continue
+        owner = cleanup.get("account_id")
+        if not isinstance(owner, str):
+            continue
+        if cleanup.get("kind") == "credentials":
+            if owner in merged_account_ids:
+                continue
+        elif owner not in merged_account_ids or owner in incoming_accounts:
+            continue
+        merged_cleanups.append(cleanup)
+    cleanup_keys = {
+        (cleanup.get("account_id"), cleanup.get("kind")) for cleanup in merged_cleanups
+    }
+    incoming_cleanup_keys = {
+        (cleanup.get("account_id"), cleanup.get("kind"))
+        for cleanup in incoming_document.get("pending_credential_cleanups", [])
+        if isinstance(cleanup, dict)
+    }
+
+    # What the merge changes, decided before the document is built: the
+    # comparison the sync uses ignores a session on purpose, so it cannot be
+    # asked whether a fresher session was kept.
+    changed = bool(
+        locally_only
+        or fresher_local
+        or {account.get("id") for account in incoming_account_rows} != set(incoming_accounts)
+        or {station.get("id") for station in incoming_station_rows} != set(incoming_stations)
+        or {row["id"] for row in merged_tombstones["removed_stations"]} != set(incoming_removed_stations)
+        or {row["id"] for row in merged_tombstones["removed_accounts"]} != set(incoming_removed_accounts)
+        or cleanup_keys != incoming_cleanup_keys
+    )
+    if not changed:
+        # The merge changed nothing: install the incoming copy verbatim, so the
+        # ordinary case stays a plain whole-file replacement.
+        return None
+
+    merged = dict(incoming_document)
+    merged["stations"] = [*incoming_station_rows, *kept_station_rows]
+    merged["accounts"] = merged_accounts
+    merged["removed_stations"] = merged_tombstones["removed_stations"]
+    merged["removed_accounts"] = merged_tombstones["removed_accounts"]
+    merged["pending_credential_cleanups"] = merged_cleanups
     merged.setdefault("version", local_document.get("version", 3))
     return json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
 
@@ -856,19 +968,33 @@ def _durable_relay_bytes(data: bytes) -> bytes | None:
     ]
     cleanups = _relay_rows(document.get("pending_credential_cleanups"), "account_id")
     cleanups.sort(key=lambda row: json.dumps(row, ensure_ascii=False, sort_keys=True))
+    # A removal tombstone is content too: two machines write the same removals
+    # in whatever order they made them, so the order here is the id's, never
+    # the writer's.
+    removals = {
+        key: _relay_rows(document.get(key), "id")
+        for key in ("removed_stations", "removed_accounts")
+    }
     # Every field this version does not know is kept: a future durable field
     # must still be able to tell the two ends apart, and only the observations
     # named above are known to be written without a reader's hand.
     durable = {
         key: value
         for key, value in document.items()
-        if key not in {"accounts", "stations", "pending_credential_cleanups"}
+        if key not in {
+            "accounts",
+            "stations",
+            "pending_credential_cleanups",
+            "removed_stations",
+            "removed_accounts",
+        }
     }
     durable.update(
         {
             "stations": _relay_rows(document.get("stations"), "id"),
             "accounts": accounts,
             "pending_credential_cleanups": cleanups,
+            **removals,
         }
     )
     return json.dumps(durable, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")

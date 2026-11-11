@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -112,6 +113,73 @@ class ProviderDeleteRelayReleaseTests(unittest.TestCase):
             core.apply(domains=["relay_accounts", "providers_models"], revision=core.revision)
             self.assertEqual([], relay.snapshot()["stations"])
             self.assertEqual([], relay.snapshot()["accounts"])
+
+    def test_the_removal_is_written_down_so_a_sync_cannot_reinstate_it(self) -> None:
+        """A deletion is durable content, not the absence of content.
+
+        The relay store is a synced file compared as a whole, so "this machine
+        never had it" and "this machine deleted it" look identical to the
+        merge: an older bundle from another machine brought the deleted station
+        and its twelve keys straight back.  The store now names the ids it
+        removed, and that list survives the reload a restart performs.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            core, relay, providers = self._core(root)
+            station_id, account_id = self._signed_in_station(core, relay, "https://wawapii.com")
+            provider_id = self._provider(core, providers, name="wawapii", api_base="wawapii.com")
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "provider.delete",
+                    "payload": {"provider_id": provider_id},
+                }
+            )
+            core.apply(domains=["relay_accounts", "providers_models"], revision=core.revision)
+
+            stored = json.loads(relay.storage_path.read_text(encoding="utf-8"))
+            self.assertEqual([station_id], [row["id"] for row in stored["removed_stations"]])
+            self.assertEqual([account_id], [row["id"] for row in stored["removed_accounts"]])
+            self.assertTrue(all(row["removed_at"] for row in stored["removed_stations"]))
+
+            # A restart reads the same document back: the tombstones are part of
+            # the store, not process memory.
+            reopened = RelayAccountsDomain(root)
+            self.assertEqual([], reopened.snapshot()["stations"])
+            self.assertEqual(
+                [station_id],
+                [row["id"] for row in json.loads(reopened.storage_path.read_text(encoding="utf-8"))["removed_stations"]],
+            )
+
+    def test_a_row_that_exists_again_drops_its_tombstone(self) -> None:
+        """A document carrying both the row and its tombstone is contradictory.
+
+        An import or a package can put a station back with the id a tombstone
+        names.  The row is the later fact, so the tombstone is dropped rather
+        than failing the file -- and rather than suppressing the row it names.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relay = RelayAccountsDomain(root)
+            relay.storage_path.write_text(
+                json.dumps(
+                    {
+                        "version": 3,
+                        "stations": [{"id": "station-back", "name": "back", "origin": "https://back.example.test", "type": "newapi"}],
+                        "accounts": [],
+                        "pending_credential_cleanups": [],
+                        "removed_stations": [{"id": "station-back", "removed_at": "2026-01-01T00:00:00Z"}],
+                        "removed_accounts": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            relay.reload()
+            self.assertEqual(["https://back.example.test"], [station["origin"] for station in relay.snapshot()["stations"]])
+            stored = json.loads(relay.storage_path.read_text(encoding="utf-8"))
+            self.assertEqual([], stored["removed_stations"])
 
     def test_a_station_another_row_still_reaches_is_kept(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

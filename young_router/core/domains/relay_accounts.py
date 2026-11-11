@@ -57,6 +57,10 @@ DEPENDENCY_POLICIES = ("delete_models", "detach", "detach_disabled", "rebind")
 MAX_ACCOUNTS = 64
 MAX_STATIONS = MAX_ACCOUNTS
 MAX_PENDING_CLEANUPS = MAX_ACCOUNTS
+# A removal tombstone outlives the row it names: it is what stops a sync from
+# reinstating a station this machine has already deleted.  One per station and
+# one per account, with the same ceiling as the rows themselves.
+MAX_REMOVED_ROWS = MAX_ACCOUNTS + MAX_STATIONS
 MAX_PENDING_OPERATIONS = 512
 MAX_MODELS = 512
 MAX_RESOURCES = 256
@@ -779,6 +783,36 @@ def _public_pending_cleanup(cleanup: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
+def _removed_row(raw: Mapping[str, Any], label: str) -> dict[str, str]:
+    """Validate one durable removal tombstone: the id, and when it was removed.
+
+    The id is the whole value here: nothing else about a removed station or
+    account is kept, because the only question a sync asks is whether that id
+    may come back.  ``removed_at`` exists so a reader -- and a test -- can tell
+    an old decision from a fresh one.
+    """
+
+    return {
+        "id": _text(raw.get("id"), label, limit=96),
+        "removed_at": _updated_at(raw.get("removed_at")) or _utc_now_iso(),
+    }
+
+
+def _removals_changed(raw: object, kept: list[dict[str, str]]) -> bool:
+    """Whether loading this list had to drop a row, so the file needs rewriting.
+
+    A pruned tombstone that is not written back is worse than no pruning: the
+    next bundle a peer reads would still carry it and delete the row it names.
+    """
+
+    if raw is None:
+        return False
+    if not isinstance(raw, list):
+        return True
+    raw_ids = [str(item.get("id", "")) for item in raw if isinstance(item, Mapping)]
+    return raw_ids != [row["id"] for row in kept]
+
+
 def _pending_operation(raw: Mapping[str, Any]) -> dict[str, Any]:
     """Validate one durable, secret-free relay Apply operation."""
 
@@ -1393,6 +1427,14 @@ class RelayAccountsDomain:
         # A native browser-session erase can fail after account deletion. Keep
         # only an opaque tombstone so the UI can retry after a restart.
         self._pending_credential_cleanups: list[dict[str, str]] = []
+        # Removals, not absences.  The durable document is compared as a whole
+        # by the WebDAV sync, and "this machine never had it" is
+        # indistinguishable from "this machine deleted it" -- which is how a
+        # deleted station came back from another machine's older bundle.  These
+        # name the ids this store removed and when, so the merge can refuse to
+        # reinstate them.
+        self._removed_stations: list[dict[str, str]] = []
+        self._removed_accounts: list[dict[str, str]] = []
         # Account, station, and relay-key CRUD are one explicit draft.  Login
         # and metadata refresh may update the same in-memory state, but never
         # smuggle a draft change across the persistence boundary.
@@ -1445,6 +1487,8 @@ class RelayAccountsDomain:
                 _public_pending_cleanup(cleanup)
                 for cleanup in self._pending_credential_cleanups
             ],
+            "removed_stations": [copy.deepcopy(row) for row in self._removed_stations],
+            "removed_accounts": [copy.deepcopy(row) for row in self._removed_accounts],
         }
 
     def _journal_payload(self) -> dict[str, Any]:
@@ -1579,6 +1623,8 @@ class RelayAccountsDomain:
             "session_secrets": copy.deepcopy(self._session_secrets),
             "resource_secret_cache": copy.deepcopy(self._resource_secret_cache),
             "pending_credential_cleanups": copy.deepcopy(self._pending_credential_cleanups),
+            "removed_stations": copy.deepcopy(self._removed_stations),
+            "removed_accounts": copy.deepcopy(self._removed_accounts),
             "pending_operations": copy.deepcopy(self._pending_operations),
             "auto_grouping_draft_baselines": copy.deepcopy(self._auto_grouping_draft_baselines),
             "draft_staged": self._draft_staged,
@@ -1595,6 +1641,8 @@ class RelayAccountsDomain:
         secrets = checkpoint.get("session_secrets")
         resource_secrets = checkpoint.get("resource_secret_cache")
         pending_cleanups = checkpoint.get("pending_credential_cleanups")
+        removed_stations = checkpoint.get("removed_stations")
+        removed_accounts = checkpoint.get("removed_accounts")
         pending_operations = checkpoint.get("pending_operations")
         auto_grouping_draft_baselines = checkpoint.get("auto_grouping_draft_baselines")
         draft_staged = checkpoint.get("draft_staged")
@@ -1610,6 +1658,8 @@ class RelayAccountsDomain:
             or not isinstance(secrets, Mapping)
             or not isinstance(resource_secrets, Mapping)
             or not isinstance(pending_cleanups, list)
+            or not isinstance(removed_stations, list)
+            or not isinstance(removed_accounts, list)
             or not isinstance(pending_operations, list)
             or not isinstance(auto_grouping_draft_baselines, Mapping)
             or type(draft_staged) is not bool
@@ -1625,6 +1675,8 @@ class RelayAccountsDomain:
         self._session_secrets = copy.deepcopy(dict(secrets))
         self._resource_secret_cache = copy.deepcopy(dict(resource_secrets))
         self._pending_credential_cleanups = copy.deepcopy(pending_cleanups)
+        self._removed_stations = copy.deepcopy(removed_stations)
+        self._removed_accounts = copy.deepcopy(removed_accounts)
         self._pending_operations = copy.deepcopy(pending_operations)
         self._auto_grouping_draft_baselines = copy.deepcopy(dict(auto_grouping_draft_baselines))
         self._draft_staged = draft_staged
@@ -1980,6 +2032,16 @@ class RelayAccountsDomain:
             or has_invalid_cleanup_owner
         ):
             raise RelayAccountsError("Relay cleanup storage is invalid")
+        removed_stations = self._decode_removals(
+            loaded.get("removed_stations"),
+            label="Relay station",
+            present=station_by_id,
+        )
+        removed_accounts = self._decode_removals(
+            loaded.get("removed_accounts"),
+            label="Relay account",
+            present=account_ids,
+        )
         migrated = (
             loaded.get("version") != 3
             or "stations" not in loaded
@@ -1987,14 +2049,53 @@ class RelayAccountsDomain:
             or relinked_accounts
             or any(not isinstance(item.get("station_id"), str) or not item.get("station_id") for item in raw_accounts if isinstance(item, Mapping))
             or len(stations) != len(raw_stations)
+            or _removals_changed(loaded.get("removed_stations"), removed_stations)
+            or _removals_changed(loaded.get("removed_accounts"), removed_accounts)
         )
-        return stations, accounts, pending_cleanups, migrated
+        return stations, accounts, pending_cleanups, removed_stations, removed_accounts, migrated
+
+    def _decode_removals(self, raw: object, *, label: str, present: set[str]) -> list[dict[str, str]]:
+        """Validate one tombstone list, dropping ids the document holds again.
+
+        A document that carries both a row and a tombstone for the same id says
+        two things at once.  The row is the later fact -- an import, a package,
+        a sign-in that reused the file -- so the tombstone is dropped rather
+        than failing the whole file: nothing is protected by keeping it, and
+        rejecting saves the reader nothing.
+        """
+
+        if raw is None:
+            return []
+        if not isinstance(raw, list) or len(raw) > MAX_REMOVED_ROWS:
+            raise RelayAccountsError("Relay removal storage is invalid")
+        rows = [_removed_row(item, label) for item in raw if isinstance(item, Mapping)]
+        if len(rows) != len(raw):
+            raise RelayAccountsError("Relay removal storage is invalid")
+        kept: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for row in rows:
+            if row["id"] in seen:
+                continue
+            seen.add(row["id"])
+            if row["id"] in present:
+                continue
+            kept.append(row)
+        return kept
 
     def _replace_storage_state(self, loaded: Mapping[str, Any]) -> bool:
-        stations, accounts, pending_cleanups, migrated = self._decode_storage(loaded)
+        (
+            stations,
+            accounts,
+            pending_cleanups,
+            removed_stations,
+            removed_accounts,
+            migrated,
+        ) = self._decode_storage(loaded)
         self._stations = stations
         self._accounts = accounts
         self._pending_credential_cleanups = pending_cleanups
+        self._removed_stations = removed_stations
+        self._removed_accounts = removed_accounts
         # A reload or package replacement invalidates every process-local
         # credential. Reusing an account id from another file must never reuse
         # the previous file's browser session or API-key cache.
@@ -2411,6 +2512,29 @@ class RelayAccountsDomain:
         account["resources"] = resources
         self._accounts[index] = _private_account(account)
 
+    def _remember_removal(self, *, station_ids: tuple[str, ...] = (), account_ids: tuple[str, ...] = ()) -> None:
+        """Record ids this store removed, so a sync cannot reinstate them.
+
+        A removal is durable content, not the absence of content: the store's
+        own bytes are what the WebDAV sync compares, and "this machine never
+        had it" reads exactly like "this machine deleted it".  One line per id,
+        stamped once -- a repeated removal of an id already named here keeps
+        the earlier stamp, because the decision was made then.
+        """
+
+        stamp = _utc_now_iso()
+        for bucket, identifiers in (
+            (self._removed_stations, station_ids),
+            (self._removed_accounts, account_ids),
+        ):
+            known = {row["id"] for row in bucket}
+            for identifier in identifiers:
+                if not identifier or identifier in known:
+                    continue
+                bucket.append({"id": identifier, "removed_at": stamp})
+                known.add(identifier)
+            del bucket[: max(0, len(bucket) - MAX_REMOVED_ROWS)]
+
     def _remove_account_local(self, account_id: object, *, dependency_policy: object) -> dict[str, Any]:
         index = self._index(account_id)
         account = self._accounts[index]
@@ -2437,8 +2561,15 @@ class RelayAccountsDomain:
         self._accounts.pop(index)
         self._session_secrets.pop(account["id"], None)
         self._clear_resource_cache(account["id"])
-        if station_id and self._station_account_count(station_id) == 0:
+        # The station that loses its last account goes with it, and both ids are
+        # remembered: an older bundle from another machine still lists them.
+        station_removed = bool(station_id) and self._station_account_count(station_id) == 0
+        if station_removed:
             self._stations = [item for item in self._stations if item["id"] != station_id]
+        self._remember_removal(
+            station_ids=(station_id,) if station_removed else (),
+            account_ids=(account["id"],),
+        )
         self._draft_staged = self._draft_staged_from_baseline()
         return {
             "kind": "account_remove",
@@ -2461,6 +2592,7 @@ class RelayAccountsDomain:
             details = self._remove_account_local(account_id, dependency_policy=policy)
             resources.extend(details["resources"])
         self._stations = [item for item in self._stations if item["id"] != station["id"]]
+        self._remember_removal(station_ids=(station["id"],), account_ids=tuple(account_ids))
         self._draft_staged = self._draft_staged_from_baseline()
         return {
             "kind": "station_remove",

@@ -354,6 +354,24 @@ class WebDAVArchiveTests(unittest.TestCase):
         self.assertEqual(b'{"app": "litellm-menu"}', calls[1][2])
 
 
+class _MemoryWebDAV:
+    """A WebDAV collection held in memory: PUT stores, GET answers or 404s."""
+
+    def __init__(self) -> None:
+        self.files: dict[str, bytes] = {}
+
+    def try_mkcol(self, url: str) -> None:
+        return None
+
+    def put(self, url: str, data: bytes, content_type: str) -> None:
+        self.files[url] = data
+
+    def get(self, url: str, max_bytes: int | None = None) -> bytes:
+        if url not in self.files:
+            raise webdav_core.WebDAVHTTPError("GET", url, 404, "Not Found")
+        return self.files[url]
+
+
 class WebDAVSyncBundleTests(unittest.TestCase):
     def test_an_incompatible_remote_bundle_names_its_cause(self) -> None:
         """A bundle from another app identity or archive version states why.
@@ -819,6 +837,266 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             ],
             "pending_credential_cleanups": [],
         }
+
+    def _two_station_store(
+        self,
+        *,
+        removed: bool,
+    ) -> dict[str, object]:
+        """Two relay stations, one of them optionally deleted with its account.
+
+        The deleted half is the shape the wizard's own delete leaves behind: the
+        station and its account are gone, and the store names both ids in
+        ``removed_stations`` / ``removed_accounts`` so a sync cannot hand them
+        back.  The surviving half is the control -- it must arrive untouched.
+        """
+
+        document: dict[str, object] = {
+            "version": 3,
+            "stations": [
+                {"id": "station-nimbus", "name": "nimbus", "origin": "https://relay.example.test", "type": "newapi"},
+                {"id": "station-wawapii", "name": "wawapii", "origin": "https://wawapii.com", "type": "newapi"},
+            ],
+            "accounts": [
+                {
+                    "id": "account-nimbus",
+                    "station_id": "station-nimbus",
+                    "type": "newapi",
+                    "label": "nimbus",
+                    "origin": "https://relay.example.test",
+                    "username": "person@example.test",
+                    "login_status": "unknown",
+                    "remember_password": False,
+                    "password": "",
+                    "session": {"cookie": "", "access_token": "", "refresh_token": ""},
+                    "balance": 0.0,
+                    "last_updated_at": "",
+                    "login_observed_at": "",
+                    "resource_status": "ready",
+                    "resource_error": "none",
+                    "resources": [],
+                    "groups": [],
+                },
+                {
+                    "id": "account-wawapii",
+                    "station_id": "station-wawapii",
+                    "type": "newapi",
+                    "label": "wawapii",
+                    "origin": "https://wawapii.com",
+                    "username": "person@example.test",
+                    "login_status": "signed_in",
+                    "remember_password": True,
+                    "password": "replace-password",
+                    "session": {"cookie": "session=wawapii", "access_token": "", "refresh_token": ""},
+                    "balance": 3.5,
+                    "last_updated_at": "2026-11-10T03:00:00Z",
+                    "login_observed_at": "2026-11-10T03:00:00Z",
+                    "resource_status": "ready",
+                    "resource_error": "none",
+                    "resources": [{"id": "sub2api-1", "api_name": "GLM"}],
+                    "groups": [],
+                },
+            ],
+            "pending_credential_cleanups": [],
+        }
+        if removed:
+            document["stations"] = [document["stations"][0]]  # type: ignore[index]
+            document["accounts"] = [document["accounts"][0]]  # type: ignore[index]
+            document["removed_stations"] = [{"id": "station-wawapii", "removed_at": "2026-11-10T03:05:00Z"}]
+            document["removed_accounts"] = [{"id": "account-wawapii", "removed_at": "2026-11-10T03:05:00Z"}]
+            document["pending_credential_cleanups"] = [
+                {"account_id": "account-wawapii", "label": "wawapii", "kind": "credentials"}
+            ]
+        return document
+
+    def _write_relay(self, config_path: Path, document: dict[str, object]) -> Path:
+        path = webdav_core.relay_accounts_path(config_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return path
+
+    def test_a_deleted_station_stays_deleted_when_the_bundle_still_lists_it(self) -> None:
+        """A deletion is content; an absence is not.
+
+        The relay store is compared as a whole, so "this Mac never had it" and
+        "this Mac deleted it" are the same bytes -- which is how a station
+        deleted here, with its twelve keys and its dashboard session, came back
+        from another machine's older bundle minutes after it was removed.  The
+        store now names the ids it removed, and a pull that still lists them
+        installs everything else and drops those.
+        """
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            local = root / "local"
+            remote = root / "remote"
+            local.mkdir()
+            remote.mkdir()
+            local_config = self.write_config(local)
+            remote_config = self.write_config(remote)
+
+            local_relay = self._write_relay(local_config, self._two_station_store(removed=True))
+            # The other machine has not synced since the delete: its bundle
+            # still carries the station, the account, its password and session.
+            self._write_relay(remote_config, self._two_station_store(removed=False))
+
+            bundle, _manifest_snapshot = webdav_core.create_bundle(remote_config)
+            webdav_core.install_bundle(bundle, local_config)
+
+            merged = json.loads(local_relay.read_text(encoding="utf-8"))
+            self.assertEqual(["station-nimbus"], [station["id"] for station in merged["stations"]])
+            self.assertEqual(["account-nimbus"], [account["id"] for account in merged["accounts"]])
+            # The tombstone is what keeps doing the work: the next stale bundle
+            # is answered by the same rule.
+            self.assertEqual(["station-wawapii"], [row["id"] for row in merged["removed_stations"]])
+            self.assertEqual(["account-wawapii"], [row["id"] for row in merged["removed_accounts"]])
+            self.assertEqual(
+                [{"account_id": "account-wawapii", "label": "wawapii", "kind": "credentials"}],
+                merged["pending_credential_cleanups"],
+            )
+
+    def test_a_deletion_made_on_the_other_machine_lands_here(self) -> None:
+        """The rule is symmetric: the peer's tombstone removes the local row.
+
+        Without this half, "deleted here" would win but "deleted there" would
+        be undone by this machine's next push -- the same bug with the sides
+        swapped.
+        """
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            local = root / "local"
+            remote = root / "remote"
+            local.mkdir()
+            remote.mkdir()
+            local_config = self.write_config(local)
+            remote_config = self.write_config(remote)
+
+            local_relay = self._write_relay(local_config, self._two_station_store(removed=False))
+            self._write_relay(remote_config, self._two_station_store(removed=True))
+
+            bundle, _manifest_snapshot = webdav_core.create_bundle(remote_config)
+            webdav_core.install_bundle(bundle, local_config)
+
+            installed = json.loads(local_relay.read_text(encoding="utf-8"))
+            self.assertEqual(["station-nimbus"], [station["id"] for station in installed["stations"]])
+            self.assertEqual(["account-nimbus"], [account["id"] for account in installed["accounts"]])
+            self.assertEqual(["station-wawapii"], [row["id"] for row in installed["removed_stations"]])
+
+    def test_a_removal_tombstone_outlives_the_copy_that_agrees(self) -> None:
+        """The tombstone is kept, not spent when the two copies agree.
+
+        Pruning it the moment neither copy lists the id is what let a stale
+        peer -- agreeing today, offering the row back tomorrow -- reinstate a
+        station that had already been deleted twice.  The list is bounded by
+        the store's own cap rather than by an agreement that cannot be proven.
+        """
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            local = root / "local"
+            remote = root / "remote"
+            local.mkdir()
+            remote.mkdir()
+            local_config = self.write_config(local)
+            remote_config = self.write_config(remote)
+
+            local_relay = self._write_relay(local_config, self._two_station_store(removed=True))
+            agreed = self._two_station_store(removed=True)
+            agreed["removed_stations"] = []  # type: ignore[index]
+            agreed["removed_accounts"] = []  # type: ignore[index]
+            agreed["pending_credential_cleanups"] = []  # type: ignore[index]
+            self._write_relay(remote_config, agreed)
+
+            bundle, _manifest_snapshot = webdav_core.create_bundle(remote_config)
+            webdav_core.install_bundle(bundle, local_config)
+
+            installed = json.loads(local_relay.read_text(encoding="utf-8"))
+            self.assertEqual(["station-wawapii"], [row["id"] for row in installed["removed_stations"]])
+            self.assertEqual(["account-wawapii"], [row["id"] for row in installed["removed_accounts"]])
+            # The credential tombstone travels with the removal it belongs to.
+            self.assertEqual(
+                [{"account_id": "account-wawapii", "label": "wawapii", "kind": "credentials"}],
+                installed["pending_credential_cleanups"],
+            )
+
+    def test_a_stale_peer_push_does_not_undo_this_machines_delete(self) -> None:
+        """The whole failure, end to end, through the real sync entry points.
+
+        Two machines, one in-memory WebDAV collection, the same push/pull/plan
+        calls the app makes.  This Mac deletes a station, syncs, and the peer
+        pulls -- then the peer, still holding its pre-delete copy, pushes it
+        back.  That last pull is the one that brought the station back with a
+        full key list; with the tombstones it installs the peer's other work and
+        leaves the deletion alone.
+        """
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mac = root / "mac"
+            peer = root / "peer"
+            mac.mkdir()
+            peer.mkdir()
+            mac_config = self.write_config(mac)
+            peer_config = self.write_config(peer)
+            mac_state = mac / "sync-state.json"
+            peer_state = peer / "sync-state.json"
+            settings = webdav_core.Settings(url="https://dav.example.test/young-router/", remote_name="config.json")
+            server = _MemoryWebDAV()
+
+            def sync(config_path: Path, state_path: Path) -> str:
+                local_snapshot = webdav_core.local_snapshot(config_path)
+                remote_snapshot = webdav_operations.remote_snapshot(
+                    server, settings, webdav_operations.read_remote_manifest(server, settings)
+                )
+                if remote_snapshot.manifest is None:
+                    webdav_operations.push_bundle(server, settings, config_path, state_path, "sync-push")
+                    return "push"
+                plan, remote_snapshot = webdav_operations.decide_sync(
+                    server, settings, local_snapshot, remote_snapshot, webdav_core.baseline_snapshot(state_path)
+                )
+                if plan == "unchanged":
+                    agreed = webdav_core.SyncSnapshot(
+                        remote_snapshot.manifest, remote_snapshot.digests or local_snapshot.digests
+                    )
+                    webdav_core.save_sync_state(state_path, settings, agreed, "sync")
+                    return "unchanged"
+                if plan == "push":
+                    webdav_operations.push_bundle(server, settings, config_path, state_path, "sync-push")
+                    return "push"
+                if plan == "conflict":
+                    return "conflict"
+                webdav_operations.pull_bundle(server, settings, config_path, state_path, "sync-pull", skip_when_unchanged=False)
+                return "pull"
+
+            mac_relay = self._write_relay(mac_config, self._two_station_store(removed=False))
+            self._write_relay(peer_config, self._two_station_store(removed=False))
+            self.assertEqual("push", sync(mac_config, mac_state))
+            # Both machines start from the same document, so the peer's first
+            # run only records the baseline it compares against later.
+            self.assertIn(sync(peer_config, peer_state), {"unchanged", "pull"})
+
+            # This Mac deletes the station the way Core does: the row goes, the
+            # tombstone stays.
+            self._write_relay(mac_config, self._two_station_store(removed=True))
+            peer_before = (webdav_core.relay_accounts_path(peer_config)).read_bytes()
+            self.assertEqual("push", sync(mac_config, mac_state))
+            self.assertEqual("pull", sync(peer_config, peer_state))
+            peer_after = json.loads((webdav_core.relay_accounts_path(peer_config)).read_text(encoding="utf-8"))
+            self.assertEqual(["station-nimbus"], [station["id"] for station in peer_after["stations"]])
+            self.assertNotEqual(peer_before, (webdav_core.relay_accounts_path(peer_config)).read_bytes())
+
+            # The peer rewinds to the copy it had before the delete and pushes
+            # it: the stale bundle that used to win.
+            self._write_relay(peer_config, self._two_station_store(removed=False))
+            self.assertEqual("push", sync(peer_config, peer_state))
+
+            self.assertEqual("pull", sync(mac_config, mac_state))
+            kept = json.loads(mac_relay.read_text(encoding="utf-8"))
+            self.assertEqual(["station-nimbus"], [station["id"] for station in kept["stations"]])
+            self.assertEqual(["account-nimbus"], [account["id"] for account in kept["accounts"]])
+            self.assertEqual(["station-wawapii"], [row["id"] for row in kept["removed_stations"]])
+            self.assertFalse([account for account in kept["accounts"] if account["label"] == "wawapii"])
 
     def test_a_balance_read_is_not_a_change_between_machines(self) -> None:
         """A station read on one machine must not read as an edit on the other.
