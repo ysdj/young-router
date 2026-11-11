@@ -1994,6 +1994,137 @@ class HookRouteRecoveryTests(HookTestCase):
         )
         self.assertEqual(chunks[-1]["response"]["id"], "resp-peer")
 
+    async def test_a_relay_upstream_error_frame_moves_the_stream_to_the_peer(
+        self,
+    ) -> None:
+        """A station's mid-stream `upstream_error` advances, it does not end.
+
+        Live 2026-11-11: flux-code streamed thinking for 3m20s and then sent
+        ``{"type":"error","error":{"type":"upstream_error","message":"Upstream
+        access forbidden, please contact administrator"}}``.  Nothing
+        classified the frame, so no peer was tried: the turn ended on that
+        route, and Claude Code's own non-streaming fallback replayed the same
+        655k-byte request into the relay's ~2-minute silent-connection ceiling
+        nine times.  The station's envelope is a verdict on the route, so the
+        same stream has to continue on the sibling.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        streaming_module = sys.modules["young_router.proxy.streaming"]
+        calls = []
+
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        cooldown_file = Path(temp_dir.name) / "deployment-cooldowns.json"
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FILE_ENV, str(cooldown_file))
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        self.set_env(hooks._SAME_DEPLOYMENT_RETRIES_ENV, "0")
+
+        route_key = (
+            "model=claude-fable-5-2 / provider=flux-code / "
+            "upstream=anthropic/claude-fable-5-2 / order=1"
+        )
+        peer_key = (
+            "model=claude-fable-5-2 / provider=sisct2 / "
+            "upstream=anthropic/claude-fable-5-2 / order=1"
+        )
+        deployments = [
+            {
+                "litellm_params": {"order": 1},
+                "model_info": {"id": "relay-a", "order": 1, "route_key": route_key},
+            },
+            {
+                "litellm_params": {"order": 1},
+                "model_info": {"id": "relay-b", "order": 1, "route_key": peer_key},
+            },
+        ]
+
+        async def peer_stream():
+            yield (
+                b'event: message_start\ndata: {"type":"message_start","message":'
+                b'{"id":"msg-peer","type":"message","role":"assistant",'
+                b'"model":"claude-fable-5-2","content":[],"stop_reason":null,'
+                b'"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+            )
+            yield (
+                b'event: content_block_start\ndata: {"type":"content_block_start",'
+                b'"index":0,"content_block":{"type":"text","text":""}}\n\n'
+            )
+            yield (
+                b'event: content_block_delta\ndata: {"type":"content_block_delta",'
+                b'"index":0,"delta":{"type":"text_delta","text":"peer answered"}}\n\n'
+            )
+            yield (
+                b'event: content_block_stop\ndata: {"type":"content_block_stop",'
+                b'"index":0}\n\n'
+            )
+            yield (
+                b'event: message_delta\ndata: {"type":"message_delta",'
+                b'"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}\n\n'
+            )
+            yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return deployments if model_name == "claude-fable-5-2" else []
+
+            async def anthropic_messages(self, **payload):
+                calls.append(payload.copy())
+                # The real router names the deployment it selected in the
+                # request-local box; without that the fallback's success would
+                # be credited to the route that just failed and clear its
+                # failure, which is exactly the accounting this test reads.
+                hooks._remember_selected_deployment(deployments[1])
+                return peer_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "claude-fable-5-2",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 64,
+            "stream": True,
+            "model_info": {"id": "relay-a", "order": 1, "route_key": route_key},
+            "proxy_server_request": {"path": "/v1/messages"},
+        }
+        exception = streaming_module._stream_chunk_error_exception(
+            b'event: error\n'
+            b'data: {"type":"error","error":{"type":"upstream_error","message":'
+            b'"Upstream access forbidden, please contact administrator"}}\n\n'
+        )
+        self.assertEqual(502, getattr(exception, "status_code", None))
+        exception.failed_deployment_id = "relay-a"
+        exception.failed_deployment_order = 1
+        # The stream path classifies the frame where it reads it, before the
+        # fallback runs (``_yield_native_stream_with_output_limit_continuation``
+        # -> ``deliver_route``), so this test starts from the same state.
+        hooks._mark_exception_for_deployment_failover(exception, request_data)
+
+        chunks = [
+            chunk
+            async for chunk in hooks._yield_streaming_error_fallback_or_raise(
+                request_data,
+                exception,
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertIs(True, calls[0].get("stream"))
+        self.assertTrue(
+            any(b"peer answered" in chunk for chunk in chunks if isinstance(chunk, bytes))
+        )
+        cooled, _active, cooldown_filtered = (
+            hooks._with_active_deployment_cooldowns(
+                deployments,
+                request_kwargs=request_data,
+            )
+        )
+        self.assertTrue(cooldown_filtered)
+        self.assertEqual(
+            [item["model_info"]["id"] for item in cooled],
+            ["relay-b"],
+        )
+
     async def test_route_recovery_poll_reuses_stream_error_fallback_marker(self) -> None:
         hooks, proxy_server = load_hook_module()
         calls = []

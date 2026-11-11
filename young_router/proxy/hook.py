@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .. import claude_aliases as _claude_aliases_module
+from . import anthropic_non_stream as _anthropic_non_stream_module
 from . import image_generation as _image_generation_module
 from . import image_context as _image_context_module
 from . import image_inputs as _image_inputs_module
@@ -86,6 +87,12 @@ class YoungRouterHook(CustomLogger):
     def _record_recent_request_started(self, kwargs: Dict[str, Any]) -> None:
         """Publish a bounded progress row before the upstream call begins."""
         record = _routing_module._request_log_record("pending", kwargs)
+        # The row states when *this attempt* started, not when the turn did.
+        # Hops of one turn share a request id, and a retry that copied the
+        # turn's start sorted before the failure that caused it while its own
+        # stale window was already half spent; ``started_at`` keeps the turn's
+        # start for the reader that wants the whole turn's age.
+        record["ts"] = _state_module._utc_now_iso()
         # A request id is the join key used when later success/failure/stream
         # callbacks replace this progress row.  Do not emit an unjoinable
         # pending row that would remain as a duplicate legacy request entry.
@@ -108,6 +115,11 @@ class YoungRouterHook(CustomLogger):
         end_time: Any,
     ) -> None:
         if _routing_module._is_codex_compaction_capability_probe(kwargs):
+            return
+        # A whole-body turn bridged through ``stream: true`` already logs the
+        # assembled answer's own row; the inner deployment call is a transport
+        # detail, not a second turn.
+        if _anthropic_non_stream_module._is_inner_bridge_call(kwargs):
             return
         # Every turn ends here, whichever shape carried it -- a streaming body
         # that finished, a non-streaming answer, a Responses call LiteLLM serves
@@ -142,6 +154,8 @@ class YoungRouterHook(CustomLogger):
         end_time: Any,
     ) -> None:
         if _routing_module._is_codex_compaction_capability_probe(kwargs):
+            return
+        if _anthropic_non_stream_module._is_inner_bridge_call(kwargs):
             return
         # A failed turn has no attempt in flight either; its slot goes back the
         # moment the failure is known, not when the lease expires.
@@ -178,6 +192,8 @@ class YoungRouterHook(CustomLogger):
         end_time: Any,
     ) -> None:
         if _routing_module._is_codex_compaction_capability_probe(kwargs):
+            return
+        if _anthropic_non_stream_module._is_inner_bridge_call(kwargs):
             return
         if _routing_module._is_local_control_plane_read(kwargs):
             return
@@ -589,6 +605,14 @@ class YoungRouterHook(CustomLogger):
             _stream_ended_by_its_reader = True
             raise
         except Exception as exc:
+            # The turn ended in an error.  On the Messages and Chat wires no
+            # failure callback follows a stream that failed (LiteLLM reports it
+            # through its own post-call hook, not through the logging callback),
+            # so the row this turn published is closed here, with the same
+            # classification the callback would have written.  A turn whose
+            # failure the callback did report already closed that row, and this
+            # is then a no-op.
+            _routing_module._settle_failed_stream(request_data, exc)
             # The reader has nothing to read the end of this body from: this
             # shape ends a turn at its terminal event, so a body that closes
             # without one is a turn left open -- the client waits until a person

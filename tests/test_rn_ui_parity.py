@@ -7218,6 +7218,43 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('logProtocolLabel(value.client_surface, translate),')
         self.assert_ui_has('logProtocolLabel(value.upstream_surface, translate),')
 
+    def test_request_log_states_the_mode_beside_the_wire_pair(self) -> None:
+        """A routing row says whether the client asked for a stream.
+
+        A non-streaming request is the one shape a relay's silent-connection
+        ceiling kills, and it is also what a client falls back to after a live
+        stream fails: live 2026-11-11, Claude Code fell back to non-streaming
+        after a mid-stream `upstream_error`, and the log had no column that
+        could tell the retry apart from the turn it replaced.  The mode sits
+        beside the wire pair and reads the client's own body, not the mode the
+        route was dispatched with.
+        """
+
+        self.assert_ui_has('if (tab === "requests") return [')
+        requests = self.ui.split('if (tab === "requests") return [', 1)[1].split(
+            'if (tab === "actions")', 1
+        )[0]
+        protocol = requests.index('translate("logs.protocol")')
+        mode = requests.index('translate("logs.mode")')
+        client_model = requests.index('translate("logs.clientModel")')
+        self.assertLess(protocol, mode)
+        self.assertLess(mode, client_model)
+        self.assert_ui_has('value: (row) => row.mode },')
+        self.assert_ui_has('const LOG_MODE_COLUMN_WIDTH = 96;')
+        self.assert_ui_has('const LOG_MODE_COLUMN_SIZE = 88;')
+        # The cell's words are the pane's existing mode vocabulary, not a
+        # second spelling of the same two states.
+        self.assert_ui_has('translate(value.stream ? "logs.routeTrace.streaming" : "logs.routeTrace.nonStreaming")')
+        self.assertIn('"logs.mode": "MODE"', self.en)
+        self.assertIn('"logs.mode": "模式"', self.zh)
+        translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")
+        self.assertIn('| "logs.mode"', translation_keys)
+        # Core records the client's own body flag and keeps it out of the
+        # wire-name vocabulary: a row that states nothing stays empty.
+        routing_source = (ROOT / "young_router/proxy/routing.py").read_text(encoding="utf-8")
+        self.assertIn("def _request_log_streamed(", routing_source)
+        self.assertIn('"stream": _request_log_streamed(request_kwargs),', routing_source)
+
     def test_a_shortened_cell_states_its_long_form_on_hover(self) -> None:
         """A one-letter cell is only honest if hovering restores the wire names.
 
@@ -9049,8 +9086,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const filterDirty = useRef(false);", logs)
         self.assertIn("if (filterDirty.current && coreFilter !== filterDraftRef.current) return;", logs)
         self.assertIn("filterDirty.current = true; setFilterDraft(filter);", logs)
-        # A tab switch starts from that tab's own filter.
-        self.assertIn("filterDirty.current = false;\n  }, [selected]);", logs)
+        # A tab switch starts from that tab's own filter, and the edit that was
+        # still being debounced for the tab the reader left is not carried into
+        # the field of the one they opened.
+        self.assertIn("filterDirty.current = false;\n    // A debounced edit and an in-flight write both belong to the tab they were", logs)
+        self.assertIn("    appliedFilter.current = \"\";\n  }, [selected]);", logs)
+        # The text on screen is the text Core filters by: a view write that lost
+        # a race is re-issued for the newer draft instead of leaving Core
+        # filtering by a prefix of what the reader typed.
+        self.assertIn("const flushFilter = useRef<() => void>(() => {});", logs)
+        self.assertIn('void dispatch("logs.set_filter", { tab, filter: value }, "logs")', logs)
+        self.assertIn("filterTimer.current = setTimeout(() => { flushFilter.current(); }, 250);", logs)
+        # A log view action states an absolute value, so a lost revision race
+        # rebases instead of being dropped on the floor.
+        self.assertIn("if (LOGS_VIEW_ACTIONS.has(normalized)) return true;", self.ui)
+        self.assertIn('  "logs_set_filter",\n', self.ui)
 
     def test_a_non_numeric_order_stays_in_the_field_instead_of_becoming_zero(self) -> None:
         """The model inspector's 顺序 field validates like every number field.

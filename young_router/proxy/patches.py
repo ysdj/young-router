@@ -7,6 +7,7 @@ from contextvars import ContextVar
 from pathlib import Path
 
 from .. import api_base as _api_base_module
+from . import anthropic_non_stream as _anthropic_non_stream_module
 from . import codex_fast_tier as _codex_fast_tier_module
 from . import context_window as _context_window_module
 from . import responses_request as _responses_request_module
@@ -1638,6 +1639,22 @@ def _install_generic_deployment_failover_patch() -> None:
             _responses_execution_module._wrap_generic_function_for_deployment_failover(
                 original_generic_function,
                 outer_request_kwargs=kwargs,
+            )
+        )
+        # A whole-body Messages turn can outlive a relay edge's silent-connection
+        # ceiling while the same turn streamed would not (live 2026-11-11: the
+        # client's fallback after one mid-stream frame error replayed a 655k-byte
+        # request nine times into a ~2-minute 524/502 wall).  Ask the route with
+        # ``stream: true`` and rebuild the message the client asked for; a route
+        # that fails mid-stream raises here and the turn parks it like any other
+        # route failure.
+        wrapped_original_function = (
+            _anthropic_non_stream_module.wrap_deployment_function(
+                wrapped_original_function,
+                method_name=_trace_module._trace_function_name(
+                    original_generic_function
+                ),
+                client_streaming=kwargs.get("stream") is True,
             )
         )
         while True:

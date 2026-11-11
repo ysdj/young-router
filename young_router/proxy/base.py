@@ -1257,8 +1257,11 @@ _UPSTREAM_RELAY_CAPACITY_MARKERS = (
 # "401 Authorization Required" page, or an OpenAI "invalid_api_key").  The
 # route's credential, not the request, is what the upstream rejected, so this
 # is parked like an account restriction and the turn advances to a sibling.
-# Read only the status words: a 400 about parameters must stay the request's
-# own verdict.
+# The station's own envelope spells the same refusal without a status code
+# (New API / sub2api: ``{"type":"upstream_error","message":"Upstream access
+# forbidden, please contact administrator"}``), and a stream carries it as an
+# ``error`` frame.  Read only status/access words: a 400 about parameters must
+# stay the request's own verdict.
 _UPSTREAM_SESSION_REJECTED_ERROR_MARKERS = (
     "http 401",
     "http 403",
@@ -1266,6 +1269,8 @@ _UPSTREAM_SESSION_REJECTED_ERROR_MARKERS = (
     "403 forbidden",
     "invalid_api_key",
     "invalid api key",
+    "upstream access forbidden",
+    "upstream authentication failed",
 )
 # Some callers reach this proxy with a key that is not the configured master
 # key, and LiteLLM answers that itself: the key is looked up as a virtual key,

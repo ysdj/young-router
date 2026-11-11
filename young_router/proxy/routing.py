@@ -236,6 +236,13 @@ _MODEL_CONCURRENCY_REJECTION_ATTR = "_young_router_model_concurrency_rejection"
 # Set by the deployment pre-call hook on the selected-deployment marker so the
 # wrapper that carries that attempt's stream can refresh its request-log row.
 _PENDING_REQUEST_LOG_ID_KEY = "_young_router_pending_request_log_id"
+# The pre-call hook's join key, copied onto the request the client-facing stream
+# reads.  LiteLLM hands that generator a rebuilt body that carries no
+# ``litellm_call_id``, so every trace it emitted (a failover, a cooldown
+# decision) had no request to belong to and the trace pane could only show it as
+# a standalone request that failed.  The key is this proxy's own, never a name
+# LiteLLM writes or reads.
+_REQUEST_LOG_ID_KEY = "_young_router_request_log_id"
 # One request reaches the success funnel from more than one path (the post-call
 # hook, the protocol-fallback recorder, and stream completion each call it), so
 # the route trace records the route that served the request once per request.
@@ -338,6 +345,61 @@ def _remember_pending_request_log_id(request_id: Any) -> None:
     marker = _selected_deployment_marker_from_box()
     if isinstance(marker, dict):
         marker[_PENDING_REQUEST_LOG_ID_KEY] = request_id.strip()
+
+
+def _settle_failed_stream(
+    request_data: Optional[dict],
+    exception: BaseException,
+) -> bool:
+    """Record the failure of a turn whose client-facing stream ended in error.
+
+    LiteLLM's streaming generators report a stream that fails through
+    ``post_call_failure_hook`` -- the proxy's own callback list -- not through
+    the logging callback that writes a request row.  On the Messages and Chat
+    wires no ``async_log_failure_event`` follows, so the row the turn published
+    kept saying 发送中 and the viewer renamed it 已中断 once the stale window
+    expired: a turn that failed with a named upstream refusal was reported as an
+    interruption nobody caused.  This proxy's client-facing generator is the one
+    place that knows the turn ended in an error, and the in-flight row it closes
+    is also what keeps a failure the logging callback already reported from
+    being written twice -- whichever side gets there first finds the entry.
+
+    A local shutdown is not a route failure: the restart path closes those rows
+    with its own reason (service_restart), so this leaves them alone.
+    """
+
+    if not isinstance(request_data, dict) or not isinstance(exception, Exception):
+        return False
+    if _proxy_shutdown_in_progress() or _is_local_shutdown_exception(exception):
+        return False
+    if isinstance(exception, ConnectionError):
+        # Writing to the client can fail after it stopped reading.  That is the
+        # reader's ending, not the route's: the socket belongs to this process
+        # and no upstream refused anything.
+        return False
+    _apply_current_selected_deployment_to_request(request_data)
+    request_id = _trace_request_id(request_data)
+    if not request_id:
+        return False
+    error = _request_log_error_summary({"exception": exception}, None)
+    if not error:
+        # A stop this router could not classify has no status or class to name;
+        # the row still has to say the turn ended in an error rather than in an
+        # interruption.
+        error = {"reason": "stream_error"}
+    if not _state_module._settle_failed_request(
+        request_id,
+        error,
+        deployment_id=_deployment_id_from_request(request_data),
+    ):
+        return False
+    _trace_module._request_route_trace(
+        "request_log_closed_for_stream_failure",
+        request_data,
+        request=_trace_module._trace_request_summary(request_data),
+        exception=_trace_exception(exception),
+    )
+    return True
 
 
 def _remember_request_time(
@@ -4198,6 +4260,24 @@ def _request_log_surface(value: Any) -> str:
     return "" if text.casefold() in {"", "unknown"} else text
 
 
+def _request_log_streamed(request_kwargs: Optional[dict]) -> Optional[bool]:
+    """Whether the *client* asked for a streamed response, or ``None``.
+
+    Read the body the client sent, not the kwargs at logging time: a bridge or
+    the station web-search interception may have rewritten ``stream`` by then,
+    and the row must state the mode the client chose.  A client that states no
+    ``stream`` at all leaves the answer unknown rather than guessing the
+    protocol's default into a column.
+    """
+
+    request_kwargs = request_kwargs if isinstance(request_kwargs, dict) else {}
+    body = _trace_module._trace_original_request_body(request_kwargs)
+    if isinstance(body, dict) and isinstance(body.get("stream"), bool):
+        return body["stream"]
+    value = request_kwargs.get("stream")
+    return value if isinstance(value, bool) else None
+
+
 def _request_log_record(
     status: str,
     request_kwargs: Optional[dict],
@@ -4291,6 +4371,12 @@ def _request_log_record(
         "client_surface": _request_log_surface(
             _trace_module._trace_client_surface(request_kwargs)
         ),
+        # The mode the client chose, stated beside the wire pair: a non-streaming
+        # request is the one shape a relay's silent-connection ceiling can kill,
+        # and it is also what a client falls back to after a stream fails.  The
+        # Log tab draws it as its own column; ``None`` means the body stated
+        # nothing.
+        "stream": _request_log_streamed(request_kwargs),
         "upstream_surface": _request_log_surface(
             _trace_module._trace_outbound_surface(request_kwargs)
         ),
@@ -5775,6 +5861,18 @@ def _apply_selected_deployment_marker_to_request(
 ) -> bool:
     if not isinstance(request_kwargs, dict) or not isinstance(marker, dict):
         return False
+    # The attempt's request-log row is published before the call and pinned on
+    # this marker; carrying its id onto the request keeps every trace and every
+    # log row this attempt emits attached to that one request instead of
+    # falling back to "some request failed at this clock time".  A body that
+    # already names its own call keeps it.
+    pending_request_id = marker.get(_PENDING_REQUEST_LOG_ID_KEY)
+    if (
+        isinstance(pending_request_id, str)
+        and pending_request_id.strip()
+        and not _trace_request_id(request_kwargs)
+    ):
+        request_kwargs[_REQUEST_LOG_ID_KEY] = pending_request_id.strip()
     model_info = marker.get("model_info")
     litellm_params = marker.get("litellm_params")
     request_params = marker.get("request_params")
@@ -5906,7 +6004,7 @@ def _remember_selected_deployment_for_request(
 
 def _trace_request_id(request_kwargs: Optional[dict]) -> Optional[str]:
     request_kwargs = request_kwargs or {}
-    for key in ("request_id", "litellm_call_id", "call_id"):
+    for key in (_REQUEST_LOG_ID_KEY, "request_id", "litellm_call_id", "call_id"):
         value = request_kwargs.get(key)
         if isinstance(value, str) and value.strip():
             return value
@@ -8743,7 +8841,12 @@ def _is_upstream_request_field_rejected_error(exception: Exception) -> bool:
     status_code = _exception_status_code(exception)
     if status_code is None:
         status_code = _nested_upstream_status_code(exception)
-    if status_code not in {400, 422}:
+    # A station that delivers the refusal as an SSE ``error`` frame states no
+    # status, so ``_stream_chunk_error_exception`` gives its ``upstream_error``
+    # envelope a 502 in order to park a streamed route failure at all.  That
+    # synthetic status must not swallow a payload verdict the sentence names:
+    # the field/duplicate markers below are specific enough to keep the branch.
+    if status_code not in {400, 422, 502}:
         return False
     text = _exception_text(exception)
     if any(marker in text for marker in _UPSTREAM_DUPLICATE_TOOL_NAME_MARKERS):

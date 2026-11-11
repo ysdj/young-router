@@ -935,6 +935,193 @@ class HookPatchTests(HookTestCase):
         self.assertIs(response, failed)
         self.assertEqual(len(calls), 1)
 
+    async def test_a_non_streaming_messages_turn_is_answered_from_a_stream(self) -> None:
+        """A whole-body turn is asked for as frames, then assembled.
+
+        A relay edge closes a non-streaming request that stays silent for
+        ~2 minutes while the same turn streamed is fine (live 2026-11-11).
+        The route call is therefore made with ``stream: true``; the client
+        still receives the whole message it asked for.
+        """
+
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+        calls = []
+        frames = [
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_bridged",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-fable-5-2",
+                    "content": [],
+                    "usage": {"input_tokens": 5},
+                },
+            },
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "answered"},
+            },
+            {"type": "content_block_stop", "index": 0},
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 2},
+            },
+            {"type": "message_stop"},
+        ]
+
+        class Frames:
+            def __init__(self):
+                self._chunks = [
+                    "".join(
+                        f"event: {frame['type']}\ndata: {json.dumps(frame)}\n\n"
+                        for frame in frames
+                    ).encode("utf-8")
+                ]
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self._chunks:
+                    raise StopAsyncIteration
+                return self._chunks.pop(0)
+
+        class Router:
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await original_generic_function(**kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_generic_deployment_failover_patch()
+
+        async def anthropic_messages(**kwargs):
+            calls.append(kwargs)
+            if kwargs.get("stream") is True:
+                return Frames()
+            return {"should_not": "be asked for a whole body"}
+
+        response = await Router()._ageneric_api_call_with_fallbacks_helper(
+            "claude-fable-5-2",
+            anthropic_messages,
+            messages=[{"role": "user", "content": "hi"}],
+            custom_llm_provider="anthropic",
+            stream=False,
+        )
+
+        self.assertEqual(1, len(calls))
+        self.assertIs(True, calls[0].get("stream"))
+        self.assertIs(
+            True,
+            calls[0]["litellm_metadata"][
+                hooks._anthropic_non_stream_module._INNER_CALL_METADATA_KEY
+            ],
+        )
+        self.assertEqual("msg_bridged", response.get("id"))
+        self.assertEqual("answered", response["content"][0]["text"])
+        self.assertEqual("end_turn", response.get("stop_reason"))
+        self.assertEqual(
+            {"input_tokens": 5, "output_tokens": 2},
+            response.get("usage"),
+        )
+
+    async def test_an_in_stream_error_frame_is_the_routes_refusal_after_bridging(self) -> None:
+        """The assembled turn raises where the stream path raises, so routing sees it."""
+
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+
+        class Frames:
+            def __init__(self):
+                self._chunks = [
+                    b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_x","type":"message","role":"assistant","content":[],"usage":{"input_tokens":1}}}\n\n'
+                    b'event: error\ndata: {"type":"error","error":{"type":"upstream_error","message":"Upstream access forbidden, please contact administrator"}}\n\n'
+                ]
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self._chunks:
+                    raise StopAsyncIteration
+                return self._chunks.pop(0)
+
+        class Router:
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await original_generic_function(**kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_generic_deployment_failover_patch()
+
+        routing_module = hooks._routing_module
+        original_mark = routing_module._mark_exception_for_deployment_failover
+        marked = []
+
+        def record(exc, request_kwargs):
+            marked.append(exc)
+            return original_mark(exc, request_kwargs)
+
+        routing_module._mark_exception_for_deployment_failover = record
+        self.addCleanup(
+            setattr,
+            routing_module,
+            "_mark_exception_for_deployment_failover",
+            original_mark,
+        )
+
+        async def anthropic_messages(**kwargs):
+            hooks._remember_selected_deployment(
+                {
+                    "litellm_params": {"model": "anthropic/claude-fable-5-2"},
+                    "model_info": {"id": "relay-a"},
+                }
+            )
+            return Frames()
+
+        with self.assertRaises(Exception) as context:
+            await Router()._ageneric_api_call_with_fallbacks_helper(
+                "claude-fable-5-2",
+                anthropic_messages,
+                messages=[{"role": "user", "content": "hi"}],
+                custom_llm_provider="anthropic",
+                stream=False,
+            )
+
+        self.assertEqual(1, len(marked))
+        classified = marked[0]
+        self.assertEqual(502, getattr(classified, "status_code", None))
+        self.assertEqual(
+            "relay-a", getattr(classified, "failed_deployment_id", None)
+        )
+        self.assertEqual(
+            "recovery_cooldown",
+            hooks._recovery_policy_for_exception(classified),
+        )
+        self.assertTrue(hooks._is_priority_deployment_failover_error(classified))
+        # With no sibling configured the helper answers a sanitized 503; the
+        # route was still parked (recorded above) instead of the frame ending
+        # the request as a client error.
+        self.assertEqual(503, getattr(context.exception, "status_code", None))
+
     async def test_a_buffered_responses_answer_leaves_as_a_stream(self) -> None:
         """A streaming client may never receive a buffered Responses object.
 

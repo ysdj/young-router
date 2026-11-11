@@ -59,6 +59,7 @@ export type TranslationKey =
   | "logs.online_usage"
   | "logs.localTime"
   | "logs.protocol"
+  | "logs.mode"
   | "logs.clientModel"
   | "logs.upstreamModel"
   | "logs.source"

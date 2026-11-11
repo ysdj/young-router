@@ -912,6 +912,19 @@ def _stream_chunk_error_exception(chunk: Any) -> Optional[Exception]:
         status_code = 529
     elif status_code is None and error_type == "api_error":
         status_code = 500
+    elif status_code is None and error_type == "upstream_error":
+        # The station's own envelope for "my upstream failed" (New API /
+        # sub2api): ``{"type":"upstream_error","message":"Upstream access
+        # forbidden, please contact administrator"}``.  It is an answer about
+        # the route, not about the bytes, so a stream that ends on it must park
+        # the route and advance to a sibling.  Without a status the frame read
+        # as an unclassified stop: the route stayed first in the order, and the
+        # client's own non-streaming fallback replayed the same 655k-byte turn
+        # into that route's ~2-minute silent-connection ceiling (live
+        # 2026-11-11, nine identical attempts).  A refusal the message itself
+        # names (a field the route's validator rejected, a context ceiling)
+        # still wins by its wording in the classifiers below.
+        status_code = 502
 
     exception = RuntimeError(text)
     if status_code is not None:

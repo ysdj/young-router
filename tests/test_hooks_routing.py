@@ -4492,6 +4492,42 @@ class HookRoutingTests(HookTestCase):
             hooks._recovery_policy_for_exception(unsupported), "error"
         )
 
+    def test_a_request_row_states_the_mode_the_client_chose(self) -> None:
+        """The row reports the client's own stream flag, not a bridge's rewrite.
+
+        Claude Code streams, and falls back to a non-streaming request only
+        after a stream fails (live 2026-11-11: a mid-stream relay
+        ``upstream_error`` pushed it into that fallback, and the log had no
+        column that could tell the fallback apart from the turn it replaced).
+        The mode must therefore be read from the body the client sent: a
+        station's web-search interception rewrites ``stream`` to false on the
+        way upstream, and the row must not report that rewrite as the client's
+        choice.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        kwargs = {
+            "model": "claude-fable-5-2",
+            "stream": True,
+            "proxy_server_request": {
+                "body": {
+                    "model": "claude-fable-5-2",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                }
+            },
+        }
+
+        self.assertIs(False, hooks._request_log_streamed(kwargs))
+        self.assertIs(
+            False,
+            hooks._request_log_record("success", kwargs).get("stream"),
+        )
+        self.assertIs(True, hooks._request_log_streamed({"stream": True}))
+        # A record that states no mode keeps no key: the pane leaves the cell
+        # empty instead of guessing the protocol's default into a column.
+        self.assertIsNone(hooks._request_log_streamed({}))
+
     async def test_filter_deployments_drops_a_route_whose_address_never_resolved(self) -> None:
         """A worker this host never staged is not a route it can serve.
 

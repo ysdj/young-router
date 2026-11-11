@@ -708,6 +708,159 @@ class HookTraceLoggingTests(HookTestCase):
             with hooks._PENDING_RECENT_REQUESTS_LOCK:
                 self.assertIn("finished-call", hooks._PENDING_RECENT_REQUESTS)
 
+    async def test_a_stream_that_fails_is_closed_as_a_failed_request(self) -> None:
+        """A stream that ended in an error states the error, not an interruption.
+
+        LiteLLM reports a stream that fails through its own post-call hook, not
+        through the logging callback this proxy writes request rows from, so on
+        the Messages and Chat wires nothing followed the progress row.  It then
+        read 发送中 until the stale window renamed it 已中断 -- an interruption
+        for a turn whose recorded failure named the upstream.
+        """
+
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0")
+
+        class UpstreamBadGateway(Exception):
+            status_code = 502
+
+        class _FailsDuringStream:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise UpstreamBadGateway("upstream request failed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            request_data = {
+                "call_type": "amessages",
+                "model": "public-chat",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+                "litellm_call_id": "failed-stream-call",
+            }
+            await hook.async_pre_call_deployment_hook(
+                request_data, call_type="amessages"
+            )
+
+            with self.assertRaises(Exception):
+                async for _chunk in hook.async_post_call_streaming_iterator_hook(
+                    user_api_key_dict=None,
+                    response=_FailsDuringStream(),
+                    request_data=request_data,
+                ):
+                    pass
+
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual("failed-stream-call", records[0]["request_id"])
+            self.assertEqual("pending", records[0]["status"])
+            self.assertEqual("failure", records[-1]["status"])
+            self.assertEqual("failed-stream-call", records[-1]["request_id"])
+            self.assertEqual("upstream-status-502", records[-1]["error"]["reason"])
+            self.assertEqual(502, records[-1]["error"]["status_code"])
+            self.assertIn("duration_ms", records[-1])
+            with hooks._PENDING_RECENT_REQUESTS_LOCK:
+                self.assertNotIn("failed-stream-call", hooks._PENDING_RECENT_REQUESTS)
+
+    def test_the_attempt_row_id_reaches_the_streaming_request(self) -> None:
+        """A rebuilt request body keeps the turn's identity.
+
+        LiteLLM hands the post-call streaming hook a body it rebuilt, and that
+        body carries no ``litellm_call_id``.  Every trace the stream guard wrote
+        from it (a failover, a declined cooldown) therefore had no request to
+        belong to, so the trace pane could only list it as a standalone request
+        that failed beside the request it happened in.  The pre-call hook pins
+        the attempt's row on the selected route marker, and applying that marker
+        stamps the same id on the body.
+        """
+
+        hooks, _ = load_hook_module()
+        deployment = {
+            "litellm_params": {
+                "model": "anthropic/kimi-k3",
+                "api_base": "https://chat-provider.example/v1",
+            },
+            "model_info": {"id": "kimi-chat-route", "model_group": "kimi-k3"},
+        }
+        hooks._remember_selected_deployment(deployment, surface="anthropic")
+        hooks._remember_pending_request_log_id("turn-row-1")
+        request_kwargs = {"call_type": "amessages", "model": "kimi-k3", "messages": []}
+
+        hooks._remember_selected_deployment_for_request(request_kwargs, deployment)
+
+        self.assertEqual("turn-row-1", hooks._trace_request_id(request_kwargs))
+        self.assertEqual("kimi-chat-route", request_kwargs["model_info"]["id"])
+        # The trace a failover writes from this body now names its request, so
+        # the trace pane attaches the hop to the turn instead of listing it as a
+        # standalone request that failed beside it.
+        with self.assertLogs("young_router.route_trace", level="WARNING") as captured:
+            hooks._mark_exception_for_deployment_failover(
+                RuntimeError("upstream request failed"),
+                request_kwargs,
+            )
+        traces = [
+            json.loads(line.split("litellm_route_trace ", 1)[1])
+            for line in captured.output
+            if "litellm_route_trace " in line
+        ]
+        self.assertIn("deployment_failover_marked", [trace.get("event") for trace in traces])
+        self.assertEqual(
+            {"turn-row-1"},
+            {trace.get("request_id") for trace in traces},
+        )
+
+    async def test_a_failure_the_callback_already_reported_is_not_written_twice(self) -> None:
+        """The logging callback is the same ending, reported once.
+
+        LiteLLM's own failure callback closes the in-flight row.  A stream
+        teardown that follows it must find nothing to close instead of writing a
+        second failure row for the same attempt.
+        """
+
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        start = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            kwargs = {
+                "call_type": "amessages",
+                "model": "public-chat",
+                "stream": True,
+                "litellm_call_id": "callback-failed-call",
+            }
+            await hook.async_pre_call_deployment_hook(
+                kwargs, call_type="amessages"
+            )
+            await hook.async_log_failure_event(
+                kwargs,
+                RuntimeError("upstream route failed"),
+                start,
+                start + timedelta(milliseconds=10),
+            )
+            settled = hooks._settle_failed_stream(
+                {"call_type": "amessages", "litellm_call_id": "callback-failed-call"},
+                RuntimeError("upstream route failed"),
+            )
+
+            records = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertFalse(settled)
+            self.assertEqual(
+                ["pending", "failure"], [record["status"] for record in records]
+            )
+
     async def test_terminal_callback_keeps_its_pending_row_open(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()

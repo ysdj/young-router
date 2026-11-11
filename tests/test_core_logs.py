@@ -1281,13 +1281,16 @@ model_list:
                 return (base + timedelta(seconds=offset)).isoformat()
 
             records = [
-                {"ts": stamp(0), "request_id": "completed", "status": "pending"},
-                {"ts": stamp(1), "request_id": "completed", "status": "stream"},
-                {"ts": stamp(2), "request_id": "completed", "status": "success"},
-                {"ts": stamp(3), "request_id": "completed", "status": "stream"},
-                {"ts": stamp(4), "request_id": "retried", "status": "failure"},
-                {"ts": stamp(5), "request_id": "retried", "status": "pending"},
-                {"ts": stamp(6), "request_id": "retried", "status": "stream"},
+                {"ts": stamp(0), "request_id": "completed", "deployment_id": "a", "status": "pending"},
+                {"ts": stamp(1), "request_id": "completed", "deployment_id": "a", "status": "stream"},
+                {"ts": stamp(2), "request_id": "completed", "deployment_id": "a", "status": "success"},
+                {"ts": stamp(3), "request_id": "completed", "deployment_id": "a", "status": "stream"},
+                # A turn that failed on one route and was retried on another:
+                # the failed hop is its own answer about its own route and may
+                # not be replaced by the retry's progress row.
+                {"ts": stamp(4), "request_id": "retried", "deployment_id": "a", "status": "failure"},
+                {"ts": stamp(5), "request_id": "retried", "deployment_id": "b", "status": "pending"},
+                {"ts": stamp(6), "request_id": "retried", "deployment_id": "b", "status": "stream"},
             ]
             (root / "recent-requests.jsonl").write_text(
                 "\n".join(json.dumps(record) for record in records) + "\n",
@@ -1296,10 +1299,10 @@ model_list:
 
             projected = LogsDomain(root).view("requests")["log"]["records"]
 
-            self.assertEqual(2, len(projected))
+            self.assertEqual(3, len(projected))
             self.assertEqual(
-                {"completed": "success", "retried": "stream"},
-                {record["request_id"]: record["status"] for record in projected},
+                [("completed", "success"), ("retried", "failure"), ("retried", "stream")],
+                [(record["request_id"], record["status"]) for record in projected],
             )
 
     def test_request_records_normalize_epoch_seconds_and_milliseconds(self) -> None:
@@ -3034,6 +3037,35 @@ model_list:
             self.assertEqual("fast", tab["source_id"])
             self.assertEqual("fast model", tab["records"][0]["model"])
 
+
+    def test_request_rows_keep_the_clients_stream_mode(self) -> None:
+        """A projected row still says whether the client asked for a stream.
+
+        The requests table states the mode beside the wire pair, so the
+        projection may not drop it: a non-streaming row is the one shape a
+        relay's silent-connection ceiling kills, and it is also what a client
+        falls back to after a live stream fails.  A row that states nothing
+        keeps no key, and the pane leaves the cell empty.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = [
+                {"ts": "2026-11-11T15:11:25Z", "request_id": "streamed", "status": "success", "stream": True},
+                {"ts": "2026-11-11T15:12:25Z", "request_id": "whole", "status": "success", "stream": False},
+                {"ts": "2026-11-11T15:13:25Z", "request_id": "unknown", "status": "success"},
+            ]
+            (root / "recent-requests.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n",
+                encoding="utf-8",
+            )
+
+            projected = LogsDomain(root).view("requests")["log"]["records"]
+            by_id = {record["request_id"]: record for record in projected}
+
+            self.assertIs(True, by_id["streamed"].get("stream"))
+            self.assertIs(False, by_id["whole"].get("stream"))
+            self.assertNotIn("stream", by_id["unknown"])
 
 if __name__ == "__main__":
     unittest.main()

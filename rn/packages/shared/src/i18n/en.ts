@@ -56,6 +56,7 @@ export const en: Record<TranslationKey, string> = {
   "logs.online_usage": "Online Usage",
   "logs.localTime": "LOCAL TIME",
   "logs.protocol": "PROTOCOL",
+  "logs.mode": "MODE",
   "logs.clientModel": "Client model",
   "logs.upstreamModel": "Upstream model",
   "logs.source": "SOURCE",

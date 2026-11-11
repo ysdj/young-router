@@ -1161,12 +1161,23 @@ def _safe_request_record(
         # a row recorded before these fields existed simply carries none.
         "client_surface",
         "upstream_surface",
+        # The mode the client asked for (``stream: true`` / ``false``).  The wire
+        # pair says how the turn travelled; this says whether it was answered as
+        # one live stream or one whole body, which is the shape a relay's
+        # silent-connection ceiling can kill and the shape a client falls back to
+        # after a stream fails.  A row written before the record carried it has
+        # no key, and the pane leaves the cell empty rather than guessing.
+        "stream",
         # Kept so the client's wire can be restated from it when a row was
         # written by a runtime that guessed that wire from the body's shape.
         "call_type",
         "duration_ms",
         "route_key",
         "routing_state",
+        # The hop's identity.  Not a column: it is what keeps one turn's failed
+        # attempt and the retry that replaced it two rows instead of one (see
+        # ``_request_projection_key``).
+        "deployment_id",
     ):
         if key in raw:
             result[key] = _safe_scalar(raw[key])
@@ -1326,7 +1337,22 @@ def _close_stale_request_record(
 
 
 def _request_projection_key(record: Mapping[str, Any]) -> str:
-    return _string_record_value(record.get("request_id"))
+    """The attempt a row belongs to: one turn, one route.
+
+    A turn keeps one request id across every hop it takes, and each hop is a
+    different answer about a different route.  Collapsing by request id alone
+    kept only the last hop of a failover: the failed attempt vanished under the
+    retry's ``pending`` row, so the request log reported 成功 or, for the retry
+    that also failed, an 已中断 row for a turn whose recorded failure named the
+    upstream.  The deployment is the hop's identity, so progress rows of one
+    attempt still replace each other while a fallback keeps its own row.
+    """
+
+    request_id = _string_record_value(record.get("request_id"))
+    if not request_id:
+        return ""
+    deployment_id = _string_record_value(record.get("deployment_id"))
+    return f"{request_id}\x1f{deployment_id}" if deployment_id else request_id
 
 
 def _request_record_status(record: Mapping[str, Any]) -> str:
@@ -1339,8 +1365,10 @@ def _should_replace_request_record(
 ) -> bool:
     incoming_status = _request_record_status(incoming)
     if incoming_status in _REQUEST_PENDING_STATUSES:
-        # A new deployment attempt can follow an earlier failed attempt while
-        # retaining the same request id. Surface that retry as active again.
+        # A retry on the same route republishes the attempt it belongs to (a
+        # recovery round, a second protocol pass), so that row reads as active
+        # again.  A hop on another route is a different row (see
+        # ``_request_projection_key``) and never lands here.
         return True
     existing_status = _request_record_status(existing)
     if incoming_status == "stream" and existing_status not in {
@@ -1354,7 +1382,12 @@ def _should_replace_request_record(
 
 
 def _collapse_request_records(records: list[object]) -> list[object]:
-    """Keep one row per request while allowing progress to reach a terminal state."""
+    """Keep one row per attempt while its progress reaches a terminal state.
+
+    One client turn takes one or more routes, and each route is its own answer
+    about its own deployment; the request log states them separately so a
+    failover keeps both its refusal and the route that served the turn.
+    """
     projected: dict[str, tuple[int, dict[str, Any]]] = {}
     standalone: list[tuple[int, dict[str, Any]]] = []
     for index, record in enumerate(records):

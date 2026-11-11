@@ -1620,11 +1620,37 @@ function isNonStagingAction(type: string): boolean {
   return NON_STAGING_ACTIONS.has(type.replace(/[.-]/g, "_").toLowerCase());
 }
 
+/**
+ * Log view actions that state an absolute value rather than a step.
+ *
+ * Each one names the whole intent (this filter text, this pause state, this
+ * line count), so replaying it on a newer revision is the same answer, not a
+ * second effect.  Paging actions are deliberately absent: "load more" asks for
+ * the next page, and replaying it would skip one.
+ */
+const LOGS_VIEW_ACTIONS: ReadonlySet<string> = new Set([
+  "logs_set_filter",
+  "logs_set_limit",
+  "logs_set_time_range",
+  "logs_pause",
+  "logs_resume",
+  "logs_clear",
+  "logs_goto_page",
+  "logs_first_page",
+  "logs_last_page",
+]);
+
 function isRevisionRetryableAction(type: string): boolean {
   const normalized = type.replace(/[.-]/g, "_").toLowerCase();
   // A live projection is not a staged edit: it carries no absolute value a
   // later revision could invalidate, so it rebases like the editor actions do.
   if (TRANSIENT_READ_ACTIONS.has(normalized)) return true;
+  // A log view action is the same kind of absolute value: which text this tab
+  // filters by, whether it is paused, how many lines it shows.  A keystroke
+  // burst can put several of them in flight at once, and the ones that lost the
+  // race used to be dropped by the own revision conflict they caused — the pane
+  // then showed "fable" while Core filtered by an earlier prefix of it.
+  if (LOGS_VIEW_ACTIONS.has(normalized)) return true;
   // Provider/model editor actions address their target by a stable editor id
   // and set absolute values, so they never depend on the revision they were
   // queued with. Core checks that revision only after the request acquires the
@@ -13103,6 +13129,17 @@ type RenderedLogRecord = {
   protocol: string;
   /** The same pair spelled out, for the cell's tooltip and its VoiceOver text. */
   protocolSpelled: string;
+  /**
+   * Whether the client asked for a stream, in the pane's own words (`流式` /
+   * `非流式`).  Empty when the record states no mode at all.
+   *
+   * The wire pair says how the turn travelled; this says how it was answered.
+   * A whole-body request is the one shape a relay's silent-connection ceiling
+   * kills, and it is also what a client falls back to after a live stream
+   * fails -- so a routing log has to tell the two apart without opening the
+   * record.
+   */
+  mode: string;
   provider: string;
   apiKeyName: string;
   event: string;
@@ -13840,6 +13877,7 @@ function parseTextLogRecord(record: string, tab: LogTab, _index: number, transla
     upstreamModel: "",
     protocol: "",
     protocolSpelled: "",
+    mode: "",
     provider: "",
     apiKeyName: "",
     event: "",
@@ -13957,6 +13995,7 @@ function renderOnlineUsageRecord(record: unknown, value: UnknownRecord, translat
     upstreamModel: "",
     protocol: "",
     protocolSpelled: "",
+    mode: "",
     provider: "",
     family,
     account,
@@ -14020,6 +14059,12 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
       compactLogValue(value.client_surface),
       compactLogValue(value.upstream_surface),
     )
+    : "";
+  // The client's own mode, beside the wire pair.  Core records the body's
+  // ``stream`` as a boolean; a row written before that field existed has no
+  // key, so the cell stays empty rather than guessing a mode from the wire.
+  const mode = tab === "requests" && typeof value.stream === "boolean"
+    ? translate(value.stream ? "logs.routeTrace.streaming" : "logs.routeTrace.nonStreaming")
     : "";
   const model = publicModel || upstreamModel;
   const source = tab === "service"
@@ -14121,6 +14166,7 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
     upstreamModel: compactUpstreamLogModel(upstreamModel) || recoveryFallback,
     protocol,
     protocolSpelled,
+    mode,
     provider: provider || recoveryFallback,
     apiKeyName: apiKeyName || recoveryFallback,
     event,
@@ -14286,6 +14332,13 @@ const LOG_PROTOCOL_COLUMN_WIDTH = 90;
 // the couple of points AppKit's own truncation needs before it draws an
 // ellipsis instead of the arrow.
 const LOG_PROTOCOL_COLUMN_SIZE = 56;
+// The client's mode sits beside the wire pair, and the widest cell is English
+// `Non-streaming` (about 76 pt in the table's 13 pt face) plus the cell's 8 pt
+// padding on each side; `非流式` is narrower, so the header does not set it.
+// Hiding the column when every row streams was rejected: the one row that is
+// non-streaming is precisely the row this column exists for.
+const LOG_MODE_COLUMN_WIDTH = 96;
+const LOG_MODE_COLUMN_SIZE = 88;
 // A cache share is a rate and nothing else -- `100%` measures 34.1 pt -- so the
 // header is what sets this column: 缓存命中 is 51.6 pt semibold, and 68 is that
 // plus the cell's 8 pt padding on each side.  It held 108 while the cell also
@@ -14353,6 +14406,7 @@ function logColumns(
     // A model name is the row's identity: both columns hold
     // `deepseek-v4.1-flash` whole, and a longer id is ellipsized rather than
     // made narrower than the one this app is read against.
+    { label: translate("logs.mode"), width: LOG_MODE_COLUMN_WIDTH, floor: LOG_MODE_COLUMN_SIZE, value: (row) => row.mode },
     { label: translate("logs.clientModel"), width: LOG_MODEL_COLUMN_WIDTH, floor: LOG_MODEL_COLUMN_WIDTH, value: (row) => row.model },
     { label: translate("logs.upstreamModel"), width: LOG_MODEL_COLUMN_WIDTH, floor: LOG_MODEL_COLUMN_WIDTH, value: (row) => row.upstreamModel },
     { label: translate("common.provider"), width: 78, value: (row) => row.provider },
@@ -14844,6 +14898,30 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
   filterDraftRef.current = filterDraft;
   const selectedTabRef = useRef(selected);
   selectedTabRef.current = selected;
+  // The filter Core currently holds for this tab.  A view write that lost a
+  // race is retried until the applied text is the text on screen, which is the
+  // only way "filter by fable" can never end up filtering by "fab".
+  const appliedFilter = useRef("");
+  const filterWritePending = useRef(false);
+  const flushFilter = useRef<() => void>(() => {});
+  flushFilter.current = () => {
+    const tab = selectedTabRef.current;
+    const value = filterDraftRef.current;
+    if (filterWritePending.current || value === appliedFilter.current) return;
+    filterWritePending.current = true;
+    const settle = (): void => {
+      filterWritePending.current = false;
+      // The user typed while this write was in flight: the newer draft owns
+      // the field now, so send it once this round trip is done.  A failed
+      // write is not retried by itself — that would spin on the same answer.
+      if (selectedTabRef.current === tab && filterDraftRef.current !== value) {
+        flushFilter.current();
+      }
+    };
+    void dispatch("logs.set_filter", { tab, filter: value }, "logs")
+      .then(() => { appliedFilter.current = value; })
+      .then(settle, settle);
+  };
   const active = activeState?.tab === selected ? activeState.log : undefined;
   // The tab-entry read happens inside the poll effect, which must not
   // re-subscribe on every view change, so the selection it continues from is
@@ -14868,9 +14946,19 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     // A tab switch starts from that tab's own filter, so the dirty guard is
     // dropped before the sync effect below reads the new tab's value.
     filterDirty.current = false;
+    // A debounced edit and an in-flight write both belong to the tab they were
+    // typed for: carrying either into another tab's field would filter it by
+    // text the reader never typed there.
+    if (filterTimer.current) {
+      clearTimeout(filterTimer.current);
+      filterTimer.current = undefined;
+    }
+    filterWritePending.current = false;
+    appliedFilter.current = "";
   }, [selected]);
   useEffect(() => {
     const coreFilter = active?.filter ?? "";
+    appliedFilter.current = coreFilter;
     if (filterDirty.current && coreFilter !== filterDraftRef.current) return;
     filterDirty.current = false;
     setFilterDraft(coreFilter);
@@ -15498,7 +15586,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
       setSelected(tab as LogTab);
     }} style={styles.logsTabs} />
     <View style={styles.logsToolbar}>
-      <View style={styles.logFilterRow}><Text style={styles.toolbarLabel}>{translate("common.filter")}</Text><NativeTextField style={styles.logFilterInput} value={filterDraft} placeholder={translate("logs.filterCurrent")} onChangeText={(filter) => { filterDirty.current = true; setFilterDraft(filter); if (filterTimer.current) clearTimeout(filterTimer.current); filterTimer.current = setTimeout(() => { void dispatch("logs.set_filter", { tab: selected, filter }, "logs"); }, 250); }} accessibilityLabel={translate("common.filter")} /></View>
+      <View style={styles.logFilterRow}><Text style={styles.toolbarLabel}>{translate("common.filter")}</Text><NativeTextField style={styles.logFilterInput} value={filterDraft} placeholder={translate("logs.filterCurrent")} onChangeText={(filter) => { filterDirty.current = true; setFilterDraft(filter); if (filterTimer.current) clearTimeout(filterTimer.current); filterTimer.current = setTimeout(() => { flushFilter.current(); }, 250); }} accessibilityLabel={translate("common.filter")} /></View>
       {selected === "online-usage" ? <><NativePicker overlayLayer labels={onlineUsageTimeLabels} selectedValue={onlineUsageTimeValue} compact accessibilityLabel={translate("logs.onlineUsageTimeLabel")} onChange={({ nativeEvent }) => {
         const option = onlineUsageTimeValues[nativeEvent.index];
         if (option) chooseOnlineUsageTime(option);

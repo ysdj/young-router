@@ -56,6 +56,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "logs.online_usage": "在线用量",
   "logs.localTime": "本地时间",
   "logs.protocol": "协议",
+  "logs.mode": "模式",
   "logs.clientModel": "客户端模型",
   "logs.upstreamModel": "上游模型",
   "logs.source": "来源",

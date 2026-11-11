@@ -3917,6 +3917,72 @@ class HookCoalescedNativeReadTests(HookTestCase):
         self.assertTrue(streaming._stream_chunk_has_visible_output(read))
         self.assertTrue(streaming._stream_chunk_has_meaningful_delta(read))
 
+    async def test_a_relay_upstream_error_frame_is_the_routes_refusal(self) -> None:
+        """The station's own `upstream_error` frame belongs to the route.
+
+        Live 2026-11-11: flux-code answered mid-stream with HTTP-200 SSE
+        ``{"type":"error","error":{"type":"upstream_error","message":"Upstream
+        access forbidden, please contact administrator"}}`` after 3m20s of
+        thinking.  The frame carries no status, so nothing classified it: the
+        route was never parked, the turn ended on it, and Claude Code's own
+        non-streaming fallback replayed the same 655k-byte request into that
+        route's ~2-minute silent-connection ceiling nine times.  The station's
+        envelope says the upstream failed, which is a verdict on the route.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = sys.modules["young_router.proxy.streaming"]
+
+        access_forbidden = (
+            b'event: error\n'
+            b'data: {"type":"error","error":{"type":"upstream_error","message":'
+            b'"Upstream access forbidden, please contact administrator"}}\n\n'
+        )
+        exception = streaming_module._stream_chunk_error_exception(
+            access_forbidden
+        )
+        self.assertIsNotNone(exception)
+        self.assertEqual(502, getattr(exception, "status_code", None))
+        self.assertEqual(
+            hooks._RECOVERY_POLICY_COOLDOWN,
+            hooks._recovery_policy_for_exception(exception),
+        )
+        self.assertTrue(hooks._is_priority_deployment_failover_error(exception))
+        self.assertTrue(
+            hooks._should_count_deployment_failure_for_cooldown(exception)
+        )
+        self.assertEqual(
+            "upstream-session-rejected",
+            hooks._trace_exception(exception)["reason"],
+        )
+
+        # The station's other upstream_error sentence is transient; it must
+        # still be a route failure and not an unclassified stop.
+        transient = streaming_module._stream_chunk_error_exception(
+            b'event: error\n'
+            b'data: {"type":"error","error":{"type":"upstream_error","message":'
+            b'"Upstream request failed"}}\n\n'
+        )
+        self.assertEqual(502, getattr(transient, "status_code", None))
+        self.assertTrue(hooks._is_priority_deployment_failover_error(transient))
+        self.assertEqual(
+            hooks._RECOVERY_POLICY_COOLDOWN,
+            hooks._recovery_policy_for_exception(transient),
+        )
+
+        # A field the route's validator refused keeps its own branch: the
+        # envelope type does not turn a payload verdict into a route failure.
+        field_refusal = streaming_module._stream_chunk_error_exception(
+            b'event: error\n'
+            b'data: {"type":"error","error":{"type":"upstream_error","message":'
+            b'"tools: tool names must be unique."}}\n\n'
+        )
+        self.assertTrue(hooks._is_upstream_request_field_rejected_error(field_refusal))
+        self.assertEqual(
+            "upstream-request-field-rejected",
+            hooks._trace_exception(field_refusal)["reason"],
+        )
+
     async def test_a_coalesced_error_frame_is_still_an_error(self) -> None:
         _, _proxy_server = load_hook_module()
         streaming = sys.modules["young_router.proxy.streaming"]

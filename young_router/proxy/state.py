@@ -115,6 +115,52 @@ def _aborted_recent_request_record(
     return aborted
 
 
+def _elapsed_milliseconds(started: Any, ended: Any) -> Optional[int]:
+    """Milliseconds between two of this log's own ISO instants."""
+
+    try:
+        started_at = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
+        ended_at = datetime.fromisoformat(str(ended).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    elapsed = round((ended_at - started_at).total_seconds() * 1000)
+    return elapsed if elapsed >= 0 else None
+
+
+def _failed_recent_request_record(
+    record: Mapping[str, Any],
+    error: Mapping[str, Any],
+    *,
+    deployment_id: Any = None,
+) -> dict[str, Any]:
+    """Terminal row for an attempt whose client-facing stream ended in error.
+
+    The row keeps the attempt's own route fields, so it stays attached to the
+    deployment that failed; the close moment replaces the start because this is
+    when the failure was observed (the same instant a failure callback would
+    have stamped).
+    """
+
+    failed = {
+        key: value
+        for key, value in record.items()
+        if key not in {"status", "heartbeat", "error", "duration_ms", "aborted"}
+    }
+    failed["status"] = "failure"
+    failed["ts"] = _utc_now_iso()
+    if (
+        not failed.get("deployment_id")
+        and isinstance(deployment_id, str)
+        and deployment_id.strip()
+    ):
+        failed["deployment_id"] = deployment_id.strip()
+    duration = _elapsed_milliseconds(record.get("ts"), failed["ts"])
+    if duration is not None:
+        failed["duration_ms"] = duration
+    failed["error"] = dict(error)
+    return failed
+
+
 def _track_recent_request(
     record: Mapping[str, Any],
     *,
@@ -250,6 +296,50 @@ def _settle_recent_request(
         return False
     _append_recent_request(
         _aborted_recent_request_record(entry.get("record") or {}, reason)
+    )
+    return True
+
+
+def _settle_failed_request(
+    request_id: Any,
+    error: Mapping[str, Any],
+    *,
+    deployment_id: Any = None,
+    attempt: Optional[int] = None,
+) -> bool:
+    """Append the terminal failure row for an attempt that ended in an error.
+
+    LiteLLM's streaming generators report a stream that fails through
+    ``post_call_failure_hook``, not through the logging callback that writes a
+    request row, so on the Messages and Chat wires no ``async_log_failure_event``
+    follows: the row the turn published stayed 发送中 and the viewer renamed it
+    已中断 once the stale window expired, which reported an interrupted turn
+    where there had been a classified failure.
+
+    The in-flight registry is what keeps this from doubling a failure the
+    logging callback did report: either side closes the attempt, and only the
+    first one finds the entry.
+    """
+
+    if not isinstance(request_id, str) or not request_id.strip():
+        return False
+    request_id = request_id.strip()
+    with _PENDING_RECENT_REQUESTS_LOCK:
+        entry = _PENDING_RECENT_REQUESTS.get(request_id)
+        if entry is None:
+            return False
+        if attempt is not None and int(entry.get("attempt") or 0) != attempt:
+            return False
+        entry = _PENDING_RECENT_REQUESTS.pop(request_id, None)
+    if entry is None:
+        return False
+    record = entry.get("record")
+    _append_recent_request(
+        _failed_recent_request_record(
+            record if isinstance(record, Mapping) else {},
+            error,
+            deployment_id=deployment_id,
+        )
     )
     return True
 
