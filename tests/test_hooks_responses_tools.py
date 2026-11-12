@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from hook_test_utils import *
 
+from young_router import runtime_store
+
 
 class HookResponsesToolBridgeTests(HookTestCase):
     def test_tool_adapter_preserves_provider_native_search_with_client_tools(self) -> None:
@@ -1397,7 +1399,7 @@ class HookResponsesToolBridgeTests(HookTestCase):
             )
 
             self.assertEqual(response["output_text"], "ok")
-            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            payload = runtime_store.read_document(state_path)
             self.assertEqual(
                 payload["protocol_fallbacks"]["chat-route|openai/responses"][
                     "fallback_surface"

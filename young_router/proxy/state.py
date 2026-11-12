@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover - Windows does not provide POSIX flock.
     fcntl = None  # type: ignore[assignment]
 
 from ..atomic_io import atomic_write_text
+from .. import runtime_store
 from ..log_rotation import append_bounded_log, log_max_bytes
 from .launcher_settings import (
     _DEPLOYMENT_COOLDOWN_FILE_ENV,
@@ -581,46 +582,24 @@ def _atomic_write_json(path: str, payload: dict[str, Any]) -> None:
     )
 
 
-def _locked_json_state_update(path: str, callback: Any) -> Any:
-    directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    lock_path = f"{path}.lock"
-    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        try:
-            os.chmod(lock_path, 0o600)
-        except OSError:
-            pass
-        # Windows has no ``fcntl``; there the lock file is created and the
-        # update still happens under this process's own thread, which is the
-        # same guarantee the platform's single launcher gives the other
-        # advisory locks in this package.
-        if fcntl is not None:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        missing = False
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-        except (OSError, json.JSONDecodeError):
-            payload = {}
-            missing = True
-        if not isinstance(payload, dict):
-            payload = {}
-        # Most updates only read the shared state (the cooldown and
-        # protocol-fallback filters run on every attempt).  Rewriting an
-        # unchanged document churned the file on disk thousands of times a
-        # day, so compare the revision the callback produced with the one that
-        # was read and only replace the file when it actually changed.
-        before = _canonical_json(payload)
-        result = callback(payload)
-        if missing or _canonical_json(payload) != before:
-            _atomic_write_json(path, payload)
-        return result
-    finally:
-        if fcntl is not None:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        os.close(lock_fd)
+def _locked_json_state_update(path: str, callback: Any, *, read_only: bool = False) -> Any:
+    """Run one read-modify-write of a shared document under its own lock.
+
+    The lock is now the store's write transaction (see ``runtime_store``): one
+    ``BEGIN IMMEDIATE`` around the read, the callback and the write, which is
+    the same guarantee the ``flock`` gave on this platform and gives on the one
+    without ``fcntl`` -- sixteen workers on Windows shared these documents with
+    no exclusion at all.  A document is still parsed and serialised whole; what
+    went away is the sidecar lock file, the two fsyncs and the directory fsync
+    every write paid while holding it.
+
+    ``read_only`` is for the callers that only count or filter -- the cooldown
+    and protocol-fallback filters run on every attempt.  They answer from a
+    snapshot without taking the write lock, and a prune they perform is
+    carried out by the next writer instead.
+    """
+
+    return runtime_store.update_document(path, callback, read_only=read_only)
 
 
 def _utc_now_iso() -> str:

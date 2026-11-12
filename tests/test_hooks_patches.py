@@ -11,6 +11,8 @@ from unittest import mock
 
 from hook_test_utils import *
 
+from young_router import runtime_store
+
 
 class HookPatchTests(HookTestCase):
     def test_cooled_sole_deployment_remains_same_model_with_configured_fallback(self) -> None:
@@ -2789,7 +2791,7 @@ class HookPatchTests(HookTestCase):
                 )
             )
             self.assertIn(
-                "reasoning_text_replay", json.loads(state_path.read_text())
+                "reasoning_text_replay", runtime_store.read_document(state_path)
             )
             replay_module._REQUIREMENTS.clear()
             replay_module._REQUIREMENTS_LOADED_AT = 0.0

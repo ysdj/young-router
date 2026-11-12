@@ -446,8 +446,9 @@ def _refresh_requirements_from_shared(now: float, *, force: bool = False) -> Non
         if not path:
             return
         try:
-            with open(path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
+            from .. import runtime_store
+
+            payload = runtime_store.read_document(path)
         except (OSError, ValueError):
             return
         entries = (

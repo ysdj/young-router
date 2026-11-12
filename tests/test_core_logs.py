@@ -9,6 +9,7 @@ import threading
 import unittest
 from unittest import mock
 
+from young_router import runtime_store
 from young_router.core import CoreIPCClient, CoreIPCServer, CoreStore
 from young_router.core.domains.logs import MAX_FILTER_CHARS, MAX_VIEW_BYTES, LOG_TABS, LogsDomain, LogsDomainError
 from young_router.core.service import LOG_TABS as CORE_LOG_TABS
@@ -2007,8 +2008,8 @@ model_list:
 
             domain.dispatch("logs.clear_recovery_and_cooldowns", {"tab": "recovery"})
 
-            self.assertEqual({}, json.loads(recovery_path.read_text(encoding="utf-8"))["recoveries"])
-            cooldown_payload = json.loads(cooldown_path.read_text(encoding="utf-8"))
+            self.assertEqual({}, runtime_store.read_document(recovery_path)["recoveries"])
+            cooldown_payload = runtime_store.read_document(cooldown_path)
             self.assertEqual({}, cooldown_payload["cooldowns"])
             self.assertEqual(
                 {"preserved": {"expires_at": now.timestamp() + 60}},
@@ -2055,23 +2056,14 @@ model_list:
             domain.dispatch("logs.clear", {"tab": "recovery"})
 
             self.assertEqual(0, domain.view("recovery")["log"]["line_count"])
-            recovery_path.write_text(
-                json.dumps(
-                    {
-                        "recoveries": {
-                            "first": {
-                                "heartbeat_at": now.isoformat(),
-                                "status": "polling",
-                            },
-                            "second": {
-                                "heartbeat_at": datetime.now(timezone.utc).isoformat(),
-                                "status": "waiting",
-                            },
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
+
+            def add_a_recovery(payload: dict) -> None:
+                payload["recoveries"]["second"] = {
+                    "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+                    "status": "waiting",
+                }
+
+            runtime_store.update_document(recovery_path, add_a_recovery)
 
             self.assertEqual(3, domain.view("recovery")["log"]["line_count"])
 

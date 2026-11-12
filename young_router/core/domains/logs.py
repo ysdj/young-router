@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from ..log_tabs import LOG_TABS
+from ... import runtime_store
 from ..persistence import PersistenceError, atomic_write_json, read_json
 from ..security import REDACT_TEXT
 from ...log_rotation import (
@@ -2223,10 +2224,12 @@ class LogsDomain:
         if tab == "online-usage":
             return ("online", self._online_usage_revision, len(self._online_usage_records))
         if tab == "recovery":
+            # The documents live in the store, so their cursor is the number it
+            # moves on every commit -- not a file's inode, mtime and size.
             return (
                 "state",
-                self._file_cursor(self._recovery_path),
-                self._file_cursor(self._cooldowns_path),
+                runtime_store.document_version(self._recovery_path),
+                runtime_store.document_version(self._cooldowns_path),
             )
         path = self._path(tab)
         if path is None:
@@ -2388,27 +2391,13 @@ class LogsDomain:
         """Clear recovery and deployment cooldown state without other caches."""
 
         def clear_collection(path: Path, key: str) -> None:
-            lock_descriptor: int | None = None
-            try:
-                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                if fcntl is not None:
-                    lock_path = Path(f"{path}.lock")
-                    lock_descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-                    try:
-                        os.chmod(lock_path, 0o600)
-                    except OSError:
-                        pass
-                    fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-                payload = read_json(path, default={})
+            # The same write transaction every worker uses: clearing is one
+            # update of the one document, not a second writer's file dance.
+            def clear(payload: dict[str, Any]) -> None:
                 payload["schema_version"] = 1
                 payload[key] = {}
-                atomic_write_json(path, payload)
-            finally:
-                if lock_descriptor is not None:
-                    try:
-                        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
-                    finally:
-                        os.close(lock_descriptor)
+
+            runtime_store.update_document(path, clear)
 
         try:
             clear_collection(self._recovery_path, "recoveries")
@@ -2506,17 +2495,9 @@ class LogsDomain:
             source_cursor = self._source_cursor(tab)
             clear_cursor = self._clear_cursors.get(tab)
             if tab in self._cleared and clear_cursor == source_cursor:
-                return self._recovery_path.is_file() or self._cooldowns_path.is_file(), []
-            recovery_lines = self._read_lines(self._recovery_path, complete_document=True)
-            cooldown_lines = self._read_lines(self._cooldowns_path, complete_document=True)
-            try:
-                recovery_payload = json.loads("\n".join(recovery_lines))
-            except (TypeError, json.JSONDecodeError):
-                recovery_payload = {}
-            try:
-                cooldown_payload = json.loads("\n".join(cooldown_lines))
-            except (TypeError, json.JSONDecodeError):
-                cooldown_payload = {}
+                return self._recovery_present(), []
+            recovery_payload = runtime_store.read_document(self._recovery_path)
+            cooldown_payload = runtime_store.read_document(self._cooldowns_path)
             configured_deployments = _configured_deployments(self.config_path)
             now = time.time()
             records: list[object] = []
@@ -2545,7 +2526,7 @@ class LogsDomain:
                     if needle in json.dumps(record, ensure_ascii=False, sort_keys=True).casefold()
                 ]
             return (
-                self._recovery_path.is_file() or self._cooldowns_path.is_file(),
+                self._recovery_present(),
                 _sort_records_by_time(records)[-self._line_limit(tab) :],
             )
         if tab == "route-trace":
@@ -2839,6 +2820,11 @@ class LogsDomain:
         if applied and applied < self._online_usage_page_rows:
             return applied
         return self._online_usage_page_rows
+
+    def _recovery_present(self) -> bool:
+        """Whether either document exists -- the tab states it read nothing."""
+
+        return runtime_store.has_document(self._recovery_path) or runtime_store.has_document(self._cooldowns_path)
 
     def bind_io_gate(self, gate: object) -> None:
         """Take the store's gate for the station reads this domain makes."""

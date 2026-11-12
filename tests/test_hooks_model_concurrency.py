@@ -22,6 +22,8 @@ import textwrap
 
 from hook_test_utils import *
 
+from young_router import runtime_store
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -79,9 +81,7 @@ class ConcurrencyStoreTestCase(HookTestCase):
         self.set_env("YOUNG_ROUTER_MODEL_CONCURRENCY_LIMIT", "8")
 
     def leases(self) -> dict:
-        if not self.leases_path.exists():
-            return {}
-        return json.loads(self.leases_path.read_text(encoding="utf-8")).get("leases", {})
+        return runtime_store.read_document(self.leases_path).get("leases", {})
 
 
 class ModelConcurrencyTests(ConcurrencyStoreTestCase):
@@ -723,9 +723,14 @@ class SharedStoreUnavailableTests(ConcurrencyStoreTestCase):
 
     def test_an_unwritable_store_filters_nothing_and_says_so(self) -> None:
         hooks, _ = load_hook_module()
-        # A directory where the leases file should be: the lock cannot be taken,
-        # so every read of the shared count fails.
-        self.leases_path.mkdir(parents=True, exist_ok=True)
+        # The store lives beside the document, so the way to make it unwritable
+        # is to put the document's directory behind a regular file: the store
+        # cannot create its database there and every read of the shared count
+        # fails.
+        blocker = Path(str(self.leases_path) + ".blocker")
+        blocker.write_text("not a directory", encoding="utf-8")
+        self.leases_path = blocker / "deployment-concurrency.json"
+        self.set_env("YOUNG_ROUTER_DEPLOYMENT_CONCURRENCY_FILE", str(self.leases_path))
         deployment = _deployment("route-a")
         self.assertIsNone(hooks._deployment_in_flight_count("id:route-a"))
 

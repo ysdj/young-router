@@ -31,6 +31,7 @@ from typing import Any
 
 from ..browser_identity import browser_request_headers
 from .. import config_paths
+from .. import runtime_store
 from ..dsh_config_keys import (
     DSH_VISION_ROUTER_CONFIG_KEY as _DSH_VISION_ROUTER_CONFIG_KEY,
     DSH_VISION_ROUTER_LOCAL_QUICK_KEYS as _DSH_VISION_ROUTER_LOCAL_QUICK_KEYS,
@@ -1403,9 +1404,7 @@ class CoreServiceController:
 
         for path in (self.paths.recovery, self.paths.cooldowns, self.paths.affinity):
             try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+                runtime_store.delete_document(path)
             except OSError as exc:
                 raise RuntimeError("Transient routing state could not be reset") from exc
 
