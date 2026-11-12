@@ -120,6 +120,41 @@ function coreRequest(transport: BrowserCoreTransport, path: string, init: Reques
  */
 const CORE_CALL_TIMEOUT_MS = 20_000;
 
+/**
+ * The budget a proxy lifecycle call is given.
+ *
+ * The native hosts grant these fifteen minutes for one reason: starting the
+ * proxy waits for three worker processes and then for the controller's own
+ * health window, which is minutes on a cold machine.  The page gave every call
+ * twenty seconds, so 启动服务 reported "Core did not answer" while Core was
+ * still starting -- and the retry that followed found a start already in
+ * flight.  The operation is the same on both hosts; so is its budget.
+ */
+const SERVICE_OPERATION_TIMEOUT_MS = 900_000;
+const SERVICE_OPERATIONS: ReadonlySet<string> = new Set(["start", "stop", "restart", "reload"]);
+
+/**
+ * How long one Core call may take, by what it asks Core to do.
+ *
+ * Exported for the test that pins the proxy lifecycle budget: the page and the
+ * native hosts give the same operation the same deadline, and a page that gave
+ * it twenty seconds reported "Core did not answer" over a start still running.
+ */
+export function deadlineFor(request: string): number {
+  try {
+    const parsed = JSON.parse(request) as { method?: unknown; params?: { action?: { type?: unknown } } };
+    const type = parsed?.params?.action?.type;
+    if (parsed?.method === "dispatch" && typeof type === "string") {
+      const operation = type.replace(/[.-]/g, "_").toLowerCase();
+      const name = operation.startsWith("service_") ? operation.slice("service_".length) : operation;
+      if (SERVICE_OPERATIONS.has(name)) return SERVICE_OPERATION_TIMEOUT_MS;
+    }
+  } catch {
+    // A request this page did not build is not one it can classify.
+  }
+  return CORE_CALL_TIMEOUT_MS;
+}
+
 /** A failure with the code the shared UI maps to its own sentence. */
 function codedFailure(code: string, message: string = code): Error & { code: string } {
   const failure = new Error(message) as Error & { code?: string };
@@ -128,8 +163,8 @@ function codedFailure(code: string, message: string = code): Error & { code: str
 }
 
 /** A Core call that outlived its budget, named so the pane can say why. */
-function coreTimeout(): Error & { code: string } {
-  return codedFailure("core_timeout", `Young Router's Core did not answer within ${Math.round(CORE_CALL_TIMEOUT_MS / 1000)} seconds`);
+function coreTimeout(budget = CORE_CALL_TIMEOUT_MS): Error & { code: string } {
+  return codedFailure("core_timeout", `Young Router's Core did not answer within ${Math.round(budget / 1000)} seconds`);
 }
 
 /** A call that never reached Core at all: this page's own connection is gone. */
@@ -148,10 +183,10 @@ function isAbort(reason: unknown): boolean {
  * The signal reaches the request *and* the body read, so a response whose
  * headers arrived and whose bytes never do is covered by the same budget.
  */
-function withDeadline<T>(operation: (signal: AbortSignal | undefined) => Promise<T>): Promise<T> {
+function withDeadline<T>(operation: (signal: AbortSignal | undefined) => Promise<T>, budget = CORE_CALL_TIMEOUT_MS): Promise<T> {
   if (typeof AbortController !== "function") return operation(undefined);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), CORE_CALL_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), budget);
   return operation(controller.signal).finally(() => clearTimeout(timer));
 }
 
@@ -268,7 +303,9 @@ export function createBrowserIpcBridge(transport: BrowserCoreTransport): Browser
     const text = await response.text();
     if (!text) throw new Error("The local core returned no response.");
     return text;
-  }).catch((reason: unknown) => { throw isAbort(reason) ? coreTimeout() : reason; });
+  }, deadlineFor(request)).catch((reason: unknown) => {
+    throw isAbort(reason) ? coreTimeout(deadlineFor(request)) : reason;
+  });
 
   const request = (method: string, params: Record<string, unknown> = {}): string => JSON.stringify({
     protocol_version: 1,
