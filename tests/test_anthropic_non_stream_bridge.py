@@ -211,6 +211,9 @@ class AnthropicNonStreamBridgeTests(HookTestCase):
         message = await wrapped(
             stream=False,
             custom_llm_provider="flux-code",
+            # The surface adapter writes this on every non-Responses wire; only
+            # the Responses handler reads it.  It must not veto the bridge.
+            use_chat_completions_api=True,
             model="flux-code/claude-fable-5-2",
             messages=[{"role": "user", "content": "hi"}],
         )

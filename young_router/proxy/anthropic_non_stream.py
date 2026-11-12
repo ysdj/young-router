@@ -118,15 +118,20 @@ def _should_bridge(
         return False
     if call_kwargs.get("stream") is True:
         return False
-    # A Chat bridge speaks OpenAI chunks, not Anthropic frames.
-    if call_kwargs.get("use_chat_completions_api") is True:
-        return False
     surface = _selected_surface()
     if surface:
         # A route may name its own provider (``flux-code``) while its wire is
         # the Anthropic Messages surface; the surface is what decides whether
-        # these frames exist at all.
+        # these frames exist at all.  Do not gate this on
+        # ``use_chat_completions_api``: the surface adapter marks every
+        # non-Responses wire with it (including ``anthropic``), and only the
+        # Responses handler reads it.  Gating on it skipped the bridge for
+        # exactly the routes the silent-connection ceiling breaks.
         return surface == "anthropic"
+    # Without a recorded surface, a Chat bridge is the conservative read: it
+    # speaks OpenAI chunks, not Anthropic frames.
+    if call_kwargs.get("use_chat_completions_api") is True:
+        return False
     return _call_provider(call_kwargs) == "anthropic"
 
 
