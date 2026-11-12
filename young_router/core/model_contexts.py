@@ -16,7 +16,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 import urllib.request
 from urllib.parse import urlparse
@@ -690,15 +690,70 @@ def _suffix_match_keys_from_tails(
 
 
 class RecordLookupIndex(dict):
-    """The record map plus a tail index `_lookup` reuses across calls.
+    """The record map plus the indexes its lookups reuse across calls.
 
     Subclassing the mapping keeps every existing reader and writer of
-    ``registry._records`` working, while the index is rebuilt whenever the
-    records themselves are replaced.
+    ``registry._records`` working, while the indexes are rebuilt whenever the
+    records change.  Every mutator below clears them, so a writer this module
+    does not own -- a test, a future source -- cannot leave a lookup answering
+    from records the map no longer holds; ``invalidate_tail_index`` is kept as
+    the name the loader already calls.
+
+    ``_records`` is the model catalog: the projection walks every entry, and a
+    pane resolves image metadata once per route, so a lookup that scans it is a
+    scan repeated hundreds of times per edit.  These indexes turn those scans
+    into a few dictionary reads while keeping the answers -- including which
+    record wins a tie -- exactly the ones the ordered scans produced.
     """
 
     tail_index: dict[str, tuple[str, ...]] | None = None
+    position_index: dict[str, int] | None = None
+    image_index: tuple[tuple[int, str, int], ...] | None = None
+    image_tails: dict[str, tuple[tuple[int, str, int], ...]] | None = None
 
+    # -- mutation: every index is stale as soon as the map changes -----------
+    def _invalidate(self) -> None:
+        self.tail_index = None
+        self.position_index = None
+        self.image_index = None
+        self.image_tails = None
+
+    def __setitem__(self, key: object, value: object) -> None:
+        super().__setitem__(key, value)  # type: ignore[index]
+        self._invalidate()
+
+    def __delitem__(self, key: object) -> None:
+        super().__delitem__(key)  # type: ignore[arg-type]
+        self._invalidate()
+
+    def update(self, *args: object, **kwargs: object) -> None:
+        super().update(*args, **kwargs)  # type: ignore[arg-type]
+        self._invalidate()
+
+    def setdefault(self, key: object, default: object = None) -> object:
+        present = key in self
+        value = super().setdefault(key, default)  # type: ignore[arg-type]
+        if not present:
+            self._invalidate()
+        return value
+
+    def pop(self, key: object, *default: object) -> object:
+        if key in self:
+            value = super().pop(key, *default)  # type: ignore[arg-type]
+            self._invalidate()
+            return value
+        return super().pop(key, *default)  # type: ignore[arg-type]
+
+    def popitem(self) -> tuple[object, object]:
+        item = super().popitem()
+        self._invalidate()
+        return item
+
+    def clear(self) -> None:
+        super().clear()
+        self._invalidate()
+
+    # -- the indexes ---------------------------------------------------------
     def record_tail_index(self) -> dict[str, tuple[str, ...]]:
         if self.tail_index is None:
             grouped: dict[str, list[str]] = {}
@@ -708,7 +763,68 @@ class RecordLookupIndex(dict):
         return self.tail_index
 
     def invalidate_tail_index(self) -> None:
-        self.tail_index = None
+        self._invalidate()
+
+    def record_position_index(self) -> dict[str, int]:
+        """Each key's place in the records' own order, which breaks ties."""
+
+        if self.position_index is None:
+            self.position_index = {key: index for index, key in enumerate(self)}
+        return self.position_index
+
+    def records_in_order(self, keys: "set[str] | frozenset[str]") -> list[str]:
+        """``keys`` as the records themselves are ordered."""
+
+        positions = self.record_position_index()
+        return sorted((key for key in keys if key in positions), key=positions.__getitem__)
+
+    def image_records(self) -> tuple[tuple[int, str, int], ...]:
+        """``(position, key, priority)`` for each record that states image metadata."""
+
+        if self.image_index is None:
+            entries: list[tuple[int, str, int]] = []
+            for index, (key, record) in enumerate(self.items()):
+                if not isinstance(record, Mapping):
+                    continue
+                if not isinstance(record.get("image_model_metadata"), Mapping):
+                    continue
+                entries.append((index, key, _positive_int(record.get("priority")) or 0))
+            grouped: dict[str, list[tuple[int, str, int]]] = {}
+            for entry in entries:
+                grouped.setdefault(entry[1].rsplit("/", 1)[-1], []).append(entry)
+            self.image_index = tuple(entries)
+            self.image_tails = {tail: tuple(items) for tail, items in grouped.items()}
+        return self.image_index
+
+    def image_matches(self, candidates: Sequence[str]) -> dict[str, tuple[int, int]]:
+        """``key -> (priority, position)`` for the image records a candidate names.
+
+        The comparison is the one the ordered scan made -- the key equals the
+        candidate, or ends with ``/<candidate>`` -- reached through the key's
+        own tail.  A key that equals a multi-segment candidate has that
+        candidate's last segment as its tail, and a key that ends with
+        ``/<candidate>`` has the same tail, so one group answers both tests.
+        """
+
+        if not candidates:
+            return {}
+        self.image_records()
+        tails = self.image_tails or {}
+        positions = self.record_position_index()
+        matched: dict[str, tuple[int, int]] = {}
+        for candidate in candidates:
+            tail = candidate.rsplit("/", 1)[-1]
+            for position, key, priority in tails.get(tail, ()):
+                if key not in matched and (key == candidate or key.endswith(f"/{candidate}")):
+                    matched[key] = (priority, position)
+            if candidate in matched:
+                continue
+            exact = self.get(candidate)
+            if isinstance(exact, Mapping) and isinstance(exact.get("image_model_metadata"), Mapping):
+                position = positions.get(candidate)
+                if position is not None:
+                    matched[candidate] = (_positive_int(exact.get("priority")) or 0, position)
+        return matched
 
 
 #: The fields a record states about a route's thinking, as opposed to its
@@ -820,10 +936,18 @@ def _lookup(records: Mapping[str, Mapping[str, Any]], model_id: str) -> dict[str
     direct_match = max(direct_matches, key=lambda item: (item[0], item[1])) if direct_matches else None
     suffix_keys = _suffix_match_keys(records, candidates)
     # Walk the records in their own order so the selected record for a tie is
-    # the same one the ordered scan used to produce.
+    # the same one the ordered scan used to produce -- but only the records
+    # that can match: the index knows each key's place, so narrowing to the
+    # matched keys in that order is the same list without walking the catalog.
     suffix_matches: list[tuple[int, dict[str, Any]]] = []
-    for key, value in records.items():
-        if key not in suffix_keys or not isinstance(value, Mapping):
+    ordered_keys: Iterable[str] = (
+        records.records_in_order(suffix_keys)
+        if isinstance(records, RecordLookupIndex)
+        else (key for key in records if key in suffix_keys)
+    )
+    for key in ordered_keys:
+        value = records[key]
+        if not isinstance(value, Mapping):
             continue
         suffix_matches.append((_positive_int(value.get("priority")) or 0, dict(value)))
     if suffix_matches:
@@ -2006,19 +2130,34 @@ class ModelContextRegistry:
         if refresh:
             self.refresh_if_due()
         candidates = _candidate_ids(model_id)
-        matches: list[tuple[int, int, dict[str, Any]]] = []
-        for index, (record_id, record) in enumerate(self._records.items()):
-            if not isinstance(record, Mapping) or not isinstance(record.get("image_model_metadata"), Mapping):
-                continue
-            if any(
-                record_id == candidate
-                or record_id.endswith(f"/{candidate}")
-                for candidate in candidates
-            ):
-                matches.append((_positive_int(record.get("priority")) or 0, -index, dict(record)))
-        if not matches:
+        if not candidates:
             return None
-        metadata = max(matches, key=lambda item: (item[0], item[1]))[2].get("image_model_metadata")
+        records = self._records
+        if isinstance(records, RecordLookupIndex):
+            matched = records.image_matches(candidates)
+            if not matched:
+                return None
+            # Highest priority wins; equal priorities keep the record the
+            # ordered scan would have seen first.
+            record_id = max(matched, key=lambda key: (matched[key][0], -matched[key][1]))
+            record = records.get(record_id)
+        else:  # a plain mapping, as a test may hand over
+            record = None
+            best: tuple[int, int] | None = None
+            for index, (record_id, candidate_record) in enumerate(records.items()):
+                if not isinstance(candidate_record, Mapping):
+                    continue
+                if not isinstance(candidate_record.get("image_model_metadata"), Mapping):
+                    continue
+                if not any(
+                    record_id == candidate or record_id.endswith(f"/{candidate}")
+                    for candidate in candidates
+                ):
+                    continue
+                rank = (_positive_int(candidate_record.get("priority")) or 0, -index)
+                if best is None or rank > best:
+                    best, record = rank, candidate_record
+        metadata = record.get("image_model_metadata") if isinstance(record, Mapping) else None
         return dict(metadata) if isinstance(metadata, Mapping) else None
 
     def states_image_generation(self, model_ids: Sequence[str]) -> bool:
