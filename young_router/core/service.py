@@ -1426,6 +1426,11 @@ class CoreStore:
         # One lock per registered domain: the write lane an edit in that domain
         # holds, and the only lane an unrelated domain's edit waits on.
         self._domain_locks: dict[str, threading.RLock] = {}
+        # The scopes this thread is inside, innermost last.  A domain's dispatch
+        # may hand its lane back for one call that is a conversation with a
+        # station rather than a transaction (see ``_release_lane_for_io``), and
+        # this is how that call finds the locks to give back.
+        self._lane_frames = threading.local()
         # Which threads are inside a domain write, by ident and nesting depth.
         # A projection reads all domains at once, so any *other* holder means
         # the projection must answer the last committed view instead of reading
@@ -1575,6 +1580,7 @@ class CoreStore:
             self._load_metadata()
         for adapter in domains:
             self.register_domain(adapter)
+        self._bind_io_gates()
 
     @contextlib.contextmanager
     def _mutation_scope(self):
@@ -1732,17 +1738,77 @@ class CoreStore:
         # committed view instead of concluding nobody is writing.
         self._note_domain_hold(1)
         taken: list[threading.RLock] = []
+        frame = {"locks": taken, "lane": lane, "released": False}
+        self._thread_lane_frames().append(frame)
         try:
             for lock in locks:
                 lock.acquire()
                 taken.append(lock)
             yield
         finally:
+            frames = self._thread_lane_frames()
+            if frames and frames[-1] is frame:
+                frames.pop()
             self._note_domain_hold(-1)
             for lock in reversed(taken):
                 lock.release()
             if lane:
                 self._release_mutation_lane()
+
+    def _thread_lane_frames(self) -> list[dict[str, Any]]:
+        """The write scopes this thread is inside, innermost last."""
+
+        frames = getattr(self._lane_frames, "frames", None)
+        if frames is None:
+            frames = []
+            self._lane_frames.frames = frames
+        return frames
+
+    def has_io_gate(self) -> bool:
+        """Whether a domain built over this store may lend its lane out."""
+
+        return True
+
+    @contextlib.contextmanager
+    def _release_lane_for_io(self):
+        """Give this thread's domain lane back for one station conversation.
+
+        A dispatch holds its domain's write lane for the whole action, which is
+        what makes two writes to one domain take turns -- and what makes a read
+        that talks to a station a problem.  The online-usage page read is one
+        such read: the station answers one page at a time with a budget of 90 s,
+        and every poll of the log tab takes the same lane to re-derive its view.
+        The tab therefore stopped updating for as long as one station took, and
+        a filter or pause queued behind it.
+
+        A domain that knows which of its calls is a conversation wraps exactly
+        that call in this gate.  The lane is released for its duration and taken
+        again afterwards, so the dispatch keeps its single path, its revision
+        and its bookkeeping; the work inside is not part of the transaction it
+        began, which is already how the logs domain treats an answer that a
+        newer selection replaced while it was in flight.
+
+        Only a single domain's own write is lent out.  A cross-domain
+        transaction's locks are one promise -- a half-committed provider/relay
+        pair is what they exist to prevent -- so its gate does nothing.
+        """
+
+        frames = self._thread_lane_frames()
+        frame = frames[-1] if frames else None
+        if frame is None or frame["released"] or frame["lane"] or len(frame["locks"]) != 1:
+            yield
+            return
+        frame["released"] = True
+        self._note_domain_hold(-1)
+        for lock in reversed(frame["locks"]):
+            lock.release()
+        try:
+            yield
+        finally:
+            for lock in frame["locks"]:
+                lock.acquire()
+            self._note_domain_hold(1)
+            frame["released"] = False
 
     @contextlib.contextmanager
     def _projection_scope(self, *, wait: bool = True):
@@ -2331,6 +2397,18 @@ class CoreStore:
     def domains(self) -> tuple[str, ...]:
         with self._lock:
             return tuple(self._domains)
+
+    def _bind_io_gates(self) -> None:
+        """Let a domain that reads a station lend its lane out for that read."""
+
+        for adapter in self._domains.values():
+            binder = getattr(adapter, "bind_io_gate", None)
+            if not callable(binder):
+                continue
+            try:
+                binder(self._release_lane_for_io)
+            except Exception:
+                continue
 
     def register_domain(self, adapter: DomainAdapter) -> str:
         name_value = getattr(adapter, "name", None)

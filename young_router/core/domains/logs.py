@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -1814,6 +1815,13 @@ def _call_reader_refresh(
         return refresh(source_id)  # type: ignore[operator]
 
 
+@contextlib.contextmanager
+def _no_io_gate():
+    """The gate a domain built on its own has: the lane is not its to lend."""
+
+    yield
+
+
 class LogsDomain:
     name = DOMAIN_NAME
 
@@ -1829,6 +1837,10 @@ class LogsDomain:
         maximum_read_bytes: int = MAX_READ_BYTES,
     ) -> None:
         self.root = _runtime_root(runtime_root)
+        # The store lends this domain's write lane out for the one call that
+        # talks to a station (see ``CoreStore._release_lane_for_io``).  A
+        # domain built on its own has no lane to lend.
+        self._io_gate = _no_io_gate
         self.config_path = Path(config_path).expanduser() if config_path else self.root / "config.yaml"
         self._online_usage_reader = online_usage_reader
         # The relay-account store owns the durable login material, so a refresh
@@ -2828,6 +2840,12 @@ class LogsDomain:
             return applied
         return self._online_usage_page_rows
 
+    def bind_io_gate(self, gate: object) -> None:
+        """Take the store's gate for the station reads this domain makes."""
+
+        if callable(gate):
+            self._io_gate = gate  # type: ignore[assignment]
+
     def _read_online_usage_page(self, tab: str, request: str = "") -> bool:
         """Read the page the pager names from the chosen relay.
 
@@ -2851,12 +2869,18 @@ class LogsDomain:
             elif not callable(refresh):
                 values, reason, station_total, applied_rows = [], "Online usage logs are unavailable.", 0, 0
             else:
-                answered = _call_reader_refresh(
-                    refresh,
-                    source_id,
-                    page=max(1, self._online_usage_page),
-                    rows_per_page=self._effective_page_rows(),
-                )
+                # One station page, and the only read in this domain that can
+                # take as long as a station's own budget: the log tab's polls
+                # take this domain's lane to re-derive their view, so the lane
+                # is given back for the duration of the read and retaken to
+                # apply its answer.
+                with self._io_gate():
+                    answered = _call_reader_refresh(
+                        refresh,
+                        source_id,
+                        page=max(1, self._online_usage_page),
+                        rows_per_page=self._effective_page_rows(),
+                    )
                 if request and request != self._online_usage_request:
                     # This answer belongs to a source the user has since
                     # replaced, so it neither becomes a row nor ends the wait
