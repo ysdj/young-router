@@ -1406,6 +1406,56 @@ def _collapse_request_records(records: list[object]) -> list[object]:
     return [record for _index, record in sorted(result, key=lambda x: x[0])]
 
 
+# The words each mode is stated as, keyed by value of the record's own
+# ``stream`` flag: the requests tab draws them as its 模式 cell (流式 / 非流式),
+# and a route trace writes the same fact into its detail parts
+# (``stream=true``).  A request row carries the client's boolean and nothing
+# else, so a filter typed from the column matched no row at all -- 2026-11-12,
+# the column had just been added.
+#
+# This cannot be a searched-for substring of some derived text: 非流式 contains
+# 流式 and Non-streaming contains Streaming, so a substring would either answer
+# "nothing" or answer both rows.  The word is therefore compared whole against
+# the mode the row itself recorded, and only the row's own mode matches.
+_REQUEST_MODE_WORDS: dict[bool, frozenset[str]] = {
+    True: frozenset({"流式", "streaming"}),
+    False: frozenset({"非流式", "non-streaming"}),
+}
+
+
+def _mode_named_by_filter(needle: str) -> bool | None:
+    """The mode a filter word names, or ``None`` when it names none."""
+
+    for stream, words in _REQUEST_MODE_WORDS.items():
+        if needle in words:
+            return stream
+    return None
+
+
+def _record_matches_filter(record: object, needle: str, *, tab: str) -> bool:
+    """Whether one row answers the tab's filter text.
+
+    The filter reads the row's own fields; it also reads the mode, whose words
+    travel only in the pane -- as this tab's 模式 cell, or as a route trace's
+    own ``stream=true`` detail part.
+    """
+
+    if needle in json.dumps(record, ensure_ascii=False, sort_keys=True).casefold():
+        return True
+    if not isinstance(record, Mapping):
+        return False
+    mode = _mode_named_by_filter(needle)
+    if mode is None:
+        return False
+    if tab == "requests":
+        stream = record.get("stream")
+        return isinstance(stream, bool) and stream is mode
+    if tab == "route-trace":
+        detail = record.get("detail")
+        return isinstance(detail, str) and f"stream={'true' if mode else 'false'}" in detail
+    return False
+
+
 def _is_service_noise(line: str) -> bool:
     message = SERVICE_TIMESTAMP_PREFIX.sub("", line).strip()
     if not message:
@@ -2486,8 +2536,7 @@ class LogsDomain:
                 records = [
                     record
                     for record in records
-                    if needle
-                    in json.dumps(record, ensure_ascii=False, sort_keys=True).casefold()
+                    if _record_matches_filter(record, needle, tab=tab)
                 ]
             return path.exists(), _sort_records_by_time(records)[-self._line_limit(tab) :]
         if tab == "recovery":
@@ -2640,7 +2689,7 @@ class LogsDomain:
             records = [
                 record
                 for record in records
-                if needle in json.dumps(record, ensure_ascii=False, sort_keys=True).casefold()
+                if _record_matches_filter(record, needle, tab=tab)
             ]
         available = path.exists() or (
             tab == "route-trace" and path.with_name(f"{path.name}.1").exists()

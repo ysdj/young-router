@@ -7274,9 +7274,22 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The cell's words are the pane's existing mode vocabulary, not a
         # second spelling of the same two states.
         self.assert_ui_has('translate(value.stream ? "logs.routeTrace.streaming" : "logs.routeTrace.nonStreaming")')
-        # The detail text states it too: that is what the reader copies and
-        # what a route-trace attempt shows beside its own failure.
-        self.assert_ui_has('if (mode) details.push(mode);')
+        # The mode is stated once: the column it was added for.  The detail cell
+        # used to open with the same word (and the record's own `stream: true`
+        # beside it), so every row repeated its 模式 cell in 详情.
+        self.assertNotIn("if (mode) details.push(mode);", self.ui)
+        self.assert_ui_has('"upstream_surface", "stream", "duration_ms"')
+        # A filter typed from this column has to find the row, and the record
+        # only carries the client's boolean, so both spellings of each mode are
+        # Core's vocabulary too -- taken from the same table the cell reads, in
+        # either language the pane may be running (a filter is a search).
+        core_logs = (ROOT / "young_router/core/domains/logs.py").read_text(encoding="utf-8")
+        vocabulary = core_logs.split("_REQUEST_MODE_WORDS", 1)[1].split("\n}\n", 1)[0]
+        for text in (self.en, self.zh):
+            for key in ("logs.routeTrace.streaming", "logs.routeTrace.nonStreaming"):
+                word = re.search(rf'"{re.escape(key)}": "([^"]+)"', text)
+                self.assertIsNotNone(word, key)
+                self.assertIn(f'"{word.group(1).casefold()}"', vocabulary)
         self.assertIn('"logs.mode": "MODE"', self.en)
         self.assertIn('"logs.mode": "模式"', self.zh)
         translation_keys = (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8")

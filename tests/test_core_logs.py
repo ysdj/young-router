@@ -2348,6 +2348,91 @@ model_list:
                 [record["request_id"] for record in domain.view("requests")["log"]["records"]],
             )
 
+    def test_request_filter_reads_the_mode_column_the_row_states_as_a_boolean(self) -> None:
+        """The mode column's words find their own rows, and only their own.
+
+        A request row records the client's body flag (``stream: true``), while
+        the table draws it as 模式 = 流式 / 非流式.  Filtering by the word the
+        table states therefore matched nothing at all.  It also cannot be a
+        substring of the two words: 非流式 contains 流式 (and Non-streaming
+        contains Streaming), so the word is matched whole against the mode the
+        row itself recorded.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "recent-requests.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps(
+                        {
+                            "ts": f"2026-08-01T04:10:0{index}Z",
+                            "request_id": name,
+                            "status": "success",
+                            "stream": stream,
+                        }
+                    )
+                    for index, (name, stream) in enumerate(
+                        (("live", True), ("whole", False))
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            domain = LogsDomain(root)
+
+            def names(filter_text: str) -> list[str]:
+                domain.dispatch("logs.set_filter", {"tab": "requests", "filter": filter_text})
+                return [
+                    record["request_id"]
+                    for record in domain.view("requests")["log"]["records"]
+                ]
+
+            self.assertEqual(["live"], names("流式"))
+            self.assertEqual(["whole"], names("非流式"))
+            self.assertEqual(["live"], names("Streaming"))
+            self.assertEqual(["whole"], names("non-streaming"))
+            # The row's own fields still answer, and a needle that names neither
+            # the mode nor a field keeps the tab empty rather than matching by
+            # accident.
+            self.assertEqual(["live", "whole"], names("success"))
+            self.assertEqual([], names("流"))
+
+            # The route trace states the same mode in its own detail part
+            # (`stream=true`), so the word the pane draws there finds it too.
+            (root / "server.log").write_text(
+                "\n".join(
+                    f"litellm_route_trace {json.dumps(payload)}"
+                    for payload in (
+                        {
+                            "timestamp": "2026-08-01T04:10:11Z",
+                            "event": "selected_deployment",
+                            "model_group": "live",
+                            "request": {"interface": {"stream": True}},
+                        },
+                        {
+                            "timestamp": "2026-08-01T04:10:12Z",
+                            "event": "selected_deployment",
+                            "model_group": "whole",
+                            "request": {"interface": {"stream": False}},
+                        },
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            def traced(filter_text: str) -> list[str]:
+                domain.dispatch("logs.set_filter", {"tab": "route-trace", "filter": filter_text})
+                return [
+                    record["public_model"]
+                    for record in domain.view("route-trace")["log"]["records"]
+                ]
+
+            self.assertEqual(["live", "whole"], traced(""))
+            self.assertEqual(["live"], traced("流式"))
+            self.assertEqual(["whole"], traced("非流式"))
+
     def test_request_tab_window_follows_a_configured_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

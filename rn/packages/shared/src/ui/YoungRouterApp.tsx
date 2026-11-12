@@ -14201,11 +14201,6 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
   );
   const cacheHit = formatLogCacheHit(cacheReadTokens, sentTokens);
   const details: string[] = [];
-  // The row's own words state the mode as well as its compact cell: the detail
-  // text is what a reader copies out of the pane and what the route trace
-  // shows beside an attempt, and a reader looking at a failure there must not
-  // have to infer from a wire pair whether the turn streamed.
-  if (mode) details.push(mode);
   const abortedDetail = tab === "requests" ? requestAbortedDetail(value.aborted, translate) : "";
   if (abortedDetail) details.push(abortedDetail);
   const directDetail = value.error === undefined
@@ -14216,7 +14211,7 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
       ? routeTraceDetailLabel(directDetail, translate)
       : tab === "recovery" ? recoveryDetailLabel(directDetail, translate) : directDetail,
   );
-  const used = new Set(["ts", "timestamp", "time", "created_at", "updated_at", "checked_at", "started_at", "heartbeat_at", "source", "provider", "api_key_name", "model_group", "public_model", "route_key", "routing_state", "status", "result", "detail", "message", "event", "action", "error", "aborted", "heartbeat", "upstream_model", "model", "client_surface", "upstream_surface", "duration_ms", "usage", "total_tokens", "request_id", "requestId", "session", "session_id", "deployment_id", "deployment_order", "target_order", "route", "failed_route", "failed_route_key", "failed_deployment_id", "candidate_routes", "candidates", "after_constraints", "selected_candidates", "cooldown_deployments"]);
+  const used = new Set(["ts", "timestamp", "time", "created_at", "updated_at", "checked_at", "started_at", "heartbeat_at", "source", "provider", "api_key_name", "model_group", "public_model", "route_key", "routing_state", "status", "result", "detail", "message", "event", "action", "error", "aborted", "heartbeat", "upstream_model", "model", "client_surface", "upstream_surface", "stream", "duration_ms", "usage", "total_tokens", "request_id", "requestId", "session", "session_id", "deployment_id", "deployment_order", "target_order", "route", "failed_route", "failed_route_key", "failed_deployment_id", "candidate_routes", "candidates", "after_constraints", "selected_candidates", "cooldown_deployments"]);
   for (const [key, item] of Object.entries(value)) {
     if (used.has(key)) continue;
     const display = compactLogValue(item);
