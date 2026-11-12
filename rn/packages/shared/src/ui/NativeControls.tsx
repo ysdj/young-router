@@ -1441,15 +1441,31 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
       // out is dropped instead of thrown: `scrollToIndex` fails loudly by
       // design, and a thrown error here escapes into the host process.
       onScrollToIndexFailed={() => undefined}
+      // The capsule beside the frame is this table's one scroll affordance in
+      // the browser: the host draws the browser's own bar as soon as it is told
+      // to, and a browser configured to always show scroll bars (or a platform
+      // that draws them that way) put a second, system-coloured bar beside the
+      // capsule -- two scrollbars for one list.  A host that hides them still
+      // scrolls: the wheel, the trackpad and the keyboard all reach the list.
+      showsVerticalScrollIndicator={Platform.OS !== "web"}
     />
-    {scrollMetrics.overflow && scrollMetrics.height > 0 ? <View pointerEvents="none" style={[windowsTableStyles.tableScrollThumb, { height: scrollMetrics.height, transform: [{ translateY: scrollMetrics.offset }] }]} /> : null}
   </View>;
+  // The thumb belongs to the table's frame, not to the rows: drawn inside the
+  // horizontally scrolled body it travelled with the columns and stood at the
+  // trailing edge of the *content* -- 160 pt off the pane's edge on the logs
+  // table, where nobody could see it, while the browser's own bar answered for
+  // the list instead.  Out here it stays on the frame's edge the way every
+  // persistent scroller in this app does, and the metrics are the same list's.
+  const scrollThumb = scrollMetrics.overflow && scrollMetrics.height > 0
+    ? <View pointerEvents="none" style={[windowsTableStyles.tableScrollThumb, { height: scrollMetrics.height, transform: [{ translateY: scrollMetrics.offset }] }]} />
+    : null;
   return <View style={[windowsTableStyles.root, !framed && windowsTableStyles.borderless, style]}>
     {/* A source list is a navigation pane, so it lays its rows out at the pane's
         own width and never scrolls horizontally.  Wrapping it in the data
         table's horizontal scroller made the sidebar slide sideways by a
         per-selection amount once a row was a few points too wide. */}
     {sourceList ? body : <ScrollView horizontal showsHorizontalScrollIndicator style={windowsTableStyles.horizontalScroll} contentContainerStyle={windowsTableStyles.horizontalContent}>{body}</ScrollView>}
+    {scrollThumb}
   </View>;
 }
 

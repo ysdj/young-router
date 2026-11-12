@@ -3411,6 +3411,17 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('.getScrollableNode?.();', self.native_controls)
         self.assertIn('windowsTableStyles.sourceCellViewFlex, { paddingLeft: leadingInset, paddingRight: TABLE_MIN_HORIZONTAL_PADDING }', self.native_controls)
         self.assertIn('{sourceList ? body : <ScrollView horizontal showsHorizontalScrollIndicator', self.native_controls)
+        # ... and it sits on the table's own edge, where a scroller's bar belongs.
+        # Inside the horizontally scrolled body the capsule travelled with the
+        # columns and stood at the trailing edge of the content: on the logs
+        # table that is 160 pt past the pane's edge, so the browser's own bar
+        # answered for the list instead — and a host that always shows scroll
+        # bars drew it beside the hidden capsule, two bars for one list.
+        self.assertIn('showsVerticalScrollIndicator={Platform.OS !== "web"}', self.native_controls)
+        table_source = self.native_controls.split('function WindowsTable(', 1)[1].split('\nfunction ', 1)[0]
+        body_source, thumb_source = table_source.split('const scrollThumb =', 1)
+        self.assertNotIn('tableScrollThumb', body_source)
+        self.assertIn('{scrollThumb}', thumb_source)
         self.assertIn('onHoverIn={sourceList ? () => setHovered(true) : undefined}', self.native_controls)
         shell = self.ui.split("function SettingsShell(", 1)[1].split("function RouteSurface(", 1)[0]
         self.assertIn('sourceList', shell)
