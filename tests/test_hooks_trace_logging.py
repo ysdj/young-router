@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from hook_test_utils import *
 
+from young_router import runtime_store
+
 
 def _declared_stream_start_seconds() -> float:
     """The stream-start budget this deployment is configured to use.
@@ -411,7 +413,7 @@ class HookTraceLoggingTests(HookTestCase):
 
             await hook.async_log_success_event(kwargs, response, start, end)
 
-            raw = log_path.read_text(encoding="utf-8")
+            raw = "\n".join(runtime_store.read_records(log_path, limit=10_000))
             record = json.loads(raw)
             self.assertEqual(record["ts"], "2026-06-09T12:00:00Z")
             self.assertEqual(record["status"], "success")
@@ -464,7 +466,7 @@ class HookTraceLoggingTests(HookTestCase):
 
             records = [
                 json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
+                for line in runtime_store.read_records(log_path, limit=10_000)
                 if line.strip()
             ]
             self.assertEqual(1, len(records))
@@ -473,8 +475,8 @@ class HookTraceLoggingTests(HookTestCase):
             self.assertEqual("pending-call-1", pending["request_id"])
             self.assertEqual(pending["started_at"], pending["ts"])
             self.assertNotIn("duration_ms", pending)
-            self.assertNotIn("SECRET_PROMPT_BODY", log_path.read_text(encoding="utf-8"))
-            self.assertNotIn("SECRET_API_KEY", log_path.read_text(encoding="utf-8"))
+            self.assertNotIn("SECRET_PROMPT_BODY", "\n".join(runtime_store.read_records(log_path, limit=10_000)))
+            self.assertNotIn("SECRET_API_KEY", "\n".join(runtime_store.read_records(log_path, limit=10_000)))
 
     async def test_pre_call_settles_an_abandoned_pending_request(self) -> None:
         hooks, _ = load_hook_module()
@@ -494,7 +496,7 @@ class HookTraceLoggingTests(HookTestCase):
 
             records = [
                 json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
+                for line in runtime_store.read_records(log_path, limit=10_000)
                 if line.strip()
             ]
             self.assertEqual(["pending", "aborted"], [record["status"] for record in records])
@@ -535,7 +537,7 @@ class HookTraceLoggingTests(HookTestCase):
 
             records = [
                 json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
+                for line in runtime_store.read_records(log_path, limit=10_000)
                 if line.strip()
             ]
             self.assertIn("aborted", [record["status"] for record in records])
@@ -681,7 +683,7 @@ class HookTraceLoggingTests(HookTestCase):
 
             records = [
                 json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
+                for line in runtime_store.read_records(log_path, limit=10_000)
                 if line.strip()
             ]
             self.assertEqual("aborted", records[-1]["status"])
@@ -741,7 +743,7 @@ class HookTraceLoggingTests(HookTestCase):
 
             records = [
                 json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
+                for line in runtime_store.read_records(log_path, limit=10_000)
                 if line.strip()
             ]
             self.assertEqual(
@@ -799,7 +801,7 @@ class HookTraceLoggingTests(HookTestCase):
 
             records = [
                 json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
+                for line in runtime_store.read_records(log_path, limit=10_000)
                 if line.strip()
             ]
             self.assertEqual("failed-stream-call", records[0]["request_id"])
@@ -851,7 +853,7 @@ class HookTraceLoggingTests(HookTestCase):
             # terminal stop) proves the router moved on.
             records = [
                 json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
+                for line in runtime_store.read_records(log_path, limit=10_000)
                 if line.strip()
             ]
             self.assertEqual(["pending"], [record["status"] for record in records])
@@ -865,7 +867,7 @@ class HookTraceLoggingTests(HookTestCase):
             await hook.async_pre_call_deployment_hook(second, call_type="amessages")
             records = [
                 json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
+                for line in runtime_store.read_records(log_path, limit=10_000)
                 if line.strip()
             ]
             self.assertEqual(
@@ -967,7 +969,7 @@ class HookTraceLoggingTests(HookTestCase):
 
             records = [
                 json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
+                for line in runtime_store.read_records(log_path, limit=10_000)
                 if line.strip()
             ]
             self.assertFalse(settled)
@@ -1000,7 +1002,7 @@ class HookTraceLoggingTests(HookTestCase):
 
             records = [
                 json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
+                for line in runtime_store.read_records(log_path, limit=10_000)
                 if line.strip()
             ]
             self.assertEqual(["pending", "failure"], [record["status"] for record in records])
@@ -1022,7 +1024,7 @@ class HookTraceLoggingTests(HookTestCase):
 
             records = [
                 json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
+                for line in runtime_store.read_records(log_path, limit=10_000)
                 if line.strip()
             ]
             self.assertEqual(["pending", "stream"], [record["status"] for record in records])
@@ -1111,7 +1113,7 @@ class HookTraceLoggingTests(HookTestCase):
             self.assertEqual(1, settled)
             written = [
                 json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
+                for line in runtime_store.read_records(log_path, limit=10_000)
                 if line.strip()
             ]
             self.assertEqual(5, len(written))
@@ -1156,7 +1158,7 @@ class HookTraceLoggingTests(HookTestCase):
 
             records = [
                 json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
+                for line in runtime_store.read_records(log_path, limit=10_000)
                 if line.strip()
             ]
             self.assertEqual(["stream", "success", "failure"], [record["status"] for record in records])
@@ -1177,7 +1179,7 @@ class HookTraceLoggingTests(HookTestCase):
 
             await hook.async_log_success_event(kwargs, {"id": "response-summary"}, now, now)
 
-            record = json.loads(log_path.read_text(encoding="utf-8"))
+            record = json.loads(runtime_store.read_records(log_path, limit=1)[-1])
             self.assertEqual("success", record["status"])
 
     def test_request_log_uses_router_public_model_after_upstream_rewrite(self) -> None:
@@ -1580,7 +1582,7 @@ class HookTraceLoggingTests(HookTestCase):
             )
             records = [
                 json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
+                for line in runtime_store.read_records(log_path, limit=10_000)
                 if line.strip()
             ]
             self.assertEqual(1, len(records))
@@ -1620,7 +1622,7 @@ class HookTraceLoggingTests(HookTestCase):
 
             await hook.async_log_failure_event(kwargs, None, start, end)
 
-            raw = log_path.read_text(encoding="utf-8")
+            raw = "\n".join(runtime_store.read_records(log_path, limit=10_000))
             record = json.loads(raw)
             self.assertEqual(record["status"], "failure")
             self.assertEqual(record["error"]["type"], "ProviderError")
@@ -1757,29 +1759,69 @@ class HookTraceLoggingTests(HookTestCase):
         self.assertNotIn(hooks._REQUEST_STARTED_TIME_KEY, request)
         self.assertIsNotNone(hooks._request_started_time(request))
 
-    def test_recent_request_rotation_keeps_bounded_current_and_backup_tail(self) -> None:
+    def test_recent_request_retention_keeps_the_newest_rows(self) -> None:
+        """The log is bounded by rows in the store, not by a rotation copy.
+
+        The file it replaced rotated at ten megabytes, and rotating meant
+        copying that much inside the lock while sixteen workers waited for it.
+        A row that falls out of the newest window is simply gone; nothing is
+        copied and no `.1` sibling exists to read.
+        """
+
         hooks, _ = load_hook_module()
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "recent-requests.jsonl"
-            cap = hooks.MIN_LOG_MAX_BYTES
-            log_path.write_text("a" * (cap + 1024), encoding="utf-8")
             self.set_log_env(log_path)
-            self.set_env("YOUNG_ROUTER_LOG_MAX_BYTES", str(cap))
+            for index in range(5):
+                runtime_store.append_record(
+                    log_path,
+                    json.dumps({"request_id": f"row-{index}", "status": "success"}),
+                    keep=3,
+                )
+
+            self.assertEqual(3, runtime_store.record_count(log_path))
+            rows = [json.loads(line) for line in runtime_store.read_records(log_path, limit=10)]
+            self.assertEqual(["row-2", "row-3", "row-4"], [row["request_id"] for row in rows])
+            self.assertFalse(Path(f"{log_path}.1").exists())
+            self.assertFalse(log_path.exists(), "the request log was written back as a file")
+
+    def test_a_legacy_request_log_is_imported_but_never_appended_to(self) -> None:
+        """A file-based build's log is adopted once, whole, and then history."""
+
+        hooks, _ = load_hook_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            legacy = "\n".join(
+                json.dumps({"request_id": f"old-{index}", "status": "success"}) for index in range(3)
+            ) + "\n"
+            log_path.write_text(legacy, encoding="utf-8")
+            self.set_log_env(log_path)
 
             hooks._append_recent_request({"status": "success", "marker": "latest"})
 
-            self.assertLessEqual(log_path.stat().st_size, 128)
-            backup_path = Path(f"{log_path}.1")
-            self.assertTrue(backup_path.exists())
-            self.assertLessEqual(backup_path.stat().st_size, cap)
-            self.assertIn('"marker": "latest"', log_path.read_text(encoding="utf-8"))
-            self.assertEqual(backup_path.read_text(encoding="utf-8"), "a" * cap)
+            rows = [json.loads(line) for line in runtime_store.read_records(log_path, limit=10)]
+            self.assertEqual(["old-0", "old-1", "old-2", "latest"], [row.get("request_id") or row.get("marker") for row in rows])
+            # The file the previous build wrote is not a second writer.
+            self.assertEqual(legacy, log_path.read_text(encoding="utf-8"))
 
-    def test_recent_request_rotation_uses_local_log_cap_key(self) -> None:
+    def test_the_request_log_is_bounded_by_rows_not_by_the_log_byte_cap(self) -> None:
+        """`YOUNG_ROUTER_LOG_MAX_BYTES` still caps `server.log`; this log is rows."""
+
+        from young_router import runtime_store as store_module
+
         hooks, _ = load_hook_module()
-        self.set_env("YOUNG_ROUTER_LOG_MAX_BYTES", "300000")
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            self.set_env("YOUNG_ROUTER_LOG_MAX_BYTES", str(hooks.MIN_LOG_MAX_BYTES))
+            big = {"status": "success", "body": "x" * hooks.MIN_LOG_MAX_BYTES}
+            for _ in range(3):
+                hooks._append_recent_request(dict(big))
 
-        self.assertEqual(hooks._recent_requests_max_bytes(), 300000)
+            # Three rows well over the byte cap are still three rows: the cap
+            # belongs to the rotating service log, not to this one.
+            self.assertEqual(3, store_module.record_count(log_path))
+            self.assertLessEqual(store_module.DEFAULT_RECORD_RETENTION, 100_000)
 
     async def test_deployment_failover_trace_records_route_key(self) -> None:
         hooks, _ = load_hook_module()

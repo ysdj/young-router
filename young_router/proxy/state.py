@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover - Windows does not provide POSIX flock.
 
 from ..atomic_io import atomic_write_text
 from .. import runtime_store
-from ..log_rotation import append_bounded_log, log_max_bytes
+from ..log_rotation import append_bounded_log
 from .launcher_settings import (
     _DEPLOYMENT_COOLDOWN_FILE_ENV,
     _RECENT_REQUESTS_LOG_ENV,
@@ -606,10 +606,6 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def _recent_requests_max_bytes() -> int:
-    return log_max_bytes()
-
-
 def _append_recent_request(
     record: dict[str, Any],
     *,
@@ -628,10 +624,8 @@ def _append_recent_request(
     if not path:
         return request_id
     try:
-        line = (
-            json.dumps(record, ensure_ascii=False, sort_keys=True, default=str) + "\n"
-        ).encode("utf-8")
-        append_bounded_log(path, line, maximum_bytes=_recent_requests_max_bytes())
+        line = json.dumps(record, ensure_ascii=False, sort_keys=True, default=str)
+        runtime_store.append_record(path, line)
     except Exception:
         pass
     return request_id

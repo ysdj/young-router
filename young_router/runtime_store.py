@@ -53,7 +53,18 @@ _SCHEMA = (
     " body TEXT NOT NULL,"
     " revision INTEGER NOT NULL,"
     " updated_at REAL NOT NULL"
-    ") WITHOUT ROWID"
+    ") WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS records ("
+    " name TEXT NOT NULL,"
+    " seq INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " body TEXT NOT NULL,"
+    " at REAL NOT NULL"
+    ")",
+    "CREATE INDEX IF NOT EXISTS records_name_seq ON records(name, seq)",
+    "CREATE TABLE IF NOT EXISTS record_imports ("
+    " name TEXT PRIMARY KEY,"
+    " imported_at REAL NOT NULL"
+    ") WITHOUT ROWID",
 )
 
 _handles: dict[str, "_Handle"] = {}
@@ -108,7 +119,8 @@ class _Handle:
         with self._schema_lock:
             if self._schema_ready:
                 return
-            connection.execute(_SCHEMA)
+            for statement in _SCHEMA:
+                connection.execute(statement)
             self._schema_ready = True
 
 
@@ -329,9 +341,168 @@ def delete_document(path: Path | str) -> bool:
     return bool(removed)
 
 
+#: How many request rows one log keeps.  The JSONL it replaces rotated at 10 MB,
+#: which held roughly thirty thousand of the records this proxy writes; the
+#: pane reads the newest few hundred.
+DEFAULT_RECORD_RETENTION = 30_000
+
+_records_lock = threading.Lock()
+
+
+def _import_records(connection: sqlite3.Connection, path: Path | str, name: str, keep: int) -> None:
+    """Adopt the JSONL a file-based build left behind, once."""
+
+    if connection.execute("SELECT 1 FROM record_imports WHERE name=?", (name,)).fetchone() is not None:
+        return
+    target = os.path.expanduser(os.fspath(path))
+    lines: list[str] = []
+    try:
+        with open(target, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 4 * 1024 * 1024))
+            payload = handle.read()
+    except OSError:
+        payload = b""
+    if payload:
+        # The tail may start mid-line; every complete line after it is a row.
+        text = payload.decode("utf-8", "replace")
+        lines = [line for line in text.splitlines() if line.strip()][-keep:]
+        if payload[:1] not in (b"\n", b"{") and "\n" in text:
+            lines = lines[1:] if lines and not lines[0].lstrip().startswith("{") else lines
+    now = time.time()
+    for line in lines:
+        connection.execute(
+            "INSERT INTO records(name, body, at) VALUES(?,?,?)", (name, line, now)
+        )
+    connection.execute(
+        "INSERT OR REPLACE INTO record_imports(name, imported_at) VALUES(?,?)", (name, now)
+    )
+
+
+def append_record(path: Path | str, body: str, *, keep: int = DEFAULT_RECORD_RETENTION) -> int:
+    """Append one record; returns its sequence number.
+
+    Retention is by count: the newest ``keep`` rows of this log survive, so the
+    oldest fall off without a rotation copy -- which under the file primitive
+    meant copying megabytes inside the lock while every worker waited.
+    """
+
+    name = _name(path)
+    connection = _handle(path).connection()
+    with _records_lock:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            _import_records(connection, path, name, keep)
+            cursor = connection.execute(
+                "INSERT INTO records(name, body, at) VALUES(?,?,?)", (name, body.rstrip("\n"), time.time())
+            )
+            seq = int(cursor.lastrowid or 0)
+            connection.execute(
+                "DELETE FROM records WHERE name=? AND seq <= "
+                "(SELECT MAX(seq) FROM records WHERE name=?) - ?",
+                (name, name, int(keep)),
+            )
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+    return seq
+
+
+def _ensure_records_imported(path: Path | str, keep: int = DEFAULT_RECORD_RETENTION) -> None:
+    """Adopt a file-based build's log the first time this one is read or written."""
+
+    name = _name(path)
+    connection = _handle(path).connection()
+    if connection.execute("SELECT 1 FROM record_imports WHERE name=?", (name,)).fetchone() is not None:
+        return
+    with _records_lock:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            _import_records(connection, path, name, keep)
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+
+
+def read_records(path: Path | str, *, limit: int) -> list[str]:
+    """The newest ``limit`` records, oldest first."""
+
+    _ensure_records_imported(path, max(int(limit), 1))
+    name = _name(path)
+    connection = _handle(path).connection()
+    rows = connection.execute(
+        "SELECT body FROM records WHERE name=? ORDER BY seq DESC LIMIT ?", (name, max(0, int(limit)))
+    ).fetchall()
+    return [row[0] for row in reversed(rows)]
+
+
+def records_after(path: Path | str, seq: int, *, limit: int) -> list[str]:
+    """Records appended after ``seq``, oldest first."""
+
+    _ensure_records_imported(path, max(int(limit), 1))
+    name = _name(path)
+    connection = _handle(path).connection()
+    rows = connection.execute(
+        "SELECT body FROM records WHERE name=? AND seq>? ORDER BY seq ASC LIMIT ?",
+        (name, int(seq), max(0, int(limit))),
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
+def latest_record_seq(path: Path | str) -> int:
+    """The newest record's number, or 0 when this log holds none."""
+
+    _ensure_records_imported(path)
+    name = _name(path)
+    connection = _handle(path).connection()
+    row = connection.execute("SELECT MAX(seq) FROM records WHERE name=?", (name,)).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def record_count(path: Path | str) -> int:
+    _ensure_records_imported(path)
+    name = _name(path)
+    connection = _handle(path).connection()
+    row = connection.execute("SELECT COUNT(*) FROM records WHERE name=?", (name,)).fetchone()
+    return int(row[0]) if row else 0
+
+
+def has_records(path: Path | str) -> bool:
+    if record_count(path) > 0:
+        return True
+    try:
+        return os.path.getsize(os.path.expanduser(os.fspath(path))) > 0
+    except OSError:
+        return False
+
+
+def clear_records(path: Path | str) -> None:
+    name = _name(path)
+    connection = _handle(path).connection()
+    with _records_lock:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute("DELETE FROM records WHERE name=?", (name,))
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+
+
 __all__ = [
+    "DEFAULT_RECORD_RETENTION",
     "DATABASE_NAME",
+    "append_record",
+    "clear_records",
     "database_path",
+    "has_records",
+    "latest_record_seq",
+    "read_records",
+    "record_count",
+    "records_after",
     "delete_document",
     "document_version",
     "has_document",

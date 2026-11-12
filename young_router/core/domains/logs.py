@@ -1981,105 +1981,77 @@ class LogsDomain:
         consumed = end + 1
         return data[:consumed].decode("utf-8", errors="replace").splitlines(), consumed
 
-    def _trim_request_tail(
-        self,
-        entries: list[tuple[dict[str, Any] | None, int]],
-        line_limit: int,
-    ) -> tuple[list[tuple[dict[str, Any] | None, int]], int]:
-        total = sum(size for _record, size in entries)
-        start = 0
-        while start < len(entries) and (
-            len(entries) - start > line_limit or total > self.maximum_read_bytes
-        ):
-            total -= entries[start][1]
-            start += 1
-        return (entries[start:], total) if start else (entries, total)
-
     def _requests_records(
         self,
         path: Path,
         configured_public_models: Mapping[str, str],
         configured_route_models: object,
     ) -> list[dict[str, Any]]:
-        """Project the newest request lines, reusing the parsed tail."""
+        """Project the newest request records, reusing the parsed tail.
+
+        The proxy appends these rows to one log the store owns, so "what is
+        new" is a sequence number rather than a file offset: the tab reads the
+        rows after the one it last projected, keeps the projection it already
+        built for the rows before them, and drops what falls out of the pane's
+        window.  A row the tab cannot read is skipped, not a failure.
+        """
 
         line_limit = self._line_limit("requests")
         signature = _configuration_signature(self.config_path)
-        try:
-            details = path.lstat()
-        except OSError:
-            details = None
-        regular = (
-            details is not None
-            and not stat.S_ISLNK(details.st_mode)
-            and stat.S_ISREG(details.st_mode)
-        )
+        latest = runtime_store.latest_record_seq(path)
+        cleared = self._clear_cursors.get("requests") if "requests" in self._cleared else None
+        cleared_seq = int(cleared[1]) if isinstance(cleared, tuple) and cleared[:1] == ("records",) and isinstance(cleared[1], int) else 0
+
+        def project(lines: "list[str]") -> list[dict[str, Any]]:
+            return [
+                record
+                for record in (
+                    self._project_request_line(line, configured_public_models, configured_route_models)
+                    for line in lines
+                )
+                if record is not None
+            ]
+
         with self._request_tail_lock:
             cache = self._request_tail
-            offset = cache.get("offset")
+            cached_seq = cache.get("seq")
             usable = (
-                regular
-                and cache.get("dev") == details.st_dev
-                and cache.get("ino") == details.st_ino
-                and cache.get("signature") == signature
-                and isinstance(offset, int)
-                and 0 <= offset <= details.st_size
+                cache.get("signature") == signature
                 and cache.get("line_limit", 0) >= line_limit
-                and details.st_size - offset <= self.maximum_read_bytes
-                and self._request_tail_boundary_reached(path, offset)
+                and cache.get("cleared") == cleared_seq
+                and isinstance(cached_seq, int)
+                and cleared_seq <= cached_seq <= latest
             )
             if usable:
                 entries = list(cache.get("entries") or [])
-                if details.st_size > offset:
-                    appended, consumed = self._read_appended_lines(path, offset)
-                    if consumed > 0:
-                        for line in appended:
-                            entries.append(
-                                (
-                                    self._project_request_line(
-                                        line,
-                                        configured_public_models,
-                                        configured_route_models,
-                                    ),
-                                    _line_byte_size(line),
-                                )
-                            )
-                        entries, total = self._trim_request_tail(entries, line_limit)
-                        cache.update(
-                            {
-                                "entries": entries,
-                                "bytes": total,
-                                "offset": offset + consumed,
-                                "line_limit": line_limit,
-                            }
-                        )
-                return [record for record, _size in entries if record is not None]
-            self._request_tail = {}
-        lines = self._read_lines(path, line_limit=line_limit)
-        entries = [
-            (
-                self._project_request_line(
-                    line,
-                    configured_public_models,
-                    configured_route_models,
-                ),
-                _line_byte_size(line),
-            )
-            for line in lines
-        ]
-        entries, total = self._trim_request_tail(entries, line_limit)
-        if regular:
-            with self._request_tail_lock:
+                if latest > cached_seq:
+                    entries.extend(project(runtime_store.records_after(path, cached_seq, limit=max(latest - cached_seq, line_limit))))
+                entries = entries[-line_limit:]
                 self._request_tail = {
-                    "dev": details.st_dev,
-                    "ino": details.st_ino,
-                    "offset": details.st_size,
-                    "line_limit": line_limit,
+                    "seq": latest,
                     "signature": signature,
-                    "bytes": total,
+                    "line_limit": line_limit,
+                    "cleared": cleared_seq,
                     "entries": entries,
                 }
-        return [record for record, _size in entries if record is not None]
+                return list(entries)
+        # No usable projection: build the window from the newest rows.
+        window = max(line_limit * 2, 400)
+        lines = (
+            runtime_store.records_after(path, cleared_seq, limit=window)
+            if cleared_seq
+            else runtime_store.read_records(path, limit=window)
+        )
+        entries = project(lines)[-line_limit:]
+        with self._request_tail_lock:
+            self._request_tail = {
+                "seq": latest,
+                "signature": signature,
+                "line_limit": line_limit,
+                "cleared": cleared_seq,
+                "entries": entries,
+            }
+        return list(entries)
 
     def _empty_tab(self, tab: str) -> dict[str, Any]:
         value: dict[str, Any] = {
@@ -2234,6 +2206,8 @@ class LogsDomain:
         path = self._path(tab)
         if path is None:
             return ("none",)
+        if tab == "requests":
+            return ("records", runtime_store.latest_record_seq(path), runtime_store.record_count(path))
         try:
             details = path.lstat()
         except OSError:
@@ -2490,7 +2464,7 @@ class LogsDomain:
                     if needle
                     in json.dumps(record, ensure_ascii=False, sort_keys=True).casefold()
                 ]
-            return path.exists(), _sort_records_by_time(records)[-self._line_limit(tab) :]
+            return runtime_store.has_records(path), _sort_records_by_time(records)[-self._line_limit(tab) :]
         if tab == "recovery":
             source_cursor = self._source_cursor(tab)
             clear_cursor = self._clear_cursors.get(tab)
@@ -2635,8 +2609,10 @@ class LogsDomain:
                 for record in records
                 if needle in json.dumps(record, ensure_ascii=False, sort_keys=True).casefold()
             ]
-        available = path.exists() or (
-            tab == "route-trace" and path.with_name(f"{path.name}.1").exists()
+        available = (
+            runtime_store.has_records(path)
+            if tab == "requests"
+            else path.exists() or (tab == "route-trace" and path.with_name(f"{path.name}.1").exists())
         )
         return available, _sort_records_by_time(records)[-self._line_limit(tab) :]
 
@@ -2652,6 +2628,10 @@ class LogsDomain:
         path = self._path(tab)
         if path is None:
             source = self._source_cursor(tab)[1:]
+        elif tab == "requests":
+            # The log lives in the store; a sequence that moves is the change,
+            # and it is what the tab's own view is rebuilt from.
+            source = ("records", runtime_store.latest_record_seq(path), runtime_store.record_count(path))
         elif tab == "route-trace":
             source = (
                 self._file_cursor(path.with_name(f"{path.name}.1")),
