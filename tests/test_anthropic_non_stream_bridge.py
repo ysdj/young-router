@@ -292,6 +292,28 @@ class AnthropicNonStreamBridgeTests(HookTestCase):
         await hook.async_log_failure_event(inner, {"error": "x"}, now, now)
         self.assertEqual([], appended)
 
+        # LiteLLM copies the inner call's metadata into the shared
+        # ``litellm_params``; that copy must not make the client's own row
+        # look like a second turn.
+        await hook.async_log_success_event(
+            {
+                "model": "claude-fable-5-2",
+                "stream": False,
+                "model_info": {"id": "relay-a"},
+                "litellm_params": {
+                    "litellm_metadata": {
+                        bridge._INNER_CALL_METADATA_KEY: True
+                    }
+                },
+            },
+            {"ok": True},
+            now,
+            now,
+        )
+        self.assertEqual(1, len(appended))
+        self.assertIs(False, appended[0].get("stream"))
+        appended.clear()
+
         # The client-facing answer still writes its row.
         await hook.async_log_success_event(
             {"model": "claude-fable-5-2", "stream": False, "model_info": {"id": "relay-a"}},

@@ -78,23 +78,20 @@ def _inner_call_kwargs(call_kwargs: dict) -> dict:
 
 
 def _is_inner_bridge_call(request_kwargs: Optional[dict]) -> bool:
-    """True for the deployment call a whole-body turn was bridged through."""
+    """True for the deployment call a whole-body turn was bridged through.
+
+    Only the request's own metadata is read.  LiteLLM copies the inner call's
+    metadata into the shared ``litellm_params``, which is also carried by the
+    client-facing attempt's logging kwargs; looking there would suppress the
+    client's own success row (and its cooldown-clearing success) as if it were
+    a second turn.
+    """
 
     if not isinstance(request_kwargs, dict):
         return False
-    containers = [request_kwargs]
-    for key in ("litellm_metadata", "metadata", "litellm_params"):
-        value = request_kwargs.get(key)
-        if isinstance(value, dict):
-            containers.append(value)
-    for container in list(containers):
-        if container is request_kwargs.get("litellm_params"):
-            for key in ("litellm_metadata", "metadata"):
-                value = container.get(key)
-                if isinstance(value, dict):
-                    containers.append(value)
-    for container in containers:
-        if container.get(_INNER_CALL_METADATA_KEY) is True:
+    for key in ("litellm_metadata", "metadata"):
+        metadata = request_kwargs.get(key)
+        if isinstance(metadata, dict) and metadata.get(_INNER_CALL_METADATA_KEY) is True:
             return True
     return False
 
