@@ -289,8 +289,13 @@ class AnthropicNonStreamBridgeTests(HookTestCase):
 
         await hook.async_log_success_event(inner, {"ok": True}, now, now)
         await hook.async_log_stream_event(inner, {"ok": True}, now, now)
-        await hook.async_log_failure_event(inner, {"error": "x"}, now, now)
         self.assertEqual([], appended)
+
+        # A failed inner call is the client's failure: it must leave a row,
+        # otherwise the whole-body turn stays 发送中 while the client retries.
+        await hook.async_log_failure_event(inner, {"error": "x"}, now, now)
+        self.assertEqual(1, len(appended))
+        appended.clear()
 
         # LiteLLM copies the inner call's metadata into the shared
         # ``litellm_params``; that copy must not make the client's own row

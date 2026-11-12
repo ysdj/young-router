@@ -164,8 +164,13 @@ class YoungRouterHook(CustomLogger):
     ) -> None:
         if _routing_module._is_codex_compaction_capability_probe(kwargs):
             return
-        if _anthropic_non_stream_module._is_inner_bridge_call(kwargs):
-            return
+        # A bridged deployment call that failed is the client's failure too:
+        # its success is suppressed (the assembled answer logs once), but its
+        # failure is the only evidence of why the whole-body turn ended.  When
+        # this was skipped the request stayed 发送中 in the log while the client
+        # was already retrying -- the retry loop had no row to explain it.
+        # A client-facing failure callback may also run; a second failure row
+        # is honest duplication, a missing one is a lie.
         # A failed turn has no attempt in flight either; its slot goes back the
         # moment the failure is known, not when the lease expires.
         _routing_module._release_request_concurrency_slots(kwargs)
