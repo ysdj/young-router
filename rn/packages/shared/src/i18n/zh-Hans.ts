@@ -227,7 +227,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "logs.recoveryDetail.attempt": "第 {value} 次尝试",
   "logs.recoveryDetail.timeout": "单次超时 {value} 秒",
   "logs.recoveryDetail.cooldown": "冷却 {value} 秒",
-  "logs.recoveryDetail.failures": "连续失败 {value} 次",
+  "logs.recoveryDetail.failures": "连续 {value} 次尝试失败",
   "logs.recoveryDetail.retry": "{value} 秒后重试",
   "logs.recoveryReason.billing": "余额或额度不足",
   "logs.recoveryReason.authentication": "鉴权被拒绝",

@@ -227,7 +227,7 @@ export const en: Record<TranslationKey, string> = {
   "logs.recoveryDetail.attempt": "Attempt {value}",
   "logs.recoveryDetail.timeout": "Attempt timeout {value}s",
   "logs.recoveryDetail.cooldown": "Cooldown {value}s",
-  "logs.recoveryDetail.failures": "Consecutive failures {value}",
+  "logs.recoveryDetail.failures": "{value} consecutive failed attempts",
   "logs.recoveryDetail.retry": "Retry in {value}s",
   "logs.recoveryReason.billing": "Billing or credit limit",
   "logs.recoveryReason.authentication": "Authentication rejected",
