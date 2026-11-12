@@ -1727,14 +1727,19 @@ class CoreStore:
             self._acquire_mutation_lane()
             lane = True
         locks = self._ordered_domain_locks(dict.fromkeys(ordered)) if ordered else []
-        for lock in locks:
-            lock.acquire()
+        # Stated before the locks are taken: a reader that meets one of them
+        # must always find the writer it belongs to, and answer the last
+        # committed view instead of concluding nobody is writing.
         self._note_domain_hold(1)
+        taken: list[threading.RLock] = []
         try:
+            for lock in locks:
+                lock.acquire()
+                taken.append(lock)
             yield
         finally:
             self._note_domain_hold(-1)
-            for lock in reversed(locks):
+            for lock in reversed(taken):
                 lock.release()
             if lane:
                 self._release_mutation_lane()
@@ -1789,8 +1794,28 @@ class CoreStore:
                 self._mutation_owner = ident
             self._mutation_depth += 1
         locks = self._all_domain_locks()
+        taken: list[threading.RLock] = []
         for lock in locks:
-            lock.acquire()
+            # ``wait=False`` is the whole scope's promise, not the lane's alone.
+            # One domain's ordinary write takes its own lock and never the
+            # lane, so a reader that found the lane free used to block here for
+            # as long as that write lasted -- a station refresh is seconds --
+            # whenever it arrived between the writer's lock and its stated
+            # hold.  The lock-budget suite caught it as a snapshot that waited
+            # the full 800 ms of the dispatch beside it.
+            if not lock.acquire(blocking=wait):
+                break
+            taken.append(lock)
+        if len(taken) != len(locks):
+            for lock in reversed(taken):
+                lock.release()
+            with self._lock:
+                self._mutation_depth -= 1
+                if self._mutation_depth == 0:
+                    self._mutation_owner = None
+            self._mutation.release()
+            yield False
+            return
         self._note_domain_hold(1)
         try:
             yield True
@@ -2825,44 +2850,60 @@ class CoreStore:
         # one.  The service row is the exception: a restart publishes its
         # transition without a revision, and a window has to see 启动中 while
         # the controller is being replaced.
-        def foreign_view() -> dict[str, Any] | None:
+        def foreign_view(*, lane_refused: bool = False) -> dict[str, Any] | None:
             with self._lock:
                 foreign_lane = self._mutation_owner not in (None, threading.get_ident())
                 foreign_domain = any(
                     holder != threading.get_ident() for holder in self._domain_holds
                 )
-                if (foreign_lane or foreign_domain) and self._snapshot_view is not None:
-                    view = copy.deepcopy(self._snapshot_view)
-                    # The domains in this view are the last committed
-                    # projection; the revision is a fact about Core now, and so
-                    # are the live fields below.  Answering the old number made
-                    # a reader believe it held state Core had already left: a
-                    # pane re-sent that revision as its Apply for as long as a
-                    # proxy reload held the lane, and every attempt was refused
-                    # as a conflict for a change that had already happened — the
-                    # strip reported 更改未生效 over a write that landed before
-                    # the first retry.
-                    #
-                    # The domains still have a revision of their own, and it
-                    # travels as ``projected_revision``: a window chains the
-                    # next patch on the state it actually holds, never on the
-                    # newer number that only says where Core's head is.  Two
-                    # numbers because they are two facts; a window that read
-                    # one as the other dropped the patch that described this
-                    # very change.
-                    projection_revision = view.get("revision")
-                    view["service"] = copy.deepcopy(_safe_public(self._service))
-                    view["drafts"] = copy.deepcopy(self._drafts)
-                    view["disk"] = copy.deepcopy(self._disk)
-                    view["action_summaries"] = copy.deepcopy(self._last_actions)
-                    view["revision"] = self._revision
-                    view["projected_revision"] = (
-                        projection_revision
-                        if type(projection_revision) is int and projection_revision <= self._revision
-                        else self._revision
-                    )
-                    return view
-                return None
+                committed = self._snapshot_view
+                # ``lane_refused`` is the reader that just tried the lane and
+                # was turned away: somebody holds it, whether or not that
+                # holder has published itself yet, so the committed view is the
+                # answer without asking who.
+                if committed is None or not (lane_refused or foreign_lane or foreign_domain):
+                    return None
+                # Only the small live fields are copied under the lock, as on
+                # the path below.  The committed view is every domain at once;
+                # copying it here was a 280 ms hold in ``core-lock.log``, and
+                # this is the answer every window gets for as long as a lane
+                # is held.  A committed view is replaced, never edited, so the
+                # reference is enough to copy it from once the lock is free.
+                head = self._revision
+                live = {
+                    "service": copy.deepcopy(_safe_public(self._service)),
+                    "drafts": copy.deepcopy(self._drafts),
+                    "disk": copy.deepcopy(self._disk),
+                    "action_summaries": dict(self._last_actions),
+                }
+            view = copy.deepcopy(committed)
+            # The domains in this view are the last committed
+            # projection; the revision is a fact about Core now, and so
+            # are the live fields.  Answering the old number made
+            # a reader believe it held state Core had already left: a
+            # pane re-sent that revision as its Apply for as long as a
+            # proxy reload held the lane, and every attempt was refused
+            # as a conflict for a change that had already happened — the
+            # strip reported 更改未生效 over a write that landed before
+            # the first retry.
+            #
+            # The domains still have a revision of their own, and it
+            # travels as ``projected_revision``: a window chains the
+            # next patch on the state it actually holds, never on the
+            # newer number that only says where Core's head is.  Two
+            # numbers because they are two facts; a window that read
+            # one as the other dropped the patch that described this
+            # very change.
+            projection_revision = view.get("revision")
+            view.update(live)
+            view["action_summaries"] = copy.deepcopy(view["action_summaries"])
+            view["revision"] = head
+            view["projected_revision"] = (
+                projection_revision
+                if type(projection_revision) is int and projection_revision <= head
+                else head
+            )
+            return view
 
         # The controller status read is a probe, not a projection: it can spend
         # its endpoint timeout waiting for a proxy that is booting.  It used to
@@ -2924,7 +2965,7 @@ class CoreStore:
                 # a real installation.  It runs under this scope, never under
                 # the state lock.
                 return self._project_and_publish()
-        fallback = foreign_view()
+        fallback = foreign_view(lane_refused=True)
         if fallback is not None:
             return fallback
         # No committed view exists to answer with yet (the very first read of a
@@ -2970,7 +3011,10 @@ class CoreStore:
         with self._lock:
             self._snapshot_cache = (self._revision, projected)
             self._snapshot_view = view
-        return view
+        # The committed view is what later readers are copied from, with no
+        # lock held (see ``snapshot``).  The caller gets its own, as it does on
+        # every other path, so nothing it does to its answer reaches theirs.
+        return copy.deepcopy(view)
 
     def _adopt_external_disk_changes(self) -> None:
         """Reload clean drafts whose files changed, without the state lock.
@@ -3571,12 +3615,75 @@ class CoreStore:
                 "present": present,
             }
 
+    @contextlib.contextmanager
+    def _plaintext_read_lane(self, name: str):
+        """Hold one domain's write lane for a plaintext read, when it is free.
+
+        A plaintext read is a lookup in the document this process holds --
+        except the one that is not.  A relay API key this process has not read
+        yet is asked of the station that minted it, and a session that aged out
+        is renewed on the way: a round trip with the station's own budget, by a
+        reader that rewrites the account it reads.  That call used to run under
+        the state lock, the one lock every window needs for its next frame, and
+        ``core-lock.log`` recorded what it cost: holds of 0.5 to 5 s, eighteen
+        of the twenty overruns that file ever stated.
+
+        The lane such a read belongs on is its domain's own, which a station
+        refresh already holds across the same kind of round trip.  It is taken
+        only when it is free.  The key is on screen already, so neither a
+        refresh in flight nor a state lock somebody else holds is something to
+        queue behind; the value is then read from the live document, which is
+        what this path always did.
+
+        A ``snapshot`` answers the last committed view while a lane is held, so
+        the hold is stated before the lock is taken: a reader arriving in
+        between must not start a projection that would then wait here.  With no
+        committed view to answer with, the lane is left alone for the same
+        reason.
+        """
+
+        ident = threading.get_ident()
+        if not self._lock.acquire(timeout=_SECRET_READ_LOCK_TIMEOUT_SECONDS):
+            yield
+            return
+        lane: threading.RLock | None = None
+        revision = 0
+        try:
+            if self._domain_holds.get(ident, 0) == 0 and self._snapshot_view is not None:
+                lane = self._domain_locks.get(name)
+                if lane is None:
+                    lane = threading.RLock()
+                    self._domain_locks[name] = lane
+                self._domain_holds[ident] = 1
+                revision = self._revision
+        finally:
+            self._lock.release()
+        if lane is None:
+            # Inside this thread's own write, or before the first projection.
+            yield
+            return
+        if not lane.acquire(timeout=_SECRET_READ_LOCK_TIMEOUT_SECONDS):
+            self._note_domain_hold(-1)
+            yield
+            return
+        try:
+            yield
+        finally:
+            lane.release()
+            with self._lock:
+                self._domain_holds.pop(ident, None)
+                moved = self._revision != revision
+            if moved:
+                # A commit elsewhere published the last committed view while
+                # this lane was held; its event is still owed.
+                self._request_emit()
+
     def _trusted_secret_document_read(self, domain: str, field: object, target: object | None) -> tuple[dict[str, Any], str]:
         """Validate one plaintext-native field and read its live value.
 
-        Deliberately lock-free: the caller decides how long it may wait for the
-        store, because the value is drawn on screen already.  Every lookup here
-        is a read of the document this process already holds.
+        Never called under the state lock: the adapter's read can be a station
+        round trip (see ``_plaintext_read_lane``).  The caller decides how long
+        it may wait for the store, because the value is drawn on screen already.
         """
 
         name = _canonical_domain(domain)
@@ -3596,14 +3703,19 @@ class CoreStore:
         if not target_required and target not in (None, ""):
             raise CoreError("invalid_secret", "The requested secret field is unavailable")
         target_value = target if target_required else None
+        # The lease names the store as it stood before the read: a settings
+        # change that lands while a station is being asked still has to refuse
+        # the value this lease is later presented for.
+        revision = self._revision
         adapter = self._domains.get(name)
         reader = getattr(adapter, "trusted_secret_value", None) if adapter is not None else None
         if not callable(reader):
             raise CoreError("invalid_secret", "The requested secret field is unavailable")
-        try:
-            value = reader(field_name, target_value)
-        except Exception:
-            raise CoreError("invalid_secret", "The requested secret field is unavailable") from None
+        with self._plaintext_read_lane(name):
+            try:
+                value = reader(field_name, target_value)
+            except Exception:
+                raise CoreError("invalid_secret", "The requested secret field is unavailable") from None
         if (
             not isinstance(value, str)
             or len(value.encode("utf-8")) > _secret_value_limit(name, field_name, target_value)
@@ -3615,7 +3727,7 @@ class CoreStore:
             "domain": name,
             "field": field_name,
             "target": target_value,
-            "revision": self._revision,
+            "revision": revision,
             "present": bool(value.strip()),
         }, value
 
@@ -3648,8 +3760,7 @@ class CoreStore:
         They are never included in snapshots or the React request protocol.
         """
 
-        with self._lock:
-            return self._trusted_secret_document_read(domain, field, target)[0]
+        return self._trusted_secret_document_read(domain, field, target)[0]
 
     def trusted_secret_read_descriptor(
         self,
@@ -3660,16 +3771,11 @@ class CoreStore:
         """The descriptor of a plaintext read lease, without waiting.
 
         Issuing the lease is the first half of drawing a key that is already on
-        screen, so it takes the store lock only when the lock is free: a relay
-        round trip holding it must not delay the field behind that round trip.
+        screen.  Its ``present`` is the value's own answer, so issuing it is a
+        read of that value -- and it holds the state lock for none of it.
         """
 
-        locked = self._lock.acquire(timeout=_SECRET_READ_LOCK_TIMEOUT_SECONDS)
-        try:
-            return self._trusted_secret_document_read(domain, field, target)[0]
-        finally:
-            if locked:
-                self._lock.release()
+        return self._trusted_secret_document_read(domain, field, target)[0]
 
     def trusted_secret_value(
         self,
@@ -3682,24 +3788,23 @@ class CoreStore:
         """Read one plaintext field via an already-authorized native lease.
 
         A provider pane draws the key the moment it opens, so this read may not
-        queue behind the store's own work: a relay login or a station refresh
-        holds the store lock across its network round trip, and a key waiting
-        for that lock stayed on its loading hint for as long as the round trip
-        took.  The capability this call consumes was issued for a revision the
-        store already authorized, so a busy store is not a reason to wait — the
-        read uses the free lock when it can have it and the live document
+        queue behind the store's own work: a key waiting for a relay login or a
+        station refresh stayed on its loading hint for as long as that round
+        trip took.  The capability this call consumes was issued for a revision
+        the store already authorized, so a busy store is not a reason to wait —
+        the read uses the free lock when it can have it and the live document
         otherwise, and the caller re-reads after any later change.
         """
 
-        locked = self._lock.acquire(timeout=_SECRET_READ_LOCK_TIMEOUT_SECONDS)
-        try:
-            if locked:
+        # The lease is checked under the lock when the lock is free, and the
+        # lock is given back before the value is read.
+        if self._lock.acquire(timeout=_SECRET_READ_LOCK_TIMEOUT_SECONDS):
+            try:
                 self._check_revision(revision)
-            _descriptor, value = self._trusted_secret_document_read(domain, field, target)
-            return value
-        finally:
-            if locked:
+            finally:
                 self._lock.release()
+        _descriptor, value = self._trusted_secret_document_read(domain, field, target)
+        return value
 
     def stage_secret(
         self,
