@@ -1257,11 +1257,9 @@ _UPSTREAM_RELAY_CAPACITY_MARKERS = (
 # "401 Authorization Required" page, or an OpenAI "invalid_api_key").  The
 # route's credential, not the request, is what the upstream rejected, so this
 # is parked like an account restriction and the turn advances to a sibling.
-# The station's own envelope spells the same refusal without a status code
-# (New API / sub2api: ``{"type":"upstream_error","message":"Upstream access
-# forbidden, please contact administrator"}``), and a stream carries it as an
-# ``error`` frame.  Read only status/access words: a 400 about parameters must
-# stay the request's own verdict.
+# Read only status/credential words: a 400 about parameters must stay the
+# request's own verdict, and the station's channel envelope below is a
+# different fact.
 _UPSTREAM_SESSION_REJECTED_ERROR_MARKERS = (
     "http 401",
     "http 403",
@@ -1269,6 +1267,18 @@ _UPSTREAM_SESSION_REJECTED_ERROR_MARKERS = (
     "403 forbidden",
     "invalid_api_key",
     "invalid api key",
+)
+# The station's own envelope answers for the *channel* behind the route, not
+# for this route's key: New API / sub2api spell it as
+# ``{"type":"upstream_error","message":"Upstream access forbidden, please
+# contact administrator"}`` ("Upstream authentication failed" is the same
+# refusal), delivered mid-stream as an SSE ``error`` frame after the route has
+# already generated.  The route's key was accepted -- the station picked a
+# channel behind it that refused -- so a later attempt can reach a different
+# channel.  Read as our credential this parked the only deployment of a
+# single-route group, and every client retry then answered "no deployments
+# available" without contacting an upstream at all (live 2026-11-12).
+_UPSTREAM_CHANNEL_REFUSED_ERROR_MARKERS = (
     "upstream access forbidden",
     "upstream authentication failed",
 )

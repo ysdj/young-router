@@ -1113,14 +1113,19 @@ class HookPatchTests(HookTestCase):
         self.assertEqual(
             "relay-a", getattr(classified, "failed_deployment_id", None)
         )
+        # The station's frame is about the channel it selected, not this
+        # route's key: recoverable, and never counted as a cooldown (a park
+        # here emptied the only pool entry of a single-route group).
         self.assertEqual(
-            "recovery_cooldown",
+            "recovery",
             hooks._recovery_policy_for_exception(classified),
         )
+        self.assertFalse(
+            hooks._should_count_deployment_failure_for_cooldown(classified)
+        )
         self.assertTrue(hooks._is_priority_deployment_failover_error(classified))
-        # With no sibling configured the helper answers a sanitized 503; the
-        # route was still parked (recorded above) instead of the frame ending
-        # the request as a client error.
+        # With no sibling configured the helper answers a sanitized 503 instead
+        # of turning the frame into a client error.
         self.assertEqual(503, getattr(context.exception, "status_code", None))
 
     async def test_a_non_streaming_client_disconnect_stops_the_turn(self) -> None:

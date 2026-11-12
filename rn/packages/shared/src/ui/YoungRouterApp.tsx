@@ -13795,6 +13795,7 @@ function recoveryDetailLabel(value: string, translate: Translate): string {
     local_capacity: "logs.recoveryReason.localCapacity",
     local_gateway_auth: "logs.recoveryReason.localGatewayAuth",
     timeout: "logs.recoveryReason.timeout",
+    upstream_channel_refused: "logs.recoveryReason.stationChannelRefused",
     unknown: "logs.recoveryReason.unknown",
   };
   return value.split(" · ").map((part) => {

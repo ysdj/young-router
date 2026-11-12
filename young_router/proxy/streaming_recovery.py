@@ -12,6 +12,7 @@ Importing either module first is safe: the helpers below resolve
 
 from __future__ import annotations
 
+import re
 
 from . import responses_request as _responses_request_module
 from . import request_context as _request_context_module
@@ -768,6 +769,7 @@ async def _yield_native_stream_after_terminal(
                     failure_request,
                 )
                 raise chunk_exception
+            saw_chunk = True
             buffered_chunks.append(chunk)
             saw_terminal = saw_terminal or _native_stream_chunk_is_terminal(
                 chunk,
@@ -811,6 +813,14 @@ async def _stream_native_route_recovery_poll_attempt(
     buffered_chunks: List[Any] = []
     finished_choice_indices: set[int] = set()
     saw_terminal = False
+    # Any frame at all is proof the upstream is producing.  The attempt
+    # deadline below bounds how long this client waits for the route's *first*
+    # byte; once a frame has arrived the stream is alive and the idle watchdog
+    # is the only clock that may end it.  Without this flag a healthy long
+    # answer was cancelled at the start budget while its thinking was still
+    # arriving -- the client had already counted the tokens (live 2026-11-12:
+    # 4m44s, 816 tokens, then "attempt timeout").
+    saw_chunk = False
     next_chunk_task = None
     configured_timeout_seconds = (
         _routing_module._stream_start_timeout_seconds_for_request(request_data)
@@ -875,7 +885,7 @@ async def _stream_native_route_recovery_poll_attempt(
                     )
             try:
                 wait_seconds = _streaming_module._ROUTE_RECOVERY_SSE_KEEPALIVE_SECONDS
-                if attempt_deadline is not None:
+                if attempt_deadline is not None and not saw_chunk:
                     remaining_seconds = attempt_deadline - time.monotonic()
                     if remaining_seconds <= 0:
                         await cancel_pending_read()
@@ -928,7 +938,11 @@ async def _stream_native_route_recovery_poll_attempt(
                                 yield completed_chunk
                             return
                         raise
-                elif attempt_deadline is not None and time.monotonic() >= attempt_deadline:
+                elif (
+                    attempt_deadline is not None
+                    and not saw_chunk
+                    and time.monotonic() >= attempt_deadline
+                ):
                     await cancel_pending_read()
                     if saw_terminal:
                         async for completed_chunk in yield_completed_attempt():
@@ -971,6 +985,7 @@ async def _stream_native_route_recovery_poll_attempt(
                 )
                 raise chunk_exception
 
+            saw_chunk = True
             buffered_chunks.append(chunk)
             saw_terminal = saw_terminal or _native_stream_chunk_is_terminal(
                 chunk,
@@ -993,6 +1008,34 @@ async def _stream_native_route_recovery_poll_attempt(
 #: by default.  A route that is only cooling never gets here: the wait branch
 #: above it serves out the cooldown and that same route answers.
 _SINGLE_ROUTE_EMPTY_POOL_ROUNDS = 2
+
+#: How many route-recovery rounds a *station-channel* refusal may spend on the
+#: same single-route group.  The station picks its upstream channel per attempt,
+#: so a fresh attempt can be served where the last one was refused; that is the
+#: whole reason this class is not parked.  It is still a bound: a station whose
+#: channels all refuse answers in a few seconds each (the refusal arrives after
+#: the route has already generated), and the default recovery window is four
+#: hours of keepalives.  Three rounds turn a transient refusal into a served
+#: turn without turning a dead station into a held-open client.
+_CHANNEL_REFUSED_SINGLE_ROUTE_ROUNDS = 3
+
+#: How many times a single-route group may wait out the *router's own* cooldown
+#: before the poll reports the opening refusal.  ``no deployments available ...
+#: try again in 45 seconds`` is LiteLLM cooling the deployment it just saw fail,
+#: not this module's cooldown state (which declines to charge a station refusal
+#: to its route).  A poll that ticks every few seconds through that window
+#: answers locally each time and then gives up while the route was only parked;
+#: waiting the stated seconds and retrying the same route is the attempt that
+#: can be served.  Two waits bound a dead station at roughly two cooldowns
+#: instead of a four-hour keepalive window.
+_ROUTE_RECOVERY_ROUTER_COOLDOWN_WAITS = 2
+
+#: ``... try again in 45 seconds.`` -- the only place LiteLLM states the delay
+#: it has parked a deployment for.
+_ROUTER_COOLDOWN_SECONDS_PATTERN = re.compile(
+    r"try again in\s+(\d+(?:\.\d+)?)\s*seconds?",
+    re.IGNORECASE,
+)
 
 
 def _route_recovery_poll_keep_going(exception: Exception) -> bool:
@@ -1286,6 +1329,15 @@ async def _stream_route_recovery_poll(
     single_route_deployment_ids = _route_recovery_poll_configured_deployment_ids(
         request_data
     )
+    # A station-channel refusal is not a verdict on the bytes or on our key, and
+    # it is not parked (see ``routing._recovery_policy_for_exception``).  On a
+    # group with one route the poll is therefore the only retry there is, and it
+    # has to be bounded: every round can take minutes when the station selects a
+    # bad channel, and the recovery window is four hours.
+    channel_refused_single_route = bool(
+        _routing_module._is_upstream_channel_refused_error(exception)
+        and len(single_route_deployment_ids) == 1
+    )
     refusal_about_the_body = bool(
         len(single_route_deployment_ids) == 1
         and _routing_module._is_refusal_about_the_request_body(exception)
@@ -1300,6 +1352,8 @@ async def _stream_route_recovery_poll(
         _routing_module._is_model_concurrency_rejection_error(exception)
     )
     single_route_empty_pool_rounds = 0
+    router_cooldown_waits = 0
+    router_cooldown_delay_seconds = 0.0
     ignore_local_constraints = bool(
         request_data.pop("_route_recovery_ignore_local_constraints", False)
     )
@@ -1419,6 +1473,16 @@ async def _stream_route_recovery_poll(
                 break
             attempt += 1
             attempt_started_at = now
+            if channel_refused_single_route:
+                # This class is retried on the route that refused: release both
+                # the budget marker and this request's exclusion of it, or the
+                # round below re-excludes the only deployment and answers
+                # locally without contacting an upstream (live 2026-11-12).
+                _routing_module._allow_same_deployment_retry(last_exception)
+                _routing_module._allow_the_failed_deployment_again(
+                    last_exception,
+                    request_data,
+                )
             if (
                 _routing_module._is_request_scoped_priority_deployment_failover_error(
                     last_exception,
@@ -1464,6 +1528,13 @@ async def _stream_route_recovery_poll(
                 preserve_failed_deployment=(
                     _responses_execution_module._failed_deployment_id(last_exception) is not None
                     and not no_deployments_available
+                    # A station-channel refusal is retried *on this route*: the
+                    # deployment this round must be able to pick is the one the
+                    # last round named, or every round answers locally out of
+                    # its own exclusion (live 2026-11-12: the poll preserved the
+                    # only route's exclusion and stopped after two local rounds
+                    # without contacting an upstream).
+                    and not channel_refused_single_route
                 ),
                 preserve_existing_exclusions=(
                     no_deployments_available
@@ -1476,6 +1547,36 @@ async def _stream_route_recovery_poll(
             )
             if forced_target_order is not None:
                 request_data[_streaming_module._ROUTE_RECOVERY_FORCED_TARGET_ORDER_KEY] = forced_target_order
+            if len(single_route_deployment_ids) == 1 and (
+                _routing_module._is_no_deployments_available_error(last_exception)
+            ):
+                # The pool answer carries the deployment this request *was*
+                # pointed at, and every hop that marks it for failover copies
+                # that id back into this request's exclusions.  A group with one
+                # route has no other candidate, so each round reaches
+                # ``filter_deployments`` empty and answers locally without
+                # contacting an upstream (live 2026-11-12: 27 rounds over two
+                # minutes, every one "no deployments available").  The answer
+                # named no upstream, so this request's exclusion cannot be
+                # evidence about the route: reopen it for this attempt.
+                request_data.pop("_excluded_deployment_ids", None)
+                # The dispatch rebuilds its exclusion set from this context
+                # variable as well as from the request, so clearing only the
+                # two dictionaries leaves the route excluded anyway.
+                _CURRENT_EXCLUDED_DEPLOYMENT_IDS.set(set())
+                metadata = request_data.get("litellm_metadata")
+                if isinstance(metadata, dict):
+                    metadata.pop("excluded_deployment_ids", None)
+                for attribute in (
+                    "failed_deployment_id",
+                    "failed_deployment_order",
+                    "failed_deployment_route_key",
+                    "failed_deployment_surface",
+                ):
+                    try:
+                        delattr(last_exception, attribute)
+                    except Exception:
+                        pass
             # Captured after the reset above: the reopen clears this request's
             # exclusions, so an earlier snapshot would hide the refusal this
             # attempt is about to record.
@@ -1628,6 +1729,25 @@ async def _stream_route_recovery_poll(
                         exception=_routing_module._trace_exception(last_exception),
                     )
 
+            if (
+                channel_refused_single_route
+                and attempt >= _CHANNEL_REFUSED_SINGLE_ROUTE_ROUNDS
+            ):
+                # Every round reached the station and was refused by the channel
+                # it picked.  The opening refusal is the one with the cause, and
+                # the sentence built from it names the station; a wrapper from a
+                # later empty-pool round would replace that with its own status.
+                last_exception = exception
+                _trace_module._request_route_trace(
+                    "route_recovery_poll_channel_refused_exhausted",
+                    request_data,
+                    poll_attempt=attempt,
+                    configured_deployment_ids=sorted(single_route_deployment_ids),
+                    elapsed_seconds=round(time.monotonic() - started_at_monotonic, 3),
+                    exception=_routing_module._trace_exception(last_exception),
+                )
+                break
+
             # A single-deployment group cannot refresh to another route: the
             # reopen below recomputes the same order and selects the same
             # deployment again. Once that route has actually refused this round,
@@ -1701,35 +1821,102 @@ async def _stream_route_recovery_poll(
                 last_exception = exception
                 break
 
-            if (
-                single_route_group
-                and single_route_deployment_ids <= excluded_after_attempt
-                and _route_recovery_poll_cooldown_wait(request_data) is None
-                and not opening_refusal_was_a_cap
-                and not _routing_module._is_model_concurrency_rejection_error(
+            # Read the current exception, not the flag from the top of the
+            # iteration: the round that just failed is the one holding the park.
+            if single_route_group and _routing_module._is_no_deployments_available_error(
+                last_exception
+            ):
+                router_cooldown_seconds = _route_recovery_poll_router_cooldown_seconds(
                     last_exception
                 )
-            ):
-                # A route that is only at its cap is excluded from this round
-                # for as long as other requests run, not because nothing can
-                # serve these bytes: it takes the next attempt a slot frees.
-                # Waiting it out like any other unavailable route is the whole
-                # point -- ending here measured live at 5.3 s of silence for
-                # five of six turns that the route then served fine.
-                single_route_empty_pool_rounds += 1
-                if single_route_empty_pool_rounds >= _SINGLE_ROUTE_EMPTY_POOL_ROUNDS:
+                if _route_recovery_poll_cooldown_wait(request_data) is not None:
+                    # This module's own cooldown has the route parked; the wait
+                    # branch above serves it and reopens the same route.
+                    pass
+                elif router_cooldown_seconds > 0:
+                    if (
+                        router_cooldown_waits
+                        >= _ROUTE_RECOVERY_ROUTER_COOLDOWN_WAITS
+                    ):
+                        _trace_module._request_route_trace(
+                            "route_recovery_poll_router_cooldown_exhausted",
+                            request_data,
+                            poll_attempt=attempt,
+                            router_cooldown_waits=router_cooldown_waits,
+                            configured_deployment_ids=sorted(
+                                single_route_deployment_ids
+                            ),
+                            elapsed_seconds=round(
+                                time.monotonic() - started_at_monotonic, 3
+                            ),
+                            exception=_routing_module._trace_exception(
+                                last_exception
+                            ),
+                        )
+                        # Report the opening refusal: the wrapper only says the
+                        # route is parked, and the client needs the cause.
+                        last_exception = exception
+                        break
+                    # The only route is parked by the router itself, not by
+                    # this module's state: "no deployments available ... try
+                    # again in 45 seconds" is LiteLLM cooling the deployment it
+                    # just saw fail.  Ticking through that window answers
+                    # locally and then reports "cannot progress" while the
+                    # route was merely cooling (live 2026-11-12: 5.2 s, two
+                    # empty rounds, no upstream contact).  Wait the stated
+                    # delay and retry that route; the round after it is the
+                    # attempt that can be served.
+                    router_cooldown_waits += 1
+                    router_cooldown_delay_seconds = max(
+                        1.0, min(router_cooldown_seconds, 120.0)
+                    )
                     _trace_module._request_route_trace(
-                        "route_recovery_poll_single_route_cannot_progress",
+                        "route_recovery_poll_router_cooldown_wait",
                         request_data,
                         poll_attempt=attempt,
-                        configured_deployment_ids=sorted(single_route_deployment_ids),
-                        empty_pool_rounds=single_route_empty_pool_rounds,
+                        wait_seconds=round(router_cooldown_delay_seconds, 3),
+                        router_cooldown_waits=router_cooldown_waits,
+                        configured_deployment_ids=sorted(
+                            single_route_deployment_ids
+                        ),
                         elapsed_seconds=round(
                             time.monotonic() - started_at_monotonic, 3
                         ),
-                        exception=_routing_module._trace_exception(last_exception),
+                        exception=_routing_module._trace_exception(
+                            last_exception
+                        ),
                     )
-                    break
+                else:
+                    # A pool answer with no stated park and nothing cooling:
+                    # no later round can reach an upstream.  One round is
+                    # granted, because a poll's first round can meet only this
+                    # request's own exclusion -- the fallback round just left it
+                    # behind -- which says nothing yet about the route.
+                    single_route_empty_pool_rounds += 1
+                    if (
+                        single_route_empty_pool_rounds
+                        >= _SINGLE_ROUTE_EMPTY_POOL_ROUNDS
+                    ):
+                        _trace_module._request_route_trace(
+                            "route_recovery_poll_single_route_cannot_progress",
+                            request_data,
+                            poll_attempt=attempt,
+                            configured_deployment_ids=sorted(
+                                single_route_deployment_ids
+                            ),
+                            empty_pool_rounds=single_route_empty_pool_rounds,
+                            elapsed_seconds=round(
+                                time.monotonic() - started_at_monotonic, 3
+                            ),
+                            exception=_routing_module._trace_exception(
+                                last_exception
+                            ),
+                        )
+                        # Report the opening refusal, not the pool's own
+                        # answer: the wrapper says "no deployments available
+                        # ... try again in 45 seconds" and hides the cause.
+                        last_exception = exception
+                        break
 
             now = time.monotonic()
             if max_poll_seconds <= 0 or (
@@ -1744,11 +1931,24 @@ async def _stream_route_recovery_poll(
                 )
                 break
 
-            delay_seconds = (
-                poll_interval_seconds
-                if deadline is None
-                else min(poll_interval_seconds, max(0.0, deadline - now))
-            )
+            if router_cooldown_delay_seconds:
+                # One wait for the router's own park, then back to the normal
+                # interval: the next round must be an attempt, not another tick.
+                delay_seconds = (
+                    router_cooldown_delay_seconds
+                    if deadline is None
+                    else min(
+                        router_cooldown_delay_seconds,
+                        max(0.0, deadline - now),
+                    )
+                )
+                router_cooldown_delay_seconds = 0.0
+            else:
+                delay_seconds = (
+                    poll_interval_seconds
+                    if deadline is None
+                    else min(poll_interval_seconds, max(0.0, deadline - now))
+                )
             _trace_module._request_route_trace(
                 "route_recovery_poll_next_attempt_scheduled", request_data,
                 poll_attempt=attempt,
@@ -1894,6 +2094,27 @@ def _route_recovery_poll_configured_deployment_ids(request_data: dict) -> set[st
         return _configured_deployment_ids(llm_router, request_data)
     except Exception:
         return set()
+
+
+def _route_recovery_poll_router_cooldown_seconds(exception: Exception) -> float:
+    """The delay LiteLLM states it has parked the only route for, if any.
+
+    Read from the wrapper's own sentence: this module's cooldown state is not
+    where that park lives, and a request-scoped exclusion is what the poll can
+    clear itself.  Zero means the wrapper named no delay.
+    """
+
+    try:
+        text = _routing_module._exception_text(exception)
+    except Exception:
+        text = str(exception)
+    match = _ROUTER_COOLDOWN_SECONDS_PATTERN.search(text or "")
+    if match is None:
+        return 0.0
+    try:
+        return max(0.0, float(match.group(1)))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _route_recovery_cooldown_wait_delay(

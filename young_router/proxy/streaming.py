@@ -2013,6 +2013,25 @@ def _unclassified_stop_message() -> str:
     )
 
 
+def _sanitized_failure_wire_pair(exception: Exception) -> tuple[str, str]:
+    """The wire type/code pair that agrees with a sentence already decided.
+
+    A sanitized route failure carries the policy of the refusal it was built
+    from, and the two clients read different halves of the terminal event: Pi
+    the sentence, Codex the code.  The wrapper's own class says nothing about
+    the cause, so the pair comes from that policy -- ``invalid_prompt`` is
+    Codex's name for a stop no resend changes, and an unrecognised code would
+    be retried forever.
+    """
+
+    if (
+        _routing_module._recovery_policy_for_exception(exception)
+        == _routing_module._RECOVERY_POLICY_ERROR
+    ):
+        return "invalid_request_error", "invalid_prompt"
+    return "server_error", "upstream_route_failure"
+
+
 def _synthesized_failed_response_event(
     request_data: dict,
     exception: Exception,
@@ -2077,6 +2096,14 @@ def _synthesized_failed_response_event(
                 else "server_error"
             )
             error_code = "upstream_compaction_failure"
+    elif _routing_module._is_sanitized_upstream_route_failure_error(exception):
+        # The sentence was already decided where the turn ended; choosing a new
+        # one from this wrapper replaces its cause with the wrapper's own status.
+        # Live 2026-11-12: the route-recovery poll's terminal event re-worded a
+        # station refusal into "temporary upstream server error", so the reader
+        # was told a bare 5xx while the trace still named the station.
+        message = str(exception)
+        error_type, error_code = _sanitized_failure_wire_pair(exception)
     elif _routing_module._is_image_generation_all_deployments_unsupported_error(
         exception
     ):
@@ -2376,6 +2403,18 @@ def _synthesized_failed_response_event(
         )
         error_type = "invalid_request_error"
         error_code = "invalid_prompt"
+    elif _routing_module._is_upstream_channel_refused_error(exception):
+        # The cause is specific -- the station's selected channel refused -- and
+        # the generic transient branch below would replace it with "produced no
+        # answer", inviting a resend without saying why one works.  The routing
+        # sentence carries the station's scope and the client's retry phrase.
+        message = _routing_module._sanitized_upstream_route_failure_message(
+            model,
+            exception,
+            request_data,
+        )
+        error_type = "server_error"
+        error_code = "upstream_route_failure"
     elif (
         _routing_module._is_route_recovery_poll_error(exception)
         # This worker's own stall watchdog already names its cause and keeps its
@@ -2564,6 +2603,12 @@ def _synthesized_native_stream_error_chunk(
     }
 
 def _native_stream_error_code(exception: Exception) -> str:
+    if _routing_module._is_sanitized_upstream_route_failure_error(exception):
+        # The sentence is the one the router decided on; the code has to agree
+        # with it.  A wrapper's own class says nothing about the cause, and a
+        # transient sentence carrying a terminal code (or the reverse) makes the
+        # two clients disagree about the same stop.
+        return _sanitized_failure_wire_pair(exception)[1]
     if _routing_module._is_local_shutdown_exception(exception):
         return "router_restarting"
     if _routing_module._is_context_size_error(exception):
@@ -2630,6 +2675,12 @@ def _native_stream_error_message(
     exception: Exception,
     request_data: dict,
 ) -> str:
+    if _routing_module._is_sanitized_upstream_route_failure_error(exception):
+        # Same contract as the Responses builder: the sentence was decided where
+        # the turn ended, and re-deriving one from the wrapper loses its cause.
+        original = str(exception).strip()
+        if original:
+            return original
     if _routing_module._is_local_shutdown_exception(exception):
         # Same contract as the Responses branch: the replacement is listening,
         # so the sentence has to read as the transient restart it is.
@@ -2652,6 +2703,15 @@ def _native_stream_error_message(
             "The upstream model route stopped sending this response, so the "
             "stream ended without a terminal response event. Send the message "
             "again or choose another model route."
+        )
+    if _routing_module._is_upstream_channel_refused_error(exception):
+        # Same contract as the Responses builder: name the station's channel and
+        # keep the retry phrase; the generic transient wording would drop the
+        # cause the trace already named.
+        return _routing_module._sanitized_upstream_route_failure_message(
+            model,
+            exception,
+            request_data,
         )
     if _routing_module._is_context_size_error(exception):
         # A terminal ``response.failed`` event for a context refusal is read by

@@ -1997,7 +1997,7 @@ class HookRouteRecoveryTests(HookTestCase):
     async def test_a_relay_upstream_error_frame_moves_the_stream_to_the_peer(
         self,
     ) -> None:
-        """A station's mid-stream `upstream_error` advances, it does not end.
+        """A station's mid-stream `upstream_error` advances, and parks nothing.
 
         Live 2026-11-11: flux-code streamed thinking for 3m20s and then sent
         ``{"type":"error","error":{"type":"upstream_error","message":"Upstream
@@ -2007,6 +2007,12 @@ class HookRouteRecoveryTests(HookTestCase):
         655k-byte request into the relay's ~2-minute silent-connection ceiling
         nine times.  The station's envelope is a verdict on the route, so the
         same stream has to continue on the sibling.
+
+        The refusal is the station's *channel*, not this route's credential
+        (live 2026-11-12): the route's key had already been accepted and
+        another attempt can reach another channel, so the failed route is not
+        parked.  A cooldown here emptied a single-route group's only pool entry
+        and every retry then failed locally with "no deployments available".
         """
 
         hooks, proxy_server = load_hook_module()
@@ -2119,11 +2125,514 @@ class HookRouteRecoveryTests(HookTestCase):
                 request_kwargs=request_data,
             )
         )
-        self.assertTrue(cooldown_filtered)
+        # The station's channel refused, so the route stays in the pool: parking
+        # it is what turned one upstream refusal into a stream of local
+        # "no deployments available" answers on a single-route group.
+        self.assertFalse(cooldown_filtered)
         self.assertEqual(
             [item["model_info"]["id"] for item in cooled],
-            ["relay-b"],
+            ["relay-a", "relay-b"],
         )
+
+    async def test_a_channel_refusal_poll_reaches_the_only_route_again(
+        self,
+    ) -> None:
+        """The poll must clear this request's own exclusion before it retries.
+
+        Live 2026-11-12, after the first fix: the fallback round exhausted its
+        one same-route attempt, so the only deployment stayed in the request's
+        exclusion set.  The poll preserved it (``preserve_failed_deployment``),
+        every round answered locally with "no deployments available", the second
+        round recorded a cooldown from that wrapper, and the turn ended on
+        "(upstream rate limit)" -- 5 s, no upstream contact.  A channel refusal
+        is retried *on this route*, so its exclusion has to be released.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        calls = []
+        excluded_at_dispatch = []
+
+        deployments = [
+            {
+                "litellm_params": {"order": 0.35},
+                "model_info": {"id": "relay-only", "order": 0.35},
+            },
+        ]
+        request_data = {
+            "model": "claude-fable-5-2(cursor)",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "metadata": {"request_id": "channel-refused-exclusion"},
+            "litellm_metadata": {
+                hooks._STREAM_ERROR_FALLBACK_METADATA_KEY: True,
+            },
+            # What the fallback round leaves behind when its same-route budget
+            # is exhausted: the only deployment, excluded for this request.
+            "_excluded_deployment_ids": ["relay-only"],
+        }
+
+        class ChannelRefused(RuntimeError):
+            status_code = 502
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return deployments if model_name == "claude-fable-5-2(cursor)" else []
+
+            async def aresponses(self, **payload):
+                # LiteLLM drops a request's own exclusions from the candidates
+                # it may pick: with the only route still excluded the round is
+                # answered locally and never reaches this method at all.  A fake
+                # that ignored the exclusion made the poll look like it retried
+                # while the live process reported ``no deployments available``.
+                excluded_at_dispatch.append(
+                    list(request_data.get("_excluded_deployment_ids") or [])
+                )
+                calls.append(payload.copy())
+                raise ChannelRefused(
+                    "upstream access forbidden, please contact administrator "
+                    "type=upstream_error"
+                )
+
+        proxy_server.llm_router = FakeRouter()
+        opening = ChannelRefused(
+            "upstream access forbidden, please contact administrator "
+            "type=upstream_error"
+        )
+        opening.failed_deployment_id = "relay-only"
+        opening.failed_deployment_order = 0.35
+        hooks._mark_same_deployment_retry_exhausted(opening)
+
+        chunks = [
+            chunk
+            async for chunk in hooks._stream_route_recovery_poll(
+                request_data,
+                opening,
+            )
+        ]
+        text = json.dumps(chunks, default=str)
+
+        # Every round reached the upstream instead of its own exclusion.
+        self.assertEqual(hooks._CHANNEL_REFUSED_SINGLE_ROUTE_ROUNDS, len(calls))
+        self.assertEqual([[]] * len(calls), excluded_at_dispatch)
+        # The stop names the station, not the pool's wrapper.
+        self.assertIn("station behind this route refused", text)
+        self.assertNotIn("no deployments available", text)
+        cooled, _active, cooldown_filtered = (
+            hooks._with_active_deployment_cooldowns(
+                deployments,
+                request_kwargs=request_data,
+            )
+        )
+        self.assertFalse(cooldown_filtered)
+
+    async def test_a_producing_native_stream_outlives_the_attempt_deadline(
+        self,
+    ) -> None:
+        """The attempt budget bounds the wait for a first frame, not the answer.
+
+        The native attempt applied its start deadline on every later read too,
+        so a healthy long answer was cancelled at the budget even though its
+        frames were still arriving -- the client had already counted the tokens
+        (live 2026-11-12: 4m44s, 816 tokens, then "attempt timeout").  Once any
+        frame has arrived the stream is alive, and the idle watchdog is the only
+        clock allowed to end it.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env("YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS", "1")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+
+        async def producing_round(request_data, exception, **kwargs):
+            yield {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "hel"},
+            }
+            # Past the one-second attempt budget while the answer continues.
+            await asyncio.sleep(1.6)
+            yield {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "lo"},
+            }
+            yield {"type": "message_stop"}
+
+        request_data = {
+            "call_type": "anthropic_messages",
+            "model": "claude-fable-5-2(cursor)",
+            "messages": [{"role": "user", "content": "Write."}],
+            "stream": True,
+            "metadata": {"request_id": "producing-native-attempt"},
+        }
+
+        with mock.patch.object(
+            hooks._streaming_module,
+            "_stream_streaming_error_fallback_round",
+            producing_round,
+        ):
+            chunks = [
+                chunk
+                async for chunk in hooks._stream_native_route_recovery_poll_attempt(
+                    request_data,
+                    RuntimeError("upstream channel refused"),
+                    attempt=1,
+                )
+            ]
+
+        self.assertEqual("hel", chunks[0]["delta"]["text"])
+        self.assertEqual("lo", chunks[1]["delta"]["text"])
+        self.assertEqual("message_stop", chunks[-1]["type"])
+
+    async def test_a_silent_native_stream_still_times_out_at_the_budget(
+        self,
+    ) -> None:
+        """The deadline still answers the case it exists for: no first frame."""
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env("YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS", "1")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+
+        async def silent_round(request_data, exception, **kwargs):
+            await asyncio.sleep(30)
+            yield {"type": "message_stop"}
+
+        request_data = {
+            "call_type": "anthropic_messages",
+            "model": "claude-fable-5-2(cursor)",
+            "messages": [{"role": "user", "content": "Write."}],
+            "stream": True,
+            "metadata": {"request_id": "silent-native-attempt"},
+        }
+
+        with mock.patch.object(
+            hooks._streaming_module,
+            "_stream_streaming_error_fallback_round",
+            silent_round,
+        ):
+            with self.assertRaises(Exception) as caught:
+                async for _chunk in hooks._stream_native_route_recovery_poll_attempt(
+                    request_data,
+                    RuntimeError("upstream channel refused"),
+                    attempt=1,
+                ):
+                    pass
+
+        self.assertIn("timeout", str(caught.exception).lower())
+
+    async def test_a_pool_answer_reopens_the_only_route_for_the_next_round(
+        self,
+    ) -> None:
+        """A round after "no deployments available" must see the pool again.
+
+        The wrapper carries the deployment the request was pointed at, and every
+        hop that marks it for failover copies that id back into this request's
+        exclusions.  On a single-route group that is the whole pool: the round
+        reaches ``filter_deployments`` empty and answers locally, round after
+        round (live 2026-11-12: 27 rounds in two minutes, no upstream contact).
+        The pool answer named no upstream, so the exclusion is not evidence
+        about the route and has to be dropped before the next attempt.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        calls: list[dict] = []
+        excluded_at_dispatch: list[list] = []
+
+        deployments = [
+            {
+                "litellm_params": {"order": 0.35},
+                "model_info": {"id": "relay-only", "order": 0.35},
+            },
+        ]
+        request_data = {
+            "model": "claude-fable-5-2(cursor)",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "metadata": {"request_id": "pool-answer-reopen"},
+            "_excluded_deployment_ids": ["relay-only"],
+            "litellm_metadata": {"excluded_deployment_ids": ["relay-only"]},
+        }
+
+        async def healthy_stream():
+            yield {"type": "response.output_text.delta", "delta": "reopened"}
+            yield {"type": "response.completed", "response": {"id": "resp-reopened"}}
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return deployments if model_name == "claude-fable-5-2(cursor)" else []
+
+            async def aresponses(self, **payload):
+                excluded_at_dispatch.append(
+                    list(request_data.get("_excluded_deployment_ids") or [])
+                )
+                calls.append(payload.copy())
+                return healthy_stream()
+
+        proxy_server.llm_router = FakeRouter()
+
+        class RouterRateLimitError(Exception):
+            pass
+
+        opening = RouterRateLimitError(
+            "no deployments available for selected model, try again in 45 "
+            "seconds. passed model=claude-fable-5-2(cursor)"
+        )
+        opening.status_code = 429
+        opening.failed_deployment_id = "relay-only"
+        opening.failed_deployment_order = 0.35
+
+        text = json.dumps(
+            [
+                chunk
+                async for chunk in hooks._stream_route_recovery_poll(
+                    request_data,
+                    opening,
+                )
+            ],
+            default=str,
+        )
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual([[]], excluded_at_dispatch)
+        self.assertIn("resp-reopened", text)
+
+    async def test_a_single_route_waits_out_the_routers_own_cooldown(self) -> None:
+        """The pool answer's stated park is waited out, not ticked through.
+
+        ``no deployments available ... try again in 45 seconds`` is LiteLLM
+        cooling the deployment it just saw fail; this module's cooldown state
+        declined to charge that failure to the route.  Ticking every five
+        seconds answered locally each round and then reported "cannot progress"
+        after 5.2 s while the route was only parked (live 2026-11-12).  Waiting
+        the stated delay and retrying the same route is the attempt that can be
+        served.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        calls: list[dict] = []
+
+        deployments = [
+            {
+                "litellm_params": {"order": 0.35},
+                "model_info": {"id": "relay-only", "order": 0.35},
+            },
+        ]
+        request_data = {
+            "model": "claude-fable-5-2(cursor)",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "metadata": {"request_id": "router-cooldown-wait"},
+            "litellm_metadata": {},
+        }
+
+        class RouterRateLimitError(Exception):
+            pass
+
+        def pool_answer() -> Exception:
+            error = RouterRateLimitError(
+                "no deployments available for selected model, try again in 1 "
+                "seconds. passed model=claude-fable-5-2(cursor)"
+            )
+            error.status_code = 429
+            return error
+
+        async def healthy_stream():
+            yield {"type": "response.output_text.delta", "delta": "served"}
+            yield {"type": "response.completed", "response": {"id": "resp-cooled"}}
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return deployments if model_name == "claude-fable-5-2(cursor)" else []
+
+            async def aresponses(self, **payload):
+                calls.append(payload.copy())
+                if len(calls) == 1:
+                    raise pool_answer()
+                return healthy_stream()
+
+        proxy_server.llm_router = FakeRouter()
+        opening = RuntimeError("upstream 502")
+        opening.status_code = 502
+        opening.failed_deployment_id = "relay-only"
+        opening.failed_deployment_order = 0.35
+
+        chunks = [
+            chunk
+            async for chunk in hooks._stream_route_recovery_poll(
+                request_data,
+                opening,
+            )
+        ]
+        text = json.dumps(chunks, default=str)
+
+        # The parked route was retried instead of the poll answering locally.
+        self.assertEqual(2, len(calls))
+        self.assertIn("served", text)
+
+    async def test_a_single_route_stops_after_the_router_cooldown_budget(self) -> None:
+        """A station that keeps parking its only route ends with the cause.
+
+        Waiting the stated cooldown is bounded: a route that is parked again
+        after two waits is not made healthy by a third, and the client is told
+        what the opening refusal said instead of a wrapper that only reports
+        the park.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        calls: list[dict] = []
+
+        deployments = [
+            {
+                "litellm_params": {"order": 0.35},
+                "model_info": {"id": "relay-only", "order": 0.35},
+            },
+        ]
+        request_data = {
+            "model": "claude-fable-5-2(cursor)",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "metadata": {"request_id": "router-cooldown-exhausted"},
+            "litellm_metadata": {},
+        }
+
+        class RouterRateLimitError(Exception):
+            pass
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return deployments if model_name == "claude-fable-5-2(cursor)" else []
+
+            async def aresponses(self, **payload):
+                calls.append(payload.copy())
+                error = RouterRateLimitError(
+                    "no deployments available for selected model, try again in 1 "
+                    "seconds. passed model=claude-fable-5-2(cursor)"
+                )
+                error.status_code = 429
+                raise error
+
+        proxy_server.llm_router = FakeRouter()
+        opening = RuntimeError("upstream 502")
+        opening.status_code = 502
+        opening.failed_deployment_id = "relay-only"
+        opening.failed_deployment_order = 0.35
+
+        chunks = [
+            chunk
+            async for chunk in hooks._stream_route_recovery_poll(
+                request_data,
+                opening,
+            )
+        ]
+        text = json.dumps(chunks, default=str)
+
+        self.assertEqual(1 + hooks._ROUTE_RECOVERY_ROUTER_COOLDOWN_WAITS, len(calls))
+        # The terminal names the interrupted turn, not the wrapper's park.
+        self.assertIn("response.failed", text)
+        self.assertNotIn("no deployments available", text.lower())
+
+    async def test_a_station_channel_refusal_retries_the_only_route(self) -> None:
+        """One configured route: real attempts, then a resend tip.
+
+        The station's frame is about the channel it picked, so the class is not
+        parked and the recovery poll's rounds are the only retries there are.
+        This pins the end-to-end behaviour a single-deployment group gets: the
+        upstream is contacted again (not answered locally out of an empty
+        pool), the attempts are bounded, and the stop carries the phrase the
+        client resends on so the *next* request can reach another channel.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        calls = []
+
+        route_key = (
+            "model=claude-fable-5-2(cursor) / provider=flux-code / "
+            "upstream=anthropic/claude-fable-5-2 / order=0.35"
+        )
+        deployments = [
+            {
+                "litellm_params": {"order": 0.35},
+                "model_info": {
+                    "id": "relay-only",
+                    "order": 0.35,
+                    "route_key": route_key,
+                },
+            },
+        ]
+
+        class ChannelRefused(RuntimeError):
+            status_code = 502
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return (
+                    deployments
+                    if model_name == "claude-fable-5-2(cursor)"
+                    else []
+                )
+
+            async def anthropic_messages(self, **payload):
+                calls.append(payload.copy())
+                hooks._remember_selected_deployment(deployments[0])
+                raise ChannelRefused(
+                    "upstream access forbidden, please contact administrator "
+                    "type=upstream_error"
+                )
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "claude-fable-5-2(cursor)",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 64,
+            "stream": True,
+            "model_info": {
+                "id": "relay-only",
+                "order": 0.35,
+                "route_key": route_key,
+            },
+            "proxy_server_request": {"path": "/v1/messages"},
+        }
+        exception = ChannelRefused(
+            "upstream access forbidden, please contact administrator "
+            "type=upstream_error"
+        )
+        exception.failed_deployment_id = "relay-only"
+        exception.failed_deployment_order = 0.35
+        hooks._mark_exception_for_deployment_failover(exception, request_data)
+
+        chunks = [
+            chunk
+            async for chunk in hooks._yield_streaming_error_fallback_or_raise(
+                request_data,
+                exception,
+            )
+        ]
+        text = b"".join(
+            chunk if isinstance(chunk, bytes) else b""
+            for chunk in chunks
+        ).decode("utf-8", "replace")
+
+        # The upstream was contacted again -- not answered locally out of an
+        # emptied pool -- and the attempts are bounded: the same-route fallback
+        # round plus the poll's three rounds, each a real call.
+        self.assertEqual(1 + hooks._CHANNEL_REFUSED_SINGLE_ROUTE_ROUNDS, len(calls))
+        self.assertIn("ended without", text)
+        self.assertIn("no other route", text)
+        self.assertNotIn("another route will answer", text)
+        self.assertNotIn("temporary upstream server error", text)
+        # No cooldown was recorded for the only route.
+        cooled, _active, cooldown_filtered = (
+            hooks._with_active_deployment_cooldowns(
+                deployments,
+                request_kwargs=request_data,
+            )
+        )
+        self.assertFalse(cooldown_filtered)
+        self.assertEqual(["relay-only"], [item["model_info"]["id"] for item in cooled])
 
     async def test_route_recovery_poll_reuses_stream_error_fallback_marker(self) -> None:
         hooks, proxy_server = load_hook_module()
@@ -2169,6 +2678,74 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertIn(
             {"type": "response.output_text.delta", "delta": "recovered after poll"},
             chunks,
+        )
+
+    async def test_a_station_channel_refusal_has_a_bounded_same_route_budget(
+        self,
+    ) -> None:
+        """A station that refuses every channel ends the poll, not the window.
+
+        The station's ``upstream access forbidden`` frame is about the channel
+        it selected (the route's key was accepted), so the class is retried on
+        the same route instead of being parked.  On a single-route group that
+        retry *is* the whole recovery: unbounded, a station whose channels all
+        refuse would hold the client open with keepalives for the four-hour
+        recovery window, one refused round per attempt.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        calls = []
+
+        class ChannelRefused(Exception):
+            status_code = 502
+
+        class FakeRouter:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [{"model_info": {"id": "only-route"}}]
+
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                raise ChannelRefused(
+                    "upstream access forbidden, please contact administrator "
+                    "type=upstream_error"
+                )
+
+        proxy_server.llm_router = FakeRouter()
+        request_data = {
+            "model": "claude-fable-5-2(cursor)",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "metadata": {"request_id": "channel-refused-budget"},
+            "litellm_metadata": {
+                hooks._STREAM_ERROR_FALLBACK_METADATA_KEY: True,
+            },
+        }
+        opening = ChannelRefused(
+            "upstream access forbidden, please contact administrator "
+            "type=upstream_error"
+        )
+
+        started = time.monotonic()
+        chunks = [
+            chunk
+            async for chunk in hooks._stream_route_recovery_poll(
+                request_data,
+                opening,
+            )
+        ]
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(hooks._CHANNEL_REFUSED_SINGLE_ROUTE_ROUNDS, len(calls))
+        self.assertLess(elapsed, 5.0)
+        # Nothing was answered, so the caller raises the opening refusal; the
+        # poll itself must not turn it into a served turn.
+        self.assertFalse(
+            any(
+                isinstance(chunk, dict)
+                and chunk.get("type") == "response.output_text.delta"
+                for chunk in chunks
+            )
         )
 
     async def test_route_recovery_poll_retries_until_success(self) -> None:
@@ -4762,17 +5339,28 @@ class HookSlowFailureRecoveryTests(HookTestCase):
         hooks, _proxy_server = load_hook_module()
         self.set_env(hooks._SLOW_FAILURE_RECOVERY_SECONDS_ENV, "60")
 
-        for label, status, message in (
-            ("generic 400", 400, "invalid request"),
-            ("account forbidden", 502, "Upstream access forbidden"),
-            ("cloudflare block", 403, "error code: 1010"),
+        # The station's channel refusal is recoverable at any age: its own
+        # envelope names a channel that is picked per attempt, not our key or
+        # these bytes, so waiting for the slow-failure rule to rescue it is not
+        # what makes it retryable.
+        for label, status, message, expected in (
+            ("generic 400", 400, "invalid request", hooks._RECOVERY_POLICY_COOLDOWN),
+            (
+                "station channel refused",
+                502,
+                "Upstream access forbidden",
+                hooks._RECOVERY_POLICY_RECOVERY,
+            ),
+            (
+                "cloudflare block",
+                403,
+                "error code: 1010",
+                hooks._RECOVERY_POLICY_COOLDOWN,
+            ),
         ):
             with self.subTest(case=label):
                 exception = self._api_error(hooks, status, message)
-                self.assertEqual(
-                    hooks._RECOVERY_POLICY_COOLDOWN,
-                    self._at_age(hooks, 61.0, exception),
-                )
+                self.assertEqual(expected, self._at_age(hooks, 61.0, exception))
 
     def test_a_refusal_that_arrives_at_once_keeps_the_request_verdict(self) -> None:
         hooks, _proxy_server = load_hook_module()

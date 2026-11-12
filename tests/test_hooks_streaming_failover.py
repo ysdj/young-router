@@ -3917,17 +3917,26 @@ class HookCoalescedNativeReadTests(HookTestCase):
         self.assertTrue(streaming._stream_chunk_has_visible_output(read))
         self.assertTrue(streaming._stream_chunk_has_meaningful_delta(read))
 
-    async def test_a_relay_upstream_error_frame_is_the_routes_refusal(self) -> None:
-        """The station's own `upstream_error` frame belongs to the route.
+    async def test_a_relay_upstream_error_frame_is_the_stations_channel_refusal(
+        self,
+    ) -> None:
+        """The station's own `upstream_error` frame is about its channel.
 
         Live 2026-11-11: flux-code answered mid-stream with HTTP-200 SSE
         ``{"type":"error","error":{"type":"upstream_error","message":"Upstream
         access forbidden, please contact administrator"}}`` after 3m20s of
         thinking.  The frame carries no status, so nothing classified it: the
-        route was never parked, the turn ended on it, and Claude Code's own
-        non-streaming fallback replayed the same 655k-byte request into that
-        route's ~2-minute silent-connection ceiling nine times.  The station's
-        envelope says the upstream failed, which is a verdict on the route.
+        turn ended on it, and Claude Code's own non-streaming fallback replayed
+        the same 655k-byte request into the relay's ~2-minute silent-connection
+        ceiling nine times.
+
+        The station's envelope is about the channel it selected, not about this
+        route's credential: the key had already been accepted (the route
+        generated), and the station picks a channel per attempt.  So the class
+        is recoverable -- retried on the same route when it has no sibling --
+        and must never count a cooldown: on a single-route group that park
+        emptied the only pool entry and every retry then failed locally with
+        "no deployments available" (live 2026-11-12).
         """
 
         hooks, _proxy_server = load_hook_module()
@@ -3943,16 +3952,18 @@ class HookCoalescedNativeReadTests(HookTestCase):
         )
         self.assertIsNotNone(exception)
         self.assertEqual(502, getattr(exception, "status_code", None))
+        self.assertTrue(hooks._is_upstream_channel_refused_error(exception))
+        self.assertFalse(hooks._is_upstream_session_rejected_error(exception))
         self.assertEqual(
-            hooks._RECOVERY_POLICY_COOLDOWN,
+            hooks._RECOVERY_POLICY_RECOVERY,
             hooks._recovery_policy_for_exception(exception),
         )
         self.assertTrue(hooks._is_priority_deployment_failover_error(exception))
-        self.assertTrue(
+        self.assertFalse(
             hooks._should_count_deployment_failure_for_cooldown(exception)
         )
         self.assertEqual(
-            "upstream-session-rejected",
+            "upstream-channel-refused",
             hooks._trace_exception(exception)["reason"],
         )
 

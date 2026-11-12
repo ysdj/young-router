@@ -157,6 +157,7 @@ from .base import (
     _UPSTREAM_CLIENT_VERSION_REJECTION_MARKERS,
     _UPSTREAM_CLIENT_VERSION_REJECTION_PATTERN,
     _UPSTREAM_SESSION_REJECTED_ERROR_MARKERS,
+    _UPSTREAM_CHANNEL_REFUSED_ERROR_MARKERS,
     _UPSTREAM_BALANCE_ERROR_MARKERS,
     _UPSTREAM_HTML_BAD_REQUEST_MARKERS,
     _UPSTREAM_RELAY_CAPACITY_MARKERS,
@@ -1076,6 +1077,26 @@ def _allow_the_failed_deployment_again(
         request_kwargs["litellm_metadata"] = updated_metadata
 
 
+def _allow_same_deployment_retry(exception: Exception) -> None:
+    """Let the next attempt select the deployment this failure named.
+
+    The fallback round marks the same-route budget exhausted when it gives up on
+    a route, and that marker makes ``_mark_exception_for_deployment_failover``
+    add the deployment to this request's exclusions again.  A class that is
+    retried *on that route* (the station's channel refusal) must clear the
+    marker first, or every recovery round is answered locally out of its own
+    exclusion (live 2026-11-12: the poll reported ``no deployments available``
+    with nothing upstream, three times in ten seconds).
+    """
+
+    try:
+        delattr(exception, _SAME_DEPLOYMENT_RETRY_EXHAUSTED_ATTR)
+    except AttributeError:
+        pass
+    except Exception:
+        pass
+
+
 def _same_deployment_retry_exhausted(exception: Exception) -> bool:
     return bool(getattr(exception, _SAME_DEPLOYMENT_RETRY_EXHAUSTED_ATTR, False))
 
@@ -1149,6 +1170,35 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
         # window rather than parking the route -- a cooldown here would remove
         # the only route of a single-route group from its own next request.
         return _RECOVERY_POLICY_RECOVERY
+
+    # The station behind this route picked a channel, and that channel refused
+    # the attempt mid-stream: the route's own key was accepted, no account of
+    # ours is broken, and a cooldown would park a healthy route.  On a
+    # single-route group that park is what emptied the only pool entry, so every
+    # client retry was answered locally with "no deployments available" -- the
+    # fast failures of 2026-11-12.  Another attempt can reach another channel,
+    # so this is recovery; ``streaming_recovery`` bounds the same-route rounds
+    # so a station that refuses every channel cannot hold the client for the
+    # whole recovery window.
+    if _is_upstream_channel_refused_error(exception):
+        return _RECOVERY_POLICY_RECOVERY
+
+    if _is_no_deployments_available_error(exception):
+        # The pool answered for *this request*: every candidate is either
+        # excluded by this attempt or already cooling for its own recorded
+        # failure.  Charging that answer to a route parks it for a failure no
+        # upstream gave -- and on a single-route group it erases the only route
+        # from the very next attempt (live 2026-11-12: the recovery poll's local
+        # "no deployments available" round re-parked the route the poll was
+        # about to retry, so every later round failed locally in milliseconds).
+        #
+        # Read before the preserved policy and before the slow-failure rule: the
+        # wrapper is raised at the *end* of an attempt that may have run for
+        # minutes, so the age rule charged it to the route even though this
+        # answer named no upstream at all (the live trace labelled it
+        # ``recovery_cooldown`` on 2026-11-12 for exactly that reason).
+        return _RECOVERY_POLICY_RECOVERY
+
     preserved = getattr(exception, _SANITIZED_UPSTREAM_ROUTE_FAILURE_POLICY_ATTR, None)
     if preserved in _RECOVERY_POLICY_VALUES:
         return preserved
@@ -1216,11 +1266,6 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
             _RECOVERY_POLICY_COOLDOWN,
         )
     if _is_upstream_relay_capacity_error(exception):
-        return _recovery_policy_setting(
-            _RECOVERY_POLICY_SERVER_ENV,
-            _RECOVERY_POLICY_COOLDOWN,
-        )
-    if _is_no_deployments_available_error(exception):
         return _recovery_policy_setting(
             _RECOVERY_POLICY_SERVER_ENV,
             _RECOVERY_POLICY_COOLDOWN,
@@ -6136,6 +6181,11 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         # could not name it is how the same pool kept being read as a request
         # error.
         reason = "upstream-relay-capacity"
+    elif _is_upstream_channel_refused_error(exception):
+        # The station's channel refused, not this route's key.  ``other`` hid
+        # which side of the relay the refusal belonged to, and the credential
+        # label sent the reader to refresh an account that was never refused.
+        reason = "upstream-channel-refused"
     elif _is_upstream_session_rejected_error(exception):
         reason = "upstream-session-rejected"
     elif _is_upstream_account_restricted_error(exception):
@@ -6292,6 +6342,17 @@ def _recovery_diagnostic(exception: Exception) -> dict[str, Any]:
             "title": "Upstream account pool unavailable",
             "detail": (
                 "The upstream has no available accounts or channels for this route."
+            ),
+        }
+    elif _is_upstream_channel_refused_error(exception):
+        result = {
+            "kind": "upstream_channel_refused",
+            "title": "The station's upstream channel refused",
+            "detail": (
+                "The station behind this route answered with its own upstream "
+                "error: the channel it selected refused the turn. The route's "
+                "key was accepted, and the next attempt may reach another "
+                "channel, so this route is not parked."
             ),
         }
     elif _is_upstream_account_restricted_error(exception):
@@ -7644,9 +7705,16 @@ def _mark_exception_for_deployment_failover(
     _release_request_concurrency_slots(request_kwargs)
     deployment_id = _deployment_id_from_request(request_kwargs)
     route_key = _deployment_route_key_from_request(request_kwargs)
+    # The pool answering "nothing available" is not a route failure: the
+    # deployment the request was last pointed at was never contacted, so naming
+    # it here would exclude the only route of a single-route group on every
+    # round -- the poll then answers locally for its whole window while the
+    # router's own cooldown is the only thing keeping the route out (live
+    # 2026-11-12: two rounds, five seconds, no upstream contact at all).
+    pool_answered = _is_no_deployments_available_error(exception)
     _record_image_generation_tool_unsupported(exception, request_kwargs)
     _record_web_search_tool_unsupported(exception, request_kwargs)
-    if deployment_id and not getattr(exception, "failed_deployment_id", None):
+    if deployment_id and not pool_answered and not getattr(exception, "failed_deployment_id", None):
         try:
             exception.failed_deployment_id = deployment_id  # type: ignore[attr-defined]
         except Exception:
@@ -7675,7 +7743,8 @@ def _mark_exception_for_deployment_failover(
         except Exception:
             pass
     should_sync_exclusions = (
-        not _is_local_stream_timeout_error(exception)
+        not pool_answered
+        and not _is_local_stream_timeout_error(exception)
         and not _is_local_shutdown_exception(exception)
         and (
             not _should_retry_same_deployment_before_fallback(exception)
@@ -7881,6 +7950,10 @@ def _is_priority_deployment_failover_error(exception: Exception) -> bool:
     if _is_upstream_surface_failover_error(exception):
         return True
     if getattr(exception, "stream_incomplete", False):
+        return True
+    if _is_upstream_channel_refused_error(exception):
+        # The station's channel can differ per attempt, and a sibling route may
+        # answer the same bytes: advance instead of ending the turn here.
         return True
     if _is_upstream_session_rejected_error(exception):
         # The route's own credential is what the upstream refused, even though
@@ -8678,6 +8751,27 @@ def _is_upstream_session_rejected_error(exception: Exception) -> bool:
     return any(marker in text for marker in _UPSTREAM_SESSION_REJECTED_ERROR_MARKERS)
 
 
+def _is_upstream_channel_refused_error(exception: Exception) -> bool:
+    """Whether the *station's* upstream channel refused, not this route's key.
+
+    New API / sub2api answer for the channel they selected behind the route,
+    not for the key this proxy holds: ``upstream access forbidden, please
+    contact administrator`` (delivered as an SSE ``error`` frame mid-stream,
+    after the route has already generated) and the sibling sentence
+    ``upstream authentication failed``.  The route's own key was accepted --
+    otherwise nothing would have streamed -- and the station picks a channel
+    per attempt, so a later attempt can reach one that answers.
+
+    Read as the route's credential (live 2026-11-12) this parked the only
+    deployment of a single-route group, every retry answered "no deployments
+    available" without contacting an upstream, and the turn ended on a
+    sentence telling the reader to refresh an account that was never refused.
+    """
+
+    text = _exception_text(exception).lower()
+    return any(marker in text for marker in _UPSTREAM_CHANNEL_REFUSED_ERROR_MARKERS)
+
+
 def _is_upstream_client_version_rejected_error(exception: Exception) -> bool:
     """Whether the route refused this model because *its own* client is too old.
 
@@ -8921,12 +9015,79 @@ def _upstream_request_field_rejected_message(model_group: str) -> str:
     )
 
 
+def _request_group_deployment_count(
+    request_kwargs: Optional[dict],
+) -> Optional[int]:
+    """How many routes the requested group configures, when that is knowable.
+
+    ``None`` means "not knowable in this context" (no router, no model group),
+    and every caller must then avoid promising a sibling rather than assume
+    one: the sentence a client renders decides whether it resends this turn.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return None
+    model_group = _responses_execution_module._request_model_group(request_kwargs)
+    if not isinstance(model_group, str) or not model_group.strip():
+        return None
+    try:
+        from litellm.proxy.proxy_server import llm_router
+    except Exception:
+        return None
+    if llm_router is None:
+        return None
+    metadata = _request_context_module._request_metadata_dict(
+        request_kwargs,
+        "metadata",
+    ) or {}
+    try:
+        deployments = _router_configured_deployments(
+            llm_router,
+            model_group,
+            team_id=metadata.get("user_api_key_team_id"),
+        )
+    except Exception:
+        return None
+    deployment_ids = {
+        _responses_request_module._deployment_id(deployment)
+        for deployment in deployments
+        if isinstance(deployment, dict)
+    }
+    deployment_ids.discard(None)
+    return len(deployment_ids) or None
+
+
+def _sanitized_failure_sentence(exception: Exception) -> str:
+    """The sentence a sanitized route failure already carries.
+
+    ``str()`` on the installed LiteLLM prefixes the class name
+    (``litellm.ServiceUnavailableError: ...``), and that prefix is not part of
+    what the reader needs; ``message`` is the sentence itself.
+    """
+
+    message = getattr(exception, "message", None)
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+    text = str(exception).strip()
+    prefix = re.match(r"^litellm\.[A-Za-z0-9_.]+:\s*", text)
+    return text[prefix.end() :].strip() if prefix else text
+
+
 def _sanitized_upstream_route_failure_message(
     model: Optional[str],
     exception: Exception,
     request_kwargs: Optional[dict],
 ) -> str:
     model_group = model or _responses_execution_module._request_model_group(request_kwargs) or "requested model"
+    if _is_sanitized_upstream_route_failure_error(exception):
+        # The sentence was already decided where the turn ended.  Re-deriving
+        # one from its wrapper replaces the cause with the wrapper's own status
+        # -- live 2026-11-12 the route-recovery poll's terminal event re-worded
+        # a station refusal into "temporary upstream server error" and dropped
+        # the sentence the reader could act on.
+        original = _sanitized_failure_sentence(exception)
+        if original:
+            return original
     if _request_body_size_rejected(request_kwargs):
         # The replay itself was refused, not the route. Naming the cause keeps
         # the client from waiting for a route that cannot ever accept it.
@@ -8945,6 +9106,25 @@ def _sanitized_upstream_route_failure_message(
             "The router was restarting while this turn was streaming, so the "
             "turn was terminated. Send the message again."
         )
+    if _is_upstream_channel_refused_error(exception):
+        # The station's channel refused, not this route's credential: the key
+        # was accepted and the attempt arrived mid-stream.  The station selects
+        # its channel per attempt, so a resend is the one action that can land
+        # on a different one -- and the sentence may not promise a sibling route
+        # when the group configures exactly one.
+        channel_scope = (
+            "This group configures no other route, so the next attempt reaches "
+            "the same station."
+            if _request_group_deployment_count(request_kwargs) == 1
+            else "No other candidate route answered it either."
+        )
+        return (
+            "The station behind this route refused the attempt with its own "
+            f"upstream error for {model_group}. {channel_scope} The station "
+            "selects its upstream channel per attempt, so another attempt can "
+            "be served by a different one; send the message again. This "
+            "attempt's stream ended without a terminal response event."
+        )
     if _is_upstream_session_rejected_error(exception):
         # The route's own credential is what the upstream refused, even though
         # the adapter reports it as a 400.  No replay changes that answer, and a
@@ -8953,6 +9133,18 @@ def _sanitized_upstream_route_failure_message(
         # the recovery-policy constant from here reached the client as the
         # literal word "recovery_cooldown".
         #
+        # With one configured route there is no sibling to move the next
+        # request to: promising one, and telling the reader to resend into the
+        # same parked route, is what made a single-route group show a retry
+        # button that could only meet "no deployments available" (live
+        # 2026-11-12).  That sentence therefore carries no retry phrase.
+        if _request_group_deployment_count(request_kwargs) == 1:
+            return (
+                "The upstream refused the credential behind this route for "
+                f"{model_group}, and this group configures no other route. "
+                "Fix or replace that route's account before sending this turn "
+                "again; resending meets the same refusal."
+            )
         # The route was parked, so the *next* request is served by a sibling --
         # that is exactly the stop a client should resend, and only a phrase the
         # client's retry classifier knows keeps the turn alive.  Note the client

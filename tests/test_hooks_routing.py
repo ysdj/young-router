@@ -4671,6 +4671,291 @@ class HookRoutingTests(HookTestCase):
 
         self.assertEqual(filtered, [deployment])
 
+    def test_a_station_channel_refusal_is_not_the_routes_credential(self) -> None:
+        """The station answers for its channel, not for the key we hold.
+
+        flux-code (sub2api) sends ``{"type":"error","error":{"type":
+        "upstream_error","message":"Upstream access forbidden, please contact
+        administrator"}}`` as an SSE frame after the route already generated.
+        The key was accepted and the station picks a channel per attempt, so a
+        resend can reach one that answers.  Read as our credential (live
+        2026-11-12) this parked the only deployment, and every retry then failed
+        locally with "no deployments available" -- the fast failures.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = sys.modules["young_router.proxy.streaming"]
+
+        exception = streaming_module._stream_chunk_error_exception(
+            b'event: error\n'
+            b'data: {"type":"error","error":{"type":"upstream_error","message":'
+            b'"Upstream access forbidden, please contact administrator"}}\n\n'
+        )
+
+        self.assertTrue(hooks._is_upstream_channel_refused_error(exception))
+        self.assertFalse(hooks._is_upstream_session_rejected_error(exception))
+        self.assertEqual(
+            hooks._RECOVERY_POLICY_RECOVERY,
+            hooks._recovery_policy_for_exception(exception),
+        )
+        self.assertFalse(
+            hooks._should_count_deployment_failure_for_cooldown(exception)
+        )
+        self.assertEqual(
+            "upstream-channel-refused",
+            hooks._trace_exception(exception)["reason"],
+        )
+        self.assertEqual(
+            "upstream_channel_refused",
+            hooks._recovery_diagnostic(exception)["kind"],
+        )
+
+        message = hooks._sanitized_upstream_route_failure_message(
+            "claude-fable-5-2(cursor)",
+            exception,
+            {"model": "claude-fable-5-2(cursor)"},
+        )
+        # The sentence has to keep the client resending -- the phrase list Pi
+        # matches is the only thing that revives the turn -- and it may not
+        # repeat the two false claims of the credential wording.
+        self.assertIn("ended without", message)
+        self.assertIn("station", message)
+        self.assertNotIn("credential", message)
+        self.assertNotIn("refresh that route's account", message)
+        self.assertNotIn("another route will answer", message)
+
+        # A real credential refusal keeps its own branch and its own policy.
+        credential = RuntimeError(
+            "litellm.BadRequestError: OpenAIException - request rejected by "
+            "upstream (http 401): invalid_api_key"
+        )
+        credential.status_code = 400
+        self.assertTrue(hooks._is_upstream_session_rejected_error(credential))
+        self.assertFalse(hooks._is_upstream_channel_refused_error(credential))
+        self.assertEqual(
+            hooks._RECOVERY_POLICY_COOLDOWN,
+            hooks._recovery_policy_for_exception(credential),
+        )
+
+    def test_an_empty_pool_is_not_charged_to_the_only_route(self) -> None:
+        """The pool answer for *this request* is not a failure of a route.
+
+        Every candidate is either excluded by this attempt or cooling for its
+        own recorded failure.  Charging the wrapper parks a route no upstream
+        refused and, on a single-route group, erases the only route from the
+        very attempt that was about to retry it (live 2026-11-12: the poll's
+        local round recorded a 45 s cooldown, so every later round answered
+        locally and the turn ended in five seconds).
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class RouterRateLimitError(Exception):
+            pass
+
+        exception = RouterRateLimitError(
+            "no deployments available for selected model, try again in 45 "
+            "seconds. passed model=claude-fable-5-2(cursor)"
+        )
+        exception.status_code = 429
+
+        self.assertTrue(hooks._is_no_deployments_available_error(exception))
+        self.assertEqual(
+            hooks._RECOVERY_POLICY_RECOVERY,
+            hooks._recovery_policy_for_exception(exception),
+        )
+        self.assertFalse(
+            hooks._should_count_deployment_failure_for_cooldown(exception)
+        )
+        self.assertEqual(
+            "no-available-deployment", hooks._trace_exception(exception)["reason"]
+        )
+
+    def test_a_pool_answer_does_not_name_the_route_it_never_reached(self) -> None:
+        """Marking "no deployments available" must not exclude the only route.
+
+        The wrapper is raised at the end of an attempt, so the request still
+        carries the deployment it was pointed at; attributing that id to the
+        wrapper makes ``_sync_failed_deployment_exclusions`` add the route to
+        this request's exclusions on every recovery round.  On a single-route
+        group that is the whole pool: each round then answers locally while the
+        router's own cooldown was the only thing keeping the route out (live
+        2026-11-12: two rounds, 5.2 s, no upstream contact).
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class RouterRateLimitError(Exception):
+            pass
+
+        exception = RouterRateLimitError(
+            "no deployments available for selected model, try again in 45 "
+            "seconds. passed model=claude-fable-5-2(cursor)"
+        )
+        exception.status_code = 429
+        request_data = {
+            "model": "claude-fable-5-2(cursor)",
+            "deployment_id": "relay-only",
+            "model_info": {"id": "relay-only", "order": 0.35},
+            "litellm_metadata": {},
+        }
+
+        hooks._mark_exception_for_deployment_failover(exception, request_data)
+
+        self.assertIsNone(getattr(exception, "failed_deployment_id", None))
+        self.assertEqual(
+            [],
+            list(request_data.get("_excluded_deployment_ids") or []),
+        )
+        self.assertEqual(
+            [],
+            list(
+                (request_data.get("litellm_metadata") or {}).get(
+                    "excluded_deployment_ids"
+                )
+                or []
+            ),
+        )
+
+    def test_a_single_route_group_is_never_promised_a_sibling(self) -> None:
+        """One configured route cannot answer "another route will answer".
+
+        The sentence a client renders decides whether it resends, so promising
+        a sibling that does not exist (and telling the reader to resend into the
+        same parked route) is how a single-route group produced a retry button
+        that could only meet "no deployments available" (live 2026-11-12).
+        """
+
+        hooks, proxy_server = load_hook_module()
+
+        class FakeRouter:
+            def __init__(self, count: int) -> None:
+                self.deployments = [
+                    {"model_info": {"id": f"route-{index}"}}
+                    for index in range(count)
+                ]
+
+            def _get_all_deployments(self, model_name, team_id=None):
+                return list(self.deployments)
+
+        request = {"model": "claude-fable-5-2(cursor)"}
+        channel_refused = RuntimeError(
+            "upstream access forbidden, please contact administrator "
+            "type=upstream_error"
+        )
+        channel_refused.status_code = 502
+        credential_refused = RuntimeError(
+            "workbuddy upstream client (http 401): invalid token"
+        )
+        credential_refused.status_code = 400
+
+        previous_router = getattr(proxy_server, "llm_router", None)
+        self.addCleanup(setattr, proxy_server, "llm_router", previous_router)
+
+        proxy_server.llm_router = FakeRouter(1)
+        self.assertEqual(
+            1, hooks._request_group_deployment_count(request)
+        )
+        single_channel = hooks._sanitized_upstream_route_failure_message(
+            "claude-fable-5-2(cursor)",
+            channel_refused,
+            request,
+        )
+        self.assertIn("no other route", single_channel)
+        self.assertNotIn("another route will answer", single_channel)
+        single_credential = hooks._sanitized_upstream_route_failure_message(
+            "claude-fable-5-2(cursor)",
+            credential_refused,
+            request,
+        )
+        self.assertNotIn("another route will answer", single_credential)
+        self.assertIn("resending meets the same refusal", single_credential)
+        # A refusal no resend can clear must not carry a phrase Pi resends on.
+        self.assertNotIn("ended without", single_credential)
+
+        proxy_server.llm_router = FakeRouter(2)
+        self.assertEqual(
+            2, hooks._request_group_deployment_count(request)
+        )
+        multi_channel = hooks._sanitized_upstream_route_failure_message(
+            "claude-fable-5-2(cursor)",
+            channel_refused,
+            request,
+        )
+        self.assertNotIn("no other route", multi_channel)
+        self.assertIn("ended without", multi_channel)
+        multi_credential = hooks._sanitized_upstream_route_failure_message(
+            "claude-fable-5-2(cursor)",
+            credential_refused,
+            request,
+        )
+        self.assertIn("another route will answer", multi_credential)
+
+    def test_a_sanitized_route_failure_is_not_reworded_by_its_wrapper(self) -> None:
+        """Re-sanitizing the wrapper replaces the cause with its own status.
+
+        Live 2026-11-12: the route-recovery poll's terminal event was built from
+        the sanitized ``ServiceUnavailableError``, so the sentence was derived a
+        second time.  Its status (503) chose "temporary upstream server error"
+        and the station refusal the reader could act on disappeared from the
+        client's copy while the trace still named it.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = sys.modules["young_router.proxy.streaming"]
+
+        original = RuntimeError(
+            "upstream access forbidden, please contact administrator "
+            "type=upstream_error"
+        )
+        original.status_code = 502
+        request = {
+            "model": "claude-fable-5-2(cursor)",
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+        }
+        sanitized = hooks._sanitized_upstream_route_exception(
+            "claude-fable-5-2(cursor)",
+            original,
+            request,
+        )
+        self.assertTrue(hooks._is_sanitized_upstream_route_failure_error(sanitized))
+
+        message = hooks._sanitized_upstream_route_failure_message(
+            "claude-fable-5-2(cursor)",
+            sanitized,
+            request,
+        )
+        self.assertEqual(str(sanitized), message)
+        self.assertIn("station", message)
+        self.assertNotIn("temporary upstream server error", message)
+
+        event = streaming_module._synthesized_failed_response_event(
+            request,
+            sanitized,
+            after_visible_output=True,
+        )
+        payload = event if isinstance(event, dict) else json.loads(event.data or "{}")
+        error = payload["response"]["error"]
+        self.assertIn("station", error["message"])
+        self.assertNotIn("temporary upstream server error", error["message"])
+        self.assertEqual("upstream_route_failure", error["code"])
+
+        # The chat wire has to agree with the sentence: a wrapper's own class
+        # says nothing about the cause, and one client reads the code.
+        chunk = streaming_module._synthesized_native_stream_error_chunk(
+            {
+                "model": "claude-fable-5-2(cursor)",
+                "messages": [{"role": "user", "content": "Continue."}],
+                "stream": True,
+                "proxy_server_request": {"path": "/v1/chat/completions"},
+            },
+            sanitized,
+        )
+        self.assertEqual("upstream_route_failure", chunk["error"]["code"])
+        self.assertIn("station", chunk["error"]["message"])
+        self.assertNotIn("temporary upstream server error", chunk["error"]["message"])
+
 
 if __name__ == "__main__":
     unittest.main()

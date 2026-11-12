@@ -3213,10 +3213,13 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
 
         The recovery poll finishes its window on a route pool that is entirely
         in cooldown.  Nothing was rendered, so the old guard sent that to the
-        unclassified sentence even though the policy for it is
-        ``recovery_cooldown`` -- the router had classified the stop, it just had
-        not said so.  The sentence now states the cause, and its second clause
-        does not claim an answer was streaming when nothing had.
+        unclassified sentence even though the router had classified the stop --
+        it just had not said so.  The sentence now states the cause, and its
+        second clause does not claim an answer was streaming when nothing had.
+
+        The pool's own answer is ``recovery``, not ``recovery_cooldown``: no
+        upstream refused anything, and charging it to a route would park the
+        only route for a failure it never produced (live 2026-11-12).
         """
 
         hooks, _proxy_server = load_hook_module()
@@ -3238,7 +3241,7 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         }
 
         self.assertEqual(
-            "recovery_cooldown",
+            "recovery",
             hooks._recovery_policy_for_exception(exception),
         )
 

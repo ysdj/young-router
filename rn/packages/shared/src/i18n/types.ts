@@ -243,6 +243,7 @@ export type TranslationKey =
   | "logs.recoveryReason.localCapacity"
   | "logs.recoveryReason.localGatewayAuth"
   | "logs.recoveryReason.unknown"
+  | "logs.recoveryReason.stationChannelRefused"
   | "logs.action"
   | "logs.type"
   | "logs.duration"
