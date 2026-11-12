@@ -4771,6 +4771,48 @@ class HookRoutingTests(HookTestCase):
             "no-available-deployment", hooks._trace_exception(exception)["reason"]
         )
 
+    def test_a_sanitized_copy_still_reads_as_the_pool_answer(self) -> None:
+        """The copy a recovery loop holds must answer like the original.
+
+        Every later classifier sees the sanitized stop, whose own sentence is
+        "temporary upstream route failure ... (upstream rate limit)": the words
+        that say "no deployments available" are gone.  A text-only predicate
+        answered "no" for the copy, so the poll neither reopened its only route
+        nor recognised the class, and the exclusion survived round after round
+        (live 2026-11-12: 58 rounds, every one "no deployments available" with
+        ``excluded: ["69b30c61"]``).  The reason the sanitizer records is the
+        fact the classifiers need.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        copy = RuntimeError(
+            "litellm.serviceunavailableerror: temporary upstream route failure "
+            "for claude-fable-5-2(cursor) (upstream rate limit) after litellm "
+            "fallback retries, so the stream ended without a terminal response "
+            "event."
+        )
+        copy.status_code = 503
+        setattr(
+            copy,
+            hooks._SANITIZED_UPSTREAM_ROUTE_FAILURE_REASON_ATTR,
+            "no-available-deployment",
+        )
+
+        self.assertTrue(hooks._is_no_deployments_available_error(copy))
+        self.assertEqual(
+            "no-available-deployment", hooks._trace_exception(copy)["reason"]
+        )
+        self.assertFalse(hooks._is_upstream_channel_refused_error(copy))
+
+        setattr(
+            copy,
+            hooks._SANITIZED_UPSTREAM_ROUTE_FAILURE_REASON_ATTR,
+            "upstream-channel-refused",
+        )
+        self.assertTrue(hooks._is_upstream_channel_refused_error(copy))
+        self.assertFalse(hooks._is_no_deployments_available_error(copy))
+
     def test_a_pool_answer_does_not_name_the_route_it_never_reached(self) -> None:
         """Marking "no deployments available" must not exclude the only route.
 

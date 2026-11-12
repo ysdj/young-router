@@ -8533,7 +8533,22 @@ def _router_configured_deployments(
         return []
 
 
+def _preserved_failure_reason(exception: BaseException) -> str:
+    """The reason a sanitized copy carries from the exception it was built on.
+
+    A sanitized stop is a copy this proxy built, so its own sentence no longer
+    says "no deployments available" or "upstream access forbidden" -- the text
+    classes would answer "no" for the copy every recovery loop actually holds.
+    The reason travels as an attribute for exactly this reason.
+    """
+
+    value = getattr(exception, _SANITIZED_UPSTREAM_ROUTE_FAILURE_REASON_ATTR, None)
+    return value.strip() if isinstance(value, str) else ""
+
+
 def _is_no_deployments_available_error(exception: BaseException) -> bool:
+    if _preserved_failure_reason(exception) == "no-available-deployment":
+        return True
     text = _exception_text(exception) if isinstance(exception, Exception) else str(exception).lower()
     if "no deployments available" in text:
         return True
@@ -8768,6 +8783,8 @@ def _is_upstream_channel_refused_error(exception: Exception) -> bool:
     sentence telling the reader to refresh an account that was never refused.
     """
 
+    if _preserved_failure_reason(exception) == "upstream-channel-refused":
+        return True
     text = _exception_text(exception).lower()
     return any(marker in text for marker in _UPSTREAM_CHANNEL_REFUSED_ERROR_MARKERS)
 
