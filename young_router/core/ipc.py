@@ -460,6 +460,14 @@ def _web_login_page(language: str) -> bytes:
 
 
 EVENT_POLL_TIMEOUT_SECONDS = 25.0
+
+#: What a poll names when the subscription it asks for no longer exists.
+#: Distinct from "no event yet", which every host reads as a heartbeat: a Core
+#: that was replaced starts with no subscriptions at all, so a host's poll named
+#: one that is gone, was answered "nothing happened" for as long as the window
+#: stayed open, and re-asked at once -- the macOS bridge loops on a null event
+#: with no delay, and the page re-subscribed only by accident.
+SUBSCRIPTION_GONE = "subscription_gone"
 MAX_EVENTS = 32
 EDITOR_CAPABILITY_TTL_SECONDS = 10 * 60.0
 MAX_EDITOR_CAPABILITIES = 32
@@ -1291,6 +1299,14 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             timeout = EVENT_POLL_TIMEOUT_SECONDS
         event = self._owner.next_event(subscription_id, session_token=token, timeout=timeout)
+        if event is SUBSCRIPTION_GONE:
+            # 410 rather than a quiet 200: every host already treats a non-200
+            # on this route as "ask again with a new subscription", and the
+            # page's own loop re-subscribes on it.  The alternative -- the
+            # null heartbeat -- left the macOS bridge re-asking with no delay
+            # at all, for as long as the window stayed open.
+            self._send_error(410, code=SUBSCRIPTION_GONE, message="The event subscription is gone")
+            return
         self._send(200, {"protocol_version": PROTOCOL_VERSION, "event": event})
 
 
@@ -2600,10 +2616,18 @@ class CoreIPCServer:
         )
 
     def next_event(self, subscription_id: str, *, session_token: str, timeout: float) -> dict[str, Any] | None:
+        """One event for this subscription, ``None`` for a quiet one.
+
+        An id this server does not hold -- a Core that was replaced starts with
+        no subscriptions -- is not a quiet one: it is answered with
+        ``SUBSCRIPTION_GONE`` so the poll states it instead of keeping every
+        host's window on a heartbeat that can never carry an event again.
+        """
+
         with self._lock:
             subscription = self._subscriptions.get(subscription_id)
             if subscription is None or subscription.session_token != session_token:
-                return None
+                return SUBSCRIPTION_GONE  # type: ignore[return-value]
         if subscription.needs_resync:
             subscription.needs_resync = False
             # Whatever this queue still holds predates the gap: a full read is

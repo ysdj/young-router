@@ -199,8 +199,9 @@ def _shared_reference_url(ref_id: str) -> Optional[str]:
     if not path:
         return None
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
+        from .. import runtime_store
+
+        payload = runtime_store.read_document(path)
     except (OSError, ValueError):
         return None
     references = payload.get("references") if isinstance(payload, Mapping) else None

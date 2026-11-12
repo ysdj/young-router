@@ -7,6 +7,8 @@ import copy
 
 from hook_test_utils import *
 
+from young_router import runtime_store
+
 
 class HookRouteRecoveryTests(HookTestCase):
     def test_a_server_refusal_hidden_in_a_connection_error_cools_the_route(self) -> None:
@@ -209,9 +211,10 @@ class HookRouteRecoveryTests(HookTestCase):
             state_module._upsert_route_recovery_state(record)
 
             key = record["key"]
-            payload = json.loads(state_path.read_text(encoding="utf-8"))
-            payload["recoveries"][key]["heartbeat_at"] = "2000-01-01T00:00:00Z"
-            state_path.write_text(json.dumps(payload), encoding="utf-8")
+            def age_heartbeat(payload: dict) -> None:
+                payload["recoveries"][key]["heartbeat_at"] = "2000-01-01T00:00:00Z"
+
+            runtime_store.update_document(state_path, age_heartbeat)
 
             keepalive = hooks._route_recovery_sse_keepalive(
                 1,
@@ -223,7 +226,7 @@ class HookRouteRecoveryTests(HookTestCase):
                 ": young_router route_recovery phase=attempt attempt=1\n\n",
             )
             self.assertIsInstance(keepalive, str)
-            touched = json.loads(state_path.read_text(encoding="utf-8"))
+            touched = runtime_store.read_document(state_path)
             self.assertNotEqual(
                 touched["recoveries"][key]["heartbeat_at"],
                 "2000-01-01T00:00:00Z",

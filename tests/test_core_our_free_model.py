@@ -12,6 +12,8 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+
+from young_router.adapters.our_free_model import OurFreeModelRuntime
 from unittest import mock
 
 from young_router import adapters as managed_adapters
@@ -1119,6 +1121,26 @@ class LaneChannelTests(unittest.TestCase):
         self.assertEqual(
             {"our-free-model": ["big-pickle", "kilo-auto/free"]}, document["routes"]
         )
+
+
+class WorkerLogRetentionTests(unittest.TestCase):
+    """One worker runs at a time, so only its transcript is worth keeping.
+
+    Every start takes a fresh random port and names its log after it, and the
+    old code removed only the log for the port it was about to use.  One
+    installation had 2 639 of them.
+    """
+
+    def test_a_start_removes_the_transcripts_of_workers_that_are_gone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = OurFreeModelRuntime(directory)
+            for port in (51001, 51002, 51003):
+                (runtime.root / f"worker.{port}.log").write_text("x", encoding="utf-8")
+            (runtime.root / "worker.notes.txt").write_text("x", encoding="utf-8")
+            runtime._prune_worker_logs(51003)
+            self.assertEqual(["worker.51003.log"], sorted(p.name for p in runtime.root.glob("worker.*.log")))
+            self.assertTrue((runtime.root / "worker.notes.txt").exists())
+
 
 
 if __name__ == "__main__":

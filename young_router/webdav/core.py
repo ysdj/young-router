@@ -8,6 +8,7 @@ import http.client
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -822,6 +823,15 @@ def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
     return json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
 
 
+#: How many copies of one document a sync leaves behind.  Each copy is the
+#: bytes a pull was about to overwrite, and a document can be pulled every
+#: interval: on one installation 17 relay-account copies had accumulated, each
+#: carrying the plaintext keys and sessions, and nothing ever removed them.
+WEBDAV_BACKUP_RETENTION = 5
+
+_BACKUP_SUFFIX = re.compile(r"\.bak-webdav-\d{8}-\d{6}$")
+
+
 def _backup(path: pathlib.Path) -> str:
     backup_path = path.with_name(f"{path.name}.bak-webdav-{_timestamp()}")
     shutil.copy2(path, backup_path)
@@ -829,7 +839,39 @@ def _backup(path: pathlib.Path) -> str:
         os.chmod(backup_path, 0o600)
     except OSError:
         pass
+    _prune_backups(path)
     return str(backup_path)
+
+
+def _prune_backups(path: pathlib.Path) -> None:
+    """Keep the newest copies of one document, and nothing else.
+
+    Only names this writer produced are candidates: a stamp a person chose --
+    ``config.yaml.bak-before-key-switch-20260920`` -- states an intent no
+    rotation rule can know, and the config editor's own backups are its own.
+    """
+
+    prefix = f"{path.name}.bak-webdav-"
+    stamped: list[str] = []
+    try:
+        candidates = list(path.parent.glob(f"{path.name}.bak-webdav-*"))
+    except OSError:
+        return
+    for candidate in candidates:
+        if _BACKUP_SUFFIX.search(candidate.name) is None:
+            continue
+        try:
+            if not candidate.is_file() or candidate.is_symlink():
+                continue
+        except OSError:
+            continue
+        stamped.append(candidate.name[len(prefix) :])
+    stamped.sort(reverse=True)
+    for stale in stamped[WEBDAV_BACKUP_RETENTION:]:
+        try:
+            path.with_name(prefix + stale).unlink()
+        except OSError:
+            pass
 
 
 def _require_yaml() -> Any:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from hook_test_utils import *
 
+from young_router import runtime_store
+
 
 class HookResponsesWebSearchBridgeTests(HookTestCase):
     async def test_raw_reasoning_delta_is_forwarded_when_a_summary_was_requested(self) -> None:
@@ -984,7 +986,7 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
                 600.0,
                 delta=2.0,
             )
-            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            payload = runtime_store.read_document(state_path)
             self.assertIn("web_search_tool_unsupported", payload)
 
             # The probe memory still answers the capability question: a route

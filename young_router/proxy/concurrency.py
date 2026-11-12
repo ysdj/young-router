@@ -257,8 +257,14 @@ def _prune_waiters(waiters: dict[str, Any], now: float) -> None:
             waiters.pop(wait_key, None)
 
 
-def _update(callback: Any) -> Any:
-    """Run one read-modify-write under the file lock every worker shares."""
+def _update(callback: Any, *, read_only: bool = False) -> Any:
+    """Run one read-modify-write of the leases every worker shares.
+
+    ``read_only`` asks for a snapshot: the caller only counts, and the prune it
+    performs on that copy is left to the next claim or release.  A request
+    attempt asks for a count before it claims, so making every count take the
+    write transaction would serialise all sixteen workers on their reads too.
+    """
 
     path = file_path()
     if not path:
@@ -273,7 +279,7 @@ def _update(callback: Any) -> Any:
         return callback(leases, waiters, now), now
 
     try:
-        return _state_module._locked_json_state_update(path, update)
+        return _state_module._locked_json_state_update(path, update, read_only=read_only)
     except OSError:
         # A read-only or vanished state directory is a fact about this host, not
         # about the request: the caller treats ``None`` as "no shared count".
@@ -295,7 +301,7 @@ def counts() -> Optional[dict[str, int]]:
                 counted[deployment] = counted.get(deployment, 0) + 1
         return counted
 
-    result = _update(read)
+    result = _update(read, read_only=True)
     return result[0] if isinstance(result, tuple) and isinstance(result[0], dict) else None
 
 
@@ -474,7 +480,7 @@ def waiting_count(deployment_key: str) -> Optional[int]:
             if isinstance(state, Mapping) and state.get("deployment") == deployment_key
         )
 
-    result = _update(read)
+    result = _update(read, read_only=True)
     return result[0] if isinstance(result, tuple) and isinstance(result[0], int) else None
 
 

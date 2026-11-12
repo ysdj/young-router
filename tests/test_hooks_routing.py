@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from hook_test_utils import *
 
+from young_router import runtime_store
+
 
 class HookRoutingTests(HookTestCase):
     async def test_encrypted_history_continuation_keeps_eligible_routes(self) -> None:
@@ -1064,9 +1066,7 @@ class HookRoutingTests(HookTestCase):
                 error.status_code = 403
                 hooks._mark_exception_for_deployment_failover(error, request_kwargs)
 
-            cooldown_payload = json.loads(
-                Path(temp_dir, "deployment-cooldowns.json").read_text(encoding="utf-8")
-            )
+            cooldown_payload = runtime_store.read_document(Path(temp_dir, "deployment-cooldowns.json"))
             cooldown_state = cooldown_payload["cooldowns"]["id:stable-backup_provider"]
             self.assertEqual(cooldown_state["model_group"], "default-chat")
             self.assertEqual(cooldown_state["provider"], "backup_provider")
@@ -1118,7 +1118,7 @@ class HookRoutingTests(HookTestCase):
             self.assertEqual([deployment], available)
             self.assertEqual([], cooled)
             self.assertFalse(filtered)
-            written = path.stat().st_mtime_ns
+            written = runtime_store.document_version(path)
 
             for _ in range(3):
                 hooks._with_active_deployment_cooldowns(
@@ -1126,14 +1126,14 @@ class HookRoutingTests(HookTestCase):
                     request_kwargs=request_kwargs,
                 )
 
-            self.assertEqual(written, path.stat().st_mtime_ns)
+            self.assertEqual(written, runtime_store.document_version(path))
 
             error = RuntimeError("insufficient account balance")
             error.status_code = 403
             hooks._mark_exception_for_deployment_failover(error, request_kwargs)
 
-            self.assertNotEqual(written, path.stat().st_mtime_ns)
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertNotEqual(written, runtime_store.document_version(path))
+            payload = runtime_store.read_document(path)
             self.assertEqual(
                 1,
                 payload["cooldowns"]["id:stable-backup_provider"]["failures"],
@@ -1473,7 +1473,7 @@ class HookRoutingTests(HookTestCase):
         self.assertTrue(hooks._is_route_recovery_sse_keepalive(first_chunk))
         self.assertEqual(first_chunk["metadata"]["phase"], "cooldown")
         self.assertEqual(calls, [])
-        waiting_state = json.loads(recovery_state_path.read_text(encoding="utf-8"))
+        waiting_state = runtime_store.read_document(recovery_state_path)
         record = next(iter(waiting_state["recoveries"].values()))
         self.assertEqual(record["status"], "waiting")
         self.assertGreater(record["cooldown_until"], time.time())
@@ -4023,7 +4023,7 @@ class HookRoutingTests(HookTestCase):
 
             self.assertEqual(["supported"] * 8, statuses)
             self.assertEqual(1, len(calls))
-            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            saved = runtime_store.read_document(state_path)
             self.assertEqual(
                 "supported",
                 next(iter(saved["codex_compaction_capabilities"].values()))["status"],

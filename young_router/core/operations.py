@@ -31,6 +31,7 @@ from typing import Any
 
 from ..browser_identity import browser_request_headers
 from .. import config_paths
+from .. import runtime_store
 from ..dsh_config_keys import (
     DSH_VISION_ROUTER_CONFIG_KEY as _DSH_VISION_ROUTER_CONFIG_KEY,
     DSH_VISION_ROUTER_LOCAL_QUICK_KEYS as _DSH_VISION_ROUTER_LOCAL_QUICK_KEYS,
@@ -714,10 +715,32 @@ class CoreServiceController:
     _PROCESS_IDENTITY_TTL_SECONDS = 1.0
     _process_identity_memo: "dict[int, tuple[float, str | None]]" = {}
 
-    @staticmethod
-    def _posix_process_has_token(pid: int, token: str) -> bool:
+    #: How long a token check answers for.  Reading one costs a `ps` spawn --
+    #: 10 to 20 ms, and up to its own second when the process table is wedged --
+    #: and every snapshot of every window asks while the proxy is stopped,
+    #: starting, or unhealthy.  The identity beside it is already memoized for
+    #: the same second; the spawn was the one part that was not.
+    _PROCESS_TOKEN_TTL_SECONDS = 1.0
+    _process_token_memo: "dict[tuple[int, str], tuple[float, bool]]" = {}
+
+    @classmethod
+    def _posix_process_has_token(cls, pid: int, token: str) -> bool:
         if os.name == "nt":
             return True
+        key = (pid, token)
+        now = time.monotonic()
+        memo = cls._process_token_memo
+        cached = memo.get(key)
+        if cached is not None and now - cached[0] < cls._PROCESS_TOKEN_TTL_SECONDS:
+            return cached[1]
+        answer = cls._read_process_token(pid, token)
+        if len(memo) > 64:
+            memo.clear()
+        memo[key] = (now, answer)
+        return answer
+
+    @classmethod
+    def _read_process_token(cls, pid: int, token: str) -> bool:
         try:
             result = subprocess.run(
                 ["ps", "eww", "-o", "command=", "-p", str(pid)],
@@ -1403,9 +1426,7 @@ class CoreServiceController:
 
         for path in (self.paths.recovery, self.paths.cooldowns, self.paths.affinity):
             try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+                runtime_store.delete_document(path)
             except OSError as exc:
                 raise RuntimeError("Transient routing state could not be reset") from exc
 

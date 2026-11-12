@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import threading
 import time
+
+from . import oplog
 from typing import Callable
 
 DEFAULT_WINDOW_SECONDS = 0.016
@@ -160,12 +162,19 @@ class CoalescingEmitter:
             if self._requests <= self._covered:
                 return
             pending = self._requests
+            previous = self._covered
             # Claimed before the send: a request that arrives while it runs is
             # a new event rather than one silently folded into this one.
             self._covered = pending
         try:
             self._send()
-        except Exception:
+        except Exception as exc:
             # A publisher that raised must not end the thread; ``CoreStore``
-            # already contains a subscriber that raised.
-            pass
+            # already contains a subscriber that raised.  The batch is owed
+            # again, though: claiming it before the send is what kept two
+            # publishers from splitting one burst, and rolling the claim back
+            # is what keeps a send that never happened from taking the event
+            # with it -- the next request publishes everything still pending.
+            with self._lock:
+                self._covered = min(self._covered, previous)
+            oplog.note("a state event could not be published", trace=exc)

@@ -9,6 +9,7 @@ import threading
 import unittest
 from unittest import mock
 
+from young_router import runtime_store
 from young_router.core import CoreIPCClient, CoreIPCServer, CoreStore
 from young_router.core.domains.logs import MAX_FILTER_CHARS, MAX_VIEW_BYTES, LOG_TABS, LogsDomain, LogsDomainError
 from young_router.core.service import LOG_TABS as CORE_LOG_TABS
@@ -2007,8 +2008,8 @@ model_list:
 
             domain.dispatch("logs.clear_recovery_and_cooldowns", {"tab": "recovery"})
 
-            self.assertEqual({}, json.loads(recovery_path.read_text(encoding="utf-8"))["recoveries"])
-            cooldown_payload = json.loads(cooldown_path.read_text(encoding="utf-8"))
+            self.assertEqual({}, runtime_store.read_document(recovery_path)["recoveries"])
+            cooldown_payload = runtime_store.read_document(cooldown_path)
             self.assertEqual({}, cooldown_payload["cooldowns"])
             self.assertEqual(
                 {"preserved": {"expires_at": now.timestamp() + 60}},
@@ -2055,23 +2056,14 @@ model_list:
             domain.dispatch("logs.clear", {"tab": "recovery"})
 
             self.assertEqual(0, domain.view("recovery")["log"]["line_count"])
-            recovery_path.write_text(
-                json.dumps(
-                    {
-                        "recoveries": {
-                            "first": {
-                                "heartbeat_at": now.isoformat(),
-                                "status": "polling",
-                            },
-                            "second": {
-                                "heartbeat_at": datetime.now(timezone.utc).isoformat(),
-                                "status": "waiting",
-                            },
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
+
+            def add_a_recovery(payload: dict) -> None:
+                payload["recoveries"]["second"] = {
+                    "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+                    "status": "waiting",
+                }
+
+            runtime_store.update_document(recovery_path, add_a_recovery)
 
             self.assertEqual(3, domain.view("recovery")["log"]["line_count"])
 
@@ -2239,92 +2231,71 @@ model_list:
             self.assertFalse(second["changed"])
             self.assertIsNone(second["log"])
 
-    def test_request_tab_projects_only_appended_lines_and_matches_a_cold_read(self) -> None:
+    def test_request_tab_projects_only_appended_records_and_matches_a_cold_read(self) -> None:
+        """An append is a new row; the tab reads the newest ones without a re-walk."""
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = root / "recent-requests.jsonl"
-            path.write_text(
-                json.dumps({"ts": "2026-08-01T04:10:00Z", "request_id": "first", "status": "success"})
-                + "\n",
-                encoding="utf-8",
-            )
             domain = LogsDomain(root)
-            domain.view("requests")
+            runtime_store.append_record(
+                path, json.dumps({"ts": "2026-08-01T04:10:00Z", "request_id": "first", "status": "success"})
+            )
+            self.assertEqual(["first"], [record["request_id"] for record in domain.view("requests")["log"]["records"]])
 
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(
-                    json.dumps({"ts": "2026-08-01T04:10:01Z", "request_id": "second", "status": "success"})
-                    + "\n"
-                )
-            domain._source_signatures.pop("requests", None)
-            projected = [
-                mock.patch.object(domain, "_read_lines", side_effect=AssertionError("unexpected full read")),
-            ]
-            with projected[0]:
-                incremental = domain.view("requests")["log"]["records"]
+            runtime_store.append_record(
+                path, json.dumps({"ts": "2026-08-01T04:10:01Z", "request_id": "second", "status": "success"})
+            )
+            incremental = [record["request_id"] for record in domain.view("requests")["log"]["records"]]
 
-            self.assertEqual(["first", "second"], [record["request_id"] for record in incremental])
+            self.assertEqual(["first", "second"], incremental)
             self.assertEqual(
-                LogsDomain(root).view("requests")["log"]["records"],
                 incremental,
+                [record["request_id"] for record in LogsDomain(root).view("requests")["log"]["records"]],
             )
 
-    def test_request_tab_reads_a_partial_line_only_after_its_newline(self) -> None:
+    def test_a_record_the_store_holds_but_the_tab_cannot_read_is_skipped(self) -> None:
+        """A row written by a build that changed shape is not the tab's failure."""
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = root / "recent-requests.jsonl"
-            record = json.dumps({"ts": "2026-08-01T04:10:00Z", "request_id": "split", "status": "success"})
-            path.write_text(record[:20], encoding="utf-8")
-            domain = LogsDomain(root)
-
-            self.assertEqual([], domain.view("requests")["log"]["records"])
-
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(record[20:] + "\n")
-            domain._source_signatures.pop("requests", None)
+            runtime_store.append_record(path, "not json at all")
+            runtime_store.append_record(
+                path, json.dumps({"ts": "2026-08-01T04:10:00Z", "request_id": "split", "status": "success"})
+            )
 
             self.assertEqual(
                 ["split"],
-                [entry["request_id"] for entry in domain.view("requests")["log"]["records"]],
+                [entry["request_id"] for entry in LogsDomain(root).view("requests")["log"]["records"]],
             )
 
-    def test_request_tab_rebuilds_the_window_after_rotation_and_truncation(self) -> None:
+    def test_the_request_tab_follows_the_store_not_the_file_it_replaced(self) -> None:
+        """Once the store holds this log, the old JSONL is history, not a second writer."""
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = root / "recent-requests.jsonl"
             path.write_text(
-                json.dumps({"ts": "2026-08-01T04:10:00Z", "request_id": "before", "status": "success"})
-                + "\n",
+                json.dumps({"ts": "2026-08-01T04:10:00Z", "request_id": "before", "status": "success"}) + "\n",
                 encoding="utf-8",
             )
             domain = LogsDomain(root)
+            self.assertEqual(["before"], [record["request_id"] for record in domain.view("requests")["log"]["records"]])
+
+            # A file-based build writing beside the store is not adopted: the
+            # store imported this log once and owns it from then on.
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"ts": "2026-08-01T04:11:00Z", "request_id": "after", "status": "success"}) + "\n")
+            self.assertEqual(["before"], [record["request_id"] for record in domain.view("requests")["log"]["records"]])
+
+            runtime_store.append_record(
+                path, json.dumps({"ts": "2026-08-01T04:12:00Z", "request_id": "stored", "status": "success"})
+            )
             self.assertEqual(
-                ["before"],
+                ["before", "stored"],
                 [record["request_id"] for record in domain.view("requests")["log"]["records"]],
             )
-
-            rotated = root / "recent-requests.jsonl.1"
-            path.rename(rotated)
-            path.write_text(
-                json.dumps({"ts": "2026-08-01T04:11:00Z", "request_id": "after", "status": "success"})
-                + "\n",
-                encoding="utf-8",
-            )
-            domain._source_signatures.pop("requests", None)
-            self.assertEqual(
-                ["after"],
-                [record["request_id"] for record in domain.view("requests")["log"]["records"]],
-            )
-
-            path.write_text(
-                json.dumps({"ts": "2026-08-01T04:12:00Z", "request_id": "truncated", "status": "success"})
-                + "\n",
-                encoding="utf-8",
-            )
-            domain._source_signatures.pop("requests", None)
-            records = domain.view("requests")["log"]["records"]
-
-            self.assertEqual(["truncated"], [record["request_id"] for record in records])
 
     def test_request_tab_view_actions_rebuild_the_window(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

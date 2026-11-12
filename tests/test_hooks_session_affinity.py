@@ -7,6 +7,8 @@ from pathlib import Path
 
 from hook_test_utils import *
 
+from young_router import runtime_store
+
 
 def _deployment(deployment_id: str, order: float = 0.1) -> dict:
     return {
@@ -61,8 +63,8 @@ class SessionAffinityRecordingTests(HookTestCase):
             }
             hooks._record_session_deployment_affinity(request)
 
-            self.assertTrue(path.is_file())
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertTrue(runtime_store.has_document(path))
+            payload = runtime_store.read_document(path)
             self.assertEqual(len(payload), 1)
             entry = next(iter(payload.values()))
             self.assertEqual(entry["deployment_id"], "dep-a")
@@ -440,7 +442,7 @@ class HookFilterSessionAffinityTests(HookTestCase):
                     "metadata": {"model_group": "default-chat"},
                 }
             )
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = runtime_store.read_document(path)
             entry = next(iter(payload.values()))
             self.assertEqual(entry["deployment_id"], "dep-b")
 

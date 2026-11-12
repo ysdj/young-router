@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from hook_test_utils import *
 
+from young_router import runtime_store
+
 
 class HookStreamingTimeoutTests(HookTestCase):
     async def test_codex_chat_bridge_reports_restored_reasoning(self) -> None:
@@ -674,7 +676,7 @@ class HookStreamingTimeoutTests(HookTestCase):
 
             records = [
                 json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
+                for line in runtime_store.read_records(log_path, limit=10_000)
                 if line.strip()
             ]
             stuck_records = [record for record in records if record.get("status") == "stuck"]
@@ -796,7 +798,7 @@ class HookStreamingTimeoutTests(HookTestCase):
 
             records = [
                 json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
+                for line in runtime_store.read_records(log_path, limit=10_000)
                 if line.strip()
             ]
             stuck_records = [
@@ -916,8 +918,7 @@ class HookStreamingTimeoutTests(HookTestCase):
             self.assertEqual(chunks[2]["delta"], "visible later")
             self.assertEqual(chunks[-1]["response"]["id"], chunks[0]["response"]["id"])
             self.assertEqual(calls, [])
-            if log_path.exists():
-                self.assertEqual(log_path.read_text(encoding="utf-8").strip(), "")
+            self.assertEqual([], runtime_store.read_records(log_path, limit=10))
 
     async def test_streaming_reasoning_summary_is_delivered_but_raw_reasoning_is_not(self) -> None:
         hooks, proxy_server = load_hook_module()
@@ -1728,7 +1729,7 @@ class HookStreamingTimeoutTests(HookTestCase):
 
             records = [
                 json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
+                for line in runtime_store.read_records(log_path, limit=10_000)
                 if line.strip()
             ]
             stuck_records = [record for record in records if record.get("status") == "stuck"]
@@ -1871,7 +1872,7 @@ class HookStreamingTimeoutTests(HookTestCase):
 
             records = [
                 json.loads(line)
-                for line in log_path.read_text(encoding="utf-8").splitlines()
+                for line in runtime_store.read_records(log_path, limit=10_000)
                 if line.strip()
             ]
             stuck_records = [
