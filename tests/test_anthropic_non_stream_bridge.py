@@ -179,6 +179,77 @@ class AnthropicNonStreamBridgeTests(HookTestCase):
         self.assertEqual("message", message["type"])
         self.assertEqual("Hello", message["content"][1]["text"])
 
+    async def test_a_custom_providers_anthropic_surface_is_still_bridged(self) -> None:
+        """A route's provider name is not its wire.
+
+        flux-code is a provider name this gateway registers; the deployment's
+        wire is the Anthropic Messages surface.  Gating on the provider name
+        skipped the bridge for exactly the routes the silent-connection
+        ceiling breaks, so the surface the router selected is the gate.
+        """
+
+        bridge = _bridge_module()
+        hooks, _ = load_hook_module()
+        hooks._remember_selected_deployment(
+            {
+                "litellm_params": {"model": "anthropic/claude-fable-5-2"},
+                "model_info": {"id": "flux-route"},
+            },
+            surface="anthropic",
+        )
+        calls = []
+
+        async def original(**kwargs):
+            calls.append(kwargs)
+            return _ChunkStream([_sse(_a_full_turn())])
+
+        wrapped = bridge.wrap_deployment_function(
+            original,
+            method_name="anthropic_messages",
+            client_streaming=False,
+        )
+        message = await wrapped(
+            stream=False,
+            custom_llm_provider="flux-code",
+            model="flux-code/claude-fable-5-2",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+        self.assertEqual(1, len(calls))
+        self.assertIs(True, calls[0]["stream"])
+        self.assertEqual("message", message["type"])
+
+    async def test_a_chat_surface_is_never_bridged_for_a_custom_provider(self) -> None:
+        """The same provider name over the Chat surface answers OpenAI chunks."""
+
+        bridge = _bridge_module()
+        hooks, _ = load_hook_module()
+        hooks._remember_selected_deployment(
+            {
+                "litellm_params": {"model": "openai/claude-fable-5-2"},
+                "model_info": {"id": "flux-route"},
+            },
+            surface="openai/chat",
+        )
+        whole = {"id": "chatcmpl-1", "choices": []}
+
+        async def original(**kwargs):
+            return whole
+
+        wrapped = bridge.wrap_deployment_function(
+            original,
+            method_name="anthropic_messages",
+            client_streaming=False,
+        )
+        self.assertIs(
+            whole,
+            await wrapped(
+                stream=False,
+                custom_llm_provider="flux-code",
+                model="flux-code/claude-fable-5-2",
+            ),
+        )
+
     async def test_the_inner_call_writes_no_second_request_row(self) -> None:
         """The bridged call is a transport detail, not a second turn.
 

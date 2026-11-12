@@ -121,7 +121,27 @@ def _should_bridge(
     # A Chat bridge speaks OpenAI chunks, not Anthropic frames.
     if call_kwargs.get("use_chat_completions_api") is True:
         return False
+    surface = _selected_surface()
+    if surface:
+        # A route may name its own provider (``flux-code``) while its wire is
+        # the Anthropic Messages surface; the surface is what decides whether
+        # these frames exist at all.
+        return surface == "anthropic"
     return _call_provider(call_kwargs) == "anthropic"
+
+
+def _selected_surface() -> str:
+    """The wire the selected route declares, when the router has selected one."""
+
+    from young_router.proxy import routing as _routing_module
+    from young_router.proxy import base as _base_module
+
+    marker = _routing_module._selected_deployment_marker_from_box()
+    if not isinstance(marker, dict):
+        return ""
+    return _routing_module._normalized_request_surface(
+        marker.get(_base_module._CURRENT_UPSTREAM_URL_SURFACE_KEY)
+    )
 
 
 def _call_provider(call_kwargs: dict) -> str:
