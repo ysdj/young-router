@@ -24,6 +24,7 @@ from young_router.core.domains.relay_accounts import RelayAccountsDomain
 from young_router.core.domains.runtime import RuntimeSettingsDomain
 from young_router.core.domains.webdav import WebDAVSettingsDomain
 from young_router.core.domains._shared import DomainError
+from young_router.core import operations as operations_module
 from young_router.core.operations import CoreServiceController, _provider_config_source
 
 from young_router.webdav import core as webdav_core  # noqa: E402
@@ -2697,7 +2698,6 @@ class ServiceStatusProjectionTests(unittest.TestCase):
         above the healthy case and well inside one window's budget.
         """
 
-        from young_router.core import operations as operations_module
 
         self.assertLessEqual(
             operations_module.SERVICE_HEALTH_PROBE_TIMEOUT_SECONDS, 0.2
@@ -2768,6 +2768,52 @@ class ServiceStatusProjectionTests(unittest.TestCase):
             50.0,
             "an unanswered probe was paid again by the next read",
         )
+
+
+class OwnershipTokenMemoTests(unittest.TestCase):
+    """The token check answers for a second instead of spawning `ps` per snapshot.
+
+    Every window's snapshot asks whether this Core still owns the proxy, and
+    while the proxy is stopped, starting or unhealthy the answer is not cached
+    anywhere: each ask spawned `ps eww` -- 10 to 20 ms, or its own second when
+    the process table is wedged -- on the state-lock-free snapshot path every
+    window shares.  The identity beside it was already memoized for a second;
+    this is the other half.
+    """
+
+    def tearDown(self) -> None:
+        CoreServiceController._process_token_memo.clear()
+
+    def test_a_second_call_within_the_window_does_not_spawn(self) -> None:
+        controller = CoreServiceController(tempfile.mkdtemp())
+        calls: list[list[str]] = []
+
+        def run(command, **_kwargs):
+            calls.append(list(command))
+            return subprocess.CompletedProcess(command, 0, stdout=f"ps eww {operations_module.OWNER_TOKEN_ENV}=abc\n", stderr="")
+
+        with mock.patch("young_router.core.operations.os.name", "posix"), mock.patch(
+            "young_router.core.operations.subprocess.run", side_effect=run
+        ):
+            self.assertTrue(controller._posix_process_has_token(4811, "abc"))
+            self.assertTrue(controller._posix_process_has_token(4811, "abc"))
+        self.assertEqual(1, len(calls), "the token check spawned `ps` twice in one second")
+
+    def test_a_different_token_is_asked_again(self) -> None:
+        controller = CoreServiceController(tempfile.mkdtemp())
+        calls: list[list[str]] = []
+
+        def run(command, **_kwargs):
+            calls.append(list(command))
+            return subprocess.CompletedProcess(command, 0, stdout=f"ps eww {operations_module.OWNER_TOKEN_ENV}=abc\n", stderr="")
+
+        with mock.patch("young_router.core.operations.os.name", "posix"), mock.patch(
+            "young_router.core.operations.subprocess.run", side_effect=run
+        ):
+            self.assertTrue(controller._posix_process_has_token(4811, "abc"))
+            self.assertFalse(controller._posix_process_has_token(4811, "another-token"))
+        self.assertEqual(2, len(calls))
+
 
 
 if __name__ == "__main__":
