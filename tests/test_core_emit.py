@@ -665,5 +665,37 @@ class CoalescingEmitterTests(unittest.TestCase):
         self.assertEqual([1], sent)
 
 
+class FailedPublishTests(unittest.TestCase):
+    """An event whose send raised is still owed to the next reader.
+
+    The emitter claims a burst before it sends it, which is what keeps two
+    publishers from splitting one burst in half.  Claiming it *instead* of
+    sending it -- what happened when the send raised -- lost the event with
+    nothing anywhere stating it, so every window kept the state from before a
+    commit that had already landed.
+    """
+
+    def test_a_send_that_raised_is_published_by_the_next_request(self) -> None:
+        from young_router.core.emitter import CoalescingEmitter
+
+        attempts: list[int] = []
+
+        def send() -> None:
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("the projection failed")
+
+        emitter = CoalescingEmitter(send)
+        self.addCleanup(emitter.stop)
+        emitter.request()
+        emitter.flush()
+        self.assertEqual(1, len(attempts))
+        # No new request arrives: the batch the failed send claimed is still
+        # owed, and the next flush publishes it.
+        emitter.flush()
+        self.assertEqual(2, len(attempts))
+
+
+
 if __name__ == "__main__":
     unittest.main()
