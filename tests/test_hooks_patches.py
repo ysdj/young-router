@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import tempfile
@@ -1121,6 +1122,59 @@ class HookPatchTests(HookTestCase):
         # route was still parked (recorded above) instead of the frame ending
         # the request as a client error.
         self.assertEqual(503, getattr(context.exception, "status_code", None))
+
+    async def test_a_non_streaming_client_disconnect_stops_the_turn(self) -> None:
+        """The client's own timeout must not leave a ghost whole-body call.
+
+        Claude Code retries a non-streaming fallback after ~a minute; the
+        bridge kept reading the upstream for minutes and the progress row said
+        发送中 while the client was already on its next attempt.  The endpoint
+        hands the wrapper a Starlette Request, so the disconnect is observable
+        and the inner stream can be cancelled.
+        """
+
+        hooks, _ = load_hook_module()
+        module = types.ModuleType("litellm.proxy.common_request_processing")
+
+        class ProxyBaseLLMRequestProcessing:
+            def __init__(self):
+                self.data = {
+                    "model": "default-chat",
+                    "stream": False,
+                    "request_id": "disconnect-test",
+                    "litellm_metadata": {},
+                }
+
+            async def base_process_llm_request(
+                self, request, fastapi_response, *args, **kwargs
+            ):
+                await asyncio.sleep(30)
+                return {"ok": True}
+
+        module.ProxyBaseLLMRequestProcessing = ProxyBaseLLMRequestProcessing
+
+        class Request:
+            async def is_disconnected(self):
+                await asyncio.sleep(0.01)
+                return True
+
+        with mock.patch.dict(
+            sys.modules,
+            {"litellm.proxy.common_request_processing": module},
+        ):
+            hooks._install_non_stream_client_disconnect_patch()
+            started = time.monotonic()
+            with self.assertRaises(Exception) as context:
+                await ProxyBaseLLMRequestProcessing().base_process_llm_request(
+                    Request(),
+                    None,
+                    route_type="anthropic_messages",
+                )
+            self.assertLess(time.monotonic() - started, 2.0)
+
+        # The patch raises Starlette's disconnect signal; compare the class
+        # name because the hook test harness may hold a reloaded copy.
+        self.assertEqual(type(context.exception).__name__, "ClientDisconnect")
 
     async def test_a_buffered_responses_answer_leaves_as_a_stream(self) -> None:
         """A streaming client may never receive a buffered Responses object.

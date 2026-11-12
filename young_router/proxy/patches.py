@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -316,6 +317,114 @@ def _install_latin1_response_headers_patch() -> None:
     )
     ProxyBaseLLMRequestProcessing.get_custom_headers = staticmethod(
         patched_get_custom_headers
+    )
+
+
+_NON_STREAM_DISCONNECT_PATCH_ATTR = "_young_router_non_stream_disconnect_patch"
+
+
+def _settle_abandoned_request(request_data: Any) -> None:
+    """Close the progress row an abandoned whole-body turn left behind."""
+
+    if not isinstance(request_data, dict):
+        return
+    request_id = _routing_module._trace_request_id(request_data)
+    if not request_id:
+        return
+    from . import state as _state_module
+
+    if _state_module._settle_recent_request(request_id, "client_disconnect"):
+        _trace_module._request_route_trace(
+            "request_log_closed_for_client_disconnect",
+            request_data,
+        )
+
+
+def _install_non_stream_client_disconnect_patch() -> None:
+    """Stop a bridged whole-body turn when its client has already gone.
+
+    A non-streaming client has its own timeout.  Claude Code's fallback gives
+    up after roughly a minute and retries; the bridge, meanwhile, keeps reading
+    the upstream stream and holding the turn.  The row stayed ``发送中`` while
+    the client was already on its next attempt, and the retries piled up as
+    ghosts.  The endpoint has the Starlette ``Request``; this wrapper races the
+    work against ``is_disconnected()`` and cancels it (the bridge's inner stream
+    included) the moment the client leaves.
+    """
+
+    try:
+        from litellm.proxy.common_request_processing import (
+            ProxyBaseLLMRequestProcessing,
+        )
+        from starlette.requests import ClientDisconnect
+    except Exception:
+        return
+    original = getattr(
+        ProxyBaseLLMRequestProcessing,
+        "base_process_llm_request",
+        None,
+    )
+    if not callable(original) or getattr(
+        original, _NON_STREAM_DISCONNECT_PATCH_ATTR, False
+    ):
+        return
+
+    async def patched_base_process_llm_request(
+        self: Any,
+        request: Any,
+        fastapi_response: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        route_type = kwargs.get("route_type")
+        data = getattr(self, "data", None)
+        if route_type != "anthropic_messages" or not isinstance(data, dict) or data.get(
+            "stream"
+        ) is True:
+            return await original(
+                self,
+                request,
+                fastapi_response,
+                *args,
+                **kwargs,
+            )
+        task = asyncio.ensure_future(
+            original(self, request, fastapi_response, *args, **kwargs)
+        )
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=1.0)
+                if done:
+                    return task.result()
+                try:
+                    disconnected = await request.is_disconnected()
+                except Exception:
+                    disconnected = False
+                if not disconnected:
+                    continue
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
+                _settle_abandoned_request(data)
+                raise ClientDisconnect()
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
+
+    setattr(patched_base_process_llm_request, _NON_STREAM_DISCONNECT_PATCH_ATTR, True)
+    setattr(
+        patched_base_process_llm_request,
+        "_original_base_process_llm_request",
+        original,
+    )
+    ProxyBaseLLMRequestProcessing.base_process_llm_request = (
+        patched_base_process_llm_request
     )
 
 
@@ -3548,6 +3657,7 @@ def _install_openai_responses_fake_stream_patch() -> None:
 def install_all() -> None:
     _install_latin1_response_headers_patch()
     _install_anthropic_unversioned_endpoint_patch()
+    _install_non_stream_client_disconnect_patch()
     # Anthropic caches only what the request marks, and a Responses turn has no
     # place to mark it: without this every Codex thread pays full input price.
     _enable_anthropic_prompt_caching()
