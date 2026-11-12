@@ -26,6 +26,8 @@ export const zhHans: Record<TranslationKey, string> = {
   "language.english": "English",
   "language.simplified_chinese": "简体中文",
   "claude.title": "Claude 设置",
+  "claude.nonstreamFallback": "禁用非流式回退",
+  "claude.nonstreamFallbackHint": "流式回答中途失败时，用流式重试，而不是把整轮改成一个非流式请求。写入 Claude Code 设置，下次启动生效。",
   "claude.model": "模型",
   "claude.gateway": "漾路由网关",
   "claude.permissions": "权限",

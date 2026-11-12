@@ -50,6 +50,7 @@ from ._shared_api import (
 
 
 DOMAIN_NAME = "claude"
+_CLAUDE_NONSTREAM_FALLBACK_ENV = "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK"
 SETTINGS_FILENAME = "settings.json"
 DEFAULT_SETTINGS_DIR = ".claude"
 
@@ -2219,6 +2220,51 @@ class ClaudeSettingsDomain:
         base_url = env.get("ANTHROPIC_BASE_URL") if isinstance(env, Mapping) else None
         return on_local_api(base_url, versioned=False)
 
+    def code_nonstream_fallback_enabled(self) -> bool:
+        """True when Claude Code is told not to re-send a failed stream whole."""
+
+        env = self._code_env()
+        return str(env.get(_CLAUDE_NONSTREAM_FALLBACK_ENV) or "").strip() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+    def set_code_nonstream_fallback(self, enabled: bool) -> None:
+        """Write Claude Code's non-streaming fallback switch and persist it.
+
+        The switch is a client setting, not a proxy one: when it is on, a
+        stream that fails mid-answer is retried as a stream instead of
+        re-sending the whole turn as one body.  The disk document is the last
+        one loaded (``_raw``) so toggling does not save unrelated unsaved
+        edits; the draft receives the same env key so the pane and the next
+        Apply agree.
+        """
+
+        if not isinstance(self._raw, dict):
+            self._raw = {}
+        for document in (self._raw, self._draft):
+            if not isinstance(document, dict):
+                continue
+            env = dict(_mapping(document.get("env", {}), "env"))
+            if enabled:
+                env[_CLAUDE_NONSTREAM_FALLBACK_ENV] = "1"
+            else:
+                env.pop(_CLAUDE_NONSTREAM_FALLBACK_ENV, None)
+            document["env"] = env
+        errors = validate_settings(self._raw)
+        if errors:
+            raise ClaudeSettingsError(errors[0])
+        if _current_bytes(self.settings_path) != self._baseline_bytes:
+            raise ClaudeSettingsError(
+                "Claude Settings changed on disk; reload and try again"
+            )
+        text = json.dumps(self._raw, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        _atomic_write(self.settings_path, text)
+        self._exists = True
+        self._baseline_bytes = text.encode("utf-8")
+
     def desktop_uses_local_api(self) -> bool:
         if self._desktop is None or not self._local_api_base_url:
             return False
@@ -2379,6 +2425,7 @@ class ClaudeSettingsDomain:
                     "uses_local_api": self.code_uses_local_api(),
                     "designated_route": self.client_route("claudeCode"),
                     "model_list_enabled": self.code_model_list_enabled(),
+                    "nonstream_fallback_enabled": self.code_nonstream_fallback_enabled(),
                 },
                 "claudeDesktop": {
                     "uses_local_api": self.desktop_uses_local_api(),
@@ -2634,6 +2681,18 @@ class ClaudeSettingsDomain:
             store_generated_models(
                 self.app_state_root, "claudeCode", self.code_model_list_public_names() if enabled else []
             )
+            self._revision += 1
+            return self.snapshot()
+        if name in {
+            "claude_nonstream_fallback_set",
+            "claudenonstreamfallbackset",
+            "nonstream_fallback_set",
+            "nonstreamfallbackset",
+        }:
+            enabled = data.get("enabled")
+            if not isinstance(enabled, bool):
+                raise DomainError("The Claude non-streaming fallback switch is invalid")
+            self.set_code_nonstream_fallback(enabled)
             self._revision += 1
             return self.snapshot()
         candidate = copy.deepcopy(self._draft)

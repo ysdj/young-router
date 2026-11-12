@@ -4339,7 +4339,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
     {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} status={result} /> : null}
     {route === "webdav-settings" ? <WebDavSettingsPanel snapshot={snapshot} busy={busy} status={dataManagementStatuses.webdav} translate={translate} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onProbe={probeWebDavDetails} onSave={saveWebDavDetails} onSync={syncWebDavAndReadState} onCompareConflict={compareWebDavConflict} onResolveConflict={resolveWebDavConflictAndReadState} onSetContentSize={(width, height) => { void native.window.setContentSize?.("webdav-settings", width, height); }} onClose={closeRoute} /> : null}
-    {settingsRoute ? <AssistantSettingsWorkspace initialClient={initialClient} busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} codexRoute={codexDesignatedRoute ? { model: stringValue(codexDesignatedRoute.model), provider: stringValue(codexDesignatedRoute.provider), deployment_id: stringValue(codexDesignatedRoute.deployment_id), label: clientRouteLabel(stringValue(codexDesignatedRoute.provider), stringValue(codexDesignatedRoute.model)) } : undefined} standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} claudeClients={{ claudeCode: asRecord(claudeClients.claudeCode), claudeDesktop: asRecord(claudeClients.claudeDesktop) }} claudeModels={claudeModelRows} onClaudeUseLocalApi={(app, selection) => dispatch("use_local_api", { ...selection, client: app }, "claude")} onClaudeUseSavedModel={(app, selection) => dispatch("use_saved_model", { ...selection, client: app }, "claude")} onToggleClaudeModelList={(app, enabled) => dispatch("claude.models.set", { client: app, enabled }, "claude")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} onStatus={setResult} /> : null}
+    {settingsRoute ? <AssistantSettingsWorkspace initialClient={initialClient} busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} codexRoute={codexDesignatedRoute ? { model: stringValue(codexDesignatedRoute.model), provider: stringValue(codexDesignatedRoute.provider), deployment_id: stringValue(codexDesignatedRoute.deployment_id), label: clientRouteLabel(stringValue(codexDesignatedRoute.provider), stringValue(codexDesignatedRoute.model)) } : undefined} standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} claudeClients={{ claudeCode: asRecord(claudeClients.claudeCode), claudeDesktop: asRecord(claudeClients.claudeDesktop) }} claudeModels={claudeModelRows} onClaudeUseLocalApi={(app, selection) => dispatch("use_local_api", { ...selection, client: app }, "claude")} onClaudeUseSavedModel={(app, selection) => dispatch("use_saved_model", { ...selection, client: app }, "claude")} onToggleClaudeModelList={(app, enabled) => dispatch("claude.models.set", { client: app, enabled }, "claude")} onToggleClaudeNonstreamFallback={(enabled) => dispatch("claude.nonstream_fallback.set", { enabled }, "claude")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} onStatus={setResult} /> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} onStatusBar={setStatusBarControls} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
     {route === "general-settings" ? <GeneralWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} dispatch={dispatch} dispatchServiceAction={enqueueServiceDispatch} translate={translate} onStatus={setResult} onSnapshot={onSnapshot} /> : null}
     {route === "runtime-settings" ? <RuntimeWorkspace snapshot={snapshot} busy={busy} translate={translate} dispatch={dispatch} onSecretState={onSecretState} clearSecret={clearSecret} native={native} ipc={ipc} onStatus={setResult} /> : null}
@@ -11304,6 +11304,31 @@ function ProxyScopedToggleField({ label, accessibilityLabel, value, proxyOnly, b
   </View>;
 }
 
+function ClientToggleField({ label, hint, accessibilityLabel, value, busy, onValueChange }: {
+  label: string;
+  hint: string;
+  accessibilityLabel: string;
+  value: boolean;
+  busy: boolean;
+  onValueChange: (enabled: boolean) => void;
+}): React.JSX.Element {
+  return <View style={SETTINGS_FIELD}>
+    <View style={SETTINGS_FIELD_ROW_INDENTED}>
+      <TooltipText numberOfLines={1} tooltip={label} style={SETTINGS_FIELD_LABEL} accessibilityLabel={accessibilityLabel}>{label}</TooltipText>
+      <View style={SETTINGS_FIELD_VALUE_SLOT}>
+        <NativeToggle
+          accessibilityLabel={accessibilityLabel}
+          value={value}
+          disabled={busy}
+          onValueChange={onValueChange}
+          style={SETTINGS_FIELD_SWITCH_SLOT}
+        />
+      </View>
+    </View>
+    <View style={SETTINGS_FIELD_HELP_SLOT}><Text style={SETTINGS_FIELD_HELP_TEXT}>{hint}</Text></View>
+  </View>;
+}
+
 /**
  * One client's listed files, grouped by the app that owns them.
  *
@@ -11345,7 +11370,7 @@ function ClientFileRows({ files, revealFileLabel, revealFile, busy, translate, o
   return <>{files.map(row)}</>;
 }
 
-function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, codexModelCatalogEnabled, codexRoute, standaloneSearch, onToggleStandaloneSearch, codexFeatures, clientProvider, clientModel, localApiActive, onToggleCodexModelCatalog, onToggleCodexFeature, onUseLocalApi, onUseSavedModel, claudeClients, claudeModels, onClaudeUseLocalApi, onClaudeUseSavedModel, onToggleClaudeModelList, translate, ipc, filesToken, onOpenFile, onStatus }: {
+function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, codexModelCatalogEnabled, codexRoute, standaloneSearch, onToggleStandaloneSearch, codexFeatures, clientProvider, clientModel, localApiActive, onToggleCodexModelCatalog, onToggleCodexFeature, onUseLocalApi, onUseSavedModel, claudeClients, claudeModels, onClaudeUseLocalApi, onClaudeUseSavedModel, onToggleClaudeModelList, onToggleClaudeNonstreamFallback, translate, ipc, filesToken, onOpenFile, onStatus }: {
   /** The client the route named, when it named one (`claude-settings`). */
   initialClient?: ClientFile["client"];
   busy: boolean;
@@ -11370,6 +11395,7 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
   onClaudeUseLocalApi: (app: ClaudeClientApp, selection: UnknownRecord) => Promise<void>;
   onClaudeUseSavedModel: (app: ClaudeClientApp, selection: UnknownRecord) => Promise<void>;
   onToggleClaudeModelList: (app: ClaudeClientApp, enabled: boolean) => Promise<void>;
+  onToggleClaudeNonstreamFallback: (enabled: boolean) => Promise<void>;
   translate: Translate;
   ipc: IpcClient;
   filesToken: number;
@@ -11592,6 +11618,14 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
             onUseLocalApi={(selection) => forEveryClaudeApp(onClaudeUseLocalApi, selection)}
             onUseSavedModel={(selection) => forEveryClaudeApp(onClaudeUseSavedModel, selection)}
             translate={translate}
+          />
+          <ClientToggleField
+            label={translate("claude.nonstreamFallback")}
+            accessibilityLabel={translate("claude.nonstreamFallback")}
+            hint={translate("claude.nonstreamFallbackHint")}
+            value={booleanValue(claudeCode.nonstream_fallback_enabled)}
+            busy={busy}
+            onValueChange={onToggleClaudeNonstreamFallback}
           />
           <ClientFileRows
             files={claudeFiles}

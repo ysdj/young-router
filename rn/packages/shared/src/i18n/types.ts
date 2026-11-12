@@ -29,6 +29,8 @@ export type TranslationKey =
   | "language.english"
   | "language.simplified_chinese"
   | "claude.title"
+  | "claude.nonstreamFallback"
+  | "claude.nonstreamFallbackHint"
   | "claude.model"
   | "claude.gateway"
   | "claude.permissions"

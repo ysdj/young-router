@@ -26,6 +26,8 @@ export const en: Record<TranslationKey, string> = {
   "language.english": "English",
   "language.simplified_chinese": "简体中文",
   "claude.title": "Claude Settings",
+  "claude.nonstreamFallback": "Disable non-streaming fallback",
+  "claude.nonstreamFallbackHint": "When a stream fails mid-answer, retry it as a stream instead of re-sending the whole turn as one body. Written to Claude Code settings; takes effect on its next launch.",
   "claude.model": "Model",
   "claude.gateway": "Young Router gateway",
   "claude.permissions": "Permissions",
