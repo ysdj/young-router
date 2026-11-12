@@ -144,7 +144,11 @@ class YoungRouterHook(CustomLogger):
             "async_complete_streaming_response" in kwargs
             or _streaming_module._responses_stream_chunk_is_completed(response_obj)
         )
-        if not streaming:
+        # A completed stream is a delivered answer: it clears the route's
+        # failure count exactly like a whole-body success.  Only the stream's
+        # start is not evidence -- the attempt may still fail after the first
+        # frame -- so a turn that is still streaming does not clear here.
+        if not streaming or completed_stream:
             _routing_module._record_deployment_success_for_cooldown(kwargs)
         status = "stream" if streaming and not completed_stream else "success"
         _state_module._append_recent_request(
@@ -203,7 +207,9 @@ class YoungRouterHook(CustomLogger):
         if _routing_module._is_local_control_plane_read(kwargs):
             return
         failed = _codex_fast_tier_module._response_indicates_failure(response_obj)
-        completed = _streaming_module._responses_stream_chunk_is_completed(response_obj)
+        completed = _streaming_module._responses_stream_chunk_is_completed(
+            response_obj
+        ) or _streaming_module._stream_chunk_is_native_terminal(response_obj)
         if failed:
             _trace_codex_fast_tier_result(kwargs, response_obj, outcome="stream_failure")
         elif completed:

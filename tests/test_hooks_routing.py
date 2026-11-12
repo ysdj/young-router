@@ -1220,6 +1220,70 @@ class HookRoutingTests(HookTestCase):
         )
         self.assertFalse(hooks._DEPLOYMENT_COOLDOWNS)
 
+    async def test_a_completed_native_stream_clears_the_failure_count(self) -> None:
+        """A streamed answer is a success; it must reset the route's streak.
+
+        The cooldown row said "连续失败 5 次" while the request log showed
+        several completed streams to the same route in between.  Only
+        Responses-style completion was recognized, so native Messages and Chat
+        streams never cleared the count and "consecutive" was really
+        "cumulative since the last expiry".
+        """
+
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        request_kwargs = {
+            "model": "default-chat",
+            "stream": True,
+            "litellm_params": {"model": "anthropic/claude-x"},
+            "model_info": {"id": "stream-route"},
+        }
+        error = RuntimeError("temporary upstream failure")
+        error.status_code = 503
+        hooks._mark_exception_for_deployment_failover(error, request_kwargs)
+        self.assertTrue(hooks._DEPLOYMENT_COOLDOWNS)
+
+        now = datetime.now(timezone.utc)
+        await hook.async_log_stream_event(
+            request_kwargs,
+            b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+            now,
+            now,
+        )
+        self.assertFalse(hooks._DEPLOYMENT_COOLDOWNS)
+
+    async def test_a_completed_stream_success_clears_the_failure_count(self) -> None:
+        """The terminal success callback carries a completed stream, not a chunk."""
+
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        request_kwargs = {
+            "model": "default-chat",
+            "stream": True,
+            "litellm_params": {"model": "anthropic/claude-x"},
+            "model_info": {"id": "stream-route"},
+        }
+        error = RuntimeError("temporary upstream failure")
+        error.status_code = 503
+        hooks._mark_exception_for_deployment_failover(error, request_kwargs)
+        self.assertTrue(hooks._DEPLOYMENT_COOLDOWNS)
+
+        now = datetime.now(timezone.utc)
+        await hook.async_log_success_event(
+            {
+                **request_kwargs,
+                "async_complete_streaming_response": {"type": "message"},
+            },
+            {"type": "message"},
+            now,
+            now,
+        )
+        self.assertFalse(hooks._DEPLOYMENT_COOLDOWNS)
+
     async def test_deployment_cooldown_does_not_count_sanitized_wrapper(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()

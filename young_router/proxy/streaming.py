@@ -1122,6 +1122,31 @@ def _stream_chunk_response_status(chunk: Any) -> str:
     status = dumped.get("status")
     return status if isinstance(status, str) else ""
 
+def _stream_chunk_is_native_terminal(chunk: Any) -> bool:
+    """True for the frame that ends a Chat or Anthropic Messages stream.
+
+    ``_responses_stream_chunk_is_completed`` only reads Responses events.  A
+    native Messages stream ends on ``message_stop`` (bytes or a dict), and a
+    Chat stream ends on ``[DONE]`` or a choice with a finish reason.  The
+    cooldown's success accounting asks this question once per turn, so a
+    streamed answer that completed must clear its route's failure count just
+    like a whole-body answer does.
+    """
+
+    text = _sse_stream_chunk_text(chunk)
+    if text is not None:
+        return "event: message_stop" in text or "data: [DONE]" in text
+    dumped = _stream_chunk_dump(chunk)
+    if dumped.get("type") == "message_stop":
+        return True
+    choices = dumped.get("choices")
+    if isinstance(choices, list):
+        return any(
+            isinstance(choice, dict) and choice.get("finish_reason") is not None
+            for choice in choices
+        )
+    return False
+
 def _responses_stream_chunk_is_completed(chunk: Any) -> bool:
     return _stream_chunk_type(chunk) in _RESPONSES_STREAM_COMPLETED_TYPES or (
         _stream_chunk_type(chunk) == "response"
