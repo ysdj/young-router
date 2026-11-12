@@ -2607,5 +2607,36 @@ class WebDAVSyncBundleTests(unittest.TestCase):
                 client.request("GET", url, response_max_bytes=4)
 
 
+class BackupRetentionTests(unittest.TestCase):
+    """A pull keeps the bytes it is about to overwrite -- a bounded number of them.
+
+    Each copy carries the whole document, and for the relay accounts that means
+    the plaintext keys and sessions.  On the installation measured, seventeen of
+    them had accumulated and nothing ever removed one.
+    """
+
+    def test_only_the_newest_copies_survive(self) -> None:
+        from young_router.webdav import core as webdav_core
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "relay-accounts.json"
+            target.write_text("{}", encoding="utf-8")
+            for day, hour in ((1, 0), (2, 0), (3, 0), (4, 0), (5, 0), (6, 0), (7, 0)):
+                (root / f"relay-accounts.json.bak-webdav-202601{day:02d}-{hour:02d}0000").write_text("{}", encoding="utf-8")
+            # A copy a person named is theirs: its name states an intent no
+            # rotation rule can know.
+            personal = root / "relay-accounts.json.bak-before-key-switch-20260920"
+            personal.write_text("{}", encoding="utf-8")
+
+            webdav_core._backup(target)
+
+            kept = sorted(p.name for p in root.glob("relay-accounts.json.bak-webdav-*"))
+            self.assertEqual(webdav_core.WEBDAV_BACKUP_RETENTION, len(kept))
+            self.assertNotIn("relay-accounts.json.bak-webdav-20260101-000000", kept)
+            self.assertTrue(personal.exists())
+
+
+
 if __name__ == "__main__":
     unittest.main()

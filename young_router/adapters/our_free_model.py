@@ -520,6 +520,11 @@ class OurFreeModelRuntime:
             args.extend(("--setting", f"{key}={value}"))
         log_path = self.root / f"worker.{port}.log"
         log_path.unlink(missing_ok=True)
+        # Every start takes a fresh random port, so every start used to leave
+        # its predecessor's transcript behind: one installation had 2 639 of
+        # them.  A transcript from any other port belongs to a worker that no
+        # longer runs -- this adapter owns exactly one at a time.
+        self._prune_worker_logs(port)
         handoff = tempfile.TemporaryFile(mode="w+", dir=self.root, prefix="handoff.", suffix=".lock")
         _lock_file(handoff, wait=True)
         handoff.seek(0)
@@ -769,6 +774,22 @@ class OurFreeModelRuntime:
             # a roster whose inner split is its own.
             "wires": _wire_membership(document.get("wires")),
         }
+
+    def _prune_worker_logs(self, port: int) -> None:
+        """Remove the transcripts of workers this adapter no longer runs."""
+
+        keep = f"worker.{port}.log"
+        try:
+            names = os.listdir(self.root)
+        except OSError:
+            return
+        for name in names:
+            if name == keep or not name.startswith("worker.") or not name.endswith(".log"):
+                continue
+            try:
+                (self.root / name).unlink()
+            except OSError:
+                continue
 
     def _request(
         self,
