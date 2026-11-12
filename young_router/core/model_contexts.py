@@ -12,7 +12,11 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+import importlib.machinery
+import json
+import os
 import re
+import sys
 import threading
 import time
 from pathlib import Path
@@ -1051,15 +1055,98 @@ def _reasoning_capability(record: Mapping[str, Any]) -> ReasoningCapability | No
     )
 
 
+#: The file ``litellm.model_cost`` is built from, inside LiteLLM's own package.
+_COST_MAP_FILE_NAME = "model_prices_and_context_window_backup.json"
+#: LiteLLM reads this table from its package instead of the network under either
+#: of these, which is what makes reading the file the same answer as importing.
+_LOCAL_COST_MAP_ENVS = ("LITELLM_LOCAL_MODEL_COST_MAP", "LITELLM_OFFLINE_MODE")
+
+# ``False`` means "not read yet"; ``None`` means "this install offers no local
+# map", which is a fact to remember so the fallback import is not retried for
+# every unknown model.
+_packaged_cost_map: Mapping[str, Any] | None | bool = False
+
+
+def _local_cost_map_requested() -> bool:
+    return any(os.environ.get(name, "").strip().lower() == "true" for name in _LOCAL_COST_MAP_ENVS)
+
+
+def _packaged_cost_map_for_this_install() -> Mapping[str, Any] | None:
+    """LiteLLM's cost map, read from the file its own package ships.
+
+    Importing LiteLLM to reach ``litellm.model_cost`` measured 2.7 s and a
+    244 MB resident peak, paid by Core's first projection of a model the
+    profiles do not know -- and the table it produces is this file.  Reading it
+    is the same data at 0.01 s; the import stays as the fallback for the one
+    install shape this file cannot describe, a map LiteLLM fetched from the
+    network because nothing pinned it to the bundled copy.
+    """
+
+    global _packaged_cost_map
+    cached = _packaged_cost_map
+    if cached is not False:
+        return cached
+    loaded: Mapping[str, Any] | None = None
+    if _local_cost_map_requested():
+        try:
+            # The path finder answers from ``sys.path`` without consulting
+            # ``sys.modules``, so a host where importing LiteLLM fails (a
+            # missing dependency, a broken install) still reads the table:
+            # this question is about a file, not about the runtime.
+            spec = importlib.machinery.PathFinder.find_spec("litellm")
+        except (ImportError, ValueError):
+            spec = None
+        origin = getattr(spec, "origin", None)
+        if isinstance(origin, str) and origin:
+            path = os.path.join(os.path.dirname(origin), _COST_MAP_FILE_NAME)
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            except (OSError, ValueError):
+                payload = None
+            if isinstance(payload, Mapping):
+                loaded = payload
+    _packaged_cost_map = loaded
+    return loaded
+
+
+def _cost_map() -> Mapping[str, Any] | None:
+    """The cost map both readers below answer from, without importing LiteLLM.
+
+    A LiteLLM already loaded in this process is the live map: it is what the
+    proxy answers from, and it is the object a test that states a row patches.
+    The file is the answer when nothing imported the runtime -- which is Core's
+    normal case -- and the import stays for the one install shape the file
+    cannot describe: a map LiteLLM fetched from the network unpinned.
+    """
+
+    loaded = sys.modules.get("litellm")
+    if loaded is not None:
+        live = getattr(loaded, "model_cost", None)
+        if isinstance(live, Mapping):
+            return live
+    local = _packaged_cost_map_for_this_install()
+    if local is not None:
+        return local
+    try:
+        import litellm
+    except Exception:
+        return None
+    live = getattr(litellm, "model_cost", None)
+    return live if isinstance(live, Mapping) else None
+
+
 def _litellm_record(model_ids: Sequence[str]) -> dict[str, Any] | None:
     # LiteLLM's provider registry is large and is not needed for the normal
-    # bundled-context path. Import it only for an unknown model that actually
+    # bundled-context path. It is read only for an unknown model that actually
     # needs a provider fallback lookup.
-    import litellm
+    cost_map = _cost_map()
+    if cost_map is None:
+        return None
 
     for model_id in model_ids:
         for candidate in _candidate_ids(model_id):
-            value = litellm.model_cost.get(candidate)
+            value = cost_map.get(candidate)
             if not isinstance(value, Mapping):
                 continue
             # ``max_tokens`` is LiteLLM's own legacy fallback for the window, as
@@ -1085,11 +1172,11 @@ _IMAGE_GENERATION_MODE = "image_generation"
 def litellm_mode(model_ids: Sequence[str] | str) -> str | None:
     """The mode LiteLLM's cost map states for one of these ids, if it states one.
 
-    Read from ``litellm.model_cost`` rather than through ``get_model_info``:
-    that function raises for a name the map does not carry, and the question
-    here is only whether the table speaks about this model at all.  The import
-    is the same one ``_litellm_record`` already pays for, and it is lazy so a
-    Core that resolves known profiles never imports the runtime.
+    Read from the cost map rather than through ``get_model_info``: that
+    function raises for a name the map does not carry, and the question here is
+    only whether the table speaks about this model at all.  It is the same map
+    ``_litellm_record`` reads, and it is loaded lazily so a Core that resolves
+    known profiles never pays for it.
 
     A single name is accepted as well as a list: a string is a sequence of
     characters, and iterating one here asked the cost map about ``g``, ``p``,
@@ -1098,12 +1185,8 @@ def litellm_mode(model_ids: Sequence[str] | str) -> str | None:
 
     if isinstance(model_ids, str):
         model_ids = [model_ids]
-    try:
-        import litellm
-    except Exception:
-        return None
-    cost_map = getattr(litellm, "model_cost", None)
-    if not isinstance(cost_map, Mapping):
+    cost_map = _cost_map()
+    if cost_map is None:
         return None
     for model_id in model_ids:
         for candidate in _candidate_ids(model_id):
