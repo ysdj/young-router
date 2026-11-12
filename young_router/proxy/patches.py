@@ -658,10 +658,12 @@ def _request_local_cooling_only_candidate_deployment(
     if not isinstance(model, str) or not model.strip():
         return None
     request_kwargs = request_kwargs if isinstance(request_kwargs, dict) else {}
-    if _routing_module._is_route_recovery_poll_payload(request_kwargs):
-        return None
-    if _responses_request_module._request_is_fallback_attempt(request_kwargs):
-        return None
+    # This is the last resort for a group with no selectable route left: a
+    # recovery poll or a client fallback can only be served by attempting a
+    # cooled route, so neither is excluded here.  A hard refusal is the one
+    # answer that cannot help them, and with every route cooling it is also
+    # the answer that turns an intermittent relay failure into an unavailable
+    # model until the timer expires.
     metadata = _request_context_module._request_metadata_dict(
         request_kwargs,
         "metadata",
@@ -833,7 +835,7 @@ def _install_routing_constraint_patch() -> None:
                         verified_ids=verified_ids,
                         target_order=target_order,
                     )
-                    if deployment is None and not verified_ids:
+                    if deployment is None:
                         deployment = _request_local_cooling_only_candidate_deployment(
                             self,
                             model,
@@ -914,7 +916,7 @@ def _install_routing_constraint_patch() -> None:
                     verified_ids=verified_ids,
                     target_order=target_order,
                 )
-                if deployment is None and not verified_ids:
+                if deployment is None:
                     deployment = _request_local_cooling_only_candidate_deployment(
                         self,
                         model,

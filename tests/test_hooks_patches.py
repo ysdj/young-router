@@ -3805,7 +3805,7 @@ class HookPatchTests(HookTestCase):
 
         self.assertIn(selected["model_info"]["id"], {"route-a", "route-b"})
 
-    async def test_async_selection_does_not_bypass_unique_cooling_candidate_for_route_recovery_poll(self) -> None:
+    async def test_async_selection_serves_the_only_cooling_route_to_a_recovery_poll(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
@@ -3838,18 +3838,20 @@ class HookPatchTests(HookTestCase):
             },
         )
 
-        with self.assertRaisesRegex(RuntimeError, "no healthy deployments"):
-            await Router().async_get_available_deployment(
-                "default-chat",
-                {
-                    "model": "default-chat",
-                    "litellm_metadata": {
-                        hooks._ROUTE_RECOVERY_POLL_METADATA_KEY: True,
-                    },
+        # The only route is all the recovery poll can ever be given; refusing
+        # it holds the client for the timer and then asks the same route.
+        selected = await Router().async_get_available_deployment(
+            "default-chat",
+            {
+                "model": "default-chat",
+                "litellm_metadata": {
+                    hooks._ROUTE_RECOVERY_POLL_METADATA_KEY: True,
                 },
-            )
+            },
+        )
+        self.assertEqual("only-route", selected["model_info"]["id"])
 
-    def test_selection_does_not_bypass_unique_cooling_candidate_for_fallback_attempt(self) -> None:
+    def test_selection_serves_the_only_cooling_route_to_a_fallback_attempt(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
@@ -3884,16 +3886,17 @@ class HookPatchTests(HookTestCase):
             },
         )
 
-        with self.assertRaisesRegex(RuntimeError, "There are no healthy deployments"):
-            Router().get_available_deployment(
-                "default-chat",
-                request_kwargs={
-                    "model": "default-chat",
-                    "_excluded_deployment_ids": ["another-route"],
-                },
-            )
+        # A client fallback is a fresh request; the only route is what it has.
+        selected = Router().get_available_deployment(
+            "default-chat",
+            request_kwargs={
+                "model": "default-chat",
+                "_excluded_deployment_ids": ["another-route"],
+            },
+        )
+        self.assertEqual("only-route", selected["model_info"]["id"])
 
-    async def test_verified_peer_selection_still_respects_menu_cooldown(self) -> None:
+    async def test_verified_peer_selection_serves_the_peer_when_it_is_the_only_route(self) -> None:
         hooks, _ = load_hook_module()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
@@ -3925,15 +3928,17 @@ class HookPatchTests(HookTestCase):
             },
         )
 
-        with self.assertRaisesRegex(RuntimeError, "no healthy deployments"):
-            await Router().async_get_available_deployment(
-                "default-chat",
-                {
-                    "model": "default-chat",
-                    "_target_order": 1,
-                    hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: ["peer-b"],
-                },
-            )
+        # The verified peer is cooling, but it is still the group's only route:
+        # the cooldown must not turn a verified fallback into a refusal.
+        selected = await Router().async_get_available_deployment(
+            "default-chat",
+            {
+                "model": "default-chat",
+                "_target_order": 1,
+                hooks._VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY: ["peer-b"],
+            },
+        )
+        self.assertEqual("peer-b", selected["model_info"]["id"])
 
     async def test_routing_constraint_patch_cools_down_the_deployment(self) -> None:
         hooks, _ = load_hook_module()
