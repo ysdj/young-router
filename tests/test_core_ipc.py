@@ -2681,11 +2681,17 @@ class CoreIPCTests(unittest.TestCase):
         # The native host's quiet event poll is authenticated activity. It
         # must keep its Core session alive instead of later forcing a Core
         # replacement while the LiteLLM proxy is serving remote streams.
-        status, _body, _headers = client._http(
+        status, body, _headers = client._http(
             "/ipc/events?subscription_id=missing&timeout=0",
             token=session,
         )
-        self.assertEqual(200, status)
+        # A subscription this Core does not hold is stated, not answered with a
+        # heartbeat: a replaced Core starts with none, and a host that keeps
+        # polling a dead id re-asks at once (the macOS bridge loops on a null
+        # event with no delay).  The poll is still authenticated activity, which
+        # is what the assertion below is about.
+        self.assertEqual(410, status)
+        self.assertEqual("subscription_gone", json.loads(body)["error"]["code"])
         with server._lock:
             self.assertGreater(server._sessions[session].expires_at, time.monotonic() + 60)
 
@@ -2773,6 +2779,50 @@ class CoreIPCTests(unittest.TestCase):
 
             self.assertNotIn(str(selected), capability)
             self.assertEqual(selected, core.file_capabilities.resolve(capability, "import"))
+
+    def test_a_subscription_this_core_does_not_hold_is_stated_not_held_open(self) -> None:
+        """A replaced Core starts with no subscriptions; say so once.
+
+        The poll used to answer ``{event: null}`` for an id it did not know,
+        which every host reads as a quiet Core.  A window whose Core had been
+        replaced therefore re-asked immediately and forever -- the macOS bridge
+        loops on a null event with no delay -- and no event could ever arrive on
+        an id this Core never minted.
+        """
+
+        core = CoreStore(domains=[MemoryDomain("memo")])
+        server = CoreIPCServer(core)
+        endpoint = server.start()
+        self.addCleanup(server.stop)
+        client = CoreIPCClient(endpoint, server.bootstrap_token)
+        self.addCleanup(client.close)
+        subscription = client.call("subscribe", {})["subscription_id"]
+        session = client._session_token
+
+        # A live subscription with nothing to report is a heartbeat.
+        status, body, _headers = client._http(
+            f"/ipc/events?subscription_id={subscription}&timeout=0", token=session
+        )
+        self.assertEqual(200, status)
+        self.assertIsNone(json.loads(body)["event"])
+
+        # The Core a window was talking to is gone: so is the subscription.
+        with server._lock:
+            server._subscriptions.clear()
+        status, body, _headers = client._http(
+            f"/ipc/events?subscription_id={subscription}&timeout=0", token=session
+        )
+        self.assertEqual(410, status)
+        self.assertEqual("subscription_gone", json.loads(body)["error"]["code"])
+
+        # And a subscription another session holds is not handed over.
+        other = client.call("subscribe", {})["subscription_id"]
+        with server._lock:
+            server._subscriptions[other].session_token = "another-session"
+        status, body, _headers = client._http(
+            f"/ipc/events?subscription_id={other}&timeout=0", token=session
+        )
+        self.assertEqual(410, status)
 
     def test_a_dead_session_takes_its_subscriptions_with_it(self) -> None:
         """An expired session's subscriptions are swept with its capabilities.
