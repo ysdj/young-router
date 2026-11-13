@@ -18,6 +18,7 @@ from . import responses_output as _responses_output_module
 from . import web_search_native as _web_search_native_module
 from . import reasoning as _reasoning_module
 from . import reasoning_replay as _reasoning_replay_module
+from . import thinking_signature_replay as _thinking_signature_replay_module
 from . import routing as _routing_module
 from . import streaming as _streaming_module
 from . import trace as _trace_module
@@ -1766,6 +1767,18 @@ def _install_generic_deployment_failover_patch() -> None:
                     original_generic_function
                 ),
                 client_streaming=kwargs.get("stream") is True,
+            )
+        )
+        # A replayed ``thinking`` signature verifies only on the account that
+        # issued it, and the station reports that refusal as its own 5xx
+        # envelope, so the bytes meet the same wall on every attempt until they
+        # are rewritten (2026-11-13: one Claude Code thread retried a 924,938-
+        # token history nine times).  The repair is learned from the session and
+        # the route, never applied speculatively: a signature that verifies is
+        # proof the route is the right one for that history.
+        wrapped_original_function = (
+            _thinking_signature_replay_module.wrap_deployment_function(
+                wrapped_original_function
             )
         )
         while True:
