@@ -379,15 +379,15 @@ class ImageWeightTests(unittest.TestCase):
         environment.start()
         self.addCleanup(environment.stop)
 
-    def _image(self, seed: int, size: tuple = (64, 64)) -> dict:
+    def _image(self, seed: int, size: tuple = (64, 64), noisy: bool = True) -> dict:
         from test_image_context import _data_url, _png
 
         return {
             "type": "input_image",
-            "image_url": _data_url(_png(*size, noisy=True, seed=seed)),
+            "image_url": _data_url(_png(*size, noisy=noisy, seed=seed)),
         }
 
-    def _replay(self, images: int, size: tuple = (64, 64)) -> dict:
+    def _replay(self, images: int, size: tuple = (64, 64), noisy: bool = True) -> dict:
         items: list = [
             {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "be brief"}]}
         ]
@@ -398,7 +398,7 @@ class ImageWeightTests(unittest.TestCase):
                     "role": "user",
                     "content": [
                         {"type": "input_text", "text": f"look at this {index}"},
-                        self._image(index + 1, size),
+                        self._image(index + 1, size, noisy=noisy),
                     ],
                 }
             )
@@ -433,7 +433,7 @@ class ImageWeightTests(unittest.TestCase):
         # token request with five screenshots to be over a 1,000,000 token window
         # on every step of a live thread -- and the pass then removed pictures
         # the image pass had deliberately kept.
-        data = self._replay(1, size=(2240, 3040))
+        data = self._replay(1, size=(2240, 3040), noisy=False)
         count = 32_000
         estimate = cw.pessimistic_tokens(data, count) - count
         self.assertLess(estimate, 20_000)
@@ -605,6 +605,105 @@ class ImageWeightTests(unittest.TestCase):
                 )
             )
         self.assertLess(cw._inline_image_bytes(data["input"]), before)
+
+
+class MessagesWireTests(unittest.TestCase):
+    """The same guard, on the other wire that replays a history.
+
+    Regression ground: two Claude Code threads grew past the route's 1M input
+    cap.  The guard only understood the Responses shape, so neither the pre-call
+    pass nor the size-refusal retry touched them, and the relay answered the
+    *streaming* attempt with a frame that says "Upstream access forbidden" --
+    the client then retried a request that could never be served.
+    """
+
+    def _messages(self) -> list:
+        return [
+            {"role": "user", "content": [{"type": "text", "text": "start"}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "plan", "signature": "SIG"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "cat big"}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "x" * 20000}
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_2", "name": "Read", "input": {"path": "a"}}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_2", "content": "y" * 20000},
+                    {"type": "text", "text": "what changed?"},
+                ],
+            },
+        ]
+
+    class _CountingRouter(_Router):
+        def _count_pre_call_check_tokens(self, messages=None, input=None, request_kwargs=None):
+            return int(len(json.dumps(input or messages or [])) / 4)
+
+    def test_an_oversized_messages_replay_is_shortened(self) -> None:
+        data = {"model": "m", "messages": self._messages()}
+        router = self._CountingRouter(800)
+        with mock.patch.object(cw, "_router", return_value=router):
+            fitted = cw.apply(data)
+        self.assertIsNotNone(fitted)
+        self.assertIn("messages", fitted)
+        self.assertLessEqual(len(fitted["messages"]), len(data["messages"]))
+        # Whatever leaves, leaves as a whole exchange: every remaining
+        # ``tool_use`` is answered by the message that follows it.
+        for index, turn in enumerate(fitted["messages"][:-1]):
+            content = turn.get("content")
+            if not isinstance(content, list):
+                continue
+            wanted = {
+                block.get("id")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "tool_use"
+            }
+            if not wanted:
+                continue
+            answered = {
+                block.get("tool_use_id")
+                for block in fitted["messages"][index + 1].get("content") or []
+                if isinstance(block, dict) and block.get("type") == "tool_result"
+            }
+            self.assertLessEqual(wanted, answered)
+        # The turn being answered survives byte for byte; its tool result is
+        # what the model is in the middle of using.
+        self.assertEqual(
+            fitted["messages"][-1], data["messages"][-1]
+        )
+        self.assertLess(len(json.dumps(fitted)), len(json.dumps(data)))
+        self.assertLess(len(json.dumps(fitted)), len(json.dumps(data)))
+
+    def test_a_messages_replay_under_the_window_is_untouched(self) -> None:
+        data = {"model": "m", "messages": self._messages()}
+        router = self._CountingRouter(10**6)
+        with mock.patch.object(cw, "_router", return_value=router):
+            self.assertIsNone(cw.apply(data))
+
+    def test_a_size_refusal_shortens_a_messages_replay(self) -> None:
+        data = {"model": "m", "messages": self._messages()}
+        before = len(json.dumps(data))
+        with mock.patch.object(cw, "_router", return_value=self._CountingRouter(800)):
+            repaired = cw.retry_for_refusal(
+                data,
+                RuntimeError("Input is too long >1m"),
+                attempt=0,
+                model="m",
+            )
+        self.assertTrue(repaired)
+        self.assertLess(len(json.dumps(data)), before)
+        self.assertEqual(len(data["messages"]), 5)
 
 
 if __name__ == "__main__":

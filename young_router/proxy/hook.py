@@ -66,6 +66,17 @@ class YoungRouterHook(CustomLogger):
         # two for one request.
         _routing_module._ensure_attempt_lease_id(data)
         if not _responses_request_module._request_is_responses_api(data):
+            # Messages replays the same history and meets the same cap.  The
+            # route refuses an oversized prompt with a plain 400, and on its
+            # streaming path the same refusal arrives as an
+            # ``upstream_error`` frame that reads "Upstream access forbidden" --
+            # so a thread one message past the cap retries forever and never
+            # learns why.  Shortening here is the only place that runs before
+            # the request is spent, and it leaves the shape of the replay
+            # alone (see ``context_window``).
+            fitted_messages = _context_window_module.apply(data)
+            if fitted_messages is not None:
+                return fitted_messages
             return None
         # Record this before any bridge or surface adapter rewrites the input:
         # a Chat-shaped route replays this history as messages and the answer it
@@ -339,10 +350,6 @@ class YoungRouterHook(CustomLogger):
                 )
             )
             after_cooldown = candidate_deployments
-            responses_surface_filtered = False
-            image_generation_filtered = False
-            web_search_filtered = False
-            web_search_unsupported_bridge = False
             responses_image_input_filtered = False
             # A route at its concurrency cap can serve nothing, so it leaves the
             # candidate pool exactly as a cooled route does.  The cap is per
@@ -406,7 +413,9 @@ class YoungRouterHook(CustomLogger):
                     for deployment in candidate_deployments
                     if _image_inputs_module._deployment_allows_responses_image_input(deployment)
                 ]
-                responses_image_input_filtered = bool(responses_image_safe)
+                responses_image_input_filtered = len(responses_image_safe) < len(
+                    candidate_deployments
+                )
                 candidate_deployments = responses_image_safe or candidate_deployments
 
             (
@@ -444,10 +453,6 @@ class YoungRouterHook(CustomLogger):
                     image_tool_unsupported_deployments and not candidate_deployments
                 ),
                 image_tool_unsupported_deployments=image_tool_unsupported_deployments,
-                responses_surface_filtered=responses_surface_filtered,
-                image_generation_filtered=image_generation_filtered,
-                web_search_filtered=web_search_filtered,
-                web_search_unsupported_bridge=web_search_unsupported_bridge,
                 responses_image_input_filtered=responses_image_input_filtered,
                 session_affinity_deployment_id=session_affinity_deployment_id,
                 session_affinity_applied=session_affinity_applied,

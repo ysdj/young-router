@@ -60,6 +60,9 @@ _TARGET_FRACTION = 0.9
 #: text it replaces.
 _MIN_ELIDABLE_CHARS = 400
 
+#: Share of the chars-to-tokens ratio an elision is credited with.
+_ELIDE_SAFETY = 1.0
+
 _TEXT_FIELDS = ("input_text", "output_text", "text", "summary_text")
 
 #: Ratios tried, in order, when the *upstream* rejects a prompt the router was
@@ -146,7 +149,115 @@ def window_for(model: str, router: Any = None) -> Optional[int]:
             continue
         if declared > 0:
             windows.append(declared)
-    return min(windows) if windows else None
+    if windows:
+        return min(windows)
+    return _catalog_window(model, router)
+
+
+def _catalog_window(model: str, router: Any = None) -> Optional[int]:
+    """The input cap the model behind this group states, for a route with none.
+
+    A route is not required to carry ``model_info.max_input_tokens``, and none
+    of the routed Claude groups did: the guard then had no number to compare
+    against, so every oversized replay went out to meet the relay's own 1M cap
+    and the thread died on a frame that only says "access forbidden".
+
+    The cap is a property of the model the deployment names upstream, which is
+    the map LiteLLM already ships; the app's own catalog is not used here.  It
+    describes the *client's* window (a display number, adjusted per view), and
+    on a route with no declared window it answered 272,000 for a group whose
+    upstream accepts 1,000,000 -- a guess that would have elided four fifths of
+    a replay that fit.
+    """
+
+    try:
+        import litellm
+    except Exception:
+        return None
+    router = router if router is not None else _router()
+    windows: List[int] = []
+    for entry in _deployments(router, model):
+        params = entry.get("litellm_params")
+        upstream = params.get("model") if isinstance(params, Mapping) else None
+        if not isinstance(upstream, str) or not upstream:
+            continue
+        try:
+            info = litellm.get_model_info(upstream)
+        except Exception:
+            continue
+        try:
+            declared = int((info or {}).get("max_input_tokens") or 0)
+        except (TypeError, ValueError):
+            continue
+        if declared > 0:
+            windows.append(declared)
+    if windows:
+        return min(windows)
+    # The cost map in a shipped bundle can carry the price tiers of a model
+    # without its window (the dated map has no ``max_input_tokens`` for the
+    # routed Claude groups).  The app's own catalog states the window it shows,
+    # and that is the number the client compacts against.
+    try:
+        from . import reasoning as _reasoning_module
+
+        record = _reasoning_module._reasoning_registry().record_for(model)
+        catalog = getattr(record, "context_window", None)
+    except Exception:
+        return None
+    if isinstance(catalog, int) and catalog > 0:
+        return catalog
+    return None
+
+
+_ENCODER: Any = None
+
+
+def wire_tokens(items: Any) -> Optional[int]:
+    """Tokens the text of this replay costs, not the count LiteLLM keeps.
+
+    ``_count_pre_call_check_tokens`` reads a Messages payload through the chat
+    shape, and every block that shape has no room for -- a ``tool_result``'s
+    body, a ``thinking`` block, a ``tool_use`` input -- is dropped on the way.
+    On a 4.1 MB Claude Code replay it answered 578,261 for text the upstream
+    counted at over a million, so a guard comparing that number with a 1M
+    window saw room that was not there and sent the request to be refused.
+
+    Everything the wire will carry is a string somewhere in this list, so every
+    string is counted.  The estimate is still not the upstream's own tokenizer,
+    but it is the right order of magnitude, which the dropped-blocks count was
+    not.
+    """
+
+    global _ENCODER
+    if not isinstance(items, list):
+        return None
+    text = _strings_joined(items)
+    if not text:
+        return None
+    try:
+        import tiktoken
+
+        if _ENCODER is None:
+            _ENCODER = tiktoken.get_encoding("o200k_base")
+        return len(_ENCODER.encode(text, disallowed_special=()))
+    except Exception:
+        return None
+
+
+def _strings_joined(node: Any, out: Optional[List[str]] = None) -> str:
+    """Every string inside ``node``, in order, as one blob."""
+
+    parts = out if out is not None else []
+    stack = [node]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, Mapping):
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return "".join(parts)
 
 
 def count_tokens(data: Mapping[str, Any], router: Any = None) -> Optional[int]:
@@ -165,6 +276,18 @@ def count_tokens(data: Mapping[str, Any], router: Any = None) -> Optional[int]:
         )
     except Exception:
         return None
+
+
+def measure_tokens(data: Mapping[str, Any], router: Any = None) -> Optional[int]:
+    """The largest honest count for this payload."""
+
+    count = count_tokens(data, router)
+    key, items = payload_items(data)
+    if key == "messages":
+        wire = wire_tokens(items)
+        if wire is not None and (count is None or wire > count):
+            return wire
+    return count
 
 
 def _text_of(container: Any) -> str:
@@ -188,13 +311,17 @@ def _item_text(item: Mapping[str, Any]) -> str:
         return _text_of(item.get("content"))
     if item.get("type") == "input_image":
         return str(item.get("image_url") or "")
+    if _is_message_turn(item):
+        return _messages_text(item.get("content"))
     return ""
 
 
-def _marker(item: Mapping[str, Any], chars: int) -> str:
-    kind = "tool output" if item.get("type") == "function_call_output" else "message"
+def _marker(item: Mapping[str, Any], chars: int, kind: Optional[str] = None) -> str:
+    label = kind or (
+        "tool output" if item.get("type") == "function_call_output" else "message"
+    )
     return (
-        f"[{chars} characters of earlier {kind} elided to fit this model's "
+        f"[{chars} characters of earlier {label} elided to fit this model's "
         "context window; re-read the file or ask the user if you need it.]"
     )
 
@@ -239,6 +366,8 @@ def _carries_image(item: Mapping[str, Any]) -> bool:
 def _elide_item(item: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """Return a copy of ``item`` with its body replaced, or ``None``."""
 
+    if _is_message_turn(item):
+        return _elided_message_turn(item)
     # A body that includes a picture cannot be replaced by a text marker: the
     # picture is not what "earlier characters elided" describes.  Images leave
     # the replay only through the placeholder pass, which can name their file.
@@ -261,6 +390,115 @@ def _elide_item(item: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     updated = dict(item)
     updated["content"] = content
     return updated
+
+
+# ---------------------------------------------------------------- Messages --
+# "Messages" is the other wire whose payload this pass may shorten.  Its items
+# are ``{"role": ..., "content": ...}`` turns, and the content that costs the
+# window is the ``tool_result`` a turn carries: a single `cat` of a large file
+# replays as hundreds of thousands of tokens on every step of the thread.  A
+# turn is rewritten block by block -- the block, its ``tool_use_id`` and its
+# position all stay in place, so the pairing the upstream validates and the
+# shape the client replays are untouched -- and the body becomes a marker.
+#
+# Whole turns are never dropped here: Messages alternates user/assistant and
+# pairs ``tool_use`` with ``tool_result``, so deleting either half is what the
+# upstream refuses.  Eliding bodies alone is enough -- a refused 4.1 MB replay
+# was 3.2 MB of tool output.
+
+
+def _is_message_turn(item: Any) -> bool:
+    return (
+        isinstance(item, Mapping)
+        and isinstance(item.get("role"), str)
+        and item.get("type") is None
+        and "content" in item
+    )
+
+
+def _messages_text(content: Any) -> str:
+    """The characters a Messages block will cost, whatever shape it has."""
+
+    if isinstance(content, str):
+        return content
+    if isinstance(content, Mapping):
+        # Every block names its body under a different key -- ``content`` for a
+        # tool result, ``thinking`` for reasoning, ``input`` for a tool call --
+        # so a named-field read misses two of the three.  Joining every string
+        # in the block sizes all of them, which is what this measure is for.
+        return _strings_joined(content)
+    if isinstance(content, list):
+        return "".join(_messages_text(part) for part in content)
+    return ""
+
+
+def _elided_message_turn(item: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """Replace the bodies this turn carries that cost the window.
+
+    A ``tool_result`` is the usual one, but a turn can also replay a large
+    ``tool_use`` input (a written file, a command with a heredoc) or a long
+    text block, and a thread whose tool outputs have already been elided still
+    has to reach the target through those.  Every block keeps its type, its id
+    and its position: only the body becomes a marker.
+    """
+
+    content = item.get("content")
+    if not isinstance(content, list):
+        return None
+    rewritten: List[Any] = []
+    changed = False
+    for block in content:
+        if isinstance(block, Mapping):
+            kind = block.get("type")
+            if kind == "tool_result":
+                chars = len(_messages_text(block.get("content")))
+                if chars >= _MIN_ELIDABLE_CHARS and not _carries_image(block):
+                    updated = dict(block)
+                    updated["content"] = _marker(block, chars, "tool output")
+                    rewritten.append(updated)
+                    changed = True
+                    continue
+            elif kind == "tool_use":
+                raw = block.get("input")
+                chars = len(_strings_joined(raw))
+                if chars >= _MIN_ELIDABLE_CHARS:
+                    updated = dict(block)
+                    updated["input"] = {"elided": _marker(block, chars, "tool input")}
+                    rewritten.append(updated)
+                    changed = True
+                    continue
+            elif kind == "thinking":
+                # Reasoning is the largest body a long Claude Code thread
+                # replays (1.8 MB of a 4.1 MB history), and it cannot be cut
+                # without its signature: the signature covers the text, so a
+                # marker with the original signature is a replay the upstream
+                # refuses.  It leaves as an unsigned marker instead -- the same
+                # shape the signature repair sends when a route will not verify
+                # a foreign signature, and one every route here serves.
+                text = block.get("thinking")
+                chars = len(text) if isinstance(text, str) else 0
+                if chars >= _MIN_ELIDABLE_CHARS:
+                    updated = dict(block)
+                    updated["thinking"] = _marker(block, chars, "reasoning")
+                    updated["signature"] = ""
+                    rewritten.append(updated)
+                    changed = True
+                    continue
+            elif kind == "text":
+                text = block.get("text")
+                chars = len(text) if isinstance(text, str) else 0
+                if chars >= _MIN_ELIDABLE_CHARS:
+                    updated = dict(block)
+                    updated["text"] = _marker(block, chars, "message")
+                    rewritten.append(updated)
+                    changed = True
+                    continue
+        rewritten.append(block)
+    if not changed:
+        return None
+    updated_turn = dict(item)
+    updated_turn["content"] = rewritten
+    return updated_turn
 
 
 def _elidable(items: List[Any]) -> List[int]:
@@ -299,6 +537,9 @@ def _protected_index(items: List[Any]) -> int:
     for index in range(len(items) - 1, -1, -1):
         item = items[index]
         if isinstance(item, Mapping) and item.get("type") == "message":
+            return index
+    for index in range(len(items) - 1, -1, -1):
+        if _is_message_turn(items[index]) and items[index].get("role") == "user":
             return index
     return len(items)
 
@@ -344,6 +585,7 @@ def _droppable(items: List[Any]) -> List[int]:
         grouped.append((min(call_index, output_index), sorted((call_index, output_index))))
     grouped.sort()
     dropped: List[int] = []
+    dropped.extend(_droppable_tool_exchanges(items, protected))
     for index, item in enumerate(items):
         if index >= protected:
             continue
@@ -356,32 +598,97 @@ def _droppable(items: List[Any]) -> List[int]:
     return unique
 
 
+def payload_items(data: Mapping[str, Any]) -> Tuple[Optional[str], Optional[List[Any]]]:
+    """The list this request replays, and which field holds it.
+
+    Responses calls it ``input``; Messages calls it ``messages``.  Everything
+    else in this module works on the list, so the two wires share one pass.
+    """
+
+    for key in ("input", "messages"):
+        items = data.get(key)
+        if isinstance(items, list) and items:
+            return key, items
+    return None, None
+
+
+def _droppable_tool_exchanges(items: List[Any], protected: int) -> List[int]:
+    """Oldest complete ``tool_use``/``tool_result`` exchanges, as units.
+
+    A Messages replay cannot have half a pair removed: the next message must
+    carry a ``tool_result`` for every ``tool_use`` it follows.  Dropping the
+    assistant turn *and* the user turn that answers it keeps that rule, and it
+    is the only way to remove the reasoning blocks that ride along with an old
+    exchange (reasoning is the largest thing a long Claude Code thread keeps
+    replaying).
+    """
+
+    dropped: List[int] = []
+    index = 0
+    while index + 1 < protected:
+        turn = items[index]
+        answer = items[index + 1]
+        if not (_is_message_turn(turn) and _is_message_turn(answer)):
+            index += 1
+            continue
+        if turn.get("role") != "assistant" or answer.get("role") != "user":
+            index += 1
+            continue
+        content = turn.get("content")
+        if not isinstance(content, list):
+            index += 1
+            continue
+        wanted = {
+            block.get("id")
+            for block in content
+            if isinstance(block, Mapping) and block.get("type") == "tool_use"
+        }
+        if not wanted:
+            index += 1
+            continue
+        answered = {
+            block.get("tool_use_id")
+            for block in (answer.get("content") or [])
+            if isinstance(block, Mapping) and block.get("type") == "tool_result"
+        }
+        if not wanted <= answered:
+            index += 1
+            continue
+        dropped.extend((index, index + 1))
+        index += 2
+    return dropped
+
+
 def shorten(
     data: Mapping[str, Any],
     *,
     count: int,
     window: int,
-    router: Any = None,
     target: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return a copy of ``data`` that fits, or ``None`` when it cannot."""
 
-    items = data.get("input")
-    if not isinstance(items, list) or not items:
+    key, items = payload_items(data)
+    if key is None or items is None:
         return None
     budget = target if target is not None else int(window * _TARGET_FRACTION)
     rewritten = _fitted_items(items, count=count, target=budget)
     if rewritten is None:
         return None
     result = dict(data)
-    result["input"] = rewritten
+    result[key] = rewritten
     return result
 
 
 def _fitted_items(items: List[Any], *, count: int, target: int) -> Optional[List[Any]]:
     """Drop or elide old bodies until the estimate reaches ``target`` tokens."""
 
-    total_chars = sum(len(_item_text(item)) for item in items if isinstance(item, Mapping))
+    # The ratio has to be taken on the same text the count was taken on.  A
+    # Messages turn names its body in ``_item_text`` but the wire also carries
+    # keys, ids and tool inputs, so measuring the ratio from the block texts
+    # alone made every elision look three times larger than it was and stopped
+    # the pass one block in, still over the cap.
+    total_chars = len(_strings_joined(items))
     if total_chars <= 0:
         return None
     chars_per_token = max(total_chars / max(count, 1), 0.25)
@@ -397,8 +704,12 @@ def _fitted_items(items: List[Any], *, count: int, target: int) -> Optional[List
         elided = _elide_item(item)
         if elided is None:
             continue
-        replaced_chars = len(_item_text(item))
-        freed += int(replaced_chars / chars_per_token)
+        replaced_chars = len(_strings_joined(item))
+        # The bodies this pass removes tokenize denser than the payload average
+        # (tool output is code and paths, not prose), so the ratio alone
+        # over-credits every elision; half of it keeps the pass going until the
+        # measured count -- not the estimate -- is under the target.
+        freed += int(replaced_chars / chars_per_token * _ELIDE_SAFETY)
         rewritten[index] = elided
         changed = True
     # Phase two: the markers themselves and the wrapper items now cost more
@@ -437,7 +748,10 @@ def retry_for_refusal(
     Returns True when the payload now differs, so the caller can resend it.
     """
 
-    if not isinstance(data, dict) or not isinstance(data.get("input"), list):
+    if not isinstance(data, dict):
+        return False
+    payload_key, payload = payload_items(data)
+    if payload_key is None or payload is None:
         return False
     if attempt >= len(_RETRY_FRACTIONS):
         return False
@@ -459,9 +773,10 @@ def retry_for_refusal(
     before_bytes = _payload_bytes(data)
     rewritten_images = _image_shrunk(data, 0)
     if rewritten_images is not None and _shrank_enough(
-        {"input": rewritten_images["input"]}, before_bytes
+        {"input": rewritten_images.get("input") or data.get("messages")}, before_bytes
     ):
-        data["input"] = rewritten_images["input"]
+        if isinstance(rewritten_images.get("input"), list):
+            data["input"] = rewritten_images["input"]
         _SHRUNK.set(True)
         _trace_retry(
             data,
@@ -478,20 +793,20 @@ def retry_for_refusal(
         # window, so there may be no measurement to scale from; the refusal is
         # the first evidence about the size that matters, and counting once
         # here is cheaper than ending the turn.
-        measured = count_tokens(data, _router())
+        measured = measure_tokens(data, _router())
     if not measured or measured <= 0:
         return False
     target = int(measured * _RETRY_FRACTIONS[attempt])
-    rewritten = _fitted_items(data["input"], count=measured, target=target)
+    rewritten = _fitted_items(payload, count=measured, target=target)
     if rewritten is None:
         return False
-    if not _shrank_enough({"input": rewritten}, before_bytes):
+    if not _shrank_enough({payload_key: rewritten}, before_bytes):
         # Eliding freed nothing a relay would notice (everything that fits this
         # target already sits inside the turn being answered).  Resending the
         # same bytes invites the same refusal, so the turn ends on the
         # classified error instead of on a second attempt that cannot succeed.
         return False
-    data["input"] = rewritten
+    data[payload_key] = rewritten
     _MEASURED_INPUT_TOKENS.set(target)
     _SHRUNK.set(True)
     _trace_retry(
@@ -507,8 +822,9 @@ def retry_for_refusal(
 def _payload_bytes(data: Mapping[str, Any]) -> int:
     """The wire size of the replay, which is what a relay refuses."""
 
+    key, items = payload_items(data)
     try:
-        return len(json.dumps(data.get("input") or []))
+        return len(json.dumps(items or []))
     except Exception:
         return 0
 
@@ -634,7 +950,8 @@ def _image_token_estimate(items: Any) -> int:
 def pessimistic_tokens(data: Mapping[str, Any], count: int) -> int:
     """``count`` plus what the images could add in the window's own unit."""
 
-    return count + _image_token_estimate(data.get("input"))
+    _key, items = payload_items(data)
+    return count + _image_token_estimate(items)
 
 
 def _image_shrunk(data: Any, keep: int) -> Optional[Dict[str, Any]]:
@@ -654,14 +971,15 @@ def _image_shrunk(data: Any, keep: int) -> Optional[Dict[str, Any]]:
 def _count_is_worth_running(data: Mapping[str, Any], window: int) -> bool:
     """A bytes upper bound: no request that small can reach that window.
 
-    Three UTF-8 bytes per token is generous for CJK text, the densest case the
-    counter sees, so a payload that even overestimates this way stays under
-    the window cannot be refused -- skip the exact count that the router would
-    otherwise pay twice for a healthy replay.
+    2.5 UTF-8 bytes per token is deliberately more pessimistic than the
+    three-byte bound for CJK text, the densest case the counter sees: only a
+    payload this estimate already places under the window skips the exact
+    count that the router would otherwise pay twice for a healthy replay.
     """
 
+    _key, items = payload_items(data)
     try:
-        serialized = len(json.dumps(data.get("input") or []))
+        serialized = len(json.dumps(items or []))
     except Exception:
         return True
     return serialized / 2.5 >= window
@@ -672,7 +990,8 @@ def apply(data: Any) -> Optional[Dict[str, Any]]:
 
     if not isinstance(data, dict):
         return None
-    if not isinstance(data.get("input"), list):
+    payload_key, payload = payload_items(data)
+    if payload_key is None or payload is None:
         return None
     model = data.get("model")
     if not isinstance(model, str) or not model:
@@ -701,7 +1020,15 @@ def apply(data: Any) -> Optional[Dict[str, Any]]:
     limit = window if budget is None or budget >= window else min(window, budget)
     if not _count_is_worth_running(data, limit):
         return None
-    count = count_tokens(data, router)
+    count = measure_tokens(data, router)
+    # A Messages replay is measured on the text it carries: the router's count
+    # reads the chat shape and drops the blocks (tool results, thinking) that
+    # make up most of a Claude Code history, so it under-reports by more than
+    # the margin this pass needs.
+    if payload_key == "messages":
+        measured_wire = wire_tokens(payload)
+        if measured_wire is not None and (count is None or measured_wire > count):
+            count = measured_wire
     if count is None:
         return None
     _MEASURED_INPUT_TOKENS.set(count)
@@ -712,9 +1039,11 @@ def apply(data: Any) -> Optional[Dict[str, Any]]:
     # placeholder is the only rewrite that removes them.  Eliding text under
     # them would leave the largest cost in place.
     rewritten_images = _image_shrunk(data, 0)
+    fitted_count: Optional[int] = count
     if rewritten_images is not None:
         data = rewritten_images
-        next_count = count_tokens(data, router)
+        next_count = measure_tokens(data, router)
+        fitted_count = next_count
         if next_count is not None:
             count = next_count
             _MEASURED_INPUT_TOKENS.set(count)
@@ -726,6 +1055,7 @@ def apply(data: Any) -> Optional[Dict[str, Any]]:
             window=limit,
             router=router,
             image_pass=True,
+            after_count=fitted_count,
         )
         return dict(data)
     # The estimate the first pass uses is bytes-per-token, which is close but
@@ -739,11 +1069,12 @@ def apply(data: Any) -> Optional[Dict[str, Any]]:
     if budget is not None and budget < target:
         target = budget
     for _ in range(4):
-        shorter = shorten(current, count=current_count, window=window, router=router, target=target)
+        shorter = shorten(current, count=current_count, window=window, target=target)
         if shorter is None:
             break
         result = shorter
-        next_count = count_tokens(shorter, router)
+        next_count = measure_tokens(shorter, router)
+        fitted_count = next_count
         if next_count is None or next_count <= limit:
             current_count = next_count if next_count is not None else current_count
             break
@@ -751,10 +1082,17 @@ def apply(data: Any) -> Optional[Dict[str, Any]]:
     final = result if result is not None else data
     if final is original:
         return None
-    fitted_count = count_tokens(final, router)
     if fitted_count is not None:
         _MEASURED_INPUT_TOKENS.set(fitted_count)
-    _trace(original, final, count=original_count, window=limit, router=router)
+    _trace(
+        original,
+        final,
+        count=original_count,
+        window=limit,
+        router=router,
+        image_pass=rewritten_images is not None,
+        after_count=fitted_count,
+    )
     return dict(final)
 
 
@@ -784,12 +1122,16 @@ def _trace(
     window: int,
     router: Any,
     image_pass: bool = False,
+    after_count: Optional[int] = None,
 ) -> None:
     from . import routing as _routing_module
     from . import trace as _trace_module
 
     try:
-        after_count = count_tokens(after, router)
+        if after_count is None:
+            after_count = count_tokens(after, router)
+        _before_key, before_items = payload_items(before)
+        _after_key, after_items = payload_items(after)
         _trace_module._route_trace(
             TRACE_EVENT,
             request_id=_routing_module._trace_request_id(dict(before)),
@@ -800,13 +1142,13 @@ def _trace(
             after=after_count,
             # The token count and the wire size are both answers to "will this
             # be accepted", and only the pair shows which one the elision moved.
-            image_bytes_before=_inline_image_bytes(before.get("input")),
-            image_bytes_after=_inline_image_bytes(after.get("input")),
+            image_bytes_before=_inline_image_bytes(before_items),
+            image_bytes_after=_inline_image_bytes(after_items),
             image_pass=image_pass,
-            before_facts=_turn_facts(before.get("input")),
-            after_facts=_turn_facts(after.get("input")),
-            items_before=len(before.get("input") or []),
-            items_after=len(after.get("input") or []),
+            before_facts=_turn_facts(before_items),
+            after_facts=_turn_facts(after_items),
+            items_before=len(before_items or []),
+            items_after=len(after_items or []),
         )
     except Exception:
         # A trace must never decide a request.
