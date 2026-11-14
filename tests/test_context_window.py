@@ -1132,6 +1132,92 @@ class ToolSchemaWeightTests(unittest.TestCase):
             "to be shortened too",
         )
 
+class ExchangeLeavesWholeTests(unittest.TestCase):
+    """A tool exchange leaves as a unit even when the target is hit mid-pair.
+
+    The drop loop walks the indices ``_droppable`` listed and stops the moment
+    the estimate reaches its target.  The two halves of one exchange are
+    adjacent in that list, so a stop between them deleted the call and kept
+    the answer -- a live Claude Code replay went out with ``unexpected
+    `tool_use_id` found in `tool_result` blocks`` on every retry, and no
+    resend could ever satisfy it.
+    """
+
+    class _WholePayloadRouter:
+        """Prices the whole serialized payload, as the live pass does."""
+
+        def __init__(self, window: int) -> None:
+            self.window = window
+
+        def get_model_list(self, model_name=None):
+            return [{"model_info": {"max_input_tokens": self.window}}]
+
+        def _count_pre_call_check_tokens(
+            self, messages=None, input=None, request_kwargs=None
+        ):
+            return int(len(json.dumps(input or messages or [])) / 4)
+
+    def _thread(self) -> list:
+        items = [{"role": "user", "content": "start"}]
+        for index in range(400):
+            items.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "t" * 300},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_%03d" % index,
+                            "name": "Read",
+                            "input": {"p": "x" * 200},
+                        },
+                    ],
+                }
+            )
+            items.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_%03d" % index,
+                            "content": "o" * 4000,
+                        }
+                    ],
+                }
+            )
+        items.append({"role": "user", "content": "go"})
+        return items
+
+    def test_no_result_outlives_the_call_it_answers(self) -> None:
+        data = {"model": "m", "messages": self._thread()}
+        with mock.patch.object(
+            cw, "_router", return_value=self._WholePayloadRouter(30_000)
+        ):
+            fitted = cw.apply(data)
+        self.assertIsNotNone(fitted)
+        assert fitted is not None
+        calls = set()
+        results = []
+        for message in fitted["messages"]:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    calls.add(block["id"])
+                elif block.get("type") == "tool_result":
+                    results.append(block["tool_use_id"])
+        self.assertTrue(results, "the case only means something while results remain")
+        self.assertEqual(
+            [],
+            [identifier for identifier in results if identifier not in calls],
+            "a call and its answer have to leave together; half a pair is a "
+            "replay the wire refuses",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

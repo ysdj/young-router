@@ -670,6 +670,58 @@ def payload_items(data: Mapping[str, Any]) -> Tuple[Optional[str], Optional[List
     return None, None
 
 
+def _exchange_partner(items: List[Any], index: int) -> Optional[int]:
+    """The other half of the tool exchange ``index`` belongs to, if any.
+
+    ``_droppable`` lists both halves of a pair, and the loop that consumes the
+    list must not stop between them: a call without its answer (or the other
+    way round) is a replay the wire refuses.
+    """
+
+    if not (0 <= index < len(items)):
+        return None
+    item = items[index]
+    if not isinstance(item, Mapping):
+        return None
+    content = item.get("content")
+    if not isinstance(content, list):
+        return None
+    calls = {
+        block.get("id")
+        for block in content
+        if isinstance(block, Mapping) and block.get("type") == "tool_use"
+    }
+    answers = {
+        block.get("tool_use_id")
+        for block in content
+        if isinstance(block, Mapping) and block.get("type") == "tool_result"
+    }
+    if not calls and not answers:
+        return None
+    for other in (index + 1, index - 1):
+        if not (0 <= other < len(items)):
+            continue
+        candidate = items[other]
+        if not isinstance(candidate, Mapping):
+            continue
+        other_content = candidate.get("content")
+        if not isinstance(other_content, list):
+            continue
+        other_calls = {
+            block.get("id")
+            for block in other_content
+            if isinstance(block, Mapping) and block.get("type") == "tool_use"
+        }
+        other_answers = {
+            block.get("tool_use_id")
+            for block in other_content
+            if isinstance(block, Mapping) and block.get("type") == "tool_result"
+        }
+        if (calls & other_answers) or (answers & other_calls):
+            return other
+    return None
+
+
 def _droppable_tool_exchanges(items: List[Any], protected: int) -> List[int]:
     """Oldest complete ``tool_use``/``tool_result`` exchanges, as units.
 
@@ -774,12 +826,30 @@ def _fitted_items(items: List[Any], *, count: int, target: int) -> Optional[List
     # than the room that is left.  Dropping them is lossless -- the marker
     # says so -- and a tool call only ever leaves together with its output.
     if count - freed > target:
-        for index in _droppable(rewritten):
+        # A tool exchange leaves as a unit, and this loop is where that can
+        # stop being true: ``_droppable`` lists the call and its answer as two
+        # adjacent indices, so a break between them drops the call and keeps
+        # the answer -- the replay then goes out with ``unexpected
+        # `tool_use_id` found in `tool_result` blocks``, which no resend can
+        # satisfy.  Take the pair together.
+        order = _droppable(rewritten)
+        position = 0
+        while position < len(order):
             if count - freed <= target:
                 break
-            freed += int(len(_item_text(rewritten[index])) / chars_per_token)
-            rewritten[index] = None
-            changed = True
+            index = order[position]
+            partner = _exchange_partner(rewritten, index)
+            group = [index] if partner is None else [index, partner]
+            for member in group:
+                if rewritten[member] is not None:
+                    freed += int(
+                        len(_item_text(rewritten[member])) / chars_per_token
+                    )
+                    rewritten[member] = None
+                    changed = True
+            position += 1
+            while position < len(order) and order[position] in group:
+                position += 1
     if not changed:
         return None
     if any(item is None for item in rewritten):

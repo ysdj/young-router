@@ -89,7 +89,13 @@ class YoungRouterHook(CustomLogger):
             # alone (see ``context_window``).
             fitted_messages = _context_window_module.apply(data)
             if fitted_messages is not None:
-                return fitted_messages
+                # The shrink drops whole turns, and a turn it drops can be the
+                # one that carried a call whose answer is still in the replay.
+                # Pairing ran on the body before that, so the answer is now an
+                # orphan the wire refuses.  Pairing again on what the shrink
+                # produced is the only place that sees what is left.
+                repaired = _tool_history_module.paired_request(fitted_messages)
+                return repaired if repaired is not None else fitted_messages
             return paired
         # Record this before any bridge or surface adapter rewrites the input:
         # a Chat-shaped route replays this history as messages and the answer it
@@ -105,7 +111,10 @@ class YoungRouterHook(CustomLogger):
         # exists and Codex has already told the user to start a new thread.
         fitted = _context_window_module.apply(data)
         if fitted is not None:
-            return fitted
+            # Same reason as the Messages branch above: the shrink can leave a
+            # result whose call it dropped, and pairing has already run.
+            repaired = _tool_history_module.paired_request(fitted)
+            return repaired if repaired is not None else fitted
         return paired
 
     def _record_recent_request_started(self, kwargs: Dict[str, Any]) -> None:
