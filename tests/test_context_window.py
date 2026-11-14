@@ -708,3 +708,135 @@ class MessagesWireTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _DenseCounterRouter(_Router):
+    """A counter that charges what base64 really costs.
+
+    ``_Router`` prices a payload at four bytes per token, the density of prose.
+    The replay here is mostly base64, where a token is 1.48 bytes -- and the
+    point of the case is that the *bound* before the count has to assume the
+    densest bytes, so the counter must not be the thing that hides the size.
+    """
+
+    def _count_pre_call_check_tokens(self, messages=None, input=None, request_kwargs=None):
+        import json
+
+        return int(len(json.dumps(input or [])) / 1.4)
+
+
+class OneTurnThreadTests(unittest.TestCase):
+    """A long single-turn thread still has to be shortened.
+
+    A live ``deepseek-v4.1-flash`` thread replayed 230 items: one developer
+    message, one user message at index 1, then 85 tool calls with their outputs
+    and 50 encrypted reasoning blocks.  ``_protected_index`` anchors on the last
+    user *message*, so it answered 1 and protected the other 221 items;
+    ``_droppable`` then had nothing to drop, ``_truncated_tail`` found nothing
+    it could cut (the weight sat in signed ``encrypted_content``), and the pass
+    returned the request unchanged.  The upstream refused it with ``prompt is
+    too long: 1177033 tokens > 1048576 maximum``, and every resend of the same
+    thread was refused the same way -- which is why switching the thread to
+    another protocol changed nothing, and what the user reported.
+    """
+
+    @staticmethod
+    def _thread(encrypted: str) -> list:
+        items: list = [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "d" * 7555}],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "u" * 9287}],
+            },
+        ]
+        for index in range(85):
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": f"call_{index}",
+                    "name": "shell",
+                    "arguments": '{"command":["cat","f"]}',
+                }
+            )
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": f"call_{index}",
+                    "output": "o" * 400,
+                }
+            )
+        for _ in range(50):
+            items.append(
+                {
+                    "type": "reasoning",
+                    "summary": [],
+                    "encrypted_content": encrypted,
+                    "status": "completed",
+                }
+            )
+        return items
+
+    def test_an_oversized_single_turn_thread_is_shortened(self) -> None:
+        import base64
+        import random
+
+        random.seed(11)
+        encrypted = base64.b64encode(
+            bytes(random.getrandbits(8) for _ in range(30_000))
+        ).decode()
+        items = self._thread(encrypted)
+        data = {"model": "m", "input": items}
+        router = _DenseCounterRouter(1_048_576)
+        with mock.patch.object(cw, "_router", return_value=router):
+            fitted = cw.apply(data)
+        self.assertIsNotNone(
+            fitted,
+            "a thread whose only user message opens the replay must still be "
+            "shortened when it is past the window",
+        )
+        self.assertLess(
+            len(json.dumps(fitted["input"])),
+            len(json.dumps(items)),
+            "the replay sent upstream has to be smaller than the refused one",
+        )
+
+    def test_the_turn_being_answered_keeps_its_tool_outputs(self) -> None:
+        """Only the reasoning that a finished round trip left behind may go."""
+
+        import base64
+        import random
+
+        random.seed(11)
+        encrypted = base64.b64encode(
+            bytes(random.getrandbits(8) for _ in range(30_000))
+        ).decode()
+        items = self._thread(encrypted)
+        data = {"model": "m", "input": items}
+        router = _DenseCounterRouter(1_048_576)
+        with mock.patch.object(cw, "_router", return_value=router):
+            fitted = cw.apply(data)
+        assert fitted is not None
+        after = fitted["input"]
+        # Every tool call still has its own output: dropping one half of a pair
+        # is what the upstream refuses.
+        calls = {item.get("call_id") for item in after if item.get("type") == "function_call"}
+        outputs = {
+            item.get("call_id")
+            for item in after
+            if item.get("type") == "function_call_output"
+        }
+        self.assertEqual(calls, outputs)
+        self.assertEqual(len(calls), 85)
+        # And the user's own words are still there.
+        self.assertTrue(
+            any(
+                item.get("role") == "user"
+                for item in after
+                if item.get("type") == "message"
+            )
+        )

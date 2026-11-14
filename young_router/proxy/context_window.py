@@ -78,6 +78,12 @@ _RETRY_FRACTIONS = (0.55, 0.3)
 #: so the same thread pays for the discovery once and not on every message.
 _ACCEPTED_SIZE: Dict[str, int] = {}
 
+#: The fewest bytes one token of a replay can occupy.  Base64 -- the encoded
+#: reasoning a Responses client replays -- is 1.48 bytes per token measured
+#: against ``o200k_base``; a bytes-per-token bound above that reads a replay as
+#: smaller than it is and skips the count that would have caught it.
+_DENSEST_BYTES_PER_TOKEN = 1.4
+
 #: A shrink has to remove at least this share of the payload to be worth a
 #: resend.  A rewrite that leaves the body within a rounding error of what was
 #: just refused is the same bytes going back up, and the answer to those bytes
@@ -566,6 +572,19 @@ def _droppable(items: List[Any]) -> List[int]:
     protected = _protected_index(items)
     calls: Dict[str, int] = {}
     outputs: Dict[str, int] = {}
+    # Reasoning a finished round trip left behind is the one body inside the
+    # protected turn that can go: it is a replay of what the model already
+    # thought, not an output it is in the middle of using.  A long Codex or Pi
+    # thread keeps one user message near its start and then hundreds of
+    # assistant round trips, so the protected turn *is* most of the replay;
+    # with reasoning excluded from ``_droppable`` a 1.36M-token thread had
+    # nothing to drop and every resend met the same ``prompt is too long``.
+    reasoning: List[int] = [
+        index
+        for index in range(protected, len(items))
+        if isinstance(items[index], Mapping)
+        and items[index].get("type") == "reasoning"
+    ]
     for index, item in enumerate(items):
         if not isinstance(item, Mapping) or index >= protected:
             continue
@@ -585,6 +604,7 @@ def _droppable(items: List[Any]) -> List[int]:
         grouped.append((min(call_index, output_index), sorted((call_index, output_index))))
     grouped.sort()
     dropped: List[int] = []
+    dropped.extend(reasoning)
     dropped.extend(_droppable_tool_exchanges(items, protected))
     for index, item in enumerate(items):
         if index >= protected:
@@ -982,7 +1002,7 @@ def _count_is_worth_running(data: Mapping[str, Any], window: int) -> bool:
         serialized = len(json.dumps(items or []))
     except Exception:
         return True
-    return serialized / 2.5 >= window
+    return serialized / _DENSEST_BYTES_PER_TOKEN >= window
 
 
 def apply(data: Any) -> Optional[Dict[str, Any]]:
