@@ -5030,6 +5030,63 @@ class HookPatchTests(HookTestCase):
 
         self.assertEqual(seen, [(messages, None)])
 
+    def test_pre_call_token_count_forwards_keywords_the_router_added(self) -> None:
+        """A keyword LiteLLM adds to this call must reach the count, not fail it.
+
+        LiteLLM 1.109 grew ``tokenizer_model`` on
+        ``Router._count_pre_call_check_tokens``.  A wrapper with a fixed
+        signature raised ``TypeError: ... unexpected keyword argument
+        'tokenizer_model'`` on every Responses request; the caller logs that as
+        ``failed to count tokens`` and skips the whole context-window
+        pre-check, so an oversized replay was refused by the route instead of
+        being measured here.  One measured runtime logged that error 36 times.
+        """
+
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+        seen: list[dict[str, object]] = []
+
+        class Router:
+            def _count_pre_call_check_tokens(
+                self, messages, input, request_kwargs=None, tokenizer_model=""
+            ):
+                seen.append(
+                    {
+                        "messages": messages,
+                        "input": input,
+                        "request_kwargs": request_kwargs,
+                        "tokenizer_model": tokenizer_model,
+                    }
+                )
+                return 11
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_pre_call_token_count_patch()
+
+        request_input = [
+            {
+                "type": "reasoning",
+                "id": "rs_2",
+                "summary": [{"type": "summary_text", "text": "y" * 40_000}],
+            },
+            {"type": "message", "role": "user", "content": "continue"},
+        ]
+
+        count = Router()._count_pre_call_check_tokens(
+            messages=None,
+            input=request_input,
+            request_kwargs={"model": "deepseek-v4.1-flash"},
+            tokenizer_model="deepseek-v4.1-flash",
+        )
+
+        self.assertEqual(count, 11)
+        # The router's own keyword reached the count it wraps.
+        self.assertEqual(seen[0]["tokenizer_model"], "deepseek-v4.1-flash")
+        self.assertEqual(seen[0]["request_kwargs"], {"model": "deepseek-v4.1-flash"})
+        # And the summary strip still applies on the way through.
+        self.assertNotIn("summary", seen[0]["input"][0])
+
 
 class ChatBridgeReasoningReplayTests(HookTestCase):
     """A bridging replay must satisfy a thinking upstream's field contract.

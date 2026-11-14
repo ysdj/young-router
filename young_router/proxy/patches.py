@@ -3401,17 +3401,27 @@ def _install_pre_call_token_count_patch() -> None:
         messages: Optional[Any],
         input: Optional[Any],
         request_kwargs: Optional[Any] = None,
+        **count_kwargs: Any,
     ) -> int:
         # ``messages`` is already a chat shape: nothing here needs reading.
         if messages is None and isinstance(input, list):
             input = _responses_request_module._without_replayed_reasoning_summary_text(
                 input
             )
+        # Every keyword LiteLLM adds to this call belongs to the count, not to
+        # this wrapper: the router learned to pass ``tokenizer_model`` and the
+        # fixed signature above turned each request into
+        # ``failed to count tokens ... unexpected keyword argument`` -- a
+        # logged error with the whole context-window pre-check skipped, so an
+        # oversized replay was then refused by the route instead of here.
+        # Forwarding everything keeps the wrapper transparent as the signature
+        # of the function it replaces grows.
         return original_count(
             self,
             messages=messages,
             input=input,
             request_kwargs=request_kwargs,
+            **count_kwargs,
         )
 
     setattr(
