@@ -307,6 +307,33 @@ def measure_tokens(data: Mapping[str, Any], router: Any = None) -> Optional[int]
     return count
 
 
+def schema_tokens(data: Mapping[str, Any]) -> int:
+    """Tokens the tool definitions add to this prompt, every request.
+
+    A Claude Code turn carries one definition per tool the client exposes --
+    192 on the thread that could not get through, 165 of them from the MCP
+    servers it had connected.  They ride on every request and the model reads
+    them, so they are part of the prompt the route prices.  The client's own
+    "Context window 100.8k / 1M" counts the conversation and not the schema,
+    which is why a turn that looked like 10% of the window was refused for
+    size: the pass had fitted the messages and the wire still carried 169 KB
+    of definitions on top.
+    """
+
+    tools = data.get("tools")
+    if not tools:
+        return 0
+    global _ENCODER
+    try:
+        import tiktoken
+
+        if _ENCODER is None:
+            _ENCODER = tiktoken.get_encoding("o200k_base")
+        return len(_ENCODER.encode(json.dumps(tools), disallowed_special=()))
+    except Exception:
+        return 0
+
+
 def _text_of(container: Any) -> str:
     if isinstance(container, str):
         return container
@@ -1069,6 +1096,10 @@ def apply(data: Any) -> Optional[Dict[str, Any]]:
             count = measured_wire
     if count is None:
         return None
+    # The tool definitions are part of the prompt and do not shrink with the
+    # history: they are added on top of whatever the messages cost.
+    schema = schema_tokens(data)
+    count += schema
     _MEASURED_INPUT_TOKENS.set(count)
     if pessimistic_tokens(data, count) <= limit:
         return None
@@ -1081,6 +1112,8 @@ def apply(data: Any) -> Optional[Dict[str, Any]]:
     if rewritten_images is not None:
         data = rewritten_images
         next_count = measure_tokens(data, router)
+        if next_count is not None:
+            next_count += schema
         fitted_count = next_count
         if next_count is not None:
             count = next_count
@@ -1112,8 +1145,14 @@ def apply(data: Any) -> Optional[Dict[str, Any]]:
             break
         result = shorter
         next_count = measure_tokens(shorter, router)
+        if next_count is not None:
+            next_count += schema
         fitted_count = next_count
-        if next_count is None or next_count <= limit:
+        # Stop at the target, not at the last count that was still under the
+        # limit.  A live thread was elided to 983,041 against a 1,000,000
+        # window -- 1.7% of margin -- and the relay counted the same bytes
+        # higher, so the replay was refused and the next attempt started over.
+        if next_count is None or next_count <= target:
             current_count = next_count if next_count is not None else current_count
             break
         current, current_count = shorter, next_count

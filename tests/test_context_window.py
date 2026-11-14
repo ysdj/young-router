@@ -998,5 +998,140 @@ class WireCountShapeTests(unittest.TestCase):
         )
 
 
+class ShrinkMarginTests(unittest.TestCase):
+    """A shrink has to leave room, not stop at the edge of the window.
+
+    A live Claude Code thread was elided to 983,041 tokens against a
+    1,000,000-token window -- 98.3% of it.  The loop stopped the moment the
+    count came in at or under the *limit*, so the replay was sent with 1.7%
+    of margin against a relay whose own count of the same bytes has been
+    measured 20% higher.  It was refused, and the next attempt started over.
+    """
+
+    def test_the_rewrite_stops_at_the_target_not_the_limit(self) -> None:
+        items = [{"role": "user", "content": "start"}]
+        for index in range(120):
+            items.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_%04d" % index,
+                            "name": "Bash",
+                            "input": {"command": "grep -rn foo ."},
+                        }
+                    ],
+                }
+            )
+            items.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_%04d" % index,
+                            "content": "line of output " * 400,
+                        }
+                    ],
+                }
+            )
+        items.append({"role": "user", "content": "now what?"})
+        data = {"model": "m", "messages": items}
+        window = 60_000
+        router = _Router(window)
+        with mock.patch.object(cw, "_router", return_value=router):
+            fitted = cw.apply(data)
+        self.assertIsNotNone(fitted)
+        assert fitted is not None
+        after = cw.measure_tokens(fitted, router)
+        self.assertIsNotNone(after)
+        # The pass has to land at its target, not at the last number that was
+        # still technically under the limit.
+        self.assertLessEqual(
+            after,
+            int(window * cw._TARGET_FRACTION),
+            "the rewrite has to stop at the target, not at the edge of the "
+            "window",
+        )
+
+class ToolSchemaWeightTests(unittest.TestCase):
+    """The tool schema is part of the prompt and has to be counted.
+
+    A Claude Code turn carries 192 tool definitions -- 165 of them from the
+    MCP servers the user connected -- and they ride on every request.  The
+    client's own "Context window 100.8k / 1M" counts the conversation, not
+    the schema, so the pass believed a replay it had elided to 918,680 tokens
+    was under a 1,048,576 window while the wire carried the messages *and*
+    169 KB of schema on top.  The upstream refused it, the client retried the
+    same bytes, and the thread could not make progress.
+    """
+
+    @staticmethod
+    def _schema(count: int) -> list:
+        return [
+            {
+                "name": "mcp__agent-desktop__desktop_tool_%03d" % index,
+                "description": (
+                    "Performs a desktop automation step on the host machine. " * 12
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "target": {"type": "string", "description": "Element ref"},
+                        "timeout_ms": {"type": "integer", "description": "Deadline"},
+                    },
+                },
+            }
+            for index in range(count)
+        ]
+
+    def test_the_schema_is_counted_against_the_window(self) -> None:
+        items = [{"role": "user", "content": "start"}]
+        for index in range(60):
+            items.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_%05d" % index,
+                            "name": "Bash",
+                            "input": {"command": "grep -rn foo ."},
+                        }
+                    ],
+                }
+            )
+            items.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_%05d" % index,
+                            "content": "some output line here\n" * 80,
+                        }
+                    ],
+                }
+            )
+        data = {
+            "model": "m",
+            "messages": items,
+            "tools": self._schema(165),
+        }
+        # A window the messages alone fit, but the messages plus the schema
+        # do not.
+        router = _Router(40_000)
+        with mock.patch.object(cw, "_router", return_value=router):
+            without_tools = {"model": "m", "messages": items}
+            self.assertLessEqual(cw.measure_tokens(without_tools, router), 40_000)
+            fitted = cw.apply(data)
+        self.assertIsNotNone(
+            fitted,
+            "a replay whose messages fit but whose tool schema does not has "
+            "to be shortened too",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
