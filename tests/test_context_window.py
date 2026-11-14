@@ -706,8 +706,6 @@ class MessagesWireTests(unittest.TestCase):
         self.assertEqual(len(data["messages"]), 5)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class _DenseCounterRouter(_Router):
@@ -840,3 +838,77 @@ class OneTurnThreadTests(unittest.TestCase):
                 if item.get("type") == "message"
             )
         )
+
+
+class RefusalRewriteBeliefTests(unittest.TestCase):
+    """The size recorded after a rewrite has to be the size that was produced.
+
+    A live Messages thread cycled for 45 minutes: the pass rewrote a
+    1,980,609-token replay, recorded the *target* it was aiming at (985,033),
+    and the upstream answered ``prompt is too long: 1243305 tokens`` -- 26%
+    above what the pass now believed it was sending.  It never measured the
+    bytes it had actually built, so the next resend was refused the same way,
+    and the client kept compacting against a size that was never real.
+    """
+
+    def test_the_recorded_size_is_measured_from_the_rewritten_payload(self) -> None:
+        items = [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "be brief"}],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "u" * 2000}],
+            },
+        ]
+        for index in range(24):
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": "call_%d" % index,
+                    "name": "shell",
+                    "arguments": '{"command":["cat","f"]}',
+                }
+            )
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_%d" % index,
+                    "output": "".join(
+                        chr(33 + (index + i) % 90) for i in range(8000)
+                    ),
+                }
+            )
+        items.append(
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "now what?"}],
+            }
+        )
+        data = {"model": "m", "input": items}
+        router = _Router(10**9)
+        with mock.patch.object(cw, "_router", return_value=router):
+            cw._MEASURED_INPUT_TOKENS.set(cw.measure_tokens(data, router))
+            refused = RuntimeError("prompt is too long: 999999 tokens > 500000 maximum")
+            before = cw.measure_tokens(data, router)
+            self.assertTrue(
+                cw.retry_for_refusal(data, refused, attempt=0, model="m")
+            )
+            after = cw.measure_tokens(data, router)
+            believed = cw._MEASURED_INPUT_TOKENS.get()
+        self.assertLess(after, before)
+        self.assertEqual(
+            believed,
+            after,
+            "the size recorded after a rewrite has to be the size of the "
+            "rewritten payload, or the next resend is refused the same way",
+        )
+
+
+
+if __name__ == "__main__":
+    unittest.main()

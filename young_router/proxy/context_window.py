@@ -827,7 +827,14 @@ def retry_for_refusal(
         # classified error instead of on a second attempt that cannot succeed.
         return False
     data[payload_key] = rewritten
-    _MEASURED_INPUT_TOKENS.set(target)
+    # Measure what was built, not what was aimed at.  Recording ``target``
+    # claimed a size the payload did not have -- a live thread rewrote to a
+    # claimed 985,033 tokens and the upstream counted 1,243,305 on the same
+    # bytes, so every resend was refused for a size the pass believed it had
+    # already fixed, and the client compacted for 45 minutes against a number
+    # that was never real.
+    produced = measure_tokens(data, _router())
+    _MEASURED_INPUT_TOKENS.set(produced if produced is not None else target)
     _SHRUNK.set(True)
     _trace_retry(
         data,
