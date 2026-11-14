@@ -253,6 +253,36 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(usage["total_tokens"], 1207)
         self.assertLessEqual(usage["input_tokens_details"]["cached_tokens"], usage["input_tokens"])
 
+    def test_a_raised_total_does_not_turn_a_cache_hit_into_a_rebill(self) -> None:
+        """A floor corrects the size of the request, not which part was cached.
+
+        Measured on a live Pi thread replaying three screenshots every turn:
+        the upstream billed 233,027 with ``cache_read`` 232,832, so only 195
+        tokens were new, and the reported total was lifted ~23k above that by
+        the proxy's own count.  The client reads the uncached remainder as
+        ``input_tokens - cached_tokens``, so leaving the cached count behind
+        turned 195 new tokens into a 23k "billed again" warning on every turn
+        of a thread whose prefix never changed (16:49:12 onward, while
+        ``cache_read`` climbed 180k -> 193k).
+        """
+        from young_router.proxy import base as base_module
+
+        usage = base_module._responses_usage_for_codex(
+            {
+                "input_tokens": 233027,
+                "output_tokens": 175,
+                "input_tokens_details": {"cached_tokens": 232832},
+            },
+            input_token_floor=256000,
+        )
+        self.assertEqual(usage["input_tokens"], 256000)
+        # The 195 new tokens stay new; the 22,973 raised tokens were cached too.
+        self.assertEqual(
+            usage["input_tokens"] - usage["input_tokens_details"]["cached_tokens"],
+            233027 - 232832,
+        )
+        self.assertEqual(usage["total_tokens"], 256175)
+
     def test_a_streamed_turn_keeps_the_cache_it_wrote(self) -> None:
         # ``response.completed`` is the only usage a streamed turn shows, and
         # this normaliser rebuilds its details.  It used to keep only the read

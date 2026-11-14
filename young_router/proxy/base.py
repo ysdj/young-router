@@ -1065,9 +1065,24 @@ def _responses_usage_for_codex(
     # refuses it.  The proxy already counted this exact request (the same count
     # the pre-call check compares to the window), so the floor is the client
     # seeing the truth rather than whatever the upstream felt like reporting.
+    #
+    # Raising the total alone invents a miss.  The client reads the uncached
+    # remainder as ``input_tokens - cached_tokens``, so a floor applied to the
+    # total while the cached count keeps the upstream's value turns the whole
+    # difference into "tokens billed again".  Measured on a live Pi thread that
+    # replayed three screenshots every turn: from 16:49:12 the reported total
+    # sat a steady ~23k above what the upstream billed while ``cache_read``
+    # kept climbing 180k -> 193k, so the client showed a 23k re-bill on every
+    # turn of a thread whose prefix never changed.  Those tokens really were in
+    # the request; the cache did not lose them, and the two numbers have to
+    # grow together or the pair stops describing one request.
     floor_tokens = _int_or_none(input_token_floor)
     if floor_tokens is not None and floor_tokens > input_tokens:
+        raised = floor_tokens - input_tokens
         input_tokens = floor_tokens
+        # The prefix the upstream served is still served: the floor corrects
+        # the size of the request, not which part of it was cached.
+        cached_tokens += raised
         total_tokens = input_tokens + output_tokens
     bounded_input_tokens = _int_or_none(input_token_upper_bound)
     if bounded_input_tokens is not None and bounded_input_tokens >= 0:
