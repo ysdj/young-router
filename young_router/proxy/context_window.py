@@ -237,17 +237,28 @@ def wire_tokens(items: Any) -> Optional[int]:
     global _ENCODER
     if not isinstance(items, list):
         return None
-    text = _strings_joined(items)
-    if not text:
-        return None
     try:
         import tiktoken
 
         if _ENCODER is None:
             _ENCODER = tiktoken.get_encoding("o200k_base")
-        return len(_ENCODER.encode(text, disallowed_special=()))
     except Exception:
         return None
+    text = _strings_joined(items)
+    if not text:
+        return None
+    # Count the serialized replay, not just the strings inside it.  A
+    # ``tool_use``/``tool_result`` block spends tokens on its ``type``, its id
+    # and its field names before the body is counted, and a Claude Code
+    # replay is thousands of those blocks: walking the strings alone answered
+    # 10-15% below the same JSON, so a replay the pass believed it had fitted
+    # to 918,680 tokens reached the upstream at 1,169,888 and was refused
+    # again on every resend.
+    try:
+        serialized = json.dumps(items)
+    except Exception:
+        serialized = text
+    return len(_ENCODER.encode(serialized, disallowed_special=()))
 
 
 def _strings_joined(node: Any, out: Optional[List[str]] = None) -> str:

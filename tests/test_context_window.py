@@ -938,6 +938,64 @@ class RefusalRewriteBeliefTests(unittest.TestCase):
             "rewritten payload, or the next resend is refused the same way",
         )
 
+class WireCountShapeTests(unittest.TestCase):
+    """The count has to cover the structure the wire carries, not just strings.
+
+    A Claude Code replay is mostly ``tool_use``/``tool_result`` blocks: every
+    one of them spends tokens on its ``type``, its id and its field names
+    before the body is counted.  ``wire_tokens`` walked the strings only, so
+    it answered 10-15% below what the same JSON costs, and a replay the pass
+    believed it had fitted to 918,680 tokens reached the upstream at 1,169,888
+    -- refused, resent, refused again, for as long as the client kept trying.
+    """
+
+    def test_the_count_covers_the_keys_and_the_block_structure(self) -> None:
+        items = [{"role": "user", "content": "start"}]
+        for index in range(200):
+            items.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_%04d" % index,
+                            "name": "Bash",
+                            "input": {
+                                "command": "grep -rn foo .",
+                                "description": "search",
+                            },
+                        }
+                    ],
+                }
+            )
+            items.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_%04d" % index,
+                            "content": "line of output " * 200,
+                        }
+                    ],
+                }
+            )
+        counted = cw.wire_tokens(items)
+        self.assertIsNotNone(counted)
+        import tiktoken
+
+        whole = len(
+            tiktoken.get_encoding("o200k_base").encode(
+                json.dumps(items), disallowed_special=()
+            )
+        )
+        # This number is compared against a window and decides whether to
+        # resend, so it has to be at the cost of the payload, not below it.
+        self.assertGreaterEqual(
+            counted,
+            whole,
+            "the count has to cover the structure the wire carries",
+        )
 
 
 if __name__ == "__main__":
