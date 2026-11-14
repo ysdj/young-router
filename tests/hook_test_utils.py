@@ -34,6 +34,7 @@ HOOK_MODULE_NAMES = (
     "proxy.routing",
     "proxy.responses_tools",
     "proxy.responses_surfaces",
+    "proxy.tool_history",
     "proxy.web_search_native",
     "proxy.responses_output",
     "proxy.image_inputs",

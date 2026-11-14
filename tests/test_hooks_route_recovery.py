@@ -707,6 +707,39 @@ class HookRouteRecoveryTests(HookTestCase):
             "recovery",
         )
 
+    def test_every_wire_spelling_of_an_unpaired_history_is_recognized(self) -> None:
+        """The pairing invariant is stated differently by each surface.
+
+        A thread cut between a tool call and its output is refused by the
+        Messages wire as ``orphaned tool_result in conversation history``, by
+        the Responses wire as ``No tool call found for function call output``,
+        and by a station's own validator as ``工具记录不完整``.  Only the last one
+        was recognised, so the other two ended the turn on an unclassified stop
+        whose sentence invited the same broken history to be sent again.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class BadRequestError(Exception):
+            status_code = 400
+
+        for message in (
+            "litellm.BadRequestError: AnthropicException - API Error: 400 "
+            "orphaned tool_result in conversation history. Run /rewind to "
+            "recover the conversation.",
+            "litellm.BadRequestError: OpenAIException - 400 No tool call found "
+            "for function call output with call_id call_abc.",
+            "messages.2.content.3: unexpected `tool_use_id` found in "
+            "`tool_result` blocks: toolu_01Mhh3CD3BeVEU2mUPenc1X3.",
+            "工具记录不完整，请新建任务",
+        ):
+            with self.subTest(message=message):
+                error = BadRequestError(message)
+                self.assertTrue(hooks._is_upstream_tool_history_rejected_error(error))
+                # A route's own tolerance of the replay is not a broken route:
+                # a sibling of the same group may accept the same history.
+                self.assertEqual(hooks._recovery_policy_for_exception(error), "recovery")
+
     def test_route_recovery_does_not_poll_on_context_size_error(self) -> None:
         hooks, _proxy_server = load_hook_module()
 

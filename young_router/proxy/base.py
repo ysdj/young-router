@@ -1380,6 +1380,20 @@ _UPSTREAM_TOOL_HISTORY_REJECTION_MARKERS = (
     # cause recognisable, the status (400) alone reads as the request's fault.
     "tool calls and tool results do not match",
     "tool_calls and tool_results do not match",
+    # The pairing invariant, stated by each wire in its own vocabulary.  These
+    # are the sentences a thread whose turn was cut actually receives, and
+    # without them the refusal reached the reader as an unclassified stop that
+    # invited the same broken history to be sent again.
+    "orphaned tool_result",
+    "orphaned tool_use",
+    "unexpected `tool_use_id` found in `tool_result`",
+    "unexpected tool_use_id found in tool_result",
+    "each `tool_use` block must have a corresponding `tool_result` block",
+    "each `tool_result` block must have a corresponding `tool_use` block",
+    "no tool call found for function call output",
+    "tool_use ids were found without tool_result blocks",
+    "tool_result blocks were found without tool_use blocks",
+    "duplicate tool_use id",
 )
 # A provider validator refusing a field it was sent by name.  This proxy builds
 # several containers on purpose -- ``extra_body`` carries the Responses-only

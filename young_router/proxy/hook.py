@@ -12,6 +12,7 @@ from . import responses_request as _responses_request_module
 from . import codex_fast_tier as _codex_fast_tier_module
 from . import responses_execution as _responses_execution_module
 from . import responses_surfaces as _responses_surfaces_module
+from . import tool_history as _tool_history_module
 from . import web_search_native as _web_search_native_module
 from . import reasoning as _reasoning_module
 from . import routing as _routing_module
@@ -65,6 +66,18 @@ class YoungRouterHook(CustomLogger):
         # takes the peer's slot and gives the first route's back, never holding
         # two for one request.
         _routing_module._ensure_attempt_lease_id(data)
+        # Both wires validate the same invariant: a tool result belongs to a
+        # call that is still in the history, and a call is answered before the
+        # next turn starts.  A thread whose turn was cut replays one half of a
+        # pair, and the route refuses the whole body (``400 orphaned tool_result
+        # in conversation history``, ``工具记录不完整``, ``No tool call found for
+        # function call output``) -- a verdict no resend changes, so the turn
+        # ends on "start a new task".  Pairing happens here, before a deployment
+        # is chosen, so every wire, bridge and hop sees the same replay.  It is
+        # not a reason to stop: the passes below still apply to the paired body.
+        paired = _tool_history_module.paired_request(data)
+        if paired is not None:
+            data = paired
         if not _responses_request_module._request_is_responses_api(data):
             # Messages replays the same history and meets the same cap.  The
             # route refuses an oversized prompt with a plain 400, and on its
@@ -77,7 +90,7 @@ class YoungRouterHook(CustomLogger):
             fitted_messages = _context_window_module.apply(data)
             if fitted_messages is not None:
                 return fitted_messages
-            return None
+            return paired
         # Record this before any bridge or surface adapter rewrites the input:
         # a Chat-shaped route replays this history as messages and the answer it
         # returns covers the whole restored context.
@@ -93,7 +106,7 @@ class YoungRouterHook(CustomLogger):
         fitted = _context_window_module.apply(data)
         if fitted is not None:
             return fitted
-        return None
+        return paired
 
     def _record_recent_request_started(self, kwargs: Dict[str, Any]) -> None:
         """Publish a bounded progress row before the upstream call begins."""
