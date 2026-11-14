@@ -20,6 +20,17 @@ The pairing is recoverable, and both halves are the client's own data:
   history sanitizers write -- "no result was recorded", marked as an error --
   so the call stays in the transcript and the model reads what happened.
 
+The Messages wire pairs by **position**, not by id: a ``tool_result`` is read as
+the answer of the ``tool_use`` in the message before it, so a result that sits
+in a later turn answers nothing even though its call is in the body.  That is
+the shape a compaction produces when it keeps the user's next words and drops
+the results turn around them, and what a thread resumed from a summary looks
+like -- refused as ``messages.0.content.3: unexpected `tool_use_id` found in
+`tool_result` blocks`` on a 1328-turn replay carrying 656 results for 655 calls.
+So a misplaced result is moved to the turn after its call, the results open the
+turn they answer (a text block ahead of them is read as the user speaking), and
+a call answered twice keeps its first answer -- one call has one result.
+
 Nothing else is touched.  Ids, order, block types and every body stay exactly as
 replayed; only the two halves of the invariant move.  A history that already
 pairs is reported as ``None`` ("nothing to do"), so a caller never resends a
@@ -178,116 +189,152 @@ def _blocks(item: Any) -> Optional[List[Any]]:
 def _paired_messages(
     messages: List[Any],
 ) -> Tuple[Optional[List[Any]], Dict[str, int]]:
-    """Pair ``tool_use`` blocks with ``tool_result`` blocks inside turns."""
+    """Pair ``tool_use`` blocks with ``tool_result`` blocks by position.
 
-    declared: Dict[str, int] = {}
-    answered: set = set()
+    Ids alone do not pair this wire: a ``tool_result`` is read as the answer of
+    the ``tool_use`` in the message *before* it, so a replay whose ids all have
+    their call is still refused when the result sits in a later turn --
+    ``messages.0.content.3: unexpected `tool_use_id` found in `tool_result`
+    blocks`` on a 1328-turn body carrying 656 results for 655 calls.  A
+    compaction that keeps the user's next words and drops the results turn
+    around them, and a thread resumed from a summary, both produce it.  So each
+    result is placed in the turn directly after its call, the results open that
+    turn, and a call answered twice keeps its first answer.
+    """
+
+    declared: Dict[str, List[int]] = {}
     for index, message in enumerate(messages):
         for block in _blocks(message) or ():
-            if not isinstance(block, Mapping):
-                continue
-            kind = block.get("type")
-            if kind == _BLOCK_CALL:
+            if isinstance(block, Mapping) and block.get("type") == _BLOCK_CALL:
                 identifier = block.get("id")
                 if isinstance(identifier, str) and identifier:
-                    declared.setdefault(identifier, index)
-            elif kind == _BLOCK_RESULT:
-                identifier = block.get("tool_use_id")
-                if isinstance(identifier, str) and identifier:
-                    answered.add(identifier)
+                    declared.setdefault(identifier, []).append(index)
 
-    stats = {"dropped_orphan_results": 0, "answered_missing_results": 0}
-    kept_messages: List[Any] = []
-    # Where each original turn landed, because a turn that leaves shifts every
-    # turn after it and the answers below are placed by the call turn's index.
-    kept_index: Dict[int, int] = {}
+    stats = {
+        "dropped_orphan_results": 0,
+        "dropped_duplicate_results": 0,
+        "moved_misplaced_results": 0,
+        "reordered_results": 0,
+        "answered_missing_results": 0,
+    }
+
+    #: Answers that have to be written into another turn, by the turn they
+    #: answer.  ``answered`` records the turn each id ended up in, so a call is
+    #: answered once and a duplicate is recognisable wherever it appears.
+    moved: Dict[int, List[Any]] = {}
+    answered: Dict[str, int] = {}
+    kept: List[Optional[List[Any]]] = []
     for index, message in enumerate(messages):
         blocks = _blocks(message)
         if blocks is None:
-            kept_index[index] = len(kept_messages)
-            kept_messages.append(message)
+            kept.append(None)
             continue
-        kept: List[Any] = []
+        blocks_original = blocks
+        results: List[Any] = []
+        others: List[Any] = []
         for block in blocks:
             identifier = (
                 block.get("tool_use_id") if isinstance(block, Mapping) else None
             )
-            if (
+            if not (
                 isinstance(block, Mapping)
                 and block.get("type") == _BLOCK_RESULT
                 and isinstance(identifier, str)
                 and identifier
-                and identifier not in declared
             ):
+                others.append(block)
+                continue
+            # The nearest call before this turn owns the result.  A call after
+            # it, or no call at all, means the result answers nothing the model
+            # can read.
+            owners = [turn for turn in declared.get(identifier, ()) if turn < index]
+            if not owners:
                 stats["dropped_orphan_results"] += 1
                 continue
-            kept.append(block)
-        if len(kept) == len(blocks):
-            kept_index[index] = len(kept_messages)
-            kept_messages.append(message)
-            continue
-        if not kept:
-            # The turn carried only that orphan result.  Messages alternates
-            # user/assistant, so an empty turn is itself a shape the wire
-            # refuses: the message leaves together with its blocks.
-            continue
-        updated = dict(message)
-        updated["content"] = kept
-        kept_index[index] = len(kept_messages)
-        kept_messages.append(updated)
+            legal = max(owners) + 1
+            if identifier in answered:
+                stats["dropped_duplicate_results"] += 1
+                continue
+            answered[identifier] = legal
+            if legal == index:
+                results.append(block)
+            else:
+                moved.setdefault(legal, []).append(block)
+                stats["moved_misplaced_results"] += 1
+        # Results open the turn they answer.  A text block ahead of them is read
+        # as the user speaking before answering, which the wire refuses.
+        blocks = results + others if results else others
+        if blocks != blocks_original:
+            stats["reordered_results"] += 1
+        kept.append(blocks)
 
-    unanswered = [
-        identifier for identifier in declared if identifier not in answered
-    ]
-    if not unanswered:
-        if stats["dropped_orphan_results"]:
-            return kept_messages, stats
-        return None, stats
-
-    # An unanswered call is answered in the turn that follows its own call
-    # turn.  Messages requires the results to be in the *next* user message, and
-    # a client that lost one usually still has that message (it holds the other
-    # results of the same parallel batch).  Every answer goes in at once, so the
-    # turn is rewritten once rather than shifted under the loop.
-    missing_by_turn: Dict[int, List[str]] = {}
-    for identifier in unanswered:
-        turn = kept_index.get(declared[identifier])
-        if turn is None:
+    out: List[Any] = []
+    survived: List[int] = []
+    for index, message in enumerate(messages):
+        blocks = kept[index]
+        if blocks is None:
+            survived.append(index)
+            out.append(message)
             continue
-        missing_by_turn.setdefault(turn, []).append(identifier)
-    for index in sorted(missing_by_turn, reverse=True):
-        results = [
+        if not blocks:
+            # The turn carried only results that answered nothing.  Messages
+            # alternates user/assistant, so an empty turn is itself a shape the
+            # wire refuses: the message leaves together with them.
+            continue
+        survived.append(index)
+        if blocks == message.get("content"):
+            out.append(message)
+        else:
+            updated = dict(message)
+            updated["content"] = blocks
+            out.append(updated)
+
+    def _position(turn: int) -> int:
+        """Where a turn sits in the repaired list, counting the ones that left."""
+
+        return sum(1 for survived_index in survived if survived_index < turn)
+
+    # An unanswered call is answered in the turn that follows its own call turn,
+    # which is where the wire reads it from.  Every answer for one turn goes in
+    # at once, so the turn is rewritten once rather than shifted under the loop.
+    for identifier in declared:
+        if identifier in answered:
+            continue
+        legal = max(declared[identifier]) + 1
+        moved.setdefault(legal, []).append(
             {
                 "type": _BLOCK_RESULT,
                 "tool_use_id": identifier,
                 "content": MISSING_RESULT_TEXT,
                 "is_error": True,
             }
-            for identifier in missing_by_turn[index]
-        ]
-        target = index + 1
-        following = kept_messages[target] if target < len(kept_messages) else None
+        )
+        stats["answered_missing_results"] += 1
+
+    # Newest turn first: an insertion shifts every position after it.
+    for legal in sorted(moved, reverse=True):
+        position = _position(legal)
+        following = out[position] if position < len(out) else None
         blocks = _blocks(following)
         if blocks is not None and following.get("role") == "user":
             updated = dict(following)
-            # Results come first in the content array and stay together: a text
-            # block after them is what the wire reads as the user speaking, and
-            # a result placed after a text block is a shape it refuses.  So the
-            # answer joins the run of results that already opens this turn, or
-            # opens the turn itself when it has none.
+            # The answers join the run of results that already opens this turn,
+            # so a parallel batch keeps its order and the user's own words stay
+            # behind them.
             cut = 0
             for block in blocks:
                 if isinstance(block, Mapping) and block.get("type") == _BLOCK_RESULT:
                     cut += 1
                     continue
                 break
-            updated["content"] = list(blocks[:cut]) + results + list(blocks[cut:])
-            kept_messages[target] = updated
+            updated["content"] = list(blocks[:cut]) + list(moved[legal]) + list(blocks[cut:])
+            out[position] = updated
         else:
-            kept_messages.insert(target, {"role": "user", "content": results})
-        stats["answered_missing_results"] += len(results)
+            out.insert(position, {"role": "user", "content": list(moved[legal])})
 
-    return kept_messages, stats
+    if not any(stats.values()):
+        return None, stats
+    return out, stats
 
 
 def paired_request(data: Any) -> Optional[Dict[str, Any]]:

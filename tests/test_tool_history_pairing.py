@@ -268,3 +268,136 @@ class ToolHistoryPreCallTests(HookTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ToolHistoryPlacementTests(unittest.TestCase):
+    """The wire reads a result from the turn that *follows* its call.
+
+    Every id can be present and the body still refused: ``tool_result`` is only
+    the answer of the ``tool_use`` in the message before it, so a result left in
+    a later turn -- the shape a compaction or a resume produces when it keeps the
+    user's next words and drops the results turn around them -- answers nothing.
+    Observed as ``messages.0.content.3: unexpected `tool_use_id` found in
+    `tool_result` blocks`` on a 1328-message replay whose ids all paired.
+    """
+
+    def _module(self):
+        import sys
+
+        sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+        from young_router.proxy import tool_history
+
+        return tool_history
+
+    def test_a_result_in_a_later_turn_is_moved_to_the_turn_that_answers_the_call(
+        self,
+    ) -> None:
+        tool_history = self._module()
+        request = {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "go"}]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_a", "name": "Bash", "input": {}},
+                    ],
+                },
+                {"role": "user", "content": [{"type": "text", "text": "and then?"}]},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_a",
+                            "content": "late output",
+                        }
+                    ],
+                },
+            ],
+        }
+
+        repaired = tool_history.paired_request(request)
+
+        assert repaired is not None
+        messages = repaired["messages"]
+        # The result now answers the call, in the turn directly after it.
+        self.assertEqual(
+            [block["type"] for block in messages[2]["content"]],
+            ["tool_result", "text"],
+        )
+        self.assertEqual(messages[2]["content"][0]["tool_use_id"], "toolu_a")
+        self.assertEqual(messages[2]["content"][0]["content"], "late output")
+        self.assertEqual(messages[2]["content"][1]["text"], "and then?")
+        # The turn it came from carried nothing else, and an empty turn is a
+        # shape the wire refuses as well, so it leaves with the result.
+        self.assertEqual(len(messages), 3)
+
+    def test_a_result_after_a_text_block_is_still_a_shape_the_wire_refuses(
+        self,
+    ) -> None:
+        """The results open the answering turn; a text block before them is not.
+
+        ``text`` then ``tool_result`` in one user turn is read as the user
+        speaking and then answering a call -- refused.  Moving the results ahead
+        of the text is what makes the turn legal.
+        """
+
+        tool_history = self._module()
+        request = {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "go"}]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_a", "name": "Bash", "input": {}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "meanwhile"},
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_a",
+                            "content": "ok",
+                        },
+                    ],
+                },
+            ],
+        }
+
+        repaired = tool_history.paired_request(request)
+
+        assert repaired is not None
+        blocks = repaired["messages"][2]["content"]
+        self.assertEqual([block["type"] for block in blocks], ["tool_result", "text"])
+
+    def test_a_result_answered_twice_is_refused_and_one_answer_stays(self) -> None:
+        """One call has one result; a replay can carry two after a resume."""
+
+        tool_history = self._module()
+        request = {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "go"}]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "toolu_a", "name": "Bash", "input": {}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_a", "content": "a"},
+                        {"type": "tool_result", "tool_use_id": "toolu_a", "content": "b"},
+                    ],
+                },
+            ],
+        }
+
+        repaired = tool_history.paired_request(request)
+
+        assert repaired is not None
+        blocks = repaired["messages"][2]["content"]
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["content"], "a")
