@@ -290,16 +290,6 @@ def assert_upstream_route_failed_terminal(testcase, chunks):
     return failed_events[0]
 
 
-def assert_external_web_search_missing_answer_failed(testcase, chunks):
-    failed_event = assert_upstream_route_failed_terminal(testcase, chunks)
-    text = json.dumps([jsonable_stream_chunk(chunk) for chunk in chunks])
-    testcase.assertNotIn(
-        "The web search step completed, but the model did not return a final assistant response.",
-        text,
-    )
-    return failed_event
-
-
 class HookTestCase(unittest.IsolatedAsyncioTestCase):
     def set_log_env(self, path: Path) -> None:
         previous = os.environ.get("LITELLM_RECENT_REQUESTS_LOG")

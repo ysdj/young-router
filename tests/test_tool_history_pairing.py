@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import unittest
+import unittest.mock
 
 from hook_test_utils import HookTestCase, load_hook_module
 
@@ -266,8 +267,6 @@ class ToolHistoryPreCallTests(HookTestCase):
         self.assertNotIn("messages", json.dumps({k: v for k, v in request.items() if k != "messages"}))
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ToolHistoryPlacementTests(unittest.TestCase):
@@ -401,3 +400,144 @@ class ToolHistoryPlacementTests(unittest.TestCase):
         blocks = repaired["messages"][2]["content"]
         self.assertEqual(len(blocks), 1)
         self.assertEqual(blocks[0]["content"], "a")
+
+class _ShrinkRouter:
+    """Just enough router for ``window_for`` and a byte-proportional count."""
+
+    def __init__(self, window: int) -> None:
+        self.window = window
+
+    def get_model_list(self, model_name=None):
+        return [{"model_info": {"max_input_tokens": self.window}}]
+
+    def _count_pre_call_check_tokens(self, messages=None, input=None, request_kwargs=None):
+        return int(len(json.dumps(input or messages or [])) / 4)
+
+
+class PairingAfterShrinkTests(unittest.TestCase):
+    """Pairing has to run again on what the shrink produced.
+
+    The shrink drops whole turns to reach its target, and a turn it drops can
+    be the one that carried a call whose answer is still in the replay.
+    Pairing runs before the shrink, so nothing sees that pair afterwards: a
+    live Claude Code thread was cut from 1279 items to 133 and went out with
+    ``messages.22.content.5: unexpected `tool_use_id` found in `tool_result`
+    blocks``, which no resend of the same bytes can satisfy.
+    """
+
+    def _module(self):
+        import sys
+
+        sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+        from young_router.proxy import tool_history
+
+        return tool_history
+
+    def _context_window(self):
+        import sys
+
+        sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+        from young_router.proxy import context_window
+
+        return context_window
+
+    def _thread(self):
+        messages = [{"role": "user", "content": "start"}]
+        for index in range(30):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_%02d" % index,
+                            "name": "Read",
+                            "input": {"path": "f"},
+                        }
+                    ],
+                }
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_%02d" % index,
+                            "content": "o" * 3000,
+                        }
+                    ],
+                }
+            )
+        # The live tail: a second answer to an old call, carried by the turn
+        # the shrink protects, so it survives after its call is cut away.
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_05", "content": "late"},
+                    {"type": "text", "text": "go"},
+                ],
+            }
+        )
+        return messages
+
+    @staticmethod
+    def _unpaired(messages):
+        calls = {}
+        results = []
+        for index, message in enumerate(messages):
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    calls[block["id"]] = index
+                elif block.get("type") == "tool_result":
+                    results.append((block["tool_use_id"], index))
+        return [
+            (identifier, index)
+            for identifier, index in results
+            if identifier not in calls or index != calls[identifier] + 1
+        ]
+
+    def test_the_shrink_alone_leaves_a_result_behind(self) -> None:
+        """The shape the fix answers: proof the shrink breaks the pairing."""
+
+        context_window = self._context_window()
+        messages = self._thread()
+        with unittest.mock.patch.object(
+            context_window, "_router", return_value=_ShrinkRouter(3_000)
+        ):
+            fitted = context_window.apply({"model": "m", "messages": messages})
+        self.assertIsNotNone(fitted)
+        assert fitted is not None
+        self.assertTrue(
+            self._unpaired(fitted["messages"]),
+            "this test only proves anything while the shrink can strand a "
+            "result; if the pass learns to keep pairs adjacent, the repair "
+            "below is no longer the thing under test",
+        )
+
+    def test_pairing_again_repairs_what_the_shrink_stranded(self) -> None:
+        tool_history = self._module()
+        context_window = self._context_window()
+        messages = self._thread()
+        with unittest.mock.patch.object(
+            context_window, "_router", return_value=_ShrinkRouter(3_000)
+        ):
+            fitted = context_window.apply({"model": "m", "messages": messages})
+        body = fitted if fitted is not None else {"model": "m", "messages": messages}
+        repaired = tool_history.paired_request(body)
+        final = repaired if repaired is not None else body
+        self.assertEqual(
+            [],
+            self._unpaired(final["messages"]),
+            "every result has to sit in the message directly after its call",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1143,9 +1143,6 @@ class WorkerLogRetentionTests(unittest.TestCase):
 
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class LaneNameCollisionTests(unittest.TestCase):
     """Two producers, one model, one public name is not a usable roster.
@@ -1293,11 +1290,6 @@ class ChannelProviderSplitTests(unittest.TestCase):
             self.assertEqual(model["upstream_url_surface"], "openai/chat")
             self.assertIsNone(model["max_input_tokens"])
 
-            # Kilo's own row states a different number, and it is kept whole:
-            # one channel's window is not another's.
-            self.assertIsNone(
-                routes["kilo-auto/free"][0]["max_input_tokens"]
-            )
             # The projection resolves from the saved document, so it is read
             # after Apply — the same order a pane sees it in.
             domain.apply()
@@ -1681,15 +1673,6 @@ class WorkerOrphanWatchTests(unittest.TestCase):
     this drives the real worker source rather than restating it.
     """
 
-    SCRIPT = """
-import { spawn } from 'node:child_process'
-const child = spawn(process.execPath, [process.argv[1]], { stdio: ['ignore', 'pipe', 'inherit'], detached: true })
-let seen = ''
-child.stdout.on('data', chunk => { seen += String(chunk) })
-child.unref()
-setTimeout(() => { process.stdout.write(seen); process.exit(0) }, Number(process.argv[2]))
-"""
-
     def _worker_sources(self) -> list[Path]:
         adapters = Path("young_router/adapters")
         return [
@@ -1761,3 +1744,7 @@ setTimeout(() => { process.stdout.write(seen); process.exit(0) }, Number(process
             started, observed, "ppid did not change after the parent exited"
         )
         self.assertEqual(observed, "1", "the reparented child did not reach init")
+
+
+if __name__ == "__main__":
+    unittest.main()

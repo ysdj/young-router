@@ -1414,6 +1414,7 @@ class LocalApiKeyTests(unittest.TestCase):
         config = {"general_settings": {"master_key": "os.environ/NOT_SET_ANYWHERE"}}
 
         with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LITELLM_MASTER_KEY", None)
             os.environ.pop("NOT_SET_ANYWHERE", None)
             with self.assertRaises(codex_config.EditorError):
                 codex_config.local_api_key(config)
@@ -1533,9 +1534,6 @@ class ProviderDocumentParseCacheTests(unittest.TestCase):
         self.assertEqual("sk-young-router", master_key_from_document(""))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class LocalPortTests(unittest.TestCase):
     """The client document must name the port the proxy is listening on.
@@ -1583,3 +1581,7 @@ class LocalPortTests(unittest.TestCase):
 
     def test_no_records_means_the_preference(self) -> None:
         self.assertEqual("12390", codex_config.local_port())
+
+
+if __name__ == "__main__":
+    unittest.main()

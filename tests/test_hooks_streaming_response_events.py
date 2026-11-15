@@ -757,8 +757,9 @@ class HookStreamingResponseEventTests(HookTestCase):
 
         proxy_server.llm_router = FakeRouter()
 
+        text = "I'll start by reading the skill, then executing the canonical entry command."
+
         async def original_stream():
-            text = "I'll start by reading the skill, then executing the canonical entry command."
             yield {"type": "response.created", "response": {"id": "resp-preamble"}}
             yield {"type": "response.output_text.delta", "delta": text}
             yield {
@@ -802,8 +803,11 @@ class HookStreamingResponseEventTests(HookTestCase):
 
         dumped = json.dumps(chunks, ensure_ascii=False)
         self.assertIn("I'll start by reading the skill", dumped)
-        self.assertNotIn("actual work done", dumped)
         self.assertEqual(chunks[-1]["type"], "response.completed")
+        self.assertIn(
+            text,
+            chunks[-1]["response"]["output"][0]["content"][0]["text"],
+        )
 
     async def test_a_completed_responses_stream_names_the_route_that_served_it(self) -> None:
         """A Responses answer must reach the route trace as a success.
@@ -2121,37 +2125,7 @@ class HookStreamingResponseEventTests(HookTestCase):
         self.assertIsNone(normalized)
         self.assertIsNone(hooks._codex_repaired_function_arguments("not json at all"))
 
-    async def test_responses_delivery_keeps_arguments_it_cannot_repair(self) -> None:
-        """Unreadable arguments are delivered, never turned into a dead turn.
-
-        A tool call whose arguments no parser accepts is the request's own
-        shape, so it must not end the response: the Codex client treats a
-        failed terminal as fatal, which killed turns the model was still
-        writing.  The event travels as the upstream wrote it and the client's
-        own tolerant reader reports whatever it could not use.
-        """
-
-        hooks, _proxy_server = load_hook_module()
-        delivered = hooks._responses_stream_chunk_for_delivery(
-            {
-                "type": "response.function_call_arguments.done",
-                "output_index": 0,
-                "item_id": "call_bad",
-                "arguments": "{broken json",
-            },
-            {
-                "call_type": "aresponses",
-                "model": "default-chat",
-                "stream": True,
-                "input": "run a command",
-            },
-        )
-
-        self.assertEqual(delivered["type"], "response.function_call_arguments.done")
-        self.assertEqual(delivered["arguments"], "{broken json")
-        json.dumps(delivered)
-
-    async def test_guarded_responses_stream_fails_on_unrepairable_arguments(self) -> None:
+    async def test_guarded_responses_stream_keeps_unrepairable_arguments(self) -> None:
         hooks, _proxy_server = load_hook_module()
 
         async def upstream_stream():
@@ -2441,9 +2415,6 @@ class HookStreamingResponseEventTests(HookTestCase):
         self.assertEqual(types[-1], "response.completed")
         self.assertFalse(any(kind == "response.failed" for kind in types))
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class HookStreamingToolCallArgumentsTests(HookTestCase):
@@ -3894,17 +3865,29 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
 
         streaming_module = importlib.import_module("young_router.proxy.streaming")
         delivered: list[str] = []
+        # Snapshot taken the instant the upstream is asked for its next frame:
+        # anything the client does not hold by then was still being buffered.
+        delivered_before_next_frame: list[list[str]] = []
 
         async def upstream_stream():
-            yield {"choices": [{"index": 0, "delta": {"role": "assistant"}}]}
-            yield {"choices": [{"index": 0, "delta": {"reasoning_content": "step one"}}]}
-            yield {"choices": [{"index": 0, "delta": {"reasoning_content": "step two"}}]}
-            yield {"choices": [{"index": 0, "delta": {"content": "the answer"}}]}
-            yield {
-                "id": "chatcmpl-think",
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            }
+            frames = [
+                {"choices": [{"index": 0, "delta": {"role": "assistant"}}]},
+                {"choices": [{"index": 0, "delta": {"reasoning_content": "step one"}}]},
+                {"choices": [{"index": 0, "delta": {"reasoning_content": "step two"}}]},
+                {"choices": [{"index": 0, "delta": {"content": "the answer"}}]},
+                {
+                    "id": "chatcmpl-think",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                },
+            ]
+            for frame in frames:
+                yield frame
+                delivered_before_next_frame.append(list(delivered))
 
         request_data = {
             "model": "deepseek-v4.1-flash",
@@ -3927,6 +3910,18 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
                     # still producing it, not after the answer starts.
                     delivered.append("first-thinking-frame")
 
+        # Index 1 is the snapshot taken after the first thinking frame was
+        # produced and before the next one was requested.
+        self.assertTrue(
+            len(delivered_before_next_frame) > 1,
+            "the upstream stream never advanced past the first thinking frame",
+        )
+        self.assertIn(
+            "first-thinking-frame",
+            delivered_before_next_frame[1],
+            "the thinking frame was still held when the model moved on to the "
+            f"next one; delivered so far: {delivered_before_next_frame[1]}",
+        )
         self.assertIn("first-thinking-frame", delivered)
 
     def test_the_reasoning_predicate_reads_every_protocol_shape(self) -> None:
@@ -4332,11 +4327,24 @@ class StreamNoProgressWatchdogTests(HookTestCase):
 
     async def test_visible_frames_reset_the_budget(self) -> None:
         hooks, _proxy_server = load_hook_module()
+        from unittest import mock
         from young_router.proxy import streaming_recovery
+
+        clock = [0.0]
+
+        class FakeTime:
+            @staticmethod
+            def monotonic() -> float:
+                return clock[0]
 
         async def slow_but_alive():
             for index in range(4):
                 await asyncio.sleep(0.03)
+                # The clock advances only as frames are produced. Real time
+                # between frames must not be able to spend the budget, or a
+                # loaded host fails this as an idle timeout. Four advances
+                # still exceed the budget when the frames do not reset it.
+                clock[0] += 0.04
                 yield {
                     "type": "response.reasoning_summary_text.delta",
                     "delta": "thinking %d" % index,
@@ -4353,13 +4361,14 @@ class StreamNoProgressWatchdogTests(HookTestCase):
             },
         }
 
-        observed = [
-            chunk
-            async for chunk in streaming_recovery._yield_downstream_keepalive_stream(
-                slow_but_alive(),
-                request_data,
-            )
-        ]
+        with mock.patch.object(streaming_recovery, "time", FakeTime):
+            observed = [
+                chunk
+                async for chunk in streaming_recovery._yield_downstream_keepalive_stream(
+                    slow_but_alive(),
+                    request_data,
+                )
+            ]
 
         deltas = [
             chunk
@@ -4410,3 +4419,7 @@ class StreamNoProgressWatchdogTests(HookTestCase):
         response = chunks[-1]["response"]
         self.assertEqual("failed", response["status"])
         self.assertEqual("upstream_stream_idle_timeout", response["error"]["code"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -314,8 +314,24 @@ class ReasoningSummaryStreamTests(unittest.TestCase):
 
     def test_a_streamed_summary_owns_its_terminal_frames(self) -> None:
         texts: dict[str, str] = {}
-        seen = {"r1"}
+        seen: set[str] = set()
         done: set[str] = set()
+        upstream = _event(
+            {
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "r1",
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": "the upstream summary",
+            }
+        )
+        self.assertEqual(
+            [],
+            patches.reasoning_summary_chunks_for_delivery(
+                upstream, texts, seen, done
+            ),
+        )
+        self.assertIn("r1", seen)
         final = _event(
             {
                 "type": "response.content_part.done",
@@ -332,9 +348,6 @@ class ReasoningSummaryStreamTests(unittest.TestCase):
             ),
         )
         self.assertEqual({}, texts)
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ChatBridgeReasoningSummaryTests(unittest.IsolatedAsyncioTestCase):
@@ -566,3 +579,7 @@ class ReasoningPhaseStreamTests(unittest.TestCase):
                 if event["type"] == "response.reasoning_summary_text.delta"
             ],
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

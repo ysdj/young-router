@@ -386,24 +386,52 @@ class WorkBuddyProviderTests(unittest.TestCase):
         build behind the other.
         """
 
-        directory, domain, config = self._domain()
+        runtime = StubRuntime()
+        runtime.catalog = [
+            # The entry a staged library answers with ...
+            {
+                "id": "glm-5.3",
+                "name": "GLM-5.3",
+                "contextWindow": 1_000_000,
+                "maxTokens": 64_000,
+                "supportsImages": True,
+                "creditMultiplier": 0.79,
+            },
+            # ... and the raw document an older worker forwarded instead.
+            {
+                "id": "hy3",
+                "name": "Hy3",
+                "contextWindow": 192_000,
+                "maxTokens": 64_000,
+                "supportsImages": True,
+                "billing": {"credits": "x0.42 credits"},
+            },
+        ]
+        directory, domain, config = self._domain(runtime)
         with directory:
             provider = domain.dispatch("service_provider.add", {"kind": "workbuddy_login"})["providers"][0]
             provider_id = provider["id"]
-            # The catalog the staged library actually answers with.
             domain.dispatch("workbuddy_models", {"provider": "workbuddy"})
-            self.assertEqual(domain._published_rates, {"workbuddy": {"glm-5.3": 0.79, "hy3": 0.0}})
+            self.assertEqual(
+                domain._published_rates,
+                {"workbuddy": {"glm-5.3": 0.79, "hy3": 0.42}},
+            )
 
-            model_id = provider["models"][0]["id"]
+            # The route stated in the older spelling has to reach an order the
+            # same way, or a worker one build behind publishes rates nothing can
+            # follow.
+            legacy = next(model for model in provider["models"] if model["upstream_model"] == "hy3")
             domain.dispatch(
                 "model.patch",
-                {"provider_id": provider_id, "model_id": model_id, "changes": {"order_mode": "relay_multiplier"}},
+                {"provider_id": provider_id, "model_id": legacy["id"], "changes": {"order_mode": "relay_multiplier"}},
             )
-            followed = domain.snapshot()["providers"][0]["models"][0]
-            self.assertEqual(followed["effective_order"], 0.79)
+            followed = next(
+                model for model in domain.snapshot()["providers"][0]["models"] if model["id"] == legacy["id"]
+            )
+            self.assertEqual(followed["effective_order"], 0.42)
             self.assertTrue(domain.validate()["valid"])
             self.assertTrue(domain.apply()["applied"])
-            self.assertIn("order: 0.79", config.read_text(encoding="utf-8"))
+            self.assertIn("order: 0.42", config.read_text(encoding="utf-8"))
 
     def test_a_route_that_cannot_follow_a_rate_never_refuses_the_next_edit(self) -> None:
         """A dead-end draft is refused at its own edit, not at every later one.
@@ -532,9 +560,10 @@ class WorkBuddyProviderTests(unittest.TestCase):
             ROOT
             / "rn/.staging-cache/connect-workbuddy/lib/index.d.ts"
         )
-        if staged.exists():
-            declarations = staged.read_text(encoding="utf-8")
-            self.assertIn("creditMultiplier?: number;", declarations)
+        if not staged.exists():
+            self.skipTest("staged library absent")
+        declarations = staged.read_text(encoding="utf-8")
+        self.assertIn("creditMultiplier?: number;", declarations)
 
     def test_following_the_rate_learns_it_before_the_pane_ever_shows_it(self) -> None:
         """The rate arrives when it is asked for, not only when a pane read it.
@@ -603,17 +632,12 @@ class WorkBuddyProviderTests(unittest.TestCase):
     def test_provider_status_reports_an_unstaged_integration_as_unsupported(self) -> None:
         directory, domain, _config = self._domain(StubRuntime(available=False))
         with directory:
-            provider = domain.dispatch(
-                "provider.add",
-                {
-                    "provider": {
-                        "name": "Manual",
-                        "api_base": "https://api.example.test/v1",
-                        "models": [],
-                    }
-                },
-            )["providers"][0]
-            self.assertEqual(provider["auth_status"], "signed_out")
+            with mock.patch.object(workbuddy, "available", return_value=False):
+                provider = domain.dispatch(
+                    "service_provider.add",
+                    {"kind": "workbuddy_login", "models": []},
+                )["providers"][0]
+                self.assertEqual(provider["auth_status"], "unsupported")
 
     def test_workbuddy_status_and_models_answer_the_wizard(self) -> None:
         runtime = StubRuntime()
@@ -735,10 +759,8 @@ class WorkBuddyProviderTests(unittest.TestCase):
             self.assertEqual(
                 provider["extra"]["x-young-router-provider-auth"]["kind"], "workbuddy_login"
             )
-            self.assertEqual(
-                provider["models"][0]["upstream_url_surface"] if provider["models"] else "openai/chat",
-                "openai/chat",
-            )
+            self.assertTrue(provider["models"])
+            self.assertEqual(provider["models"][0]["upstream_url_surface"], "openai/chat")
 
     def test_a_live_read_never_advances_the_shared_revision(self) -> None:
         """A read that stages nothing is not a settings change.
@@ -820,11 +842,15 @@ class WorkBuddyProviderTests(unittest.TestCase):
             # 刷新 always reaches the worker.
             domain.dispatch("workbuddy_status", {"refresh": True})
             self.assertEqual(2, len(reads()))
-            # A window of 0 means a read on every entry.
+            # A window of 0 means a read on every entry.  The reader resolves
+            # the file through the environment, not beside this domain's
+            # config, so the fixture has to name it outright.
             settings = Path(directory.name) / "runtime-settings.env"
             settings.write_text("YOUNG_ROUTER_SERVICE_ACCOUNT_RECHECK_SECONDS=0\n", encoding="utf-8")
-            with mock.patch.object(
-                domain, "_workbuddy_recheck_seconds", return_value=0.0,
+            with mock.patch.dict(
+                os.environ,
+                {"YOUNG_ROUTER_RUNTIME_SETTINGS_FILE": str(settings)},
+                clear=False,
             ):
                 domain.dispatch("workbuddy_status", {"refresh": False})
             self.assertEqual(3, len(reads()))
@@ -835,7 +861,18 @@ class WorkBuddyProviderTests(unittest.TestCase):
         runtime = StubRuntime()
         directory, domain, _config = self._domain(runtime)
         with directory:
-            self.assertEqual(60.0, domain.snapshot()["service_account_recheck_seconds"])
+            # The default is read from the installation's settings file, so
+            # name one that does not exist instead of reading the runner's.
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "YOUNG_ROUTER_RUNTIME_SETTINGS_FILE": str(
+                        Path(directory.name) / "runtime-settings.env"
+                    )
+                },
+                clear=False,
+            ):
+                self.assertEqual(60.0, domain.snapshot()["service_account_recheck_seconds"])
             domain.dispatch("service_provider.add", {"kind": "workbuddy_login", "models": []})
             provider = domain.snapshot()["providers"][0]
             self.assertIsInstance(provider["auth_observed_seconds_ago"], float)
@@ -867,6 +904,22 @@ class WorkBuddyProviderTests(unittest.TestCase):
                 self.assertEqual(provider["auth_status"], "signed_in")
                 self.assertEqual(provider["auth_observed"]["nickname"], "Example User")
             self.assertEqual(len(runtime.calls), before)
+
+    def test_a_service_snapshot_summary_preserves_slash_bearing_upstream_ids(self) -> None:
+        """Compact summaries use the same transport-prefix rule as detail rows."""
+
+        model = {
+            "deployment_id": "slash-route",
+            "model_name": "slash-route",
+            "litellm_model": "openrouter/free",
+        }
+        summary = CoreStore._providers_summary(
+            {"providers_models": {"providers": [{"name": "relay", "models": [model]}]}}
+        )
+        self.assertEqual(
+            "openrouter/free",
+            summary["providers"][0]["models"][0]["upstream_model"],
+        )
 
     def test_a_service_snapshot_summary_carries_the_account_it_observed(self) -> None:
         """The summary a window reads states the account Core last observed.
@@ -924,11 +977,15 @@ class WorkBuddyProviderTests(unittest.TestCase):
     def test_a_snapshot_states_nothing_it_has_not_observed(self) -> None:
         """A signed-out projection is not a stale success."""
 
-        runtime = StubRuntime(state="signed-out")
+        runtime = StubRuntime()
         directory, domain, _config = self._domain(runtime)
         with directory:
+            domain.dispatch("service_provider.add", {"kind": "workbuddy_login", "models": []})
+            self.assertEqual(domain.snapshot()["providers"][0]["auth_status"], "signed_in")
+            runtime.state = "signed-out"
             domain.dispatch("workbuddy_status", {"refresh": True})
-            self.assertEqual(domain.snapshot()["providers"], [])
+            provider = domain.snapshot()["providers"][0]
+            self.assertEqual(provider["auth_status"], "signed_out")
 
     def test_a_read_that_never_observed_the_worker_stays_unstated(self) -> None:
         """With no live read, Core says nothing rather than guessing."""

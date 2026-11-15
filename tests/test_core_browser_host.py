@@ -16,25 +16,20 @@ from __future__ import annotations
 
 import base64
 import http.client
-import io
 import json
 import os
 from pathlib import Path
-import socket
 import tempfile
 import threading
 import time
 import unittest
-import urllib.error
-import urllib.request
 
 from young_router.core import CoreIPCServer, CoreStore, IPCError, MemoryDomain
 from young_router.core import __main__ as core_main
 from unittest import mock
 
-from young_router.core import ipc, relay_browser, relay_mirror
+from young_router.core import relay_browser, relay_mirror
 from young_router.core.service import BROWSER_LOGIN_REAP_SECONDS
-from urllib.parse import urlsplit
 from young_router.core.domains.relay_accounts import RelayAccountsDomain, RelayAccountsError, RelaySessionLimitError
 from young_router.core.domains.runtime import RuntimeSettingsDomain, WEB_PASSWORD_SETTING
 from young_router.core.ipc import (
@@ -960,10 +955,6 @@ class BrowserFileCapabilityTests(unittest.TestCase):
         self.server.enable_web_host(root, password="preview-password")
         self.cookie = _login(self.server, "preview-password")
 
-    def _session(self) -> str:
-        _status, headers, _body = _hello(self.server, bootstrap=self.server.bootstrap_token)
-        return headers["x-litellm-core-session"]
-
     def _post(self, path: str, body: dict[str, object], *, session: str | None = None) -> tuple[int, dict[str, object]]:
         endpoint = self.server.endpoint
         connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=5)
@@ -989,11 +980,16 @@ class BrowserFileCapabilityTests(unittest.TestCase):
         self.assertFalse(path.exists())
 
     def test_upload_rejects_wrong_size_and_unsupported_type(self) -> None:
-        for name, size, content in (("example.json", 4, b"{}"), ("example.html", 2, b"{}"), ("example.json", 2, b"not base64")):
+        for name, size, content in (("example.json", 4, b"{}"), ("example.html", 2, b"{}")):
             with self.subTest(name=name, size=size):
                 status, answer = self._post("/ipc/host/file-upload", {"purpose": "import", "name": name, "size": size, "data": base64.b64encode(content).decode()})
                 self.assertEqual(400, status)
                 self.assertEqual("invalid_file_capability", answer["error"]["code"])
+        # The route decodes with `validate=True`; encoding this first would make
+        # it valid base64 and exercise the size check instead.
+        status, answer = self._post("/ipc/host/file-upload", {"purpose": "import", "name": "example.json", "size": 2, "data": "not base64"})
+        self.assertEqual(400, status)
+        self.assertEqual("invalid_file_capability", answer["error"]["code"])
 
     def test_download_returns_written_bytes_once_to_the_owning_session(self) -> None:
         status, answer = self._post("/ipc/host/file-download", {"purpose": "export", "name": "example.json"})
@@ -1009,11 +1005,11 @@ class BrowserFileCapabilityTests(unittest.TestCase):
     def test_download_is_not_shared_with_another_session(self) -> None:
         _status, answer = self._post("/ipc/host/file-download", {"purpose": "export", "name": "example.json"})
         token = answer["token"]
-        other = _login(self.server, "preview-password")
+        other = _login(self.server, "preview-password").split("=", 1)[1]
         self.assertNotEqual(self.cookie.split("=", 1)[1], other)
         status, answer = self._post("/ipc/host/file-download", {"token": token}, session=other)
-        self.assertIn(status, (400, 401))
-        self.assertIn(answer["error"]["code"], ("invalid_file_capability", "unauthorized"))
+        self.assertEqual(400, status)
+        self.assertEqual("invalid_file_capability", answer["error"]["code"])
 
 
 class BrowserLoginItemTests(unittest.TestCase):
@@ -1340,7 +1336,8 @@ class BrowserRelaySignInTests(unittest.TestCase):
         password" and "the station's own page, with its captcha".
         """
 
-        with mock.patch.object(relay_browser, "launch", side_effect=relay_browser.BrowserLaunchFailed("no chrome here")):
+        with mock.patch.object(relay_browser, "unavailable_reason", return_value=""), \
+             mock.patch.object(relay_browser, "launch", side_effect=relay_browser.BrowserLaunchFailed("no chrome here")):
             answered = self.core.start_relay_browser_login(
                 account_id="login-browser-0123456789abcdef",
                 account_type="newapi",
@@ -1362,7 +1359,8 @@ class BrowserRelaySignInTests(unittest.TestCase):
         browser.browser.name = "Chromium"
         browser.mirror = mock.Mock(width=560, height=820)
         browser.expired = False
-        with mock.patch.object(relay_browser, "launch", return_value=browser), \
+        with mock.patch.object(relay_browser, "unavailable_reason", return_value=""), \
+             mock.patch.object(relay_browser, "launch", return_value=browser), \
              mock.patch.object(relay_browser, "embedded_display", return_value=True):
             answered = self.core.start_relay_browser_login(
                 account_id="login-browser-0123456789abcdef",
@@ -1416,6 +1414,76 @@ class BrowserRelaySignInTests(unittest.TestCase):
             read = [entry for entry in self.reads if entry[1] == "/api/user/self"][-1]
             self.assertEqual(cookie, read[2].get("Cookie"))
             self.assertEqual("7", read[2].get("New-Api-User"))
+
+    def _jar_entry(self) -> dict[str, object]:
+        class Browser:
+            def cookies(self) -> list[object]:
+                return []
+
+            def storage(self) -> dict[str, str]:
+                return {}
+
+        return {"browser": Browser(), "origin": "https://relay.example.test", "type": "newapi", "last_cookie": ""}
+
+    def test_a_jar_the_station_never_answered_for_is_offered_again(self) -> None:
+        """A request that never got an answer says nothing about the jar.
+
+        The jar was remembered before the station was asked, so one network
+        blip on the poll that first saw the finished login left that jar marked
+        as already offered.  The jar is final by then -- it never changes again
+        -- so every later poll skipped it and the window waited forever.
+        """
+
+        from young_router.core.domains.relay_accounts import RelayTransportError
+
+        entry = self._jar_entry()
+        answers: list[object] = [
+            RelayTransportError(),
+            {"username": "window-user", "cookie": "session=jar", "user_id": "7"},
+        ]
+        asked: list[str] = []
+
+        def verify(**arguments: str) -> object:
+            asked.append(arguments["cookie"])
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        with mock.patch.object(relay_browser, "cookie_header", return_value="session=jar"), mock.patch.object(
+            self.relay, "verify_browser_session", verify
+        ), mock.patch.object(
+            self.core, "_accept_browser_session", lambda _entry, verified: {"status": "signed_in", **verified}
+        ):
+            self.assertIsNone(self.core._verify_browser_jar("login", entry))
+            # Not on the very next poll: an unreachable station is not asked
+            # once a second.
+            self.assertIsNone(self.core._verify_browser_jar("login", entry))
+            self.assertEqual(1, len(asked))
+            entry["jar_retry_at"] = 0.0
+            outcome = self.core._verify_browser_jar("login", entry)
+
+        assert outcome is not None
+        self.assertEqual("signed_in", outcome["status"])
+        self.assertEqual(2, len(asked))
+
+    def test_a_jar_the_station_refused_is_not_offered_twice(self) -> None:
+        from young_router.core.domains.relay_accounts import RelayAccountsError
+
+        entry = self._jar_entry()
+        asked: list[str] = []
+
+        def refuse(**arguments: str) -> object:
+            asked.append(arguments["cookie"])
+            raise RelayAccountsError("Relay session is not signed in")
+
+        with mock.patch.object(relay_browser, "cookie_header", return_value="session=jar"), mock.patch.object(
+            self.relay, "verify_browser_session", refuse
+        ):
+            for _ in range(3):
+                self.assertIsNone(self.core._verify_browser_jar("login", entry))
+
+        self.assertEqual(1, len(asked), "a refused jar was sent to the station again")
 
     def test_a_copy_still_works_on_a_page_with_no_clipboard_api(self) -> None:
         """A page published over plain HTTP has no `navigator.clipboard`.
@@ -1692,21 +1760,46 @@ class MirrorTests(unittest.TestCase):
 class MirrorFrameTests(unittest.TestCase):
     """The stream and the input path, through Core's own listener."""
 
-    def _frame_call(self, mirror: object) -> dict:
-        """One answer from `/ipc/host/relay/browser/frames`, without a server."""
+    def _frame_call(self, server: CoreIPCServer, session: str, since: int) -> dict[str, object]:
+        """One answer from `/ipc/host/relay/browser/frames`."""
 
-        server = CoreIPCServer.__new__(CoreIPCServer)
-        server.core = mock.Mock()
-        server.core.relay_browser_mirror = mock.Mock(return_value=mock.Mock(mirror=mirror, port=1, origin="https://example.org"))
-        return {"core": server.core}
+        endpoint = server.endpoint
+        connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=5)
+        try:
+            connection.request(
+                "POST",
+                "/ipc/host/relay/browser/frames",
+                body=json.dumps({"login_id": "frame-login", "since": since}),
+                headers={"Content-Type": "application/json", "Cookie": f"yr-core-session={session}"},
+            )
+            response = connection.getresponse()
+            self.assertEqual(200, response.status)
+            return json.loads(response.read())
+        finally:
+            connection.close()
 
     def test_a_frame_is_base64_and_an_idle_poll_carries_none(self) -> None:
+        core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
+        server = CoreIPCServer(core)
+        server.start()
+        self.addCleanup(server.stop)
+        _status, headers, _body = _hello(server, bootstrap=server.bootstrap_token)
+        session = headers["x-litellm-core-session"]
         mirror = mock.Mock(width=560, height=820)
-        mirror.latest = mock.Mock(return_value=(4, b"jpeg"))
-        then = mock.Mock(width=560, height=820)
-        then.latest = mock.Mock(return_value=(4, b""))
-        self.assertEqual(b"jpeg", base64.b64decode(base64.b64encode(mirror.latest(3)[1])))
-        self.assertEqual(b"", then.latest(4)[1])
+        mirror.latest = mock.Mock(side_effect=[(4, b"jpeg"), (4, b"")])
+        core._browser_logins["frame-login"] = {
+            "browser": mock.Mock(mirror=mirror, port=1, origin="https://example.org", expired=False),
+        }
+
+        answer = self._frame_call(server, session, 0)
+        self.assertEqual("frame", answer["status"])
+        self.assertEqual(4, answer["seq"])
+        self.assertEqual(b"jpeg", base64.b64decode(answer["frame"]))
+
+        idle = self._frame_call(server, session, answer["seq"])
+        self.assertEqual("idle", idle["status"])
+        self.assertEqual(4, idle["seq"])
+        self.assertNotIn("frame", idle)
 
     def test_the_page_surface_draws_frames_and_forwards_input(self) -> None:
         shared = Path(__file__).resolve().parents[1] / "rn/packages/shared/src"

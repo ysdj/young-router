@@ -99,10 +99,17 @@ class ProviderConfigPathTests(unittest.TestCase):
         profile deliberately named.
         """
 
-        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
-            os.environ, {"LITELLM_CONFIG_FILE": str(Path(directory) / "config.yaml")}
-        ):
-            self.assertIsNone(config_paths.stale_document(Path(directory)))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            chosen = root / "config.yaml"
+            chosen.write_text("model_list: []\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"LITELLM_CONFIG_FILE": str(chosen)}):
+                self.assertIsNone(config_paths.stale_document(root))
+            # Unset, the same file is reported, so the check above is about the
+            # setting rather than a file that was never there.
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("LITELLM_CONFIG_FILE", None)
+                self.assertEqual(chosen, config_paths.stale_document(root))
 
 
 class StagingRefusesARetiredDocumentTests(unittest.TestCase):
@@ -141,9 +148,6 @@ class StagingRefusesARetiredDocumentTests(unittest.TestCase):
             "Provider/model configuration is unavailable", str(raised.exception)
         )
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ProviderChannelTagTests(unittest.TestCase):
@@ -203,3 +207,7 @@ class RuntimeSettingsPathTests(unittest.TestCase):
 
         with mock.patch.dict(os.environ, {"YOUNG_ROUTER_RUNTIME_SETTINGS_FILE": "/tmp/one-file.env"}, clear=False):
             self.assertEqual(Path("/tmp/one-file.env"), runtime_settings_path_for("/tmp/installation"))
+
+
+if __name__ == "__main__":
+    unittest.main()

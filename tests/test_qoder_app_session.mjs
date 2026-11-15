@@ -54,7 +54,7 @@ assert.equal(
 // A key derived from the wrong password is "no session", never a crash or a
 // half-decoded buffer that would later be parsed into a session.
 assert.equal(
-  sessions.decryptEnvelope(macBlob, sessions.chromiusKeyFromPassword('another-password')),
+  sessions.decryptEnvelope(macBlob, sessions.chromiumKeyFromPassword('another-password')),
   undefined,
 )
 

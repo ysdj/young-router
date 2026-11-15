@@ -634,9 +634,11 @@ class HookStreamingToolEventTests(HookTestCase):
         self.assertNotIn(marker, json.dumps(chunks, ensure_ascii=False))
         self.assertNotIn(".\n\n", json.dumps(chunks, ensure_ascii=False))
 
-    async def test_guarded_responses_stream_error_after_search_tool_only_output_recovers(self) -> None:
+    async def test_guarded_responses_stream_error_after_search_tool_only_output_does_not_recover(self) -> None:
         hooks, proxy_server = load_hook_module()
         recovery_calls = []
+        # A web_search_call-only prefix is not deliverable recovery output, so the
+        # router must never be asked to replay it and this answer must not surface.
 
         async def recovery_stream():
             yield {

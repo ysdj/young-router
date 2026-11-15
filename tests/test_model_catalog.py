@@ -177,6 +177,26 @@ class ModelCatalogTests(unittest.TestCase):
             _number_text_for_schema(base_module._STREAM_KEEPALIVE_DEFAULT_INTERVAL_SECONDS),
             defaults_by_key["YOUNG_ROUTER_STREAM_KEEPALIVE_INTERVAL_SECONDS"],
         )
+        # A value at its schema default is not written to the settings file, so
+        # the number the pane shows is only true while the proxy's own fallback
+        # agrees with it.  These two were raised to 300 s in the proxy while the
+        # pane kept saying 120 -- and 120 could not be stored, being "default".
+        self.assertEqual(
+            _number_text_for_schema(base_module._STREAM_START_TIMEOUT_DEFAULT_SECONDS),
+            defaults_by_key["YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS"],
+        )
+        self.assertEqual(
+            _number_text_for_schema(base_module._STALL_TIMEOUT_DEFAULT_SECONDS),
+            defaults_by_key["YOUNG_ROUTER_STALL_TIMEOUT_SECONDS"],
+        )
+        # The model probe states the same first-event budget a third time, as
+        # the fallback it uses when no settings file can be read.
+        from young_router.core.domains.providers_models import ProvidersModelsDomain
+
+        self.assertEqual(
+            base_module._STREAM_START_TIMEOUT_DEFAULT_SECONDS,
+            ProvidersModelsDomain._MODEL_PROBE_TIMEOUT_SECONDS,
+        )
         self.assertEqual(
             str(DEFAULT_LOG_BACKUP_SEGMENTS),
             defaults_by_key["YOUNG_ROUTER_LOG_BACKUP_SEGMENTS"],
@@ -305,6 +325,9 @@ class ModelCatalogTests(unittest.TestCase):
     def test_catalog_round_trip_and_invalid_file_are_distinct(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "catalog.json"
+            write_catalog(path, ["5.6 Sol"])
+            self.assertEqual(["5.6 Sol"], catalog_model_names(path))
+            path.write_text('{"models":[{}]}\n', encoding="utf-8")
             self.assertIsNone(catalog_model_names(path))
 
     def test_inherited_profile_follows_the_clients_declared_hierarchy(self) -> None:
@@ -764,8 +787,6 @@ class ModelCatalogTests(unittest.TestCase):
             "slug": "gpt-5.6-sol",
             "base_instructions": "Native prompt",
             "model_messages": {"instructions_template": "Native prompt"},
-            "supports_search_tool": True,
-            "web_search_tool_type": "text_and_image",
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -803,15 +824,15 @@ class ModelCatalogTests(unittest.TestCase):
                 model = catalog_payload(["gpt-5-test"], registry=registry)["models"][0]
 
         self.assertTrue(model["supports_search_tool"])
-        self.assertEqual("text_and_image", model["web_search_tool_type"])
+        # The native path must not invent the bridge's optional search type.
+        self.assertNotIn("web_search_tool_type", model)
 
     def test_non_gpt_route_advertises_the_gateway_search_bridge(self) -> None:
+        # The bridge must add the search fields; the inherited profile states neither.
         native_profile = {
             "slug": "gpt-5.6-sol",
             "base_instructions": "Native prompt",
             "model_messages": {"instructions_template": "Native prompt"},
-            "supports_search_tool": True,
-            "web_search_tool_type": "text_and_image",
         }
         with tempfile.TemporaryDirectory() as directory:
             runtime = Path(directory) / "config.yaml"
@@ -833,12 +854,11 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual("text_and_image", model["web_search_tool_type"])
 
     def test_explicit_false_native_capability_keeps_the_gateway_search_bridge(self) -> None:
+        # The bridge must add the search fields; the inherited profile states neither.
         native_profile = {
             "slug": "gpt-5.6-sol",
             "base_instructions": "Native prompt",
             "model_messages": {"instructions_template": "Native prompt"},
-            "supports_search_tool": True,
-            "web_search_tool_type": "text_and_image",
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -917,8 +937,6 @@ class ModelCatalogTests(unittest.TestCase):
             "slug": "gpt-5.6-sol",
             "base_instructions": "Native prompt",
             "model_messages": {"instructions_template": "Native prompt"},
-            "supports_search_tool": True,
-            "web_search_tool_type": "text_and_image",
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -957,7 +975,8 @@ class ModelCatalogTests(unittest.TestCase):
                 model = catalog_payload(["third-party-alias"], registry=registry)["models"][0]
 
         self.assertTrue(model["supports_search_tool"])
-        self.assertEqual("text_and_image", model["web_search_tool_type"])
+        # The native path must not invent the bridge's optional search type.
+        self.assertNotIn("web_search_tool_type", model)
 
     def test_search_tool_advertisement_keeps_native_profile_without_route_config(self) -> None:
         native_profile = {
@@ -1635,6 +1654,38 @@ class SharedContextCacheTests(unittest.TestCase):
         self.assertEqual(200_000, effective.context_window)
         self.assertEqual(1_048_576, default.context_window)
 
+    def test_copies_that_agree_on_nothing_leave_the_selected_record_its_ladder(self) -> None:
+        """A merge that declines must not erase what the selected copy states.
+
+        When no level is served by a majority of the copies, the merge answers
+        nothing "so the caller keeps the record it already selected".  The
+        caller cleared that record's reasoning keys before applying the (empty)
+        answer, so the route was left with no reasoning metadata at all and the
+        whole group published no levels.
+        """
+
+        def copy(served: str) -> dict[str, object]:
+            levels: dict[str, str | None] = {
+                level: None for level in ("off", "minimal", "low", "medium", "high")
+            }
+            levels[served] = served
+            record = self._profile(200_000)
+            record["reasoning"] = True
+            record["thinking_level_map"] = levels
+            return record
+
+        records = {"vendor-a/model-x": copy("low"), "vendor-b/model-x": copy("medium")}
+        self.assertEqual({}, model_contexts_module._consensus_reasoning(list(records.values())))
+
+        selected = model_contexts_module._lookup(records, "model-x")
+
+        assert selected is not None
+        self.assertTrue(selected["reasoning"])
+        self.assertEqual("low", selected["thinking_level_map"]["low"])
+        capability = model_contexts_module._reasoning_capability(selected)
+        assert capability is not None
+        self.assertEqual(("low",), capability.supported_levels)
+
     def test_a_relay_model_publishes_the_ladder_its_copies_agree_on(self) -> None:
         """One provider copy may not decide a relay model's thinking for the route.
 
@@ -2174,6 +2225,9 @@ class SharedContextCacheTests(unittest.TestCase):
                 self.assertEqual(
                     0, first.default_record_for("vendor/new-generator").context_window
                 )
+                # The negative is recorded too, so a chat route is never re-asked
+                # and never loses its window to a stale positive.
+                first.remember_image_generator(["vendor/new-chat"], generator=False)
 
             # A restart reads the same finding from the shared cache; no probe
             # runs in this process at all.
@@ -2181,9 +2235,10 @@ class SharedContextCacheTests(unittest.TestCase):
             self.assertEqual(
                 0, second.default_record_for("vendor/new-generator").context_window
             )
-            # The negative is recorded too, so a chat route is never re-asked
-            # and never loses its window to a stale positive.
-            self.assertFalse(second.is_remembered_image_generator(["vendor/new-chat"]))
+            # The accessor answers False for an id that was never asked, so read
+            # the cache to prove the negative itself was recorded.
+            persisted = json.loads(cache.read_text(encoding="utf-8"))["image_generators"]
+            self.assertIs(False, persisted["vendor/new-chat"])
 
     def test_a_recorded_negative_keeps_a_chat_route_a_chat_route(self) -> None:
         """``generator=False`` is evidence, not an absence of evidence."""
@@ -2192,14 +2247,14 @@ class SharedContextCacheTests(unittest.TestCase):
             cache = Path(directory) / "model-contexts.json"
             cache.write_text(json.dumps(self._cache({})), encoding="utf-8")
             registry = ModelContextRegistry(cache_path=cache, refresh_enabled=False)
-            with mock.patch.object(
-                model_contexts_module, "_litellm_states_image_generation", return_value=True
-            ):
-                registry.remember_image_generator(["openai/relay-chat"], generator=False)
-            self.assertFalse(registry.is_remembered_image_generator(["openai/relay-chat"]))
+            registry.remember_image_generator(["openai/relay-chat"], generator=False)
+            # The accessor answers False for an id that was never asked, so read
+            # the cache to prove the negative itself was recorded.
+            persisted = json.loads(cache.read_text(encoding="utf-8"))["image_generators"]
+            self.assertIs(False, persisted["openai/relay-chat"])
             # The finding is remembered under the route's own spellings, and
             # only those: a probe is a statement about one model.
-            self.assertFalse(registry.is_remembered_image_generator(["relay-chat"]))
+            self.assertIs(False, persisted["relay-chat"])
 
     def test_a_generator_publishes_no_reasoning_ladder_in_the_catalog(self) -> None:
         """A generator is not a conversation, and its entry states no window.

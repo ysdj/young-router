@@ -304,8 +304,10 @@ class SiteCustomizeTests(unittest.TestCase):
         #   ImportError: Could not import image_generation_routing_hook from
         #   young_router.callbacks
         #
-        # Every module that imports it now guards the import, which is the
-        # pattern ``log_rotation`` and ``core/domains/logs`` already used.
+        # The proxy's shared state has since moved to the store, so only
+        # ``log_rotation`` still locks with ``fcntl``, behind a guarded import.
+        # What this pins is unchanged: the graph the callback pulls in imports
+        # where the module does not exist.
         self.require_litellm()
         with tempfile.TemporaryDirectory() as temp_dir:
             runtime = Path(temp_dir) / "runtime"
@@ -333,7 +335,7 @@ class SiteCustomizeTests(unittest.TestCase):
                     from young_router.core.domains import logs
 
                     print(type(image_generation_routing_hook).__name__)
-                    print(base.fcntl, state.fcntl, log_rotation.fcntl, logs.fcntl)
+                    print(log_rotation.fcntl)
                     """
                 ),
                 extra_env={"YOUNG_ROUTER_PROXY_PROCESS": "1"},
@@ -342,7 +344,7 @@ class SiteCustomizeTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             output = result.stdout.split()
             self.assertEqual(output[0], "YoungRouterHook")
-            self.assertEqual(output[1:], ["None"] * 4)
+            self.assertEqual(output[1:], ["None"])
 
     def test_proxy_console_lines_receive_utc_timestamps(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -480,6 +482,85 @@ class SiteCustomizeTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), "False")
+
+    def test_every_patch_registered_for_one_module_runs(self) -> None:
+        # The import system takes the first finder that answers and never asks
+        # another.  Three installers were once registered for ``uvicorn``, each
+        # with a finder of its own, so only the last one registered ever ran
+        # and the other two sat on ``sys.meta_path`` for the life of the
+        # process.  A second registration now joins the first one's finder.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Path(temp_dir) / "runtime"
+            runtime.mkdir()
+
+            result = self.run_probe(
+                runtime=runtime,
+                template=ROOT,
+                pythonpath_extra=[],
+                code=textwrap.dedent(
+                    """
+                    import sys
+                    import sitecustomize
+
+                    calls = []
+                    sitecustomize._patch_after_import("colorsys", lambda module: calls.append("first"))
+                    sitecustomize._patch_after_import("colorsys", lambda module: calls.append("second"))
+                    import colorsys
+
+                    sitecustomize._patch_after_import("colorsys", lambda module: calls.append("late"))
+                    pending = [
+                        finder
+                        for finder in sys.meta_path
+                        if getattr(finder, "_module_name", None) == "colorsys"
+                    ]
+                    print(",".join(calls), len(pending))
+                    """
+                ),
+                extra_env={"YOUNG_ROUTER_PROXY_PROCESS": "1"},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "first,second,late 0")
+
+    def test_importing_uvicorn_does_not_load_the_proxy_runtime(self) -> None:
+        # The launcher imports uvicorn while its forkserver preloads the whole
+        # LiteLLM runtime.  A hook on that import that reached
+        # ``young_router.proxy.base`` would load the runtime a second time in
+        # the launcher itself, which is what ``launcher_settings`` exists to
+        # prevent -- so the one patch hung on ``import uvicorn`` stays
+        # stdlib-only, and nothing is left waiting on ``sys.meta_path``.
+        self.require_uvicorn()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Path(temp_dir) / "runtime"
+            runtime.mkdir()
+
+            result = self.run_probe(
+                runtime=runtime,
+                template=ROOT,
+                pythonpath_extra=[],
+                code=textwrap.dedent(
+                    """
+                    import sys
+                    import uvicorn.server
+
+                    stranded = [
+                        finder
+                        for finder in sys.meta_path
+                        if getattr(finder, "_module_name", None) == "uvicorn"
+                    ]
+                    print(
+                        "litellm" in sys.modules,
+                        "young_router.proxy.base" in sys.modules,
+                        len(stranded),
+                        getattr(uvicorn.server.Server.main_loop, "_young_router_idle_tick_patch", False),
+                    )
+                    """
+                ),
+                extra_env={"YOUNG_ROUTER_PROXY_PROCESS": "1"},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "False False 0 True")
 
     def test_non_proxy_python_keeps_upstream_serve_loops(self) -> None:
         self.require_uvicorn()
@@ -715,7 +796,9 @@ class SiteCustomizeTests(unittest.TestCase):
         expected = str(Path(temp_dir) / "startup-cache")
         self.assertEqual(result.stdout.strip().splitlines(), [expected, expected])
         self.assertEqual(in_bundle, [])
-        environment["YOUNG_ROUTER_PYCACHE_DIR"] = str(Path(temp_dir) / "state" / "pycache")
+        # Leave only the runtime root so the derived cache location is what
+        # the interpreter reports: an explicit cache dir would answer instead.
+        environment.pop("YOUNG_ROUTER_PYCACHE_DIR", None)
         environment["LITELLM_RUNTIME_ROOT"] = str(Path(temp_dir) / "state")
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         result = subprocess.run(

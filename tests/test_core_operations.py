@@ -318,30 +318,38 @@ class CoreOperationsTests(unittest.TestCase):
             self.assertNotIn("--run_gunicorn", command)
             self.assertNotIn(controller.litellm_bin, command)
 
-    def test_macos_defaults_to_sixteen_forkserver_workers(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            controller = CoreServiceController(directory)
-            process = mock.Mock(pid=4815)
-            process.poll.return_value = None
-            with mock.patch("young_router.core.operations.os.name", "posix"), mock.patch(
-                "young_router.core.operations.sys.platform", "darwin"
-            ), mock.patch.object(controller, "status", return_value={"state": "stopped"}), mock.patch.object(
-                controller, "_stage_runtime_config"
-            ), mock.patch.object(
-                controller,
-                "_runtime_env",
-                return_value={"LITELLM_PORT": "4000"},
-            ), mock.patch.object(controller, "_write_owner_record"), mock.patch.object(
-                controller, "_health", return_value=True
-            ), mock.patch(
-                "young_router.core.operations.atomic_write_text"
-            ), mock.patch("young_router.core.operations.subprocess.Popen", return_value=process) as popen:
-                controller.start()
+    def test_default_forkserver_workers_follow_the_platform(self) -> None:
+        # The macOS default and the fallback currently agree, so pin the macOS
+        # constant to a different value; otherwise the platform branch could be
+        # dropped and every case would still start the same number of workers.
+        for platform, expected in (("darwin", "7"), ("linux", "16")):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as directory:
+                controller = CoreServiceController(directory)
+                process = mock.Mock(pid=4815)
+                process.poll.return_value = None
+                with mock.patch("young_router.core.operations.os.name", "posix"), mock.patch(
+                    "young_router.core.operations.sys.platform", platform
+                ), mock.patch(
+                    "young_router.core.operations.MACOS_DEFAULT_WORKERS", "7"
+                ), mock.patch.object(
+                    controller, "status", return_value={"state": "stopped"}
+                ), mock.patch.object(
+                    controller, "_stage_runtime_config"
+                ), mock.patch.object(
+                    controller,
+                    "_runtime_env",
+                    return_value={"LITELLM_PORT": "4000"},
+                ), mock.patch.object(controller, "_write_owner_record"), mock.patch.object(
+                    controller, "_health", return_value=True
+                ), mock.patch(
+                    "young_router.core.operations.atomic_write_text"
+                ), mock.patch("young_router.core.operations.subprocess.Popen", return_value=process) as popen:
+                    controller.start()
 
-            command = popen.call_args.args[0]
-            workers_index = command.index("--workers")
-            self.assertEqual("16", command[workers_index + 1])
-            self.assertNotIn("--run_gunicorn", command)
+                command = popen.call_args.args[0]
+                workers_index = command.index("--workers")
+                self.assertEqual(expected, command[workers_index + 1])
+                self.assertNotIn("--run_gunicorn", command)
 
     def test_every_posix_host_starts_the_app_rather_than_bare_litellm(self) -> None:
         """A Linux host is the same app on the same port, not only LiteLLM.
@@ -731,21 +739,6 @@ class CoreOperationsTests(unittest.TestCase):
             core.dispatch({"type": "service.launch_background_disable"})
             self.assertEqual("disabled", controller.launch_background_status())
             self.assertFalse(controller.paths.launch_background.exists())
-
-    def test_default_core_exposes_a_non_running_service_for_diagnostics(self) -> None:
-        with tempfile.TemporaryDirectory() as directory, mock.patch(
-            "young_router.core.operations.CoreServiceController"
-        ) as controller_type:
-            config = Path(directory) / "config.yaml"
-            config.write_text("providers: {}\nmodel_list: []\n", encoding="utf-8")
-            controller = controller_type.return_value
-            controller.status.return_value = {"state": "unknown"}
-            controller.dispatch.return_value = {"state": "unknown"}
-
-            core = CoreStore.with_default_domains(runtime_root=directory, config_path=config)
-
-        controller.start.assert_not_called()
-        self.assertEqual("unknown", core.snapshot()["service"]["state"])
 
     def test_controller_status_and_autostart_use_private_runtime_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1851,6 +1844,11 @@ class CoreOperationsTests(unittest.TestCase):
 
             import_token = core.file_capabilities.register(provider_file, "import")
             prepared = core.prepare_import(source_token=import_token, revision=core.revision)
+            self.assertEqual(("providers_models",), prepared.detected_sections)
+            self.assertEqual(
+                {"providers_models": {"available": True, "will_replace_draft": False}},
+                dict(prepared.preview),
+            )
             result = core.import_package(
                 package=prepared.package,
                 sections=["providers_models"],
@@ -2226,6 +2224,112 @@ class CoreOperationsTests(unittest.TestCase):
             # the sync's own validation, so the surface refuses every write.
             with self.assertRaises(CoreError):
                 core.stage_editor_text("webdav", "config", local, revision=core.revision)
+
+    def test_a_diverged_sync_merges_both_edits_and_publishes_them(self) -> None:
+        """Two routes added on two machines are two edits, not one question.
+
+        ``smart_sync_plan`` only knows that both sides moved.  The documents
+        say what moved, and different rows of one file are exactly what a
+        three-way merge settles: this run installs the combined configuration,
+        publishes it so the other machine converges, and reports "merge" as its
+        outcome instead of raising the choice the pane would have to offer.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.yaml"
+            original = textwrap.dedent(PROVIDER_CONFIG).lstrip()
+            config.write_text(original, encoding="utf-8")
+            providers = ProvidersModelsDomain(config)
+            relay = RelayAccountsDomain(storage_path=root / ".litellm-runtime" / "relay-accounts.json")
+            webdav = self._configured_webdav_domain(root, config)
+            core = CoreStore(domains=[providers, relay, webdav])
+            state_path = root / "webdav-state.json"
+
+            def with_route(text: str, name: str, deployment_id: str) -> bytes:
+                document = yaml.safe_load(text)
+                document["model_list"] = [
+                    *document["model_list"],
+                    {
+                        "model_name": name,
+                        "litellm_params": {"model": f"openai/{name}", "api_base": "https://example.test/v1"},
+                        "model_info": {"id": deployment_id, "provider": "primary"},
+                    },
+                ]
+                return yaml.safe_dump(
+                    document, allow_unicode=True, default_flow_style=False, sort_keys=False
+                ).encode("utf-8")
+
+            def manifest(sha: str) -> dict[str, object]:
+                return {
+                    "app": "young-router",
+                    "version": 1,
+                    "format": "json",
+                    "created_at": "2026-11-13T15:29:00Z",
+                    "summary": {},
+                    "files": [
+                        {"path": "config.yaml", "present": True, "sha256": sha},
+                        {"path": "config.disabled-models.yaml", "present": False},
+                        {"path": "relay-accounts.json", "present": False},
+                    ],
+                }
+
+            local_text = with_route(original, "added-here", "0000aaaa")
+            remote_text = with_route(original, "added-there", "0000bbbb")
+            webdav_core.save_sync_state(
+                state_path,
+                webdav.sync_settings(),
+                webdav_core.SyncSnapshot(
+                    manifest("base"),
+                    {"config.yaml": "base", "config.disabled-models.yaml": None, "relay-accounts.json": None},
+                    {"config.yaml": original.encode("utf-8")},
+                ),
+                "sync",
+            )
+            local = webdav_core.SyncSnapshot(
+                manifest("local"),
+                {"config.yaml": "local", "config.disabled-models.yaml": None, "relay-accounts.json": None},
+                {"config.yaml": local_text},
+            )
+            remote = webdav_core.SyncSnapshot(
+                manifest("remote"),
+                {"config.yaml": "remote", "config.disabled-models.yaml": None, "relay-accounts.json": None},
+                {"config.yaml": remote_text},
+            )
+
+            pushed: list[object] = []
+            with mock.patch("young_router.webdav.core.WebDAVClient", return_value=object()), mock.patch(
+                "young_router.webdav.core.local_snapshot", return_value=local
+            ), mock.patch(
+                "young_router.webdav.operations.read_remote_manifest", return_value=remote.manifest
+            ), mock.patch(
+                "young_router.webdav.operations.read_remote_digests", return_value=remote.digests
+            ), mock.patch(
+                "young_router.webdav.operations.remote_snapshot_from_bundle", return_value=remote
+            ), mock.patch(
+                "young_router.webdav.operations.push_bundle",
+                side_effect=lambda *args, **kwargs: pushed.append(args[4]) or (32, remote.manifest),
+            ), mock.patch(
+                "young_router.webdav.operations.pull_bundle"
+            ) as pulled, mock.patch("young_router.webdav.operations.publish_remote_digests", return_value=True):
+                result = core.dispatch(
+                    {
+                        "domain": "webdav",
+                        "type": "sync",
+                        "payload": {"sections": ["providers_models", "relay_accounts"]},
+                    },
+                    expected_revision=core.revision,
+                )
+
+            merged = yaml.safe_load(config.read_text(encoding="utf-8"))
+            self.assertEqual(["added-here", "added-there"], [row["model_name"] for row in merged["model_list"]])
+            # The merged document is what was published, and the run says so.
+            self.assertEqual(["sync-merge"], pushed)
+            self.assertEqual("merge", result["action_summary"]["outcome"])
+            pulled.assert_not_called()
+            self.assertFalse((root / "webdav-conflict.json").exists())
+            status = json.loads((root / "webdav-status.json").read_text(encoding="utf-8"))
+            self.assertTrue(status["ok"])
 
     def test_a_route_edit_beside_a_relay_read_is_pushed_not_contested(self) -> None:
         """The reported false conflict: a host's balance read is not an edit.

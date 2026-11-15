@@ -1147,6 +1147,11 @@ class HookResponsesWebSearchBridgeTests(HookTestCase):
             ["web_search"],
         )
         metadata = calls[0].get("litellm_metadata", {})
+        self.assertNotIn(
+            hooks._RESPONSES_TOOL_ADAPTER_METADATA_KEY,
+            metadata,
+        )
+        self.assertNotIn(hooks._RESPONSES_CHAT_BRIDGE_METADATA_KEY, metadata)
 
     async def test_generic_response_wrapper_forwards_hosted_search_despite_deduced_unsupported(self) -> None:
         hooks, _ = load_hook_module()

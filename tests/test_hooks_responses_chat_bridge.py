@@ -1515,7 +1515,6 @@ class HookResponsesChatBridgeTests(HookTestCase):
         self.assertTrue(chunks)
         self.assertTrue(chat_calls)
         for payload in chat_calls:
-            self.assertTrue(payload.get("use_chat_completions_api") is not None or True)
             self.assertNotIn(
                 "extra_body",
                 payload,
@@ -2743,7 +2742,6 @@ class BridgeProviderSearchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.hooks, _ = load_hook_module()
         self.tools_module = importlib.import_module("young_router.proxy.responses_tools")
-        self.surfaces = importlib.import_module("young_router.proxy.responses_surfaces")
 
     def _request(self, surface: str, tools=None) -> dict:
         return {
@@ -2875,9 +2873,9 @@ class BridgeProviderSearchTests(unittest.TestCase):
             bridge.get("web_search_options"),
         )
 
-    def test_the_declaration_names_the_type_the_provider_reads(self) -> None:
-        # The name is the contract: it is what makes LiteLLM emit
-        # ``web_search_20250305`` instead of an unknown Chat tool.
+    def test_the_declaration_is_the_medium_context_options(self) -> None:
+        # The bridge carries this dict as ``web_search_options``; LiteLLM derives
+        # the Anthropic ``web_search_20250305`` tool from it downstream.
         options = self.tools_module._responses_bridge_anthropic_search_options(
             self._request("anthropic")
         )

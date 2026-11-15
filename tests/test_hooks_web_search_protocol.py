@@ -12,6 +12,26 @@ class HookWebSearchProtocolTests(HookTestCase):
         self.assertEqual(hooks._strip_raw_tool_call_blocks(text), text)
         self.assertEqual(hooks._strip_raw_tool_call_blocks("."), ".")
 
+    def test_a_dsml_parameter_that_is_not_json_after_all_stays_text(self):
+        # ``string="false"`` says the body is JSON; the body is still the
+        # model's own text.  Parsing it unguarded raised through the stream
+        # filter and its callers, which ended the client's stream.
+        hooks, _ = load_hook_module()
+        marker = "\uff5c\uff5cDSML\uff5c\uff5c"
+
+        def call(body: str) -> str:
+            return (
+                f'<{marker} calls><{marker} invoke name="shell">'
+                f'<{marker} parameter name="timeout" string="false">{body}</{marker} parameter>'
+                f"</{marker} invoke></{marker} calls>"
+            )
+
+        [parsed] = hooks._raw_dsml_tool_call_items(call("295"))
+        self.assertEqual({"timeout": 295}, json.loads(parsed["arguments"]))
+        [kept] = hooks._raw_dsml_tool_call_items(call("sleep 295"))
+        self.assertEqual({"timeout": "sleep 295"}, json.loads(kept["arguments"]))
+        self.assertEqual("shell", kept["name"])
+
     def test_fenced_dsml_example_is_not_a_tool_call(self):
         hooks, _ = load_hook_module()
         marker = "\uff5c\uff5cDSML\uff5c\uff5c"

@@ -259,13 +259,37 @@ class SessionAffinityFilterTests(HookTestCase):
                 hooks._SESSION_DEPLOYMENT_AFFINITY_FILE_ENV,
                 str(Path(directory) / "session-deployment-affinity.json"),
             )
-            candidates, _sticky, applied = hooks._with_session_deployment_affinity(
-                [_deployment("dep-a")],
+            solo = _deployment("dep-a")
+            hooks._record_session_deployment_affinity(
+                {
+                    "proxy_server_request": {"headers": {"session_id": "sess-123"}},
+                    "model_info": {"id": "dep-a"},
+                    "metadata": {"model_group": "default-chat"},
+                }
+            )
+            candidates, sticky, applied = hooks._with_session_deployment_affinity(
+                [solo],
                 self._request(),
                 "default-chat",
             )
+            # A single candidate is returned untouched even when it is the
+            # session's sticky deployment; claiming affinity applied would make
+            # callers think it picked between routes.
             self.assertFalse(applied)
-            self.assertEqual(len(candidates), 1)
+            self.assertIsNone(sticky)
+            self.assertEqual(candidates, [solo])
+
+            # Prove the recorded affinity is live: it does narrow a list that
+            # actually offers a choice.
+            narrowed, sticky, applied = hooks._with_session_deployment_affinity(
+                [_deployment("dep-a"), _deployment("dep-b")],
+                self._request(),
+                "default-chat",
+            )
+            self.assertTrue(applied)
+            self.assertEqual(sticky, "dep-a")
+            self.assertEqual(len(narrowed), 1)
+            self.assertEqual(narrowed[0]["model_info"]["id"], "dep-a")
 
 
 class HookFilterSessionAffinityTests(HookTestCase):

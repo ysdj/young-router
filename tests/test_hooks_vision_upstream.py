@@ -75,6 +75,58 @@ class VisionUpstreamBridgeTests(unittest.TestCase):
                     self.assertIsNone(upstream.provider_chain({"backend": "auto"}))
 
 
+class VisionWorkerFailureMemoryTests(unittest.TestCase):
+    """A failed ask is remembered for a moment, not for the life of the process.
+
+    The failure used to be cached exactly like an answer.  One worker that died
+    mid-conversation therefore degraded every later image turn to the fallback
+    chain until the proxy restarted, although the comment beside it said the
+    worker "is restarted on the next miss".
+    """
+
+    def _worker(self, answers: list[object]) -> tuple[object, list[int]]:
+        worker = upstream._Worker()
+        asked: list[int] = []
+
+        def ask(_config):
+            asked.append(1)
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        worker._ask = ask  # type: ignore[method-assign]
+        return worker, asked
+
+    def test_a_worker_that_died_is_asked_again_after_the_pause(self) -> None:
+        chain = [{"name": "ovh", "base_url": "https://example.test/v1", "model": "m"}]
+        worker, asked = self._worker([OSError("worker pipe closed"), chain])
+        clock = [1000.0]
+        with mock.patch.object(upstream.time, "monotonic", lambda: clock[0]):
+            self.assertIsNone(worker.chain({"backend": "auto"}))
+            # Not on the very next request: a package that is really missing
+            # must not cost a process start per image.
+            self.assertIsNone(worker.chain({"backend": "auto"}))
+            self.assertEqual(1, len(asked))
+            clock[0] += upstream._FAILURE_RETRY_SECONDS + 1
+            self.assertEqual(chain, worker.chain({"backend": "auto"}))
+            # An answer, unlike a failure, is kept.
+            clock[0] += 3600
+            self.assertEqual(chain, worker.chain({"backend": "auto"}))
+        self.assertEqual(2, len(asked))
+
+    def test_an_unavailable_package_is_rechecked_too(self) -> None:
+        chain: list[dict[str, object]] = []
+        worker, asked = self._worker([upstream.VisionWorkerUnavailable("not staged"), chain])
+        clock = [5.0]
+        with mock.patch.object(upstream.time, "monotonic", lambda: clock[0]):
+            self.assertIsNone(worker.chain({"backend": "off"}))
+            clock[0] += upstream._FAILURE_RETRY_SECONDS + 1
+            # An empty chain is an answer (``backend: "off"``), not a failure.
+            self.assertEqual([], worker.chain({"backend": "off"}))
+        self.assertEqual(2, len(asked))
+
+
 class VisionWorkerProtocolTests(unittest.TestCase):
     """The worker's own behaviour, driven through the real Node runtime."""
 
@@ -132,6 +184,7 @@ class VisionWorkerProtocolTests(unittest.TestCase):
         self.assertEqual([], off["providers"])
         local = self._run({"backend": "local", "freeFallback": True}, package=package)
         self.assertEqual("upstream", local["source"])
+        self.assertEqual([], local["providers"])
 
 
 class VisionStagingTests(unittest.TestCase):

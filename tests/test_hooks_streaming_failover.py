@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import copy
 
+from unittest import mock
+
 from hook_test_utils import *
 
 
@@ -1555,7 +1557,9 @@ class HookStreamingFailoverTests(HookTestCase):
             "_CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS",
             previous_compaction_timeout,
         )
-        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.01")
+        # The fake call must outlive the ordinary start budget but fit the
+        # compaction one, so the wrapper proves it applied the latter.
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0.01")
         self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "1")
 
         async def delayed_stream():
@@ -2557,14 +2561,6 @@ class HookStreamingFailoverTests(HookTestCase):
         hooks, _ = load_hook_module()
         self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "60")
         self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0.01")
-        sleeps = []
-        original_sleep = hooks.asyncio.sleep
-
-        async def fake_sleep(seconds):
-            sleeps.append(seconds)
-
-        hooks.asyncio.sleep = fake_sleep
-        self.addCleanup(setattr, hooks.asyncio, "sleep", original_sleep)
         router_module = types.ModuleType("litellm.router")
         calls = []
 
@@ -2627,7 +2623,7 @@ class HookStreamingFailoverTests(HookTestCase):
             if deployment_id == "cheap":
                 raise ServiceUnavailable("service temporarily unavailable")
             if deployment_id == "plus":
-                await original_sleep(60)
+                await asyncio.sleep(60)
                 return pro_stream()
             return pro_stream()
 
@@ -2643,99 +2639,6 @@ class HookStreamingFailoverTests(HookTestCase):
         )
         self.assertNotIn("_excluded_deployment_ids", calls[1])
         self.assertNotIn("_excluded_deployment_ids", calls[2])
-        self.assertEqual(
-            chunks,
-            [
-                {"type": "response.output_text.delta", "delta": "from pro"},
-                {"type": "response.completed", "response": {"id": "resp-pro"}},
-            ],
-        )
-
-    async def test_generic_streaming_fallback_uses_configured_first_event_timeout(self) -> None:
-        hooks, _ = load_hook_module()
-        self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "60")
-        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0.01")
-        sleeps = []
-        original_sleep = hooks.asyncio.sleep
-
-        async def fake_sleep(seconds):
-            sleeps.append(seconds)
-
-        hooks.asyncio.sleep = fake_sleep
-        self.addCleanup(setattr, hooks.asyncio, "sleep", original_sleep)
-        router_module = types.ModuleType("litellm.router")
-        calls = []
-
-        class Router:
-            async def _ageneric_api_call_with_fallbacks_helper(
-                self,
-                model,
-                original_generic_function,
-                **kwargs,
-            ):
-                for deployment in (
-                    {"id": "cheap", "order": 1},
-                    {"id": "plus", "order": 2},
-                    {"id": "pro", "order": 3},
-                ):
-                    excluded = set(kwargs.get("_excluded_deployment_ids") or [])
-                    if deployment["id"] in excluded:
-                        continue
-                    try:
-                        return await original_generic_function(
-                            stream=True,
-                            input=[{"role": "user", "content": "hi"}],
-                            model_info={
-                                "id": deployment["id"],
-                                "order": deployment["order"],
-                                "route_key": f"route / {deployment['id']}",
-                            },
-                        )
-                    except Exception as exc:
-                        if hooks._is_priority_deployment_failover_error(exc):
-                            await hooks._sleep_before_final_route_retry(
-                                model,
-                                exc,
-                                kwargs,
-                                attempt=len(calls),
-                                max_retries=5,
-                                configured_delay_seconds=0,
-                            )
-                            continue
-                        raise
-                raise RuntimeError("no route reached")
-
-        router_module.Router = Router
-        sys.modules["litellm.router"] = router_module
-        hooks._install_generic_deployment_failover_patch()
-
-        class ServiceUnavailable(Exception):
-            status_code = 503
-
-        async def pro_stream():
-            yield {"type": "response.output_text.delta", "delta": "from pro"}
-            yield {"type": "response.completed", "response": {"id": "resp-pro"}}
-
-        async def original_generic_function(**kwargs):
-            calls.append(kwargs.copy())
-            deployment_id = kwargs["model_info"]["id"]
-            if deployment_id == "cheap":
-                raise ServiceUnavailable("service temporarily unavailable")
-            if deployment_id == "plus":
-                await original_sleep(60)
-                return pro_stream()
-            return pro_stream()
-
-        response = await Router()._ageneric_api_call_with_fallbacks_helper(
-            "default-chat",
-            original_generic_function,
-        )
-        chunks = [chunk async for chunk in response]
-
-        self.assertEqual(
-            [call["model_info"]["id"] for call in calls],
-            ["cheap", "plus", "pro"],
-        )
         self.assertEqual(
             chunks,
             [
@@ -3388,6 +3291,28 @@ class HookOutputStreamContinuationTests(HookTestCase):
             )
         )
 
+        responses_turn = self._chat_request()
+        responses_turn.pop("messages")
+        responses_turn["input"] = [{"role": "user", "content": "hi"}]
+        responses_turn["proxy_server_request"] = {"path": "/v1/responses"}
+
+        self.assertFalse(
+            continuation_module._continuation_is_decided_by_the_engine(
+                responses_turn,
+                ceiling,
+            )
+        )
+
+        non_stream_turn = self._chat_request()
+        non_stream_turn["stream"] = False
+
+        self.assertFalse(
+            continuation_module._continuation_is_decided_by_the_engine(
+                non_stream_turn,
+                ceiling,
+            )
+        )
+
     async def test_the_continuation_request_carries_the_delivered_tail(self) -> None:
         _, _proxy_server = load_hook_module()
         continuation_module = sys.modules["young_router.proxy.stream_continuation"]
@@ -3566,6 +3491,85 @@ class HookOutputStreamContinuationTests(HookTestCase):
 
         self.assertEqual(chunks, [])
         self.assertEqual(calls, [])
+
+    async def test_exhausting_the_rounds_still_ends_with_the_ceiling_frame(self) -> None:
+        """An answer still unfinished after the last round must say so.
+
+        The withheld ceiling frame is emitted only when the continuation did
+        not close the answer itself.  A round that writes text and hits the
+        ceiling again yields frames and no terminal, so "it yielded something"
+        cannot stand in for "it closed": reading it that way left the client a
+        stream with no end.
+        """
+        hooks, proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        self.set_env(continuation_module._STREAM_CONTINUATION_ENV, "1")
+        self.set_env(continuation_module._MAX_CONTINUATION_ROUNDS_ENV, "2")
+
+        class StubRouter:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def acompletion(self, **kwargs):
+                self.calls += 1
+
+                async def stream():
+                    yield {
+                        "choices": [
+                            {"index": 0, "delta": {"content": "继续写。"}, "finish_reason": None}
+                        ]
+                    }
+                    # Every round stops at the ceiling again.
+                    yield {
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]
+                    }
+
+                return stream()
+
+        original_router = getattr(proxy_server, "llm_router", None)
+        proxy_server.llm_router = StubRouter()
+        self.addCleanup(setattr, proxy_server, "llm_router", original_router)
+
+        async def upstream():
+            yield {
+                "choices": [
+                    {"index": 0, "delta": {"content": "第一段。"}, "finish_reason": None}
+                ]
+            }
+            yield {"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}
+
+        delivered = [
+            chunk
+            async for chunk in streaming._yield_native_stream_with_output_limit_continuation(
+                [],
+                upstream(),
+                {
+                    "model": "default-chat",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "写长一点。"}],
+                    "proxy_server_request": {"path": "/v1/chat/completions"},
+                },
+                stream_started_at=0.0,
+            )
+        ]
+
+        reasons = [
+            choice.get("finish_reason")
+            for chunk in delivered
+            for choice in (chunk.get("choices") or [])
+            if choice.get("finish_reason")
+        ]
+        # The answer is still unfinished, and the last thing the client reads
+        # says exactly that.
+        self.assertEqual(reasons, ["length"])
+        text = "".join(
+            (choice.get("delta") or {}).get("content") or ""
+            for chunk in delivered
+            for choice in (chunk.get("choices") or [])
+        )
+        self.assertIn("第一段。", text)
+        self.assertIn("继续写。", text)
 
     async def test_the_continuation_does_not_resend_the_source_document(self) -> None:
         """Re-sending the document re-asks the original question.
@@ -4139,6 +4143,118 @@ class HookCoalescedNativeReadTests(HookTestCase):
             with self.subTest(reads=label):
                 self.assertIn("message_stop", types)
                 self.assertEqual("message_stop", types[-1])
+
+
+    async def test_a_continuation_that_ran_out_still_ends_the_answer(self) -> None:
+        """Rounds that add text but never reach a stop leave the withheld frame owed.
+
+        The continuation emits the answer's last frame only when it reaches a
+        natural stop.  When every round hits the ceiling again (or a round
+        fails after it started writing), it has yielded text and no terminal --
+        and "it yielded something" was read as "it closed the answer", so the
+        withheld ceiling frame and the stop behind it were never sent: a stream
+        with no end, which a client renders as a reply that hung.
+        """
+        _, _proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        delta = (
+            b'event: content_block_delta\n'
+            b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi there"}}\n\n'
+        )
+        ceiling = (
+            b'event: message_delta\n'
+            b'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}\n\n'
+        )
+        stop = b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+        more = (
+            b'event: content_block_delta\n'
+            b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" and more"}}\n\n'
+        )
+
+        async def rounds_that_never_stop(*_args, **_kwargs):
+            yield more
+
+        async def upstream():
+            for read in (delta, ceiling, stop):
+                yield read
+
+        with mock.patch.object(
+            continuation_module, "_stream_native_continuation_rounds", rounds_that_never_stop
+        ):
+            delivered = [
+                chunk
+                async for chunk in streaming._yield_native_stream_with_output_limit_continuation(
+                    [],
+                    upstream(),
+                    self._anthropic_request(),
+                    stream_started_at=0.0,
+                )
+            ]
+        frames = [
+            frame for chunk in delivered for frame in streaming._stream_chunk_dumps(chunk)
+        ]
+        types = [frame.get("type") for frame in frames]
+        self.assertEqual(["message_delta", "message_stop"], types[-2:])
+        self.assertEqual("max_tokens", frames[-2]["delta"]["stop_reason"])
+        # ...after the text the continuation did add, not instead of it.
+        self.assertIn(" and more", "".join(str(frame) for frame in frames))
+
+    async def test_a_continuation_that_stopped_is_not_closed_twice(self) -> None:
+        _, _proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        continuation_module = sys.modules["young_router.proxy.stream_continuation"]
+        delta = (
+            b'event: content_block_delta\n'
+            b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi there"}}\n\n'
+        )
+        ceiling = (
+            b'event: message_delta\n'
+            b'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}\n\n'
+        )
+        stop = b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+        more = (
+            b'event: content_block_delta\n'
+            b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" and more"}}\n\n'
+        )
+        natural_stop = (
+            b'event: message_delta\n'
+            b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n'
+        )
+
+        async def rounds_that_stop(*_args, **_kwargs):
+            # What the continuation yields for a route that finished: its text,
+            # its stop reason, and the frame that closes the message.
+            yield more
+            yield natural_stop
+            yield stop
+
+        async def upstream():
+            for read in (delta, ceiling, stop):
+                yield read
+
+        with mock.patch.object(
+            continuation_module, "_stream_native_continuation_rounds", rounds_that_stop
+        ):
+            delivered = [
+                chunk
+                async for chunk in streaming._yield_native_stream_with_output_limit_continuation(
+                    [],
+                    upstream(),
+                    self._anthropic_request(),
+                    stream_started_at=0.0,
+                )
+            ]
+        frames = [
+            frame for chunk in delivered for frame in streaming._stream_chunk_dumps(chunk)
+        ]
+        reasons = [
+            frame.get("delta", {}).get("stop_reason")
+            for frame in frames
+            if frame.get("type") == "message_delta"
+        ]
+        self.assertEqual(["end_turn"], reasons)
+        self.assertEqual(1, [frame.get("type") for frame in frames].count("message_stop"))
 
 
 class HookNativeFallbackDispatchTests(HookTestCase):

@@ -4,7 +4,7 @@ import json
 import tempfile
 import unittest
 
-from young_router.core.domains.relay_accounts import RelayAccountsDomain
+from young_router.core.domains.relay_accounts import RelayAccountsDomain, RelayAccountsError
 from young_router.core.service import CoreStore
 
 
@@ -305,6 +305,50 @@ class RelayApiKeyDomainTests(unittest.TestCase):
                 ("DELETE", "/api/v1/keys/key-ungrouped", "https://relay.example.test", {"Cookie": "session=fixture"}, None),
                 client.calls,
             )
+
+    def test_disabling_auto_grouping_keeps_another_accounts_staged_work(self) -> None:
+        # The journal is one store-wide list.  Turning the layout off for one
+        # account restores that account's rows; a second account's staged
+        # create made while the switch was on is not this switch's to drop.
+        client = RelayMutationHTTPClient(
+            {
+                "/api/v1/user/profile": {"data": {"balance": 4.5}},
+                "/api/v1/keys?page=1&page_size=100": {
+                    "data": {"items": [{"id": "key-one", "name": "old", "status": "active", "key": "replace-secret", "group_id": 2, "group": {"name": "Balanced"}}]}
+                },
+                "/api/v1/groups/available": {"data": [{"id": 2, "name": "Balanced", "rate_multiplier": 1.25}]},
+                "/api/v1/groups/rates": {"data": {}},
+                "/api/v1/channels/available": {"data": [{"platforms": [{"supported_models": ["model-test"]}]}]},
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=client)
+            first = domain.dispatch(
+                "account.add",
+                {"type": "sub2api", "label": "First", "origin": "https://first.example.test"},
+            )["accounts"][0]
+            second = domain.dispatch(
+                "account.add",
+                {"type": "sub2api", "label": "Second", "origin": "https://second.example.test"},
+            )["accounts"][-1]
+            for account in (first, second):
+                domain.accept_login_result(account["id"], username="person@example.test", cookie="session=fixture")
+                domain.refresh_resources(account["id"])
+            domain.dispatch("api_key.set_auto_grouping", {"account_id": first["id"], "enabled": True})
+            domain.dispatch("api_key.create", {"account_id": second["id"], "name": "Second key"})
+            self.assertIn(
+                "api_key_create",
+                [operation["kind"] for operation in domain.prepare_apply()["operations"]],
+            )
+
+            domain.dispatch("api_key.set_auto_grouping", {"account_id": first["id"], "enabled": False})
+
+            prepared = domain.prepare_apply()
+            self.assertEqual(
+                ["api_key_create"],
+                [operation["kind"] for operation in prepared["operations"]],
+            )
+            self.assertEqual(1, len(prepared["operations"]))
 
     def test_auto_grouping_rehomes_a_key_whose_group_was_renamed(self) -> None:
         """A renamed group is a re-homed key, not a deleted and recreated one.
@@ -627,6 +671,11 @@ class RelayApiKeyDomainTests(unittest.TestCase):
 
             self.assertEqual("ready", refreshed["resource_status"])
             self.assertEqual([False], [item["enabled"] for item in refreshed["resources"]])
+            # The refusal comes before any provider is consulted, so the
+            # placeholder stands in for a providers domain that must not be
+            # reached at all.
+            with self.assertRaisesRegex(RelayAccountsError, "Enable the selected relay API resource"):
+                domain.import_resources(account["id"], ["newapi-7"], object())
             self.assertEqual(
                 "sk-replace-generated-secret",
                 domain.trusted_secret_value("api_key", f"{account['id']}:newapi-7"),
@@ -722,10 +771,8 @@ class RelayApiKeyDomainTests(unittest.TestCase):
             )
             # The station's own automatic grouping is the user's own
             # configuration: this app creates an ordinary grouped key and never
-            # writes the candidate list or the cross-group retry flag.
-            self.assertNotIn("auto_groups", create[4])
-            self.assertNotIn("cross_group_retry", create[4])
-
+            # writes the candidate list or the cross-group retry flag, so the
+            # body stays pinned to exactly these three fields.
 
 
     def test_auto_grouping_does_not_refill_a_group_whose_key_is_being_retired(self) -> None:

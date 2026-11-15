@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -183,7 +185,7 @@ class LocalFactPatternTests(unittest.TestCase):
 
 
 class StagedScanTests(unittest.TestCase):
-    """The gate as the commit path really runs it, against the real repository."""
+    """The gate as the commit path and CI really run it."""
 
     def test_the_committed_tree_is_clean(self) -> None:
         self.assertEqual([], hygiene.scan_tree("HEAD"))
@@ -191,18 +193,40 @@ class StagedScanTests(unittest.TestCase):
     def test_the_gate_refuses_a_staged_leak(self) -> None:
         """A staged blob carrying a private value fails the commit."""
 
-        findings = hygiene._scan_bytes(
-            b'base_url = "https://api.vendor.example/v1"\n',
-            "young_router/config/providers.yaml",
-            local_facts_allowed=False,
-        )
-        self.assertEqual([], findings)
+        with tempfile.TemporaryDirectory() as directory:
+            hygiene._run(["git", "init", "-q", directory])
+            hygiene._run(
+                ["git", "-C", directory, "config", "user.name", "Hygiene Test"]
+            )
+            hygiene._run(
+                [
+                    "git",
+                    "-C",
+                    directory,
+                    "config",
+                    "user.email",
+                    "hygiene@example.test",
+                ]
+            )
+            name = "young_router/config/providers.yaml"
+            path = Path(directory) / name
+            path.parent.mkdir(parents=True)
+            previous = os.getcwd()
+            os.chdir(directory)
+            try:
+                path.write_text(
+                    'base_url = "https://api.vendor.example/v1"\n',
+                    encoding="utf-8",
+                )
+                hygiene._run(["git", "add", "-f", name])
+                self.assertEqual([], hygiene.scan_staged())
 
-        findings = hygiene._scan_bytes(
-            f'home = "{HOME_PATH}"\n'.encode(),
-            "young_router/config/providers.yaml",
-            local_facts_allowed=False,
-        )
+                path.write_text(f'home = "{HOME_PATH}"\n', encoding="utf-8")
+                hygiene._run(["git", "add", "-f", name])
+                findings = hygiene.scan_staged()
+            finally:
+                os.chdir(previous)
+
         self.assertEqual(["local fact"], [finding.kind for finding in findings])
 
     def test_a_runtime_document_is_refused_by_name(self) -> None:

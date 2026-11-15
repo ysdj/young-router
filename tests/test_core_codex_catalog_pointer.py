@@ -182,6 +182,49 @@ class CodexCatalogPointerTests(unittest.TestCase):
             self.assertTrue(snapshot["model_catalog"]["enabled"])
             self.assertEqual(["default-chat"], snapshot["model_catalog"]["public_models"])
 
+    def test_a_retired_catalog_stays_while_the_pointer_still_names_it(self) -> None:
+        """A pointer that could not be moved keeps the file it points at.
+
+        The migration writes the current catalog and then moves the pointer.
+        When that second write failed, the view was still recorded as settled,
+        and the next refresh took the "nothing changed" path -- which removes
+        every retired spelling.  That deleted the catalog ``config.toml`` still
+        named: the dangling pointer Codex refuses its whole configuration for.
+        """
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            "young_router.core.codex_config.local_exposed_models",
+            return_value=EXPOSED,
+        ):
+            root = Path(directory)
+            home = root / "codex"
+            runtime, home = self._fixture(root, str(legacy_managed_catalog_path(home)))
+            legacy = legacy_managed_catalog_path(home)
+            legacy.write_text(json.dumps({"models": [{"slug": "default-chat"}]}), encoding="utf-8")
+            domain = CodexSettingsDomain(runtime, codex_home=home)
+
+            with mock.patch(
+                "young_router.core.codex_config.apply_editor",
+                side_effect=OSError("config.toml is read-only"),
+            ):
+                domain.refresh_model_catalog()
+                settled = domain.revision
+                for _ in range(2):
+                    domain.refresh_model_catalog()
+                    text = (home / "config.toml").read_text(encoding="utf-8")
+                    self.assertIn(f'model_catalog_json = "{legacy}"', text)
+                    self.assertTrue(legacy.exists(), "the catalog the pointer names was removed")
+                # A move that keeps failing is retried, not announced each time.
+                self.assertEqual(settled, domain.revision)
+
+            # Once the write goes through, the migration completes as before.
+            domain.refresh_model_catalog()
+            current = managed_catalog_path(home)
+            text = (home / "config.toml").read_text(encoding="utf-8")
+            self.assertIn(f'model_catalog_json = "{current}"', text)
+            self.assertTrue(current.exists())
+            self.assertFalse(legacy.exists())
+
     def test_rebrand_pointer_is_migrated_to_the_current_catalog_name(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch(
             "young_router.core.codex_config.local_exposed_models",

@@ -144,6 +144,32 @@ class AnthropicNonStreamBridgeTests(HookTestCase):
         self.assertEqual("Hello", message["content"][1]["text"])
         self.assertEqual({"cmd": "ls"}, message["content"][2]["input"])
 
+    async def test_a_character_split_across_reads_is_still_one_character(self) -> None:
+        """A read may end inside a character, not only inside a frame.
+
+        Each read used to be decoded on its own: one that ended mid-character
+        raised, and the whole read was dropped with the frames it carried.  A
+        Chinese answer came back empty -- as a successful message.
+        """
+
+        bridge = _bridge_module()
+        events = _a_full_turn()
+        for event in events:
+            delta = event.get("delta")
+            if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                delta["text"] = "你好，世界" if delta["text"] == "Hel" else ""
+        wire = "".join(
+            f"event: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+            for event in events
+        ).encode("utf-8")
+
+        for size in (7, 5, 3, 1):
+            with self.subTest(read_size=size):
+                chunks = [wire[index : index + size] for index in range(0, len(wire), size)]
+                message = await bridge.assemble_anthropic_message(_ChunkStream(chunks))
+                self.assertEqual("你好，世界", message["content"][1]["text"])
+                self.assertEqual({"cmd": "ls"}, message["content"][2]["input"])
+
     async def test_a_whole_body_turn_asks_the_route_for_a_stream(self) -> None:
         """The client asked for one message; the route is asked with frames."""
 
@@ -235,8 +261,10 @@ class AnthropicNonStreamBridgeTests(HookTestCase):
             surface="openai/chat",
         )
         whole = {"id": "chatcmpl-1", "choices": []}
+        calls = []
 
         async def original(**kwargs):
+            calls.append(kwargs)
             return whole
 
         wrapped = bridge.wrap_deployment_function(
@@ -252,6 +280,11 @@ class AnthropicNonStreamBridgeTests(HookTestCase):
                 model="flux-code/claude-fable-5-2",
             ),
         )
+        # A dict has no frames to assemble, so a bridged call would return it
+        # unchanged too; the flag the call was made with is what shows the
+        # wrapper passed it through instead of bridging it.
+        self.assertEqual(1, len(calls))
+        self.assertIs(False, calls[0].get("stream"))
 
     async def test_the_inner_call_writes_no_second_request_row(self) -> None:
         """The bridged call is a transport detail, not a second turn.
@@ -381,8 +414,10 @@ class AnthropicNonStreamBridgeTests(HookTestCase):
 
         bridge = _bridge_module()
         whole = {"id": "chatcmpl-1", "choices": []}
+        calls = []
 
-        async def original(**_kwargs):
+        async def original(**kwargs):
+            calls.append(kwargs)
             return whole
 
         wrapped = bridge.wrap_deployment_function(
@@ -398,6 +433,10 @@ class AnthropicNonStreamBridgeTests(HookTestCase):
                 use_chat_completions_api=True,
             ),
         )
+        # A dict carries no frames: the stream flag on the call is what shows
+        # the wrapper passed it through instead of bridging it.
+        self.assertEqual(1, len(calls))
+        self.assertIs(False, calls[0].get("stream"))
 
     async def test_an_error_frame_is_the_routes_failure(self) -> None:
         """A relay's in-stream refusal parks the route instead of ending the turn."""

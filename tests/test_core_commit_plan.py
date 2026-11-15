@@ -33,20 +33,6 @@ from young_router.core.domains.providers_models import ProvidersModelsDomain
 from young_router.core.ipc import CoreIPCServer
 from young_router.core.service import CoreStore
 
-#: Every domain the shell asks the plan for.  The real store registers them;
-#: this fixture reads the same list so a rename shows up here as a failure.
-PLAN_DOMAINS = [
-    "providers_models",
-    "relay_accounts",
-    "runtime",
-    "language",
-    "codex",
-    "claude",
-    "clients",
-    "webdav",
-    "logs",
-]
-
 
 def _document(providers: int = 6, routes: int = 6) -> str:
     """A document shaped like an installation someone actually runs."""

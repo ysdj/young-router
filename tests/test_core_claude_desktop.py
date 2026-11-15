@@ -15,7 +15,6 @@ from young_router.core.claude_desktop import (
     ClaudeDeveloperSettings,
 )
 from young_router.core.domains.claude import ClaudeSettingsDomain
-from young_router.proxy import claude_desktop_listing as claude_desktop_listing_module
 
 
 def _write_runtime_config(path: pathlib.Path, declarations: dict[str, int]) -> pathlib.Path:
@@ -1480,7 +1479,14 @@ general_settings:
                 runtime_config_path=root / "config.yaml",
                 runtime_root=root,
             )
-            with mock.patch.object(domain, "desktop_uses_local_api", return_value=True):
+            with mock.patch.object(domain, "desktop_uses_local_api", return_value=True), mock.patch.object(
+                domain, "_public_models", return_value=["gpt-5.4"]
+            ), mock.patch.object(
+                domain,
+                "_public_model_rows",
+                return_value=[{"id": "gpt-5.4", "max_input_tokens": 1_000_000}],
+            ):
+                self.assertTrue(domain._publishes_one_million_context())
                 domain._prefer_one_million_context()
             config = json.loads(domain.raw_text(document="desktop", include_sensitive=True))
             self.assertFalse(config["modelPrefer1mContext"])

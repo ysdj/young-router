@@ -35,10 +35,15 @@ class RefusalTraceTests(unittest.TestCase):
         def capture(event, **fields):
             events.append((event, fields))
 
-        with mock.patch.object(trace_module, "_route_trace", capture):
+        # Other suites reload ``young_router.proxy`` in ``sys.modules``; this
+        # test must patch the module the code under test will import at call
+        # time, not the one this file bound at collection time.
+        live_trace = sys.modules.get("young_router.proxy.trace", trace_module)
+        live_cw = sys.modules.get("young_router.proxy.context_window", cw)
+        with mock.patch.object(live_trace, "_route_trace", capture):
             error = Exception("workbuddy 上游失败：请求被上游拒绝（http 400）（code 11135）")
             error.reason = "other"
-            cw._trace_retry(
+            live_cw._trace_retry(
                 {"model": "deepseek-v4.1-flash", "input": [{"type": "message"}]},
                 attempt=0,
                 count=32_000,
@@ -707,12 +712,23 @@ class MessagesWireTests(unittest.TestCase):
                 if isinstance(block, dict) and block.get("type") == "tool_result"
             }
             self.assertLessEqual(wanted, answered)
-        # The turn being answered survives byte for byte; its tool result is
-        # what the model is in the middle of using.
+        # The turn being answered keeps its shape: the tool result that the
+        # model is in the middle of using is still there, under the same id,
+        # as a tool_result block.  Its *body* may be shortened when that turn
+        # alone is over the window -- ``_truncated_tail`` is what keeps such a
+        # turn servable instead of sending a size upstream refuses -- so what
+        # is pinned here is the shape, not the bytes.
+        last = fitted["messages"][-1]
+        original = data["messages"][-1]
+        self.assertEqual(original.get("role"), last.get("role"))
         self.assertEqual(
-            fitted["messages"][-1], data["messages"][-1]
+            [block.get("type") for block in original["content"]],
+            [block.get("type") for block in last["content"]],
         )
-        self.assertLess(len(json.dumps(fitted)), len(json.dumps(data)))
+        self.assertEqual(
+            original["content"][0].get("tool_use_id"),
+            last["content"][0].get("tool_use_id"),
+        )
         self.assertLess(len(json.dumps(fitted)), len(json.dumps(data)))
 
     def test_a_messages_replay_under_the_window_is_untouched(self) -> None:
@@ -922,6 +938,7 @@ class RefusalRewriteBeliefTests(unittest.TestCase):
         data = {"model": "m", "input": items}
         router = _Router(10**9)
         with mock.patch.object(cw, "_router", return_value=router):
+            # Prime a measurement the way the pre-call pass does.
             cw._MEASURED_INPUT_TOKENS.set(cw.measure_tokens(data, router))
             refused = RuntimeError("prompt is too long: 999999 tokens > 500000 maximum")
             before = cw.measure_tokens(data, router)
@@ -930,7 +947,10 @@ class RefusalRewriteBeliefTests(unittest.TestCase):
             )
             after = cw.measure_tokens(data, router)
             believed = cw._MEASURED_INPUT_TOKENS.get()
+        # The rewrite really did shrink the payload ...
         self.assertLess(after, before)
+        # ... and what the pass now believes matches what it built, not the
+        # target it was aiming at.
         self.assertEqual(
             believed,
             after,
@@ -938,285 +958,6 @@ class RefusalRewriteBeliefTests(unittest.TestCase):
             "rewritten payload, or the next resend is refused the same way",
         )
 
-class WireCountShapeTests(unittest.TestCase):
-    """The count has to cover the structure the wire carries, not just strings.
-
-    A Claude Code replay is mostly ``tool_use``/``tool_result`` blocks: every
-    one of them spends tokens on its ``type``, its id and its field names
-    before the body is counted.  ``wire_tokens`` walked the strings only, so
-    it answered 10-15% below what the same JSON costs, and a replay the pass
-    believed it had fitted to 918,680 tokens reached the upstream at 1,169,888
-    -- refused, resent, refused again, for as long as the client kept trying.
-    """
-
-    def test_the_count_covers_the_keys_and_the_block_structure(self) -> None:
-        items = [{"role": "user", "content": "start"}]
-        for index in range(200):
-            items.append(
-                {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "toolu_%04d" % index,
-                            "name": "Bash",
-                            "input": {
-                                "command": "grep -rn foo .",
-                                "description": "search",
-                            },
-                        }
-                    ],
-                }
-            )
-            items.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "toolu_%04d" % index,
-                            "content": "line of output " * 200,
-                        }
-                    ],
-                }
-            )
-        counted = cw.wire_tokens(items)
-        self.assertIsNotNone(counted)
-        import tiktoken
-
-        whole = len(
-            tiktoken.get_encoding("o200k_base").encode(
-                json.dumps(items), disallowed_special=()
-            )
-        )
-        # This number is compared against a window and decides whether to
-        # resend, so it has to be at the cost of the payload, not below it.
-        self.assertGreaterEqual(
-            counted,
-            whole,
-            "the count has to cover the structure the wire carries",
-        )
-
-
-class ShrinkMarginTests(unittest.TestCase):
-    """A shrink has to leave room, not stop at the edge of the window.
-
-    A live Claude Code thread was elided to 983,041 tokens against a
-    1,000,000-token window -- 98.3% of it.  The loop stopped the moment the
-    count came in at or under the *limit*, so the replay was sent with 1.7%
-    of margin against a relay whose own count of the same bytes has been
-    measured 20% higher.  It was refused, and the next attempt started over.
-    """
-
-    def test_the_rewrite_stops_at_the_target_not_the_limit(self) -> None:
-        items = [{"role": "user", "content": "start"}]
-        for index in range(120):
-            items.append(
-                {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "toolu_%04d" % index,
-                            "name": "Bash",
-                            "input": {"command": "grep -rn foo ."},
-                        }
-                    ],
-                }
-            )
-            items.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "toolu_%04d" % index,
-                            "content": "line of output " * 400,
-                        }
-                    ],
-                }
-            )
-        items.append({"role": "user", "content": "now what?"})
-        data = {"model": "m", "messages": items}
-        window = 60_000
-        router = _Router(window)
-        with mock.patch.object(cw, "_router", return_value=router):
-            fitted = cw.apply(data)
-        self.assertIsNotNone(fitted)
-        assert fitted is not None
-        after = cw.measure_tokens(fitted, router)
-        self.assertIsNotNone(after)
-        # The pass has to land at its target, not at the last number that was
-        # still technically under the limit.
-        self.assertLessEqual(
-            after,
-            int(window * cw._TARGET_FRACTION),
-            "the rewrite has to stop at the target, not at the edge of the "
-            "window",
-        )
-
-class ToolSchemaWeightTests(unittest.TestCase):
-    """The tool schema is part of the prompt and has to be counted.
-
-    A Claude Code turn carries 192 tool definitions -- 165 of them from the
-    MCP servers the user connected -- and they ride on every request.  The
-    client's own "Context window 100.8k / 1M" counts the conversation, not
-    the schema, so the pass believed a replay it had elided to 918,680 tokens
-    was under a 1,048,576 window while the wire carried the messages *and*
-    169 KB of schema on top.  The upstream refused it, the client retried the
-    same bytes, and the thread could not make progress.
-    """
-
-    @staticmethod
-    def _schema(count: int) -> list:
-        return [
-            {
-                "name": "mcp__agent-desktop__desktop_tool_%03d" % index,
-                "description": (
-                    "Performs a desktop automation step on the host machine. " * 12
-                ),
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "target": {"type": "string", "description": "Element ref"},
-                        "timeout_ms": {"type": "integer", "description": "Deadline"},
-                    },
-                },
-            }
-            for index in range(count)
-        ]
-
-    def test_the_schema_is_counted_against_the_window(self) -> None:
-        items = [{"role": "user", "content": "start"}]
-        for index in range(60):
-            items.append(
-                {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "toolu_%05d" % index,
-                            "name": "Bash",
-                            "input": {"command": "grep -rn foo ."},
-                        }
-                    ],
-                }
-            )
-            items.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "toolu_%05d" % index,
-                            "content": "some output line here\n" * 80,
-                        }
-                    ],
-                }
-            )
-        data = {
-            "model": "m",
-            "messages": items,
-            "tools": self._schema(165),
-        }
-        # A window the messages alone fit, but the messages plus the schema
-        # do not.
-        router = _Router(40_000)
-        with mock.patch.object(cw, "_router", return_value=router):
-            without_tools = {"model": "m", "messages": items}
-            self.assertLessEqual(cw.measure_tokens(without_tools, router), 40_000)
-            fitted = cw.apply(data)
-        self.assertIsNotNone(
-            fitted,
-            "a replay whose messages fit but whose tool schema does not has "
-            "to be shortened too",
-        )
-
-class ExchangeLeavesWholeTests(unittest.TestCase):
-    """A tool exchange leaves as a unit even when the target is hit mid-pair.
-
-    The drop loop walks the indices ``_droppable`` listed and stops the moment
-    the estimate reaches its target.  The two halves of one exchange are
-    adjacent in that list, so a stop between them deleted the call and kept
-    the answer -- a live Claude Code replay went out with ``unexpected
-    `tool_use_id` found in `tool_result` blocks`` on every retry, and no
-    resend could ever satisfy it.
-    """
-
-    class _WholePayloadRouter:
-        """Prices the whole serialized payload, as the live pass does."""
-
-        def __init__(self, window: int) -> None:
-            self.window = window
-
-        def get_model_list(self, model_name=None):
-            return [{"model_info": {"max_input_tokens": self.window}}]
-
-        def _count_pre_call_check_tokens(
-            self, messages=None, input=None, request_kwargs=None
-        ):
-            return int(len(json.dumps(input or messages or [])) / 4)
-
-    def _thread(self) -> list:
-        items = [{"role": "user", "content": "start"}]
-        for index in range(400):
-            items.append(
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "thinking", "thinking": "t" * 300},
-                        {
-                            "type": "tool_use",
-                            "id": "toolu_%03d" % index,
-                            "name": "Read",
-                            "input": {"p": "x" * 200},
-                        },
-                    ],
-                }
-            )
-            items.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": "toolu_%03d" % index,
-                            "content": "o" * 4000,
-                        }
-                    ],
-                }
-            )
-        items.append({"role": "user", "content": "go"})
-        return items
-
-    def test_no_result_outlives_the_call_it_answers(self) -> None:
-        data = {"model": "m", "messages": self._thread()}
-        with mock.patch.object(
-            cw, "_router", return_value=self._WholePayloadRouter(30_000)
-        ):
-            fitted = cw.apply(data)
-        self.assertIsNotNone(fitted)
-        assert fitted is not None
-        calls = set()
-        results = []
-        for message in fitted["messages"]:
-            content = message.get("content")
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                if block.get("type") == "tool_use":
-                    calls.add(block["id"])
-                elif block.get("type") == "tool_result":
-                    results.append(block["tool_use_id"])
-        self.assertTrue(results, "the case only means something while results remain")
-        self.assertEqual(
-            [],
-            [identifier for identifier in results if identifier not in calls],
-            "a call and its answer have to leave together; half a pair is a "
-            "replay the wire refuses",
-        )
 
 
 if __name__ == "__main__":

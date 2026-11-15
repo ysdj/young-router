@@ -18,25 +18,7 @@ class LogRotationTests(unittest.TestCase):
             "YOUNG_ROUTER_SERVICE_LOG",
         ):
             os.environ.pop(key, None)
-        self.addCleanup(lambda: os.environ.pop(key, None))
-
-    def _rotate_times(self, times: int, *, maximum: int = 400) -> None:
-        for index in range(times):
-            payload = f"segment-{index}-" + ("x" * 200) + "\n"
-            log_rotation.append_bounded_log(
-                self.log_path,
-                payload.encode("utf-8"),
-                maximum_bytes=maximum,
-            )
-            # Keep the main file under the cap: append_bounded_log truncates
-            # when the write would exceed it, which rotates the tail.
-            size = os.path.getsize(self.log_path)
-            if size > maximum:
-                log_rotation.append_bounded_log(
-                    self.log_path,
-                    b"",
-                    maximum_bytes=maximum,
-                )
+            self.addCleanup(lambda key=key: os.environ.pop(key, None))
 
     def test_rotation_keeps_multiple_backup_segments(self) -> None:
         maximum = 400

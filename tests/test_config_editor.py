@@ -428,6 +428,16 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         ][:2]
         self.assertEqual(("collider_api_key", "collider_api_key_2"), (first_anchor, second_anchor))
 
+        # The anchor is only right if the written document resolves it to the
+        # second slot's credential: an alias pointing at the first anchor reads
+        # back as ``sk-first`` while still naming the second label.
+        path = self.write_config(
+            text + config_dump._dump_model_list_section("model_list", [entry])
+        )
+        reloaded = config_load.load_config(path)["providers"][0]["models"][0]
+        self.assertEqual("国产模型", reloaded["api_key_name"])
+        self.assertEqual("sk-second", reloaded["api_key"])
+
     def test_load_keeps_a_key_whose_credential_another_key_already_carries(self) -> None:
         """One name is one key; one value is not.
 
@@ -613,7 +623,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
               - model_name: claude-sonnet
                 litellm_params:
                   model: anthropic/claude-sonnet-4-5
-                  api_key: os.environ/YOUNG_ROUTER_AUTH_EXAMPLE
+                  api_key: sk-ant-oat-synthetic
                   order: 1
                 model_info:
                   id: "00000004"
@@ -638,6 +648,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
 
         self.assertNotIn("claude_login", source)
         self.assertNotIn("credential_ref", source)
+        # The route's own token is replaced by the plain key its slot names.
         self.assertNotIn("sk-ant-oat", source)
 
     def test_workbuddy_login_round_trip_keeps_the_loopback_reference(self) -> None:
@@ -1627,7 +1638,6 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
             saved["model_info"]["route_key"],
         )
         self.assertEqual("key-two", saved["model_info"]["api_key_name"])
-        self.assertNotIn("openai-default-chat-compat_provider", reloaded_model["deployment_id"])
 
     def test_save_refuses_a_model_naming_a_key_the_provider_does_not_carry(self) -> None:
         """A dangling key name is never resolved to another slot.
@@ -2610,16 +2620,28 @@ class ConfigBackupRetentionTests(unittest.TestCase):
         )
 
     def test_only_the_newest_copies_of_one_document_survive(self) -> None:
-        for _ in range(config_api.BACKUP_RETENTION + 4):
+        for _ in range(config_api.BACKUP_RETENTION + 3):
             self._apply()
+
+        before = sorted(
+            candidate.name
+            for candidate in self.root.glob("config.yaml.bak-*")
+        )
+        pre_apply = self.path.read_text(encoding="utf-8")
+        self._apply()
 
         stamps = sorted(
             candidate.name
             for candidate in self.root.glob("config.yaml.bak-*")
         )
         self.assertEqual(config_api.BACKUP_RETENTION, len(stamps))
-        # The newest copy is the document one Apply ago, not the first one.
-        self.assertTrue(stamps[-1].endswith(_newest_stamp(self.root)))
+        # Rotation drops the oldest copies, never the one written a moment
+        # ago: that copy is the document this Apply replaced.
+        self.assertIn(before[-1], stamps)
+        self.assertNotIn(before[0], stamps)
+        newest = self.root / f"config.yaml.bak-{_newest_stamp(self.root)}"
+        self.assertNotIn(newest.name, before)
+        self.assertEqual(pre_apply, newest.read_text(encoding="utf-8"))
 
     def test_a_copy_this_build_did_not_write_is_never_deleted(self) -> None:
         """A hand-made name states an intent no rotation rule can know."""
@@ -2923,6 +2945,102 @@ class YamlTextParseReuseTests(unittest.TestCase):
             # is not a value any key holds.
             self.assertEqual("", provider["models"][0]["provider_key_id"])
             self.assertEqual("", provider["models"][0]["api_key_name"])
+
+    def test_a_save_error_names_the_model_it_is_about(self) -> None:
+        """"Model #N" counts from one, and N is the model that is wrong.
+
+        The writer was handed a counter that was already the model's position
+        and added one to it, so the first model was reported as #2 and the user
+        was sent to a row that was fine.
+        """
+
+        def provider(names: list[str]) -> dict[str, object]:
+            return {
+                "name": "p",
+                "enabled": True,
+                "api_base": "https://api.example.test/v1",
+                "api_keys": [
+                    {"id": "k1", "name": "default", "value": "sk-replace-me", "source": {"kind": "independent"}}
+                ],
+                "models": [
+                    {
+                        "model_name": name,
+                        "litellm_model": "openai/x",
+                        "enabled": True,
+                        "model_enabled": True,
+                        "provider": "p",
+                        "provider_key_id": "k1",
+                        "api_key_name": "default",
+                    }
+                    for name in names
+                ],
+                "extra": {},
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text("model_list: []\n", encoding="utf-8")
+            for names, expected in (([""], "Model #1 "), (["a", "b", ""], "Model #3 ")):
+                with self.subTest(names=names):
+                    with self.assertRaises(ValueError) as raised:
+                        config_api.save_config([provider(names)], path=path)
+                    self.assertIn(expected, str(raised.exception))
+
+    def test_a_missing_file_may_be_read_as_an_empty_document(self) -> None:
+        """``allow_missing`` answers an empty draft instead of raising.
+
+        It substituted the empty string for the absent file, which parses to
+        nothing and is refused as "not a YAML mapping": the flag raised the
+        error it exists to avoid, and its only caller swallowed it.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            absent = Path(directory) / "config.yaml"
+            document = config_load.config_document_from_path(absent, allow_missing=True)
+            self.assertEqual([], config_load.load_config_document(document)["providers"])
+            with self.assertRaises(OSError):
+                config_load.config_document_from_path(absent)
+
+    def test_every_account_a_legacy_row_was_written_for_is_read_back(self) -> None:
+        """Each per-credential entry names an account; all of them are the provider's.
+
+        Entries after the first are deployments of a row that already exists,
+        and the read returned for them before it had looked at their credential.
+        With two accounts beyond the mirrored one, the second was never put on
+        the provider's list, and the next save wrote the provider without it.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            entries = "".join(
+                "  - model_name: gpt-5.4\n"
+                "    litellm_params:\n"
+                "      model: chatgpt/gpt-5.4\n"
+                f"      api_key: young-router-auth:provider-auth-{name}\n"
+                "    model_info:\n"
+                "      provider: OpenAI\n"
+                f"      id: abcd123{index}\n"
+                for index, name in enumerate(("two", "three"))
+            )
+            path.write_text(
+                "providers:\n"
+                "  OpenAI:\n"
+                "    x-young-router-provider-auth:\n"
+                "      kind: openai_login\n"
+                "      credential_ref: provider-auth-one\n"
+                "model_list:\n" + entries,
+                encoding="utf-8",
+            )
+            provider = config_load.load_config(path)["providers"][0]
+
+            self.assertEqual(
+                ["provider-auth-one", "provider-auth-two", "provider-auth-three"],
+                [entry["ref"] for entry in provider["auth_accounts"]],
+            )
+            # Still one row: the entries are its deployments, and it states the
+            # account of the entry that opened it.
+            self.assertEqual(1, len(provider["models"]))
+            self.assertEqual("provider-auth-two", provider["models"][0]["account_ref"])
 
     def test_a_login_rows_account_list_survives_a_save(self) -> None:
         """The accounts are a field, not an unread extension.

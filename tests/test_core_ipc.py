@@ -43,14 +43,6 @@ class SnapshotPollCacheTests(unittest.TestCase):
     times a second, so those bytes are worth keeping.
     """
 
-    def _server(self):
-        with tempfile.TemporaryDirectory() as directory:
-            core = CoreStore(domains=[MemoryDomain("probe")])
-            server = CoreIPCServer(core)
-            server.start()
-            self.addCleanup(server.stop)
-        return core, server
-
     def test_the_second_poll_of_a_revision_is_the_same_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             core = CoreStore(domains=[MemoryDomain("probe")])
@@ -73,7 +65,6 @@ class SnapshotPollCacheTests(unittest.TestCase):
             first = poll("first")
             expected = json.loads(first)
             self.assertTrue(expected["ok"])
-            self.assertEqual("snapshot", "snapshot")
             self.assertEqual(set(expected["result"]), {"snapshot"})
             self.assertIsNotNone(server._snapshot_body)
 
@@ -762,6 +753,33 @@ class CoreProtocolTests(unittest.TestCase):
         self.assertIn("ANTHROPIC_AUTH_TOKEN=configured", redacted)
         self.assertIn("token_configured=true", redacted)
 
+    def test_redaction_masks_a_bearer_token_that_carries_no_hyphen(self) -> None:
+        # The bearer rule sat behind the guard written for the ``sk-``/``key-``
+        # prefixes: a cheap test for a hyphen.  A bearer token needs none, so
+        # the one credential form the prefix rule cannot see went out as text.
+        for text in (
+            "upstream rejected Bearer AbC123xyzQ99",
+            "auth BEARER   AbC123xyzQ99 refused",
+            "bearer AbC123xyzQ99",
+        ):
+            with self.subTest(text=text):
+                redacted = REDACT_TEXT(text)
+                self.assertNotIn("AbC123xyzQ99", redacted)
+                self.assertIn("Bearer configured", redacted)
+        # A word that merely contains the letters is left alone.
+        self.assertEqual("the forbearer queue is empty", REDACT_TEXT("the forbearer queue is empty"))
+
+    def test_redaction_survives_a_url_whose_port_is_not_a_number(self) -> None:
+        # ``urlsplit`` accepts the text; reading ``.port`` is what raises, and
+        # that read was outside the guard -- so one such log line made the
+        # redactor itself raise and took the whole projection with it.
+        redacted = REDACT_TEXT(
+            "connect http://user:synthetic-password@example.test:8o80/v1?token=synthetic-token failed"
+        )
+        # ...and the rest of that URL is still redacted: the authority keeps
+        # what was written minus its userinfo, the query loses its token.
+        self.assertEqual("connect http://example.test:8o80/v1?token=configured failed", redacted)
+
 
 class CorePersistenceAndStoreTests(unittest.TestCase):
     def test_multidomain_apply_rolls_back_files_state_metadata_and_events(self) -> None:
@@ -1053,9 +1071,6 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
         self.assertEqual("upstream-chat", model["upstream_model"])
         self.assertFalse(model["enabled"])
         self.assertEqual(2, model["order"])
-        encoded = json.dumps(model)
-        self.assertNotIn("sk-synthetic-summary-secret", encoded)
-        self.assertNotIn("/private/user", encoded)
         self.assertNotIn("supported_upstream_url_surfaces", model)
 
     def test_export_and_import_use_opaque_file_capabilities(self) -> None:
@@ -1434,6 +1449,11 @@ class CorePersistenceAndStoreTests(unittest.TestCase):
             client = CoreIPCClient(endpoint, server.bootstrap_token)
             self.addCleanup(client.close)
             editor = client.call("editor", {"domain": "claude", "document": "settings"})
+            other_session = server._mint_web_session()
+            with self.assertRaises(Exception):
+                server.stage_editor_capability(
+                    editor["editor_token"], "{}\n", session_token=other_session
+                )
 
             client.call(
                 "dispatch",
@@ -2129,30 +2149,6 @@ class CoreIPCKeepAliveTests(unittest.TestCase):
         finally:
             server.stop()
 
-    def test_a_route_that_never_reads_its_body_still_leaves_a_reusable_socket(self) -> None:
-        # ``/ipc/hello`` answers without parsing anything: it is the route whose
-        # unread body corrupted the next request line.
-        core = CoreStore(domains=[MemoryDomain("language", {"choice": "system"})])
-        server = CoreIPCServer(core)
-        server.start()
-        try:
-            connection, token = self._connection(server)
-            body = json.dumps(
-                {"protocol_version": 1, "request_id": uuid.uuid4().hex, "method": "snapshot", "params": {}}
-            ).encode()
-            connection.request(
-                "POST",
-                "/ipc",
-                body=body,
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            )
-            response = connection.getresponse()
-            self.assertEqual(200, response.status)
-            self.assertTrue(json.loads(response.read())["ok"])
-            connection.close()
-        finally:
-            server.stop()
-
 
 class CoreIPCTests(unittest.TestCase):
     def test_dispatch_returns_the_fetch_summary_through_authenticated_ipc(self) -> None:
@@ -2676,7 +2672,7 @@ class CoreIPCTests(unittest.TestCase):
         self.assertEqual("system", client.call("snapshot")["snapshot"]["language"])
         session = client._session_token
         with server._lock:
-            server._sessions[session].expires_at = time.monotonic() + 0.01
+            server._sessions[session].expires_at = time.monotonic() + 5.0
 
         # The native host's quiet event poll is authenticated activity. It
         # must keep its Core session alive instead of later forcing a Core

@@ -43,17 +43,6 @@ class RollbackWriteTests(unittest.TestCase):
             _restore_files(checkpoints)
             self.assertEqual("providers: {}\n", path.read_text(encoding="utf-8"))
 
-    def test_restoring_a_changed_file_puts_the_checkpoint_back(self) -> None:
-        from young_router.core.service import _checkpoint_files, _restore_files
-
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "config.yaml"
-            path.write_text("kept\n", encoding="utf-8")
-            checkpoints = _checkpoint_files([path])
-            path.write_text("changed by a half-finished apply\n", encoding="utf-8")
-            _restore_files(checkpoints)
-            self.assertEqual("kept\n", path.read_text(encoding="utf-8"))
-
 
 class CoreServiceReloadTests(unittest.TestCase):
     def test_provider_apply_reloads_service_after_source_config_commit(self) -> None:
@@ -289,7 +278,7 @@ class CoreServiceReloadTests(unittest.TestCase):
             (codex_home / "auth.json").write_text("{}\n", encoding="utf-8")
             live_models = {"names": ["public-a"]}
 
-            def exposed_models(_api_key: str) -> tuple[list[str], bool]:
+            def exposed_models(_api_key: str, _config_path=None) -> tuple[list[str], bool]:
                 return list(live_models["names"]), True
 
             def reload_service(operation: str) -> dict[str, str]:
@@ -865,6 +854,59 @@ class CoreServiceReloadTests(unittest.TestCase):
         self.assertTrue(core.wait_for_service_reload(5.0))
         self.assertEqual(["restart", "reload"], reload_calls)
 
+    def test_a_runtime_change_keeps_its_replacement_when_providers_apply_with_it(self) -> None:
+        """One Apply can carry both domains; the environment change is still one.
+
+        The providers branch decides by the runtime document's digest, which an
+        environment setting never moves.  A runtime change committed together
+        with a provider edit therefore got a rolling reload -- or, when the
+        provider edit left the served document as it was, no restart at all --
+        and the proxy went on serving the environment the pane said was
+        replaced.
+        """
+
+        scheduled: list[bool] = []
+        for applied, expected in (
+            (("providers_models", "runtime"), [True]),
+            (("runtime", "providers_models"), [True]),
+            (("runtime",), [True]),
+            # The providers-only rules are unchanged: a document the proxy
+            # already holds is not reloaded, a new one is rolled.
+            (("providers_models",), []),
+        ):
+            with self.subTest(applied=applied):
+                scheduled.clear()
+                core = CoreStore(
+                    domains=[],
+                    service_handlers={
+                        "status": lambda _operation: {"state": "running"},
+                        "stage_runtime_config": lambda _operation: {"fingerprint": "served-document"},
+                    },
+                )
+                with mock.patch.object(
+                    core,
+                    "_schedule_service_reload_after_apply",
+                    lambda *, replace_process=False: scheduled.append(replace_process),
+                ):
+                    core._schedule_reload_for_applied_domains(applied, "served-document")
+                self.assertEqual(expected, scheduled)
+
+        scheduled.clear()
+        core = CoreStore(
+            domains=[],
+            service_handlers={
+                "status": lambda _operation: {"state": "running"},
+                "stage_runtime_config": lambda _operation: {"fingerprint": "new-document"},
+            },
+        )
+        with mock.patch.object(
+            core,
+            "_schedule_service_reload_after_apply",
+            lambda *, replace_process=False: scheduled.append(replace_process),
+        ):
+            core._schedule_reload_for_applied_domains(("providers_models",), "served-document")
+        self.assertEqual([False], scheduled)
+
     def test_a_failed_replacement_stays_owed_instead_of_becoming_a_reload(self) -> None:
         """A replacement that did not come up must not be downgraded.
 
@@ -985,7 +1027,15 @@ class WebDAVPullReloadTests(unittest.TestCase):
           public_model_groups: [public-chat]
         """
 
-    def _core(self, root: Path, reload_calls: list[str], staged: dict[str, str], *, document: str | None = None):
+    def _core(
+        self,
+        root: Path,
+        reload_calls: list[str],
+        staged: dict[str, str],
+        *,
+        document: str | None = None,
+        runtime_settings_path: Path | None = None,
+    ):
         from young_router.core.domains.relay_accounts import RelayAccountsDomain
         from young_router.core.domains.webdav import WebDAVSettingsDomain
 
@@ -1019,6 +1069,8 @@ class WebDAVPullReloadTests(unittest.TestCase):
         providers = ProvidersModelsDomain(config_path)
         relay = RelayAccountsDomain(storage_path=root / ".litellm-runtime" / "relay-accounts.json")
         domains = [providers, relay, webdav]
+        if runtime_settings_path is not None:
+            domains.append(RuntimeSettingsDomain(runtime_settings_path, config_path=config_path))
         core = CoreStore(
             domains=list(domains),
             service_handlers={
@@ -1115,18 +1167,10 @@ class WebDAVPullReloadTests(unittest.TestCase):
             root = Path(directory)
             staged: dict[str, str] = {}
             reload_calls: list[str] = []
-            core, config_path, _webdav, domains = self._core(root, reload_calls, staged)
-            runtime_domain = RuntimeSettingsDomain(root / "runtime-settings.env", config_path=config_path)
-            core = CoreStore(
-                domains=[*domains, runtime_domain],
-                service_handlers={
-                    "status": lambda _operation: {"state": "running"},
-                    "reload": lambda operation: (reload_calls.append(operation), {"state": "running"})[1],
-                    "stage_runtime_config": lambda _operation=None: {"fingerprint": "before"},
-                    "runtime_fingerprint": lambda _operation=None: "before",
-                },
+            core, config_path, _webdav, domains = self._core(
+                root, reload_calls, staged, runtime_settings_path=root / "runtime-settings.env"
             )
-            core.snapshot()
+            runtime_domain = domains[-1]
             self.assertFalse(runtime_domain.external_disk_state()["changed"])
 
             self._pull(core, self.CONFIG.replace("sk-local-key", "sk-arrived-from-another-machine"))

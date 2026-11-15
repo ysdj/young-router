@@ -40,6 +40,15 @@ class ReasoningCapabilityRegistrationTests(unittest.TestCase):
             self.assertEqual(0, gateway.register("/nonexistent.yaml"))
             self.assertEqual(0, gateway.register(""))
 
+    def test_a_config_that_does_not_parse_registers_nothing(self) -> None:
+        # ``yaml.YAMLError`` is not a ``ValueError``.  This runs at import time
+        # in every worker, so a half-written document used to end the worker's
+        # start instead of registering nothing.
+        with tempfile.TemporaryDirectory() as directory, mock.patch("litellm.model_cost", {}):
+            path = Path(directory) / "config.yaml"
+            path.write_text("model_list: [unclosed\n  - {\n", encoding="utf-8")
+            self.assertEqual(0, gateway.register(str(path)))
+
     def test_the_runtime_config_path_comes_from_the_launcher_environment(self) -> None:
         with mock.patch.dict(
             "os.environ",

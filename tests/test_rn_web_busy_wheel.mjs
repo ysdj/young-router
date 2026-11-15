@@ -91,8 +91,10 @@ function App() {
         box its idle state had, so a row never re-flows under the pointer. */}
     <NativeButton title="" symbol="refresh" compact busy accessibilityLabel="busy-symbol" />
     <NativeButton title="" symbol="refresh" compact accessibilityLabel="idle-symbol" />
-    <NativeButton title="刷新" symbol="refresh" compact busy accessibilityLabel="busy-titled" />
-    <NativeButton title="刷新" symbol="refresh" compact accessibilityLabel="idle-titled" />
+    {/* A symbol button draws its title only when asked to, so without
+        symbolWithTitle this pair would measure the icon-only one twice. */}
+    <NativeButton title="刷新" symbol="refresh" symbolWithTitle compact busy accessibilityLabel="busy-titled" />
+    <NativeButton title="刷新" symbol="refresh" symbolWithTitle compact accessibilityLabel="idle-titled" />
   </View>;
 }
 

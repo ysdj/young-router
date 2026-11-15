@@ -60,6 +60,17 @@ class MasterKeyDocumentTests(unittest.TestCase):
         self.assertEqual(master_key_from_document(""), DEFAULT_MASTER_KEY)
         self.assertEqual(master_key_from_document("general_settings: {}\n"), DEFAULT_MASTER_KEY)
 
+    def test_a_document_that_is_not_utf8_states_no_key(self) -> None:
+        # "Unreadable" includes bytes that do not decode: the comparison a sync
+        # makes around an install must get "" back, not a decoder traceback.
+        from young_router.core import service
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_bytes(b"general_settings:\n  master_key: \xff\xfe\n")
+            self.assertEqual("", service._document_master_key(path))
+            self.assertEqual("", service._document_master_key(Path(directory) / "absent.yaml"))
+
     def test_a_rewrite_states_the_key_and_changes_nothing_else(self) -> None:
         source = textwrap.dedent(DOCUMENT)
 
@@ -369,8 +380,10 @@ class GeneralApiKeyCoreTests(unittest.TestCase):
                 "staged-page-key",
                 revision=store.revision,
             )
+            self.assertNotIn("staged-page-key", repr(store.snapshot()))
             store.apply("runtime", revision=staged["revision"])
             store.wait_for_service_reload(10.0)
+            self.assertNotIn("staged-page-key", repr(store.snapshot()))
             descriptor, value = store._trusted_secret_document_read(
                 "runtime", "setting", "YOUNG_ROUTER_WEB_PASSWORD"
             )

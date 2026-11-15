@@ -1324,13 +1324,21 @@ class ContradictedInferenceTakesTheUpstreamsWindowTests(unittest.TestCase):
     def test_an_exact_profile_is_never_contradicted(self) -> None:
         """A record that names the id is a lookup, not an inference.
 
-        ``deepseek-v4.1-flash`` is stated exactly by several providers, so no
-        catalog read may move it however different the number it states.
+        ``deepseek-v4.1-flash`` has a record of its own at 1,000,000 beside a
+        provider copy at 64,000, and the lane states the copy's number; the
+        upstream agrees with a copy the inference did not take, so without the
+        exact-lookup exemption the group would be published at 64,000.
         """
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            self._registry(root, {"deepseek/deepseek-v4.1-flash": 1_000_000})
+            self._registry(
+                root,
+                {
+                    "deepseek-v4.1-flash": 1_000_000,
+                    "deepseek/deepseek-v4.1-flash": 64_000,
+                },
+            )
             domain = self._domain(root, "deepseek-v4.1-flash", "deepseek-v4.1-flash")
             registry = domain._context_registry()
             registry.remember_stated_windows({"deepseek-v4.1-flash": 64_000})

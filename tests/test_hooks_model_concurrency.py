@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 import textwrap
+from unittest import mock
 
 from hook_test_utils import *
 
@@ -696,19 +697,100 @@ class AttemptLeaseIdentityTests(ConcurrencyStoreTestCase):
         self.assertEqual(hooks._deployment_in_flight_count("id:route-a"), 0)
 
 
-def test_the_proxy_and_the_config_editor_name_one_key() -> None:
-    """Both halves must spell the route's cap the same way.
+class SharedSpellingTests(unittest.TestCase):
+    # A method of a TestCase, not a function at module level: this suite runs
+    # under ``python -m unittest``, which collects only the former, so the
+    # check below sat in the file for as long as it was a bare function without
+    # ever running.
 
-    The editor writes the key through ``config.schema``, the store reads it off
-    the deployment, and the pane states it — so a rename on one side would make
-    every route's own number unreachable while the pane kept writing it.
+    def test_the_proxy_and_the_config_editor_name_one_key(self) -> None:
+        """Both halves must spell the route's cap the same way.
+
+        The editor writes the key through ``config.schema``, the store reads it
+        off the deployment, and the pane states it — so a rename on one side
+        would make every route's own number unreachable while the pane kept
+        writing it.
+        """
+
+        from young_router.config.schema import MODEL_CONCURRENCY_KEY, MODEL_CONCURRENCY_MAX
+        from young_router.proxy import concurrency
+
+        self.assertEqual(concurrency.MODEL_CONCURRENCY_LIMIT_KEY, MODEL_CONCURRENCY_KEY)
+        self.assertEqual(concurrency.MODEL_CONCURRENCY_MAX, MODEL_CONCURRENCY_MAX)
+
+
+class WindowsLeaseOwnerProbeTests(unittest.TestCase):
+    """Asking whether a lease's owner exists must not end it.
+
+    On Windows ``os.kill(pid, 0)`` is ``TerminateProcess``: every signal but the
+    two console events kills.  The probe ran on every claim, release and count,
+    over leases written with the asking worker's own pid -- so the first prune
+    on that host ended a serving worker, usually itself.
     """
 
-    from young_router.config.schema import MODEL_CONCURRENCY_KEY, MODEL_CONCURRENCY_MAX
-    from young_router.proxy import concurrency
+    class _Function:
+        """A foreign function: callable, and it takes ``argtypes``/``restype``."""
 
-    assert concurrency.MODEL_CONCURRENCY_LIMIT_KEY == MODEL_CONCURRENCY_KEY
-    assert concurrency.MODEL_CONCURRENCY_MAX == MODEL_CONCURRENCY_MAX
+        def __init__(self, call) -> None:
+            self._call = call
+
+        def __call__(self, *arguments):
+            return self._call(*arguments)
+
+    class _Kernel32:
+        def __init__(self, *, handle: int, exit_code: int = 259, last_error: int = 0) -> None:
+            self.last_error = last_error
+            self.closed: list[int] = []
+
+            def get_exit_code(_handle, pointer):
+                pointer._obj.value = exit_code
+                return 1
+
+            def close(opened):
+                self.closed.append(opened)
+                return 1
+
+            function = WindowsLeaseOwnerProbeTests._Function
+            self.OpenProcess = function(lambda _access, _inherit, _pid: handle)
+            self.GetExitCodeProcess = function(get_exit_code)
+            self.CloseHandle = function(close)
+
+    def _probe(self, kernel32: "WindowsLeaseOwnerProbeTests._Kernel32"):
+        import ctypes
+
+        from young_router.proxy import concurrency
+
+        with mock.patch.object(concurrency.os, "name", "nt"), mock.patch.object(
+            concurrency.os, "kill", side_effect=AssertionError("os.kill is not a probe on Windows")
+        ), mock.patch.object(ctypes, "WinDLL", lambda *_a, **_k: kernel32, create=True), mock.patch.object(
+            ctypes, "get_last_error", lambda: kernel32.last_error, create=True
+        ):
+            return concurrency._pid_alive(4242)
+
+    def test_a_running_owner_is_alive_and_was_never_signalled(self) -> None:
+        kernel32 = self._Kernel32(handle=7)
+        self.assertIs(self._probe(kernel32), True)
+        self.assertEqual([7], kernel32.closed)
+
+    def test_an_owner_that_exited_is_gone(self) -> None:
+        self.assertIs(self._probe(self._Kernel32(handle=7, exit_code=0)), False)
+
+    def test_a_pid_that_cannot_be_opened_is_gone_unless_access_was_denied(self) -> None:
+        self.assertIs(self._probe(self._Kernel32(handle=0, last_error=87)), False)
+        self.assertIs(self._probe(self._Kernel32(handle=0, last_error=5)), True)
+
+    def test_a_probe_that_cannot_run_leaves_the_lease_to_its_age(self) -> None:
+        import ctypes
+
+        from young_router.proxy import concurrency
+
+        def unavailable(*_a, **_k):
+            raise OSError("kernel32 is not available")
+
+        with mock.patch.object(concurrency.os, "name", "nt"), mock.patch.object(
+            concurrency.os, "kill", side_effect=AssertionError("os.kill is not a probe on Windows")
+        ), mock.patch.object(ctypes, "WinDLL", unavailable, create=True):
+            self.assertIsNone(concurrency._pid_alive(4242))
 
 
 class SharedStoreUnavailableTests(ConcurrencyStoreTestCase):
@@ -927,15 +1009,16 @@ class TurnEndReleasesTheSlotTests(ConcurrencyStoreTestCase):
     def test_a_slot_is_released_under_any_name_the_turn_is_known_by(self) -> None:
         """The claim and the release see different copies of the request.
 
-        One copy keeps this proxy's marker, another keeps only LiteLLM's trace
-        id, a third only the client's own request id. A slot registered under one
-        name and looked for under another is never given back, which is what made
+        The claim copy carries this proxy's marker and LiteLLM's trace id; the
+        release copy keeps only the trace id. A slot registered under one name
+        and looked for under another is never given back, which is what made
         every turn leak the slot it had just claimed.
         """
 
         hooks, _proxy_server = load_hook_module()
         claim_copy = {
             "_young_router_attempt_lease_id": "lease-1",
+            "litellm_trace_id": "trace-1",
             "model_info": {"id": "route-a"},
         }
         release_copy = {
@@ -948,14 +1031,12 @@ class TurnEndReleasesTheSlotTests(ConcurrencyStoreTestCase):
                 claim_copy, _deployment("route-a"), 8
             )
         )
-        # Both copies name the same turn by its marker, so the release finds it.
+        # The claim registers the slot under every name the turn is known by, so
+        # a release that carries only the trace id still finds it.
         self.assertEqual(
-            ["lease-1"], hooks._lease_identifier_candidates(claim_copy)
+            ["lease-1", "trace-1"], hooks._lease_identifier_candidates(claim_copy)
         )
 
-        hooks._HELD_CONCURRENCY_LEASES.setdefault(
-            "trace-1", set()
-        ).add(sorted(hooks._HELD_CONCURRENCY_LEASES["lease-1"])[0])
         hooks._release_request_concurrency_slots(release_copy)
 
         self.assertEqual({}, self.leases())

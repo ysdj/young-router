@@ -174,7 +174,7 @@ class LockBudgetTests(unittest.TestCase):
 
         core = CoreStore(service_handlers={"status": status})
         core.snapshot()
-        released = threading.Event()
+        acquisitions: list[float] = []
         stop = threading.Event()
 
         def poll() -> None:
@@ -182,15 +182,20 @@ class LockBudgetTests(unittest.TestCase):
             # probe is in flight.
             while not stop.is_set():
                 with core._lock:
-                    released.set()
+                    acquisitions.append(time.perf_counter())
                 time.sleep(0.005)
 
         thread = threading.Thread(target=poll, daemon=True)
         thread.start()
+        started = time.perf_counter()
         core.snapshot()
-        self.assertTrue(released.wait(0.2), "the status probe held the state lock")
+        finished = time.perf_counter()
         stop.set()
         thread.join(timeout=2)
+        self.assertTrue(
+            any(started <= at <= finished for at in acquisitions),
+            "the status probe held the state lock",
+        )
         self.assertEqual((), core._lock.overruns())
 
     def test_adopting_an_external_edit_does_not_hold_the_state_lock(self) -> None:
@@ -199,22 +204,27 @@ class LockBudgetTests(unittest.TestCase):
         core = CoreStore(domains=[domain])
         core.snapshot()
         domain.external_changed = True
-        released = threading.Event()
+        acquisitions: list[float] = []
         stop = threading.Event()
 
         def poll() -> None:
             while not stop.is_set():
                 with core._lock:
-                    released.set()
+                    acquisitions.append(time.perf_counter())
                 time.sleep(0.005)
 
         thread = threading.Thread(target=poll, daemon=True)
         thread.start()
+        started = time.perf_counter()
         core.snapshot()
+        finished = time.perf_counter()
         self.assertEqual(1, domain.reloaded)
-        self.assertTrue(released.wait(0.2), "adopting an external edit held the state lock")
         stop.set()
         thread.join(timeout=2)
+        self.assertTrue(
+            any(started <= at <= finished for at in acquisitions),
+            "adopting an external edit held the state lock",
+        )
         self.assertEqual((), core._lock.overruns())
 
     def test_snapshots_keep_answering_during_a_long_dispatch(self) -> None:
@@ -248,24 +258,28 @@ class LockBudgetTests(unittest.TestCase):
     def test_a_slow_projection_does_not_hold_the_state_lock(self) -> None:
         domain = SlowSnapshotDomain(wait=0)
         core = CoreStore(domains=[domain])
-        released = threading.Event()
+        acquisitions: list[float] = []
         stop = threading.Event()
 
         def poll() -> None:
             while not stop.is_set():
                 with core._lock:
-                    released.set()
+                    acquisitions.append(time.perf_counter())
                 time.sleep(0.005)
 
         thread = threading.Thread(target=poll, daemon=True)
         thread.start()
         started = time.perf_counter()
         core.snapshot()
-        elapsed = time.perf_counter() - started
+        finished = time.perf_counter()
+        elapsed = finished - started
         stop.set()
         thread.join(timeout=2)
         self.assertGreaterEqual(elapsed, 0.35, "the fixture did not exercise a slow projection")
-        self.assertTrue(released.wait(0.2), "the domain projection held the state lock")
+        self.assertTrue(
+            any(started <= at <= finished for at in acquisitions),
+            "the domain projection held the state lock",
+        )
         self.assertEqual((), core._lock.overruns())
 
     def test_a_large_action_summary_is_copied_outside_the_state_lock(self) -> None:
@@ -285,6 +299,13 @@ class LockBudgetTests(unittest.TestCase):
 
         thread = threading.Thread(target=poll, daemon=True)
         thread.start()
+        # Wait until the poller is actually scheduled: starting the snapshot
+        # first let a loaded machine finish it before this thread ever ran, and
+        # the test then read "no acquisition" as "held the lock".
+        deadline = time.perf_counter() + 5.0
+        while not acquisitions and time.perf_counter() < deadline:
+            time.sleep(0.001)
+        self.assertTrue(acquisitions, "the poller never acquired the lock")
         started = time.perf_counter()
         payload = core.snapshot()
         finished = time.perf_counter()

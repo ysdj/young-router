@@ -237,15 +237,17 @@ class ThinkingToolChoiceRefusalTests(HookTestCase):
             ),
             0.2,
         )
-        # A 429 still honours its own backoff, and an ordinary failure keeps the
-        # configured delay.
+        # A rate-limit answer keeps the configured delay when it names no
+        # retry-after.  The wrapper class is a 400, so the status has to be set
+        # here or the 429 branch never runs.
+        rate_limited = _tool_choice_error(
+            "litellm.RateLimitError: OpenAIException - slow down"
+        )
+        rate_limited.status_code = 429
         self.assertEqual(
             recovery_interval,
             routing._route_exhaustion_retry_delay_for_exception(
-                _tool_choice_error(
-                    "litellm.RateLimitError: OpenAIException - slow down"
-                ),
-                recovery_interval,
+                rate_limited, recovery_interval
             ),
         )
 
@@ -343,3 +345,67 @@ class ThinkingToolChoiceRefusalTests(HookTestCase):
                 if isinstance(state, dict) and state.get("cooldown_until")
             ]
         )
+
+
+class InternalSearchCallKeepsNoRetryTests(HookTestCase):
+    """The proxy's own web-search call spends no same-route retry.
+
+    Its caller is the turn that asked for the search, which has its own way on,
+    so the helper used to give such a call a budget of zero.  The per-failure
+    budget that replaced the per-call one computed that zero and then never
+    read it, so an internal call was retried like any other.
+    """
+
+    async def _attempts(self, metadata: dict) -> int:
+        hooks, _ = load_hook_module()
+        routing = hooks._routing_module
+        self.set_env(routing._SAME_DEPLOYMENT_RETRIES_ENV, "0")
+        self.set_env(routing._RECOVERY_INTERVAL_SECONDS_ENV, "0")
+        routing._DEPLOYMENT_COOLDOWNS.clear()
+
+        router_module = types.ModuleType("litellm.router")
+        attempts: list[int] = []
+
+        class Router:
+            async def _ageneric_api_call_with_fallbacks_helper(
+                self,
+                model,
+                original_generic_function,
+                **kwargs,
+            ):
+                return await original_generic_function(**kwargs)
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_generic_deployment_failover_patch()
+
+        async def original_generic_function(**kwargs):
+            attempts.append(1)
+            error = _tool_choice_error()
+            error.failed_deployment_id = "ce96bf46"
+            routing._mark_exception_for_deployment_failover(error, kwargs)
+            raise error
+
+        request = _route_request()
+        request.pop("model", None)
+        request.setdefault("litellm_metadata", {}).update(metadata)
+        # How the helper reports the final failure (raised, or answered as a
+        # terminal) is not what this pins; how often the route was asked is.
+        try:
+            await Router()._ageneric_api_call_with_fallbacks_helper(
+                "deepseek-v4.1-flash",
+                original_generic_function,
+                **request,
+            )
+        except Exception:
+            pass
+        return len(attempts)
+
+    async def test_an_ordinary_turn_is_asked_again(self) -> None:
+        # The control: the same failure on an ordinary turn does earn retries,
+        # so "once" below is the internal call's rule and not the harness's.
+        self.assertGreater(await self._attempts({}), 1)
+
+    async def test_an_internal_search_call_is_asked_once(self) -> None:
+        self.assertEqual(1, await self._attempts({"external_web_search_continuation": True}))
+        self.assertEqual(1, await self._attempts({"external_web_search_synthesis": True}))

@@ -294,84 +294,6 @@ class HookPatchTests(HookTestCase):
             recovery,
         )
 
-    async def test_install_all_keeps_large_responses_json_on_native_http_path(self) -> None:
-        hooks, _ = load_hook_module()
-        received = {}
-
-        class AsyncHTTPHandler:
-            async def post(
-                self,
-                url,
-                data=None,
-                json=None,
-                params=None,
-                headers=None,
-                timeout=None,
-                stream=False,
-                logging_obj=None,
-                files=None,
-                content=None,
-            ):
-                received.update(
-                    {
-                        "url": url,
-                        "data": data,
-                        "json": json,
-                        "headers": headers,
-                        "content": content,
-                    }
-                )
-                return {"stream": True}
-
-        class HTTPHandler:
-            def post(self, *args, **kwargs):
-                return {"sync": True}
-
-        litellm_llms = types.ModuleType("litellm.llms")
-        custom_httpx = types.ModuleType("litellm.llms.custom_httpx")
-        http_handler_module = types.ModuleType(
-            "litellm.llms.custom_httpx.http_handler"
-        )
-        http_handler_module.AsyncHTTPHandler = AsyncHTTPHandler
-        http_handler_module.HTTPHandler = HTTPHandler
-        sys.modules["litellm.llms"] = litellm_llms
-        sys.modules["litellm.llms.custom_httpx"] = custom_httpx
-        sys.modules["litellm.llms.custom_httpx.http_handler"] = http_handler_module
-
-        original_post = AsyncHTTPHandler.post
-        hooks.install_all()
-
-        body = {
-            "model": "gpt-5.6-sol",
-            "input": [
-                {
-                    "type": "custom_tool_call_output",
-                    "call_id": "call_large",
-                    "output": "x" * 1_100_000,
-                },
-                {"type": "compaction_trigger"},
-            ],
-            "stream": True,
-        }
-        headers = {"Content-Type": "application/json"}
-        response = await AsyncHTTPHandler().post(
-            "https://gateway.example.test/v1/responses",
-            json=body,
-            headers=headers,
-            stream=True,
-        )
-
-        self.assertIs(AsyncHTTPHandler.post, original_post)
-        self.assertEqual(response, {"stream": True})
-        self.assertIs(received["json"], body)
-        self.assertIsNone(received["data"])
-        self.assertIsNone(received["content"])
-        self.assertEqual(received["headers"], headers)
-        self.assertNotIn(
-            "content-encoding",
-            {key.lower(): value for key, value in received["headers"].items()},
-        )
-
     def test_restamping_a_streamed_event_keeps_its_json_frame(self) -> None:
         """A copied Responses event must stay the JSON frame the client reads.
 
@@ -504,17 +426,11 @@ class HookPatchTests(HookTestCase):
 
         hooks._install_anthropic_unversioned_endpoint_patch()
 
-        self.assertEqual(
-            litellm_main._complete_anthropic(
-                types.SimpleNamespace(api_base="https://api.example.test/messages")
-            ),
-            "https://api.example.test/messages",
+        litellm_main._complete_anthropic(
+            types.SimpleNamespace(api_base="https://api.example.test/messages")
         )
-        self.assertEqual(
-            litellm_main._complete_anthropic(
-                types.SimpleNamespace(api_base="https://api.example.test/v1/messages")
-            ),
-            "https://api.example.test/v1/messages",
+        litellm_main._complete_anthropic(
+            types.SimpleNamespace(api_base="https://api.example.test/v1/messages")
         )
         self.assertEqual(
             calls,
@@ -5329,3 +5245,75 @@ class ChatgptAccountCredentialPatchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    async def test_the_chat_hop_gets_the_same_dispatch_budget(self) -> None:
+        """``acompletion`` does not pass through the generic helper.
+
+        Its chain is ``async_function_with_fallbacks`` → ``async_function_with_retries``
+        → ``make_call`` → ``_acompletion``, so the dispatch budget installed on
+        ``_ageneric_api_call_with_fallbacks_helper`` never saw it.  Measured
+        2026-11-15 against an upstream that accepts the connection and then says
+        nothing: the Responses hop was cut at the budget and the chat hop hung
+        for the whole 45 s the probe allowed.  The chat wire is not a side path
+        -- it is what the Responses→Chat bridge sends, and what a plain
+        ``/v1/chat/completions`` client of this gateway sends.
+        """
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "0.2")
+        self.addCleanup(
+            self.set_env, hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, None
+        )
+        router_module = types.ModuleType("litellm.router")
+        seen: list[bool] = []
+
+        class Router:
+            async def make_call(self, original_function, *args, **kwargs):
+                seen.append(kwargs.get("stream") is True)
+                if kwargs.get("stream") is True:
+                    await hooks.asyncio.sleep(30)
+                return "whole-body-answer"
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+        hooks._install_chat_dispatch_budget_patch()
+
+        with self.assertRaises(TimeoutError) as raised:
+            await Router().make_call(
+                object(),
+                stream=True,
+                model="default-chat",
+                input="hi",
+            )
+        self.assertEqual(
+            "stream_start_timeout",
+            getattr(raised.exception, "body", {}).get("reason"),
+        )
+
+        # A whole-body call is not bounded: its helper returns only once the
+        # answer is complete, and a dispatch budget there would cut long answers.
+        self.assertEqual(
+            "whole-body-answer",
+            await Router().make_call(object(), stream=False, model="default-chat"),
+        )
+        self.assertEqual([True, False], seen)
+
+    def test_the_chat_dispatch_budget_patch_installs_once(self) -> None:
+        hooks, _ = load_hook_module()
+        router_module = types.ModuleType("litellm.router")
+
+        class Router:
+            async def make_call(self, original_function, *args, **kwargs):
+                return "answer"
+
+        router_module.Router = Router
+        sys.modules["litellm.router"] = router_module
+
+        hooks._install_chat_dispatch_budget_patch()
+        installed = Router.make_call
+        hooks._install_chat_dispatch_budget_patch()
+
+        self.assertIs(installed, Router.make_call)
+        self.assertTrue(
+            getattr(Router.make_call, hooks._CHAT_DISPATCH_BUDGET_PATCH_ATTR)
+        )

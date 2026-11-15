@@ -14,9 +14,11 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from young_router import runtime_store
 
@@ -84,6 +86,65 @@ class RuntimeStoreTests(unittest.TestCase):
         self.assertFalse(runtime_store.has_document(self.path))
         self.assertFalse(self.path.exists())
         self.assertEqual({}, runtime_store.read_document(self.path))
+
+    def test_a_legacy_file_that_is_not_utf8_is_no_document(self) -> None:
+        # A decode error is a ``ValueError``: it left through neither the
+        # ``OSError`` handler around the read nor the one around the parse.
+        self.path.write_bytes(b'{"leases": "\xff\xfe"}')
+        self.assertEqual({}, runtime_store.read_document(self.path))
+        self.assertFalse(runtime_store.has_document(self.path))
+
+    def test_a_schema_that_failed_once_is_built_on_the_next_use(self) -> None:
+        # The connection used to be cached before the schema existed, so one
+        # failure (another process still creating the file) left this thread a
+        # connection that every later call returned as ready.
+        handle = runtime_store._handle(self.path)
+        original = handle._ensure_schema
+        calls = []
+
+        def fail_once(connection):
+            calls.append(1)
+            if len(calls) == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return original(connection)
+
+        handle._ensure_schema = fail_once  # type: ignore[method-assign]
+        self.addCleanup(setattr, handle, "_ensure_schema", original)
+        with self.assertRaises(OSError):
+            runtime_store.read_document(self.path)
+
+        runtime_store.update_document(self.path, lambda payload: payload.update({"ok": True}))
+        self.assertEqual({"ok": True}, runtime_store.read_document(self.path))
+
+    def test_a_legacy_log_that_could_not_be_read_is_adopted_on_a_later_call(self) -> None:
+        # A lock or a permission is not "there is no legacy log".  The import
+        # used to be recorded as done either way, which left the history on
+        # disk and never read it again.
+        log = Path(self.directory.name) / "recent-requests.jsonl"
+        log.write_text(json.dumps({"request_id": "old"}) + "\n", encoding="utf-8")
+        real_open = open
+
+        def locked(file, mode="r", *args, **kwargs):
+            if os.fspath(file) == str(log) and "b" in mode:
+                raise PermissionError("locked")
+            return real_open(file, mode, *args, **kwargs)
+
+        with mock.patch("builtins.open", locked):
+            runtime_store.append_record(log, json.dumps({"request_id": "new-1"}))
+        runtime_store.append_record(log, json.dumps({"request_id": "new-2"}))
+
+        bodies = [json.loads(body)["request_id"] for body in runtime_store.read_records(log, limit=10)]
+        self.assertEqual({"old", "new-1", "new-2"}, set(bodies))
+        self.assertEqual(3, len(bodies), "the adopted history was imported more than once")
+
+    def test_a_log_with_no_legacy_file_is_marked_imported(self) -> None:
+        log = Path(self.directory.name) / "recent-requests.jsonl"
+        runtime_store.append_record(log, json.dumps({"request_id": "first"}))
+        # A file that appears afterwards is not a history this log ever had.
+        log.write_text(json.dumps({"request_id": "stray"}) + "\n", encoding="utf-8")
+        runtime_store.append_record(log, json.dumps({"request_id": "second"}))
+        bodies = [json.loads(body)["request_id"] for body in runtime_store.read_records(log, limit=10)]
+        self.assertEqual(["first", "second"], bodies)
 
     def test_a_store_that_cannot_be_reached_is_an_oserror(self) -> None:
         blocker = Path(self.directory.name) / "blocker"

@@ -83,7 +83,6 @@ def _release_archive(
 
 
 TAG_COMMIT = "0123456789abcdef0123456789abcdef01234567"
-_TAGS = f"{TAG_COMMIT}\trefs/tags/v0.9.0\n{TAG_COMMIT}\trefs/tags/v0.9.1\n"
 
 
 class ContextAttachmentManagerGateTests(unittest.TestCase):

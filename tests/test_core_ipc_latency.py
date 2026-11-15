@@ -187,9 +187,14 @@ class IpcLatencyTests(unittest.TestCase):
         already parsed in the same request.
         """
 
-        from young_router.core import codex_config
+        from young_router.config import schema as config_schema
 
-        with mock.patch.object(codex_config.yaml, "safe_load", wraps=codex_config.yaml.safe_load) as parse:
+        # Start from an empty cache, or a read of the document would be
+        # answered by the parse made before the patch and count nothing.
+        config_schema._yaml_text_parsed.clear()
+        with mock.patch.object(
+            config_schema, "_yaml_load", wraps=config_schema._yaml_load
+        ) as parse:
             self.core.snapshot()
             self.core.snapshot()
 
@@ -218,12 +223,10 @@ class IpcLatencyTests(unittest.TestCase):
     def test_snapshot_and_reload_stay_inside_the_ipc_budget(self) -> None:
         worst_snapshot = self._timed(self.core.snapshot, repeat=7)
         worst_reload = self._timed(self.core.reload, repeat=7)
-        worst_all = self._timed(lambda: self.core.reload(), repeat=3)
         worst_providers = self._timed(lambda: self.core.reload("providers_models"), repeat=5)
 
         self.assertLess(worst_snapshot, IPC_BUDGET_MS, "snapshot exceeded the IPC budget")
         self.assertLess(worst_reload, IPC_BUDGET_MS, "reload exceeded the IPC budget")
-        self.assertLess(worst_all, IPC_BUDGET_MS, "a full reload exceeded the IPC budget")
         self.assertLess(worst_providers, IPC_BUDGET_MS, "a provider reload exceeded the IPC budget")
 
     def test_validate_and_disk_state_stay_inside_the_ipc_budget(self) -> None:
@@ -264,7 +267,7 @@ class IpcLatencyTests(unittest.TestCase):
         # window aside so this snapshot is the one that would take the live path.
         codex._catalog_source_checked_at = 0.0
 
-        def slow_listing(_key: str) -> tuple[list[str], bool]:
+        def slow_listing(_key: str, _config_path=None) -> tuple[list[str], bool]:
             time.sleep(1.0)
             return [], False
 

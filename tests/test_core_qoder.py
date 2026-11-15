@@ -10,6 +10,7 @@ secret capability and handed to the worker by target.
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 
@@ -395,7 +396,12 @@ class QoderProviderTests(unittest.TestCase):
             )
 
     def test_the_status_read_is_remembered_for_a_projection(self) -> None:
-        directory, domain, _config = self._domain()
+        runtime = StubRuntime()
+        runtime.provider_status = lambda provider: {
+            **StubRuntime().provider_status(provider),
+            "signInSource": "app",
+        }
+        directory, domain, _config = self._domain(runtime)
         with directory:
             snapshot = domain.dispatch("qoder_status", {"provider": "qoder", "refresh": True})
             self.assertTrue(snapshot["operation_summary"]["available"])
@@ -404,7 +410,7 @@ class QoderProviderTests(unittest.TestCase):
             self.assertEqual(observed["credits"]["total"], 92)
             # The pane states where the credential comes from, so the read that
             # answered it has to keep that fact, not only the account.
-            self.assertIn("signInSource", observed)
+            self.assertEqual(observed["signInSource"], "app")
             # The name matters: a ``*credential*`` key is rewritten to
             # ``configured`` by the snapshot's redaction, so a source stated
             # under that name reaches the pane unreadable.
@@ -590,6 +596,52 @@ class QoderProviderTests(unittest.TestCase):
         self.assertIn("os.environ/YOUNG_ROUTER_QODER_GLOBAL_BASE", references)
         self.assertIn("qoder_login", adapters.catalog_auth_kinds())
         self.assertEqual(adapters.catalog_provider_id("qoder_login"), "qoder")
+
+
+
+class QoderReadinessDeadlineTests(unittest.TestCase):
+    """The start deadline bounds the wait, not the readline that follows it."""
+
+    def _runtime(self, directory: str) -> qoder.QoderRuntime:
+        return qoder.QoderRuntime(tempfile.mkdtemp(dir=directory))
+
+    def test_a_worker_that_prints_nothing_does_not_block_the_deadline(self) -> None:
+        import subprocess
+        import time as time_module
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = self._runtime(directory)
+            # A process that stays alive and writes nothing: `readline()` on
+            # its pipe never returns, so a deadline tested around that call
+            # could never fire.
+            process = subprocess.Popen(
+                ["sleep", "30"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+            previous = qoder._QODER_START_TIMEOUT_SECONDS
+            qoder._QODER_START_TIMEOUT_SECONDS = 0.3
+            started = time_module.monotonic()
+            try:
+                self.assertIsNone(runtime._read_ready(process))
+            finally:
+                qoder._QODER_START_TIMEOUT_SECONDS = previous
+                process.kill()
+                process.wait(timeout=5)
+            self.assertLess(time_module.monotonic() - started, 5.0)
+
+    def test_a_ready_line_is_still_read(self) -> None:
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = self._runtime(directory)
+            process = subprocess.Popen(
+                [sys.executable, "-c", "print('{\"ready\": true, \"port\": 41234}', flush=True)"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                self.assertEqual(runtime._read_ready(process), {"ready": True, "port": 41234})
+            finally:
+                process.wait(timeout=5)
 
 
 if __name__ == "__main__":

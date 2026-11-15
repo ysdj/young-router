@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import subprocess
+from unittest import mock
+
 from hook_test_utils import *
 
 
@@ -234,16 +237,27 @@ class HookDshVisionRouterTests(HookTestCase):
 
     async def test_local_backend_detailed_format_is_preserved(self) -> None:
         hooks, _ = load_hook_module()
+        from young_router.adapters import dsh_vision_router as router
+
         self.set_env(
             "YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON",
             json.dumps({"backend": "local", "localFormat": "detailed"}),
         )
+        helper_calls: list[list[str]] = []
 
-        def local_description(reference: str) -> str:
-            self.assertTrue(reference.startswith("data:image/png;base64,"))
-            return "Layout summary:\nImage size: 900x600.\nProbable page type: dialog or modal surface.\nDetected elements: 3 OCR text line(s), modal-style central surface, about 1 button-like region(s).\nLikely button labels: Confirm"
+        def run_helper(arguments: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            helper_calls.append(arguments)
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                stdout=(
+                    "Layout summary:\nImage size: 900x600.\n"
+                    "Probable page type: dialog or modal surface.\n"
+                    "Detected elements: 3 OCR text line(s), modal-style central surface, "
+                    "about 1 button-like region(s).\nLikely button labels: Confirm"
+                ),
+            )
 
-        hooks._dsh_local_vision_description = local_description
         request = {
             "model": "text-only",
             "messages": [
@@ -251,15 +265,23 @@ class HookDshVisionRouterTests(HookTestCase):
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "what is shown?"},
-                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + VALID_IMAGE_RESULT}},
                     ],
                 }
             ],
         }
 
-        rewritten = await hooks.dsh_vision_router_request_kwargs(request)
+        # `localFormat` is read inside `_dsh_local_vision_description`, so fake
+        # only the helper launch: replacing that function would leave the
+        # config key unread and the test passing on any format.
+        with mock.patch.object(
+            router, "_vision_helper_source", lambda: Path(__file__).resolve()
+        ), mock.patch.object(router.subprocess, "run", run_helper):
+            rewritten = await hooks.dsh_vision_router_request_kwargs(request)
 
         self.assertIsNotNone(rewritten)
+        self.assertEqual(1, len(helper_calls))
+        self.assertEqual(["--format", "detailed"], helper_calls[0][1:3])
         dumped = json.dumps(rewritten)
         self.assertIn("Probable page type", dumped)
         self.assertIn("Likely button labels", dumped)

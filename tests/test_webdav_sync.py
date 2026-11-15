@@ -369,7 +369,10 @@ class WebDAVConflictRecordTests(unittest.TestCase):
                 status=root / "status.json",
                 command="sync",
             )
-            with patch("young_router.webdav.core.WebDAVClient", return_value=object()), patch(
+            with patch(
+                "young_router.webdav.commands.remote_snapshot",
+                return_value=webdav_core.SyncSnapshot(remote),
+            ), patch(
                 "young_router.webdav.commands.local_snapshot", return_value=webdav_core.SyncSnapshot(local)
             ), patch("young_router.webdav.commands.read_remote_manifest", return_value=remote), patch(
                 "young_router.webdav.commands.decide_sync",
@@ -411,6 +414,30 @@ class WebDAVArchiveTests(unittest.TestCase):
             "config.bak-20260924-195812.json",
             webdav_core.archived_bundle_name("", "20260924-195812"),
         )
+
+    def test_a_remote_manifest_that_is_not_utf8_is_a_sync_error(self) -> None:
+        """Bytes that do not decode are "not valid JSON", not a traceback.
+
+        The decode runs before the parse, and its error is not the parse's: it
+        left ``read_remote_manifest`` as a bare ``UnicodeDecodeError``, which
+        neither the command line nor the app's sync path reports as a failed
+        sync.
+        """
+
+        class Client:
+            def get(self, url: str, max_bytes: int = 0) -> bytes:
+                return b'{"app": "\xff\xfe"}'
+
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "webdav.json"
+            settings_path.write_text(
+                json.dumps({"url": "https://webdav.example.test/config/", "username": "person", "password": "secret", "remote_name": "menu-config.json"}),
+                encoding="utf-8",
+            )
+            settings = webdav_core.load_settings(settings_path)
+            with self.assertRaises(webdav_core.SyncError) as raised:
+                webdav_operations.read_remote_manifest(Client(), settings)
+        self.assertIn("not valid JSON", str(raised.exception))
 
     def test_archiving_copies_the_remote_file_to_a_sibling(self) -> None:
         """The unreadable file is read and written back under its new name."""
@@ -1041,6 +1068,47 @@ class WebDAVSyncBundleTests(unittest.TestCase):
                 [{"account_id": "account-wawapii", "label": "wawapii", "kind": "credentials"}],
                 merged["pending_credential_cleanups"],
             )
+
+    def test_a_cleanup_both_machines_hold_is_merged_as_one_row(self) -> None:
+        """A tombstone both sides carry is one tombstone, not two.
+
+        Once a deletion has synced, both stores name the same pending cleanup.
+        The merge concatenated the two lists, and the relay store refuses a
+        file that states an (account, kind) pair twice -- so the pull that kept
+        a local-only station also wrote a store the next start could not load.
+        """
+
+        import copy
+
+        peer = self._two_station_store(removed=True)
+        local = self._two_station_store(removed=True)
+        # A station only this machine knows makes the pull a merge rather than
+        # a verbatim install.
+        local["stations"].append(  # type: ignore[union-attr]
+            {"id": "station-local", "name": "local", "origin": "https://local.example.test", "type": "newapi"}
+        )
+        extra = copy.deepcopy(local["accounts"][0])  # type: ignore[index]
+        extra.update(
+            {
+                "id": "account-local",
+                "station_id": "station-local",
+                "label": "local",
+                "origin": "https://local.example.test",
+            }
+        )
+        local["accounts"].append(extra)  # type: ignore[union-attr]
+
+        merged = webdav_core._merge_relay_accounts(
+            json.dumps(local).encode("utf-8"), json.dumps(peer).encode("utf-8")
+        )
+
+        assert merged is not None
+        document = json.loads(merged)
+        self.assertIn("account-local", [account["id"] for account in document["accounts"]])
+        self.assertEqual(
+            [{"account_id": "account-wawapii", "label": "wawapii", "kind": "credentials"}],
+            document["pending_credential_cleanups"],
+        )
 
     def test_a_deletion_made_on_the_other_machine_lands_here(self) -> None:
         """The rule is symmetric: the peer's tombstone removes the local row.
@@ -2629,10 +2697,16 @@ class BackupRetentionTests(unittest.TestCase):
             personal = root / "relay-accounts.json.bak-before-key-switch-20260920"
             personal.write_text("{}", encoding="utf-8")
 
-            webdav_core._backup(target)
+            # The copy's name comes from the clock, so the clock is fixed here:
+            # on a machine dated before the names above, the copy just made would
+            # be the oldest one and every count below would still pass.
+            with patch("young_router.webdav.core._timestamp", return_value="20270101-000000"):
+                created = Path(webdav_core._backup(target))
 
             kept = sorted(p.name for p in root.glob("relay-accounts.json.bak-webdav-*"))
             self.assertEqual(webdav_core.WEBDAV_BACKUP_RETENTION, len(kept))
+            self.assertIn(created.name, kept)
+            self.assertTrue(created.exists())
             self.assertNotIn("relay-accounts.json.bak-webdav-20260101-000000", kept)
             self.assertTrue(personal.exists())
 

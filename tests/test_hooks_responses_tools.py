@@ -884,13 +884,6 @@ class HookResponsesToolBridgeTests(HookTestCase):
         self.assertEqual(stats["bridged_namespace_tools"], 1)
         self.assertEqual(stats["dropped_web_search_tools"], 0)
 
-        preemptive_chat_kwargs = hooks._responses_chat_bridge_preemptive_kwargs(
-            request_kwargs,
-            include_hosted_web_search_unsupported=True,
-            include_client_tool_unsupported=True,
-        )
-        self.assertIsNone(preemptive_chat_kwargs)
-
     def test_responses_tool_adapter_preserves_explicit_parallel_tool_calls(self) -> None:
         hooks, _ = load_hook_module()
         request_kwargs = {

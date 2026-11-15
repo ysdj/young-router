@@ -124,7 +124,7 @@ class StagedReleaseReuseTests(unittest.TestCase):
         stage(self.directory, version="0.0.1")
         calls: list[Path] = []
 
-        def fake_metadata(registry_url: str):
+        def fake_metadata(registry_url: str, version=None):
             return VERSION, "https://registry.invalid/pkg.tgz", {"dist": {"integrity": INTEGRITY}}
 
         def fake_request(url: str, *, timeout: int = 0) -> bytes:
@@ -151,7 +151,7 @@ class StagedReleaseReuseTests(unittest.TestCase):
         stage(self.directory)
         calls: list[Path] = []
 
-        def fake_metadata(registry_url: str):
+        def fake_metadata(registry_url: str, version=None):
             return VERSION, "https://registry.invalid/pkg.tgz", {"dist": {"integrity": INTEGRITY}}
 
         def fail_install(*args, **kwargs) -> None:
@@ -278,7 +278,7 @@ class DeprecatedReleaseTests(unittest.TestCase):
         version.update(overrides)
         return payload
 
-    def _resolve(self, payload):
+    def _resolve(self, payload, version=None):
         with mock.patch.object(
             update_common, "request_json", lambda *a, **k: payload
         ):
@@ -287,6 +287,7 @@ class DeprecatedReleaseTests(unittest.TestCase):
                 package_name=PACKAGE,
                 timeout=5,
                 user_agent="test",
+                version=version,
             )
 
     def test_a_deprecated_latest_is_refused(self) -> None:
@@ -312,6 +313,46 @@ class DeprecatedReleaseTests(unittest.TestCase):
             with self.subTest(value=value):
                 version, _, _ = self._resolve(self._metadata(deprecated=value))
                 self.assertEqual(version, "0.7.9")
+
+    def test_a_named_version_resolves_its_own_release(self) -> None:
+        # ``--version`` used to replace only the version string: the tarball and
+        # the integrity stayed ``latest``'s, so the stager installed one release
+        # and then refused it for not being the one it was asked for.
+        payload = self._metadata()
+        payload["versions"]["0.7.2"] = {
+            "name": PACKAGE,
+            "version": "0.7.2",
+            "dist": {"tarball": "https://registry.invalid/pkg-0.7.2.tgz", "integrity": "sha512-older"},
+        }
+        version, tarball, release = self._resolve(payload, version="0.7.2")
+        self.assertEqual(version, "0.7.2")
+        self.assertEqual(tarball, "https://registry.invalid/pkg-0.7.2.tgz")
+        self.assertEqual(release["dist"]["integrity"], "sha512-older")
+
+    def test_a_named_version_the_registry_does_not_list_is_refused(self) -> None:
+        with self.assertRaises(update_common.UpdateError) as raised:
+            self._resolve(self._metadata(), version="0.7.2")
+        self.assertIn("0.7.2", str(raised.exception))
+        with self.assertRaises(update_common.UpdateError):
+            self._resolve(self._metadata(), version="not a version")
+
+    def test_a_named_version_is_still_refused_when_deprecated(self) -> None:
+        payload = self._metadata()
+        payload["versions"]["0.7.2"] = {
+            "name": PACKAGE,
+            "version": "0.7.2",
+            "deprecated": "withdrawn",
+            "dist": {"tarball": "https://registry.invalid/pkg-0.7.2.tgz"},
+        }
+        with self.assertRaises(update_common.UpdateError):
+            self._resolve(payload, version="0.7.2")
+
+    def test_both_account_stagers_hand_their_version_to_the_resolver(self) -> None:
+        for script in ("update_connect_workbuddy.py", "update_connect_qoder.py"):
+            with self.subTest(script=script):
+                source = (SCRIPTS / script).read_text(encoding="utf-8")
+                self.assertIn("_package_metadata(registry_url, version)", source)
+                self.assertNotIn("latest = version", source)
 
     def test_the_workbuddy_stager_resolves_through_this_guard(self) -> None:
         # The guard only protects a build if every stager uses it: this one
@@ -763,7 +804,16 @@ class OurFreeModelStagingTests(unittest.TestCase):
         original_peer = (
             output / "node_modules" / "@deepseek-ai" / "dsh-llm" / "package.json"
         ).read_text(encoding="utf-8")
+        # Peer reuse happens only on a repeat stage of the same payload: the
+        # first call has nothing staged to reuse, so it always installs.
+        self.assertEqual(
+            our_free_model.update(output, source_url=f"file://{source}"), "2.4.0"
+        )
         self.assertEqual(install_peers.call_count, 1, "an unchanged source must keep its staged peers")
+        self.assertEqual(
+            (output / update_common.STAGED_RELEASE_MARKER).read_text(encoding="utf-8"),
+            original_record,
+        )
         self.assertEqual((output / "src/core/runtime.js").read_bytes(), original_runtime)
         self.assertEqual(
             (output / "node_modules" / "@deepseek-ai" / "dsh-llm" / "package.json").read_text(
@@ -1044,9 +1094,6 @@ class OurFreeModelReleaseResolutionTests(unittest.TestCase):
             with self.assertRaises(update_common.UpdateError):
                 our_free_model.update(output, source_url="https://example.test/repo.git")
         clone.assert_called_once()
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class QoderRuntimeClosureTests(unittest.TestCase):

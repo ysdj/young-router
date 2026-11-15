@@ -1601,18 +1601,6 @@ class LocalEditBesideARelayBacklogTests(unittest.TestCase):
     pending key work as a validation failure of that edit.
     """
 
-    def _providers(self) -> dict[str, object]:
-        return {
-            "providers": [
-                {
-                    "name": "independent",
-                    "api_base": "https://api.example.test/v1",
-                    "api_keys": [{"name": "primary", "value": "secret", "source": {"kind": "independent"}}],
-                    "models": [],
-                }
-            ]
-        }
-
     def test_projection_ignores_a_local_only_edit_and_keeps_relay_bindings(self) -> None:
         before = {
             "providers": [

@@ -544,10 +544,14 @@ class ServiceProviderBoundaryTests(unittest.TestCase):
             }
 
             def dispatch_operation(action: str, data):  # type: ignore[no-untyped-def]
-                domain._last_operation = (
+                summary = (
                     catalog_summary if action == "workbuddy_models" else status_summary
                 )
-                return {"operation_summary": domain._last_operation}
+                # The account read running in the other window lands in the
+                # shared slot before this dispatch returns; only the returned
+                # answer carries the catalog.
+                domain._last_operation = status_summary
+                return {"operation_summary": summary}
 
             core = CoreStore(domains=[domain])
             with patch.object(domain, "dispatch", side_effect=dispatch_operation):

@@ -594,7 +594,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "const autoAppliedKey",
             1,
         )[0]
-        self.assertIn('if ((!settingsRoute && !domain) || domain === "logs")', apply_body)
+        self.assertIn('if ((!settingsRoute && !domain && route !== "data-management") || domain === "logs")', apply_body)
         self.assertIn('settingsRoute || route === "providers-models" || route === "data-management"', apply_body)
         # An Apply is planned from the commit screen, not from the projection:
         # the whole state on every edit is what made a published page wait
@@ -853,11 +853,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '? translate("providers.probeInlineAuthError")',
             '? translate("providers.probeInlineRateLimited")',
             '? translate("providers.probeInlineUnsupported")',
-            'const compactReason = (deepTestIncluded ? degradationLine : "")',
-            'const degradationMeasured = deepTestIncluded\n    && (availableCount > 0 || Boolean(stringValue(degradation.verdict)));',
+            'const compactFinding = [',
+            'const degradationMeasured = deepTestIncluded',
             'const degradationLine = degradationMeasured ? probeDegradationLine(degradation, translate) : "";',
             'const degradationSentence = degradationMeasured ? probeDegradationLine(degradation, translate, true) : "";',
-            'const compact = [availabilityCount, compactReason].filter(Boolean).join("; ");',
+            'const compact = [availabilityCount, compactFinding].filter(Boolean).join("; ");',
             'translate("providers.probeResultPrefix")',
             'styles.inspectorProbeFinding}',
             'void native.showReadOnlyText({',
@@ -915,11 +915,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('return ["service.start", "service.stop", "service.restart", "service.reload"].contains(type) ? type : nil', macos_bridge)
         self.assertIn("timeoutInterval: Self.responseTimeoutInterval(for: metadata.method, request: data)", macos_bridge)
         self.assertIn('const int receive_timeout_ms = slow_remote_operation ? 900000 : 30000;', windows_bridge)
-        self.assertIn('bool IsServiceLifecycleOperation(std::string const& request_json) {', windows_bridge)
-        self.assertIn('bool IsOnlineUsageReadOperation(std::string const& request_json) {', windows_bridge)
-        self.assertIn('method == "probe" || IsWebdavRemoteOperation(request_json) ||', windows_bridge)
-        self.assertIn('IsServiceLifecycleOperation(request_json) ||', windows_bridge)
-        self.assertIn('IsOnlineUsageReadOperation(request_json);', windows_bridge)
+        self.assertIn('bool IsServiceLifecycleOperation(winrt::Windows::Data::Json::JsonObject const& request) {', windows_bridge)
+        self.assertIn('bool IsOnlineUsageReadOperation(winrt::Windows::Data::Json::JsonObject const& request) {', windows_bridge)
+        self.assertIn('method == "probe" || IsWebdavRemoteOperation(parsed_request) ||', windows_bridge)
+        self.assertIn('IsServiceLifecycleOperation(parsed_request) ||', windows_bridge)
+        self.assertIn('IsOnlineUsageReadOperation(parsed_request);', windows_bridge)
         self.assertIn('Request(endpoint, L"", L"POST", request_json, session, receive_timeout_ms);', windows_bridge)
 
     def test_model_detail_deep_test_names_the_degradation_probe_before_it_runs(self) -> None:
@@ -931,7 +931,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const probeTitle = degradationIncluded',
             '? translate("providers.deepTest")',
             ': translate("providers.probe");',
-            '<ActionButton title={probeTitle} titleWidth="tight" busy={probing} toolTip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} onPress={probe} />',
+            '<ProbeMenuButton title={probeTitle} busy={probing} tooltip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} onProbe={probeKind} translate={translate} />',
             'function probeDegradationLine(degradation: UnknownRecord, translate: Translate, detailed = false): string {',
             'function probeDegradationDetails(degradation: UnknownRecord, translate: Translate): string {',
             'const degradation = asRecord(result?.degradation ?? probe.degradation);',
@@ -942,7 +942,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'titleWidth="tight"',
             'accessibilityRole="link" accessibilityLabel={probePresentation.compactSentence}',
             'const degradationSentence = degradationMeasured ? probeDegradationLine(degradation, translate, true) : "";',
-            'const tooltip = joinProbeSummary([compactSentence, availabilitySentence, degradationSentence]);',
+            'const tooltip = joinProbeSummary([compactSentence, availabilitySentence, degradationSentence, preciseSentence, speedSentence]);',
             '? translate("providers.probeInlineReady")',
             '? translate("providers.probeInlinePartial")',
             '? translate("providers.probeInlineRefused")',
@@ -952,11 +952,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '? translate("providers.probeInlineAuthError")',
             '? translate("providers.probeInlineRateLimited")',
             '? translate("providers.probeInlineUnsupported")',
-            'const compactReason = (deepTestIncluded ? degradationLine : "")',
-            'const degradationMeasured = deepTestIncluded\n    && (availableCount > 0 || Boolean(stringValue(degradation.verdict)));',
+            'const compactFinding = [',
+            'const degradationMeasured = deepTestIncluded',
             'const degradationLine = degradationMeasured ? probeDegradationLine(degradation, translate) : "";',
             'const degradationSentence = degradationMeasured ? probeDegradationLine(degradation, translate, true) : "";',
-            'const compact = [availabilityCount, compactReason].filter(Boolean).join("; ");',
+            'const compact = [availabilityCount, compactFinding].filter(Boolean).join("; ");',
             'translate("providers.probeResultPrefix")',
             'styles.inspectorProbeFinding}',
         ):
@@ -965,7 +965,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # failed check is reported and nothing else.
         self.assertNotIn('degradation.status === "mismatch") ', self.ui)
         for marker in (
-            'const unreachableCount = surfaces.filter((surface) => surface.status === "network_error").length;',
             '? translate("providers.probeSummaryUnreachable")',
             ': translate("providers.probeSummaryUnavailable")',
             '.filter((text, index, all) => all.indexOf(text) === index)',
@@ -984,10 +983,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
             '"providers.probeAvailabilityCount": "{available}/{total} 可用"',
             '"providers.probeSummaryUnavailable": "不可用"',
             '"providers.probeSummaryUnreachable": "上游未响应"',
-            '"providers.degradationMatched": "未注水"',
-            '"providers.degradationMatchedDetail": "核验通过（{target} 的真伪指纹一致）"',
-            '"providers.degradationMismatch": "疑似注水"',
-            '"providers.degradationMismatchDetail": "核验未通过：{target} 的响应更像 {label}"',
+            '"providers.degradationMatched": "核验一致"',
+            '"providers.degradationMatchedDetail": "指纹与 {target} 一致"',
+            '"providers.degradationMismatch": "疑似{label}"',
+            '"providers.degradationMismatchDetail": "核验未通过：{target} 的指纹更像 {label}"',
+            '"providers.degradationMismatchUnnamed": "疑似掺水（指纹不足以指认具体模型）"',
             '"providers.degradationUnknown": "核验存疑"',
             '"providers.degradationUnreachable": "上游未响应"',
         ):
@@ -995,8 +995,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The result line carries the finding itself: a "总结:" label would only
         # eat the width the pane needs for the whole short result.
         self.assertNotIn("总结", self.zh)
-        self.assertIn('"providers.degradationMatched": "Not diluted"', self.en)
-        self.assertIn('"providers.degradationMismatch": "Looks diluted"', self.en)
+        self.assertIn('"providers.degradationMatched": "Fingerprint matches"', self.en)
+        self.assertIn('"providers.degradationMismatch": "Looks like {label}"', self.en)
+        self.assertIn('"providers.degradationMismatchUnnamed": "Looks diluted (the fingerprint cannot name the model)"', self.en)
         self.assertIn('"providers.probeSummaryUnreachable": "Upstream did not answer"', self.en)
         self.assertIn('"providers.probeResultPrefix": "Result:"', self.en)
         self.assertIn('"providers.probeAvailabilityCount": "{available}/{total} available"', self.en)
@@ -1027,7 +1028,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             '"providers.probe": "探测"',
             '"providers.deepTest": "探测"',
-            '"providers.deepTestHint": "先验可用性，再用 Veridrop 做快速真伪核验"',
+            '"providers.deepTestHint": "先验可用性，再用 modelprint 指纹表核对这一路到底服务哪个模型"',
             '"providers.degradationUnavailable": "核验不可用"',
             '"providers.degradationError": "核验失败"',
         ):
@@ -1039,7 +1040,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn(marker, self.en)
 
     def test_unprobed_models_do_not_render_a_status_placeholder(self) -> None:
-        self.assert_ui_has('return { compact: "", compactSentence: "", tooltip: "", full: "" };')
+        self.assert_ui_has('return { compact: "", compactSentence: "", tooltip: "", full: "", speedRate: "" };')
         self.assertIn('export function nativeControlTextWidth(label: string): number {', self.native_controls)
         self.assertIn('if (plainLink) return Math.ceil(nativeControlTextWidth(title)) + 2;', self.native_controls)
         self.assert_ui_has('{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding}')
@@ -1272,15 +1273,20 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )
 
     def test_provider_probe_button_reports_progress_without_graying_out(self) -> None:
+        # The button is a split control: the button itself keeps its one-press
+        # meaning, and the chevron beside it opens the menu of the other
+        # questions.  Both live in one component so the two can never disagree
+        # about what a press runs.
         self.assert_ui_has(
-            '<ActionButton title={probeTitle} titleWidth="tight" busy={probing} toolTip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} onPress={probe} />'
+            '<ProbeMenuButton title={probeTitle} busy={probing} tooltip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} onProbe={probeKind} translate={translate} />'
         )
         # The probe keeps its own name while it runs: the button carries the
         # progress as a leading spinner instead of a swapped title.
         self.assert_ui_not_has('title={probing ? translate("providers.probing")')
         self.assert_ui_has(
-            "onPress={probe} />{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding}",
+            "onPress={() => onProbe(\"identity\")} />",
         )
+        self.assert_ui_has('{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding}')
         self.assert_ui_not_has("probeSummaryTrigger")
         self.assert_ui_not_has('styles.probeSummary}')
         # The credential is what a probe exists to test, so nothing the pane
@@ -1748,7 +1754,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('dispatchWithOutcome("provider.add"', login)
         self.assertNotIn('dispatchWithOutcome("provider.select_relay_station"', login)
         # One create, on 完成, and nothing on the steps before it.
-        commit = wizard.split("const commitWizardProvider = async (): Promise<string | undefined> => {", 1)[1]
+        commit = wizard.split("const commitWizardProvider = async (importNameCase?: ImportNameCase): Promise<string | undefined> => {", 1)[1]
         commit = commit.split("const createKey", 1)[0]
         self.assertEqual(wizard.count('dispatchWithOutcome("provider.add"'), 1)
         self.assertIn('const next = await dispatchWithOutcome("provider.add", {', commit)
@@ -1812,7 +1818,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('stepRef.current = "provider";', fallback)
         # 完成 states why it cannot create; the empty name used to return before
         # the one check that says so.
-        commit = wizard.split("const commitWizardProvider = async (): Promise<string | undefined> => {", 1)[1]
+        commit = wizard.split("const commitWizardProvider = async (importNameCase?: ImportNameCase): Promise<string | undefined> => {", 1)[1]
         commit = commit.split("const createKey", 1)[0]
         self.assertLess(
             commit.index("if (!providerStepValid()) return undefined;"),
@@ -2247,7 +2253,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         a client types; after that a rename is the user's spelling.
         """
 
-        self.assert_ui_has('import { groupRoutesByPublicModel, importNeedsNameCase, publicModelKey } from "./publicModelNames";')
+        self.assert_ui_has('groupRoutesByPublicModel, importNeedsNameCase, publicModelKey } from "./publicModelNames";')
         self.assert_ui_has('const routeGroups = useMemo(() => groupRoutesByPublicModel(routes), [routes]);')
         # The selection, the row key, and the group a route belongs to all read
         # the name itself, so every control in the pane addresses one group.
@@ -3402,12 +3408,25 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # overlay that only appears mid-scroll: the keys list in the provider
         # inspector (nine keys, four visible) read as a list that ended.  It
         # draws the same 4 pt capsule `PersistentScrollView` draws.
-        self.assertIn('tableScrollThumb: { position: "absolute", top: 2, right: 2, width: 4, borderRadius: 2', self.native_controls)
+        #
+        # That capsule is drawn in the table's frame, and the frame is taller
+        # than the list: the column header is a sibling above the list.  With
+        # the capsule anchored to the frame (`top: 2` on the frame) the thumb
+        # started over the header at the first row and stopped one header — 30
+        # pt — above the bottom at the last one, so a list at its end still read
+        # as a scroll that could not finish.  `top` therefore comes from the
+        # list's own offset inside the frame, measured when the table lays out.
+        self.assertIn('tableScrollThumb: { position: "absolute", right: 2, width: 4, borderRadius: 2', self.native_controls)
         self.assertIn('scrollMetrics.overflow && scrollMetrics.height > 0', self.native_controls)
+        self.assertIn('const top = frame ? Math.max(0, Math.round(node.getBoundingClientRect().top - frame.getBoundingClientRect().top)) : 0;', self.native_controls)
+        self.assertIn('style={[windowsTableStyles.tableScrollThumb, { top: scrollMetrics.top + 2, height: scrollMetrics.height', self.native_controls)
+        self.assertIn('ref={setFrameRef}', self.native_controls)
         # The measurement bails out when the thumb did not move: every table a
         # pane mounts measures itself twice (mount effect + ResizeObserver), and
         # a fresh object each time re-rendered the whole mounted window for it.
-        self.assertIn('current.overflow === overflow && current.height === height && Math.abs(current.offset - offset) < 0.5', self.native_controls)
+        # `top` is part of that comparison: a header that appears or grows moves
+        # the capsule without moving the thumb.
+        self.assertIn('current.overflow === overflow && current.top === top && current.height === height && Math.abs(current.offset - offset) < 0.5', self.native_controls)
         self.assertIn('.getScrollableNode?.();', self.native_controls)
         self.assertIn('windowsTableStyles.sourceCellViewFlex, { paddingLeft: leadingInset, paddingRight: TABLE_MIN_HORIZONTAL_PADDING }', self.native_controls)
         self.assertIn('{sourceList ? body : <ScrollView horizontal showsHorizontalScrollIndicator', self.native_controls)
@@ -3923,9 +3942,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "const bool twoLine = newViewProps.sourceList && !newViewProps.rowDetails.empty();",
             re.sub(r"\s+", " ", mac_native),
         )
-        # Windows is a React table with the same two densities.
-        self.assertIn("rowCompact: { minHeight: 30 }", self.native_controls)
-        self.assertIn("rowRelaxed: { minHeight: 36 }", self.native_controls)
+        # Windows is a React table with the same two densities.  The row is a
+        # fixed height the virtualized list is told about, so the number lives
+        # in the function that list reads, not in a style a row could ignore.
+        self.assertIn(
+            "return compact ? 30 : WINDOWS_CONTROL.sourceRowHeight;",
+            self.native_controls,
+        )
+        self.assertIn("sourceRowHeight: 36,", self.native_controls)
+        self.assertIn(
+            "getItemLayout={(_data, index) => ({ length: rowHeight, offset: rowHeight * index, index })}",
+            self.native_controls,
+        )
 
 
     def test_native_tables_keep_short_log_columns_readable_and_scroll_overflow(self) -> None:
@@ -4705,6 +4733,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "YOUNG_ROUTER_DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED",
         ):
             self.assertIn(f"  {key}: {{ label:", localized)
+        # A quick control rewrites the stored JSON document, so the editor has
+        # to read it again.  It asks for a reload, not a reset: a reset puts the
+        # schema default in the draft, and the next blur stages that default
+        # over the document the quick control just saved.
+        self.assertIn("const [jsonReloadToken, setJsonReloadToken] = useState(0);", self.ui)
+        self.assertIn("setJsonReloadToken((current) => current + 1);", self.ui)
+        dsh_field = self.ui.split("function RuntimeField(", 1)[1].split("function RuntimeValueField(", 1)[0]
+        self.assertNotIn("setJsonResetToken((current) => current + 1);", dsh_field.split("useEffect(() => {", 1)[0])
         self.assertIn("const optionValues = stringList(item.options);", self.ui)
         self.assertIn("const next = optionValues[nativeEvent.index];", self.ui)
         self.assertNotIn('const label = stringValue(item.label, key);', self.ui)
@@ -4943,7 +4979,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("ONLINE_USAGE_TIME_OPTIONS", logs)
         self.assertIn('ipc.dispatch({ domain: "logs", type: "logs.set_time_range"', logs)
         time_range = logs.split("const setOnlineUsageTimeRange =", 1)[1].split(
-            "const commitOnlineUsageCustomRange",
+            "const chooseOnlineUsageTime",
             1,
         )[0]
         self.assertIn("const request = ++onlineUsageTimeRequest.current;", time_range)
@@ -4999,7 +5035,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('"logs.type": "TYPE"', self.en)
         self.assertIn('"logs.type": "类型"', self.zh)
         styles = UI_SOURCE.read_text(encoding="utf-8").split("const styles = StyleSheet.create({", 1)[1].split("\n});", 1)[0]
-        for style_name in ("logsWindow", "logsToolbar", "logFilterRow", "logToolbarSpacer", "logActionsRow", "onlineUsageSourcePicker", "clearCooldownButton", "toolbarLabel", "logFilterInput", "logsTabs", "logRangeMessageSlot", "logTablesLayout", "logStrip", "logPagerStatus", "logTableFrame", "logTable", "logEmptySurface", "logEmptyText", "logLoadingText", "logEmptyStatusRow", "logLoadingOverlay", "logLoadingCard", "fieldLabel", "fieldHint", "fieldError", "input", "inputInvalid", "textArea", "compactTextArea", "secretFieldActions", "secretFieldButtons", "secretFieldButton", "nativeSecretControl", "nativeSecretInput", "rawEditor", "rawEditorHeader", "rawNativeEditorFrame", "rawNativeEditor", "rawEditorOverlay", "rawEditorLoading", "empty", "cardHint", "nativeSecretMultilineControl"):
+        for style_name in ("logsWindow", "logsToolbar", "logFilterRow", "logActionsRow", "onlineUsageSourcePicker", "clearCooldownButton", "toolbarLabel", "logFilterInput", "logsTabs", "logRangeMessageSlot", "logTablesLayout", "logStripControls", "logTableFrame", "logTable", "logEmptySurface", "logEmptyText", "logLoadingText", "logEmptyStatusRow", "fieldLabel", "fieldHint", "fieldError", "input", "inputInvalid", "textArea", "compactTextArea", "secretFieldActions", "secretFieldButtons", "secretFieldButton", "nativeSecretControl", "nativeSecretInput", "rawEditor", "rawEditorHeader", "rawNativeEditorFrame", "rawNativeEditor", "rawEditorOverlay", "rawEditorLoading", "empty", "cardHint", "nativeSecretMultilineControl"):
             self.assertIn(f"{style_name}:", styles, style_name)
         native_table = (ROOT / "rn/apps/macos/src/native/macos/AppKitControlViews.mm").read_text(encoding="utf-8")
         logs_render = self.ui.split("function LogsWorkspace(", 1)[1].split("function EmptyState(", 1)[0]
@@ -5805,7 +5841,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # Which account the row stands for, above the actions that act on it:
         # 退出登录 over a row that only says "OpenAI" names no session.
         self.assertIn('translate("providers.authAccount")', editor)
-        self.assertIn("const authAccount = providerAuthAccount(provider);", editor)
+        # The helper is defined at module scope and called from several sites.
+        self.assertIn("function providerAuthAccount(", self.ui)
         self.assertIn('"providers.authAccount": "账号"', self.zh)
         self.assertIn('"providers.authAccount": "Account"', self.en)
         self.assertIn("providerAccountsHeader", editor)
@@ -6078,7 +6115,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # The account links in the one association block; models keep the
             # provider's own key slot and the key-driven 获取模型 path.
             'const refreshWorkBuddyAccount = async (): Promise<void> => {',
-            'const isOfficialAccount = kind === "openai";',
+            'const action = isLoginProviderKind(kind)',
             'const isWorkBuddyAccount = kind === "workbuddy" || kind === "workbuddyGlobal";',
             'const service = providerService(provider);',
             'translate("providers.wizard.providerType")',
@@ -6307,7 +6344,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # the user's decision, not the importer's, and the spelling is the
             # answer this step's case question got.
             'function publicModelNameForLane(modelID: string): string {',
-            'const keptNameCase = await importNameCaseAnswer(native, translate, kept);',
+            'const keptNameCase = importNameCase ?? await importNameCaseAnswer(native, translate, kept);',
             'upstream_model: model_id,',
             'imported_name_case: keptNameCase,',
             # Deleting the entry goes through the account-backed action, which
@@ -6422,7 +6459,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # tail claims a precision the balance does not have.
         self.assert_ui_has('if (typeof total !== "number" || !Number.isFinite(total)) return "";')
         self.assert_ui_has('const whole = Math.round(total);')
-        self.assert_ui_has('if (whole === 0 && total > 0) return total.toFixed(1);')
+        self.assert_ui_has('if (whole === 0 && total > 0) return total < 0.1 ? total.toFixed(2) : total.toFixed(1);')
         # Rounding a real balance to "0" would state an empty account.
         self.assert_ui_has('return String(whole);')
         for text in (self.en, self.zh):
@@ -6494,7 +6531,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The spelling lives in one module both panes import, so the model list
         # column and the relay group sheet cannot diverge.
         spelling = (ROOT / "rn/packages/shared/src/ui/rateSpelling.ts").read_text(encoding="utf-8")
-        self.assertIn('/** One stated rate with the `credits` unit word dropped. */', spelling)
+        self.assertIn('/** One stated rate with its unit word dropped and its trailing zeros gone; a spelling it cannot read is returned unchanged. */', spelling)
         self.assertIn('export function rateSpelling(', spelling)
         self.assertIn('export function multiplierSpelling(', spelling)
         self.assertIn('return prefix + String(number);', spelling)
@@ -6579,15 +6616,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_official_account_login_lives_in_the_provider_detail(self) -> None:
         editor = self.ui.split("function ProviderEditor(", 1)[1].split("function CodexWorkspace(", 1)[0]
         for marker in (
-            'dispatchWithOutcome("service_provider.auth_start", { provider_id: id }, "providers_models")',
-            'presentProviderAuthChallenge(native, translate, next, kind, providerName, id, shownChallenge.current)',
-            'authAction === "service_provider.auth_start"',
-            'if (authAction === "service_provider.auth_start") {',
-            'await dispatch(authAction, { provider_id: id }, "providers_models");',
-            'translate("relay.officialProviderAddLogin")',
             # A second account is a second account of this row, not a second
             # provider: the sign-in starts on the provider the pane shows.
             'dispatchWithOutcome("service_provider.auth_start", { provider_id: id }, "providers_models")',
+            'presentProviderAuthChallenge(native, translate, next, kindLogin, providerKindLabel(kind, translate), id, shownChallenge.current)',
+            'translate("relay.officialProviderAddLogin")',
             "officialStatusRow",
         ):
             self.assertIn(marker, editor)
@@ -6623,7 +6656,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assert_ui_has(marker)
         apply_body = self.ui.split("const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string }):", 1)[1].split("const autoAppliedKey", 1)[0]
-        self.assertIn('settingsRoute || route === "providers-models" || route === "data-management" || domain === undefined', apply_body)
+        self.assertIn('settingsRoute || route === "providers-models" || route === "data-management" || route === "general-settings" || domain === undefined', apply_body)
         self.assertIn("await dispatchQueue.current;", apply_body)
         self.assertIn('return { draftStaged: next.drafts.relay_accounts?.dirty === true };', self.ui)
 
@@ -7420,13 +7453,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "selectedKey={selectedKey}",
             "logTableFrame:",
             "logFilterRow: { flex: 1, minWidth: Platform.OS === \"web\" ? 180 : 50",
-            "logToolbarSpacer: { flex: 1, minWidth: 4",
             "logActionsRow: { height: 24, flexDirection: \"row\"",
             "onlineUsageSourcePicker: { width: 176, minWidth: 120",
-            # The pager is a row of its own under the table, never an overlay
-            # the native table paints over.
-            "usageStatusBar: { minHeight: 24, flexShrink: 0",
-            "logFilterRowOnlineUsage: { flex: 1, minWidth: 50",
             "logFilterInput: { flex: 1, minWidth:",
             "logTable: { flex: 1, minHeight: 0",
             # One permanent bottom status strip: the line count and the pause
@@ -8027,7 +8055,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # 密钥值 shows the key itself: a row whose station has no key says
         # 未提供, and the sheet never replaces the value with a presence label.
         self.assertIn('valueField?.stringValue = row.hint.isEmpty ? label("emptyLabel") : ""', mac_leaf)
-        self.assertIn("valueField?.stringValue = \"\"", mac_leaf)
+        self.assertIn('valueField?.stringValue = memoizedKeys[row.id] ?? ""', mac_leaf)
         self.assertIn("private static func readRevealedKey(target: String) -> String? {", mac_leaf)
         self.assertIn("if attempt < attempts { Thread.sleep(forTimeInterval: 0.25) }", mac_leaf)
         # The value row and the copy action read through that one retrying lease.
@@ -8258,7 +8286,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The model list travels as a list of names and is joined into the
         # newline-separated text the sheet carries on both hosts.
         self.assertIn("if (key == \"models\") {", windows_module)
-        self.assertIn("(models && models->size() > 16384)", windows_module)
+        # The join is bounded on both axes: the list's own entry count and the
+        # text it produces, so one oversized sheet cannot travel as a frame.
+        self.assertIn("array != nullptr && array->size() <= 512", windows_module)
+        self.assertIn("joined.size() > 16384", windows_module)
         self.assertIn("copy_button.Content(copy_glyph);", windows_leaf)
         self.assertIn("copy_button.Click(", windows_leaf)
         self.assertIn('CoreIPCBridge::Shared().ReadPlainTextSecret("relay_accounts", "api_key"', windows_leaf)
@@ -8861,7 +8892,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_shared_workspaces_wrap_fixed_width_controls_before_they_overlap(self) -> None:
         """Nested Codex controls, disk choices, and toolbar actions reflow instead of clipping."""
         for marker in (
-            'officialActionsRow: { minHeight: 28, flexDirection: "row", flexWrap: "wrap"',
             'dataManagementSectionItem: { minHeight: 22 }',
             'const promptedDiskGeneration = useRef<Partial<Record<EditableDiskDomain, number>>>({});',
             'void native.showConfirmation({',
@@ -8875,7 +8905,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # 刷新 and 分组 sit on the account row itself, so the relay pane has
             # no separate action row.
             'fieldRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" }',
-            'accountsEmpty: { minHeight: 40, alignItems: "center", justifyContent: "center", paddingHorizontal: 10, paddingVertical: 8, borderWidth: 1, borderColor: colors.separator, backgroundColor: colors.panel }',
         ):
             self.assertIn(marker, relay, marker)
         self.assertNotIn('accountActionsRow:', relay)
@@ -9415,7 +9444,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('const failureRemedy = webdavFailureRemedy(stringValue(lastResult.code));')
         self.assert_ui_has('function webdavFailureRemedy(code: string): TranslationKey {')
         self.assert_ui_has('{lastFailed && lastSyncAt !== "" ? <Text numberOfLines={1} style={styles.settingsActionRowFact}>{translate(failureRemedy)}</Text> : null}')
-        self.assertIn('"webdav.remedy.conflict": "两端都有改动，请在设置里比较后保留其中一侧"', self.zh)
+        self.assertIn('"webdav.remedy.conflict": "两端改了同一处，无法自动合并，请在设置里比较后保留其中一侧"', self.zh)
         self.assertIn('"webdav.remedy.incompatible": "远端文件由旧版本创建，下次同步会先另存一份再覆盖它"', self.zh)
         self.assertIn('"webdav.remedy.unsaved": "请先保存或重新加载本机的改动，再同步"', self.zh)
         self.assertIn('"webdav.remedy.disconnected": "连接失败，请在设置里测试连接"', self.zh)
@@ -10048,7 +10077,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # and the pane's off direction uses that same answer.
         domain = (ROOT / "young_router/core/domains/_shared_api.py").read_text(encoding="utf-8")
         self.assertIn("    if len(candidates) != 1:", domain)
-        self.assertIn("def _route_named(self, model: str) -> dict[str, str] | None:", (ROOT / "young_router/core/domains/claude.py").read_text(encoding="utf-8"))
+        self.assertIn("def _route_named(", (ROOT / "young_router/core/domains/claude.py").read_text(encoding="utf-8"))
         core = (ROOT / "young_router/core/codex_config.py").read_text(encoding="utf-8")
         self.assertIn('"api_key_name": str(info.get("api_key_name") or "").strip(),', core)
         self.assertIn('"order": params.get("order"),', core)

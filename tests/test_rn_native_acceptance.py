@@ -90,9 +90,19 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("POINT MinimumTrackSizeForActiveRoute() const;", header)
         self.assertIn("ContentSize RouteMinimumContentSize(std::wstring_view route)", leaf)
         # Every settings pane shares one window, so it uses one minimum size
-        # wide enough for the sidebar plus the widest pane.
-        self.assertIn('route == L"providers-models" || route == L"codex-settings"', leaf)
-        self.assertIn("return {900, 560};", leaf)
+        # wide enough for the sidebar plus the widest pane.  The route branches
+        # repeat these strings, so only this function's body may answer.
+        minimum = " ".join(
+            leaf.split("ContentSize RouteMinimumContentSize(std::wstring_view route)", 1)[1]
+            .split("ContentSize RouteInitialContentSize", 1)[0]
+            .split()
+        )
+        self.assertIn(
+            'route == L"general-settings" || route == L"providers-models" || route == L"codex-settings" '
+            '|| route == L"claude-settings" || route == L"runtime-settings" || route == L"data-management" '
+            '|| route == L"logs") { return {900, 560}; }',
+            minimum,
+        )
         self.assertIn('route == L"provider-wizard") return {540, 420};', leaf)
         self.assertIn("MinimumTrackSizeForActiveRoute();", leaf)
         self.assertIn("DipToPhysicalPixels", leaf)
@@ -212,7 +222,6 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # (the doc comments name it only to explain why it is not used)
         self.assertNotIn("NSApp.runModal(for:", leaf)
 
-        self.assertIn("override func hitTest(_ point: NSPoint) -> NSView? {", shield)
         self.assertIn("override func hitTest(_ point: NSPoint) -> NSView? {", shield)
         self.assertIn("return bounds.contains(convert(point, from: superview)) ? self : nil", shield)
         self.assertIn("override func mouseDown(with event: NSEvent) { onInteraction?() }", shield)
@@ -640,7 +649,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # overflow-aware scroll view, and that sheet's 模型列表 list (its install,
         # its layout pass, and the overflow policy that re-asserts the capsule while
         # it overflows).
-        self.assertEqual(9, leaf.count("usePersistentScrollers("))
+        self.assertEqual(7, leaf.count("usePersistentScrollers("))
         group_scroll = leaf.split("private final class NativeGroupManagerScrollView: NSScrollView {", 1)[1].split(
             "private final class NativeModelsListView: NSScrollView {", 1
         )[0]
@@ -662,7 +671,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # zero measured width lets that pass size it back to nothing.
         self.assertIn("override func tile() {", group_scroll)
         self.assertIn("if scrollerStyle == .legacy && hasVerticalScroller {", group_scroll)
-        self.assertIn("usePersistentScrollers(horizontal: true, vertical: true)", leaf)
+        # Every live host scroll view floats a vertical capsule only; horizontal
+        # capsules were only ever built by the editor class that no host uses.
+        self.assertIn("usePersistentScrollers(horizontal: false, vertical: true)", leaf)
 
     def test_the_add_account_button_opens_the_sign_in_window_at_once(self) -> None:
         # The + next to 中转站关联 used to resolve the station family with two
@@ -1706,7 +1717,6 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         windows_module = (WIN_NATIVE / "WinUI3NativeLeafModule.cpp").read_text(encoding="utf-8")
         windows_module_header = (WIN_NATIVE / "WinUI3NativeLeafModule.h").read_text(encoding="utf-8")
         mac_controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
-        windows_controls = (WIN_NATIVE / "WinUIControls.cpp").read_text(encoding="utf-8")
 
         self.assertIn("interface NativeMenuAnchor", types)
         self.assertIn("anchor: NativeMenuAnchor", types)
@@ -1746,7 +1756,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # underneath, never a submenu opening to the right.
         self.assertIn(".sectionHeader(title: entry.0)", mac)
         self.assertIn("header.isEnabled = false", mac)
-        self.assertIn("let top = min(pointer.y + anchorHeight, max(bounds.maxY - 1, 0))", mac)
+        # "Below" is +y only in a flipped view: the settings shell's backdrop
+        # is unflipped, so the same sum moved the menu up over its button.
+        self.assertIn(
+            "let below = contentView.isFlipped ? pointer.y + anchorHeight : pointer.y",
+            mac,
+        )
         self.assertIn('symbolName = @"chevron.up.chevron.down";', mac_controls)
         self.assertIn("configurationWithPointSize:LiteLLMUIFontSize - 3.5", mac_controls)
         native_controls = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
@@ -2070,7 +2085,6 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("manualType", wizard_ui)
         self.assertIn("const accountType = await resolveRelayType();", wizard_ui)
         self.assertNotIn("const updateStationName = (value: string): void =>", wizard_ui)
-        self.assertIn('onBlur={() => { void detectRelayType(); }}', relay_ui) if False else None
         self.assertIn("stationForProvider", wizard_ui)
         self.assertIn("accountType", wizard_ui)
         self.assertIn("NativePicker", relay_ui)
@@ -2262,8 +2276,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("capturedAccessToken = nil", mac_leaf)
         self.assertIn("private func beginBrowserFlow()", mac_leaf)
         self.assertIn("beginBrowserFlow()", mac_leaf)
-        check_sign_in = mac_leaf.split("@objc private func checkSignIn", 1)[1].split("private func isCurrentCheck", 1)[0]
-        self.assertNotIn("capturedPassword = nil", check_sign_in)
+        # No control can run a manual check (the login window shows only Close),
+        # so the selector and the promises that named it are gone.
+        self.assertNotIn("func checkSignIn", mac_leaf)
+        self.assertNotIn("press 验证登录", mac_leaf)
         self.assertIn("private final class NativeRelayLoginAttempt", mac_leaf)
         self.assertIn("private var activeCheck: NativeRelayLoginAttempt?", mac_leaf)
         self.assertIn("private func isCurrentCheck(_ attempt: NativeRelayLoginAttempt) -> Bool", mac_leaf)
@@ -2323,7 +2339,9 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("auto_submit_saved_password_pending", windows_relay)
         self.assertIn("did_auto_submit_saved_password", windows_relay)
         self.assertIn("localStorage.getItem('user')", windows_relay)
-        self.assertIn("user.token=access", windows_relay)
+        # A token the page minted on this navigation wins; the restored
+        # session only fills what the page left empty.
+        self.assertIn("if (!user.token) user.token=access;", windows_relay)
         self.assertIn("userInput.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });", windows_relay)
         self.assertIn("userInput.focus({ preventScroll: true })", windows_relay)
         self.assertIn("bool UseChinese(WindowsRelayLoginOptions const& options)", windows_relay)
@@ -2973,7 +2991,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "NSPopUpButton",
             "NSSegmentedControl",
             "NSTextField",
-            "LiteLLMTabSwitch",
+            "LiteLLMTabButton",
         ):
             self.assertIn(native_class, controls)
 
@@ -3101,13 +3119,13 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("void DiscardStaleScrollerSubviews(NSScrollView *scrollView)", controls)
         self.assertIn("for (NSView *subview in [scrollView.subviews copy]) {", controls)
         self.assertIn("if (subview == scrollView.verticalScroller || subview == scrollView.horizontalScroller) continue;", controls)
-        self.assertIn("DiscardStaleScrollerSubviews(self);", controls)
+        self.assertIn("ReassertPersistentScrollerPlacement(self);", controls)
         self.assertIn("DiscardStaleScrollerSubviews(scrollView);", controls)
         # AppKit rebuilds a scroller whenever a flag flips, so the tile override
         # re-installs the app capsule as well as the floating placement.
         self.assertIn("if (self.hasVerticalScroller && ![self.verticalScroller isKindOfClass:LiteLLMPersistentScroller.class]) {", controls)
         self.assertIn("if (self.hasHorizontalScroller && ![self.horizontalScroller isKindOfClass:LiteLLMPersistentScroller.class]) {", controls)
-        self.assertIn("FloatPersistentScrollerOverContent(self);", controls)
+        self.assertIn("FloatPersistentScrollerOverContent(scrollView);", controls)
         mac_leaf_scrollers = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
         self.assertIn("func floatOverContent()", mac_leaf_scrollers)
         # The scroller floats over the content, so the capsule is the only thing
@@ -4081,7 +4099,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('if method == "dispatch", onlineUsageReadOperation(in: request) != nil { return 900 }', macos_bridge)
         self.assertIn('"logs.refresh_online_usage", "logs.refresh", "logs.reload"', macos_bridge)
         windows_bridge = (ROOT / "rn/apps/windows/src/native/windows/CoreIPCBridge.cpp").read_text(encoding="utf-8")
-        self.assertIn("IsOnlineUsageReadOperation(request_json);", windows_bridge)
+        self.assertIn("IsOnlineUsageReadOperation(parsed_request);", windows_bridge)
         self.assertIn('type == "logs.refresh_online_usage" || type == "logs.refresh" || type == "logs.reload"', windows_bridge)
         self.assertNotIn('documentKey={`logs:${selected}`}', ui)
         self.assertIn("logColumns(", ui)
@@ -4116,7 +4134,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("for (auto const& handler : handlers) handler(text);", windows_bridge)
         self.assertIn("event_handler_token_ = CoreIPCBridge::Shared().AddEventHandler(", windows_module)
         self.assertIn("void CoreIPCModule::AddListener(std::string const&) noexcept {\n  RegisterEventHandler();", windows_module)
-        self.assertIn("void CoreIPCModule::RemoveListeners(double count) noexcept {\n  if (count > 0) return;\n  UnregisterEventHandler();", windows_module)
+        # A root that drops its last listener detaches: the guard used to return
+        # on every positive count, which made the unregister branch unreachable.
+        self.assertIn("void CoreIPCModule::RemoveListeners(double count) noexcept {", windows_module)
+        self.assertIn("if (count <= 0) return;", windows_module)
         self.assertIn("void RegisterEventHandler() noexcept;", windows_module_header)
 
     def test_hosts_keep_the_core_revision_monotonic_across_a_replacement(self) -> None:
@@ -4129,7 +4150,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             self.assertIn("--metadata", source)
             self.assertIn(".litellm-runtime", source)
             self.assertIn("core-state.json", source)
-        self.assertIn('arguments.append(contentsOf: ["--metadata", metadataPath])', mac)
+        self.assertIn('arguments.append(contentsOf: ["--metadata", coreMetadataPath(environment: childEnvironment)])', mac)
         self.assertIn('environment["YOUNG_ROUTER_HOME"] ?? environment["LITELLM_RUNTIME_ROOT"]', mac)
         self.assertIn('command += L" --metadata " + Quote(metadata);', windows)
         self.assertIn('std::wstring root = Environment(L"YOUNG_ROUTER_HOME");', windows)

@@ -343,6 +343,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                                 {"id": 1, "name": "claude", "status": 1, "key": "masked-1", "group": "claude-kiro"},
                                 {"id": 2, "name": "plus", "status": 1, "key": "masked-2", "group": "gpt-plus"},
                                 {"id": 3, "name": "image", "status": 1, "key": "masked-3", "group": "gpt-image-2.5"},
+                                {"id": 4, "name": "claude-two", "status": 1, "key": "masked-4", "group": "claude-kiro"},
                             ]
                         }
                     },
@@ -1099,17 +1100,8 @@ class RelayAccountsDomainTests(unittest.TestCase):
             refreshed_snapshot = core.snapshot()["domains"]["relay_accounts"]["accounts"][0]
             self.assertEqual(["model-a"], refreshed_snapshot["resources"][0]["models"])
 
-    def test_core_login_transaction_records_available_resources_without_staging_provider_models(self) -> None:
-        fake = FakeRelayHTTPClient(
-            {
-                "/api/user/models": {"success": True, "data": []},
-                "/api/token/?p=1&size=100": {
-                    "success": True,
-                    "data": {"items": [{"id": 7, "status": 1}]},
-                },
-                "/api/token/7/key": {"success": True, "data": {"key": "replace-relay-key"}},
-            }
-        )
+    def test_core_login_transaction_keeps_the_session_without_staging_provider_models(self) -> None:
+        fake = FakeRelayHTTPClient({})
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             relay = RelayAccountsDomain(root, http_client=fake)
@@ -2439,6 +2431,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             domain.apply()
             stored = root / ".litellm-runtime" / "relay-accounts.json"
             aged = json.loads(stored.read_text(encoding="utf-8"))
+            aged["accounts"][0]["login_status"] = "signed_out"
             aged["accounts"][0]["login_observed_at"] = "2000-01-01T00:00:00Z"
             stored.write_text(json.dumps(aged), encoding="utf-8")
             domain.reload()
@@ -3251,7 +3244,10 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 "signed_out",
                 core.snapshot()["domains"]["relay_accounts"]["accounts"][0]["login_status"],
             )
-            self.assertEqual("none", account["resource_error"])
+            self.assertEqual(
+                "none",
+                core.snapshot()["domains"]["relay_accounts"]["accounts"][0]["resource_error"],
+            )
 
     def test_an_unreachable_station_never_records_a_login_observation(self) -> None:
         """A network failure is not evidence that the user logged out.
@@ -4922,7 +4918,14 @@ class RelayReadPolicyTests(unittest.TestCase):
     @staticmethod
     def _serve(handler: type[BaseHTTPRequestHandler]) -> tuple[ThreadingHTTPServer, threading.Thread]:
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        # ``serve_forever`` otherwise notices the ``shutdown()`` in every test's
+        # cleanup only every 0.5 seconds, which over six servers is most of this
+        # class's runtime.
+        thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.05},
+            daemon=True,
+        )
         thread.start()
         return server, thread
 
@@ -5000,8 +5003,11 @@ class RelayReadPolicyTests(unittest.TestCase):
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 attempts.append(self.path)
-                if len(attempts) == 1:
-                    time.sleep(0.5)
+                first_attempt = len(attempts) == 1
+                # Both attempts are slow, so the retry only succeeds on the
+                # longer bound; reusing the first bound would time it out again.
+                time.sleep(0.5)
+                if first_attempt:
                     self.close_connection = True
                     self.connection.close()
                     return
@@ -5025,7 +5031,7 @@ class RelayReadPolicyTests(unittest.TestCase):
 
             self.assertEqual({"data": {"ok": True}}, payload)
             self.assertEqual(2, len(attempts))
-            self.assertGreaterEqual(elapsed, 0.2)
+            self.assertGreaterEqual(elapsed, 0.7)
             self.assertLess(elapsed, 1.5)
         finally:
             server.shutdown()
@@ -5616,9 +5622,6 @@ class RelayReadPolicyTests(unittest.TestCase):
             )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class RelaySessionLeaseTests(unittest.TestCase):
     """The dashboard link reads the session through the one-time native lease.
@@ -5671,7 +5674,7 @@ class RelaySessionLeaseTests(unittest.TestCase):
             )
             account_id = domain.snapshot()["accounts"][0]["id"]
 
-            with self.assertRaises(Exception):
+            with self.assertRaisesRegex(RelayAccountsError, "unavailable"):
                 domain.trusted_secret_value("session", account_id)
 
 
@@ -5680,3 +5683,7 @@ class _NoRelayHTTP:
 
     def json(self, *arguments: object, **keywords: object) -> object:
         raise AssertionError("the session lease must not read the station")
+
+
+if __name__ == "__main__":
+    unittest.main()

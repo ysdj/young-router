@@ -141,7 +141,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
     def test_single_observation_model_change_does_not_rewrite(self) -> None:
         endpoint = {"models": ["public-a"]}
 
-        def exposed_models(_api_key: str):
+        def exposed_models(_api_key: str, _config_path=None):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
@@ -151,10 +151,18 @@ class CodexCatalogRepairTests(unittest.TestCase):
             "young_router.core.model_catalog.load_native_catalog",
             return_value=[],
         ):
-            domain = self._domain(Path(directory))
+            root = Path(directory)
+            domain = self._domain(root)
             domain.set_model_catalog_enabled_immediately(True)
             catalog_path = domain.model_catalog_path
 
+            # The configured allowlist has to adopt the new model too: an
+            # exposed name outside it is filtered out of the live view, so the
+            # observation limit would never be reached.
+            (root / "config.yaml").write_text(
+                self._config_with_models(["public-a", "public-b"]),
+                encoding="utf-8",
+            )
             endpoint["models"] = ["public-a", "public-b"]
             self._force_catalog_observation(domain)
             domain.refresh_model_catalog()
@@ -172,7 +180,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
 
         endpoint = {"models": ["public-a"]}
 
-        def exposed_models(_api_key: str):
+        def exposed_models(_api_key: str, _config_path=None):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
@@ -203,7 +211,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
 
         endpoint = {"models": ["public-a"]}
 
-        def exposed_models(_api_key: str):
+        def exposed_models(_api_key: str, _config_path=None):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
@@ -231,7 +239,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
 
         endpoint = {"models": ["public-a", "public-b"]}
 
-        def exposed_models(_api_key: str):
+        def exposed_models(_api_key: str, _config_path=None):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
@@ -268,7 +276,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
 
         endpoint = {"models": ["public-a"]}
 
-        def exposed_models(_api_key: str):
+        def exposed_models(_api_key: str, _config_path=None):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
@@ -310,7 +318,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
         stable_models = [f"public-{index}" for index in range(10)]
         endpoint = {"models": list(stable_models)}
 
-        def exposed_models(_api_key: str):
+        def exposed_models(_api_key: str, _config_path=None):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
@@ -355,7 +363,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
 
         endpoint = {"models": ["public-a"]}
 
-        def exposed_models(_api_key: str):
+        def exposed_models(_api_key: str, _config_path=None):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
@@ -400,7 +408,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
 
         endpoint = {"models": ["public-a"]}
 
-        def exposed_models(_api_key: str):
+        def exposed_models(_api_key: str, _config_path=None):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
@@ -442,7 +450,7 @@ class CodexCatalogRepairTests(unittest.TestCase):
 
         endpoint = {"models": ["public-a"]}
 
-        def exposed_models(_api_key: str):
+        def exposed_models(_api_key: str, _config_path=None):
             return endpoint["models"], True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(

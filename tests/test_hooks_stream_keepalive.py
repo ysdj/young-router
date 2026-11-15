@@ -121,10 +121,13 @@ class DownstreamKeepaliveStreamTests(HookTestCase):
 
     async def test_active_delivery_does_not_emit_keepalives(self) -> None:
         hooks, _ = load_hook_module()
+        # The interval has to dwarf the gaps between real chunks: a tick that
+        # short would fire on a single scheduling stall and break the count
+        # below without the wrapper having changed.
         request = {
             "input": "hello",
             "stream": True,
-            "metadata": {"stream_keepalive_interval_seconds": 0.05},
+            "metadata": {"stream_keepalive_interval_seconds": 5.0},
         }
 
         async def steady_stream():
@@ -188,20 +191,28 @@ class DownstreamKeepaliveStreamTests(HookTestCase):
             "metadata": {"stream_keepalive_interval_seconds": 0.05},
         }
         started = asyncio.Event()
+        released = asyncio.Event()
 
         async def stalled_stream():
             yield {"type": "response.output_text.delta", "delta": "one"}
             started.set()
-            await asyncio.sleep(30)
-            yield {"type": "response.output_text.delta", "delta": "two"}
+            try:
+                await asyncio.sleep(30)
+                yield {"type": "response.output_text.delta", "delta": "two"}
+            finally:
+                released.set()
 
         stream = hooks._yield_downstream_keepalive_stream(stalled_stream(), request)
         first = await stream.__anext__()
         self.assertEqual(first["delta"], "one")
         keepalive = await asyncio.wait_for(stream.__anext__(), timeout=1.0)
         self.assertTrue(hooks._is_stream_keepalive_chunk(keepalive))
+        await asyncio.wait_for(started.wait(), timeout=1.0)
         await stream.aclose()
-        await asyncio.sleep(0)
+        self.assertTrue(
+            released.is_set(),
+            "closing the wrapper must release the delivery's pending read",
+        )
 
     async def test_stalled_delivery_keeps_ticking_instead_of_ending(self) -> None:
         # A keepalive tick must not end the wrapped delivery: an earlier

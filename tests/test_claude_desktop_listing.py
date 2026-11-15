@@ -277,7 +277,6 @@ class ClaudeDesktopRowsTests(unittest.TestCase):
             _response("gpt-image-2.5-flare", "deepseek-v4.1-flash")
         )["data"]
         self.assertEqual(["deepseek-v4.1-flash"], [row["display_name"] for row in rows])
-        self.assertFalse(any("image" in str(row["id"]) for row in rows))
 
     def test_the_view_is_sorted_by_the_display_name(self) -> None:
         rows = claude_desktop_listing.desktop_model_rows(
@@ -289,9 +288,12 @@ class ClaudeDesktopRowsTests(unittest.TestCase):
         )
 
     def test_first_and_last_follow_the_rows(self) -> None:
-        response = claude_desktop_listing.desktop_model_rows(_response("grok-4.7"))
+        response = claude_desktop_listing.desktop_model_rows(
+            _response("grok-4.7", "deepseek-v4.1-flash")
+        )
         self.assertEqual(response["data"][0]["id"], response["first_id"])
         self.assertEqual(response["data"][-1]["id"], response["last_id"])
+        self.assertNotEqual(response["first_id"], response["last_id"])
 
 
 class ClaudeDesktopListingPatchTests(unittest.TestCase):

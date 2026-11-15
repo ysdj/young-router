@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import base64
 import json
-from unittest import mock
 
 from hook_test_utils import *
 
@@ -355,6 +353,10 @@ class HookResponsesRequestPrepTests(HookTestCase):
         request.pop("client_metadata")
 
         self.assertIsNone(contract.with_tool_registry_contract(request))
+        # The registry is still request data, but only a Codex turn enforces
+        # the declared set, so an undeclared name is not a protocol error here.
+        self.assertIn("list_agents", contract.declared_tool_names(request))
+        self.assertFalse(contract.is_undeclared_tool_call(request, "web__run"))
 
     async def test_pre_call_never_injects_codex_rule_text(self) -> None:
         hooks, _ = load_hook_module()
@@ -433,13 +435,31 @@ class HookResponsesRequestPrepTests(HookTestCase):
     def test_codex_descendant_cleanup_instruction_can_be_disabled(self) -> None:
         hooks, _ = load_hook_module()
         contract = hooks._codex_contract_module
-        self.set_env(hooks._CODEX_DESCENDANT_CLEANUP_ENV, "0")
-
-        self.assertIsNone(
-            contract.with_descendant_cleanup_barrier(
-                self._codex_collaboration_request()
-            )
+        request = self._as_root_collaboration_request(
+            self._codex_collaboration_request()
         )
+        self._append_collaboration_call(
+            request,
+            call_id="call-list",
+            name="list_agents",
+            arguments='{"path_prefix":"/root"}',
+            output=json.dumps(
+                {
+                    "agents": [
+                        {"agent_name": "/root", "agent_status": "running"},
+                        {"agent_name": "/root/audit", "agent_status": "running"},
+                    ]
+                }
+            ),
+        )
+        self.set_env(hooks._CODEX_DESCENDANT_CLEANUP_ENV, "1")
+
+        # The same request produces a barrier while the switch is on, so the
+        # None below is the disabled env check rather than an inert request.
+        self.assertIsNotNone(contract.with_descendant_cleanup_barrier(request))
+
+        self.set_env(hooks._CODEX_DESCENDANT_CLEANUP_ENV, "0")
+        self.assertIsNone(contract.with_descendant_cleanup_barrier(request))
 
     def test_codex_descendant_cleanup_requires_management_tools(self) -> None:
         hooks, _ = load_hook_module()
@@ -552,13 +572,26 @@ class HookResponsesRequestPrepTests(HookTestCase):
     def test_codex_commentary_discipline_instruction_can_be_disabled(self) -> None:
         hooks, _ = load_hook_module()
         contract = hooks._codex_contract_module
-        self.set_env(hooks._CODEX_COMMENTARY_DISCIPLINE_ENV, "0")
-
-        self.assertIsNone(
-            contract.with_progress_message_contract(
-                self._codex_collaboration_request()
-            )
+        request = self._codex_collaboration_request()
+        # The contract only reaches the switch when the replay already carries
+        # assistant prose; without it this test would pass for the wrong reason.
+        request["input"].append(
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "I will now run the tests."}
+                ],
+            }
         )
+        self.set_env(hooks._CODEX_COMMENTARY_DISCIPLINE_ENV, "1")
+
+        modified = contract.with_progress_message_contract(request)
+        self.assertIsNotNone(modified)
+        assert modified is not None
+        self.assertEqual(modified["tool_choice"], "required")
+
+        self.set_env(hooks._CODEX_COMMENTARY_DISCIPLINE_ENV, "0")
+        self.assertIsNone(contract.with_progress_message_contract(request))
 
     def test_codex_commentary_discipline_needs_a_declared_tool(self) -> None:
         hooks, _ = load_hook_module()
@@ -648,40 +681,6 @@ class HookResponsesRequestPrepTests(HookTestCase):
             ]
         )
 
-    def test_codex_root_with_active_descendant_must_make_a_tool_call(self) -> None:
-        hooks, _ = load_hook_module()
-        contract = hooks._codex_contract_module
-        request = self._as_root_collaboration_request(
-            self._codex_collaboration_request()
-        )
-        self._append_collaboration_call(
-            request,
-            call_id="call-list",
-            name="list_agents",
-            arguments='{"path_prefix":"/root"}',
-            output=json.dumps(
-                {
-                    "agents": [
-                        {"agent_name": "/root", "agent_status": "running"},
-                        {
-                            "agent_name": "/root/audit",
-                            "agent_status": "running",
-                        },
-                    ]
-                }
-            ),
-        )
-
-        modified = contract.with_descendant_cleanup_barrier(request)
-
-        self.assertIsNotNone(modified)
-        assert modified is not None
-        self.assertEqual(modified["tool_choice"], "required")
-        self.assertEqual(
-            modified["litellm_metadata"][hooks._CODEX_DESCENDANT_CLEANUP_METADATA_KEY]["state"],
-            "active_descendants",
-        )
-
     def test_codex_root_without_descendant_history_keeps_requested_choice(self) -> None:
         hooks, _ = load_hook_module()
         contract = hooks._codex_contract_module
@@ -732,7 +731,7 @@ class HookResponsesRequestPrepTests(HookTestCase):
             {"type": "function", "name": "list_agents"},
         )
 
-    def test_codex_root_invalidated_snapshot_preserves_existing_required_choice(self) -> None:
+    def test_codex_root_invalidated_snapshot_names_the_recovery_tool(self) -> None:
         hooks, _ = load_hook_module()
         contract = hooks._codex_contract_module
         request = self._as_root_collaboration_request(

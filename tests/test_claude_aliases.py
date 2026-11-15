@@ -155,13 +155,14 @@ class ClaudeDesktopAliasTests(unittest.TestCase):
         self.assertFalse(is_derived_alias("claude-opus-5-5[1m]"))
 
 
-    def test_a_real_claude_name_is_never_mapped_through_an_alias(self) -> None:
-        # Two routers can serve the same third-party name; the alias is derived
-        # from the name, so the same route reads the same on both.
-        self.assertEqual(
-            claude_desktop_alias("kimi-k3.1-pro"),
-            claude_desktop_alias("kimi-k3.1-pro"),
-        )
+    def test_a_third_party_name_reads_the_same_on_every_router(self) -> None:
+        # Two routers can serve the same third-party name; the alias is a digest
+        # of the name alone, so the same route reads the same on both -- and on
+        # a client that still holds the id another installation gave it.  Stated
+        # as values: comparing the call with itself, which is what this test
+        # used to do, cannot tell a per-process salt from none.
+        self.assertEqual("claude-mythos-f0bb7e", claude_desktop_alias("kimi-k3.1-pro"))
+        self.assertEqual("claude-mythos-eb1394", claude_desktop_alias("deepseek-v4.1-flash"))
 
 
 if __name__ == "__main__":

@@ -119,6 +119,12 @@ class HookRoutingTests(HookTestCase):
         overload.status_code = 503
         network = RuntimeError("Cannot connect to host api.example.test")
         network.status_code = 500
+        # A host that was never reached is not the same failure as a route that
+        # answered and dropped the body, and the two now have their own
+        # policies: the first is parked so the next request does not pay the
+        # same silence, the second is kept because another attempt may resume.
+        dropped_body = RuntimeError("Server disconnected")
+        dropped_body.status_code = 500
         start_timeout = TimeoutError("stream did not start")
         start_timeout.status_code = 504
         start_timeout.body = {"reason": "stream_start_timeout"}
@@ -140,7 +146,8 @@ class HookRoutingTests(HookTestCase):
         # A 5xx is the route failing, whatever sentence it wears: an "overloaded"
         # 503 is a route the next request must not try first again.
         self.assertEqual(hooks._recovery_policy_for_exception(overload), "recovery_cooldown")
-        self.assertEqual(hooks._recovery_policy_for_exception(network), "recovery")
+        self.assertEqual(hooks._recovery_policy_for_exception(network), "recovery_cooldown")
+        self.assertEqual(hooks._recovery_policy_for_exception(dropped_body), "recovery")
         self.assertEqual(hooks._recovery_policy_for_exception(start_timeout), "recovery_cooldown")
         self.assertEqual(hooks._recovery_policy_for_exception(idle_timeout), "recovery")
         self.assertEqual(hooks._recovery_policy_for_exception(request_error), "error")
@@ -169,7 +176,11 @@ class HookRoutingTests(HookTestCase):
         # outage.  The diagnostic still says which refusal it was.
         self.assertEqual(hooks._recovery_policy_for_exception(rejected), "recovery_cooldown")
         self.assertEqual(hooks._recovery_diagnostic(rejected)["kind"], "authentication")
-        self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(network))
+        self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(network))
+        # A body that was already flowing is not this route's absence, so it
+        # still only waits: parking it would take a healthy route out of the
+        # pool for a drop another attempt may survive.
+        self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(dropped_body))
         # The default now counts a rate limit against the route's cooldown, so
         # two consecutive refusals park it exactly as a 5xx does.
         self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(rate_limit))
@@ -410,6 +421,18 @@ class HookRoutingTests(HookTestCase):
         ):
             with self.subTest(text=text):
                 self.assertIsNone(hooks._quota_reset_absolute_seconds(text))
+
+        # Digits after the time that no clock offset can be (a day or more)
+        # are not an offset: the stamp is still read, as UTC, instead of
+        # raising out of the classification of the refusal that carried it.
+        self.assertIsNotNone(hooks._quota_reset_absolute_seconds("reset at 2099-01-02 03:04:05 +2500"))
+        self.assertIsNotNone(hooks._quota_reset_absolute_seconds("reset at 2099-01-02 03:04:05 -99"))
+
+        # A stored failure count that is not a finite number is no count; it
+        # must not make the whole shared cooldown update raise.
+        self.assertEqual(
+            0, hooks._clean_deployment_cooldown_state({"failures": float("inf"), "cooldown_until": 0})["failures"]
+        )
 
         # A reset already in the past never extends a cooldown.
         self.assertEqual(
@@ -1605,7 +1628,7 @@ class HookRoutingTests(HookTestCase):
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
-        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "0.01")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "0.5")
         deployments = [
             {"litellm_params": {"model": "openai/x-cheap"}, "model_info": {"id": "x-cheap"}},
             {"litellm_params": {"model": "openai/x-plus"}, "model_info": {"id": "x-plus"}},
@@ -1628,7 +1651,7 @@ class HookRoutingTests(HookTestCase):
         )
         self.assertEqual(filtered, [deployments[1]])
 
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.6)
 
         filtered = await hook.async_filter_deployments(
             "default-chat",
@@ -1672,6 +1695,14 @@ class HookRoutingTests(HookTestCase):
         for error in errors:
             hooks._mark_exception_for_deployment_failover(error, request_kwargs)
 
+        filtered = await hook.async_filter_deployments(
+            "default-chat",
+            deployments,
+            messages=None,
+            request_kwargs={},
+        )
+        self.assertEqual(filtered, deployments)
+
         # A rate limit is not a request-shaped error: the default counts it
         # against the route, so it parks the route exactly as a server error
         # would.  Request and context errors stay uncounted (asserted above).
@@ -1700,17 +1731,6 @@ class HookRoutingTests(HookTestCase):
             "model_info": {"id": "x-cheap"},
         }
 
-        timeout_error = RuntimeError("upstream gateway timeout")
-        timeout_error.status_code = 504
-        hooks._mark_exception_for_deployment_failover(timeout_error, request_kwargs)
-
-        long_wait_error = RuntimeError("upstream returned 500 after 60s")
-        long_wait_error.status_code = 500
-        hooks._mark_exception_for_deployment_failover(
-            long_wait_error,
-            {**request_kwargs, "duration_ms": 60000},
-        )
-
         stream_idle_error = TimeoutError("stream idle timeout")
         stream_idle_error.status_code = 504
         stream_idle_error.body = {"reason": "stream_idle_timeout"}
@@ -1722,30 +1742,18 @@ class HookRoutingTests(HookTestCase):
             messages=None,
             request_kwargs={},
         )
-        self.assertEqual(filtered, [deployments[1]])
+        self.assertEqual(filtered, deployments)
 
-    async def test_deployment_cooldown_does_not_count_network_connectivity_errors(self) -> None:
-        hooks, _ = load_hook_module()
-        hook = hooks.YoungRouterHook()
-        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
-        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
-        deployments = [
-            {"litellm_params": {"model": "openai/x-cheap"}, "model_info": {"id": "x-cheap"}},
-            {"litellm_params": {"model": "openai/x-plus"}, "model_info": {"id": "x-plus"}},
-        ]
-        request_kwargs = {
-            "model": "default-chat",
-            "litellm_params": {"model": "openai/x-cheap"},
-            "model_info": {"id": "x-cheap"},
-        }
+        timeout_error = RuntimeError("upstream gateway timeout")
+        timeout_error.status_code = 504
+        hooks._mark_exception_for_deployment_failover(timeout_error, request_kwargs)
 
-        for message in (
-            "InternalServerError: OpenAIException - Cannot connect to host api.example.test:443 ssl:default",
-            "InternalServerError: OpenAIException - Server disconnected",
-        ):
-            error = RuntimeError(message)
-            error.status_code = 500
-            hooks._mark_exception_for_deployment_failover(error, request_kwargs)
+        long_wait_error = RuntimeError("upstream returned 500 after 60s")
+        long_wait_error.status_code = 500
+        hooks._mark_exception_for_deployment_failover(
+            long_wait_error,
+            {**request_kwargs, "duration_ms": 60000},
+        )
 
         filtered = await hook.async_filter_deployments(
             "default-chat",
@@ -1753,8 +1761,70 @@ class HookRoutingTests(HookTestCase):
             messages=None,
             request_kwargs={},
         )
-        self.assertEqual(filtered, deployments)
-        self.assertNotIn("_excluded_deployment_ids", request_kwargs)
+        self.assertEqual(filtered, [deployments[1]])
+
+    async def test_a_route_that_was_never_reached_is_parked_but_a_dropped_body_is_not(self) -> None:
+        """Two connectivity shapes, two answers: absent vs. cut mid-answer.
+
+        The connect-phase failure is the one a sibling can serve: nothing was
+        exchanged, so no replay can be judged and no silence is informative.  It
+        is parked.  A body the upstream had already started writing is a
+        different answer: another attempt may resume it, so the route stays.
+        Measured 2026-11-15, the first shape was recorded as ``recovery`` and
+        therefore never accrued a cooldown, so the dead route was selected first
+        on every turn of its group and each turn paid ~270 s for nothing.
+        """
+
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        def deployments(prefix: str) -> list[dict]:
+            return [
+                {
+                    "litellm_params": {"model": "openai/x-cheap"},
+                    "model_info": {"id": f"{prefix}-cheap"},
+                },
+                {
+                    "litellm_params": {"model": "openai/x-plus"},
+                    "model_info": {"id": f"{prefix}-plus"},
+                },
+            ]
+
+        def request_kwargs(prefix: str) -> dict:
+            return {
+                "model": "default-chat",
+                "litellm_params": {"model": "openai/x-cheap"},
+                "model_info": {"id": f"{prefix}-cheap"},
+            }
+
+        # Two halves, two route ids: a cooldown this test creates is shared
+        # state, and reusing one id would make the second half read the first
+        # half's park instead of its own verdict.
+        unreachable_routes = deployments("absent")
+        unreachable = request_kwargs("absent")
+        error = RuntimeError(
+            "InternalServerError: OpenAIException - Cannot connect to host api.example.test:443 ssl:default"
+        )
+        error.status_code = 500
+        hooks._mark_exception_for_deployment_failover(error, unreachable)
+        filtered = await hook.async_filter_deployments(
+            "default-chat", unreachable_routes, messages=None, request_kwargs={}
+        )
+        self.assertEqual(filtered, [unreachable_routes[1]])
+
+        dropped_routes = deployments("cut")
+        dropped = request_kwargs("cut")
+        error = RuntimeError(
+            "InternalServerError: OpenAIException - Server disconnected"
+        )
+        error.status_code = 500
+        hooks._mark_exception_for_deployment_failover(error, dropped)
+        filtered = await hook.async_filter_deployments(
+            "default-chat", dropped_routes, messages=None, request_kwargs={}
+        )
+        self.assertEqual(filtered, dropped_routes)
+        self.assertNotIn("_excluded_deployment_ids", dropped)
 
     def test_network_connectivity_error_is_retryable_but_not_hard_deployment_failure(self) -> None:
         hooks, _proxy_server = load_hook_module()
@@ -1767,7 +1837,7 @@ class HookRoutingTests(HookTestCase):
         self.assertTrue(hooks._is_route_recovery_poll_error(exc))
         self.assertTrue(hooks._should_sanitize_final_upstream_route_error(exc))
         self.assertTrue(hooks._should_retry_same_deployment_before_fallback(exc))
-        self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(exc))
+        self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(exc))
         self.assertEqual(hooks._trace_exception(exc)["reason"], "upstream-network-connectivity")
 
         class ReadError(Exception):
@@ -1786,6 +1856,92 @@ class HookRoutingTests(HookTestCase):
             hooks._recovery_policy_for_exception(sending_request),
             "recovery",
         )
+
+    def test_only_a_connect_phase_failure_is_unreachable(self) -> None:
+        """The narrow reading that keeps a cut body out of the parked class.
+
+        Every marker here can appear before a single response byte travelled.
+        The wording a dropped body wears -- reset, closed, disconnected, ended
+        -- is deliberately absent: those bytes cannot be replayed, another
+        attempt may resume them, and parking the route would take a working
+        deployment out of its own pool.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        for message in (
+            "InternalServerError: OpenAIException - Cannot connect to host api.example.test:443 ssl:default [Connect call failed ('127.0.0.1', 443)]",
+            "litellm.Timeout: Connection timed out. Timeout passed=10.0, time taken=10.004 seconds",
+            "Connection refused",
+            "Network is unreachable",
+            "No route to host",
+            "Temporary failure in name resolution",
+            "Name or service not known",
+        ):
+            self.assertTrue(
+                hooks._is_upstream_unreachable_error(RuntimeError(message)), message
+            )
+            self.assertEqual(
+                hooks._recovery_policy_for_exception(RuntimeError(message)),
+                hooks._RECOVERY_POLICY_COOLDOWN,
+                message,
+            )
+
+        for message in (
+            "Server disconnected",
+            "Connection reset by peer",
+            "Read timed out.",
+            "connection closed.",
+            "ssl: certificate_verify_failed",
+            "upstream connection lost",
+        ):
+            self.assertFalse(
+                hooks._is_upstream_unreachable_error(RuntimeError(message)), message
+            )
+
+    def test_the_process_defaults_are_the_document_the_pane_shows(self) -> None:
+        """A published number no process obeys is a defect, not a preference.
+
+        Measured 2026-11-15: the settings pane read 120 for the first-event and
+        stream-idle budgets, the proxy's own defaults were 300, and no host
+        file carried either key -- so the pane documented a number that was
+        never in force, and an operator changing it could not tell.
+        """
+
+        from young_router.core.runtime_settings_schema import RUNTIME_SETTINGS_SCHEMA
+
+        hooks, _proxy_server = load_hook_module()
+        documented = {entry["key"]: entry["default"] for entry in RUNTIME_SETTINGS_SCHEMA}
+        pairs = (
+            (hooks._REQUEST_TIMEOUT_SECONDS_ENV, hooks._REQUEST_TIMEOUT_DEFAULT_SECONDS),
+            (
+                hooks._STREAM_START_TIMEOUT_SECONDS_ENV,
+                hooks._STREAM_START_TIMEOUT_DEFAULT_SECONDS,
+            ),
+            (hooks._STALL_TIMEOUT_SECONDS_ENV, hooks._STALL_TIMEOUT_DEFAULT_SECONDS),
+            (
+                hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV,
+                hooks._UPSTREAM_CONNECT_TIMEOUT_DEFAULT_SECONDS,
+            ),
+            (
+                hooks._HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS_ENV,
+                hooks._HEAVY_REPLAY_STREAM_START_TIMEOUT_DEFAULT_SECONDS,
+            ),
+            (
+                hooks._CODEX_COMPACTION_STREAM_START_TIMEOUT_SECONDS_ENV,
+                hooks._CODEX_COMPACTION_STREAM_START_TIMEOUT_DEFAULT_SECONDS,
+            ),
+            (
+                hooks._STREAM_KEEPALIVE_INTERVAL_SECONDS_ENV,
+                hooks._STREAM_KEEPALIVE_DEFAULT_INTERVAL_SECONDS,
+            ),
+            (hooks._RECOVERY_MAX_SECONDS_ENV, hooks._RECOVERY_MAX_DEFAULT_SECONDS),
+            (hooks._RECOVERY_INTERVAL_SECONDS_ENV, hooks._RECOVERY_INTERVAL_DEFAULT_SECONDS),
+        )
+        for key, actual in pairs:
+            with self.subTest(key=key):
+                self.assertIn(key, documented)
+                self.assertEqual(float(documented[key]), float(actual))
 
     async def test_deployment_cooldown_does_not_count_stream_start_timeout_after_chunks(self) -> None:
         hooks, _ = load_hook_module()

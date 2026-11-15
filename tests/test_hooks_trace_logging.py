@@ -21,6 +21,14 @@ def _declared_stream_start_seconds() -> float:
     return routing_module._stream_start_timeout_seconds_for_request({})
 
 
+def _declared_recovery_max_seconds() -> float:
+    """The route-recovery budget this deployment is configured to use."""
+
+    from young_router.proxy import routing as routing_module
+
+    return routing_module._recovery_max_seconds_for_request({})
+
+
 class HookTraceLoggingTests(HookTestCase):
     def test_the_row_eviction_keeps_a_stream_that_is_still_reporting(self) -> None:
         """The cap evicts the least recently touched row, not the oldest one.
@@ -157,7 +165,10 @@ class HookTraceLoggingTests(HookTestCase):
             summary["timeouts"]["stream_start_seconds"],
             _declared_stream_start_seconds(),
         )
-        self.assertEqual(summary["timeouts"]["recovery_max_seconds"], 14400.0)
+        self.assertEqual(
+            summary["timeouts"]["recovery_max_seconds"],
+            _declared_recovery_max_seconds(),
+        )
         self.assertEqual(summary["tools"]["count"], 2)
         self.assertIn("web_search", summary["tools"]["types"])
         self.assertIn("lookup_order", summary["tools"]["names"])
@@ -443,7 +454,7 @@ class HookTraceLoggingTests(HookTestCase):
             self.assertEqual(record["usage"]["total_tokens"], 15)
             self.assertIn("image_generation", record["tool_types"])
             self.assertNotIn("SECRET_PROMPT_BODY", raw)
-            self.assertNotIn("SECRETKEYVALUE", raw)
+            self.assertNotIn("sk-test-secret", raw)
             self.assertNotIn("SECRET_AUTH_VALUE", raw)
             self.assertNotIn("Authorization", raw)
 

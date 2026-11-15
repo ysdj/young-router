@@ -29,6 +29,12 @@ for (const operation of ["start", "stop", "restart", "reload"]) {
   assert.equal(deadlineFor(dispatch(`service.${operation}`)), FIFTEEN_MINUTES, `service.${operation}`);
 }
 
+// A probe reads the upstream, so the page gives it the same fifteen minutes the
+// native hosts do.  A flash route's press measures the route's speed -- seconds
+// of streaming output on top of the surface probes -- and the twenty-second
+// edit budget aborted a measurement that was running normally.
+assert.equal(deadlineFor(JSON.stringify({ method: "probe", params: { provider_id: "p", model_id: "m" } })), FIFTEEN_MINUTES);
+
 // Everything else keeps the twenty-second budget: a page that waits minutes on
 // a snapshot or an edit is a page with no strip to say why.
 assert.equal(deadlineFor(dispatch("provider.patch")), TWENTY_SECONDS);

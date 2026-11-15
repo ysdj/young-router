@@ -15,8 +15,6 @@ its locks -- a half-committed provider/relay pair is what they exist to prevent.
 
 from __future__ import annotations
 
-import contextlib
-import os
 import tempfile
 import threading
 import time

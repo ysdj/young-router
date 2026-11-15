@@ -76,6 +76,7 @@ class RouteConcurrencyConfigTests(unittest.TestCase):
         # ``None`` is what the pane draws as "follows the global limit".  A zero
         # here would make the saved route permanently ignore that setting.
         self.assertIsNone(self.model("00000001")["max_concurrency"])
+        self.domain.apply()
         saved = self.path.read_text(encoding="utf-8")
         self.assertNotIn("max_concurrency", saved)
 

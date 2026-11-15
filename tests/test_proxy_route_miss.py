@@ -25,6 +25,9 @@ def build_app():  # noqa: ANN201 - FastAPI is a test-time import
 
     app = FastAPI()
 
+    async def ok() -> dict[str, object]:
+        return {"ok": True}
+
     @app.get("/v1/models")
     async def models() -> dict[str, object]:
         return {"data": []}
@@ -36,6 +39,19 @@ def build_app():  # noqa: ANN201 - FastAPI is a test-time import
     @app.get("/v1/models/{name}")
     async def model(name: str) -> dict[str, object]:
         raise HTTPException(status_code=404, detail="model not found")
+
+    # The rest of the surface this port publishes under /v1.  A wire table entry
+    # no route serves would tell a client its base URL is missing /v1 for a path
+    # this port never had, so the table is checked against these routes.
+    for tail in (
+        "messages/count_tokens",
+        "responses",
+        "chat/completions",
+        "completions",
+        "embeddings",
+        "images/generations",
+    ):
+        app.add_api_route(f"/v1/{tail}", ok, methods=["POST"])
 
     return app
 
@@ -75,8 +91,9 @@ class ClassificationTests(unittest.TestCase):
     def test_the_wire_table_names_no_path_that_does_not_exist(self) -> None:
         """The table is a claim about this port; it must not invent a route."""
 
+        served = {getattr(route, "path", "") for route in build_app().routes}
         for tail in route_miss.WIRE_TAILS:
-            self.assertTrue(tail.startswith(("messages", "responses", "chat", "completions", "models", "embeddings", "images")), tail)
+            self.assertIn(f"{route_miss.API_PREFIX}/{tail}", served, tail)
 
 
 class NotFoundAnswerTests(unittest.IsolatedAsyncioTestCase):

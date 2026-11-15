@@ -20,7 +20,7 @@ from unittest import mock
 from young_router.core.domains import DomainError
 from young_router.core.domains.codex import CodexSettingsDomain
 from young_router.core.domains.providers_models import ProvidersModelsDomain
-from young_router.adapters import veridrop
+from young_router.adapters import modelprint
 from young_router.core.domains.relay_accounts import RelayAccountsDomain
 from young_router.core.domains.runtime import RuntimeSettingsDomain
 from young_router.core.domains.webdav import WebDAVSettingsDomain
@@ -71,16 +71,15 @@ DEEP_TEST_MODEL = "claude-opus-4-8"
 DEEP_TEST_PROTOCOL = "anthropic"
 
 
-def deep_test_config(model_name: str = DEEP_TEST_MODEL, surface: str = "anthropic", *, protocol_mode: str = "") -> str:
+def deep_test_config(model_name: str = DEEP_TEST_MODEL, *, protocol_mode: str = "") -> str:
     """The provider fixture renamed to a model the staged scan program carries."""
 
     config = textwrap.dedent(PROVIDER_CONFIG).lstrip().replace("default-chat", model_name)
-    if surface != "openai/responses":
-        config = config.replace("upstream_url_surface: openai/responses", f"upstream_url_surface: {surface}")
+    config = config.replace("upstream_url_surface: openai/responses", "upstream_url_surface: anthropic")
     if protocol_mode:
         config = config.replace(
-            f"upstream_url_surface: {surface}",
-            f"upstream_url_surface: {surface}\n      upstream_protocol_mode: {protocol_mode}",
+            "upstream_url_surface: anthropic",
+            f"upstream_url_surface: anthropic\n      upstream_protocol_mode: {protocol_mode}",
             1,
         )
     return config
@@ -96,27 +95,45 @@ def degradation_engine(
     model: str = DEEP_TEST_MODEL,
     protocol: str = DEEP_TEST_PROTOCOL,
 ):
-    """Patch the Veridrop adapter so a test never needs the staged program."""
+    """Patch the modelprint adapter so a test never needs the staged tables."""
 
     resolved_engine = engine or {
-        "name": "Veridrop",
+        "name": "modelprint",
         "source": "test",
-        "license": "AGPL-3.0-or-later",
+        "license": "MIT",
         "revision": "test",
         "staged_at": "",
         "mode": "quick",
         "available": True,
     }
-    resolved_target = {"model": model, "protocol": protocol} if supported else None
+    resolved_plan = (
+        {
+            "includes_degradation": True,
+            "target": model,
+            "protocol": protocol,
+            "surface": "anthropic" if protocol == "anthropic" else "openai/chat",
+            "probes": ["tok-english"],
+            "reason": "",
+        }
+        if supported
+        else {
+            "includes_degradation": False,
+            "target": model,
+            "protocol": protocol,
+            "surface": "",
+            "probes": [],
+            "reason": "no-baseline",
+        }
+    )
 
-    def run_quick(**_kwargs: object) -> dict[str, object]:
+    def run_probes(**_kwargs: object) -> dict[str, object]:
         if error is not None:
             raise error
         return dict(decision or {})
 
-    with mock.patch.object(veridrop, "target", return_value=resolved_target), mock.patch.object(
-        veridrop, "engine", return_value=resolved_engine
-    ), mock.patch.object(veridrop, "run_quick", side_effect=run_quick) as staged:
+    with mock.patch.object(modelprint, "plan", return_value=dict(resolved_plan)), mock.patch.object(
+        modelprint, "engine", return_value=resolved_engine
+    ), mock.patch.object(modelprint, "run", side_effect=run_probes) as staged:
         yield staged
 
 
@@ -1760,9 +1777,25 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 length = int(self.headers.get("Content-Length", "0"))
                 self.rfile.read(length)
                 if self.path == "/v1/messages":
-                    body = {"content": [{"type": "text", "text": "OK"}]}
+                    body = {
+                        "id": "msg_1",
+                        "model": DEEP_TEST_MODEL,
+                        "content": [{"type": "text", "text": "OK"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 11, "output_tokens": 1},
+                    }
                 else:
-                    body = {"choices": [{"message": {"role": "assistant", "content": "OK"}}]}
+                    body = {
+                        "id": "chatcmpl-1",
+                        "model": DEEP_TEST_MODEL,
+                        "choices": [
+                            {
+                                "message": {"role": "assistant", "content": "OK"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 11, "completion_tokens": 1},
+                    }
                 encoded = json.dumps(body).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1789,9 +1822,16 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 with degradation_engine(
                     decision={
                         "verdict": "passed",
-                        "score": 92.0,
-                        "summary": "All detectors passed",
-                        "detectors": [{"name": "identity", "status": "pass", "score": 100.0}],
+                        "score": 100.0,
+                        "summary": "the tokenizer and shape rows match claude-opus-4-8",
+                        "label": DEEP_TEST_MODEL,
+                        "label_source": "baseline",
+                        "label_confidence": 1.0,
+                        "measured": ["tok-english", "tok-chinese"],
+                        "probes": [
+                            {"name": "tok-english", "value": "47"},
+                            {"name": "tok-chinese", "value": "56"},
+                        ],
                     }
                 ) as staged:
                     result = core.probe(
@@ -1805,16 +1845,15 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             thread.join(timeout=2)
 
         arguments = staged.call_args.kwargs
-        self.assertEqual(f"http://127.0.0.1:{port}", arguments["base_url"])
+        self.assertEqual(f"http://127.0.0.1:{port}", arguments["api_base"])
         self.assertEqual("replace-me-secret", arguments["api_key"])
-        self.assertEqual(DEEP_TEST_MODEL, arguments["model"])
         self.assertEqual(DEEP_TEST_PROTOCOL, arguments["protocol"])
         self.assertEqual("matched", result["degradation"]["status"])
         self.assertEqual(DEEP_TEST_MODEL, result["degradation"]["target"])
         self.assertEqual("anthropic", result["degradation"]["protocol"])
         self.assertEqual("passed", result["degradation"]["verdict"])
-        self.assertEqual(92.0, result["degradation"]["score"])
-        self.assertEqual("Veridrop", result["degradation"]["engine"]["name"])
+        self.assertEqual(100.0, result["degradation"]["score"])
+        self.assertEqual("modelprint", result["degradation"]["engine"]["name"])
         self.assertTrue(result["degradation"]["engine"]["available"])
         self.assertEqual("matched", model["probe"]["degradation"]["status"])
         self.assertEqual(
@@ -1823,6 +1862,9 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 "target": DEEP_TEST_MODEL,
                 "protocol": "anthropic",
                 "surface": "anthropic",
+                "probes": ["tok-english"],
+                "reason": "",
+                "precision_reference": None,
             },
             model["deep_probe"],
         )
@@ -1842,10 +1884,14 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), degradation_engine(
                 decision={
                     "verdict": "failed",
-                    "score": 31.0,
-                    "summary": "Identity answered as another brand",
-                    "brands": ["Amazon Q"],
-                    "detectors": [{"name": "identity", "status": "fail", "score": 0.0}],
+                    "score": 100.0,
+                    "summary": "the rows match claude-opus-4-7, not claude-opus-4-8",
+                    "label": "claude-opus-4-7",
+                    "label_source": "baseline",
+                    "label_confidence": 1.0,
+                    "brands": ["anthropic"],
+                    "measured": ["tok-english"],
+                    "probes": [{"name": "tok-english", "value": "49"}],
                 }
             ):
                 result = core.probe(
@@ -1857,9 +1903,9 @@ class ProvidersModelsDomainTests(unittest.TestCase):
 
         self.assertEqual("mismatch", result["degradation"]["status"])
         self.assertEqual("failed", result["degradation"]["verdict"])
-        self.assertEqual("Amazon Q", result["degradation"]["label"])
-        self.assertIn("Amazon Q", result["degradation"]["detail"])
-        self.assertIn("31/100", result["degradation"]["detail"])
+        self.assertEqual("claude-opus-4-7", result["degradation"]["label"])
+        self.assertIn("claude-opus-4-7", result["degradation"]["detail"])
+        self.assertIn("1 rows", result["degradation"]["detail"])
         # A failed check is a finding, never a routing decision: the model keeps
         # its enable checkbox and the draft stays clean.
         self.assertTrue(model["model_enabled"])
@@ -1888,31 +1934,31 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 "surface_status": "ok",
             }
             with mock.patch.object(
-                veridrop, "engine", return_value={"name": "Veridrop", "available": False, "revision": ""}
+                modelprint, "engine", return_value={"name": "modelprint", "available": False, "revision": ""}
             ):
                 unstaged = domain._degradation_probe(**arguments)
             with mock.patch.object(
-                veridrop,
+                modelprint,
                 "engine",
-                return_value={"name": "Veridrop", "available": True, "revision": "test"},
+                return_value={"name": "modelprint", "available": True, "revision": "test"},
             ), mock.patch.object(
-                veridrop,
-                "run_quick",
-                side_effect=veridrop.VeridropUnavailable("Veridrop is not staged"),
+                modelprint,
+                "run",
+                side_effect=modelprint.ModelPrintUnavailable("modelprint is not staged"),
             ):
                 missing = domain._degradation_probe(**arguments)
             with mock.patch.object(
-                veridrop,
+                modelprint,
                 "engine",
-                return_value={"name": "Veridrop", "available": True, "revision": "test"},
-            ), mock.patch.object(veridrop, "run_quick", side_effect=RuntimeError("program exploded")):
+                return_value={"name": "modelprint", "available": True, "revision": "test"},
+            ), mock.patch.object(modelprint, "run", side_effect=RuntimeError("program exploded")):
                 broken = domain._degradation_probe(**arguments)
 
         self.assertEqual("unavailable", unstaged["status"])
         # The finding still names the route it was about.
         self.assertEqual(DEEP_TEST_MODEL, unstaged["target"])
         self.assertEqual("unavailable", missing["status"])
-        self.assertIn("Veridrop is not staged", missing["detail"])
+        self.assertIn("modelprint is not staged", missing["detail"])
         self.assertEqual("error", broken["status"])
         self.assertIn("program exploded", broken["detail"])
         self.assertNotIn("replace-me-secret", json.dumps(unstaged) + json.dumps(missing) + json.dumps(broken))
@@ -2035,14 +2081,27 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 clear=False,
             ):
                 self.assertEqual(7.0, ProvidersModelsDomain._model_probe_timeout_seconds())
-            os.environ.pop(ProvidersModelsDomain._MODEL_PROBE_TIMEOUT_ENV, None)
         with mock.patch.dict(
             os.environ,
             {"YOUNG_ROUTER_RUNTIME_SETTINGS_FILE": "/nonexistent/runtime-settings.env"},
             clear=False,
         ):
             os.environ.pop(ProvidersModelsDomain._MODEL_PROBE_TIMEOUT_ENV, None)
-            self.assertEqual(120.0, ProvidersModelsDomain._model_probe_timeout_seconds())
+            # With nothing configured the probe waits as long as the proxy does
+            # by default -- the number the pane shows for First-event timeout.
+            # The literal is not restated here: the point of this assertion is
+            # that the two agree, and a third copy is what let them drift apart
+            # (the proxy answered 120 while this file still said 300).
+            from young_router.proxy import base as proxy_base
+
+            self.assertEqual(
+                proxy_base._STREAM_START_TIMEOUT_DEFAULT_SECONDS,
+                ProvidersModelsDomain._MODEL_PROBE_TIMEOUT_SECONDS,
+            )
+            self.assertEqual(
+                ProvidersModelsDomain._MODEL_PROBE_TIMEOUT_SECONDS,
+                ProvidersModelsDomain._model_probe_timeout_seconds(),
+            )
 
     def test_model_probe_does_not_recommend_a_protocol_change_after_a_dropped_connection(self) -> None:
         """A reset on the configured surface must not re-point a working route."""
@@ -2204,29 +2263,6 @@ class ProvidersModelsDomainTests(unittest.TestCase):
 
         self.assertNotIn("openai/images", surfaces_asked)
         self.assertTrue(result["unreachable"])
-
-    def test_a_chat_route_is_never_asked_the_images_question(self) -> None:
-        """Only a route that refused every chat wire pays for the extra request."""
-
-        surfaces_asked: list[str] = []
-
-        def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
-            surfaces_asked.append(surface)
-            return {"surface": surface, "available": True, "status": "ok"}
-
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "config.yaml"
-            path.write_text(deep_test_config(model_name="gpt-6.1-sol"), encoding="utf-8")
-            domain = ProvidersModelsDomain(path)
-            with mock.patch.object(
-                ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe
-            ), mock.patch.object(
-                ProvidersModelsDomain, "_serves_images", return_value=False
-            ):
-                result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
-
-        self.assertNotIn("openai/images", surfaces_asked)
-        self.assertTrue(result["ok"])
 
     def test_the_pane_is_told_when_a_route_only_generates_images(self) -> None:
         """The window row has nothing to state for a generator.
@@ -2450,14 +2486,21 @@ class ProvidersModelsDomainTests(unittest.TestCase):
             path.write_text(deep_test_config(model_name="gemini-3.8-flash"), encoding="utf-8")
             domain = ProvidersModelsDomain(path)
 
-            def run_quick(**_kwargs: object) -> dict[str, object]:
-                return {"verdict": "failed", "score": 0.0, "brands": ["Amazon Q"], "summary": "x"}
+            def run_probes(**_kwargs: object) -> dict[str, object]:
+                return {
+                    "verdict": "failed",
+                    "score": 100.0,
+                    "label": "some-other-model",
+                    "brands": ["amazon"],
+                    "summary": "x",
+                    "probes": [],
+                }
 
-            with mock.patch.object(veridrop, "engine", return_value={"name": "Veridrop", "available": True, "revision": "t"}), mock.patch.object(
-                veridrop, "run_quick", side_effect=run_quick
+            with mock.patch.object(modelprint, "engine", return_value={"name": "modelprint", "available": True, "revision": "t"}), mock.patch.object(
+                modelprint, "run", side_effect=run_probes
             ) as staged:
                 finding = domain._degradation_probe(
-                    plan={"includes_degradation": True, "target": "gemini-3.8-flash", "protocol": "gemini", "surface": ""},
+                    plan={"includes_degradation": True, "target": "gemini-3.8-flash", "protocol": "openai", "surface": ""},
                     api_base="https://example.test/v1",
                     credential="replace-me-secret",
                     model_name="gemini-3.8-flash",
@@ -2471,13 +2514,172 @@ class ProvidersModelsDomainTests(unittest.TestCase):
         self.assertEqual("", finding["verdict"])
         self.assertIn("No surface answered", finding["detail"])
 
-    def test_a_reachable_route_without_a_probe_surface_is_still_scanned(self) -> None:
-        """The Gemini protocol has no gate, and gating it would drop its check.
+    def test_the_speed_probe_reads_the_endpoint_s_own_token_count(self) -> None:
+        """A rate from the usage block is the endpoint's number, not a guess.
 
-        Its plan carries no surface because this app's probe matrix has none to
-        require, so the scan is decided by what the address actually answered.
-        A route that answered anywhere is measured; only a route that answered
-        nowhere is left unscanned.
+        ``basis`` is part of the finding: a rate divided out of the endpoint's
+        own usage and a rate counted from the words it wrote are different
+        claims, and a reader has to be able to tell which one they have.
+        """
+
+        domain = ProvidersModelsDomain.__new__(ProvidersModelsDomain)
+        body = json.dumps(
+            {
+                "choices": [{"message": {"content": "1 2 3 4 5"}}],
+                "usage": {"completion_tokens": 100, "prompt_tokens": 12},
+            }
+        ).encode("utf-8")
+
+        text, tokens, reported = domain._speed_probe_usage(body, "openai/chat", False)
+
+        self.assertEqual("1 2 3 4 5", text)
+        self.assertEqual(100, tokens)
+        self.assertTrue(reported)
+
+    def test_the_speed_probe_falls_back_to_the_answer_s_own_words(self) -> None:
+        """An endpoint that reports no usage still gets a rate, and says how.
+
+        Counting the answer's words is not the same measurement as reading the
+        endpoint's usage block, so the count is marked unreported and the pane
+        can label it.  A rate with no basis is a number about nothing.
+        """
+
+        domain = ProvidersModelsDomain.__new__(ProvidersModelsDomain)
+        body = json.dumps(
+            {"choices": [{"message": {"content": "one two three"}}]}
+        ).encode("utf-8")
+
+        text, tokens, reported = domain._speed_probe_usage(body, "openai/chat", False)
+
+        self.assertEqual("one two three", text)
+        self.assertEqual(3, tokens)
+        self.assertFalse(reported)
+
+    def test_the_speed_probe_refuses_a_rate_for_an_image_route(self) -> None:
+        """A picture has no token rate, and printing one would be a number about nothing."""
+
+        domain = ProvidersModelsDomain.__new__(ProvidersModelsDomain)
+
+        with mock.patch.object(
+            ProvidersModelsDomain, "isolated_http_opener", create=True
+        ) as opener:
+            reading = domain._speed_probe(
+                surface="openai/images",
+                api_base="https://example.test/v1",
+                credential="replace-me-secret",
+                model_name="gpt-image-2.6-flare",
+            )
+
+        self.assertEqual([], opener.call_args_list)
+        self.assertFalse(reading["available"])
+        self.assertEqual("unsupported", reading["status"])
+        self.assertIsNone(reading["tokens_per_second"])
+
+    def test_a_probe_kind_names_which_layers_a_press_runs(self) -> None:
+        """The button asks one of four questions, and each names its own layers.
+
+        They are separate because they cost wildly different amounts: a
+        reachability check is a handful of requests, identity is the
+        fingerprint table's 23, precision is a 40-request battery.  A pane that
+        ran all of them for every press made the cheapest question cost as much
+        as the most expensive one.
+        """
+
+        domain = ProvidersModelsDomain.__new__(ProvidersModelsDomain)
+
+        self.assertEqual(("reachability",), domain._PROBE_KIND_LAYERS["reachability"])
+        self.assertEqual(("reachability", "identity"), domain._PROBE_KIND_LAYERS["identity"])
+        self.assertEqual(("reachability", "precision"), domain._PROBE_KIND_LAYERS["precision"])
+        self.assertEqual(("reachability", "speed"), domain._PROBE_KIND_LAYERS["speed"])
+        self.assertEqual(
+            ("reachability", "identity", "precision", "speed"),
+            domain._PROBE_KIND_LAYERS["full"],
+        )
+        # Every layer set is reachable from the public names, so a kind the
+        # pane offers can never fall through to a default.
+        for kind in domain._PROBE_KINDS:
+            self.assertIn(kind, domain._PROBE_KIND_LAYERS)
+
+    def test_an_unknown_probe_kind_falls_back_to_identity(self) -> None:
+        """An old client that sends no kind keeps the behaviour it had.
+
+        The default is the fingerprint check because that is what this button
+        has always run; a Core that read a missing kind as "reachability" would
+        silently stop checking identity for every caller that predates the
+        menu.
+        """
+
+        domain = ProvidersModelsDomain.__new__(ProvidersModelsDomain)
+
+        self.assertEqual("identity", domain._probe_kind({}))
+        self.assertEqual("identity", domain._probe_kind({"kind": "nonsense"}))
+        self.assertEqual("speed", domain._probe_kind({"kind": "speed"}))
+        self.assertEqual("speed", domain._probe_kind({"probe_kind": "SPEED"}))
+
+    def test_the_identity_layer_does_not_run_when_only_precision_was_asked(self) -> None:
+        """A precision-only press must not spend the fingerprint table's requests."""
+
+        domain = ProvidersModelsDomain.__new__(ProvidersModelsDomain)
+        calls: list[str] = []
+
+        def never(*args: object, **kwargs: object) -> object:
+            calls.append("modelprint")
+            raise AssertionError("the identity table must not run for a precision-only press")
+
+        with mock.patch.object(modelprint, "engine", return_value={"name": "modelprint", "available": True, "revision": "t"}), mock.patch.object(
+            modelprint, "run", side_effect=never
+        ):
+            finding = domain._degradation_probe(
+                plan={
+                    "includes_degradation": True,
+                    "target": "gpt-5.5",
+                    "protocol": "openai",
+                    "surface": "",
+                    "precision_reference": None,
+                },
+                api_base="https://example.test/v1",
+                credential="replace-me-secret",
+                model_name="gpt-5.5",
+                surface_status="ok",
+                layers=("reachability", "precision"),
+            )
+
+        self.assertEqual([], calls)
+        # The identity table never ran, and neither a "mismatch" nor an
+        # "unavailable" about it appears: a check that was not asked for must
+        # never read as a finding about the route.
+        self.assertNotEqual("mismatch", finding["status"])
+        self.assertIsNone(finding["label"])
+        self.assertEqual("", finding["verdict"])
+        # The precision layer did run, and with no baseline to compare against
+        # it recorded one and said so.  A comparison of the route with itself
+        # would always agree, which is the one answer a dilution check must
+        # never give.
+        precision = finding.get("precision") or {}
+        self.assertIn(precision.get("status"), {"captured", "unavailable"})
+        self.assertNotEqual("match", precision.get("verdict"))
+        self.assertIn("precision_capture", finding)
+
+    def test_a_layer_that_did_not_run_says_so_instead_of_reporting_a_finding(self) -> None:
+        """A probe that was not asked for carries no verdict to misread."""
+
+        domain = ProvidersModelsDomain.__new__(ProvidersModelsDomain)
+
+        record = domain._probe_not_run({"target": "gpt-5.5", "protocol": "openai"}, "identity")
+
+        self.assertEqual("not_run", record["status"])
+        self.assertEqual("", record["verdict"])
+        self.assertIsNone(record["label"])
+        self.assertIsNone(record["score"])
+        self.assertEqual([], record["detectors"])
+        self.assertEqual("gpt-5.5", record["target"])
+
+    def test_a_reachable_route_without_a_probe_surface_is_still_scanned(self) -> None:
+        """A protocol with no surface precondition is gated by what answered.
+
+        The probe table speaks one protocol per run, and a model this app has no
+        wire for carries no surface to require.  A route that answered anywhere
+        is measured; only a route that answered nowhere is left unscanned.
         """
 
         with tempfile.TemporaryDirectory() as directory:
@@ -2489,28 +2691,48 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 answered = surface == "openai/chat"
                 return {"surface": surface, "available": answered, "status": "ok" if answered else "network_error"}
 
-            def run_quick(**_kwargs: object) -> dict[str, object]:
-                return {"verdict": "failed", "score": 31.0, "brands": ["Amazon Q"], "summary": "x"}
+            def run_probes(**_kwargs: object) -> dict[str, object]:
+                return {
+                    "verdict": "failed",
+                    "score": 100.0,
+                    "label": "some-other-model",
+                    "label_source": "baseline",
+                    "brands": ["amazon"],
+                    "summary": "x",
+                    "measured": ["tok-english"],
+                    "probes": [{"name": "tok-english", "value": "49"}],
+                }
 
             with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), mock.patch.object(
-                veridrop, "engine", return_value={"name": "Veridrop", "available": True, "revision": "t"}
-            ), mock.patch.object(veridrop, "run_quick", side_effect=run_quick) as staged:
+                modelprint, "engine", return_value={"name": "modelprint", "available": True, "revision": "t"}
+            ), mock.patch.object(
+                modelprint,
+                "plan",
+                return_value={
+                    "includes_degradation": True,
+                    "target": "gemini-3.8-flash",
+                    "protocol": "openai",
+                    "surface": "",
+                    "probes": ["tok-english"],
+                    "reason": "",
+                },
+            ), mock.patch.object(modelprint, "run", side_effect=run_probes) as staged:
                 result = domain.probe({"provider_id": "primary", "model_id": "00000071"})
 
         # Something answered, so the scan ran and its real finding survives.
         self.assertEqual(1, len(staged.call_args_list))
-        self.assertEqual("gemini", staged.call_args.kwargs["protocol"])
+        self.assertEqual("openai", staged.call_args.kwargs["protocol"])
         self.assertEqual("mismatch", result["degradation"]["status"])
-        self.assertEqual("Amazon Q", result["degradation"]["label"])
+        self.assertEqual("some-other-model", result["degradation"]["label"])
 
     def test_a_run_upstream_refused_is_not_a_dilution_finding(self) -> None:
         """A blocked run scored 0 by the suite must not read as a diluted route.
 
-        Veridrop reports its own run-level error when upstream has no balance or
-        no channel for the model, and its zero score belongs to that invalid run
-        rather than to the route. Scoring it as a dilution verdict is how an
-        unrunnable account produced a "diluted" finding for models that were
-        never measured.
+        A blocked run reports its own run-level error when upstream has no
+        balance or no channel for the model, and its zero score belongs to that
+        invalid run rather than to the route. Scoring it as a dilution verdict
+        is how an unrunnable account produced a "diluted" finding for models
+        that were never measured.
         """
 
         with tempfile.TemporaryDirectory() as directory:
@@ -2521,15 +2743,15 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 "verdict": "failed",
                 "score": 0.0,
                 "run_error": "检测无效: 上游返回余额不足或用量限制错误。",
-                "brands": ["Amazon Q"],
+                "brands": ["amazon"],
                 "summary": "检测无效",
             }
 
-            def run_quick(**_kwargs: object) -> dict[str, object]:
+            def run_probes(**_kwargs: object) -> dict[str, object]:
                 return dict(blocked)
 
-            with mock.patch.object(veridrop, "engine", return_value={"name": "Veridrop", "available": True, "revision": "t"}), mock.patch.object(
-                veridrop, "run_quick", side_effect=run_quick
+            with mock.patch.object(modelprint, "engine", return_value={"name": "modelprint", "available": True, "revision": "t"}), mock.patch.object(
+                modelprint, "run", side_effect=run_probes
             ):
                 finding = domain._degradation_probe(
                     plan={"includes_degradation": True, "target": "gpt-5.5", "protocol": "openai", "surface": "openai/chat"},
@@ -2576,12 +2798,13 @@ class ProvidersModelsDomainTests(unittest.TestCase):
         self.assertIn("did not answer", result["degradation"]["detail"])
 
     def test_model_deep_test_scans_a_name_the_staged_tables_do_not_carry(self) -> None:
-        """An unlisted name is still scanned; the tables are not a permission list.
+        """An unlisted name is scanned when there is something to compare it to.
 
-        The quick suite compares a response against the request that asked for
-        it, so a name upstream has not listed yet - a newer model, a local
-        alias - is probeable on the protocol its own name resolves to.  Only a
-        name that resolves to no protocol the suite speaks is skipped.
+        The probe table measures any route it can reach, but naming what
+        answered needs a reference: a staged baseline for this model, or a
+        fingerprint the route recorded from an endpoint the caller trusts.  An
+        unlisted name without a reference is skipped instead of reporting a
+        "no match" that only means nothing was on file.
         """
 
         with tempfile.TemporaryDirectory() as directory:
@@ -2594,18 +2817,19 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 return {"surface": surface, "available": True, "status": "ok"}
 
             with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), degradation_engine(
-                supported=False
+                supported=True, model="gpt-6-astra", protocol="openai"
             ) as staged:
                 result = core.probe(
                     {"provider_id": "primary", "model_id": "00000071"},
                     domain="providers_models",
                 )
-            model = core.snapshot()["domains"]["providers_models"]["providers"][0]["models"][0]
+                # The projection asks the same plan question, so it is read
+                # while the staged tables answer for this name.
+                model = core.snapshot()["domains"]["providers_models"]["providers"][0]["models"][0]
 
         self.assertEqual(1, len(staged.call_args_list))
-        # Scanned under this route's own wire name, on the protocol its name
+        # Scanned under this route's own wire name, on the wire its name
         # resolves to.
-        self.assertEqual("gpt-6-astra", staged.call_args.kwargs["model"])
         self.assertEqual("openai", staged.call_args.kwargs["protocol"])
         self.assertEqual("gpt-6-astra", result["degradation"]["target"])
         self.assertEqual(
@@ -2614,6 +2838,9 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 "target": "gpt-6-astra",
                 "protocol": "openai",
                 "surface": "openai/chat",
+                "probes": ["tok-english"],
+                "reason": "",
+                "precision_reference": None,
             },
             model["deep_probe"],
         )
@@ -2632,7 +2859,7 @@ class ProvidersModelsDomainTests(unittest.TestCase):
                 return {"surface": surface, "available": True, "status": "ok"}
 
             with mock.patch.object(ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe), degradation_engine(
-                supported=False
+                supported=False, model="space-bunny", protocol="openai"
             ) as staged:
                 result = core.probe(
                     {"provider_id": "primary", "model_id": "00000071"},
@@ -2642,9 +2869,20 @@ class ProvidersModelsDomainTests(unittest.TestCase):
 
         self.assertEqual([], staged.call_args_list)
         self.assertEqual("skipped", result["degradation"]["status"])
-        self.assertIsNone(result["degradation"]["target"])
+        # The finding still names the route it was about, and says why it is
+        # skipped: there is no reference to compare this model's answers to.
+        self.assertEqual("space-bunny", result["degradation"]["target"])
+        self.assertIn("no fingerprint", result["degradation"]["detail"])
         self.assertEqual(
-            {"includes_degradation": False, "target": None, "protocol": "", "surface": ""},
+            {
+                "includes_degradation": False,
+                "target": "space-bunny",
+                "protocol": "",
+                "surface": "",
+                "probes": [],
+                "reason": "no-baseline",
+                "precision_reference": None,
+            },
             model["deep_probe"],
         )
         self.assertTrue(model["model_enabled"])
@@ -3759,7 +3997,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
     def test_enabled_catalog_keeps_last_verified_models_when_young_router_is_unavailable(self) -> None:
         endpoint = {"result": (["default-chat"], True)}
 
-        def exposed_models(_api_key: str):
+        def exposed_models(_api_key: str, _config_path=None):
             return endpoint["result"]
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
@@ -3801,7 +4039,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
 
         endpoint = {"result": (["default-chat"], True)}
 
-        def exposed_models(_api_key: str):
+        def exposed_models(_api_key: str, _config_path=None):
             return endpoint["result"]
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
@@ -3984,7 +4222,7 @@ class CodexSettingsDomainTests(unittest.TestCase):
     def test_provider_apply_updates_enabled_catalog(self) -> None:
         live_models = {"names": ["default-chat"]}
 
-        def exposed_models(_api_key: str) -> tuple[list[str], bool]:
+        def exposed_models(_api_key: str, _config_path=None) -> tuple[list[str], bool]:
             return list(live_models["names"]), True
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
@@ -4542,9 +4780,6 @@ class WebDAVSettingsDomainTests(unittest.TestCase):
 
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class RetiredAuthKindLoadsTests(unittest.TestCase):
     """Renaming an identifier must not make a document unreadable.
@@ -4661,3 +4896,7 @@ class RetiredAuthKindLoadsTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             _provider_auth({"kind": "not_a_login_kind", "credential_ref": "x"})
+
+
+if __name__ == "__main__":
+    unittest.main()

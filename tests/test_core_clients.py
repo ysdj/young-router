@@ -329,8 +329,8 @@ class ClientFilesDomainTests(unittest.TestCase):
             )
             self.assertEqual(document + "\n", staged["text"])
 
-    def test_a_document_past_the_editor_budget_names_its_size(self) -> None:
-        """A refusal states the document's size instead of blaming the Core."""
+    def test_a_document_past_the_editor_budget_is_refused_with_the_core_code(self) -> None:
+        """Reading and staging both answer with the Core's own ``editor_too_large`` code."""
 
         with tempfile.TemporaryDirectory() as directory:
             environment = _client_environment(directory)

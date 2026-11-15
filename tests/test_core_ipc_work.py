@@ -32,7 +32,6 @@ from ipc_work_ledger import (
     PROVIDER_RELOAD,
     PROVIDER_SAVE,
     PROVIDER_SNAPSHOT,
-    READ_PROVIDER_DOCUMENT,
     WorkLedger,
     work_ledger,
 )
@@ -104,8 +103,12 @@ class WorkLedgerTests(unittest.TestCase):
         self.assertIs(CoreStore.snapshot, original)
 
 
-class OperationWorkTests(unittest.TestCase):
-    """Drive one Core the way the settings shell drives it."""
+class _CoreWorkFixture:
+    """Build the Core the settings shell talks to.
+
+    Held apart from ``unittest.TestCase`` so the regression probes below can
+    borrow the fixture without also inheriting -- and re-running -- every test.
+    """
 
     def setUp(self) -> None:
         self._directory = tempfile.TemporaryDirectory()
@@ -192,6 +195,10 @@ class OperationWorkTests(unittest.TestCase):
                 f"{operation} derived one input through {seam} {worst} times"
                 f" (limit {allowed}){detail}",
             )
+
+
+class OperationWorkTests(_CoreWorkFixture, unittest.TestCase):
+    """Drive one Core the way the settings shell drives it."""
 
     def test_a_window_refresh_derives_no_domain_state(self) -> None:
         """The most-called method must be the cheapest one."""
@@ -327,7 +334,7 @@ class OperationWorkTests(unittest.TestCase):
                     )
 
 
-class LedgerCatchesRegressionsTests(OperationWorkTests):
+class LedgerCatchesRegressionsTests(_CoreWorkFixture, unittest.TestCase):
     """The instrument must fail on the defects it was written for.
 
     An instrument nobody has seen fail is indistinguishable from one that cannot

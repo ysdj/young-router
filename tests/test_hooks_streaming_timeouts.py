@@ -23,31 +23,6 @@ class HookStreamingTimeoutTests(HookTestCase):
 
         proxy_server.llm_router = FakeRouter()
 
-        async def codex_stream(has_reasoning: bool) -> list[dict]:
-            input_items = [{"role": "user", "content": "continue"}]
-            if has_reasoning:
-                input_items.append(
-                    {
-                        "type": "reasoning",
-                        "summary": [],
-                        "encrypted_content": "opaque-reasoning",
-                    }
-                )
-            stream = await hooks._responses_chat_bridge_direct_stream_response(
-                {
-                    "model": "default-chat",
-                    "input": input_items,
-                    "stream": True,
-                    "client_metadata": {
-                        "x-codex-turn-metadata": '{"request_kind":"turn"}',
-                    },
-                    "model_info": {
-                        "upstream_url_surface": "openai/chat",
-                    },
-                }
-            )
-            return [jsonable_stream_chunk(chunk) async for chunk in stream]
-
         async def repaired_response(**_kwargs):
             return {
                 "id": "resp_repaired",
@@ -254,6 +229,9 @@ class HookStreamingTimeoutTests(HookTestCase):
         )
         self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.01")
         self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "1")
+        # The first chunk arrives later than this ordinary first-event budget;
+        # only the compaction budget above can let it through.
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "0.01")
         request_data = {
             "model": "default-chat",
             "input": [
@@ -833,9 +811,11 @@ class HookStreamingTimeoutTests(HookTestCase):
 
         async def original_stream():
             yield {"type": "response.created", "response": {"id": "resp-original"}}
-            await asyncio.sleep(0.01)
-            yield {"type": "response.output_text.delta", "delta": "hello"}
-            await asyncio.sleep(0.01)
+            # Each gap stays under the idle budget while the whole stream
+            # outlasts it, so only a per-chunk reset keeps the turn alive.
+            for _ in range(4):
+                await asyncio.sleep(0.02)
+                yield {"type": "response.output_text.delta", "delta": "hello"}
             yield {"type": "response.completed", "response": {"id": "resp-original"}}
 
         request_data = {
@@ -860,6 +840,9 @@ class HookStreamingTimeoutTests(HookTestCase):
                 "response.created",
                 "response.in_progress",
                 "response.output_text.delta",
+                "response.output_text.delta",
+                "response.output_text.delta",
+                "response.output_text.delta",
                 "response.completed",
             ],
         )
@@ -872,8 +855,14 @@ class HookStreamingTimeoutTests(HookTestCase):
         calls = []
 
         async def original_stream():
+            yield {"type": "response.created", "response": {"id": "resp-original"}}
+            # Each gap stays under the idle budget while the whole thinking
+            # run outlasts it, so only a reasoning reset keeps the turn alive.
+            await asyncio.sleep(0.03)
             yield {"type": "response.reasoning_text.delta", "delta": "internal thinking"}
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.03)
+            yield {"type": "response.reasoning_text.delta", "delta": "still thinking"}
+            await asyncio.sleep(0.03)
             yield {"type": "response.output_text.delta", "delta": "visible later"}
             yield {"type": "response.completed", "response": {"id": "resp-original"}}
 
@@ -884,7 +873,7 @@ class HookStreamingTimeoutTests(HookTestCase):
 
         proxy_server.llm_router = FakeRouter()
         hook = hooks.YoungRouterHook()
-        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "1")
+        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.05")
 
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "recent-requests.jsonl"
@@ -2023,3 +2012,165 @@ class HookStreamingTimeoutTests(HookTestCase):
         hooks._request_replay_payload_bytes(bare)
         self.assertNotIn(cached_key, bare)
         self.assertIsNone(hooks._request_replay_payload_bytes({"model": "default-chat"}))
+
+    async def test_the_dispatch_budget_ends_an_attempt_no_stream_budget_covers(self) -> None:
+        """The phase before the response object now has a budget of its own.
+
+        Measured on the live gateway 2026-11-15: a route whose host stopped
+        answering held a turn for 271 s, because the first-event and stream-idle
+        clocks both start on the first frame of a response that host never sent.
+        What ran out was the kernel's SYN ladder and LiteLLM's own retry.
+        """
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "0.2")
+        self.addCleanup(
+            self.set_env, hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, None
+        )
+        request = {"model": "default-chat", "input": "hi", "stream": True}
+
+        async def never_reaches_the_host():
+            await hooks.asyncio.sleep(30)
+
+        with self.assertRaises(TimeoutError) as raised:
+            await hooks._await_upstream_dispatch(
+                never_reaches_the_host(),
+                request,
+            )
+
+        body = getattr(raised.exception, "body", {})
+        self.assertEqual("stream_start_timeout", body.get("reason"))
+        self.assertFalse(body.get("saw_chunk"))
+        # The route answered with nothing, so a sibling may serve the same
+        # bytes and the route is parked -- the two decisions this shape carries.
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(raised.exception),
+            hooks._RECOVERY_POLICY_COOLDOWN,
+        )
+
+    async def test_the_dispatch_budget_leaves_a_finished_attempt_alone(self) -> None:
+        hooks, _ = load_hook_module()
+        request = {"model": "default-chat", "input": "hi", "stream": True}
+
+        async def answers_immediately():
+            return "response-object"
+
+        self.assertEqual(
+            "response-object",
+            await hooks._await_upstream_dispatch(answers_immediately(), request),
+        )
+
+    async def test_an_upstream_timeout_keeps_its_own_reason(self) -> None:
+        """``asyncio.TimeoutError`` is the builtin one since 3.11.
+
+        A route that raised its own ``TimeoutError`` must keep that failure and
+        its route identity; rewriting it into this proxy's silence is how a real
+        cause disappears from the log (measured on the first draft of this
+        budget, which used ``wait_for``).
+        """
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "5")
+        self.addCleanup(
+            self.set_env, hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, None
+        )
+        request = {"model": "default-chat", "input": "hi", "stream": True}
+
+        async def upstream_refused():
+            exc = TimeoutError("upstream said nothing for its own 30s")
+            exc.body = {"reason": "upstream_own_reason"}
+            raise exc
+
+        with self.assertRaises(TimeoutError) as raised:
+            await hooks._await_upstream_dispatch(upstream_refused(), request)
+
+        self.assertEqual("upstream_own_reason", getattr(raised.exception, "body", {}).get("reason"))
+        self.assertEqual("upstream said nothing for its own 30s", str(raised.exception))
+
+    async def test_the_dispatch_budget_keeps_the_selected_route_visible(self) -> None:
+        """The budget must not move the attempt into a child task.
+
+        A new task gets a copy of the context, so every ``ContextVar`` write the
+        attempt makes would stay inside it -- and this proxy keeps the route that
+        answered in one.  A copy turns "route-peer answered" into "no route
+        identity", losing the log row, the cooldown key and the delivery marker
+        together.
+        """
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "5")
+        self.addCleanup(
+            self.set_env, hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, None
+        )
+        request = {"model": "default-chat", "input": "hi", "stream": True}
+        box: dict = {}
+
+        async def answers_from_one_route():
+            hooks._CURRENT_SELECTED_DEPLOYMENT_BOX.set(box)
+            box["deployment_id"] = "route-peer"
+            return "response-object"
+
+        await hooks._await_upstream_dispatch(answers_from_one_route(), request)
+
+        self.assertEqual(
+            {"deployment_id": "route-peer"},
+            hooks._CURRENT_SELECTED_DEPLOYMENT_BOX.get(),
+        )
+
+    def test_the_dispatch_budget_widens_for_the_bytes_a_request_carries(self) -> None:
+        """A heavy replay has to travel before a header can come back.
+
+        The allowance is one megabyte per second, far below any link this proxy
+        runs on, so it only ever rescues an upload: an absent host accepts no
+        bytes and pays the bare connect budget.
+        """
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "10")
+        self.addCleanup(
+            self.set_env, hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, None
+        )
+
+        small = hooks._upstream_dispatch_budget_seconds({"input": "hi"})
+        heavy = hooks._upstream_dispatch_budget_seconds(
+            {"input": [{"role": "user", "content": "x" * 3_000_000}]}
+        )
+
+        self.assertAlmostEqual(10.0, small, places=2)
+        self.assertGreater(heavy, 12.0)
+        self.assertLess(heavy, 20.0)
+
+        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "0")
+        self.assertEqual(
+            0.0, hooks._upstream_dispatch_budget_seconds({"input": "hi"})
+        )
+
+    def test_a_chat_body_earns_the_same_upload_allowance(self) -> None:
+        """A Claude-sized ``messages`` history is an upload like any other.
+
+        The dispatch budget is the connect budget plus one megabyte per second
+        of body, and it used to be computed from ``input`` alone -- so every
+        Chat-shaped request paid the bare budget no matter how much history it
+        carried.  The bridge sends Chat shapes, and so does a plain
+        ``/v1/chat/completions`` client of this gateway.
+        """
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "10")
+        self.addCleanup(
+            self.set_env, hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, None
+        )
+
+        small = hooks._upstream_dispatch_budget_seconds(
+            {"messages": [{"role": "user", "content": "hi"}]}
+        )
+        heavy = hooks._upstream_dispatch_budget_seconds(
+            {"messages": [{"role": "user", "content": "x" * 3_000_000}]}
+        )
+        responses_heavy = hooks._upstream_dispatch_budget_seconds(
+            {"input": "x" * 3_000_000}
+        )
+
+        self.assertAlmostEqual(10.0, small, places=2)
+        self.assertGreater(heavy, 12.0)
+        self.assertAlmostEqual(heavy, responses_heavy, places=1)

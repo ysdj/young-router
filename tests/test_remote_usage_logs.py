@@ -134,6 +134,36 @@ class RemoteUsageLogsTests(unittest.TestCase):
                       api_key_name: default
                       upstream_url_surface: openai/responses
                       supported_upstream_url_surfaces: [openai/responses]
+                  - model_name: default-chat-2
+                    litellm_params:
+                      model: openai/default-chat-2
+                      api_base: https://relay.example.test/v1
+                    model_info:
+                      id: b2c3d4e5
+                      provider: relay
+                      api_key_name: default
+                      upstream_url_surface: openai/responses
+                      supported_upstream_url_surfaces: [openai/responses]
+                  - model_name: default-chat-3
+                    litellm_params:
+                      model: openai/default-chat-3
+                      api_base: https://relay.example.test/v1
+                    model_info:
+                      id: c3d4e5f6
+                      provider: relay
+                      api_key_name: default
+                      upstream_url_surface: openai/responses
+                      supported_upstream_url_surfaces: [openai/responses]
+                  - model_name: default-chat-4
+                    litellm_params:
+                      model: openai/default-chat-4
+                      api_base: https://relay.example.test/v1
+                    model_info:
+                      id: d4e5f6a7
+                      provider: relay
+                      api_key_name: default
+                      upstream_url_surface: openai/responses
+                      supported_upstream_url_surfaces: [openai/responses]
                 """
             ).lstrip(),
             encoding="utf-8",
@@ -251,14 +281,33 @@ class RemoteUsageLogsTests(unittest.TestCase):
         )
 
     def test_keys_of_one_account_are_one_target(self) -> None:
-        path = self.write_config()
+        path = self.write_signed_in_config()
 
         # Four routes reaching the same control plane are one relay to read.
         sources = remote_usage_logs.usage_sources(path)
 
         self.assertEqual(1, len(sources))
         target = remote_usage_logs.active_usage_targets(path)[0]
-        self.assertEqual(1, len(target.credentials()))
+        # The login is the read scope, and it answers through its session: a
+        # route's key is a fallback for a station whose dashboard cannot be
+        # asked, never a second entry in the dropdown.
+        self.assertEqual("login-test", target.account_id)
+        self.assertTrue(target.headers())
+
+    def test_a_known_account_without_a_session_stays_selectable_but_unavailable(self) -> None:
+        """The source row lets the user recover the login instead of vanishing."""
+
+        path = self.write_config()
+        self.write_relay_station(path, "https://relay.example.test", account_id="login-test")
+        document = Path(path).parent / ".litellm-runtime" / "relay-accounts.json"
+        payload = json.loads(document.read_text(encoding="utf-8"))
+        payload["accounts"][0]["session"] = {}
+        document.write_text(json.dumps(payload), encoding="utf-8")
+
+        sources = remote_usage_logs.usage_sources(path)
+        self.assertEqual(1, len(sources))
+        self.assertFalse(sources[0]["available"])
+        self.assertEqual({}, remote_usage_logs.active_usage_targets(path)[0].headers())
 
     def test_one_station_with_two_accounts_is_two_targets(self) -> None:
         """A station's logins are separate read scopes, not one history.
@@ -285,7 +334,9 @@ class RemoteUsageLogsTests(unittest.TestCase):
         self.assertEqual("relay", targets[0].provider)
         self.assertIn("login-a", targets[0].display())
 
-    def test_a_stations_other_credentials_are_kept_as_fallbacks(self) -> None:
+    def test_a_stations_keys_are_not_a_read_scope_of_their_own(self) -> None:
+        # The read scope is a login, so the station needs one for its keys to
+        # belong to a target at all; the second key stays this login's fallback.
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         path = Path(directory.name) / "config.yaml"
@@ -321,28 +372,26 @@ class RemoteUsageLogsTests(unittest.TestCase):
             ).lstrip(),
             encoding="utf-8",
         )
-        self.write_relay_station(path, "https://relay.example.test")
+        self.write_relay_station(path, "https://relay.example.test", account_id="login-test")
 
         target = remote_usage_logs.active_usage_targets(path)[0]
 
-        self.assertEqual("replace-me-first", target.api_key)
-        # Both keys were pasted by hand, so neither belongs to a relay account:
-        # they stay one target's credentials instead of one target per key.
-        self.assertEqual("", target.account_id)
-        self.assertEqual(("replace-me-second",), target.fallback_keys)
-        self.assertEqual(
-            ("replace-me-first", "replace-me-second"),
-            target.credentials(),
-        )
+        # The login reads through its session.  The station's hand-pasted keys
+        # name no login and can never answer the ledger, so they do not become
+        # a dropdown entry of their own.
+        self.assertEqual("login-test", target.account_id)
+        self.assertTrue(target.headers())
+        self.assertEqual([], remote_usage_logs.active_usage_targets(path)[1:])
 
     def test_usage_sources_name_each_relay_without_exposing_a_credential(self) -> None:
-        path = self.write_config()
+        path = self.write_signed_in_config()
 
         sources = remote_usage_logs.usage_sources(path)
 
-        # The dropdown names the relay by the name the user gave the station,
-        # never by its URL and never by the credential.
-        self.assertEqual(["relay"], [source["label"] for source in sources])
+        # The dropdown names the relay by the name the user gave the station
+        # and the login the rows belong to, never by its URL and never by the
+        # credential.
+        self.assertEqual(["relay · tester"], [source["label"] for source in sources])
         self.assertTrue(sources[0]["id"])
         self.assertNotIn("replace-me", sources[0]["id"])
 
@@ -794,6 +843,19 @@ class RemoteUsageLogsTests(unittest.TestCase):
         self.assertEqual([], records)
         self.assertEqual(remote_usage_logs.USAGE_REASON_LOGIN_EXPIRED, reason)
 
+    def test_a_200_session_refusal_envelope_is_login_expired(self) -> None:
+        target = self._session_target()
+
+        def opener(request, timeout):
+            return FakeResponse({"success": False, "message": "未登录或登录已过期"})
+
+        with patch("young_router.core.remote_usage_logs.isolated_http_opener") as opener_factory:
+            opener_factory.return_value.open.side_effect = opener
+            _kind, records, reason, _total, _applied = remote_usage_logs.fetch_target(target, 1)
+
+        self.assertEqual([], records)
+        self.assertEqual(remote_usage_logs.USAGE_REASON_LOGIN_EXPIRED, reason)
+
     def test_a_sub2api_account_reads_its_per_request_ledger_not_the_summary(self) -> None:
         """The ledger is the only shape that can fill a log table.
 
@@ -1172,7 +1234,18 @@ class RemoteUsageLogsTests(unittest.TestCase):
                             "type": "newapi",
                         }
                     ],
-                    "accounts": [],
+                    "accounts": [
+                        {
+                            "id": "login-relay",
+                            "station_id": "station-relay",
+                            "type": "newapi",
+                            "label": "tester",
+                            "origin": "https://relay.example.test",
+                            "username": "tester@example.test",
+                            "session": {"access_token": "session-token"},
+                            "resources": [],
+                        }
+                    ],
                     "pending_credential_cleanups": [],
                 }
             ),
@@ -1181,7 +1254,7 @@ class RemoteUsageLogsTests(unittest.TestCase):
 
         sources = remote_usage_logs.usage_sources(path)
 
-        self.assertEqual(["relay"], [source["label"] for source in sources])
+        self.assertEqual(["relay · tester"], [source["label"] for source in sources])
 
 
 if __name__ == "__main__":

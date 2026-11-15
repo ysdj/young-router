@@ -115,6 +115,18 @@ assert.deepEqual(
   "the added route is not in the provider it names",
 );
 assert.equal(added.domains.providers_models.provider_count, 1);
+
+// Adapter prefixes are presentation syntax, but slash-bearing upstream ids are
+// real ids and must survive the compact summary path unchanged.
+const slashModel = model("slash-route", { upstream_model: "openrouter/free", litellm_model: "openrouter/free" });
+const slashProvider = { ...provider, models: [slashModel] };
+const slashSnapshot = snapshotAt(12, [slashProvider]);
+assert.equal(slashSnapshot.domains.providers_models.providers[0].models[0].upstream_model, "openrouter/free");
+const slashPatch = applyPatch(slashSnapshot, patch(12, [
+  { domain: "providers_models", kind: "upsert", id: "provider:primary", value: slashProvider },
+]));
+assert.equal(slashPatch.providers_models.providers[0].models[0].upstream_model, "openrouter/free");
+
 assert.deepEqual(
   added.providers_models.providers.map((row) => [row.id, row.model_count]),
   [["provider-primary", 2]],
@@ -289,7 +301,10 @@ assert.deepEqual([providerNotifications, runtimeNotifications], [2, 2], "the mov
 assert.equal(getDomain("providers_models"), added.domains.providers_models, "the store did not keep the domain reference");
 unsubscribeProviders();
 unsubscribeRuntime();
-publishSnapshot(base);
+// A publish older than the state the store holds is dropped before the listener
+// loop runs, so this one has to be newer and move both domains for the
+// assertion below to mean anything.
+publishSnapshot({ ...base, revision: 9, domains: { ...base.domains, providers_models: { ...base.domains.providers_models }, runtime: { domain: "runtime", revision: 10 } } });
 assert.deepEqual([providerNotifications, runtimeNotifications], [2, 2], "an unsubscribed listener was still called");
 
 // ---------------------------------------------------------------------------

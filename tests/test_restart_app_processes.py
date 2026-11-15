@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shlex
 import signal
 import subprocess
 import tempfile
@@ -60,20 +59,6 @@ class AppProcessesTests(unittest.TestCase):
 
     def stop(self, *pids: int) -> subprocess.CompletedProcess:
         return self.helper("stop", *(str(pid) for pid in pids))
-
-    def interpreter(self) -> Path:
-        """The bundle's interpreter path, as the Core and the launcher use it.
-
-        A symlink to the system shell, not a copy: what the helper reads is the
-        command line, and a real interpreter would only add startup cost.
-        """
-
-        directory = self.app / "Contents" / "Resources" / "Core" / "runtime" / "python" / "bin"
-        directory.mkdir(parents=True, exist_ok=True)
-        python = directory / "python3.12"
-        if not python.exists():
-            python.symlink_to("/bin/sh")
-        return python
 
     def alive(self, *pids: int) -> list[int]:
         result = self.helper("alive", *(str(pid) for pid in pids))

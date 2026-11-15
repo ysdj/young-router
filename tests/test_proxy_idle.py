@@ -225,9 +225,6 @@ class UvicornSupervisorHealthcheckTests(unittest.TestCase):
             self.assertTrue(getattr(worker, proxy_idle._TEARDOWN_ATTR, False))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class UvicornShutdownMarkerTests(unittest.TestCase):
     """The proxy's own teardown must be visible to the routing classifiers."""
@@ -390,3 +387,7 @@ class UvicornShutdownMarkerTests(unittest.TestCase):
         asyncio.run(uvicorn.server.Server.shutdown(self.server))
 
         self.assertFalse(streaming.transport.aborted)
+
+
+if __name__ == "__main__":
+    unittest.main()

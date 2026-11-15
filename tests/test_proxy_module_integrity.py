@@ -24,6 +24,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "young_router"
+CLIENT = ROOT / "rn"
+
+# Installed dependencies and staging output repeat third-party text; a copy of
+# the sentence inside one of them says nothing about the sources edited here.
+CLIENT_SKIP_DIRS = frozenset({"node_modules", "vendor", ".staging-cache"})
 
 
 def _parsed_files():
@@ -48,8 +53,13 @@ class ProxyModuleIntegrityTests(unittest.TestCase):
         """
 
         banned = "failed before a final assistant response"
+        sources = list(PACKAGE.rglob("*.py"))
+        for pattern in ("*.ts", "*.tsx", "*.js"):
+            sources.extend(
+                path for path in CLIENT.rglob(pattern) if CLIENT_SKIP_DIRS.isdisjoint(path.parts)
+            )
         offenders = []
-        for path in sorted(PACKAGE.rglob("*.py")):
+        for path in sorted(sources):
             text = path.read_text(encoding="utf-8", errors="replace").lower()
             if banned in text:
                 offenders.append(str(path.relative_to(ROOT)))

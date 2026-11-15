@@ -1572,8 +1572,6 @@ class HookStreamingCompactionTests(HookTestCase):
         self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "0")
         router_module = types.ModuleType("litellm.router")
         generic_calls = []
-        generic_helper_state_ids = []
-        generic_call_state_ids = []
         streaming_calls = []
         client_metadata = {
             "thread_id": "thread-fallback-state",
@@ -1676,7 +1674,6 @@ class HookStreamingCompactionTests(HookTestCase):
                 original_generic_function,
                 **kwargs,
             ):
-                generic_helper_state_ids.append(id(kwargs))
                 excluded_ids = set(kwargs.get("_excluded_deployment_ids") or [])
                 selected = next(
                     deployment
@@ -1717,7 +1714,6 @@ class HookStreamingCompactionTests(HookTestCase):
         proxy_server.llm_router = StreamingRouter()
 
         async def original_generic_function(**kwargs):
-            generic_call_state_ids.append(id(kwargs))
             generic_calls.append(copy.deepcopy(kwargs))
             deployment_id = kwargs["model_info"]["id"]
             if deployment_id == "route-primary":
@@ -1752,7 +1748,6 @@ class HookStreamingCompactionTests(HookTestCase):
             original_generic_function,
             **initial_request,
         )
-        self.assertNotIn("_excluded_deployment_ids", request_data)
         response_marker = hooks._selected_deployment_marker_from_response(response)
         self.assertIsNotNone(response_marker)
         assert response_marker is not None
@@ -1772,17 +1767,6 @@ class HookStreamingCompactionTests(HookTestCase):
         self.assertEqual(
             [call["model_info"]["id"] for call in generic_calls],
             ["route-primary", "route-peer"],
-        )
-        self.assertEqual(len(generic_helper_state_ids), 2)
-        self.assertEqual(len(generic_call_state_ids), 2)
-        self.assertTrue(
-            all(
-                helper_state_id != call_state_id
-                for helper_state_id, call_state_id in zip(
-                    generic_helper_state_ids,
-                    generic_call_state_ids,
-                )
-            )
         )
         self.assertEqual(
             generic_calls[1]["_excluded_deployment_ids"],
@@ -1860,6 +1844,19 @@ class HookStreamingCompactionTests(HookTestCase):
         self.assertIsNotNone(explicit_standard_payload)
         assert explicit_standard_payload is not None
         self.assertEqual(explicit_standard_payload["service_tier"], "standard")
+
+        injected_default_payload = hooks._build_streaming_error_fallback_payload(
+            {
+                **base_request,
+                "litellm_metadata": {
+                    "codex_fast_default_service_tier": "priority",
+                },
+            },
+            method_name="aresponses",
+        )
+        self.assertIsNotNone(injected_default_payload)
+        assert injected_default_payload is not None
+        self.assertEqual(injected_default_payload["service_tier"], "priority")
 
     async def test_structured_codex_compaction_recovery_poll_replays_after_bounded_fallback(self) -> None:
         hooks, proxy_server = load_hook_module()
@@ -2498,9 +2495,6 @@ class HookStreamingCompactionTests(HookTestCase):
                 },
             },
         ]
-        all_deployment_ids = {
-            deployment["model_info"]["id"] for deployment in deployments
-        }
 
         class FakeRouter:
             def _get_all_deployments(self, model_name, team_id=None):

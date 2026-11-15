@@ -144,9 +144,12 @@ class WorkLedger:
         memo = _MEMO_STATE.get(attribute) if worked else None
 
         def counted(*args: Any, **kwargs: Any) -> Any:
-            before = memo(target) if memo is not None else None
+            # The memo lives on the instance while the wrapper replaces a
+            # method on the class, so the state is read through the receiver.
+            subject = args[0] if args else target
+            before = memo(subject) if memo is not None else None
             outcome = original(*args, **kwargs)
-            if memo is None or memo(target) != before:
+            if memo is None or memo(subject) != before:
                 self.record(seam, key(*args, **kwargs) if key else None)
             return outcome
 
@@ -167,6 +170,7 @@ class WorkLedger:
 def work_ledger() -> Iterator[WorkLedger]:
     """Instrument one Core's seams, then remove every wrapper again."""
 
+    from young_router.config import api as config_api
     from young_router.config import schema as config_schema
     from young_router.core import codex_config
     from young_router.core.domains.providers_models import ProvidersModelsDomain
@@ -193,6 +197,7 @@ def work_ledger() -> Iterator[WorkLedger]:
         ledger.wrap(EMIT_EVENT, CoreStore, "_emit")
         ledger.wrap(PROVIDER_SNAPSHOT, ProvidersModelsDomain, "snapshot")
         ledger.wrap(PROVIDER_RELOAD, ProvidersModelsDomain, "reload")
+        ledger.wrap(PROVIDER_SAVE, config_api, "save_config")
         ledger.wrap(CATALOG_ROUTE_INDEX, ModelContextRegistry, "_route_index", worked=True)
         ledger.wrap(CATALOG_IMAGE_LOOKUP, ModelContextRegistry, "image_metadata_for_model_id")
         ledger.wrap(HEALTH_PROBE, CoreServiceController, "_health")

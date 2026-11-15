@@ -296,7 +296,7 @@ class ModelListingEffortsTests(HookTestCase):
             builder("space-bunny")["supported_efforts"],
         )
 
-    def test_a_relay_model_publishes_the_ladder_its_copies_agree_on(self) -> None:
+    def test_a_relay_model_publishes_the_ladder_most_of_its_copies_serve(self) -> None:
         """Every provider that serves the model is a copy, not the route's rule.
 
         The route is ``deepseek-v4.1-flash`` behind relays, so its deployment
@@ -305,6 +305,9 @@ class ModelListingEffortsTests(HookTestCase):
         be written first maps ``low`` to ``null``; reading it as the route's own
         ladder reported ``off,high,max,ultra`` while the vendor's entry for the
         same model serves ``low`` through ``max`` and the request path maps it.
+        Copies are merged by majority, so one copy's ``null`` only vetoes a
+        level the copies are split on; a route's own deployments are
+        intersected instead, which is what the sibling test above asserts.
         """
 
         hooks, _ = load_hook_module()

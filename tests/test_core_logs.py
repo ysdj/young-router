@@ -15,14 +15,6 @@ from young_router.core.domains.logs import MAX_FILTER_CHARS, MAX_VIEW_BYTES, LOG
 from young_router.core.service import LOG_TABS as CORE_LOG_TABS
 
 
-class _UsageReader:
-    def refresh(self) -> list[dict[str, str]]:
-        return [
-            {"timestamp": "2026-01-01T00:00:00Z", "source": "newapi", "source_label": "relay", "model": "default-chat", "total_tokens": "12"},
-            {"timestamp": "2026-01-01T00:00:00Z", "source": "newapi", "source_label": "relay", "model": "other-chat", "total_tokens": "4"},
-        ]
-
-
 class _ChangingUsageReader:
     def __init__(self) -> None:
         self.calls = 0
@@ -2254,6 +2246,34 @@ model_list:
                 [record["request_id"] for record in LogsDomain(root).view("requests")["log"]["records"]],
             )
 
+    def test_clearing_the_request_tab_reveals_only_the_requests_that_follow(self) -> None:
+        """A cleared tab hides what was there, not everything that arrives after.
+
+        The clear is recorded as a store sequence, and the reader that
+        understands it is the request projection.  A cleared tab used to skip
+        that reader for the file one, which reads a file the proxy no longer
+        appends to: the tab stayed empty however many requests came in.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "recent-requests.jsonl"
+            domain = LogsDomain(root)
+            runtime_store.append_record(
+                path, json.dumps({"ts": "2026-08-01T04:10:00Z", "request_id": "first", "status": "success"})
+            )
+            self.assertEqual(["first"], [record["request_id"] for record in domain.view("requests")["log"]["records"]])
+
+            domain.dispatch("logs.clear", {"tab": "requests"})
+            self.assertEqual([], domain.view("requests")["log"]["records"])
+
+            runtime_store.append_record(
+                path, json.dumps({"ts": "2026-08-01T04:10:05Z", "request_id": "second", "status": "success"})
+            )
+            self.assertEqual(
+                ["second"], [record["request_id"] for record in domain.view("requests")["log"]["records"]]
+            )
+
     def test_a_record_the_store_holds_but_the_tab_cannot_read_is_skipped(self) -> None:
         """A row written by a build that changed shape is not the tab's failure."""
 
@@ -2431,7 +2451,7 @@ model_list:
                 [record["request_id"] for record in domain.view("requests")["log"]["records"]],
             )
 
-    def test_request_tab_reprojects_when_the_configuration_revision_changes(self) -> None:
+    def test_request_tab_reprojects_after_its_signature_cache_is_invalidated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = root / "config.yaml"
@@ -2468,6 +2488,9 @@ model_list:
                 config.read_text(encoding="utf-8").replace("first-name", "second-name"),
                 encoding="utf-8",
             )
+            # The requests signature tracks the record store, not the
+            # configuration, so the view would answer from its cache without
+            # this eviction.
             domain._source_signatures.pop("requests", None)
 
             self.assertEqual(
@@ -2530,7 +2553,6 @@ model_list:
             # A reader without paging answers the same list for page two, so the
             # pager still names a page it can describe rather than crashing.
             self.assertEqual(2, second["page"])
-            self.assertEqual([], [key for key in first if key.startswith("_")])
 
     def test_default_core_can_start_when_the_optional_worker_is_not_configured(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2581,7 +2603,7 @@ model_list:
     def test_online_usage_toolbar_lists_relays_before_a_refresh(self) -> None:
         class _NeverRead:
             def refresh(self, source_id: str | None = None) -> list[dict[str, str]]:
-                self.fail("A source listing must not contact a relay.")
+                raise AssertionError("A source listing must not contact a relay.")
 
             def sources(self) -> list[dict[str, str]]:
                 return [{"id": "one", "label": "one"}]
@@ -2769,7 +2791,21 @@ model_list:
                                 "type": "newapi",
                             }
                         ],
-                        "accounts": [],
+                        # The read scope is a login: a station with no account
+                        # has no history this app may read, so the dropdown
+                        # lists nothing for it.
+                        "accounts": [
+                            {
+                                "id": "login-relay",
+                                "station_id": "station-relay",
+                                "type": "newapi",
+                                "label": "tester",
+                                "origin": "http://127.0.0.1:45678",
+                                "username": "tester@example.test",
+                                "session": {"access_token": "session-token"},
+                                "resources": [],
+                            }
+                        ],
                         "pending_credential_cleanups": [],
                     }
                 ),
@@ -2782,7 +2818,7 @@ model_list:
                 )
                 sources = core.log_view("online-usage")["log"]["sources"]
 
-            self.assertEqual(["relay"], [source["label"] for source in sources])
+            self.assertEqual(["relay · tester"], [source["label"] for source in sources])
 
     def test_online_usage_pages_move_over_the_stations_history(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -271,7 +271,11 @@ class ServiceSupervisionTests(unittest.TestCase):
         def probe(operation: str) -> dict[str, object]:
             return dict(next(probes))
 
-        core = CoreStore(service_handlers={"health": probe, "restart": lambda op: {"state": "running"}})
+        def restart(operation: str) -> dict[str, object]:
+            calls.append(operation)
+            return {"state": "running"}
+
+        core = CoreStore(service_handlers={"health": probe, "restart": restart})
         with mock.patch("young_router.core.service.time.monotonic", return_value=1000.0):
             self.assertFalse(core.supervise_service_once())
         with mock.patch("young_router.core.service.time.monotonic", return_value=2000.0):

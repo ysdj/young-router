@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 from unittest import mock
 
 import copy
@@ -12,20 +11,30 @@ from young_router import runtime_store
 
 class HookRouteRecoveryTests(HookTestCase):
     def test_a_server_refusal_hidden_in_a_connection_error_cools_the_route(self) -> None:
-        """A refused route is cooled down; a real outage keeps recovering.
+        """A refused route is cooled down; a body that was cut keeps recovering.
 
         LiteLLM turns some server answers into ``APIConnectionError``, whose
         class name reads as an outage.  The server still answered, and it will
         answer the same way to every replay, so the route is unusable until
         someone changes the account or region.  Cooling it down is what stops
-        the next request from reaching it; a connection that never got an
-        answer keeps the recovery policy.
+        the next request from reaching it.
+
+        The connectivity side of this split is not "did it raise a connection
+        error" but "did a byte ever arrive": a host that was never reached is
+        parked too (a sibling can serve the same bytes and the silence is not
+        informative), while a body this proxy had already been handed keeps the
+        network policy, because another attempt may resume it.
         """
 
         hooks, _proxy_server = load_hook_module()
         refusal = "openaiException - 403: {\"type\":\"freetiererror\",\"message\":\"free tier\"}"
         wrapped = type("APIConnectionError", (Exception,), {})(refusal)
-        outage = type("APIConnectionError", (Exception,), {})("connection refused")
+        unreachable = type("APIConnectionError", (Exception,), {})(
+            "connection refused"
+        )
+        cut_body = type("APIConnectionError", (Exception,), {})(
+            "Server disconnected"
+        )
         direct = RuntimeError("forbidden")
         direct.status_code = 403
 
@@ -37,9 +46,15 @@ class HookRouteRecoveryTests(HookTestCase):
             hooks._recovery_policy_for_exception(direct),
             hooks._RECOVERY_POLICY_COOLDOWN,
         )
-        self.assertNotEqual(
-            hooks._recovery_policy_for_exception(outage),
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(unreachable),
             hooks._RECOVERY_POLICY_COOLDOWN,
+        )
+        self.assertTrue(hooks._is_upstream_unreachable_error(unreachable))
+        self.assertFalse(hooks._is_upstream_unreachable_error(cut_body))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(cut_body),
+            hooks._RECOVERY_POLICY_RECOVERY,
         )
 
     def test_stream_route_recovery_eligibility_is_protocol_neutral(self) -> None:
@@ -1228,6 +1243,127 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertGreaterEqual(len(attempts), 3)
         self.assertEqual(chunks[-1].get("type"), "response.completed")
 
+    async def test_single_route_at_its_cap_is_not_put_on_the_empty_pool_budget(
+        self,
+    ) -> None:
+        """A busy route's pool answer is "busy", not "nothing can serve this".
+
+        The shape measured live: the turn opens on this proxy's own cap
+        rejection, and the rounds after it carry the fallback round's wrapper
+        -- "no deployments available ... try again in 5 seconds".  Reading only
+        that latest exception put the route on the router-cooldown budget (two
+        waits, then the opening refusal), so a turn the route would have served
+        a moment later was ended instead.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "30")
+        self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
+        attempts: list[int] = []
+        served: list[int] = []
+
+        class AtCapacity(Exception):
+            status_code = 503
+
+        capacity = AtCapacity(
+            "litellm.RateLimitError: model concurrency limit reached: "
+            "id:only-route is already serving 16 request(s) at the cap"
+        )
+        capacity.failed_deployment_id = "only-route"
+        setattr(capacity, hooks._MODEL_CONCURRENCY_REJECTION_ATTR, True)
+        self.assertTrue(hooks._is_model_concurrency_rejection_error(capacity))
+
+        class Router:
+            def _get_all_deployments(self, model_name, team_id=None):
+                return [{"model_info": {"id": "only-route", "order": 0}}]
+
+        proxy_server.llm_router = Router()
+
+        async def busy_then_served(request_data, exception, **kwargs):
+            attempts.append(1)
+            if len(attempts) <= 4:
+                raise RuntimeError(
+                    "litellm.RouterRateLimitError: No deployments available for selected "
+                    "model, Try again in 5 seconds. Passed model=single-route-chat"
+                )
+            served.append(1)
+            yield {
+                "type": "response.completed",
+                "response": {"id": "r", "status": "completed", "output": []},
+            }
+
+        waits: list[float] = []
+
+        async def no_router_wait(delay, *args, **kwargs):
+            waits.append(float(delay))
+
+        request_data = {
+            "model": "single-route-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "metadata": {"request_id": "single-route-busy-pool"},
+            "model_info": {"id": "only-route", "order": 0},
+        }
+
+        with mock.patch.object(
+            hooks._streaming_module, "_stream_route_recovery_poll_attempt", busy_then_served
+        ), mock.patch.object(
+            hooks._streaming_module, "_stream_native_route_recovery_poll_attempt", busy_then_served
+        ):
+            chunks = [
+                chunk
+                async for chunk in hooks._stream_route_recovery_poll(request_data, capacity)
+            ]
+
+        self.assertEqual(served, [1], "a busy route was abandoned instead of waited for")
+        self.assertEqual(chunks[-1].get("type"), "response.completed")
+
+    async def test_a_responses_attempt_that_is_answering_is_not_ended_by_a_quiet_gap(
+        self,
+    ) -> None:
+        """Once a frame has arrived, a pause between frames is not a failed attempt.
+
+        The attempt wakes at the keepalive interval so the client keeps hearing
+        from it.  Before the first frame that wake-up checks the attempt's start
+        budget; after it, the Responses attempt re-raised the bare timeout --
+        so an answer whose model thought for longer than the interval between
+        two frames was dropped mid-delivery.  The native attempt already sends a
+        keepalive there and keeps reading; only the stream's own idle watchdog
+        may end an answer that has started.
+        """
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "30")
+        original = hooks._ROUTE_RECOVERY_SSE_KEEPALIVE_SECONDS
+        hooks._ROUTE_RECOVERY_SSE_KEEPALIVE_SECONDS = 0.01
+        self.addCleanup(setattr, hooks, "_ROUTE_RECOVERY_SSE_KEEPALIVE_SECONDS", original)
+        release = asyncio.Event()
+
+        async def answering_round(*_args, **_kwargs):
+            yield {"type": "response.output_text.delta", "delta": "started"}
+            await release.wait()
+            yield {"type": "response.completed", "response": {"id": "resp-1"}}
+
+        hooks._stream_streaming_error_fallback_round = answering_round
+        request = {
+            "model": "default-chat",
+            "stream": True,
+            "input": [{"role": "user", "content": "Continue."}],
+        }
+        stream = hooks._stream_route_recovery_poll_attempt(
+            request, RuntimeError("upstream temporarily unavailable"), attempt=1
+        )
+        first = await anext(stream)
+        self.assertEqual("response.output_text.delta", first.get("type"))
+        quiet = await asyncio.wait_for(anext(stream), timeout=2.0)
+        self.assertTrue(hooks._is_route_recovery_sse_keepalive(quiet))
+        release.set()
+        rest = [chunk async for chunk in stream]
+        self.assertEqual(
+            "response.completed",
+            [chunk for chunk in rest if not hooks._is_route_recovery_sse_keepalive(chunk)][-1].get("type"),
+        )
+
     async def test_single_route_cooldown_refusal_keeps_polling_for_its_own_recovery(
         self,
     ) -> None:
@@ -1393,7 +1529,7 @@ class HookRouteRecoveryTests(HookTestCase):
 
         self.assertEqual(len(calls), 1)
 
-    def test_route_recovery_reopens_a_sanitized_final_failure(self) -> None:
+    def test_a_sanitized_final_failure_with_a_healthy_next_order_returns_the_failed_stream(self) -> None:
         hooks, _proxy_server = load_hook_module()
 
         class FakeRouter:
@@ -2276,7 +2412,7 @@ class HookRouteRecoveryTests(HookTestCase):
         """
 
         hooks, _proxy_server = load_hook_module()
-        self.set_env("YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS", "1")
+        self.set_env("YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS", "0.05")
         self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
 
         async def producing_round(request_data, exception, **kwargs):
@@ -2285,8 +2421,8 @@ class HookRouteRecoveryTests(HookTestCase):
                 "index": 0,
                 "delta": {"type": "text_delta", "text": "hel"},
             }
-            # Past the one-second attempt budget while the answer continues.
-            await asyncio.sleep(1.6)
+            # Past the attempt budget while the answer continues.
+            await asyncio.sleep(0.1)
             yield {
                 "type": "content_block_delta",
                 "index": 0,
@@ -2326,7 +2462,7 @@ class HookRouteRecoveryTests(HookTestCase):
         """The deadline still answers the case it exists for: no first frame."""
 
         hooks, _proxy_server = load_hook_module()
-        self.set_env("YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS", "1")
+        self.set_env("YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS", "0.05")
         self.set_env(hooks._RECOVERY_INTERVAL_SECONDS_ENV, "0.001")
 
         async def silent_round(request_data, exception, **kwargs):
@@ -2494,13 +2630,22 @@ class HookRouteRecoveryTests(HookTestCase):
         opening.failed_deployment_id = "relay-only"
         opening.failed_deployment_order = 0.35
 
-        chunks = [
-            chunk
-            async for chunk in hooks._stream_route_recovery_poll(
-                request_data,
-                opening,
-            )
-        ]
+        async def instant_pause(_delay_seconds, **_kwargs):
+            if False:
+                yield None
+
+        with mock.patch.object(
+            sys.modules["young_router.proxy.streaming_recovery"],
+            "_sleep_route_recovery_poll_interval",
+            instant_pause,
+        ):
+            chunks = [
+                chunk
+                async for chunk in hooks._stream_route_recovery_poll(
+                    request_data,
+                    opening,
+                )
+            ]
         text = json.dumps(chunks, default=str)
 
         # The parked route was retried instead of the poll answering locally.
@@ -2556,13 +2701,22 @@ class HookRouteRecoveryTests(HookTestCase):
         opening.failed_deployment_id = "relay-only"
         opening.failed_deployment_order = 0.35
 
-        chunks = [
-            chunk
-            async for chunk in hooks._stream_route_recovery_poll(
-                request_data,
-                opening,
-            )
-        ]
+        async def instant_pause(_delay_seconds, **_kwargs):
+            if False:
+                yield None
+
+        with mock.patch.object(
+            sys.modules["young_router.proxy.streaming_recovery"],
+            "_sleep_route_recovery_poll_interval",
+            instant_pause,
+        ):
+            chunks = [
+                chunk
+                async for chunk in hooks._stream_route_recovery_poll(
+                    request_data,
+                    opening,
+                )
+            ]
         text = json.dumps(chunks, default=str)
 
         self.assertEqual(1 + hooks._ROUTE_RECOVERY_ROUTER_COOLDOWN_WAITS, len(calls))
@@ -4611,6 +4765,10 @@ class HookRouteRecoveryTests(HookTestCase):
 
         exc = APIError("request body storage capacity exhausted")
         self.assertFalse(hooks._is_request_body_size_rejection_error(exc))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exc),
+            hooks._RECOVERY_POLICY_COOLDOWN,
+        )
 
     def test_an_unrelated_bad_request_keeps_the_ordinary_route_treatment(self) -> None:
         """Only a stated size limit changes the classification."""
@@ -4622,6 +4780,10 @@ class HookRouteRecoveryTests(HookTestCase):
 
         exc = BadRequestError("invalid_request_error: unknown parameter 'foo'")
         self.assertFalse(hooks._is_request_body_size_rejection_error(exc))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exc),
+            hooks._RECOVERY_POLICY_ERROR,
+        )
 
     def test_request_body_size_rejection_is_remembered_and_skips_later_polling(self) -> None:
         hooks, _proxy_server = load_hook_module()
@@ -4967,11 +5129,24 @@ class HookRouteRecoveryTests(HookTestCase):
 
         self.assertFalse(hooks._is_local_shutdown_exception(exc))
         self.assertTrue(hooks._is_network_recovery_exception(exc))
+        # Nothing ever reached this host, so the route is parked: a sibling can
+        # serve the same bytes, and the next request must not pay the same
+        # silence again.  (The network policy's ``recovery`` answers the other
+        # connectivity shape -- a body that was already flowing.)
         self.assertEqual(
             hooks._recovery_policy_for_exception(exc),
+            hooks._RECOVERY_POLICY_COOLDOWN,
+        )
+        self.assertTrue(hooks._is_upstream_unreachable_error(exc))
+        self.assertEqual(hooks._trace_exception(exc)["reason"], "upstream-network-connectivity")
+
+        dropped = APIConnectionError("Server disconnected")
+        self.assertTrue(hooks._is_network_recovery_exception(dropped))
+        self.assertFalse(hooks._is_upstream_unreachable_error(dropped))
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(dropped),
             hooks._RECOVERY_POLICY_RECOVERY,
         )
-        self.assertEqual(hooks._trace_exception(exc)["reason"], "upstream-network-connectivity")
 
     def test_a_body_the_upstream_cut_mid_stream_parks_the_route(self) -> None:
         """A half-written body is the route's own fault, not an unclassified stop.
@@ -5168,8 +5343,9 @@ class RouteRecoveryKeepaliveWaitTests(HookTestCase):
         ):
             owner = hooks._owners.get(name)
             if owner is None:
-                continue
+                self.fail(f"{name}: no guarded recovery wait found")
             source = inspect.getsource(getattr(owner, name))
+            matched = False
             for match in re.finditer(r"asyncio\.wait_for\(\s*asyncio\.shield\((\w+)\)", source):
                 task_name = match.group(1)
                 # The handler that follows this wait must test the same task.
@@ -5180,6 +5356,8 @@ class RouteRecoveryKeepaliveWaitTests(HookTestCase):
                     f"{name}: the wait around {task_name} must resolve a settled task",
                 )
                 offenders.append(task_name)
+                matched = True
+            self.assertTrue(matched, f"{name}: no guarded recovery wait found")
 
         self.assertTrue(offenders, "expected the recovery keepalive waits to be present")
 
@@ -5465,7 +5643,7 @@ class HookSlowFailureRecoveryTests(HookTestCase):
 
         elapsed = hooks._current_attempt_elapsed_seconds()
         self.assertIsNotNone(elapsed)
-        self.assertGreaterEqual(elapsed, 0.0)
+        self.assertLess(elapsed, 1.0)
 
 
 class RuntimeRootStateTests(HookTestCase):

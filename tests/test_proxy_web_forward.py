@@ -71,7 +71,7 @@ class PrefixOwnershipTests(unittest.TestCase):
         # The page: a plain statement that this host has none, and nothing
         # about what else runs here.
         for path in ("/ui", "/ui/", "/ui/bundle.js"):
-            below.called = False
+            _Unreached.called = False
             status, headers, body = _call(middleware, "GET", path)
             self.assertEqual(404, status, path)
             self.assertTrue(headers["content-type"].startswith("text/plain"), path)
@@ -80,7 +80,7 @@ class PrefixOwnershipTests(unittest.TestCase):
 
         # The settings API is asked by a program: it reads the same answer a
         # restarting Core gives, because from a client's side they are one fact.
-        below.called = False
+        _Unreached.called = False
         status, headers, body = _call(middleware, "POST", "/ipc", b"{}")
         self.assertEqual(503, status)
         self.assertEqual("application/json", headers["content-type"].split(";")[0])
@@ -329,7 +329,7 @@ class ForwardingTests(unittest.TestCase):
         # route for either, so an answer from it would be a 404 the page reads
         # as "the Core is gone".
         for owned in ("/ui/bundle.js", "/ipc"):
-            below.called = False
+            _Unreached.called = False
             _call(middleware, "POST" if owned == "/ipc" else "GET", owned, b"" if owned == "/ipc" else b"{}")
             self.assertFalse(below.called, owned)
 

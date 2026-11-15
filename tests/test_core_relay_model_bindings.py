@@ -1677,3 +1677,71 @@ model_list:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RelayImportJoinsTheBoundProviderTests(unittest.TestCase):
+    """An import joins the station's provider, even when a placeholder exists.
+
+    The coordinator names an import's provider `relay-<station_id>` when the
+    station is not bound yet.  That placeholder is not a name the user chose:
+    once the user binds a provider to the station, later imports must land
+    there.  Joining the stale placeholder instead split one station across two
+    provider rows and kept feeding the row nobody looks at.
+    """
+
+    def _add_provider(self, domain: ProvidersModelsDomain, name: str) -> str:
+        added = domain.dispatch(
+            "provider.add",
+            {
+                "provider": {
+                    "name": name,
+                    "enabled": True,
+                    "api_base": "https://relay.example.test/v1",
+                    "api_keys": [],
+                    "models": [],
+                }
+            },
+        )
+        return added["providers"][-1]["editor_id"]
+
+    def test_a_placeholder_does_not_outrank_the_provider_bound_to_the_station(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            domain = ProvidersModelsDomain(Path(directory) / "config.yaml")
+            # The user's own provider, bound to the station.
+            bound_id = self._add_provider(domain, "my-station")
+            domain.dispatch(
+                "provider.select_relay_station",
+                {
+                    "provider_id": bound_id,
+                    "source": {
+                        "kind": "relay",
+                        "station_id": "station-a",
+                        "name": "my-station",
+                        "api_base": "https://relay.example.test",
+                    },
+                },
+            )
+            # A placeholder an earlier import minted before the binding existed.
+            self._add_provider(domain, "relay-station-a")
+
+            domain.stage_relay_import(
+                [
+                    relay_source(
+                        station_id="station-a",
+                        resource_id="resource-b",
+                        provider_name="relay-station-a",
+                    )
+                ],
+                import_mode="linked",
+            )
+
+            providers = domain.snapshot()["providers"]
+            self.assertEqual(
+                {"my-station", "relay-station-a"},
+                {provider["name"] for provider in providers},
+            )
+            # The import fed the bound provider, not the leftover placeholder.
+            bound = next(p for p in providers if p["name"] == "my-station")
+            placeholder = next(p for p in providers if p["name"] == "relay-station-a")
+            self.assertEqual(1, len(bound["models"]))
+            self.assertEqual([], placeholder["models"])

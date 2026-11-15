@@ -1366,9 +1366,6 @@ class ImageContextSizeModeTests(_ImageContextCase):
             image_context_module.rewrite_for_size(_request(items), keep=0)
         )
 
-if __name__ == "__main__":  # pragma: no cover
-    unittest.main()
-
 
 class ImageContextIdFetchTests(_ImageContextCase):
     """The fetch that needs no tool: the model writes the id, the next turn has it.
@@ -1388,18 +1385,6 @@ class ImageContextIdFetchTests(_ImageContextCase):
         self.environment.start()
         os.environ["HOME"] = self.gateway_home
         os.environ[image_context_module.IMAGE_CONTEXT_FETCH_ENV] = "auto"
-
-    def payloads(self, result: dict) -> dict:
-        """``id -> (mime, bytes)`` for every image the request carries."""
-
-        found = {}
-        for item in result["input"]:
-            for part in item.get("content") or item.get("output") or []:
-                if isinstance(part, dict) and part.get("type") == "input_image":
-                    url = part.get("image_url") or ""
-                    header, _, data = url.partition(",")
-                    found.setdefault(header, []).append(len(data) * 3 // 4)
-        return found
 
     def image_bytes(self, result: dict) -> list:
         sizes = []
@@ -1547,3 +1532,7 @@ class ImageContextIdFetchTests(_ImageContextCase):
         self.assertEqual(1, len(carried))
         original = len(base64.b64encode(_png(1000, 800, noisy=True, seed=2)))
         self.assertGreater(carried[0], original // 2)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()
