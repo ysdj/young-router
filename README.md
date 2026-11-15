@@ -9,12 +9,12 @@ Young Router is a native macOS and Windows app that runs a local AI gateway (bui
 ## Highlights
 
 - **Never stops.** Every model can have several routes, failing over same-order → next-order → wraparound. Incompatible protocols switch automatically and are remembered for 10 minutes. Failing routes cool down (2 failures / 300 s by default) and a background loop restores them as soon as they answer; stalled streams fail over instead of hanging. The app owns the service — start, health checks, shutdown — and the local port steps forward when busy.
-- **Public-model context you control.** The **Routes** view groups every route under its public model; click a group to rename it across all of its routes and set the context window the whole group declares (Codex 上下文). The model detail states that number read-only under 公开模型, with a 设置 button that opens the public-model pane where it is written: the window tells a Codex client (with the model catalog enabled) how much conversation the model can hold before it compacts on its own — it does not cap the proxy. Leave the field empty to keep the value pi.dev and the built-in registry resolve.
-- **A model's own concurrency cap.** A route can say how many requests it serves at once — the model detail sets one per route, and **Runtime** sets the default every route without its own number follows. A request arriving while a route is full is answered by the model's next route exactly as a cooled route is skipped; when every route of a model is full, the client is told its limit was reached instead of being sent to a different model. One route can also opt out of the cap entirely.
+- **Public-model context you control.** The **Routes** view groups every route under its public model; click a group to rename it across all of its routes and set the context window the whole group declares (**Public context**). The model detail states that number read-only under **Public model**, with a **Set** button that opens the public-model pane where it is written: the window tells a Codex client (with the model catalog enabled) how much conversation the model can hold before it compacts on its own — it does not cap the proxy. Leave the field empty to keep the value pi.dev and the built-in registry resolve.
+- **A model's own concurrency cap.** A route can say how many requests it serves at once — the model detail sets one per route, and **Runtime** sets the default every route without its own number follows. A request arriving while a route is full is answered by the model's next route exactly as a cooled route is skipped; when every route of a model is full, a streaming turn queues with its stream kept open and is served as soon as a slot frees; a non-streaming request is told the limit was reached. Neither is sent to a different model. One route can also opt out of the cap entirely.
 - **Vision bridge.** When a route explicitly rejects image input, Young Router describes the image (local OCR, Ollama / LM Studio, your HTTP vision providers, or a free fallback) and retries the same route with text context. Routes that support vision always get the original image untouched.
 - **Search belongs to the upstream.** A hosted `web_search` declaration reaches the route exactly as the client sent it; capability flags only decide whether the protocol has to be converted, never whether the proxy searches. When a route refuses the tool, its own error is what the client sees — no local search engine and no synthesized answer stand in for it. Provider-native search items that do come back are still translated into the standard `web_search_call` lifecycle.
 - **Relay-station management.** Add a New API / Sub2API station by URL — the app detects its type, you sign in inside the app, and it loads your API keys, groups, models, and balance. Key changes save and sync to the station as you make them; deleting a key first shows which models depend on it; keys auto-bind to providers with the same Base URL. Official OpenAI / Claude accounts live in the same window.
-- **Authenticity deep test.** The model detail pane's probe names what it will run: when the model is one the bundled [Veridrop](https://github.com/canarybyte/veridrop) tables carry, it also runs Veridrop's `quick` suite against the route and reports whether the endpoint answers as the model it claims — identity, thinking signature, model consistency, protocol conformance, and message ids. A failed check is only reported — the model keeps its enable checkbox and its routing stays yours to change.
+- **Authenticity deep test.** The model detail pane's probe names what it will run: it runs the bundled [modelprint](https://github.com/unclecode/modelprint) fingerprint table against the route — pinned-tokenizer counts, the serving template's own overhead, the lab's validation prose, the error-code family, the finish vocabulary, and the top-logprob geometry that separates a quantized deployment from full weights — then reports **which model actually answered**. A route that answers like another model is reported as that model (`疑似 qwen3.8-max`), never as a generic dilution grade, and a match too weak to name one says so. Naming needs a reference, so the tables are compared against the model's staged baseline, against a fingerprint this repository captured from the vendor's own endpoint, or against one the route recorded from an endpoint you trust. Every artifact build asks upstream whether the tables moved before staging them. A failed check is only reported — the model keeps its enable checkbox and its routing stays yours to change.
 - **Image generation bridge.** Image-generation requests are routed to the deployments that support them, with a forced retry when a capable route returns nothing.
 - **WorkBuddy accounts (China and international).** Add the product in the provider wizard: the second step lists the WorkBuddy desktop app's own catalog, and the models you tick are created with the entry. The app's sign-in stays in the **Service links** section, Young Router keeps its token refreshed, and the bundled [dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy) worker remains the single owner of the upstream protocol. The two gateways coexist as two regions, each keeping its own account, catalog, and credit.
 - **Qoder accounts (China and international).** The Qoder desktop app's own sign-in *is* the account: add Qoder or Qoder Global in the provider wizard and the account, its model roster and its credits are read from the app — nothing is typed, and no credential of this app's own is stored. The bundled [dsh-connect-qoder](https://github.com/dingminhua/dsh-connect-qoder) worker remains the single owner of the upstream protocol. The two gateways coexist as two regions, each keeping its own account, catalog, and credits.
@@ -32,8 +32,8 @@ Also included: route-trace HTML reports, online usage, and optional WebDAV confi
 2. Open Young Router — the local service starts automatically; the menu bar / tray icon shows its state.
 3. Open **Service Provider Management…** to sign in to OpenAI / Claude, or add a New API / Sub2API station by URL. Keys and models load automatically.
    Prefer plain API keys? Add them in **Providers & Models…**, or import your current Codex / Claude setup.
-   WorkBuddy users: in the wizard pick WorkBuddy or WorkBuddy Global (the domestic and the international gateway) — the wizard fills that gateway's own address — then tick the models to import on the second step; 完成 creates the entry with them. The desktop app's account is linked in the provider's **Service links** block.
-   Qoder users: pick Qoder or Qoder Global — the account is the Qoder desktop app's own sign-in, so the model step offers to open the app when it is signed out. That step lists the account's own catalog, and 完成 creates the entry with the models you ticked, under their lower-case public names.
+   WorkBuddy users: in the wizard pick WorkBuddy or WorkBuddy Global (the domestic and the international gateway) — the wizard fills that gateway's own address — then tick the models to import on the second step; **Finish** creates the entry with them. The desktop app's account is linked in the provider's **Service links** block.
+   Qoder users: pick Qoder or Qoder Global — the account is the Qoder desktop app's own sign-in, so the model step offers to open the app when it is signed out. That step lists the account's own catalog, and **Finish** creates the entry with the models you ticked, under their lower-case public names.
    Our Free Model users: in the wizard pick **Our Free Model** — nothing is typed there — tick the models on the second step and press Finish; the bundled package creates the entry with them. If the anonymous producer refuses the current network location, that provider's probe reports the refusal on its own row instead of blaming the key.
 4. Connect your tools:
    - **Codex** → **Codex Settings…** → choose a LiteLLM deployment
@@ -42,7 +42,7 @@ Also included: route-trace HTML reports, online usage, and optional WebDAV confi
 
 ## Installation
 
-Requirements: macOS 13+ (prebuilt Cask: Apple silicon); Windows via source build.
+Requirements: macOS 14+ (prebuilt Cask: Apple silicon); Windows via source build.
 
 ```bash
 brew tap ysdj/young-router https://github.com/ysdj/young-router && brew trust ysdj/young-router && brew install --cask ysdj/young-router/young-router
@@ -80,13 +80,13 @@ Source builds also need Xcode, CocoaPods, Node.js 22+, pnpm 11, and [uv](https:/
 
 ## Configuration
 
-Editable config: `~/.young-router/config.yaml` (sanitized example: [`config.example.yaml`](./config.example.yaml)). Every edit is validated as it is written and the service reloads itself when a saved change requires it; only the provider wizard, the raw file editor, and 分组管理 stage their edits until their own Save/Close. Runtime knobs (timeouts, cool-downs, port, vision / computer settings) live in **Runtime**; per-deployment capability flags (`upstream_protocol_mode`, `upstream_url_surface`, `supports_responses_web_search`, `supports_responses_image_generation_tool`, `supports_responses_compaction`) are documented in the example file.
+Editable config: `~/.young-router/config.yaml` (sanitized example: [`config.example.yaml`](./config.example.yaml)). Every edit is validated as it is written and the service reloads itself when a saved change requires it; only the provider wizard, the raw file editor, and **Group Manager** stage their edits until their own Save/Close. Runtime knobs (timeouts, cool-downs, port, vision / computer settings) live in **Runtime**; the per-deployment fields a route carries (`upstream_protocol_mode`, `upstream_url_surface`, `supports_responses_image_generation_tool`) are shown on the example file's route and are set from the model detail pane.
 
 <details>
 <summary>Import / export, sync, deep links, development</summary>
 
 - **Import/export:** bring providers in from Codex / Claude settings, files, or New API / CC Switch links; export configuration sections as JSON. Confirming the detected sections writes them right away. Optional WebDAV smart sync (push / pull / merge) is available under **Backup & Sync**.
-- **Deep links:** open any screen directly — `open "young-router://open/<route>"` with `home`, `providers-models`, `provider-wizard`, `codex-settings`, `claude-settings`, `runtime-settings`, `relay-accounts`, `data-management`, or `logs?tab=…` (`requests`, `service`, `route-trace`, `recovery`, `online-usage`). Links cannot carry values or trigger a configuration write.
+- **Deep links:** open any screen directly — `open "young-router://open/<route>"` with `home`, `general-settings`, `providers-models`, `provider-wizard`, `codex-settings`, `claude-settings`, `runtime-settings`, `data-management`, or `logs?tab=…` (`requests`, `service`, `actions`, `route-trace`, `recovery`, `online-usage`). Links cannot carry values or trigger a configuration write.
 - **Development:** contributor guide in [`AGENTS.md`](./AGENTS.md); focused Python tests live in `tests/`; run `pnpm exec tsc --noEmit` inside `rn/`. A UI edit costs a reload rather than a build: `scripts/dev-loop-macos.sh --metro` points the installed app at Metro and keeps it running, and `scripts/dev-loop-macos.sh --reload` makes the running app load the bundle again while Core and the proxy keep serving. Python edits use `--python`, and the isolated proxy loop is `--proxy`; `--help` lists every mode. A finished change is carried into the installed app by the loop, not by a build: `scripts/build-and-install-macos.sh` is the deploy that signs and installs; when the loop refuses a change because a native source must be compiled, run it by default to refresh and restart rather than ending the turn on that fact. `scripts/version.py` keeps `VERSION`, manifests, and the Cask in sync; builds advance `LITELLM_VERSION` to the latest stable release and bundle a matching Node.js 22 runtime.
 
 </details>
@@ -116,11 +116,12 @@ MIT License. See [LICENSE](./LICENSE).
 ## 核心优势
 
 - **永不停歇。** 每个模型可以配置多条线路，按同序 → 下一顺序 → 环绕自动回退；协议不兼容时自动切换并记忆 10 分钟；失败线路默认冷却（连续 2 次 / 300 秒），后台每 5 秒探测、恢复后自动重新启用；流式响应卡住会改走其他线路而不是一直挂起。服务由应用托管（启动、健康检查、退出关闭），本地端口被占用时自动顺延。
-- **模型自带的并发上限。** 每条线路都能声明自己同时服务多少个请求——模型详情里按线路设置，**运行时**里设置所有未单独设置的路由所跟随的默认值。线路满时，请求交给同一公开模型的下一条线路，和路由冷却一样被跳过；某个模型的每条线路都满时，客户端会看到明确的并发上限提示，而不是被换到别的模型。单条线路也可以完全退出该限制。
+- **公开模型的上下文由你决定。** **路由**视图把每条线路归到它的公开模型之下；点击一个分组，可以在它的全部线路上统一改名，并设置整个分组声明的上下文窗口（**公开上下文**）。模型详情在**公开模型**下只读显示这个数值，旁边的**设置**按钮打开写入它的公开模型面板：这个窗口告诉（开启了模型目录的）Codex 客户端，模型在自行压缩之前能容纳多少对话——它不限制代理本身。留空则沿用 pi.dev 与内置注册表解析出的值。
+- **模型自带的并发上限。** 每条线路都能声明自己同时服务多少个请求——模型详情里按线路设置，**运行时**里设置所有未单独设置的路由所跟随的默认值。线路满时，请求交给同一公开模型的下一条线路，和路由冷却一样被跳过；某个模型的每条线路都满时，流式回合会排队等待、客户端流保持开启，名额空出后继续服务；非流式请求会看到明确的并发上限提示。两者都不会被换到别的模型。单条线路也可以完全退出该限制。
 - **识图桥接。** 线路明确拒绝图片输入时，自动生成图片描述（本机 OCR、Ollama / LM Studio、你配置的 HTTP 视觉供应商或免费回退），转成文本后重试原线路；真正支持视觉的线路始终收到未被改动的原图。
 - **联网搜索由上游负责。** 客户端声明的 hosted `web_search` 原样送到线路；能力标志只决定是否需要协议转换，不代表代理会去搜索。线路拒绝该工具时，客户端看到的就是上游自己的报错——不会用本地搜索引擎或编造的答案替代。上游确实返回的原生搜索条目仍会被转换成标准的 `web_search_call` 生命周期。
 - **中转站智能管理。** 填一个 URL 即可添加 New API / Sub2API 中转站：自动识别类型、在应用内登录、自动加载 API 密钥、分组、模型和余额。密钥改动即时保存并同步到中转站；删除前会提示哪些模型正在使用；Base URL 相同的供应商会自动绑定这些密钥。OpenAI / Claude 官方账号也在同一个窗口管理。
-- **真伪探测。** 模型详情页的按钮会说明它将要执行什么：模型名在内置 [Veridrop](https://github.com/canarybyte/veridrop) 的模型表内时，对该线路跑一遍 Veridrop 的 `quick` 套件，核验它是否真的由所声称的模型作答（身份一致性、思维签名、模型一致性、协议规范性、消息标识规范）。核验未通过只作为结果展示——不会取消模型的启用勾选，路由怎么改仍由你决定。
+- **真伪探测。** 模型详情页的按钮会说明它将要执行什么：对该线路跑一遍内置 [modelprint](https://github.com/unclecode/modelprint) 指纹表——固定分词文本的 token 数、服务模板自身的开销、厂商自己的参数校验文案、错误码家族、finish 词表，以及把量化部署与全精度权重分开的 top-logprob 几何——然后告诉你**这一路实际服务的是哪个模型**。像另一个模型的线路就按那个模型报告（`疑似 qwen3.8-max`），不给笼统的「注水」评级；指纹弱到指认不出具体模型时才说指认不出。指认要有参照物，所以对比对象是模型的已内置基线、本仓库从厂商自家端点录下的指纹，或这条线路自己从一个你信任的端点录下的指纹。每次构建产物前都会先向上游核对指纹表是否已更新，再落盘。核验未通过只作为结果展示——不会取消模型的启用勾选，路由怎么改仍由你决定。
 - **图像生成桥接。** 图像生成请求会被路由到真正支持该能力的线路；能力线路返回空响应时会强制重试，避免请求白跑。
 - **WorkBuddy 账号（国内版与国际版）。** 在添加向导中选出产品：第二步会列出 WorkBuddy 桌面 App 自己的模型目录，勾选的模型随供应商一起创建。App 的登录态仍在**服务商关联**里维护，漾路由自动续期，并通过内置的 [dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy) worker 调用——上游协议始终由这个第三方包负责。两个网关作为两个区域并存，各自使用自己的账号、模型列表与积分。
 - **Qoder 账号（国内版与国际版）。** Qoder 桌面应用自己的登录态就是账号：在添加向导中选择 Qoder 或 Qoder Global，账号、模型列表与积分都从应用直接读取，无需填写任何东西，本应用也不另存自己的凭据。上游协议仍由内置的 [dsh-connect-qoder](https://github.com/dingminhua/dsh-connect-qoder) worker 单独负责。两个网关作为两个区域并存，各自使用自己的账号、模型列表与积分。
@@ -148,7 +149,7 @@ MIT License. See [LICENSE](./LICENSE).
 
 ## 安装
 
-系统要求：macOS 13+（预构建 Cask 为 Apple silicon）；Windows 需从源码构建。
+系统要求：macOS 14+（预构建 Cask 为 Apple silicon）；Windows 需从源码构建。
 
 ```bash
 brew tap ysdj/young-router https://github.com/ysdj/young-router && brew trust ysdj/young-router && brew install --cask ysdj/young-router/young-router
@@ -167,7 +168,7 @@ pnpm run bootstrap:rnmacos && pnpm install --frozen-lockfile
 YOUNG_ROUTER_MACOS_OUTPUT="$PWD/../artifacts/Young Router.app" pnpm run build:macos
 ```
 
-Windows（Developer PowerShell，需要 Windows App SDK 与 VS C++ 桌面工作负载）：`pnpm install --frozen-lockfile && pnpm run build:windows`。
+Windows（Developer PowerShell，需要 Windows App SDK 与 VS C++ 桌面工作负载）：`cd rn; pnpm install --frozen-lockfile; pnpm run build:windows`。
 
 源码构建还需要 Xcode、CocoaPods、Node.js 22+、pnpm 11 和 [uv](https://docs.astral.sh/uv/)。
 
@@ -175,13 +176,13 @@ Windows（Developer PowerShell，需要 Windows App SDK 与 VS C++ 桌面工作�
 
 ## 配置
 
-可编辑配置：`~/.young-router/config.yaml`（脱敏示例：[`config.example.yaml`](./config.example.yaml)）。所有修改都会先校验再写入，需要重启的改动由服务自行重载；只有供应商向导、原始文件编辑器与分组管理会把修改暂存到各自的保存 / 关闭动作。超时、冷却、端口、识图 / 电脑操作等运行时项都在**运行时**中调整；每个部署的能力标志（`upstream_protocol_mode`、`upstream_url_surface`、`supports_responses_web_search`、`supports_responses_image_generation_tool`、`supports_responses_compaction`）在示例文件中有说明。
+可编辑配置：`~/.young-router/config.yaml`（脱敏示例：[`config.example.yaml`](./config.example.yaml)）。所有修改都会先校验再写入，需要重启的改动由服务自行重载；只有供应商向导、原始文件编辑器与分组管理会把修改暂存到各自的保存 / 关闭动作。超时、冷却、端口、识图 / 电脑操作等运行时项都在**运行时**中调整；每条路由自带的字段（`upstream_protocol_mode`、`upstream_url_surface`、`supports_responses_image_generation_tool`）可以在示例文件的那条路由上看到，日常在模型详情页里设置。
 
 <details>
 <summary>导入导出、同步、深链、开发</summary>
 
 - **导入导出：** 可从 Codex / Claude 设置、文件或 New API / CC Switch 链接导入供应商，按配置段导出 JSON；确认导入的配置段会立即写入。**备份与同步**中提供可选的 WebDAV 智能同步（推送 / 拉取 / 合并）。
-- **深链：** 直接打开指定页面——`open "young-router://open/<route>"`，可用 `home`、`providers-models`、`provider-wizard`、`codex-settings`、`claude-settings`、`runtime-settings`、`relay-accounts`、`data-management`、`logs?tab=…`（`requests`、`service`、`route-trace`、`recovery`、`online-usage`）。深链不能携带配置值，也不会触发配置写入。
+- **深链：** 直接打开指定页面——`open "young-router://open/<route>"`，可用 `home`、`general-settings`、`providers-models`、`provider-wizard`、`codex-settings`、`claude-settings`、`runtime-settings`、`data-management`、`logs?tab=…`（`requests`、`service`、`actions`、`route-trace`、`recovery`、`online-usage`）。深链不能携带配置值，也不会触发配置写入。
 - **开发：** 贡献者指南见 [`AGENTS.md`](./AGENTS.md)；聚焦测试位于 `tests/`，共享 UI 在 `rn/` 下运行 `pnpm exec tsc --noEmit`。改界面只需要重新加载，不必重新构建：`scripts/dev-loop-macos.sh --metro` 让已安装的应用从 Metro 加载并保持其运行，`scripts/dev-loop-macos.sh --reload` 让运行中的应用重新加载 bundle，Core 与代理不中断。改 Python 用 `--python`，数据面的独立代理回路是 `--proxy`；`--help` 列出全部模式。改完由回路送进已安装的应用，而不是靠构建：`scripts/build-and-install-macos.sh` 是负责签名并安装的部署入口，只在要求部署或必须编译原生源码时运行；循环因原生源拒绝该改动时默认直接用它刷新并重启，不把「需要部署」当成结束一轮的理由。`scripts/version.py` 负责同步版本与 Cask；构建时会自动将 `LITELLM_VERSION` 推进到最新稳定版，并打包匹配的 Node.js 22 运行时。
 
 </details>

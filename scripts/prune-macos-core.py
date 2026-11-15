@@ -143,12 +143,10 @@ def prune_core(core: Path) -> None:
             flush=True,
         )
 
-    prune_tree(core / "runtime" / "site-packages", node=False)
     # Python package tests are never imported by the router; their fixtures
-    # are especially large in botocore and Pillow.
-    for package in (core / "runtime" / "site-packages").iterdir():
-        if package.is_dir() and package.name not in {"litellm"}:
-            prune_tree(package, node=False)
+    # are especially large in botocore and Pillow. The walk recurses, so one
+    # call covers every bundled package.
+    prune_tree(core / "runtime" / "site-packages", node=False)
     # The native host owns all windows. Python's development headers, package
     # installer and GUI tooling are not runtime inputs; keep the stdlib and
     # distribution metadata needed by importlib.metadata.

@@ -140,9 +140,8 @@ private enum NativeRelayOriginPolicy {
     /// already loaded window. The pending document travels as a small JSON
     /// payload the window reads through ``pendingFileEditorTarget()``.
     private var pendingFileEditorTargetValue: String?
-    /// Every child panel on screen with the window it locks, outermost first:
-    /// ending one ends the children opened from it, and the lock over a parent
-    /// is only released with its last child. See ``presentChildPanel(_:in:prepare:)``.
+    /// Starts the React host for a route window the first time one is asked
+    /// for; set by the host owner at launch.
     private var reactHostStarter: (() -> Void)?
     private var routeWindows: [String: NSWindow] = [:]
     private var approvedCloseRoutes: Set<String> = []
@@ -150,6 +149,9 @@ private enum NativeRelayOriginPolicy {
     /// and the title-bar close button carry, the answers it offers, and the
     /// completion it settles exactly once. See ``presentDecisionPanel(_:)``.
     private var decisionPanels: [ObjectIdentifier: DecisionPanelState] = [:]
+    /// Every child panel on screen with the window it locks, outermost first:
+    /// ending one ends the children opened from it, and the lock over a parent
+    /// is only released with its last child. See ``presentChildPanel(_:in:prepare:)``.
     private var childPanels: [ChildPanel] = []
     /// The model chooser on screen: its window, the controller that answers its
     /// controls, and the completion the pending JS promise waits on. AppKit
@@ -416,12 +418,11 @@ private enum NativeRelayOriginPolicy {
     func prepareFileEditor() {
         guard routeWindows["file-editor"] == nil else { return }
         guard let title = routeWindowTitle("file-editor") else { return }
-        let keep = pendingFileEditorTargetValue
-        // The window factory only forwards a requested document; a prepared
-        // window starts with none and receives the first one on open.
-        pendingFileEditorTargetValue = nil
+        // The window factory only forwards the document named here, and a
+        // window opened without one is created empty: dropping the target
+        // before this call made the open refuse the very document it was
+        // preparing for, so the warm window was never created at all.
         open(route: "file-editor", title: title, warmOnly: true)
-        pendingFileEditorTargetValue = keep
         updateActivationPolicy()
     }
 
@@ -433,11 +434,15 @@ private enum NativeRelayOriginPolicy {
         guard !trimmed.isEmpty, trimmed.utf8.count <= 8192,
               trimmed.unicodeScalars.allSatisfy({ $0.value >= 0x20 && $0.value != 0x7f }) else { return }
         pendingFileEditorTargetValue = trimmed
-        defer { pendingFileEditorTargetValue = nil }
-        guard let title = routeWindowTitle("file-editor") else { return }
+        guard let title = routeWindowTitle("file-editor") else {
+            pendingFileEditorTargetValue = nil
+            return
+        }
         if routeWindows["file-editor"] != nil {
             // A warm window already booted its editor: present it and let the
-            // mounted root pick up the new document.
+            // mounted root pick up the new document.  The target stays set
+            // until the root has read it: `edit-file` is delivered
+            // asynchronously, so clearing it here handed the window nothing.
             open(route: "file-editor", title: title)
             emitAction("edit-file")
             return
@@ -491,10 +496,6 @@ private enum NativeRelayOriginPolicy {
     /// alive for menu/service state, but route content lives in independent
     /// React windows created by ``routeWindowFactory``.
     public func hideHostWindowAtLaunch(_ window: NSWindow?) {
-        hideHostWindowAtLaunch(window, keepStatusItem: false)
-    }
-
-    public func hideHostWindowAtLaunch(_ window: NSWindow?, keepStatusItem: Bool) {
         if let window {
             hostWindow = window
         }
@@ -559,8 +560,8 @@ private enum NativeRelayOriginPolicy {
 
     // MARK: - Child panels
 
-    /// One open child surface: the surface, the window it locks, and the lock
-    /// view that keeps that window's content from answering clicks and keys.
+    /// One open child surface and the window it locks.  The lock itself is a
+    /// separate shield view the presenter installs over that window.
     private struct ChildPanel {
         let window: NSWindow
         let parent: NSWindow?
@@ -981,15 +982,19 @@ private enum NativeRelayOriginPolicy {
             NativeDecisionAnswer(id: "cancel", title: cancelLabel, isCancel: true),
             NativeDecisionAnswer(id: "apply", title: confirmLabel, isDefault: true),
         ]
-        var builtPanel: NSPanel?
-        builtPanel = presentDecisionPanel(
+        presentDecisionPanel(
             title,
             message: "",
             answers: answers,
             accessory: input,
             accessoryHeight: 24,
-            prepare: {
-                builtPanel?.makeFirstResponder(input)
+            // `prepare` runs while the panel is being presented, before the
+            // call returns it, so the window is asked through the field that is
+            // already inside it.  Going through the returned panel left the
+            // field unfocused and its text unselected.
+            prepare: { [weak input] in
+                guard let input else { return }
+                input.window?.makeFirstResponder(input)
                 input.currentEditor()?.selectAll(nil)
             }
         ) { [weak input] answer in
@@ -1713,7 +1718,11 @@ private enum NativeRelayOriginPolicy {
             if bounds.contains(pointer) {
                 // The pointer sits on the button that asked for the menu; one
                 // button height below it clears the button's own bounds.
-                let top = min(pointer.y + anchorHeight, max(bounds.maxY - 1, 0))
+                // "Below" is +y only in a flipped view: in the settings shell's
+                // unflipped backdrop the pointer's y is already the button's
+                // lower edge, so the anchor is that point itself.
+                let below = contentView.isFlipped ? pointer.y + anchorHeight : pointer.y
+                let top = min(max(below, 0), max(bounds.maxY - 1, 0))
                 return NSPoint(x: anchorX, y: top)
             }
         }
@@ -2427,7 +2436,14 @@ private enum NativeRelayOriginPolicy {
             preferencesItem.target = self
             preferencesItem.representedObject = "open-settings"
         }
-        guard !applicationMenu.items.contains(where: { $0.representedObject as? String == "native-open-data-management" }) else { return }
+        // The item is added once and then retitled by
+        // ``updateApplicationMenuTitles``; returning here used to skip the rest
+        // of this routine on every later call, so a language change left the
+        // label in the language it was created in.
+        guard !applicationMenu.items.contains(where: { $0.representedObject as? String == "native-open-data-management" }) else {
+            updateApplicationMenuTitles()
+            return
+        }
         let dataManagementItem = applicationMenu.addItem(
             withTitle: localized("routeDataManagement", fallback: "Data Management"),
             action: #selector(openDataManagement),
@@ -2619,6 +2635,7 @@ private enum NativeRelayOriginPolicy {
         for item in applicationMenu.items {
             switch item.representedObject as? String {
             case "open-settings": item.title = localized("settings", fallback: "Settings...")
+            case "native-open-data-management": item.title = localized("routeDataManagement", fallback: "Data Management")
             case "native-reload": item.title = localized("reload", fallback: "Reload")
             case "native-close-window": item.title = localized("closeWindow", fallback: "Close Window")
             case "native-quit": item.title = localized("menuQuit", fallback: "Quit Young Router")
@@ -2804,21 +2821,6 @@ private enum NativeRelayOriginPolicy {
         reactHostStarter?()
     }
 
-    private func routeTitle(_ route: String) -> String? {
-        switch route {
-        case "home": return localized("routeHome", fallback: "Young Router")
-        case "providers-models": return localized("routeProvidersModels", fallback: "Providers & Models")
-        case "provider-wizard": return localized("routeProviderWizard", fallback: "Add Provider")
-        case "file-editor": return localized("routeFileEditor", fallback: "Edit File")
-        case "webdav-settings": return localized("routeWebDavSettings", fallback: "WebDAV Sync Settings")
-        case "codex-settings", "claude-settings": return localized("routeCodexSettings", fallback: "External")
-        case "runtime-settings": return localized("routeRuntimeSettings", fallback: "Runtime")
-        case "data-management": return localized("routeDataManagement", fallback: "Data Management")
-        case "logs": return localized("routeLogs", fallback: "Logs")
-        default: return nil
-        }
-    }
-
     /// Keep the native window title in sync with the shared route localization.
     /// AppKit owns the title bar, but React owns the language preference.
     private func routeWindowTitle(_ route: String) -> String? {
@@ -2850,10 +2852,6 @@ private enum NativeRelayOriginPolicy {
     @objc private func closeFromShortcut() {
         let window = NSApp.keyWindow
         requestClose(route: window.flatMap(routeForWindow), hiding: window)
-    }
-    @objc private func menuAction(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String else { return }
-        emitAction(id)
     }
     func requestQuit() {
         NSApp.terminate(nil)
@@ -2892,15 +2890,6 @@ enum RelayBrowserIdentity {
 /// control of the locked window answers a click or a key while the child
 /// surface is up; the child keeps its own movable window, and the app keeps
 /// rendering and answering everywhere else.
-/// The sign-in page itself is the child window's whole point, so a click that
-/// lands on it while the app is not frontmost belongs to the page.  AppKit's
-/// default spends that click on activating the app: every control inside the
-/// WebView (the email field, the sign-in button) answered only the *second*
-/// press, which the user reads as a login page that cannot be clicked.
-private final class NativeFirstMouseWebView: WKWebView {
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-}
-
 private final class NativeChildPanelShield: NSView {
     /// Called for every mouse press: the child takes the keyboard back, so a
     /// press on the locked window selects nothing in it.
@@ -2928,11 +2917,15 @@ private final class NativeChildPanelShield: NSView {
     override func accessibilityRole() -> NSAccessibility.Role? { .group }
 }
 
-/// A push button that keeps the Return-key default-button role without the
-/// accent-colored default fill. Assigning ``keyEquivalent`` ``"\\r"`` makes
-/// AppKit paint the button with the control accent color; temporarily
-/// clearing the equivalent while drawing restores the ordinary bezel while
-/// the window still routes Return to this cell.
+/// The sign-in page itself is the child window's whole point, so a click that
+/// lands on it while the app is not frontmost belongs to the page.  AppKit's
+/// default spends that click on activating the app: every control inside the
+/// WebView (the email field, the sign-in button) answered only the *second*
+/// press, which the user reads as a login page that cannot be clicked.
+private final class NativeFirstMouseWebView: WKWebView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 /// One answer a decision panel offers: its label, the id the caller hears back,
 /// whether the Return key carries it, whether Escape and the title-bar close
 /// button carry it, and whether it destroys what it names.
@@ -2947,10 +2940,12 @@ struct NativeDecisionAnswer {
 /// A decision panel's answer button: it carries the answer's id back to the
 /// panel's single action, and it can draw neutrally while still carrying Return.
 ///
-/// A destructive answer that is also the Return default would otherwise be
-/// painted with the default button's accent fill — a blue delete.  An alert
-/// draws that answer with the ordinary bezel and the system's red ink, so this
-/// button drops its key equivalent for the one draw pass and puts it back.
+/// A push button keeps the Return-key default role without the accent fill:
+/// assigning ``keyEquivalent`` ``"\r"`` makes AppKit paint the button with the
+/// control accent color, so the one draw pass that must stay neutral clears the
+/// equivalent and puts it back.  A destructive answer that is also the Return
+/// default would otherwise be a blue delete; an alert draws that answer with
+/// the ordinary bezel and the system's red ink.
 final class NativeDecisionAnswerButton: NSButton {
     var answerID = ""
     var drawsNeutralWhileDefault = false
@@ -2966,8 +2961,6 @@ final class NativeDecisionAnswerButton: NSButton {
     }
 }
 
-/// A decision panel's window.  Escape answers the panel's cancel answer even
-/// when no button carries that key, so every question dismisses the same way.
 /// A decision panel's window: one rounded borderless alert, dragged by its own
 /// background and answering Escape with the question's cancel answer even when
 /// no button carries that key.  A borderless panel only becomes key when it says
@@ -3112,7 +3105,6 @@ private final class NativeGroupManagerScrollView: NSScrollView {
 private final class NativeModelsListView: NSScrollView {
     private let textView = NSTextView(frame: .zero)
     private let emptyText: String
-    private var models: [String] = []
 
     init(font: NSFont, emptyText: String) {
         self.emptyText = emptyText
@@ -3157,7 +3149,6 @@ private final class NativeModelsListView: NSScrollView {
     /// One model per line, in the station's order; an empty list states that
     /// the key provides none.
     func setModels(_ names: [String]) {
-        models = names
         textView.string = names.isEmpty ? emptyText : names.joined(separator: "\n")
         textView.textColor = names.isEmpty ? .secondaryLabelColor : .labelColor
         refitDocument()
@@ -3276,13 +3267,12 @@ private final class NativeRelayKeyMemo {
         }
     }
 
-    /// Drop what the host remembered for one account, so a key the station
-    /// reports differently is read again instead of being shown from memory.
-    func forget(accountID: String) {
+    /// Drop what the host remembered for one key, so a key the station no
+    /// longer reports is not shown from memory.
+    func forget(accountID: String, resourceID: String) {
         lock.lock()
         defer { lock.unlock() }
-        let prefix = "\(accountID)\u{1f}"
-        values = values.filter { !$0.key.hasPrefix(prefix) }
+        values.removeValue(forKey: Self.key(accountID, resourceID))
     }
 }
 
@@ -3410,6 +3400,11 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     /// window already read instead of asking for another one, and the values
     /// are dropped with the controller when the window ends.
     private var revealedKeys: [String: String] = [:]
+    /// What an earlier window read for these keys.  It fills the value row
+    /// while this window's own read runs and never stands in for that read:
+    /// kept apart from ``revealedKeys``, which answers "this window has read
+    /// it" and so decides whether a row is read at all.
+    private var memoizedKeys: [String: String] = [:]
     /// The rows still waiting for their key, in the order the sheet reads them.
     private var revealQueue: [String] = []
     /// The queued rows a read is already running for, so a pass never asks for
@@ -3580,7 +3575,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         // current one, so the value row is never empty for a known key.
         for row in rows where !row.isDraft && !row.hint.isEmpty {
             if let value = NativeRelayKeyMemo.shared.value(accountID: accountID, resourceID: row.id) {
-                revealedKeys[row.id] = value
+                memoizedKeys[row.id] = value
             }
         }
     }
@@ -3962,8 +3957,10 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             valueLabel.topAnchor.constraint(equalTo: multiplierLabel.bottomAnchor, constant: 10),
             valueLabel.widthAnchor.constraint(equalToConstant: detailCaptionWidth),
             valueField.leadingAnchor.constraint(equalTo: valueLabel.trailingAnchor, constant: 8),
-            // Both detail lists wrap from their caption's top line, so each row
-            // grows down and the rows below it stay clear of the text.
+            // Each detail row starts at its caption's own top line.  The value
+            // field is one truncating line (the key has a copy control beside
+            // it), the name field may wrap, and both are pinned from the top so
+            // a longer name grows downward instead of moving the caption.
             valueField.topAnchor.constraint(equalTo: valueLabel.topAnchor, constant: 1),
             // The copy icon sits at the detail column's trailing edge; the key
             // wraps beside it instead of running under it.
@@ -4062,11 +4059,15 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         // a key the refresh replaced is read again on its next selection.
         let ids = Set(rows.map { $0.id })
         revealedKeys = revealedKeys.filter { ids.contains($0.key) }
+        memoizedKeys = memoizedKeys.filter { ids.contains($0.key) }
         revealQueue = revealQueue.filter { ids.contains($0) }
         // The station is the authority on which keys exist: a key it no longer
         // reports is forgotten rather than shown from what the host remembered.
+        // (Remembering an empty value is refused by the memo itself, so that
+        // is not a way to forget one.)
         for row in rows where !row.isDraft && row.hint.isEmpty {
-            NativeRelayKeyMemo.shared.remember(accountID: accountID, resourceID: row.id, value: "")
+            NativeRelayKeyMemo.shared.forget(accountID: accountID, resourceID: row.id)
+            memoizedKeys.removeValue(forKey: row.id)
         }
         modelsListHeight?.constant = CGFloat(NativeGroupManagerController.modelGridRows(rows)) * 17
         groupPopUp?.removeAllItems()
@@ -4183,6 +4184,9 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             enabledCheckbox?.state = .off
             nameField?.stringValue = ""
             multiplierField?.stringValue = empty
+            // No selection carries no rate: a tooltip left over from the
+            // previous row reports a rate nobody selected.
+            multiplierField?.toolTip = nil
             // Nothing is selected, so no read may write into the value row.
             valueField?.stringValue = empty
             valueField?.toolTip = nil
@@ -4286,17 +4290,22 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         refreshStatusText()
     }
 
-    /// The one line beside the buttons: the last outcome, else a transient
-    /// word (a failed copy), else the save in flight, else nothing — an idle
+    /// The one line beside the buttons: a save in flight, else a transient
+    /// word (a failed copy), else the last outcome, else nothing — an idle
     /// window says nothing here, and the wait for its rows already rides the
     /// wheel beside 密钥.
+    ///
+    /// The in-flight word has to win: a result outranks everything below it
+    /// and nothing clears it, so reading it first meant a failed save kept the
+    /// window open and 保存中… never appeared again, which is exactly the wait
+    /// that tells the user the retry is running.
     private func refreshStatusText() {
-        if let resultStatus {
-            setStatus(resultStatus)
+        if saving {
+            setStatus(savingStatusText())
         } else if let transientStatus {
             setStatus(transientStatus)
-        } else if saving {
-            setStatus(savingStatusText())
+        } else if let resultStatus {
+            setStatus(resultStatus)
         } else {
             setStatus("")
         }
@@ -4435,7 +4444,8 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         // The key is read by the pass below, which starts with this row: the
         // sheet shows what it can read rather than a stand-in label, and the
         // rows behind this one are filled while the user looks at this one.
-        valueField?.stringValue = ""
+        // What an earlier window read is shown until that read answers.
+        valueField?.stringValue = memoizedKeys[row.id] ?? ""
         fillRowKeys()
     }
 
@@ -4475,13 +4485,12 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
                 if let value {
                     self.revealedKeys[keyID] = value
                     NativeRelayKeyMemo.shared.remember(accountID: self.accountID, resourceID: keyID, value: value)
-                    // The row being looked at shows what this pass read; a
-                    // wrapped key makes the detail column taller than the
-                    // panel was sized for, so the window takes the height it
-                    // now needs.
+                    // The row being looked at shows what this pass read.  The
+                    // value field is one truncating line by design, so the key
+                    // cannot change the panel's height and there is nothing to
+                    // re-fit here.
                     if self.selectedRowID == keyID {
                         self.valueField?.stringValue = value
-                        self.fitPanelToContent()
                     }
                 } else if self.selectedRowID == keyID {
                     self.showTransientStatus(self.label("failedLabel"))
@@ -4731,11 +4740,9 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     @objc private func showAutoGroupingHelp(_ sender: NSButton) {
         let text = label("autoGroupingHelp")
         guard !text.isEmpty else { return }
-        if AppKitNativeLeaf.shared.presentTip(text, beside: sender) == nil {
-            // A tip that cannot be drawn still states its words: the mark's
-            // tooltip is the same sentence, so the help is never silence.
-            return
-        }
+        // The mark's own tooltip carries the same sentence, so a tip that
+        // cannot be drawn is not silence.
+        AppKitNativeLeaf.shared.presentTip(text, beside: sender)
     }
 
     /// Close discards the draft, so a window that would lose edits asks first;
@@ -4970,13 +4977,13 @@ public final class AppKitBusySpinner: NSObject {
 /// way the system draws its overlay scroller: one translucent capsule knob and
 /// no track, so the row or cell underneath stays readable.
 ///
-/// AppKit's own overlay scroller fades out as soon as scrolling stops, and a
-/// custom `NSScroller` subclass cannot take the overlay style at all - AppKit
-/// tiles such a scroller as a legacy bar in its own gutter.  The hosts
-/// therefore keep the legacy style (so this class draws the knob) and float the
-/// scroller over the content themselves
-/// (`FloatPersistentScrollerOverContent` in `AppKitControlViews.mm` and
-/// `floatOverContent()` below), which is what removes the gutter.
+/// AppKit's own overlay scroller fades out as soon as scrolling stops.  A
+/// subclass only receives the overlay style when it declares
+/// `isCompatibleWithOverlayScrollers` (this one does, below), so the hosts ask
+/// for the overlay style and also float the scroller over the content
+/// themselves (`FloatPersistentScrollerOverContent` in `AppKitControlViews.mm`
+/// and `floatOverContent()` below): the knob is drawn by this class and the
+/// gutter AppKit would still tile beside it is never left empty.
 ///
 /// The ObjC hosts instantiate this class through the generated Swift header, so
 /// it must be public to appear in `YoungRouter-Swift.h`.
@@ -5037,9 +5044,9 @@ public final class LiteLLMPersistentScroller: NSScroller {
 }
 
 /// Keep the platform overlay scroller on screen while the content overflows.
-/// A custom NSScroller subclass cannot take the overlay style - AppKit tiles it
-/// as a legacy bar in its own gutter - so the floating, translucent platform
-/// scroller is what the app keeps.
+/// The floating, translucent platform scroller is what the app keeps; a custom
+/// subclass takes that style only when it declares
+/// `isCompatibleWithOverlayScrollers`, which `LiteLLMPersistentScroller` does.
 extension NSScrollView {
     /// Draw the scrollers this scroll view keeps visible with
     /// `LiteLLMPersistentScroller` instead of AppKit's opaque legacy bar, unhide
@@ -5112,54 +5119,6 @@ extension NSScrollView {
     }
 }
 
-final class NativeTextEditor: NSScrollView {
-    let textView: NSTextView
-
-    override init(frame frameRect: NSRect) {
-        textView = NSTextView(frame: .zero)
-        super.init(frame: frameRect)
-        hasVerticalScroller = true
-        hasHorizontalScroller = true
-        autohidesScrollers = false
-        borderType = .bezelBorder
-        textView.isRichText = false
-        textView.allowsUndo = true
-        textView.isVerticallyResizable = true
-        textView.isHorizontallyResizable = true
-        textView.autoresizingMask = [.width, .height]
-        textView.frame = bounds
-        textView.minSize = NSSize(width: 0, height: 0)
-        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        textView.font = NSFont.monospacedSystemFont(ofSize: nativeUIFontSize, weight: .regular)
-        textView.usesFindPanel = true
-        textView.textContainer?.widthTracksTextView = false
-        textView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        documentView = textView
-        usePersistentScrollers(horizontal: true, vertical: true)
-    }
-
-    override func layout() {
-        super.layout()
-        usePersistentScrollers(horizontal: true, vertical: true)
-    }
-
-    required init?(coder: NSCoder) {
-        textView = NSTextView(frame: .zero)
-        super.init(coder: coder)
-    }
-}
-
-final class NativeSegmentedControl: NSSegmentedControl {
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        segmentStyle = .texturedRounded
-        trackingMode = .selectOne
-    }
-
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-    }
-}
 
 private final class NativeInstantFocusBorderView: NSView {
     var borderVisible = false {
@@ -7152,17 +7111,18 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
           const form = password.form;
           const submit = form?.querySelector('button[type=submit],input[type=submit],button:not([type])')
             ?? Array.from(document.querySelectorAll('button')).find((node) => /sign in|log in|登录/i.test((node.textContent || node.getAttribute('aria-label') || '').trim()));
-          if (submit instanceof HTMLElement) submit.click();
-          else if (form instanceof HTMLFormElement && typeof form.requestSubmit === 'function') form.requestSubmit();
-          return true;
+          if (submit instanceof HTMLElement) { submit.click(); return true; }
+          if (form instanceof HTMLFormElement && typeof form.requestSubmit === 'function') { form.requestSubmit(); return true; }
+          return false;
         })();
         """
         webView.evaluateJavaScript(script) { [weak self] value, _ in
             guard let self, self.isBrowserFlowLive else { return }
             guard value as? Bool == true else {
-                // A form that is gone or incomplete did not submit: the station
-                // was still not asked anything, so the next probe may try
-                // again.
+                // A form that is gone or incomplete did not submit, and neither
+                // did one with nothing to press (no submit control, no form
+                // around the field): the station was still not asked anything,
+                // so the next probe may try again.
                 self.didAutoSubmitSavedPassword = false
                 return
             }
@@ -7174,14 +7134,6 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         guard let data = try? JSONSerialization.data(withJSONObject: [value]),
               let text = String(data: data, encoding: .utf8), text.count >= 2 else { return "\"\"" }
         return String(text.dropFirst().dropLast())
-    }
-
-    @objc private func checkSignIn(_ sender: Any?) {
-        guard mode == .login else {
-            reloadBrowser(sender)
-            return
-        }
-        startSignInCheck(automatically: false)
     }
 
     private func startSignInCheck(automatically: Bool) {
@@ -7447,6 +7399,20 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
                 DispatchQueue.main.async { [weak self, weak attempt] in
                     guard let self, let attempt, self.isCurrentCheck(attempt) else { return }
                     if refused { self.attemptSawRefusal = true }
+                    self.probe(index: index + 1, cookieHeader: cookieHeader, attempt: attempt, automatically: automatically)
+                }
+                return
+            }
+            // A New API fork refuses a session in the body as often as in the
+            // status: 200 with {"success": false, "message": "未登录或登录已过期"}.
+            // Core, the Windows probe and this file's own session probe read
+            // that envelope as a refusal.  Reading it as an answer here took
+            // the preset username and the jar on hand and stored the session
+            // the station had just refused as a verified sign-in.
+            if NativeRelaySessionProbe.payloadRefusesSession(object) {
+                DispatchQueue.main.async { [weak self, weak attempt] in
+                    guard let self, let attempt, self.isCurrentCheck(attempt) else { return }
+                    self.attemptSawRefusal = true
                     self.probe(index: index + 1, cookieHeader: cookieHeader, attempt: attempt, automatically: automatically)
                 }
                 return
@@ -7935,6 +7901,12 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             // workspace goes with it.  ``endChildPanel`` is idempotent, so
             // releasing here as well as in ``windowWillClose`` is safe.
             releaseChildPresentation()
+            // The window closed without ``dismissPresentation``, which is where
+            // the page's script handlers are taken off.  A content controller
+            // keeps its handlers alive and they hold this controller, so
+            // without this the controller and its web view outlive the flow.
+            webView.configuration.userContentController.removeScriptMessageHandler(forName: "litellmRelayPassword")
+            webView.configuration.userContentController.removeScriptMessageHandler(forName: "litellmRelayPage")
             let callback = completion
             completion = nil
             session.finishTasksAndInvalidate()
@@ -7958,8 +7930,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         // answer surface.  A further check could only repeat the refusal the
         // submission was authorized by, and each round trip is one more request
         // against an account whose session count is what runs out, so the loop
-        // hands the decision back to the user (who can finish the sign-in in the
-        // page and press 验证登录).
+        // hands the decision back to the user, who can finish the sign-in in the
+        // page and close the window on success.
         guard !loginSubmitAuthorized else { return }
         // A station whose sign-in never answers is not retried forever: past the
         // bound the window states what it found and puts the check back in the
@@ -8004,8 +7976,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     /// answering a shape this app cannot verify — a login page that never
     /// leaves, a captcha step the page has not finished, a response with no
     /// username and no credentials this app can use.  Past the bound the window
-    /// states what it found and hands the decision back to the user through the
-    /// one control that performs the check on demand.
+    /// states what it found and leaves the rest to the page.
     private static let signInProbeMaxAttempts = 24
     private var signInProbeAttempts = 0
 
@@ -8648,7 +8619,7 @@ private enum NativeRelaySessionProbe {
     /// explicitly denies success *and* names the login is a refusal.  An
     /// envelope that fails for another reason (a missing permission, an
     /// unknown route) says nothing about the session.
-    private static func payloadRefusesSession(_ value: Any) -> Bool {
+    fileprivate static func payloadRefusesSession(_ value: Any) -> Bool {
         guard let object = value as? [String: Any],
               let success = object["success"] as? Bool, !success else { return false }
         let markers = [

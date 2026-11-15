@@ -8,7 +8,7 @@ cask "young-router" do
   homepage "https://github.com/ysdj/young-router"
 
   depends_on arch: :arm64
-  depends_on macos: :ventura
+  depends_on macos: :sonoma
 
   app "Young Router.app"
 

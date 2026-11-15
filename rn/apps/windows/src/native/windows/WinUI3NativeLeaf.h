@@ -22,7 +22,6 @@ namespace YoungRouter {
 void OpenReactChildWindow(std::wstring_view route, std::wstring_view initial_file_target = {});
 void CloseReactChildWindow();
 std::wstring InitialChildRoute(HWND window);
-HWND CurrentReactChildHostWindow() noexcept;
 
 struct NativeMenuAction {
   std::wstring id;
@@ -209,9 +208,13 @@ class WinUI3NativeLeaf : public std::enable_shared_from_this<WinUI3NativeLeaf> {
       std::wstring_view close_label,
       std::wstring_view language,
       std::wstring_view html);
-  std::optional<size_t> ShowActionMenu(std::wstring_view title, std::vector<std::wstring> const& items, NativeMenuAnchor anchor);
-  /// Two-level menu: every group is a submenu.  Returns the chosen
-  /// ``{group, item}`` pair.
+  std::optional<size_t> ShowActionMenu(
+      std::wstring_view title,
+      std::vector<std::wstring> const& items,
+      NativeMenuAnchor anchor,
+      std::vector<size_t> const& disabledIndices);
+  /// One flat menu whose group titles are disabled caption rows.  Returns the
+  /// chosen ``{group, item}`` pair.
   std::optional<std::pair<size_t, size_t>> ShowGroupedActionMenu(
       std::wstring_view title,
       std::vector<NativeMenuGroup> const& groups,

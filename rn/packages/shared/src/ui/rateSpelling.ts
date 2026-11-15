@@ -22,7 +22,7 @@ export function rateNumber(value: string): number | undefined {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
-/** One stated rate with the `credits` unit word dropped. */
+/** One stated rate with its unit word dropped and its trailing zeros gone; a spelling it cannot read is returned unchanged. */
 export function rateSpelling(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return trimmed;

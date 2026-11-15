@@ -90,8 +90,9 @@ function isChinese(translate: Translator): boolean {
 }
 
 export function assistantSettingOptions(values: Array<string | AssistantSettingOption>, translate: Translator): AssistantSettingOption[] {
+  const chinese = isChinese(translate);
   return values.map((option) => {
     if (typeof option !== "string") return option;
-    return { value: option, label: isChinese(translate) ? optionLabels[option] ?? option : option };
+    return { value: option, label: chinese ? optionLabels[option] ?? option : option };
   });
 }

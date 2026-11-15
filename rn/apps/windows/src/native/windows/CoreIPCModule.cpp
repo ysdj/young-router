@@ -43,14 +43,17 @@ void CoreIPCModule::Send(
     winrt::Microsoft::ReactNative::ReactPromise<std::string> promise) noexcept {
   try {
     auto call_invoker = context_.CallInvoker();
-    std::thread([request = std::move(request), promise = std::move(promise), call_invoker]() mutable {
+    // ReactPromise is a copyable handle, so the lambdas take copies: the
+    // failure paths below need a live promise, and a moved-from handle cannot
+    // settle the JS one.
+    std::thread([request = std::move(request), promise, call_invoker]() mutable {
       try {
         std::string response = CoreIPCBridge::Shared().Send(request);
-        call_invoker->invokeAsync([promise = std::move(promise), response = std::move(response)](facebook::jsi::Runtime&) {
+        call_invoker->invokeAsync([promise, response = std::move(response)](facebook::jsi::Runtime&) {
           promise.Resolve(response);
         });
       } catch (...) {
-        call_invoker->invokeAsync([promise = std::move(promise)](facebook::jsi::Runtime&) { promise.Reject("The local Core is unavailable."); });
+        call_invoker->invokeAsync([promise](facebook::jsi::Runtime&) { promise.Reject("The local Core is unavailable."); });
       }
     }).detach();
   } catch (...) {
@@ -71,7 +74,10 @@ void CoreIPCModule::AddListener(std::string const&) noexcept {
 }
 
 void CoreIPCModule::RemoveListeners(double count) noexcept {
-  if (count > 0) return;
+  // The shared bridge holds this module together with its raw this pointer, so
+  // a root that drops its subscription has to detach here; the next Core event
+  // would otherwise be delivered into the torn-down module.
+  if (count <= 0) return;
   UnregisterEventHandler();
 }
 

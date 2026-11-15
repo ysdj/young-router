@@ -26,10 +26,14 @@ Young Router.app/
 young.router.proxy.runtime.plist
 *audit*.png
 output/
-# Staged build output (scripts/update_veridrop.py and
-# scripts/update_connect_workbuddy.py); never committed.
+# Staged build output (the scripts/update_*.py stagers); never committed.  A
+# build stages into its own cache, but each stager takes any ``--output`` and
+# the adapters resolve these directory names beside themselves.
 young_router/adapters/veridrop/
 young_router/adapters/connect-workbuddy/
+young_router/adapters/connect-qoder/
+young_router/adapters/dsh-vision-router/
+young_router/adapters/our-free-model/
 # Persistent third-party staging cache for scripts/build-and-install-macos.sh.
 # A build reuses a staged release only when its own upstream lookup resolves
 # that exact release; deleting this directory is always safe.

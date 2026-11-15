@@ -8,7 +8,7 @@ this application used to keep a hand-written Python mirror of.
 
 Upstream is a Node module and the vision fallback runs inside the Python
 LiteLLM process, so the package is not importable there.  It is therefore
-staged into the Core bundle the same way Veridrop and
+staged into the Core bundle the same way modelprint and
 ``dsh-connect-workbuddy`` are, and ``young_router/adapters/dsh_vision_worker.mjs``
 calls it through the bundled Node.js runtime.  This script resolves the npm
 ``latest`` dist-tag, installs the package plus the peer closure it needs, writes
@@ -197,9 +197,17 @@ def _shim_reaches_only_environment_of(npm_root: Path) -> None:
     divergence, so the build fails here instead.
     """
 
+    stub_directory = npm_root / "node_modules" / ENVIRONMENT_SHIM_PACKAGE
     offenders: set[str] = set()
-    for path in sorted((npm_root / "node_modules").rglob("*.js")):
-        if ENVIRONMENT_SHIM_PACKAGE in path.parts:
+    sources = sorted(
+        path
+        for pattern in ("*.js", "*.mjs", "*.cjs")
+        for path in (npm_root / "node_modules").rglob(pattern)
+    )
+    for path in sources:
+        # The stub is the one file allowed to name the module; its package
+        # specifier spans two path elements, so it is skipped as a directory.
+        if path.is_relative_to(stub_directory):
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         for line in text.splitlines():
@@ -230,9 +238,19 @@ def _imported_names(line: str) -> list[str]:
             for part in brace.group(1).split(",")
             if part.strip()
         )
+    require_brace = re.search(r"\{([^{}]*)\}\s*=\s*require\s*\(", line)
+    if require_brace:
+        names.extend(
+            part.strip().split(":")[0].split(" as ")[0].strip()
+            for part in require_brace.group(1).split(",")
+            if part.strip()
+        )
     single = re.search(r"import\s+(\w+)\s+from", line)
     if single:
         names.append(single.group(1))
+    require_module = re.search(r"\b(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(", line)
+    if require_module:
+        names.append(require_module.group(1))
     namespace = re.search(r"import\s+\*\s+as\s+(\w+)\s+from", line)
     if namespace:
         names.append(namespace.group(1))

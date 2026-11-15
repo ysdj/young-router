@@ -28,6 +28,7 @@ struct WinUI3NativeLeafModule {
   REACT_METHOD(ShowConfirmation, L"showConfirmation");
   REACT_METHOD(ShowReadOnlyText, L"showReadOnlyText");
   REACT_METHOD(ShowActionMenu, L"showActionMenu");
+  REACT_METHOD(ShowDisabledActionMenu, L"showDisabledActionMenu");
   REACT_METHOD(ShowGroupedActionMenu, L"showGroupedActionMenu");
   REACT_METHOD(ChooseModelsToAdd, L"chooseModelsToAdd");
   REACT_METHOD(SetLocalization, L"setLocalization");
@@ -88,6 +89,22 @@ struct WinUI3NativeLeafModule {
       std::wstring const& title,
       std::vector<std::wstring> const& items,
       winrt::Microsoft::ReactNative::JSValueObject const& anchor,
+      winrt::Microsoft::ReactNative::ReactPromise<std::optional<double>> const& promise) noexcept;
+  // The same menu with rows that are listed but cannot be picked.  A separate
+  // method rather than an extra argument: REACT_METHOD passes each JavaScript
+  // argument straight into the C++ parameter of the same position, so the
+  // existing three-argument call keeps working unchanged.
+  void ShowMenuWithUnavailableRows(
+      std::wstring const& title,
+      std::vector<std::wstring> const& items,
+      winrt::Microsoft::ReactNative::JSValueObject const& anchor,
+      winrt::Microsoft::ReactNative::JSValueArray const& disabledIndices,
+      winrt::Microsoft::ReactNative::ReactPromise<std::optional<double>> const& promise) noexcept;
+  void ShowDisabledActionMenu(
+      std::wstring const& title,
+      std::vector<std::wstring> const& items,
+      winrt::Microsoft::ReactNative::JSValueObject const& anchor,
+      winrt::Microsoft::ReactNative::JSValueArray const& disabledIndices,
       winrt::Microsoft::ReactNative::ReactPromise<std::optional<double>> const& promise) noexcept;
   void ShowGroupedActionMenu(
       std::wstring const& title,

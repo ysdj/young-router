@@ -51,12 +51,19 @@ relaunch() {
 }
 trap relaunch EXIT INT TERM
 
+# LITELLM_RUNTIME_ROOT names the installation root, so the port file lives in
+# its ``.litellm-runtime`` child.  The port the proxy recorded is the one it is
+# actually listening on, not the preference, and the health check below has to
+# ask the same port on both paths through this script -- so it is resolved here
+# rather than inside the stop.
+RUNTIME_ROOT="${LITELLM_RUNTIME_ROOT:+$LITELLM_RUNTIME_ROOT/.litellm-runtime}"
+RUNTIME_ROOT="${RUNTIME_ROOT:-$HOME/.young-router/.litellm-runtime}"
+recorded_port="$(cat "${YOUNG_ROUTER_PORT_FILE:-$RUNTIME_ROOT/litellm.port}" 2>/dev/null || true)"
+[[ "$recorded_port" =~ ^[0-9]{1,5}$ ]] || recorded_port=12390
+
 if [[ -n "$("$APP_PROCESSES" hosts "$APP")" ]]; then
   echo "Young Router: stopping (restart armed)"
   STOPPING_PIDS="$("$APP_PROCESSES" tree "$APP" | tr '\n' ' ')"
-  RUNTIME_ROOT="${LITELLM_RUNTIME_ROOT:-$HOME/.young-router/.litellm-runtime}"
-  recorded_port="$(cat "$RUNTIME_ROOT/litellm.port" 2>/dev/null || true)"
-  [[ "$recorded_port" =~ ^[0-9]{1,5}$ ]] || recorded_port=12390
   port_taken() {
     [[ -n "$(lsof -nP -iTCP:"$recorded_port" -sTCP:LISTEN -t 2>/dev/null)" ]]
   }
@@ -119,7 +126,7 @@ START_TIMEOUT_SECONDS="${YOUNG_ROUTER_START_TIMEOUT_SECONDS:-70}"
 deadline=$(( SECONDS + START_TIMEOUT_SECONDS ))
 while (( SECONDS < deadline )); do
   if [[ -n "$("$APP_PROCESSES" hosts "$APP")" ]]; then
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:12390/health/liveliness 2>/dev/null || echo 000)"
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:${recorded_port}/health/liveliness" 2>/dev/null || echo 000)"
     if [[ "$code" == "200" ]]; then
       echo "Young Router: running (proxy health check passed)"
       exit 0

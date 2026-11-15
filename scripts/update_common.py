@@ -102,10 +102,11 @@ def download_bytes(url: str, *, timeout: int, user_agent: str) -> bytes:
     persistent, which is what makes the reuse possible, and the header would
     only be a redundant thing for the origin to parse.
 
-    Every connection is established with its own ``connect()`` before being
-    cached, so a request that fails mid-flight leaves no half-open socket to
-    reuse: the failure falls back to ``request_bytes``' own fresh-connection
-    retry ladder below, which is also the path for a non-HTTPS URL.
+    A request that fails mid-flight closes the pooled connection, so no
+    half-open socket is reused (``http.client`` reconnects a closed connection
+    on its next request): the failure falls back to ``request_bytes``' own
+    fresh-connection retry ladder below, which is also the path for a non-HTTPS
+    URL.
     """
 
     parsed = urllib.parse.urlsplit(url)
@@ -116,6 +117,7 @@ def download_bytes(url: str, *, timeout: int, user_agent: str) -> bytes:
     if parsed.query:
         path = f"{path}?{parsed.query}"
     headers = {"Accept": "*/*", "User-Agent": user_agent}
+    connection: http.client.HTTPSConnection | None = None
     try:
         connection = _pooled_connection(origin, timeout)
         connection.request("GET", path, headers=headers)
@@ -131,8 +133,10 @@ def download_bytes(url: str, *, timeout: int, user_agent: str) -> bytes:
     except (http.client.HTTPException, OSError, TimeoutError):
         # A pooled connection a server retired is replaced, not re-requested
         # on: the caller gets urllib's full retry ladder on a fresh socket.
-        with suppress(Exception):
-            connection.close()
+        # There is none to close when opening it was what failed.
+        if connection is not None:
+            with suppress(Exception):
+                connection.close()
         return request_bytes(url, timeout=timeout, user_agent=user_agent)
 
 
@@ -150,16 +154,28 @@ def package_metadata(
     package_name: str,
     timeout: int,
     user_agent: str,
+    version: str | None = None,
 ) -> tuple[str, str, dict[str, Any]]:
-    """Resolve the ``latest`` dist-tag and its tarball from the npm registry."""
+    """Resolve one release and its tarball from the npm registry.
+
+    The ``latest`` dist-tag by default.  ``version`` names another release, and
+    then everything returned belongs to *that* release: a caller that only
+    replaced the version string kept ``latest``'s tarball and integrity, so it
+    installed one release and recorded another.
+    """
 
     payload = request_json(registry_url, timeout=timeout, user_agent=user_agent)
     if not isinstance(payload, dict):
         raise UpdateError(f"npm registry returned an invalid {package_name} metadata object")
-    dist_tags = payload.get("dist-tags")
-    latest = dist_tags.get("latest") if isinstance(dist_tags, dict) else None
-    if not isinstance(latest, str) or not PACKAGE_VERSION_PATTERN.fullmatch(latest):
-        raise UpdateError(f"npm registry did not return a stable {package_name} latest version")
+    if version is not None:
+        if not PACKAGE_VERSION_PATTERN.fullmatch(version):
+            raise UpdateError(f"Invalid requested {package_name} version: {version}")
+        latest = version
+    else:
+        dist_tags = payload.get("dist-tags")
+        latest = dist_tags.get("latest") if isinstance(dist_tags, dict) else None
+        if not isinstance(latest, str) or not PACKAGE_VERSION_PATTERN.fullmatch(latest):
+            raise UpdateError(f"npm registry did not return a stable {package_name} latest version")
     versions = payload.get("versions")
     version_payload = versions.get(latest) if isinstance(versions, dict) else None
     if not isinstance(version_payload, dict):

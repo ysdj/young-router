@@ -172,8 +172,12 @@ if [ -n "$found" ]; then
 fi
 
 if [ -z "$found" ]; then
-  if ! install_browser; then
-    status=$?
+  # The status has to be taken from install_browser itself: under
+  # `if ! install_browser` it would be the 0 of the negated test, and an
+  # unsupported host would be reported as one that needs an operator.
+  status=0
+  install_browser || status=$?
+  if [ "$status" != 0 ]; then
     if [ "$status" = "2" ]; then
       echo "install-chromium: no package manager here knows chromium; install Google Chrome, Chromium, Edge or Brave by hand" >&2
       exit 2

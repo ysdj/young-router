@@ -182,6 +182,11 @@ def resolve_release(tags_url: str = TAGS_URL) -> dict[str, Any]:
         version = tag[1:] if tag.startswith("v") else tag
         if not re.fullmatch(PACKAGE_VERSION_PATTERN, version):
             continue
+        # ``0.11.0-rc.1`` passes the pattern above but extends the key of
+        # ``0.11.0``, so it would win ``max`` against the stable release it
+        # precedes; only a plain ``X.Y.Z`` tag is a release this gate can pin.
+        if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+            continue
         versions.append((version, tag, commit))
     if not versions:
         raise UpdateError(f"{REPOSITORY} publishes no version tag")

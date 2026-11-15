@@ -126,6 +126,7 @@ import Foundation
                 guard self.isValidResponseEnvelope(body, requestID: metadata.requestID),
                       let text = String(data: body, encoding: .utf8) else {
                     _ = self.resetCore(expectedGeneration: requestGeneration)
+                    self.scheduleSubscriptionRecovery()
                     throw BridgeError.invalidResponse
                 }
                 self.startPollingIfSubscription(in: text, request: request, method: metadata.method, generation: requestGeneration)
@@ -393,7 +394,6 @@ import Foundation
               token.utf8.count <= 256,
               object["revision"] is NSNumber,
               let present = object["present"] as? Bool else {
-            if response.statusCode >= 500 { _ = resetCore(expectedGeneration: requestGeneration) }
             throw BridgeError.invalidResponse
         }
         return SecretCapability(token: token, present: present)
@@ -424,7 +424,6 @@ import Foundation
               revision.doubleValue.rounded(.towardZero) == revision.doubleValue,
               revision.intValue >= 0,
               let present = object["present"] as? Bool else {
-            if response.statusCode >= 500 { _ = resetCore(expectedGeneration: requestGeneration) }
             throw BridgeError.invalidResponse
         }
         return SecretStageResult(revision: revision.intValue, present: present)
@@ -469,7 +468,6 @@ import Foundation
               revision.doubleValue.rounded(.towardZero) == revision.doubleValue,
               revision.intValue >= 0,
               object["present"] is Bool else {
-            if response.statusCode >= 500 { _ = resetCore(expectedGeneration: requestGeneration) }
             throw BridgeError.invalidResponse
         }
         return SecretReadCapability(token: token)
@@ -497,7 +495,6 @@ import Foundation
               !value.contains("\u{0000}"),
               (allowMultiline || !value.contains("\r")),
               (allowMultiline || !value.contains("\n")) else {
-            if response.statusCode >= 500 { _ = resetCore(expectedGeneration: requestGeneration) }
             throw BridgeError.invalidResponse
         }
         return value
@@ -710,10 +707,11 @@ import Foundation
     /// Renew `credential` and adopt the result when nothing replaced that Core
     /// meanwhile.
     ///
-    /// Called with neither `lock` nor `startLock` held: a renewal is a loopback
-    /// round trip, and ten windows renewing at the same moment must not queue
-    /// behind each other.  Returns nil when the Core this credential belongs to
-    /// is gone, which is the caller's cue to start a new one.
+    /// Called with `lock` released: a renewal is a loopback round trip, and ten
+    /// windows renewing at the same moment must not queue behind each other.
+    /// The `startSession` caller still holds `startLock`, since it is already
+    /// inside the Core replace path.  Returns nil when the Core this credential
+    /// belongs to is gone, which is the caller's cue to start a new one.
     private func renewedSession(
         endpoint: Endpoint,
         credential: String,
@@ -777,9 +775,11 @@ import Foundation
     /// Every caller that needs a new Core passes through `startLock` and then
     /// re-reads the session under `lock`: a window's first request and the
     /// warm-up arrive here together, and the second to arrive must return the
-    /// Core the first one started instead of starting a second process. Neither
-    /// `lock` nor `startLock` is held across the process launch or the bootstrap
-    /// exchange -- together they are the ten-second startup wait.
+    /// Core the first one started instead of starting a second process.
+    /// `startLock` is deliberately held across that whole replace path -- stop,
+    /// launch, bootstrap, which together are the ten-second startup wait --
+    /// because releasing it there is exactly what would start two Cores; only
+    /// `lock` is released before the launch.
     private func startSession(observedGeneration: Int) throws -> (Endpoint, String, Int, Bool) {
         startLock.lock()
         defer { startLock.unlock() }
@@ -896,6 +896,7 @@ import Foundation
             bundledPython,
         ].compactMap { $0 }
         guard let python = pythonCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            try? fileManager.removeItem(at: directory)
             throw BridgeError.unavailable
         }
         process.executableURL = URL(fileURLWithPath: python)
@@ -914,9 +915,7 @@ import Foundation
         // recovery) restarts Core's shared revision at zero while every open
         // window still holds the older, larger revision, so those windows drop
         // every later snapshot and report conflicts the user never caused.
-        if let metadataPath = coreMetadataPath(environment: childEnvironment) {
-            arguments.append(contentsOf: ["--metadata", metadataPath])
-        }
+        arguments.append(contentsOf: ["--metadata", coreMetadataPath(environment: childEnvironment)])
         process.arguments = arguments
         // An explicitly isolated Preview must never fall back to the user's
         // production configuration, assistant state, or LiteLLM service. The
@@ -934,19 +933,20 @@ import Foundation
         // wrapper redirects Core's imports. Python's no-bytecode mode keeps
         // this early import sealed; after the wrapper loads, Core writes its own
         // runtime cache to the private directory below.
-        if let metadataPath = coreMetadataPath(environment: childEnvironment) {
-            childEnvironment["YOUNG_ROUTER_PYCACHE_DIR"] =
-                "\((metadataPath as NSString).deletingLastPathComponent)/core-state/pycache"
-            childEnvironment.removeValue(forKey: "PYTHONPYCACHEPREFIX")
-        } else {
-            childEnvironment.removeValue(forKey: "YOUNG_ROUTER_PYCACHE_DIR")
-            childEnvironment.removeValue(forKey: "PYTHONPYCACHEPREFIX")
-        }
+        let metadataPath = coreMetadataPath(environment: childEnvironment)
+        childEnvironment["YOUNG_ROUTER_PYCACHE_DIR"] =
+            "\((metadataPath as NSString).deletingLastPathComponent)/core-state/pycache"
+        childEnvironment.removeValue(forKey: "PYTHONPYCACHEPREFIX")
         childEnvironment["PYTHONDONTWRITEBYTECODE"] = "1"
         process.environment = childEnvironment
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
-        try process.run()
+        do {
+            try process.run()
+        } catch {
+            try? fileManager.removeItem(at: directory)
+            throw error
+        }
 
         let deadline = Date().addingTimeInterval(Self.coreStartupTimeout)
         while Date() < deadline {
@@ -974,7 +974,7 @@ import Foundation
     }
 
     /// Resolve the same private runtime root Core derives from its environment.
-    private func coreMetadataPath(environment: [String: String]) -> String? {
+    private func coreMetadataPath(environment: [String: String]) -> String {
         let configured = environment["YOUNG_ROUTER_HOME"] ?? environment["LITELLM_RUNTIME_ROOT"]
         let root: String
         if let configured, !configured.isEmpty {
@@ -1148,9 +1148,6 @@ import Foundation
         }
     }
 
-    /// A model probe waits for the deployment's own first-event budget and then
-    /// for a complete fingerprint answer, so it outlives the transport default.
-    /// Every other method keeps the short bound that keeps the UI responsive.
     /// How long one Core reply may take.
     ///
     /// The probe and a WebDAV sync cross the network, so either can take

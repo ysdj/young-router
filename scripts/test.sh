@@ -63,8 +63,16 @@ if (($# == 0)); then
   # YOUNG_ROUTER_TEST_SHARDS=1 restores the serial run, which is what to use when
   # comparing against a stored log or bisecting an order-dependent failure.
   shards="${YOUNG_ROUTER_TEST_SHARDS:-0}"
+  # The interpreter is a command, not always one word: the uv fallback above is
+  # ``uv run ... python``.  Handing the driver only its first word ran
+  # ``uv -m unittest`` in every shard, so a checkout with neither the installed
+  # app nor LITELLM_TEST_PYTHON failed the whole suite without running a test.
+  interpreter=()
+  for word in "${TEST_COMMAND[@]}"; do
+    interpreter+=("--python-arg=$word")
+  done
   exec env PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_shards.py \
-    --python "${TEST_COMMAND[0]}" \
+    "${interpreter[@]}" \
     --shards "$shards" \
     -- tests/test*.py
 fi

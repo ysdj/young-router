@@ -292,21 +292,11 @@ bool HasRequiredCoreFiles(std::wstring const& core_directory) {
   return true;
 }
 
-std::string RequestMethod(std::string const& request_json) {
-  try {
-    auto request = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(request_json));
-    return WideToUtf8(request.GetNamedString(L"method", L"").c_str());
-  } catch (...) {
-    return {};
-  }
-}
-
 // A WebDAV sync reads and writes a remote file, so it can take minutes like a
 // model probe.  Applying the 30 s default to it reported "core unavailable"
 // while Core was still finishing the sync it had already started.
-bool IsWebdavRemoteOperation(std::string const& request_json) {
+bool IsWebdavRemoteOperation(winrt::Windows::Data::Json::JsonObject const& request) {
   try {
-    auto request = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(request_json));
     if (WideToUtf8(request.GetNamedString(L"method", L"").c_str()) != "dispatch") return false;
     auto action = request.GetNamedObject(L"params").GetNamedObject(L"action");
     if (WideToUtf8(action.GetNamedString(L"domain", L"").c_str()) != std::string("webdav")) return false;
@@ -322,9 +312,8 @@ bool IsWebdavRemoteOperation(std::string const& request_json) {
 // answers one page in anywhere from one second to over a minute, so the 30 s
 // default abandoned the read and the pane then reported a relay it had just
 // chosen as if nothing were selected.
-bool IsOnlineUsageReadOperation(std::string const& request_json) {
+bool IsOnlineUsageReadOperation(winrt::Windows::Data::Json::JsonObject const& request) {
   try {
-    auto request = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(request_json));
     if (WideToUtf8(request.GetNamedString(L"method", L"").c_str()) != "dispatch") return false;
     auto action = request.GetNamedObject(L"params").GetNamedObject(L"action");
     if (WideToUtf8(action.GetNamedString(L"domain", L"").c_str()) != std::string("logs")) return false;
@@ -338,9 +327,8 @@ bool IsOnlineUsageReadOperation(std::string const& request_json) {
 // A managed-proxy lifecycle dispatch replaces the proxy, which the drain budget
 // lets run for minutes.  The 30 s default expired mid-restart and tore Core
 // down, leaving every window stating "starting" with nothing to correct it.
-bool IsServiceLifecycleOperation(std::string const& request_json) {
+bool IsServiceLifecycleOperation(winrt::Windows::Data::Json::JsonObject const& request) {
   try {
-    auto request = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(request_json));
     if (WideToUtf8(request.GetNamedString(L"method", L"").c_str()) != "dispatch") return false;
     auto action = request.GetNamedObject(L"params").GetNamedObject(L"action");
     if (action.HasKey(L"domain")) return false;
@@ -402,7 +390,11 @@ void CoreIPCBridge::RemoveEventHandler(int token) {
 
 std::string CoreIPCBridge::Send(std::string const& request_json) {
   if (stopping_) throw std::runtime_error("core unavailable");
-  const std::string method = RequestMethod(request_json);
+  // One parse answers the method and every timeout predicate.  Each helper
+  // used to convert and parse the body on its own, so one dispatch paid four
+  // full UTF-8 -> UTF-16 conversions plus parses of the same bytes.
+  auto parsed_request = winrt::Windows::Data::Json::JsonObject::Parse(Utf8ToWide(request_json));
+  const std::string method = WideToUtf8(parsed_request.GetNamedString(L"method", L"").c_str());
   const bool is_subscription = method == "subscribe";
   // A model probe waits for the deployment's own first-event budget and then
   // for a complete fingerprint answer, so it outlives the 30 s default; a
@@ -411,9 +403,9 @@ std::string CoreIPCBridge::Send(std::string const& request_json) {
   // station answers one page in anywhere from one second to over a minute; the
   // 30 s default abandoned those reads and the pane then reported a relay it
   // had just chosen as if nothing were selected.
-  const bool slow_remote_operation = method == "probe" || IsWebdavRemoteOperation(request_json) ||
-                                     IsServiceLifecycleOperation(request_json) ||
-                                     IsOnlineUsageReadOperation(request_json);
+  const bool slow_remote_operation = method == "probe" || IsWebdavRemoteOperation(parsed_request) ||
+                                     IsServiceLifecycleOperation(parsed_request) ||
+                                     IsOnlineUsageReadOperation(parsed_request);
   const int receive_timeout_ms = slow_remote_operation ? 900000 : 30000;
   for (int attempt = 0; attempt < 2; ++attempt) {
     auto [endpoint, session, generation] = EnsureSession();
@@ -831,7 +823,17 @@ CoreIPCBridge::Session CoreIPCBridge::EnsureSession() {
         static_cast<LONG>(session_expires_at_tick_ - GetTickCount()) > 15000) {
       return {*endpoint_, session_token_, core_generation_};
     }
-    session_error_ = nullptr;
+    // A completed attempt that recorded a failure answers with it: this
+    // waiter used to clear the record and start a second Core over the first
+    // one's failure, so the reason the call failed never reached anyone.
+    // Clearing it as it is taken means the next caller starts a fresh attempt
+    // instead of reading the same failure forever.
+    if (session_error_) {
+      auto failure = session_error_;
+      session_error_ = nullptr;
+      lock.unlock();
+      std::rethrow_exception(failure);
+    }
   }
   if (endpoint_ && !session_token_.empty() &&
       static_cast<LONG>(session_expires_at_tick_ - GetTickCount()) > 15000) {
@@ -982,7 +984,10 @@ CoreIPCBridge::Endpoint CoreIPCBridge::StartCoreLocked() {
   }
   CloseHandle(process.hThread);
 
-  for (int attempt = 0; attempt < 100; ++attempt) {
+  // Ten seconds, the same budget the macOS bridge gives the same descriptor:
+  // a first start on a slow disk has to import the whole Python runtime before
+  // Core can publish its endpoint, and five seconds killed a healthy start.
+  for (int attempt = 0; attempt < 200; ++attempt) {
     std::string text = ReadSmallFile(descriptor);
     if (!text.empty()) {
       try {
@@ -1115,6 +1120,10 @@ void CoreIPCBridge::StartPollingIfSubscription(
     }
     JoinRetiredPollThread();
     std::lock_guard poll_guard(poll_mutex_);
+    // The slot is free here: ``JoinRetiredPollThread`` joined the previous
+    // loop, or detached it when this very thread is that loop and cannot wait
+    // on itself.  Assigning over a joinable std::thread calls std::terminate,
+    // which is what a second subscriber used to hit.
     poll_thread_ = std::thread([this, subscription] { PollEvents(subscription); });
   } catch (...) {
   }
@@ -1230,7 +1239,14 @@ bool CoreIPCBridge::IsSessionFailure(unsigned long status) noexcept {
 void CoreIPCBridge::JoinRetiredPollThread() {
   std::unique_lock poll_lock(poll_mutex_);
   if (!poll_thread_.joinable()) return;
-  if (poll_thread_.get_id() == std::this_thread::get_id()) return;
+  if (poll_thread_.get_id() == std::this_thread::get_id()) {
+    // A subscription arriving from inside the poll loop cannot wait on that
+    // loop.  Detaching frees the slot without blocking; the loop notices the
+    // replaced subscription and returns on its own, and the caller assigns a
+    // fresh thread over a slot that is no longer joinable.
+    poll_thread_.detach();
+    return;
+  }
   std::thread retired = std::move(poll_thread_);
   poll_lock.unlock();
   retired.join();

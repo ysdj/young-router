@@ -286,6 +286,8 @@ type RadioProps = {
 type PickerProps = {
   labels: string[];
   selectedValue: string;
+  /** Indices listed but not choosable (a relay whose login has lapsed). */
+  disabledIndices?: number[];
   disabled?: boolean;
   compact?: boolean;
   /** A macOS overlay that must remain above native content controls. */
@@ -348,7 +350,7 @@ type TableProps = {
   sourceList?: boolean;
   /** Per-row SF Symbol names (macOS) / semantic icon names (Windows). */
   rowSymbols?: string[];
-  /** Per-row sRGB hex badge colors behind each source-list symbol. */
+  /** Per-row sRGB hex colors for each source-list symbol: the macOS badge, the glyph's ink elsewhere. */
   rowSymbolColors?: string[];
   /** Per-row bundled icon-tile asset names; preferred over symbol/color. */
   rowImageNames?: string[];
@@ -491,7 +493,11 @@ function WindowsButton({ title, symbol, symbolWithTitle, symbolTrailing, toolTip
   // A destructive (and a primary) button fills its bezel with that colour, so
   // the label has to be the on-accent ink: reading in `danger` on a `danger`
   // fill is red on red — the one button the user must be able to read.
-  const ink = disabled ? WINDOWS_CONTROL.textDisabled : destructive ? WINDOWS_CONTROL.fill : primary ? WINDOWS_CONTROL.fill : link ? WINDOWS_CONTROL.accent : WINDOWS_CONTROL.text;
+  //
+  // A plain link is the quiet variant: it carries no accent ink, only the
+  // underline, so it reads as the value the row shows rather than as a
+  // navigation target beside it.
+  const ink = disabled ? WINDOWS_CONTROL.textDisabled : destructive ? WINDOWS_CONTROL.fill : primary ? WINDOWS_CONTROL.fill : plainLink ? WINDOWS_CONTROL.textSecondary : link ? WINDOWS_CONTROL.accent : WINDOWS_CONTROL.text;
   return <Pressable
     ref={ref as never}
     disabled={disabled}
@@ -604,12 +610,22 @@ type WindowsActionMenuBridge = {
     items: string[],
     anchor: { x: number; y: number; width: number; height: number },
   ) => Promise<number | undefined>;
+  /** The same menu with rows listed but not pickable. */
+  showDisabledActionMenu?: (
+    title: string,
+    items: string[],
+    anchor: { x: number; y: number; width: number; height: number },
+    disabledIndices: number[],
+  ) => Promise<number | undefined>;
 };
 
-function WindowsPicker({ labels, selectedValue, disabled, compact = true, accessibilityLabel, onChange, style }: PickerProps): React.JSX.Element {
+function WindowsPicker({ labels, selectedValue, disabledIndices = [], disabled, compact = true, accessibilityLabel, onChange, style }: PickerProps): React.JSX.Element {
   const triggerRef = React.useRef<View>(null);
   const selectedIndex = labels.indexOf(selectedValue);
   const choose = (index: number): void => {
+    // A listed-but-unavailable row answers nothing: the native menu greys it,
+    // and a click that arrives anyway must not select it.
+    if (disabledIndices.includes(index)) return;
     const value = labels[index] ?? "";
     onChange?.({ nativeEvent: { value, index } } as NativeSyntheticEvent<{ value: string; index: number }>);
   };
@@ -617,8 +633,13 @@ function WindowsPicker({ labels, selectedValue, disabled, compact = true, access
     if (disabled || labels.length === 0) return;
     const bridge = (NativeModules as { LiteLLMNativeLeaf?: WindowsActionMenuBridge }).LiteLLMNativeLeaf;
     triggerRef.current?.measureInWindow((x, y, width, height) => {
-      void bridge?.showActionMenu?.(selectedValue || " ", labels, { x, y, width, height })
-        .then((index) => {
+      // A picker with nothing unavailable keeps the original call: the host
+      // that predates this method must still open its menu.
+      const opened = disabledIndices.length > 0 && bridge?.showDisabledActionMenu
+        ? bridge.showDisabledActionMenu(selectedValue || " ", labels, { x, y, width, height }, disabledIndices)
+        : bridge?.showActionMenu?.(selectedValue || " ", labels, { x, y, width, height });
+      void opened
+        ?.then((index) => {
           if (typeof index === "number" && index >= 0 && index < labels.length) choose(index);
         })
         .catch(() => undefined);
@@ -920,14 +941,14 @@ export function NativeRadio({ label, value, disabled, onValueChange, style }: Ra
   </Pressable>;
 }
 
-export function NativePicker({ labels, selectedValue, disabled, compact = true, overlayLayer = false, accessibilityLabel, onChange, style }: PickerProps): React.JSX.Element {
+export function NativePicker({ labels, selectedValue, disabledIndices, disabled, compact = true, overlayLayer = false, accessibilityLabel, onChange, style }: PickerProps): React.JSX.Element {
   if (Platform.OS === "windows") {
-    return <WindowsPicker labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} accessibilityLabel={accessibilityLabel} onChange={onChange} style={style} />;
+    return <WindowsPicker labels={labels} selectedValue={selectedValue} disabledIndices={disabledIndices} disabled={disabled} compact={compact} accessibilityLabel={accessibilityLabel} onChange={onChange} style={style} />;
   }
   if (Platform.OS === "macos") {
-    return <AppKitPicker labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} overlayLayer={overlayLayer} accessibilityLabel={accessibilityLabel} onChange={onChange} style={[compact && style === undefined ? { minWidth: pickerLabelWidth(labels, selectedValue) } : null, style]} />;
+    return <AppKitPicker labels={labels} selectedValue={selectedValue} disabledIndices={disabledIndices} disabled={disabled} compact={compact} overlayLayer={overlayLayer} accessibilityLabel={accessibilityLabel} onChange={onChange} style={[compact && style === undefined ? { minWidth: pickerLabelWidth(labels, selectedValue) } : null, style]} />;
   }
-  if (Platform.OS === "web") return <WebPicker labels={labels} selectedValue={selectedValue} disabled={disabled} accessibilityLabel={accessibilityLabel} onChange={onChange} style={style} />;
+  if (Platform.OS === "web") return <WebPicker labels={labels} selectedValue={selectedValue} disabledIndices={disabledIndices} disabled={disabled} accessibilityLabel={accessibilityLabel} onChange={onChange} style={style} />;
   return <NativeSegmentedControl labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} onChange={onChange} style={style} />;
 }
 
@@ -940,7 +961,7 @@ export function NativePicker({ labels, selectedValue, disabled, compact = true, 
  * all in a browser.  `labels` and `selectedValue` are the same pair the native
  * pickers take; the index in the answer is what they report.
  */
-function WebPicker({ labels, selectedValue, disabled, accessibilityLabel, onChange, style }: PickerProps): React.JSX.Element {
+function WebPicker({ labels, selectedValue, disabledIndices = [], disabled, accessibilityLabel, onChange, style }: PickerProps): React.JSX.Element {
   return <View style={[styles.webPickerFrame, style]}>
     <select
       aria-label={accessibilityLabel}
@@ -949,7 +970,7 @@ function WebPicker({ labels, selectedValue, disabled, accessibilityLabel, onChan
       onChange={(event) => onChange?.({ nativeEvent: { value: event.target.value, index: labels.indexOf(event.target.value) } } as unknown as NativeSyntheticEvent<{ value: string; index: number }>)}
       style={WEB_SELECT_STYLE}
     >
-      {labels.map((label) => <option key={label} value={label}>{label}</option>)}
+      {labels.map((label, index) => <option key={label} value={label} disabled={disabledIndices.includes(index)}>{label}</option>)}
     </select>
   </View>;
 }
@@ -1032,9 +1053,10 @@ function sameColumns(left: TableColumn[], right: TableColumn[]): boolean {
   return true;
 }
 
-function sameTableRow(previous: { row: TableRow; index: number; columns: TableColumn[]; compact: boolean; sourceList: boolean; stripedRows: boolean; selected: boolean; disabled: boolean; secondaryRow: boolean; alert: boolean; rowSymbol?: string; rowSymbolColor?: string; rowImageName?: string; secondaryCellKeys: Set<string>; selectableSpanning: boolean; onSelect: (row: TableRow, index: number) => void }, next: typeof previous): boolean {
+function sameTableRow(previous: { row: TableRow; index: number; rowHeight: number; columns: TableColumn[]; compact: boolean; sourceList: boolean; stripedRows: boolean; selected: boolean; disabled: boolean; secondaryRow: boolean; alert: boolean; rowSymbol?: string; rowSymbolColor?: string; rowImageName?: string; secondaryCellKeys: Set<string>; detail?: string; selectableSpanning: boolean; cellPadding: number; firstColumnPadding: number; onSelect: (row: TableRow, index: number) => void }, next: typeof previous): boolean {
   return previous.row === next.row
     && previous.index === next.index
+    && previous.rowHeight === next.rowHeight
     && previous.compact === next.compact
     && previous.sourceList === next.sourceList
     && previous.stripedRows === next.stripedRows
@@ -1046,7 +1068,10 @@ function sameTableRow(previous: { row: TableRow; index: number; columns: TableCo
     && previous.rowSymbolColor === next.rowSymbolColor
     && previous.rowImageName === next.rowImageName
     && previous.secondaryCellKeys === next.secondaryCellKeys
+    && previous.detail === next.detail
     && previous.selectableSpanning === next.selectableSpanning
+    && previous.cellPadding === next.cellPadding
+    && previous.firstColumnPadding === next.firstColumnPadding
     && previous.onSelect === next.onSelect
     && sameColumns(previous.columns, next.columns);
 }
@@ -1238,10 +1263,12 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
                 What must not happen on the web is the glyph fallback below: a
                 browser has no "Segoe MDL2 Assets", so a glyph character renders
                 as a missing-glyph box beside every sidebar row. A tile is a
-                tile, and a missing one leaves the slot empty. */}
+                tile, and a missing one leaves the slot empty. The glyph carries
+                the row's colour as its own ink, never on a tile behind it: a
+                tinted badge around a Segoe mark reads as an emoji. */}
             {sourceImage !== undefined
               ? <Image source={sourceImage} style={windowsTableStyles.sourceImage} />
-              : Platform.OS !== "web" && rowSymbol ? <Text style={[windowsTableStyles.symbol, { color: disabled ? WINDOWS_CONTROL.textDisabled : selected ? WINDOWS_CONTROL.text : WINDOWS_CONTROL.textSecondary }]}>{windowsSourceSymbol(rowSymbol)}</Text> : null}
+              : Platform.OS !== "web" && rowSymbol ? <Text style={[windowsTableStyles.symbol, { color: disabled ? WINDOWS_CONTROL.textDisabled : rowSymbolColor || (selected ? WINDOWS_CONTROL.text : WINDOWS_CONTROL.textSecondary) }]}>{windowsSourceSymbol(rowSymbol)}</Text> : null}
             <View style={windowsTableStyles.sourceCellTextColumn}>
               <Text numberOfLines={1} style={[windowsTableStyles.cellText, { color: cellColor }]}>{visibleCell}</Text>
               {detail ? <Text numberOfLines={1} style={windowsTableStyles.sourceCellDetail}>{detail}</Text> : null}
@@ -1347,7 +1374,17 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   // metrics are read off the list node: RNW's `onScroll` fires, but the
   // content/viewport pair is cheaper here and stays right when rows resize.
   const listNode = React.useRef<HTMLElement | null>(null);
-  const [scrollMetrics, setScrollMetrics] = React.useState({ overflow: false, height: 0, offset: 0 });
+  // The capsule is drawn in the table's frame, and the frame is taller than the
+  // scrolling list: the column header is a sibling above the list, inside the
+  // horizontal scroller.  The thumb's travel therefore has to be measured from
+  // the list's own top edge, not the frame's -- a capsule anchored to the frame
+  // started inside the header and, at the end of a list, stopped a whole header
+  // (30 pt) short of the bottom, which reads as a scroll that cannot finish.
+  const frameNode = React.useRef<HTMLElement | null>(null);
+  const setFrameRef = React.useCallback((instance: unknown) => {
+    frameNode.current = Platform.OS === "web" && instance instanceof HTMLElement ? instance : null;
+  }, []);
+  const [scrollMetrics, setScrollMetrics] = React.useState({ overflow: false, top: 0, height: 0, offset: 0 });
   const readScrollMetrics = React.useCallback(() => {
     const node = listNode.current;
     if (!node) return;
@@ -1360,13 +1397,19 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
     // out again) for a capsule that had not moved.
     const overflow = node.scrollHeight > node.clientHeight + 1;
     const height = overflow ? Math.max(24, (node.clientHeight * node.clientHeight) / node.scrollHeight) : 0;
+    // Where the list sits inside the frame it shares with the header: 0 for a
+    // source list (no header, no horizontal scroller), the header's height for
+    // every data table.  A frame that cannot be read (a native host) leaves the
+    // capsule where it was, at the frame's top.
+    const frame = frameNode.current;
+    const top = frame ? Math.max(0, Math.round(node.getBoundingClientRect().top - frame.getBoundingClientRect().top)) : 0;
     const range = Math.max(1, node.scrollHeight - node.clientHeight);
     const travel = Math.max(0, node.clientHeight - height - 4);
     const offset = Math.min(travel, (node.scrollTop / range) * travel);
     setScrollMetrics((current) => (
-      current.overflow === overflow && current.height === height && Math.abs(current.offset - offset) < 0.5
+      current.overflow === overflow && current.top === top && current.height === height && Math.abs(current.offset - offset) < 0.5
         ? current
-        : { overflow, height, offset }
+        : { overflow, top, height, offset }
     ));
   }, []);
   React.useEffect(() => {
@@ -1421,9 +1464,11 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
         // RNW ScrollView) answers `getScrollableNode`, which is the element the
         // browser's own `overflow: auto` lives on.  On the native leaves this
         // host never renders, so a node that has none simply leaves the thumb
-        // unassembled.
+        // unassembled.  The platform check comes first: a native bundle has no
+        // `HTMLElement`, and `instanceof` evaluates that operand before it could
+        // return false.
         const scrollable = (instance as unknown as { getScrollableNode?: () => unknown } | null)?.getScrollableNode?.();
-        listNode.current = scrollable instanceof HTMLElement ? scrollable : null;
+        listNode.current = Platform.OS === "web" && scrollable instanceof HTMLElement ? scrollable : null;
       }}
       data={rows}
       renderItem={renderRow}
@@ -1457,9 +1502,9 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   // the list instead.  Out here it stays on the frame's edge the way every
   // persistent scroller in this app does, and the metrics are the same list's.
   const scrollThumb = scrollMetrics.overflow && scrollMetrics.height > 0
-    ? <View pointerEvents="none" style={[windowsTableStyles.tableScrollThumb, { height: scrollMetrics.height, transform: [{ translateY: scrollMetrics.offset }] }]} />
+    ? <View pointerEvents="none" style={[windowsTableStyles.tableScrollThumb, { top: scrollMetrics.top + 2, height: scrollMetrics.height, transform: [{ translateY: scrollMetrics.offset }] }]} />
     : null;
-  return <View style={[windowsTableStyles.root, !framed && windowsTableStyles.borderless, style]}>
+  return <View ref={setFrameRef} style={[windowsTableStyles.root, !framed && windowsTableStyles.borderless, style]}>
     {/* A source list is a navigation pane, so it lays its rows out at the pane's
         own width and never scrolls horizontally.  Wrapping it in the data
         table's horizontal scroller made the sidebar slide sideways by a
@@ -1571,7 +1616,11 @@ const windowsTableStyles = StyleSheet.create({
   // browser's own `overflow: auto` bar is an overlay that shows itself only
   // mid-scroll, so a list with more rows than it shows read as a list that
   // ended — the keys list in the provider inspector, four rows of nine.
-  tableScrollThumb: { position: "absolute", top: 2, right: 2, width: 4, borderRadius: 2, backgroundColor: "rgba(96,96,96,0.55)" },
+  // The capsule's `top` is the list's own top edge inside the frame, measured
+  // when the table lays out: the column header above the list is not part of
+  // the scroller, and a bar anchored to the frame's top did not line up with
+  // either end of the list it describes.
+  tableScrollThumb: { position: "absolute", right: 2, width: 4, borderRadius: 2, backgroundColor: "rgba(96,96,96,0.55)" },
   body: { flexGrow: 1 },
   row: { minWidth: "100%", borderBottomWidth: 1, borderBottomColor: WINDOWS_CONTROL.strokeSubtle, justifyContent: "center" },
   // A source list is a navigation surface, not a data table: no row rules,
@@ -1581,8 +1630,6 @@ const windowsTableStyles = StyleSheet.create({
   sourceRowSelected: { backgroundColor: WINDOWS_CONTROL.fillSelected },
   sourceRowHover: { backgroundColor: WINDOWS_CONTROL.fillHover },
   sourceSelectionIndicator: { position: "absolute", left: 0, width: 3, height: 16, borderRadius: 1.5, backgroundColor: WINDOWS_CONTROL.accent },
-  rowCompact: { minHeight: 30 },
-  rowRelaxed: { minHeight: 36 },
   rowStripe: { backgroundColor: WINDOWS_CONTROL.fillSubtle },
   rowSelected: { backgroundColor: WINDOWS_CONTROL.accentSubtle, borderLeftWidth: 3, borderLeftColor: WINDOWS_CONTROL.accent },
   rowDisabled: { opacity: 0.72 },
@@ -1596,7 +1643,6 @@ const windowsTableStyles = StyleSheet.create({
   sourceCellViewFlex: { flex: 1, minWidth: 0 },
   cellText: { flexShrink: 1, minWidth: 0, fontSize: UI_FONT_SIZE },
   cell: { color: WINDOWS_CONTROL.text, fontSize: UI_FONT_SIZE },
-  sourceCell: { flexDirection: "row", alignItems: "center" },
   sourceImage: { width: 20, height: 20, marginRight: 8, borderRadius: 4 },
   symbol: { width: 20, height: 20, marginRight: 8, fontFamily: GLYPH_FONT_FAMILY, fontSize: 16, lineHeight: 20, textAlign: "center", transform: [{ translateY: 1 }] },
   groupText: { paddingHorizontal: 12, color: WINDOWS_CONTROL.textSecondary, fontSize: UI_TIP_FONT_SIZE, fontWeight: "600" },
@@ -1783,11 +1829,8 @@ function WebSecureTextInput({ domain, field, target, label, placeholder, multili
   onSecretState?: (state: SecureTextInputState) => void;
   style?: StyleProp<ViewStyle>;
 }): React.JSX.Element {
-  // The shared UI owns commit timing for a field that commits on demand
-  // (`NativeSecretInputControl` in `YoungRouterApp.tsx`): it asks the host to
-  // commit through `commitRequest`.  An `autoCommit` field has no such asker —
-  // the native leaves stage it after their own quiet period — so this leaf
-  // owns that timer itself.
+  // The shared controller owns the auto-commit debounce; this leaf stages only
+  // when that commit arrives as `commitRequest`.
   const inputRef = React.useRef<TextInput>(null);
   const valueRef = React.useRef("");
   // The loaded value is written straight into the field's DOM node. React
@@ -1884,9 +1927,6 @@ export function NativeSplitView({ paneWidth, minPaneWidth, maxPaneWidth, paneOpe
   const trailing = panes[1];
   if (!paneOpen) {
     return <View style={[styles.splitFallback, style]}><View style={styles.splitTrailing}>{trailing}</View></View>;
-  }
-  if (Platform.OS === "windows") {
-    return <View style={[styles.splitFallback, style]}><View style={[styles.splitLeading, { width: paneWidth }]}>{leading}</View><View style={styles.splitTrailing}>{trailing}</View></View>;
   }
   if (Platform.OS === "macos") {
     return <AppKitSplitView paneWidth={paneWidth} minPaneWidth={minPaneWidth} maxPaneWidth={maxPaneWidth} paneOpen={paneOpen} disabled={disabled} onPaneWidthChange={onPaneWidthChange} style={[styles.splitView, style]}><View style={[styles.splitLeading, { width: paneWidth }]}>{leading}</View><View style={styles.splitTrailing}>{trailing}</View></AppKitSplitView>;
@@ -2019,6 +2059,5 @@ const styles = StyleSheet.create({
   splitView: { minHeight: 120, flexDirection: "row" },
   splitFallback: { minHeight: 120, flexDirection: "row" },
   splitLeading: { minWidth: 0, flexShrink: 0 },
-  splitter: { width: 6, minWidth: 6, alignSelf: "stretch", zIndex: 1 },
   splitTrailing: { minWidth: 0, flex: 1 },
 });

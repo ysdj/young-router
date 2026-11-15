@@ -20,7 +20,7 @@
  */
 
 import type { AppRoute } from "../types";
-import { pushPresentation } from "./presentationStack";
+import { pushPresentation, trapWithin } from "./presentationStack";
 
 const LAYER_SIZE: Partial<Record<AppRoute, { width: number; height: number }>> = {
   // The native route layouts, so the same pane content fits before its first
@@ -38,6 +38,9 @@ type Layer = {
 };
 
 const layers = new Map<string, Layer>();
+// The body's `overflow` before the first layer locked it.  Held once for the
+// whole stack rather than per layer: see `presentChildLayer`.
+let bodyOverflowBeforeLayers: string | null = null;
 
 export type ChildLayerOptions = {
   route: string;
@@ -161,10 +164,12 @@ export function presentChildLayer(options: ChildLayerOptions): void {
   scrim.append(frame);
   document.body.append(scrim);
 
-  // The page behind must not scroll while the layer is up, exactly as
-  // `NativeChildPanelShield` keeps the parent window from being used. Restoring
-  // the previous value matters: layers can be dismissed out of order.
-  const previousOverflow = document.body.style.overflow;
+  // The page behind must not scroll while a layer is up, exactly as
+  // `NativeChildPanelShield` keeps the parent window from being used. The lock
+  // is held once for the whole stack: layers can be dismissed out of order, so
+  // restoring each layer's own captured value would unlock the page under a
+  // layer still on screen, or leave `overflow: hidden` behind after the last one.
+  if (layers.size === 0) bodyOverflowBeforeLayers = document.body.style.overflow;
   document.body.style.overflow = "hidden";
 
   const unmount = options.mount(body);
@@ -178,21 +183,14 @@ export function presentChildLayer(options: ChildLayerOptions): void {
     if (layers.size === 0) {
       if (root) root.inert = false;
       previouslyFocused?.focus();
+      document.body.style.overflow = bodyOverflowBeforeLayers ?? "";
     }
-    document.body.style.overflow = previousOverflow;
     options.onDismiss();
   };
 
   // Escape and Tab belong to the topmost layer only: the stack answers once,
   // for the surface a person is actually looking at.
-  const trap = (event: KeyboardEvent): void => {
-    if (event.key !== "Tab") return;
-    const controls = Array.from(frame.querySelectorAll<HTMLElement>("button, input, select, textarea, [tabindex]:not([tabindex='-1'])")).filter((element) => !element.hasAttribute("disabled"));
-    const first = controls[0] ?? close;
-    const last = controls[controls.length - 1] ?? close;
-    if (event.shiftKey && (document.activeElement === first || !frame.contains(document.activeElement))) { event.preventDefault(); last.focus(); }
-    else if (!event.shiftKey && (document.activeElement === last || !frame.contains(document.activeElement))) { event.preventDefault(); first.focus(); }
-  };
+  const trap = trapWithin(frame, close);
   const askClose = (): void => {
     if (options.requestClose) {
       options.requestClose();

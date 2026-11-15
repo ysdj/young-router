@@ -45,7 +45,6 @@ HWND HostWindow(winrt::Microsoft::ReactNative::ReactContext const& context) {
     auto window = winrt::Microsoft::UI::WindowId{window_id};
     if (auto handle = winrt::Microsoft::UI::GetWindowFromWindowId(window); handle != nullptr) return handle;
   }
-  if (const auto child = YoungRouter::CurrentReactChildHostWindow(); child != nullptr) return child;
   return GetActiveWindow();
 }
 
@@ -62,7 +61,8 @@ std::vector<YoungRouter::NativeMenuAction> NativeActions(winrt::Microsoft::React
     auto checked_entry = object->find("checked");
     auto title = title_entry != object->end() && title_entry->second.TryGetString()
         ? Utf8ToWide(*title_entry->second.TryGetString()) : id;
-    bool enabled = enabled_entry == object->end() || !enabled_entry->second.TryGetBoolean() || *enabled_entry->second.TryGetBoolean();
+    auto flag = enabled_entry != object->end() ? enabled_entry->second.TryGetBoolean() : nullptr;
+    bool enabled = flag == nullptr || *flag;
     bool checked = checked_entry != object->end() && checked_entry->second.TryGetBoolean() && *checked_entry->second.TryGetBoolean();
     if (!id.empty()) result.push_back({std::move(id), std::move(title), enabled, checked});
   }
@@ -136,11 +136,20 @@ namespace YoungRouter {
 void WinUI3NativeLeafModule::Initialize(winrt::Microsoft::ReactNative::ReactContext const& context) noexcept {
   try {
     context_ = context;
+    auto owner = HostWindow(context_);
+    if (leaf_->WindowHandle() != nullptr && leaf_->WindowHandle() != owner) {
+      leaf_ = WinUI3NativeLeaf::Create();
+      leaf_->SetChildHost(true);
+    }
+    auto leaf = leaf_;
+    // Installed once, on the leaf that survives the replacement above: a
+    // handler left on the dropped object would never see the module's later
+    // actions.
     // REACT_EVENT fills the field with a lambda that calls EmitJSEvent,
     // so it is safe to call from the UI thread and no JS dispatcher is
     // needed.  Reading the field at dispatch time is what makes it
     // non-empty: at REACT_INIT the field has not been filled yet.
-    leaf_->SetActionHandler([this](std::string const& action) {
+    leaf->SetActionHandler([this](std::string const& action) {
       // The field holds the lambda REACT_EVENT installed (it calls
       // EmitJSEvent), so it is read here rather than captured: at
       // REACT_INIT it has not been filled yet, and a copy taken then
@@ -157,19 +166,6 @@ void WinUI3NativeLeafModule::Initialize(winrt::Microsoft::ReactNative::ReactCont
         }
       }).detach();
     });
-    auto owner = HostWindow(context_);
-    if (leaf_->WindowHandle() != nullptr && leaf_->WindowHandle() != owner) {
-      leaf_ = WinUI3NativeLeaf::Create();
-      leaf_->SetChildHost(true);
-    }
-    auto leaf = leaf_;
-    if (leaf->IsChildHost()) {
-      leaf->SetActionHandler([this](std::string const& action) {
-        std::thread([this, action] {
-          try { if (MenuAction) MenuAction(action); } catch (...) {}
-        }).detach();
-      });
-    }
     context_.UIDispatcher().Post([leaf, owner] {
       leaf->Initialize(owner);
       auto route = InitialChildRoute(owner);
@@ -406,6 +402,24 @@ void WinUI3NativeLeafModule::ShowActionMenu(
     std::vector<std::wstring> const& items,
     winrt::Microsoft::ReactNative::JSValueObject const& anchor,
     winrt::Microsoft::ReactNative::ReactPromise<std::optional<double>> const& promise) noexcept {
+  ShowMenuWithUnavailableRows(title, items, anchor, {}, promise);
+}
+
+void WinUI3NativeLeafModule::ShowDisabledActionMenu(
+    std::wstring const& title,
+    std::vector<std::wstring> const& items,
+    winrt::Microsoft::ReactNative::JSValueObject const& anchor,
+    winrt::Microsoft::ReactNative::JSValueArray const& disabledIndices,
+    winrt::Microsoft::ReactNative::ReactPromise<std::optional<double>> const& promise) noexcept {
+  ShowMenuWithUnavailableRows(title, items, anchor, disabledIndices, promise);
+}
+
+void WinUI3NativeLeafModule::ShowMenuWithUnavailableRows(
+    std::wstring const& title,
+    std::vector<std::wstring> const& items,
+    winrt::Microsoft::ReactNative::JSValueObject const& anchor,
+    winrt::Microsoft::ReactNative::JSValueArray const& disabledIndices,
+    winrt::Microsoft::ReactNative::ReactPromise<std::optional<double>> const& promise) noexcept {
   auto number = [&anchor](char const* key) -> std::optional<double> {
     auto found = anchor.find(key);
     if (found == anchor.end()) return std::nullopt;
@@ -423,12 +437,25 @@ void WinUI3NativeLeafModule::ShowActionMenu(
     promise.Resolve(std::nullopt);
     return;
   }
+  std::vector<size_t> unavailable;
+  unavailable.reserve(disabledIndices.size());
+  for (auto const& entry : disabledIndices) {
+    if (auto index = entry.TryGetInt64()) {
+      if (*index >= 0 && static_cast<size_t>(*index) < items.size()) {
+        unavailable.push_back(static_cast<size_t>(*index));
+      }
+    }
+  }
   try {
     auto leaf = leaf_;
     auto js_dispatcher = context_.JSDispatcher();
     YoungRouter::NativeMenuAnchor menu_anchor{*x, *y, *width, *height};
-    context_.UIDispatcher().Post([leaf, title, items, menu_anchor, promise, js_dispatcher] {
-      auto selected = leaf->ShowActionMenu(title, items, menu_anchor);
+    context_.UIDispatcher().Post([leaf, title, items, menu_anchor, unavailable, promise, js_dispatcher] {
+      std::optional<size_t> selected;
+      try {
+        selected = leaf->ShowActionMenu(title, items, menu_anchor, unavailable);
+      } catch (...) {
+      }
       js_dispatcher.Post([promise, selected] {
         promise.Resolve(selected ? std::optional<double>(static_cast<double>(*selected)) : std::nullopt);
       });
@@ -800,6 +827,7 @@ void WinUI3NativeLeafModule::ShowGroupManager(
         std::optional<std::string> multiplier;
         std::optional<std::string> hint;
         std::optional<std::string> models;
+        bool models_invalid = false;
         for (auto const& [key, value] : *object) {
           // The key's models travel as a list so the sheet can lay them out in
           // aligned columns; they are joined into the newline-separated text
@@ -811,17 +839,17 @@ void WinUI3NativeLeafModule::ShowGroupManager(
               for (auto const& entry : *array) {
                 auto const* model = entry.TryGetString();
                 if (model == nullptr || model->empty() || model->size() > 256) {
-                  joined.clear();
+                  models_invalid = true;
                   break;
                 }
                 if (!joined.empty()) joined.push_back('\n');
                 joined.append(*model);
                 if (joined.size() > 16384) {
-                  joined.clear();
+                  models_invalid = true;
                   break;
                 }
               }
-              models = joined;
+              if (!models_invalid) models = joined;
             }
             continue;
           }
@@ -834,8 +862,8 @@ void WinUI3NativeLeafModule::ShowGroupManager(
           else if (key == "multiplier") multiplier = *text;
           else if (key == "hint") hint = *text;
         }
-        if (!id || id->size() > 256 || !name || name->empty() || name->size() > 256
-            || (hint && hint->size() > 256) || (models && models->size() > 16384)) {
+        if (models_invalid || !id || id->size() > 256 || !name || name->empty() || name->size() > 256
+            || (hint && hint->size() > 256)) {
           valid = false;
           break;
         }
@@ -1043,11 +1071,17 @@ void WinUI3NativeLeafModule::RelayLogin(
   auto username = field("username");
   auto pending_entry = options.find("pendingAccount");
   std::optional<bool> pending_account;
-  if (pending_entry != options.end()) pending_account = pending_entry->second.TryGetBoolean();
+  if (pending_entry != options.end()) {
+    if (auto const* pending = pending_entry->second.TryGetBoolean()) pending_account = *pending;
+  }
+  // TryGetBoolean returns a pointer, so it has to be dereferenced here: handing
+  // it straight to std::optional<bool> converts the pointer to bool and stores
+  // true for every flag that is present, whatever its value.
   auto boolean = [&options](char const* name) -> std::optional<bool> {
     auto found = options.find(name);
     if (found == options.end()) return std::nullopt;
-    return found->second.TryGetBoolean();
+    auto const* value = found->second.TryGetBoolean();
+    return value ? std::optional<bool>(*value) : std::nullopt;
   };
   auto remember_password = boolean("rememberPassword");
   auto auto_grouping = boolean("autoGrouping");

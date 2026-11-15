@@ -139,7 +139,10 @@ function Get-ScrollPanes {
       $panes += , @($element, $pattern)
     }
   }
-  return $panes
+  # The unary comma stops the pipeline unrolling the list: with a single
+  # scrollable pane the caller would otherwise receive that pane's pair itself
+  # and index the element and pattern as if they were two panes.
+  return ,$panes
 }
 
 switch ($Command) {

@@ -111,9 +111,13 @@ def prune_python_runtime(runtime: Path) -> None:
     shutil.rmtree(site / "litellm" / "proxy" / "client" / "cli", ignore_errors=True)
     (site / "litellm" / "proxy" / "_lazy_openapi_snapshot.json").unlink(missing_ok=True)
     # LiteLLM imports this directory at module load time to mount its OpenAPI
-    # endpoint, even when the desktop host never exposes the admin UI.
+    # endpoint, even when the desktop host never exposes the admin UI. A tiny
+    # valid shell in its place avoids noisy startup errors while the 15 MiB
+    # admin bundle stays out of the Core.
     admin_ui = site / "litellm" / "proxy" / "_experimental" / "out"
     shutil.rmtree(admin_ui, ignore_errors=True)
+    (admin_ui / "_next").mkdir(parents=True)
+    (admin_ui / "index.html").write_text("<!doctype html><title>Young Router</title>\n", encoding="utf-8")
 
     # CPython's installer and GUI/development libraries are not runtime inputs.
     for relative in (

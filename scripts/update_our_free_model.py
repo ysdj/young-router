@@ -160,11 +160,11 @@ def _highest_release_candidate(tags: list[tuple[str, str, bool, bool]]) -> Relea
 def _releases_api(timeout: int) -> list[tuple[str, str, bool, bool]]:
     """The upstream's own release list, which states draft and prerelease.
 
-    GitHub's API is asked first because only that answer distinguishes a stable
-    release from one marked prerelease under a tag name that does not say so.
-    Its ``target_commitish`` is not the revision - GitHub reports the branch a
-    release was cut from there - so the answer carries no identity and the git
-    tag list below does.
+    GitHub's API is consulted after the tag list because only its answer
+    distinguishes a stable release from one marked prerelease under a tag name
+    that does not say so.  Its ``target_commitish`` is not the revision - GitHub
+    reports the branch a release was cut from there - so the answer carries no
+    identity and the git tag list does.
     """
 
     raw = request_bytes(RELEASES_URL, timeout=timeout, user_agent=USER_AGENT)
@@ -226,11 +226,12 @@ def latest_release(source_url: str, *, timeout: int = 30) -> Release:
     """Resolve the newest published release, with the commit that proves it.
 
     The tag list is the answer this build needs, because it is the only lookup
-    that says both which releases exist and which commit each one is.  GitHub's
-    release metadata is consulted first only for the property a tag name cannot
-    express: a release marked prerelease.  When that call cannot answer - it is
-    rate limited, offline, or a mirror - the build resolves from the tags, and a
-    tag that spells its own prerelease in the name is not a bare version anyway.
+    that says both which releases exist and which commit each one is.  It is
+    read first, and GitHub's release metadata is then applied only for the
+    property a tag name cannot express: a release marked prerelease.  When that
+    call cannot answer - it is rate limited, offline, or a mirror - the build
+    keeps the tag answer, and a tag that spells its own prerelease in the name
+    is not a bare version anyway.
 
     There is no further fallback: if no stable release can be read, the build
     fails rather than staging a branch or the previously staged tree.

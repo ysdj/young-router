@@ -2,9 +2,9 @@ name: CI
 
 on:
   # A run happens only when one is asked for, never on a push or a pull
-  # request.  Nothing in this repository may start a workflow on its own: a
-  # commit is not a request to spend twenty minutes of macOS and Windows
-  # runners, and a red badge nobody asked for is not a review.
+  # request: a commit is not a request to spend twenty minutes of macOS and
+  # Windows runners, and a red badge nobody asked for is not a review.  The one
+  # workflow that does start on its own is the page publisher (web-page.yml).
   workflow_dispatch:
 
 permissions:
@@ -65,7 +65,6 @@ jobs:
       - name: Run full test suite
         env:
           LITELLM_TEST_PYTHON: ${{ runner.temp }}/young-router-ci/bin/python
-          YOUNG_ROUTER_AUTO_BUILD: "0"
         run: ./scripts/test.sh
 
       - name: Check shared React Native contract
@@ -106,16 +105,10 @@ jobs:
           # The whole reachable history is audited, not just the tree: the
           # leaks this exists to catch were committed and then deleted, so
           # their only remaining copy is in an interior commit.
+          # A dispatched run has no "commits this push adds", so the range is
+          # everything HEAD reaches.
           python3 scripts/check-repo-hygiene.py --tree HEAD
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            python3 scripts/check-repo-hygiene.py --history \
-              "${{ github.event.before }}..${{ github.sha }}"
-          elif [[ -n "${{ github.event.pull_request.base.sha }}" ]]; then
-            python3 scripts/check-repo-hygiene.py --history \
-              "${{ github.event.pull_request.base.sha }}..${{ github.sha }}"
-          else
-            python3 scripts/check-repo-hygiene.py --history HEAD
-          fi
+          python3 scripts/check-repo-hygiene.py --history HEAD
 
       - name: Validate scripts and metadata
         shell: bash
@@ -133,11 +126,6 @@ jobs:
             [[ -f "$file" ]] || continue
             bash -n "$file"
           done < <(git ls-files -z 'scripts/githooks/*')
-
-          while IFS= read -r -d '' file; do
-            [[ -f "$file" ]] || continue
-            zsh -n "$file"
-          done < <(git ls-files -z '*.zsh')
 
           while IFS= read -r -d '' file; do
             [[ -f "$file" ]] || continue

@@ -28,6 +28,16 @@ import type {
   WebDavStatus,
 } from "./types";
 
+function displayUpstreamModel(value: string): string {
+  const text = value.trim();
+  const separator = text.indexOf("/");
+  if (separator < 0) return text;
+  const prefix = text.slice(0, separator).toLowerCase();
+  return ["openai", "anthropic", "chatgpt"].includes(prefix)
+    ? text.slice(separator + 1).trim()
+    : text;
+}
+
 /**
  * A snapshot states two moments, and a window needs both.
  *
@@ -292,7 +302,10 @@ function applyRowOps(rows: unknown[], ops: IpcEventOp[]): unknown[] | undefined 
  */
 function applyProvidersModelsOps(projection: unknown, ops: IpcEventOp[]): unknown {
   if (!isRecord(projection) || !Array.isArray(projection.providers)) return undefined;
-  const providers = cloneValue(projection.providers) as unknown[];
+  // Every write below replaces a slot instead of mutating a provider row, so the
+  // copy shares the rows this patch does not move and clones only the ones it
+  // does; a deep clone here would rebuild the whole registry on every edit.
+  const providers = (projection.providers as unknown[]).slice();
   const removals = ops.filter((op) => op.kind === "remove");
   const writes = ops.filter((op) => op.kind === "upsert");
 
@@ -358,8 +371,26 @@ function applyProvidersModelsOps(projection: unknown, ops: IpcEventOp[]): unknow
 
 function upsertProvider(providers: unknown[], key: string, value: UnknownRecord): boolean {
   const index = providers.findIndex((provider) => providerKey(provider) === key);
-  if (index >= 0) providers[index] = cloneValue(value);
-  else providers.push(cloneValue(value));
+  if (index < 0) {
+    providers.push(cloneValue(value));
+    return true;
+  }
+  const previous = providers[index];
+  // Provider row upserts from older/partial Core projections may omit the
+  // process-local account observation.  Replacing the row wholesale made a
+  // provider pane remount forget a login it had just checked.  Preserve the
+  // observation only when the incoming row does not state one; an explicit
+  // observation (including an empty/cleared value) remains authoritative.
+  if (isRecord(previous) && !Object.prototype.hasOwnProperty.call(value, "auth_observed")) {
+    const merged = { ...cloneValue(previous), ...cloneValue(value) } as UnknownRecord;
+    if (!Object.prototype.hasOwnProperty.call(value, "auth_observed_seconds_ago")
+      && Object.prototype.hasOwnProperty.call(previous, "auth_observed_seconds_ago")) {
+      merged.auth_observed_seconds_ago = cloneValue(previous.auth_observed_seconds_ago);
+    }
+    providers[index] = merged;
+  } else {
+    providers[index] = cloneValue(value);
+  }
   return true;
 }
 
@@ -519,20 +550,24 @@ function providersModelsSummary(value: unknown): ProvidersModelsSummary {
   raw.forEach((item, index) => {
     if (!isRecord(item)) return;
     const providerId = firstString(item.editor_id, item.id, item.name, `provider-${index + 1}`);
-    const displayName = firstString(item.display_name, item.name, providerId);
+    // Core reads these with `.get(key, default)`, which falls back only when the
+    // key is absent: a label stated as an empty string stays empty instead of
+    // becoming the next field down.
+    const displayName = typeof item.display_name === "string" ? item.display_name : firstString(item.name, providerId);
     const models: ProviderModelSummary[] = [];
     const rawModels = Array.isArray(item.models) ? item.models : [];
     rawModels.forEach((model, modelIndex) => {
       if (!isRecord(model)) return;
       const modelId = firstString(model.editor_id, model.id, model.deployment_id, model.model_name, `model-${modelIndex + 1}`);
       const publicModel = firstString(model.public_model, model.model_name, model.name, model.display_name, modelId);
-      const modelDisplayName = firstString(model.display_name, model.name, publicModel);
+      const modelDisplayName = typeof model.display_name === "string" ? model.display_name : firstString(model.name, publicModel);
       const upstream = firstString(model.upstream_model, model.litellm_model, "");
+      const upstreamLabel = displayUpstreamModel(upstream);
       models.push({
         id: modelId,
         display_name: modelDisplayName,
         public_model: publicModel,
-        upstream_model: upstream.includes("/") ? upstream.slice(upstream.indexOf("/") + 1) : upstream,
+        upstream_model: upstreamLabel,
         enabled: model.model_enabled !== false && model.enabled !== false,
         order: integerValue(model.order),
       });
@@ -550,6 +585,11 @@ function providersModelsSummary(value: unknown): ProvidersModelsSummary {
     if (item.auth_kind !== null && item.auth_kind !== undefined) summary.auth_kind = item.auth_kind as ProviderSummary["auth_kind"];
     if (item.auth_status !== null && item.auth_status !== undefined) summary.auth_status = item.auth_status as ProviderSummary["auth_status"];
     if (item.auth_active !== null && item.auth_active !== undefined) summary.auth_active = item.auth_active as boolean;
+    // The account facts a live read observed ride with the summary too: a
+    // provider row states them in its account list before its own read answers.
+    // An empty observation is left out, as Core leaves it out.
+    if (isRecord(item.auth_observed) && Object.keys(item.auth_observed).length > 0) summary.auth_observed = cloneValue(item.auth_observed);
+    if (typeof item.auth_observed_seconds_ago === "number" && Number.isFinite(item.auth_observed_seconds_ago)) summary.auth_observed_seconds_ago = item.auth_observed_seconds_ago;
     providers.push(summary);
   });
   return { providers, revision: Number.isInteger(value.revision) ? value.revision as number : 0 };

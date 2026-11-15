@@ -290,7 +290,7 @@ export interface ProbeOriginalRequest {
 }
 
 export interface ProbeSurfaceResult {
-  surface: ProbeSurfaceName | string;
+  surface: ProbeSurfaceName;
   available: boolean;
   status?: string;
   original_request?: ProbeOriginalRequest;
@@ -326,9 +326,9 @@ export interface ProbeDegradationEngine {
   available?: boolean;
 }
 
-/** Veridrop quick-mode result for the route behind one requested model name. */
+/** The fingerprint result for the route behind one requested model name. */
 export interface ProbeDegradationResult {
-  status: ProbeDegradationStatus | string;
+  status: ProbeDegradationStatus;
   target?: string | null;
   protocol?: string;
   /** Brands or self-reported identity the upstream answer carried. */
@@ -384,17 +384,17 @@ export interface ProviderModelSummary {
   upstream_protocol_mode?: "fallback" | "fixed";
   upstream_url_surface?: ProbeSurfaceName;
   /**
-   * The surfaces this route can be measured on.  One entry means the route is
-   * served by a worker this deployment runs, which mounts a single wire: the
-   * pane states that protocol instead of offering a choice the route cannot
-   * honour.  Absent on a projection that predates the field.
-   */
-  /**
    * Whether this route only generates images.  A generator holds no
    * conversation, so the pane draws no 公开上下文 row for one: there is no
    * window to state.
    */
   serves_images?: boolean;
+  /**
+   * The surfaces this route can be measured on.  One entry means the route is
+   * served by a worker this deployment runs, which mounts a single wire: the
+   * pane states that protocol instead of offering a choice the route cannot
+   * honour.  Absent on a projection that predates the field.
+   */
   probe_surfaces?: string[];
   deep_probe?: ModelDeepProbePlan;
   probe?: {
@@ -403,6 +403,8 @@ export interface ProviderModelSummary {
     summary?: ProbeSummary;
     checked_at?: string;
     degradation?: ProbeDegradationResult;
+    /** The last token-rate measurement, present only for flash routes. */
+    speed_test?: ProbeSpeedTest | null;
     surfaces?: Record<string, Omit<ProbeSurfaceResult, "surface">>;
   };
 }
@@ -444,6 +446,13 @@ export interface LogSummary {
 export interface LogSource {
   id: string;
   label: string;
+  /**
+   * Whether the login behind this relay can be read.  False for an account
+   * whose session has lapsed: the entry stays in the list (the user knows this
+   * relay) but the dropdown greys it, because a read would answer "no
+   * credential".
+   */
+  available?: boolean;
 }
 
 export interface LogView extends LogSummary {
@@ -529,7 +538,7 @@ export interface IpcParams {
   validate: { domain: ConfigDomain; revision?: number };
   apply: ({ domain: ConfigDomain; domains?: never } | { domains: ConfigDomain[]; domain?: never }) & { revision: number; confirmation?: string | string[] };
   reload: { domain?: ConfigDomain; revision?: number };
-  probe: { domain?: "providers_models" | "webdav"; provider_id?: string; model_id?: string; values?: Record<string, unknown> };
+  probe: { domain?: "providers_models" | "webdav"; provider_id?: string; model_id?: string; values?: Record<string, unknown>; kind?: "reachability" | "identity" | "precision" | "speed" | "full" };
   export: { sections: ConfigDomain[]; destination_token: string };
   import_preview: { source_token: string; revision: number };
   import: { import_plan_token: string; sections: ConfigDomain[]; revision: number };
@@ -593,6 +602,12 @@ export interface IpcResults {
     model_count?: number;
     summary?: { available_surfaces: string[]; unavailable_surfaces: string[]; unreachable_surfaces?: string[]; transport?: string; statuses: Record<string, string> };
     degradation?: ProbeDegradationResult;
+    /** Which question this press asked; absent from older Core replies. */
+    kind?: "reachability" | "identity" | "precision" | "speed" | "full";
+    /** The speed measurement, present only when that layer ran. */
+    speed?: ProbeSpeedResult;
+    /** The precision (quantization) check, present only when that layer ran. */
+    precise?: ProbePreciseResult;
     surfaces?: { surface: string; available: boolean; status?: string; original_request?: { method: string; url: string; headers: Record<string, string>; body: Record<string, unknown> } }[];
   };
   export: { revision: number; section_count: number; sections?: ConfigDomain[] };
@@ -786,20 +801,6 @@ export interface NativeMenuAction {
   checked?: boolean;
 }
 
-export interface NativeSplitView {
-  setPaneWidth(width: number): void;
-}
-
-export interface NativeTextEditor {
-  setContent(content: string): void;
-  setReadOnly(readOnly: boolean): void;
-  focus(): void;
-}
-
-export interface NativeSegmentedControl {
-  setSelectedIndex(index: number): void;
-}
-
 export interface NativeLocalization {
   appTitle: string;
   /**
@@ -886,9 +887,9 @@ export interface NativeLocalization {
   relaySignInRejected?: string;
   relaySignInUnreachable?: string;
   relaySignInLimit?: string;
-  /** What the wait says while Core holds the station's window open. */
   /** The window case's action that raises a sign-in window again. */
   relayBrowserShow?: string;
+  /** What the wait says while Core holds the station's window open. */
   relayBrowserWaiting?: string;
   /** A sign-in window that could not be opened at all, named as a sentence. */
   relayBrowserUnavailable?: string;
@@ -1214,19 +1215,50 @@ export interface NativeLeafAdapter {
 }
 
 /** The triggering control's window-local rectangle, in React Native DIPs. */
+/**
+ * One speed measurement.
+ *
+ * `basis` is part of the finding, not a detail: a rate divided out of the
+ * endpoint's own usage block and a rate counted from the words it wrote are
+ * different claims, and a reader has to be able to tell which one they have.
+ * An absent rate means the stream arrived in one burst, where no generation
+ * window exists to divide by.
+ */
+export interface ProbeSpeedResult {
+  available: boolean;
+  status: string;
+  surface?: string;
+  basis?: "usage" | "text" | "";
+  first_token_ms?: number | null;
+  tokens_per_second?: number | null;
+  total_ms?: number | null;
+  output_tokens?: number | null;
+  detail?: string;
+}
+
+/**
+ * The precision check.
+ *
+ * A dilution test is a comparison, so the two answers below are different
+ * things: `verdict` says how this route compares with a baseline it was
+ * measured against, while a `captured` status means no baseline existed and one
+ * was just recorded.  Reporting the second as "match" would say a route agrees
+ * with itself, which is the one answer a dilution check must never give.
+ */
+export interface ProbePreciseResult {
+  status: string;
+  verdict?: string;
+  mean_jsd?: number | null;
+  comparable_cells?: number | null;
+  self_consistent?: boolean | null;
+  thresholds?: Record<string, unknown>;
+  detail?: string;
+  captured_at?: string;
+}
+
 export interface NativeMenuAnchor {
   x: number;
   y: number;
   width: number;
   height: number;
 }
-
-/**
- * Codex model selection payload sent from Codex Settings to the Core editor.
- *
- * ``model``/``provider``/``deployment_id`` identify the configured LiteLLM
- * model row. ``supports_responses_compaction`` mirrors the explicit per-model
- * metadata opt-in (``model_info.supports_responses_compaction``) so the UI
- * selection carries the compaction capability; the Core apply still resolves
- * the authoritative value from the runtime configuration row.
- */

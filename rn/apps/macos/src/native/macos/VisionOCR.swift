@@ -20,12 +20,8 @@ struct OCRLine {
 }
 
 struct RectangleBox {
-    let minX: Double
     let midX: Double
-    let maxX: Double
-    let minY: Double
     let midY: Double
-    let maxY: Double
     let width: Double
     let height: Double
 }
@@ -74,11 +70,36 @@ func loadImage(_ path: String) throws -> CGImage {
     return image
 }
 
+/// Lines in reading order: the top row first, left to right within a row.
+///
+/// "On the same row" is a tolerance, and a tolerance is not an ordering: A near
+/// B and B near C do not make A near C, so a comparator built on it gives
+/// `sorted` no consistent answer and the result follows whatever order Vision
+/// returned the lines in.  The rows are formed first, from the top down, and
+/// each one is ordered on its own.
+func readingOrder(_ lines: [OCRLine]) -> [OCRLine] {
+    var rows: [[OCRLine]] = []
+    var rowY = 0.0
+    for line in lines.sorted(by: { $0.midY > $1.midY }) {
+        if rows.isEmpty || abs(rowY - line.midY) > 0.02 {
+            rows.append([line])
+            rowY = line.midY
+        } else {
+            rows[rows.count - 1].append(line)
+        }
+    }
+    return rows.flatMap { row in row.sorted { $0.minX < $1.minX } }
+}
+
 func recognizeText(from image: CGImage) throws -> [OCRLine] {
     var recognized: [OCRLine] = []
+    // A request that failed is not an image with nothing in it: the error is
+    // carried out of the handler and thrown, so the caller exits non-zero
+    // instead of printing an empty reading as if it were one.
+    var failure: Error?
     let request = VNRecognizeTextRequest { request, error in
         if let error {
-            fputs("Vision OCR failed: \(error.localizedDescription)\n", stderr)
+            failure = error
             return
         }
         guard let observations = request.results as? [VNRecognizedTextObservation] else {
@@ -106,25 +127,20 @@ func recognizeText(from image: CGImage) throws -> [OCRLine] {
     }
     request.recognitionLevel = .accurate
     request.usesLanguageCorrection = true
-    if #available(macOS 13.0, *) {
-        request.automaticallyDetectsLanguage = true
-    }
+    request.automaticallyDetectsLanguage = true
 
     let handler = VNImageRequestHandler(cgImage: image, options: [:])
     try handler.perform([request])
-    return recognized.sorted {
-        if abs($0.midY - $1.midY) > 0.02 {
-            return $0.midY > $1.midY
-        }
-        return $0.minX < $1.minX
-    }
+    if let failure { throw failure }
+    return readingOrder(recognized)
 }
 
 func detectRectangles(in image: CGImage) throws -> [RectangleBox] {
     var boxes: [RectangleBox] = []
+    var failure: Error?
     let request = VNDetectRectanglesRequest { request, error in
         if let error {
-            fputs("Rectangle detection failed: \(error.localizedDescription)\n", stderr)
+            failure = error
             return
         }
         guard let observations = request.results as? [VNRectangleObservation] else {
@@ -134,12 +150,8 @@ func detectRectangles(in image: CGImage) throws -> [RectangleBox] {
             let box = observation.boundingBox
             boxes.append(
                 RectangleBox(
-                    minX: Double(box.minX),
                     midX: Double(box.midX),
-                    maxX: Double(box.maxX),
-                    minY: Double(box.minY),
                     midY: Double(box.midY),
-                    maxY: Double(box.maxY),
                     width: Double(box.width),
                     height: Double(box.height)
                 )
@@ -154,6 +166,7 @@ func detectRectangles(in image: CGImage) throws -> [RectangleBox] {
 
     let handler = VNImageRequestHandler(cgImage: image, options: [:])
     try handler.perform([request])
+    if let failure { throw failure }
     return boxes.sorted { ($0.width * $0.height) > ($1.width * $1.height) }
 }
 
@@ -276,8 +289,12 @@ func detectNumericDensity(from lines: [OCRLine]) -> Bool {
 func probableTitle(from lines: [OCRLine]) -> String? {
     let candidates = lines.filter { $0.midY > 0.68 }
     guard !candidates.isEmpty else { return nil }
+    // Compare height buckets rather than raw heights: a tolerance is not
+    // transitive, so `sorted` could otherwise return an arbitrary order.
     let ranked = candidates.sorted {
-        if abs($0.height - $1.height) > 0.01 { return $0.height > $1.height }
+        let k0 = Int(($0.height / 0.01).rounded())
+        let k1 = Int(($1.height / 0.01).rounded())
+        if k0 != k1 { return k0 > k1 }
         if $0.text.count != $1.text.count { return $0.text.count > $1.text.count }
         return $0.midY > $1.midY
     }
@@ -310,10 +327,7 @@ func actionLabels(from lines: [OCRLine]) -> [String] {
 
 func tableHeaders(from lines: [OCRLine]) -> [String] {
     let topBand = lines.filter { $0.midY > 0.6 && $0.text.count <= 24 }
-    let sorted = topBand.sorted {
-        if abs($0.midY - $1.midY) > 0.02 { return $0.midY > $1.midY }
-        return $0.minX < $1.minX
-    }
+    let sorted = readingOrder(topBand)
     return uniquePreservingOrder(sorted.prefix(6).map(\.text))
 }
 
@@ -348,16 +362,14 @@ func topTextPreview(_ lines: [OCRLine], limit: Int) -> [String] {
     uniquePreservingOrder(lines.prefix(limit).map(\.text))
 }
 
-func probableInputCount(lines: [OCRLine], rectangles: [RectangleBox]) -> Int {
-    let labels = inputLabels(from: lines).count
+func probableInputCount(labelCount: Int, rectangles: [RectangleBox]) -> Int {
     let longRectangles = rectangles.filter { $0.width > 0.18 && $0.width < 0.72 && $0.height > 0.03 && $0.height < 0.16 }
-    return max(labels, min(longRectangles.count, 8))
+    return max(labelCount, min(longRectangles.count, 8))
 }
 
-func probableButtonCount(lines: [OCRLine], rectangles: [RectangleBox]) -> Int {
-    let labels = buttonLabels(from: lines).count
+func probableButtonCount(labelCount: Int, rectangles: [RectangleBox]) -> Int {
     let buttonRects = rectangles.filter { $0.width > 0.08 && $0.width < 0.32 && $0.height > 0.03 && $0.height < 0.14 }
-    return max(labels, min(buttonRects.count, 8))
+    return max(labelCount, min(buttonRects.count, 8))
 }
 
 func inferArchetype(
@@ -492,8 +504,8 @@ func buildLayoutSnapshot(image: CGImage, lines: [OCRLine], rectangles: [Rectangl
         looksLikeHeader: headerBand,
         looksLikeFooter: footerBand,
         twoColumn: columns >= 2,
-        probableInputCount: probableInputCount(lines: lines, rectangles: rectangles),
-        probableButtonCount: probableButtonCount(lines: lines, rectangles: rectangles)
+        probableInputCount: probableInputCount(labelCount: inputs.count, rectangles: rectangles),
+        probableButtonCount: probableButtonCount(labelCount: buttons.count, rectangles: rectangles)
     )
 }
 
@@ -626,7 +638,6 @@ func parseArguments(_ arguments: [String]) -> (OutputFormat, String)? {
     while index < arguments.count - 1 {
         let arg = arguments[index]
         if arg == "--format" {
-            guard index + 1 < arguments.count - 0 else { return nil }
             guard let parsed = OutputFormat(rawValue: arguments[index + 1]) else { return nil }
             format = parsed
             index += 2

@@ -104,7 +104,7 @@ done
 # `--delete`, into deleting working adapters mid-sync.
 CORE_SYNC_EXCLUDES=(
   --exclude '__pycache__' --exclude '*.pyc' --exclude '*.pyo'
-  --exclude 'veridrop' --exclude 'connect-workbuddy' --exclude 'connect-qoder'
+  --exclude 'modelprint' --exclude 'llm-fingerprint-detector' --exclude 'connect-workbuddy' --exclude 'connect-qoder'
   --exclude 'dsh-vision-router' --exclude 'our-free-model'
 )
 
@@ -409,10 +409,6 @@ case "$MODE" in
   python)
     [[ "$python_changed" == 1 ]] || { echo "dev-loop-macos: python tree is current; nothing to do"; exit 0; }
     sync_python
-    ;;
-  metro)
-    # The bundle is served from Metro, so there is no bundle to write.  What
-    # this mode needs from below is the one restart that makes the app load it.
     ;;
   auto)
     [[ "$js_changed$python_changed$web_changed" != "000" ]] || { echo "dev-loop-macos: nothing changed; nothing to do"; exit 0; }

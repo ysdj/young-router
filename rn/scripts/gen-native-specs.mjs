@@ -123,6 +123,9 @@ function render(text, source, platform, componentName, specFile) {
 
   const rendered = [];
   let pendingPlatform = null;
+  // Comments after a marker document the marked declaration, so they are held
+  // back until that declaration is known to be rendered for this platform.
+  let pendingComments = [];
   // The source's own header comment documents the source file; it does not
   // belong in the rendered pair (which carries its own generated header).
   let inSourceHeader = true;
@@ -136,6 +139,7 @@ function render(text, source, platform, componentName, specFile) {
     const marker = /^\s*\/\/\s*@(macos|windows)-only\s*$/.exec(line);
     if (marker) {
       pendingPlatform = marker[1];
+      pendingComments = [];
       continue;
     }
     if (pendingPlatform) {
@@ -147,7 +151,7 @@ function render(text, source, platform, componentName, specFile) {
         trimmed.startsWith("*") ||
         trimmed.startsWith("*/")
       ) {
-        rendered.push(line);
+        pendingComments.push(line);
         continue;
       }
       // A marked prop covers the declaration through its terminating line.
@@ -157,7 +161,8 @@ function render(text, source, platform, componentName, specFile) {
         cursor += 1;
         block.push(lines[cursor]);
       }
-      if (pendingPlatform === platform) rendered.push(...block);
+      if (pendingPlatform === platform) rendered.push(...pendingComments, ...block);
+      pendingComments = [];
       index = cursor;
       pendingPlatform = null;
       continue;

@@ -43,19 +43,19 @@ const INCLUDES_WITH_WINDOWS_H = ["#include <windows.h>", "#include <windows.ui.c
 const LINE_DELTA_ANCHOR = "constexpr float c_scrollerLineDelta = 16.0f;";
 const SYSTEM_LINES = `${LINE_DELTA_ANCHOR}
 
-// One wheel detent is a system-defined number of lines, not a pixel count.
+// One wheel detent moves a system-defined distance, not a pixel count.
 // Windows delivers WHEEL_DELTA units per detent and a precision touchpad sends
 // the matching fraction of one, while Windows' own scroll views move
-// WheelScrollLines lines per detent.  Handing the raw units to the tracker
-// moved a fraction of that, which reads as sluggish scrolling and is worst on
-// a touchpad, where every small delta is scaled down the same way.
-static int GetSystemWheelScrollLines() noexcept {
+// WheelScrollLines lines per detent -- or a whole viewport when the setting is
+// WHEEL_PAGESCROLL, and nothing when it is zero.  Handing the raw units to the
+// tracker moved a fraction of that, which reads as sluggish scrolling and is
+// worst on a touchpad, where every small delta is scaled down the same way.
+static UINT GetSystemWheelScrollLines() noexcept {
   UINT scrollLines = 3;
-  if (!SystemParametersInfo(SPI_GETWHEELSCROLLLINES, 0, &scrollLines, 0) || scrollLines == 0 ||
-      scrollLines == 0xFFFFFFFFu) {
-    scrollLines = 3;
+  if (!SystemParametersInfo(SPI_GETWHEELSCROLLLINES, 0, &scrollLines, 0)) {
+    return 3;
   }
-  return static_cast<int>(scrollLines);
+  return scrollLines;
 }`;
 
 const HANDLER_START = "void ScrollViewComponentView::OnPointerWheelChanged(";
@@ -68,8 +68,13 @@ const HANDLER = `void ScrollViewComponentView::OnPointerWheelChanged(
   // now: the tracker's animation is the cost of a programmatic scroll, and
   // restarting it for every wheel event is what made a touchpad feel like it
   // was dragging through treacle.
-  const float wheelDelta = (delta / WHEEL_DELTA) * static_cast<float>(GetSystemWheelScrollLines()) *
-      c_scrollerLineDelta * m_layoutMetrics.pointScaleFactor;
+  const UINT scrollLines = GetSystemWheelScrollLines();
+  const float pageExtent = static_cast<float>(
+      ppp.IsHorizontalMouseWheel() ? m_layoutMetrics.frame.size.width : m_layoutMetrics.frame.size.height);
+  // WHEEL_PAGESCROLL scrolls a whole viewport per detent; zero scrolls nothing.
+  const float deltaPerDetent =
+      scrollLines == WHEEL_PAGESCROLL ? pageExtent : static_cast<float>(scrollLines) * c_scrollerLineDelta;
+  const float wheelDelta = (delta / WHEEL_DELTA) * deltaPerDetent * m_layoutMetrics.pointScaleFactor;
   if (ppp.IsHorizontalMouseWheel()) {
     if (wheelDelta > 0) {
       if (scrollLeft(wheelDelta, false)) {

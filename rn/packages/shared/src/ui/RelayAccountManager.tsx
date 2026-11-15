@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Platform, PlatformColor, Pressable, StyleSheet, Text, View } from "react-native";
 import type { CoreSnapshot, NativeLeafAdapter, RelayGroupManagerResult } from "../types";
 import { AccountsTable } from "./AccountsTable";
-import { NativeButton, NativeCheckbox, NativePicker, NativeTable, NativeTextField, nativeControlTextWidth } from "./NativeControls";
+import { NativeButton, NativeCheckbox, NativePicker, NativeTextField, nativeControlTextWidth } from "./NativeControls";
 import { pushPresentation, trapWithin } from "../platform/presentationStack";
 import { usePendingAction } from "./pendingAction";
 import { setGroupManagerOpen } from "./providerWizardGate";
@@ -798,7 +798,7 @@ export function StationAccountsPanel({
   };
   const refreshAccountResources = async (target: ResourceRefreshTarget, options: { silent?: boolean; force?: boolean } = {}): Promise<"ready" | "unavailable"> => {
     const { silent = false, force = false } = options;
-    if (isAccountLoading(target.id)) {
+    if (loadingRef.current[target.id]?.resources) {
       return accountsRef.current.find((item) => item.id === target.id)?.resourceStatus === "ready" ? "ready" : "unavailable";
     }
     updateLoading(target.id, "resources", true);
@@ -1060,8 +1060,10 @@ export function StationAccountsPanel({
     await runPendingAction("refresh", async () => {
       setFormBusy(true);
       try {
+        // This re-read is not a sign-in: the helper already clears the status
+        // when it starts, so only a failed read has something to report.
         const status = await refreshAccountResources({ id: account.id }, { force: true });
-        publish(translate(status === "ready" ? "relay.loginComplete" : "relay.resourcesUnavailable"));
+        if (status !== "ready") publish(translate("relay.resourcesUnavailable"));
       } finally {
         setFormBusy(false);
       }
@@ -1704,7 +1706,6 @@ const colors = {
   panel: color("controlBackgroundColor", "ControlFillColorDefault", "#ffffff"),
   accent: color("systemBlueColor", "AccentFillColorDefault", "#005fb8"),
   accentText: color("alternateSelectedControlTextColor", "TextOnAccentFillColorPrimary", "#ffffff"),
-  success: "#2A9D68",
   /** The required marker beside a form label. */
   required: color("systemRedColor", "SystemFillColorCriticalBrush", "#b00020"),
 };
@@ -1718,13 +1719,7 @@ const styles = StyleSheet.create({
   accountsPanel: { minWidth: 0, gap: 6, paddingTop: 6, borderTopWidth: 1, borderTopColor: colors.separator },
   cleanupRow: { minHeight: 26, flexDirection: "row", alignItems: "center", gap: 6, flexWrap: "wrap" },
   cleanupText: { flex: 1, minWidth: 0, color: colors.secondary, fontSize: UI_FONT_SIZE, lineHeight: 16 },
-  panelHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 },
-  panelTitle: { flex: 1, color: colors.text, fontSize: UI_FONT_SIZE, fontWeight: "600" },
-  panelActions: { marginLeft: "auto", flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 4 },
   panelActionButton: { width: 22, minWidth: 22, height: 22 },
-  accountsTable: { flex: 0, height: 84, minHeight: 84, flexShrink: 0 },
-  accountsEmpty: { minHeight: 40, alignItems: "center", justifyContent: "center", paddingHorizontal: 10, paddingVertical: 8, borderWidth: 1, borderColor: colors.separator, backgroundColor: colors.panel },
-  accountsEmptyText: { color: colors.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 15, textAlign: "center" },
   accountEditor: { minWidth: 0, gap: 5 },
   // Compact and wrappable: 账号, its full value, and the session controls share
   // one row until they no longer fit, then 刷新 / 分组 flow to the next line

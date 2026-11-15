@@ -14,6 +14,11 @@ type ChangeEvent = Readonly<{ index: Int32; value: string }>;
 export interface NativePickerProps extends ViewProps {
   labels: ReadonlyArray<string>;
   selectedValue: string;
+  // Options that are listed but cannot be chosen.  A relay account whose
+  // session has lapsed still names a relay worth finding in the list; hiding
+  // the entry made the account the user must re-sign-in disappear from the
+  // one place that names it.
+  disabledIndices?: ReadonlyArray<Int32>;
   disabled?: WithDefault<boolean, false>;
   compact?: WithDefault<boolean, false>;
   overlayLayer?: WithDefault<boolean, false>;

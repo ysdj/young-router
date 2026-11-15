@@ -104,7 +104,18 @@ async function readArtifact(source) {
   if (/^https?:\/\//i.test(source)) {
     const response = await fetch(source);
     if (!response.ok) fail(`${source} answered HTTP ${response.status}`);
-    return Buffer.from(await response.arrayBuffer());
+    const bytes = Buffer.from(await response.arrayBuffer());
+    // A URL carries the same pair of files a directory export does, and the
+    // bytes are worthless without the manifest that names them: fetching only
+    // the DLL would leave nothing to verify it against.
+    const manifestUrl = new URL(MANIFEST, source);
+    const manifestResponse = await fetch(manifestUrl);
+    if (!manifestResponse.ok) fail(`${manifestUrl} answered HTTP ${manifestResponse.status}`);
+    try {
+      return { bytes, manifest: await manifestResponse.json() };
+    } catch (error) {
+      fail(`${manifestUrl} is not valid JSON: ${error.message}`);
+    }
   }
   // A directory export carries the manifest; a bare file is its own payload.
   if (existsSync(join(source, MANIFEST))) {

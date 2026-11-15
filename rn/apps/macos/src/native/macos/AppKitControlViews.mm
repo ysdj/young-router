@@ -13,6 +13,7 @@
 #import <react/renderer/components/LiteLLMMacControls/RCTComponentViewHelpers.h>
 
 #import <algorithm>
+#import <set>
 #include <cmath>
 #include <memory>
 #include <objc/runtime.h>
@@ -612,24 +613,6 @@ static BOOL HandleLiteLLMTabCommand(NSView *source, SEL commandSelector)
 @end
 
 
-@interface LiteLLMTabSwitch : NSButton
-@end
-
-@implementation LiteLLMTabSwitch
-
-- (BOOL)acceptsFirstResponder
-{
-  return self.enabled && !self.hidden;
-}
-
-- (void)keyDown:(NSEvent *)event
-{
-  if (HandleLiteLLMTabKey(self, event)) return;
-  [super keyDown:event];
-}
-
-@end
-
 @interface LiteLLMInstantFocusBorderView : NSView
 @property(nonatomic) BOOL borderVisible;
 @end
@@ -942,10 +925,10 @@ void SyncTableHeaderScrollOffset(NSScrollView *scrollView);
   if (reinstalled) {
     [super tile];
   }
-  DiscardStaleScrollerSubviews(self);
-  FloatPersistentScrollerOverContent(self);
   // AppKit's own tiling can size the capsule back to the zero width its class
-  // measures and drop it out of the view tree: every pass re-attaches it.
+  // measures and drop it out of the view tree: every pass re-attaches it.  The
+  // re-assert already ends with the stale-sweep and the float, so running them
+  // here as well did both twice on every tiling pass.
   ReassertPersistentScrollerPlacement(self);
   // Floating the scroller leaves the header to AppKit's own tiling, which still
   // measures the pre-float width: re-assert the header's width here, the one
@@ -1152,7 +1135,6 @@ void SyncTableHeaderScrollOffset(NSScrollView *scrollView);
   NSColor *ink = self.selectedForModel && self.emphasized
       ? NSColor.alternateSelectedControlTextColor
       : NSColor.labelColor;
-  self.label.textColor = ink;
   self.label.attributedStringValue = TableCellTitle(self.label.stringValue, ink);
 }
 
@@ -1928,7 +1910,6 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
   if (busyChanged) {
     // A busy button keeps its title, width, and enabled appearance; the
     // leading spinner is the whole feedback.
-    [self applyButtonContent];
     [self updateBusyAnimation];
   }
   if (oldViewProps.toolTip != newViewProps.toolTip) {
@@ -1996,6 +1977,12 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
   _button.enabled = YES;
   _button.bezelStyle = NSBezelStyleRounded;
   _button.bezelColor = nil;
+  // A plain link is borderless and left-aligned, and those two are written only
+  // when a style prop changes.  The props reset above already reads "not a
+  // link", so an ordinary button handed this view would trip no change and keep
+  // the link's frame.
+  _button.bordered = YES;
+  _button.alignment = NSTextAlignmentCenter;
   _button.buttonType = NSButtonTypeMomentaryPushIn;
   ((LiteLLMNavigationLinkButton *)_button).defaultAction = NO;
   _button.hasDestructiveAction = NO;
@@ -2197,10 +2184,19 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitCheckboxCls(void)
   const BOOL labelsChanged = oldViewProps.labels != newViewProps.labels;
   const BOOL selectedChanged = oldViewProps.selectedValue != newViewProps.selectedValue;
   const BOOL compactChanged = oldViewProps.compact != newViewProps.compact;
-  if (labelsChanged) {
+  const BOOL disabledChanged = oldViewProps.disabledIndices != newViewProps.disabledIndices;
+  if (labelsChanged || disabledChanged) {
+    // A row the caller marked unavailable stays in the list, greyed: it names a
+    // relay whose login has lapsed, and hiding it left the user nothing to
+    // click on the way back to signing in.
     [_picker removeAllItems];
-    for (const auto &label : newViewProps.labels) {
-      [_picker addItemWithTitle:StringFromStdString(label)];
+    std::set<int> unavailable;
+    for (const auto &index : newViewProps.disabledIndices) unavailable.insert(index);
+    for (size_t position = 0; position < newViewProps.labels.size(); ++position) {
+      [_picker addItemWithTitle:StringFromStdString(newViewProps.labels[position])];
+      if (unavailable.count(static_cast<int>(position)) > 0) {
+        [[_picker itemAtIndex:static_cast<NSInteger>(position)] setEnabled:NO];
+      }
     }
   }
   if (labelsChanged || selectedChanged) {
@@ -2706,10 +2702,18 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
     }
   } else {
     if (activeControlChanged || oldViewProps.borderless != newViewProps.borderless) {
+      // The same prop drives any of the three single-line controls here, so the
+      // bezel has to follow it on each of them; otherwise a password or search
+      // field keeps its native frame inside the borderless wrapper.
       const BOOL borderless = newViewProps.borderless;
       _field.bezeled = !borderless;
       _field.drawsBackground = !borderless;
       _field.liteLLMFocusBorderView.borderVisible = !borderless && _field.liteLLMShowsFocusBorder;
+      _secureField.bezeled = !borderless;
+      _secureField.drawsBackground = !borderless;
+      _secureField.liteLLMFocusBorderView.borderVisible = !borderless && _secureField.liteLLMShowsFocusBorder;
+      _searchField.bezeled = !borderless;
+      _searchField.drawsBackground = !borderless;
     }
     if ((shouldSynchronizeText || recoverEmptyControl) && ![activeField.stringValue isEqualToString:value]) {
       activeField.stringValue = value;
@@ -2746,6 +2750,15 @@ BOOL TextFieldScrollViewCanConsume(NSScrollView *scrollView, NSEvent *event)
   _field.enabled = YES;
   _secureField.enabled = YES;
   _searchField.enabled = YES;
+  // The props reset above already reads "not borderless", so the next update
+  // would not trip the pass that restores the bezel of a recycled borderless
+  // field.
+  _field.bezeled = YES;
+  _field.drawsBackground = YES;
+  _secureField.bezeled = YES;
+  _secureField.drawsBackground = YES;
+  _searchField.bezeled = YES;
+  _searchField.drawsBackground = YES;
   _field.liteLLMShowsFocusBorder = NO;
   _secureField.liteLLMShowsFocusBorder = NO;
   _multilineField.editable = YES;
@@ -2855,8 +2868,12 @@ doCommandBySelector:(SEL)commandSelector
 
 - (NSView *)accessibilityElement
 {
+  // Every arm this view can show, the search field included: without it a
+  // search field answered accessibility with the plain field that is not on
+  // screen.
   return _host.activeControl == _scrollView ? _multilineField :
-      (_host.activeControl == _secureField ? _secureField : _field);
+      (_host.activeControl == _secureField ? _secureField :
+      (_host.activeControl == _searchField ? _searchField : _field));
 }
 
 @end
@@ -3237,6 +3254,13 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
       _settingColumnWidths = YES;
       for (NSTableColumn *column in _tableView.tableColumns) column.minWidth = 1;
       _settingColumnWidths = NO;
+      // Preserving a requested width is about the columns that have one; the
+      // trailing column still asks to be widened to the content the table now
+      // holds.  Skipping the measurement here left every table that sets both
+      // flags with a trailing column that never grew.
+      if (newViewProps.scrollTrailingColumnOverflow) {
+        [self updateColumnMinimumWidths];
+      }
     } else if (newViewProps.scrollTrailingColumnOverflow) {
       [self updateColumnMinimumWidths];
     } else {
@@ -3387,6 +3411,16 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
   // previous table's style.
   [self applySourceListChrome:NO];
   _tableView.intercellSpacing = NSZeroSize;
+  // The density pass in ``updateProps`` only runs when a density prop changes,
+  // and the reset props are already the default density: without this a
+  // recycled compact or source-list table keeps its row and header height in
+  // the plain table that gets it next.
+  _tableView.rowHeight = 28;
+  if (_tableView.headerView != nil) {
+    NSRect headerFrame = _tableView.headerView.frame;
+    headerFrame.size.height = 28;
+    _tableView.headerView.frame = headerFrame;
+  }
   _scrollView.hasHorizontalScroller = NO;
   _scrollView.hasVerticalScroller = NO;
   _scrollView.acceptsHorizontalScroll = NO;
@@ -3576,7 +3610,6 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     // view (the width the content actually shows through) rather than from the
     // clip view AppKit may just have narrowed.
     FloatPersistentScrollerOverContent(_scrollView);
-    const NSRect visibleBounds = _scrollView.contentView.bounds;
     const CGFloat availableColumnWidth = NSWidth(_scrollView.bounds);
     const CGFloat preferredContentWidth = requestedContentWidth() + trailingOverflowWidth();
     const BOOL needsHorizontalScroller = minimumContentWidth() > availableColumnWidth + 0.5 ||
@@ -4482,13 +4515,6 @@ WKProcessPool *LiteLLMCodeEditorProcessPool(void)
   }];
 }
 
-- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation
-{
-  if (webView != _webView || navigation != _activeNavigation) {
-    return;
-  }
-}
-
 - (void)webView:(WKWebView *)webView
     didFailProvisionalNavigation:(WKNavigation *)navigation
                        withError:(NSError *)error
@@ -4871,6 +4897,12 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
       side);
 }
 
+- (void)viewDidMoveToWindow
+{
+  [super viewDidMoveToWindow];
+  [self applyRunning];
+}
+
 - (void)updateProps:(const Props::Shared &)props oldProps:(const Props::Shared &)oldProps
 {
   const auto &newViewProps =
@@ -4890,6 +4922,13 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitPersistentScrollIndicatorCls(void)
     [_stepTimer invalidate];
     _stepTimer = nil;
     _wheel.image = AppKitBusySpinner.frames.firstObject;
+    return;
+  }
+  if (self.window == nil) {
+    // A detached wheel draws nothing; viewDidMoveToWindow starts the timer
+    // again once the view is attached.
+    [_stepTimer invalidate];
+    _stepTimer = nil;
     return;
   }
   if (_stepTimer != nil || AppKitBusySpinner.frames.count == 0) return;
@@ -5469,8 +5508,14 @@ doCommandBySelector:(SEL)commandSelector
     return (_target.length == 0 &&
         ([_secretField isEqualToString:@"deployment_token"] || [_secretField isEqualToString:@"desktop_gateway_api_key"]));
   }
+  // The same three runtime settings ``updateProps`` reads in the clear
+  // (``readablePlainText``).  Naming only the first here made a save of the
+  // proxy key or the page key take the "not a plain-text field" path: the
+  // field was blanked and the remembered value was left at the old key.
   return [_domain isEqualToString:@"runtime"] && [_secretField isEqualToString:@"setting"] &&
-      [_target isEqualToString:@"YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"];
+      ([_target isEqualToString:@"YOUNG_ROUTER_DSH_VISION_ROUTER_CONFIG_JSON"] ||
+       [_target isEqualToString:@"YOUNG_ROUTER_MASTER_KEY"] ||
+       [_target isEqualToString:@"YOUNG_ROUTER_WEB_PASSWORD"]);
 }
 
 - (NSView *)accessibilityElement

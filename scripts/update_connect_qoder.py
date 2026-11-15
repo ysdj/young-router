@@ -41,7 +41,6 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from update_common import (
-    PACKAGE_VERSION_PATTERN,
     UpdateError,
     find_npm,
     flatten_npm_package,
@@ -77,14 +76,17 @@ def _request_bytes(url: str, *, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> bytes
     return request_bytes(url, timeout=timeout, user_agent=USER_AGENT)
 
 
-def _package_metadata(registry_url: str) -> tuple[str, str, dict[str, Any]]:
-    """Resolve the ``latest`` dist-tag and its tarball from the npm registry."""
+def _package_metadata(
+    registry_url: str, version: str | None = None
+) -> tuple[str, str, dict[str, Any]]:
+    """Resolve the ``latest`` dist-tag, or ``version``, and its tarball."""
 
     return package_metadata(
         registry_url,
         package_name=PACKAGE_NAME,
         timeout=DEFAULT_TIMEOUT_SECONDS,
         user_agent=USER_AGENT,
+        version=version,
     )
 
 
@@ -203,11 +205,7 @@ def update(output: Path, *, registry_url: str, version: str | None = None) -> st
         # A cache written before the closure rule (or by a full npm install)
         # must not be reused just because its version still matches.
         shutil.rmtree(output)
-    latest, tarball_url, version_payload = _package_metadata(registry_url)
-    if version is not None:
-        if not PACKAGE_VERSION_PATTERN.fullmatch(version):
-            raise UpdateError(f"Invalid requested {PACKAGE_NAME} version: {version}")
-        latest = version
+    latest, tarball_url, version_payload = _package_metadata(registry_url, version)
     integrity = release_integrity(version_payload)
     # The release was resolved above on this build; this only skips installing
     # the identical one again.  See ``reused_staged_release``.

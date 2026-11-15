@@ -22,6 +22,9 @@ include = ["young_router*"]
 
 [tool.setuptools.package-data]
 "young_router.adapters" = ["*.mjs"]
+# ``core/protocol.py`` reads the IPC contract beside itself at import; a wheel
+# without it starts no Core ("Core IPC schema is unavailable").
+"young_router.core" = ["*.json"]
 
 [project.scripts]
 young-router-core = "young_router.core.__main__:run"

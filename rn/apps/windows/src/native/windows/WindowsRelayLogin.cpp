@@ -1083,6 +1083,22 @@ void HideLoginDialog(std::shared_ptr<LoginState> const& state) {
   }
 }
 
+// Bring the sign-in browser back after a commit that did not complete.  The
+// window was hidden for the post-login question, and leaving it hidden would
+// keep the owner window disabled with no surface on which to answer.
+void ShowLoginDialog(std::shared_ptr<LoginState> const& state) {
+  if (!state) return;
+  try {
+    HWND handle = nullptr;
+    if (SUCCEEDED(state->dialog.as<::IWindowNative>()->get_WindowHandle(&handle)) && handle != nullptr &&
+        !IsWindowVisible(handle)) {
+      ShowWindow(handle, SW_SHOW);
+      SetForegroundWindow(handle);
+    }
+  } catch (...) {
+  }
+}
+
 // Declared ahead of ``ProbeLogin``: the failure paths of a check are what
 // decide whether the remembered password may be submitted, and that decision
 // belongs to the same flow.
@@ -1167,7 +1183,12 @@ winrt::fire_and_forget ProbeLogin(
       // probe cannot read, says nothing about the session on hand -- the same
       // rule Core applies to its own check.  The window is left for the user
       // instead of spending a session to answer a question nobody asked.
-      if (confirmed_authentication_rejection) state->attempt_saw_refusal = true;
+      if (confirmed_authentication_rejection) {
+        state->attempt_saw_refusal = true;
+        // A refused session is exactly what the remembered password is for,
+        // so this is also what opens the way to submitting it.
+        state->login_submit_authorized = true;
+      }
       throw winrt::hresult_error(E_ACCESSDENIED);
     }
     StoredSession session{verified->family.empty() ? state->options.account_type : verified->family,
@@ -1262,6 +1283,7 @@ winrt::fire_and_forget ProbeLogin(
           state->finished.store(true);
           return;
         }
+        ShowLoginDialog(state);
         // No session on hand survived, and the station said so itself.  Only
         // now is the remembered password submitted, and only once per
         // presentation.
@@ -1309,6 +1331,7 @@ winrt::fire_and_forget ProbeLogin(
         state->finished.store(true);
         return;
       }
+      ShowLoginDialog(state);
       // No session on hand survived, and the station said so itself.  Only now
       // is the remembered password submitted, and only once per presentation.
       if (state->attempt_saw_refusal && state->restored_password &&
@@ -1580,12 +1603,19 @@ std::optional<WindowsRelayLoginResult> RunWindowsRelayLogin(
       }
       const access=)JS" + JsonLiteral(access) + LR"JS(; const refresh=)JS" + JsonLiteral(refresh) + LR"JS(;
       const username=)JS" + JsonLiteral(username) + LR"JS(;
+      // The restored session fills in what the page has not stated itself.  The
+      // form fields above are handled the same way (`if (node.value) return`):
+      // a token the page minted on this navigation is the station's own answer,
+      // and overwriting it would make the probe read our record back as if the
+      // page had said it.
       if (access) {
-        localStorage.setItem('auth_token',access); localStorage.setItem('access_token',access);
+        if (!localStorage.getItem('auth_token')) localStorage.setItem('auth_token',access);
+        if (!localStorage.getItem('access_token')) localStorage.setItem('access_token',access);
         try {
           const current=JSON.parse(localStorage.getItem('user')||'null');
           const user=current&&typeof current==='object'&&!Array.isArray(current)?current:{};
-          user.token=access; if (username && !user.username) user.username=username;
+          if (!user.token) user.token=access;
+          if (username && !user.username) user.username=username;
           localStorage.setItem('user',JSON.stringify(user));
         } catch {}
       }
@@ -1733,6 +1763,14 @@ std::optional<WindowsRelaySessionRestoreResult> RestoreWindowsRelaySession(
       verified->user_id.empty() ? std::nullopt : std::optional<std::string>(verified->user_id),
       verified->quota);
   if (!accepted) return std::nullopt;
+  // The probe merges the answer's Set-Cookie and may have rotated the tokens.
+  // The next restore reads this store and the sign-in browser plants it, so
+  // both must see the session the station just accepted instead of the one it
+  // replaced.
+  StoredSession refreshed{stored->account_type, options.origin, verified->cookie,
+                          verified->access_token.value_or(""), verified->refresh_token.value_or(""),
+                          verified->user_id};
+  WriteChunkedCredential(options.account_id, L"session", EncodeSession(refreshed));
   return WindowsRelaySessionRestoreResult{
       accepted->revision, accepted->login_status, accepted->username};
 }

@@ -25,7 +25,6 @@ import {
   hostChromeSnapshot,
   settleHostChrome,
   subscribeHostChrome,
-  topHostChrome,
   type HostChromeRequest,
   type MirrorSurface,
 } from "../platform/hostChrome";
@@ -404,8 +403,13 @@ function MirrorScreen({ mirror, title }: { mirror: MirrorSurface; title: string 
   </View>;
 }
 
-/** The keys this pane forwards; everything else stays the browser's. */
-const MIRROR_KEYS = new Set(["Enter", "Tab", "Backspace", "Delete", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End"]);
+/**
+ * The keys this pane forwards; everything else stays the browser's.  Escape is
+ * not one of them: the presentation stack answers it by cancelling this surface,
+ * and its capture listener on the document stops the key before this pane sees
+ * it, so an entry here would only describe a forwarding that never happens.
+ */
+const MIRROR_KEYS = new Set(["Enter", "Tab", "Backspace", "Delete", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End"]);
 
 /** One statement and its one button; see `notice` in `platform/hostChrome`. */
 function NoticeSurface({ request }: { request: Extract<HostChromeRequest, { kind: "notice" }> }): React.JSX.Element {
@@ -621,7 +625,6 @@ const styles = StyleSheet.create({
     borderTopColor: COLOR.rule,
   },
   footerSpacer: { flex: 1 },
-  footerStatus: { flex: 1, minWidth: 0, color: COLOR.secondary, fontSize: UI_TIP_FONT_SIZE },
   promptField: { minHeight: 26 },
   // The sign-in form is a field stack, not a sentence: the label owns the row
   // above its own control, as every settings field does, and the station is a

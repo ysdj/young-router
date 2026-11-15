@@ -207,7 +207,16 @@
       continue;
     }
     NSString *route = [[url path] stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/"]];
-    NSSet<NSString *> *routes = [NSSet setWithArray:@[@"home", @"general-settings", @"providers-models", @"codex-settings", @"claude-settings", @"runtime-settings", @"data-management", @"provider-wizard", @"logs"]];
+    // The former Service Provider Management surfaces are integrated into the
+    // unified provider workspace; Windows resolves the same links there.
+    if ([route isEqualToString:@"relay-accounts"]) {
+      route = @"providers-models";
+    } else if ([route isEqualToString:@"relay-add"]) {
+      route = @"provider-wizard";
+    }
+    // Keep this equal to the routes the leaf can title: a valid route missing
+    // here is dropped with no window and no message.
+    NSSet<NSString *> *routes = [NSSet setWithArray:@[@"home", @"general-settings", @"providers-models", @"codex-settings", @"claude-settings", @"runtime-settings", @"data-management", @"provider-wizard", @"file-editor", @"webdav-settings", @"logs"]];
     if (![routes containsObject:route]) {
       continue;
     }

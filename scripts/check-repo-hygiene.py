@@ -208,14 +208,17 @@ def _repository_root() -> Path:
     return Path(_git("rev-parse", "--show-toplevel"))
 
 
-def _index_blobs() -> dict[str, bytes]:
-    """Read every staged blob, skipping binary content.
+def _index_blobs(paths: list[str]) -> dict[str, bytes]:
+    """Read the staged blob at each of ``paths``, skipping binary content.
 
     Pattern matching runs over text because a match inside a compressed or
     compiled artifact is not a value anyone can read back out, and the
     repository ships several such artifacts on purpose.
     """
 
+    if not paths:
+        return {}
+    wanted = set(paths)
     listing = _run(["git", "ls-files", "--stage", "-z"])
     entries: list[tuple[str, str]] = []
     for entry in listing.split(b"\0"):
@@ -226,7 +229,9 @@ def _index_blobs() -> dict[str, bytes]:
         if len(fields) >= 3 and fields[2] != b"0":
             continue
         if len(fields) >= 2:
-            entries.append((fields[1].decode(), path.decode("utf-8", "replace")))
+            name = path.decode("utf-8", "replace")
+            if name in wanted:
+                entries.append((fields[1].decode(), name))
     return _read_blobs(entries)
 
 
@@ -297,7 +302,7 @@ def scan_staged() -> list[Finding]:
     # Only the paths being committed are read: a file that is already tracked
     # was audited when it was committed, and re-reading all of them on every
     # commit would make the gate slow enough to be bypassed.
-    index_blobs = _index_blobs()
+    index_blobs = _index_blobs(staged)
     for name in staged:
         data = index_blobs.get(name)
         if data is None:
@@ -447,15 +452,21 @@ def _scan_reachable_blobs(revision_range: str) -> list[Finding]:
         "utf-8", "replace"
     )
     scanned: set[str] = set()
+    entries: list[tuple[str, str]] = []
     for line in listing.splitlines():
         object_id, _, path = line.partition(" ")
         if not path or object_id in scanned:
             continue
         scanned.add(object_id)
-        try:
-            data = _run(["git", "cat-file", "blob", object_id])
-        except RuntimeError:
-            continue
+        entries.append((object_id, path))
+    if not entries:
+        return findings
+    # Batched by object id, not by path: ``_read_blobs`` keeps only the newest
+    # revision of a path, which is exactly the revision this mode cannot rely
+    # on.  One batch call also avoids a ``git`` process per object.
+    payload = b"\n".join(object_id.encode() for object_id, _ in entries) + b"\n"
+    stream = _run(["git", "cat-file", "--batch"], input_bytes=payload)
+    for (object_id, path), data in zip(entries, _split_batch(stream)):
         if b"\0" in data[:8192]:
             continue
         findings.extend(

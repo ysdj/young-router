@@ -19,10 +19,6 @@ export interface NativeTextFieldProps extends ViewProps {
   onChangeText?: DirectEventHandler<TextEvent>;
   onBlur?: DirectEventHandler<Readonly<{}>>;
   onSubmitEditing?: DirectEventHandler<TextEvent>;
-  /**
-   * The field's name for a screen reader.  A placeholder is not a name: an
-   * unlabeled edit box is announced as “edit” and nothing else.
-   */
 }
 
 export default codegenNativeComponent<NativeTextFieldProps>("LiteLLMAppKitTextField");

@@ -11,7 +11,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <shellapi.h>
 #include <string_view>
 #include <thread>
@@ -30,9 +29,9 @@
 namespace {
 std::wstring AllowedRoute(std::wstring route) {
   static constexpr std::wstring_view allowed[] = {
-      L"home", L"providers-models", L"codex-settings", L"claude-settings",
-      L"runtime-settings", L"data-management", L"provider-wizard",
-      L"file-editor", L"logs"};
+      L"home", L"general-settings", L"providers-models", L"codex-settings",
+      L"claude-settings", L"runtime-settings", L"data-management",
+      L"provider-wizard", L"file-editor", L"logs"};
   return std::find(std::begin(allowed), std::end(allowed), route) == std::end(allowed)
       ? std::wstring{} : route;
 }
@@ -69,7 +68,7 @@ void ChildContentSize(std::wstring_view route, LONG& width, LONG& height) {
   }
   if (route == L"webdav-settings") {
     width = 600;
-    height = 540;
+    height = 470;
     return;
   }
   width = 900;
@@ -77,7 +76,9 @@ void ChildContentSize(std::wstring_view route, LONG& width, LONG& height) {
 }
 
 std::wstring RouteWithAllowedTab(std::wstring route, std::wstring_view query) {
-  route = CanonicalRoute(AllowedRoute(std::move(route)));
+  // Canonicalize first: the legacy aliases are not in the allow-list, so
+  // filtering before mapping would blank every old link and open home instead.
+  route = AllowedRoute(CanonicalRoute(std::move(route)));
   if (route != L"logs" || query.empty()) return route;
   if (query.front() == L'?') query.remove_prefix(1);
   constexpr std::wstring_view prefix = L"tab=";
@@ -192,15 +193,7 @@ std::wstring QuoteCommandLineArgument(std::wstring_view value) {
   return result;
 }
 
-struct ReactChildHostState {
-  std::wstring route;
-  std::wstring initial_file_target;
-  HWND parent = nullptr;
-  std::atomic<HWND> window{nullptr};
-};
 std::mutex g_child_lock;
-std::shared_ptr<ReactChildHostState> g_child_state;
-std::map<HWND, std::wstring> g_child_routes;
 std::atomic<bool> g_child_process_mode{false};
 std::wstring g_child_process_route;
 HANDLE g_child_process_handle = nullptr;
@@ -229,116 +222,18 @@ std::wstring InitialChildRoute(HWND window) {
   // is the only answer.  Without it OpenRoute never ran, the leaf kept no active
   // route, and the window fell back to the app name instead of naming the
   // surface it holds.
+  (void)window;
   if (g_child_process_mode && !g_child_process_route.empty()) return g_child_process_route;
-  std::lock_guard<std::mutex> guard(g_child_lock);
-  auto found = g_child_routes.find(window);
-  return found == g_child_routes.end() ? std::wstring{} : found->second;
-}
-
-HWND CurrentReactChildHostWindow() noexcept {
-  std::lock_guard<std::mutex> guard(g_child_lock);
-  return g_child_state ? g_child_state->window.load() : nullptr;
+  return {};
 }
 
 void CloseReactChildWindow() {
-  if (g_child_process_mode) {
-    if (auto child = WinUI3NativeLeaf::Shared()->WindowHandle(); child != nullptr) {
-      PostMessageW(child, WM_APP + 33, 0, 0);
-    }
-    return;
+  // Every child surface is its own process, so closing one is a message to
+  // that window; the in-process host this branch used to fall back to was
+  // never started by anything.
+  if (auto child = WinUI3NativeLeaf::Shared()->WindowHandle(); child != nullptr) {
+    PostMessageW(child, WM_APP + 33, 0, 0);
   }
-  std::shared_ptr<ReactChildHostState> state;
-  {
-    std::lock_guard<std::mutex> guard(g_child_lock);
-    state = g_child_state;
-  }
-  if (!state) return;
-  const auto child_handle = state->window.load();
-  if (child_handle != nullptr) ShowWindow(child_handle, SW_HIDE);
-  const auto parent = state->parent;
-  if (parent != nullptr && IsWindow(parent)) PostMessageW(parent, WM_APP + 34, 0, 0);
-  {
-    std::lock_guard<std::mutex> guard(g_child_lock);
-    if (child_handle != nullptr) g_child_routes[child_handle] = state->route;
-  }
-}
-
-void RunReactChildHost(std::shared_ptr<ReactChildHostState> state) {
-  HWND child_handle = nullptr;
-  try {
-    winrt::init_apartment(winrt::apartment_type::single_threaded);
-    auto child = winrt::Microsoft::ReactNative::ReactNativeAppBuilder().Build();
-    auto settings = child.ReactNativeHost().InstanceSettings();
-    RegisterAutolinkedNativeModulePackages(settings.PackageProviders());
-    settings.PackageProviders().Append(winrt::make<CompReactPackageProvider>());
-
-#if BUNDLE
-    WCHAR app_directory[MAX_PATH];
-    GetModuleFileNameW(nullptr, app_directory, MAX_PATH);
-    PathCchRemoveFileSpec(app_directory, MAX_PATH);
-    settings.BundleRootPath(std::wstring(L"file://").append(app_directory).append(L"\\Bundle\\").c_str());
-    settings.JavaScriptBundleFile(L"index.windows");
-    settings.UseFastRefresh(false);
-#else
-    settings.JavaScriptBundleFile(L"index");
-    settings.UseFastRefresh(true);
-#endif
-
-    auto view_options = child.ReactViewOptions();
-    view_options.ComponentName(L"YoungRouter");
-    const auto requested_route = state->route;
-    const auto requested_file = state->initial_file_target;
-    view_options.InitialProps(winrt::Microsoft::ReactNative::MakeJSValueWriter(
-        [requested_route, requested_file](winrt::Microsoft::ReactNative::IJSValueWriter const& writer) noexcept {
-      writer.WriteObjectBegin();
-      writer.WritePropertyName(L"initialRoute");
-      writer.WriteString(requested_route);
-      writer.WritePropertyName(L"isPrimaryHost");
-      writer.WriteBoolean(false);
-      if (!requested_file.empty()) {
-        writer.WritePropertyName(L"initialFileTarget");
-        writer.WriteString(requested_file);
-      }
-      writer.WriteObjectEnd();
-    }));
-
-    auto app_window = child.AppWindow();
-    app_window.Title(YoungRouter::WinUI3NativeLeaf::Shared()->RouteTitleFor(state->route));
-    child_handle = winrt::Microsoft::UI::GetWindowFromWindowId(app_window.Id());
-    LONG content_width = 0;
-    LONG content_height = 0;
-    ChildContentSize(state->route, content_width, content_height);
-    const auto frame = FrameTrackSizeForContentDips(child_handle, content_width, content_height);
-    app_window.Resize({frame.x, frame.y});
-    {
-      std::lock_guard<std::mutex> guard(g_child_lock);
-      state->window.store(child_handle);
-      g_child_routes[child_handle] = state->route;
-    }
-
-    // Start owns the child dispatcher, sets the top-level window id before
-    // creating the JS instance, mounts the React view host, and runs the
-    // message loop on this same thread.
-    child.Start();
-  } catch (winrt::hresult_error const& error) {
-    OutputDebugStringW((L"Young Router child host failed: " + error.message() + L"\\n").c_str());
-  } catch (...) {
-    OutputDebugStringW(L"Young Router child host failed.\\n");
-  }
-
-  const auto parent = state->parent;
-  {
-    std::lock_guard<std::mutex> guard(g_child_lock);
-    if (child_handle != nullptr) g_child_routes.erase(child_handle);
-    state->window.store(nullptr);
-    if (g_child_state == state) g_child_state.reset();
-  }
-  if (parent != nullptr && IsWindow(parent)) {
-    EnableWindow(parent, TRUE);
-    SetForegroundWindow(parent);
-    SetFocus(parent);
-  }
-  winrt::uninit_apartment();
 }
 
 void OpenReactChildWindow(std::wstring_view route, std::wstring_view initial_file_target) {

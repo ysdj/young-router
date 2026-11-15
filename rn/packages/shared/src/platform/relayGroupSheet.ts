@@ -5,7 +5,7 @@
  * own capability leases; a page has neither, so the same surface is a React
  * layer (`ui/RelayGroupSheet.tsx`) over the page, and this module is the state
  * the pane and that layer exchange.  It is deliberately shaped exactly like the
- * three optional leaf capabilities it serves:
+ * four optional leaf capabilities it serves:
  *
  *  - `showGroupManager` opens the sheet and answers when it closes,
  *  - `awaitGroupManagerApply` is the pane waiting for 保存并关闭,

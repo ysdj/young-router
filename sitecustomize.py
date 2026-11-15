@@ -182,9 +182,9 @@ def _install_core_parent_watchdog() -> None:
 
 
 class _PostImportPatchLoader:
-    def __init__(self, loader: Any, patch: Callable[[Any], None]) -> None:
+    def __init__(self, loader: Any, patches: list[Callable[[Any], None]]) -> None:
         self._loader = loader
-        self._patch = patch
+        self._patches = patches
 
     def create_module(self, spec: Any) -> Any:
         creator = getattr(self._loader, "create_module", None)
@@ -195,13 +195,25 @@ class _PostImportPatchLoader:
         if not callable(execute):
             raise ImportError("LiteLLM patch target has no module loader")
         execute(module)
-        self._patch(module)
+        for patch in self._patches:
+            patch(module)
 
 
 class _PostImportPatchFinder:
-    def __init__(self, module_name: str, patch: Callable[[Any], None]) -> None:
+    """Run every patch registered for one module, once, after it is imported.
+
+    One finder per module name.  The import system takes the first finder that
+    answers and never asks another, so a second finder for the same name would
+    leave the earlier one stranded on ``sys.meta_path`` with a patch that never
+    runs -- which is how three installers registered for ``uvicorn`` became one.
+    """
+
+    def __init__(self, module_name: str) -> None:
         self._module_name = module_name
-        self._patch = patch
+        self._patches: list[Callable[[Any], None]] = []
+
+    def add(self, patch: Callable[[Any], None]) -> None:
+        self._patches.append(patch)
 
     def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
         if fullname != self._module_name:
@@ -209,7 +221,7 @@ class _PostImportPatchFinder:
         spec = importlib.machinery.PathFinder.find_spec(fullname, path)
         if spec is None or spec.loader is None:
             return None
-        spec.loader = _PostImportPatchLoader(spec.loader, self._patch)
+        spec.loader = _PostImportPatchLoader(spec.loader, self._patches)
         try:
             sys.meta_path.remove(self)
         except ValueError:
@@ -222,7 +234,13 @@ def _patch_after_import(module_name: str, patch: Callable[[Any], None]) -> None:
     if module is not None:
         patch(module)
         return
-    sys.meta_path.insert(0, _PostImportPatchFinder(module_name, patch))
+    for finder in sys.meta_path:
+        if isinstance(finder, _PostImportPatchFinder) and finder._module_name == module_name:
+            finder.add(patch)
+            return
+    finder = _PostImportPatchFinder(module_name)
+    finder.add(patch)
+    sys.meta_path.insert(0, finder)
 
 
 def _int_or_none(value: Any) -> Optional[int]:
@@ -450,48 +468,6 @@ def _install_young_router_route_patches() -> None:
     _patch_after_import("litellm.proxy.proxy_server", _patch)
 
 
-def _install_uvicorn_websocket_frame_limit_patch() -> None:
-    """Raise uvicorn's inbound WebSocket frame limit before any Config exists.
-
-    Codex sends each Responses turn request as a single text frame that
-    includes the immutable replay prefix, so a long task with signed image
-    history can exceed uvicorn's default 16 MiB ``ws_max_size``.  uvicorn
-    then closes the connection with code 1009 before the request reaches
-    the pipeline and Codex reports ``websocket closed by server before
-    response.completed`` followed by its reconnect ladder.  The installer
-    lives in ``young_router.proxy.base`` so both this early hook (interpreter
-    startup, covering the LiteLLM CLI launch path) and the callback-time
-    ``young_router.proxy.patches.install_all`` share one implementation.
-    """
-
-    def _patch(uvicorn_module: Any) -> None:
-        from young_router.proxy.base import _install_websocket_frame_limit_patch
-
-        _install_websocket_frame_limit_patch()
-
-    _patch_after_import("uvicorn", _patch)
-
-
-def _install_uvicorn_shutdown_marker_patch() -> None:
-    """Record uvicorn's teardown before any Config exists.
-
-    uvicorn closes every accepted connection at the start of ``Server.shutdown``
-    and only afterwards waits for the in-flight requests, so a turn that is
-    still streaming when the app is replaced always loses its response body.
-    The installer lives in ``young_router.proxy.base`` so both this early hook
-    (interpreter startup, covering the ``macos_proxy`` launch path) and the
-    callback-time ``young_router.proxy.patches.install_all`` share one
-    implementation.
-    """
-
-    def _patch(uvicorn_module: Any) -> None:
-        from young_router.proxy.base import _install_uvicorn_shutdown_marker_patch
-
-        _install_uvicorn_shutdown_marker_patch()
-
-    _patch_after_import("uvicorn", _patch)
-
-
 def _install_proxy_idle_patches() -> None:
     """Stop the proxy's idle loops from waking the machine ten times a second.
 
@@ -501,6 +477,17 @@ def _install_proxy_idle_patches() -> None:
     early hook (interpreter startup, covering the ``macos_proxy`` launch path)
     and the callback-time ``young_router.proxy.patches.install_all`` share one
     implementation.
+
+    This is the only patch hung on ``import uvicorn``, and it is stdlib-only on
+    purpose: the launcher imports uvicorn while its forkserver is still
+    preloading the LiteLLM runtime, and a hook that reached
+    ``young_router.proxy.base`` there would load that runtime a second time in
+    the launcher itself (see ``proxy/launcher_settings``).  The WebSocket frame
+    limit and the shutdown marker are therefore not installed from here: the
+    launcher states ``ws_max_size`` itself, and every process that serves
+    requests installs both through ``install_all`` when
+    ``litellm.proxy.proxy_server`` is imported
+    (``_install_young_router_route_patches``).
     """
 
     def _patch(_uvicorn_module: Any) -> None:
@@ -578,6 +565,4 @@ if os.environ.get("YOUNG_ROUTER_PROXY_PROCESS") == "1":
     _install_litellm_optional_database_error_patch()
     _install_young_router_route_patches()
     _install_litellm_openai_image_edit_usage_patch()
-    _install_uvicorn_websocket_frame_limit_patch()
-    _install_uvicorn_shutdown_marker_patch()
     _install_proxy_idle_patches()

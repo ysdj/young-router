@@ -49,19 +49,15 @@ def latest_stable_version() -> str:
         PYPI_JSON_URL,
         headers={"Accept": "application/json", "User-Agent": "young-router-version-check"},
     )
-    last_error: Exception | None = None
     for attempt in range(4):
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 payload = json.loads(response.read())
             break
         except (OSError, ValueError) as exc:
-            last_error = exc
             if attempt == 3:
                 raise RuntimeError(f"Could not read LiteLLM release metadata after retries: {exc}") from exc
             time.sleep(1 << attempt)
-    else:
-        raise RuntimeError(f"Could not read LiteLLM release metadata: {last_error}")
     releases = payload.get("releases") if isinstance(payload, dict) else None
     if not isinstance(releases, dict):
         raise RuntimeError("PyPI did not return LiteLLM release metadata")

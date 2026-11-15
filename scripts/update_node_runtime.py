@@ -187,6 +187,11 @@ def _install_node(node_output: Path, *, source: str | None, index_url: str, arch
     if version != "copied":
         # What the next build compares against before it downloads anything.
         (node_output / "NODE_VERSION").write_text(f"{version}\n", encoding="utf-8")
+    else:
+        # A marker left by an earlier download names a release these copied
+        # bytes were not downloaded as, and a later download-mode build would
+        # trust it and skip fetching the release it names.
+        (node_output / "NODE_VERSION").unlink(missing_ok=True)
     return version
 
 

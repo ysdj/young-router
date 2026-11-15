@@ -24,11 +24,10 @@
  *   this module and returns a boolean, exactly like the native leaves.
  */
 
-import type { AppRoute, LanguagePreference, NativeLocalization, NativeMenuAction, NativeMenuAnchor, RelayGroupManagerLabels, RelayGroupManagerResult, RelayGroupManagerSnapshot, ServiceStatus } from "../types";
+import type { AppRoute, LanguagePreference, NativeLocalization, NativeMenuAction, ServiceStatus } from "../types";
 import type { NativeIpcBridge, NativeLeafBridge } from "./nativeBridge";
 import { isSettingsShellRoute } from "../routes";
 import { resolveLanguage } from "../i18n";
-import { pushPresentation } from "./presentationStack";
 import { cancelHostChrome, requestHostChrome, type MirrorSurface, type RelaySignInAnswer } from "./hostChrome";
 import {
   finishRelayGroupApply,
@@ -134,6 +133,19 @@ const SERVICE_OPERATION_TIMEOUT_MS = 900_000;
 const SERVICE_OPERATIONS: ReadonlySet<string> = new Set(["start", "stop", "restart", "reload"]);
 
 /**
+ * The budget a probe is given.
+ *
+ * A probe reads the upstream, so it is a network call in Core's hands and not
+ * an edit: the native hosts grant it fifteen minutes for exactly that reason.
+ * The page gave it the twenty-second edit budget, and a flash route's press now
+ * *measures* its speed -- six seconds of streaming output on top of the surface
+ * probes -- so the page aborted a measurement that was running normally and
+ * reported "Core did not answer" over a route that was answering.  The same
+ * operation gets the same budget on every host.
+ */
+const PROBE_TIMEOUT_MS = 900_000;
+
+/**
  * How long one Core call may take, by what it asks Core to do.
  *
  * Exported for the test that pins the proxy lifecycle budget: the page and the
@@ -143,11 +155,20 @@ const SERVICE_OPERATIONS: ReadonlySet<string> = new Set(["start", "stop", "resta
 export function deadlineFor(request: string): number {
   try {
     const parsed = JSON.parse(request) as { method?: unknown; params?: { action?: { type?: unknown } } };
+    if (parsed?.method === "probe") return PROBE_TIMEOUT_MS;
     const type = parsed?.params?.action?.type;
     if (parsed?.method === "dispatch" && typeof type === "string") {
       const operation = type.replace(/[.-]/g, "_").toLowerCase();
       const name = operation.startsWith("service_") ? operation.slice("service_".length) : operation;
       if (SERVICE_OPERATIONS.has(name)) return SERVICE_OPERATION_TIMEOUT_MS;
+      // The shared client starts a probe as a job: `dispatch` of type `probe`
+      // answers with an id at once, and the *start* is the only part this
+      // deadline covers (the wait for the result has its own budget in the
+      // client).  Reading it as an ordinary edit gave the start the same twenty
+      // seconds as a checkbox, which is enough -- but only by accident, and
+      // naming it here is what keeps a host that answers slowly from being
+      // mistaken for a host that is gone.
+      if (name === "probe") return PROBE_TIMEOUT_MS;
     }
   } catch {
     // A request this page did not build is not one it can classify.
@@ -801,7 +822,6 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
    */
   presentChild?: (route: AppRoute) => void;
   dismissChild?: (route: AppRoute) => boolean;
-  dismissPresentation?: () => void;
 }): NativeLeafBridge {
   let strings: NativeLocalization | undefined;
   let menuActions: NativeMenuAction[] = [];
@@ -859,23 +879,6 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
     return true;
   };
 
-  const download = (name: string, data: string): void => {
-    const url = URL.createObjectURL(new Blob([data], { type: "application/json" }));
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = name;
-    // The anchor has to be in the document for a click to count as a download
-    // in every browser, and removing it afterwards keeps the page untouched.
-    document.body.append(anchor);
-    anchor.click();
-    anchor.remove();
-    // Revoking on the next tick cancelled any download the browser had not
-    // finished opening — a large export failed with no error, because the blob
-    // was gone before the save began.  A minute is far past the read; the
-    // object is released either way, so nothing is leaked past this window.
-    setTimeout(() => URL.revokeObjectURL(url), 60_000);
-  };
-
   const downloadCapability = async (token: string, name: string): Promise<void> => {
     const response = await core.hostRoute("/ipc/host/file-download", { token });
     const data = typeof response.data === "string" ? response.data : "";
@@ -888,7 +891,10 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
     document.body.append(anchor);
     anchor.click();
     anchor.remove();
-    // Same hold as `download`: a revoked blob cancels a save that has not begun.
+    // Revoking on the next tick cancelled any download the browser had not
+    // finished opening — a large export failed with no error, because the blob
+    // was gone before the save began.  A minute is far past the read; the
+    // object is released either way.
     setTimeout(() => URL.revokeObjectURL(url), 60_000);
   };
 
@@ -925,12 +931,15 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
     if (download !== undefined) {
       // Only a successful export has bytes to take; a refused one leaves the
       // capability for Core's own cleanup.
+      let exported = false;
       try {
-        const payload = JSON.parse(response) as { ok?: boolean };
-        if (payload.ok !== false) await downloadCapability(download.token, download.name || "young-router-data.json");
+        exported = (JSON.parse(response) as { ok?: boolean }).ok !== false;
       } catch {
         // Core's error envelope is returned unchanged to the shared UI.
       }
+      // Only the parse is guarded: a save that timed out or was refused has to
+      // reach the pane as a failure, not as an export that finished.
+      if (exported) await downloadCapability(download.token, download.name || "young-router-data.json");
     }
     return response;
   };
@@ -988,7 +997,7 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
       writeDocumentTitle();
     },
     setMenuBarActions: (actions) => { menuActions = actions; },
-    setTrayStatus: (status) => { routeStatus = status; },
+    setTrayStatus: (status) => { routeStatus = status; writeDocumentTitle(); },
     setTrayActions: (actions) => { menuActions = actions; },
     openFilePicker: async () => {
       const file = await chooseFile();
@@ -1320,7 +1329,7 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
       // Core's snapshot can change it again.  A Chinese interface under an
       // English document is read aloud in English phone.  The native hosts
       // set this on their own window; a page states it on its root element.
-      const language = next.language ?? resolveLanguage("system", navigator.languages?.[0] ?? navigator.language);
+      const language = resolveLanguage(next.language ?? options.language, options.systemLocale ?? navigator.languages?.[0] ?? navigator.language);
       if (typeof document !== "undefined") document.documentElement.lang = language === "zh-Hans" ? "zh-Hans" : "en";
       // The service state may already have arrived while this page had no words
       // for it: state the title now, and re-state it on a later language choice.

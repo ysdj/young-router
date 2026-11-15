@@ -18,6 +18,11 @@ start (a bundled runtime), not this.
 
 Usage: test_shards.py --python <interpreter> [--shards N] -- <test files...>
 
+``--python`` names one executable.  An interpreter that is a command of several
+words (``uv run --with ... python``) is given word by word instead, as repeated
+``--python-arg=<word>``: the ``=`` form is what lets a word that starts with a
+dash through the option parser.
+
 Every shard prints one line on success; a failing shard prints its own log tail
 and the driver exits non-zero with the failing shards named.
 """
@@ -55,14 +60,14 @@ def module_name(path: Path) -> str:
     return path.stem
 
 
-def run_shard(index: int, python: str, modules: list[Path], log: Path) -> tuple[int, str, float]:
+def run_shard(python: list[str], modules: list[Path], log: Path) -> tuple[int, str, float]:
     started = time.monotonic()
     environment = dict(os.environ)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     environment["PYTHONPATH"] = os.pathsep.join([str(REPO), str(REPO / "tests")])
     with log.open("w", encoding="utf-8") as handle:
         completed = subprocess.run(
-            [python, "-m", "unittest", *[module_name(item) for item in modules]],
+            [*python, "-m", "unittest", *[module_name(item) for item in modules]],
             cwd=REPO,
             env=environment,
             stdout=handle,
@@ -74,7 +79,14 @@ def run_shard(index: int, python: str, modules: list[Path], log: Path) -> tuple[
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--python", required=True)
+    parser.add_argument(
+        "--python",
+        "--python-arg",
+        dest="python",
+        action="append",
+        required=True,
+        help="the interpreter; repeat --python-arg=<word> for a command of several words",
+    )
     parser.add_argument("--shards", type=int, default=0)
     parser.add_argument("tests", nargs="+")
     args = parser.parse_args(argv)
@@ -91,8 +103,9 @@ def main(argv: list[str]) -> int:
         environment = dict(os.environ)
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         environment["PYTHONPATH"] = os.pathsep.join([str(REPO), str(REPO / "tests")])
+        # ``-v``: the serial run is the one compared against a stored log.
         return subprocess.run(
-            [args.python, "-m", "unittest", *[module_name(item) for item in paths]],
+            [*args.python, "-m", "unittest", *[module_name(item) for item in paths], "-v"],
             cwd=REPO,
             env=environment,
             check=False,
@@ -102,17 +115,14 @@ def main(argv: list[str]) -> int:
     workspace = Path(tempfile.mkdtemp(prefix="yr-tests-"))
     started = time.monotonic()
     results: list[tuple[int, int, str, float, Path, int]] = []
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(bins)) as pool:
-            futures = [
-                pool.submit(run_shard, index, args.python, bin_, workspace / f"shard-{index + 1}.log")
-                for index, bin_ in enumerate(bins)
-            ]
-            for index, (future, bin_) in enumerate(zip(futures, bins)):
-                code, state, elapsed = future.result()
-                results.append((index, code, state, elapsed, workspace / f"shard-{index + 1}.log", len(bin_)))
-    finally:
-        pass
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(bins)) as pool:
+        futures = [
+            pool.submit(run_shard, args.python, bin_, workspace / f"shard-{index + 1}.log")
+            for index, bin_ in enumerate(bins)
+        ]
+        for index, (future, bin_) in enumerate(zip(futures, bins)):
+            code, state, elapsed = future.result()
+            results.append((index, code, state, elapsed, workspace / f"shard-{index + 1}.log", len(bin_)))
 
     total_tests = 0
     failed: list[int] = []

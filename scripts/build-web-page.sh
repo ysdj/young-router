@@ -37,7 +37,7 @@ while (($# > 0)); do
     --commit) commit_ref=${2:?--commit needs a revision}; shift 2 ;;
     --output) output_dir=${2:?--output needs a directory}; shift 2 ;;
     -h|--help)
-      sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *) echo "build-web-page: unknown argument: $1" >&2; exit 2 ;;
@@ -96,7 +96,7 @@ for candidate in "$dist"/bundle.*.js; do
   fi
   bundle_name=$(basename "$candidate")
 done
-[[ -n "$bundle_name" ]] || { echo "build-web-page: the build wrote no content-addressed bundle" >&2; exit 1; }
+[[ "$bundle_name" != none ]] || { echo "build-web-page: the build wrote no content-addressed bundle" >&2; exit 1; }
 [[ "$bundle_name" =~ ^bundle\.[0-9a-f]{16}\.js$ ]] || { echo "build-web-page: $bundle_name is not bundle.<16 hex>.js" >&2; exit 1; }
 [[ ! -e "$dist/bundle.js" ]] || { echo "build-web-page: the build left a fixed bundle.js" >&2; exit 1; }
 # The editor is a script of its own, addressed by content.  The framed page is

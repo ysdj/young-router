@@ -109,7 +109,7 @@ downloads, so the build spends its effort on size without changing what runs:
   browser's `Accept-Encoding` admits with `Content-Encoding` + `Vary`. Doing
   this here rather than in Core keeps a worker thread off the first page load
   of every browser, and the sibling cannot go stale: it is named after the file
-  it was built from. The build's `MANIFEST.json` names the page by what it
+  it was built from. The publisher's `MANIFEST.json` (`scripts/build-web-page.sh`) names the page by what it
   decodes to, not by its encoding.
 
 The last two matter most on the host this page exists for: a headless machine
@@ -138,13 +138,13 @@ serving it over a link nobody sized for it.
   hosts use. No browser is bundled: none installed means the credential form
   below is the answer, and the pane says so.
 - **On a published page the sign-in runs in the page itself.** A page reached
-  through a name that is not loopback is open in somebody else's browser, and a
-  window on the server's screen is not "a login page popped up" for them — so
-  Core answers `unsupported` with `remote` (or `no_browser`/`no_display`) and the
-  pane asks for the station account instead, which Core posts as the same form
-  the station's page would have posted. A station that insists on a captcha or a
-  third-party sign-in is finished on the machine that runs Core, at the same
-  address; a page opened there gets the browser window.
+  through a name that is not loopback is open in somebody else's browser, so
+  Core runs the browser headlessly on the server and streams its frames to the
+  page: the sign-in is still performed on the machine that runs Core, and the
+  person sees and drives it in their own browser. `unsupported` comes back only
+  when no browser is installed (`no_browser`) or the launch failed
+  (`launch_failed`); the pane then asks for the station account instead, which
+  Core posts as the same form the station's page would have posted.
 - **The page's only credential is the cookie.** It sends no `Authorization`
   header: a remembered header is a second credential, and when the cookie and
   the header disagree (a reload replaces the cookie while the previous

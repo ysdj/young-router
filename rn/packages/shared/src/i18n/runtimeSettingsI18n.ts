@@ -43,6 +43,7 @@ const units: Record<string, string> = {
 const zh: Record<string, RuntimeCopy> = {
   YOUNG_ROUTER_REQUEST_TIMEOUT_SECONDS: { label: "请求超时", help: "上游模型请求、续写合成和每次恢复探测的总超时。设为 0 可取消本地请求上限。" },
   YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS: { label: "首事件超时", help: "普通请求等待首个上游流事件的最长时间。设为 0 时回退到请求超时。" },
+  YOUNG_ROUTER_UPSTREAM_CONNECT_TIMEOUT_SECONDS: { label: "上游连接超时", help: "到达上游允许花多久：域名解析、TCP 握手、TLS、上传请求体，以及等待响应头。这是任何流预算都没覆盖的那一段——首事件与流空闲的计时都要等拿到响应对象才开始，所以没有它时，一台连不上的主机会一直跑到操作系统的 SYN 重试用完。已经连上、正在思考的上游不受影响。设为 0 时交还给传输层自己的行为。" },
   YOUNG_ROUTER_HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS: { label: "重前缀首事件超时", help: "重放前缀序列化后超过重前缀阈值的 Responses 请求，改用此更长的首事件预算；多 MB 的签名历史会让所有路由同时推迟首个事件。设为 0 时仅使用首事件超时。" },
   YOUNG_ROUTER_HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES: { label: "重前缀阈值", help: "重放负载（input 加 instructions）序列化后超过该字节数时启用重前缀首事件超时。设为 0 可完全关闭加长预算。" },
   YOUNG_ROUTER_WEB_PASSWORD: { label: "Web 密钥", help: "浏览器打开本地端口上的页面时用来登录的密钥。留空时自动生成。在「常规」中设置。" },
@@ -60,6 +61,7 @@ const zh: Record<string, RuntimeCopy> = {
   YOUNG_ROUTER_RECOVERY_POLICY_RATE_LIMIT: { label: "限流 / 过载", help: "HTTP 429、上游过载或容量不足的处理方式。默认冷却：连续失败达到「冷却失败次数」后暂停该部署，后续请求直接交给能服务的路由，不再每次都先吃同一个拒绝。设为「恢复」则每次都在原路由重试。" },
   YOUNG_ROUTER_RECOVERY_POLICY_SERVER: { label: "服务器 / 网关", help: "临时服务器故障、没有健康路由和网关超时的处理方式。" },
   YOUNG_ROUTER_RECOVERY_POLICY_NETWORK: { label: "网络", help: "断连、DNS 故障和连接错误的处理方式。默认恢复不会让部署进入冷却。" },
+  YOUNG_ROUTER_RECOVERY_POLICY_UNREACHABLE: { label: "上游不可达", help: "一次根本没到达主机的尝试如何处理：域名解析失败、握手被拒或超时、拿不到响应头。与「网络」不同，这不是答完之后又断掉的路由——一个字节都没交换过，兄弟路由能服务同一份字节，所以这条路由会被停用，下一个请求不必再付一次同样的沉默。" },
   YOUNG_ROUTER_RECOVERY_POLICY_STREAM_START_TIMEOUT: { label: "首事件超时", help: "上游首个流事件到达前发生本地超时时的处理方式。" },
   YOUNG_ROUTER_RECOVERY_POLICY_STREAM_IDLE_TIMEOUT: { label: "流空闲超时", help: "流已开始后发生本地超时时的处理方式。默认恢复不会让部署进入冷却。" },
   YOUNG_ROUTER_RECOVERY_POLICY_REQUEST_ERROR: { label: "请求 / 格式错误", help: "确定性的请求、格式、模型、策略和上下文错误的处理方式。默认错误会直接返回失败，以便修复代理配置而不是继续等待。" },

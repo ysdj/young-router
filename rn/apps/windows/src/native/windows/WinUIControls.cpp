@@ -35,7 +35,6 @@
 #include <optional>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -43,30 +42,10 @@ namespace {
 
 
 using winrt::Microsoft::ReactNative::Composition::ContentIslandComponentView;
-using winrt::Microsoft::UI::Xaml::Controls::Button;
-using winrt::Microsoft::UI::Xaml::Controls::Border;
-using winrt::Microsoft::UI::Xaml::Controls::CheckBox;
-using winrt::Microsoft::UI::Xaml::Controls::ComboBox;
-using winrt::Microsoft::UI::Xaml::Controls::FontIcon;
-using winrt::Microsoft::UI::Xaml::Controls::Grid;
-using winrt::Microsoft::UI::Xaml::Controls::HyperlinkButton;
-using winrt::Microsoft::UI::Xaml::Controls::Image;
-using winrt::Microsoft::UI::Xaml::Controls::ListView;
-using winrt::Microsoft::UI::Xaml::Controls::ListViewSelectionMode;
-using winrt::Microsoft::UI::Xaml::Controls::Orientation;
 using winrt::Microsoft::UI::Xaml::Controls::PasswordBox;
-using winrt::Microsoft::UI::Xaml::Controls::ProgressRing;
-using winrt::Microsoft::UI::Xaml::Controls::ScrollViewer;
-using winrt::Microsoft::UI::Xaml::Controls::StackPanel;
 using winrt::Microsoft::UI::Xaml::Controls::TextBox;
-using winrt::Microsoft::UI::Xaml::Controls::TextBlock;
-using winrt::Microsoft::UI::Xaml::Controls::ToolTipService;
 using winrt::Microsoft::UI::Xaml::Automation::AutomationProperties;
 using winrt::Microsoft::UI::Xaml::Controls::WebView2;
-using winrt::Microsoft::UI::Xaml::Controls::Primitives::Thumb;
-using winrt::Microsoft::UI::Xaml::Controls::Primitives::ToggleButton;
-using winrt::Microsoft::UI::Xaml::Media::SolidColorBrush;
-using winrt::Microsoft::UI::Xaml::Media::FontFamily;
 using winrt::Microsoft::UI::Xaml::Thickness;
 
 namespace web = winrt::Microsoft::Web::WebView2::Core;
@@ -209,7 +188,10 @@ struct CodeWebViewComponentView
     wait->queue = queue;
     wait->island_view = island_view;
     auto step = std::make_shared<std::function<void()>>();
-    *step = [wait, step]() {
+    // The step re-posts itself, so it must not own the function that stores it;
+    // each queued handler keeps the strong reference until it has run.
+    std::weak_ptr<std::function<void()>> weak_step = step;
+    *step = [wait, weak_step]() {
       auto self = wait->owner.get();
       if (!self || self->disposed_) return;
       auto scale = 1.0;
@@ -223,12 +205,18 @@ struct CodeWebViewComponentView
         return;
       }
       if (scale == 1.0 && ++wait->attempts < 8) {
-        wait->queue.TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, *step);
+        if (auto next = weak_step.lock()) {
+          wait->queue.TryEnqueue(
+              winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low,
+              [next]() { (*next)(); });
+        }
         return;
       }
       self->InitializeBrowser();
     };
-    queue.TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, *step);
+    queue.TryEnqueue(
+        winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low,
+        [step]() { (*step)(); });
   }
 
   void UpdateProps(
@@ -318,9 +306,16 @@ struct CodeWebViewComponentView
       winrt::com_ptr<winrt::YoungRouter::Codegen::LiteLLMWinUICodeWebViewProps> const& old_props) noexcept {
     if (disposed_ || !Props()) return;
     auto const& props = *Props();
-    if (props.html.empty() || props.documentKey.empty() ||
-        (props.language != "json" && props.language != "toml" && props.language != "yaml" && props.language != "text") ||
-        props.html.size() > kMaxEditorMessageBytes ||
+    if (props.html.empty() || props.documentKey.empty()) {
+      EmitEditorError("invalid_editor_props");
+      return;
+    }
+    // Mirrors the language union the shared editor page accepts.
+    if (props.language != "json" && props.language != "toml" && props.language != "yaml" && props.language != "text") {
+      EmitEditorError("unsupported_editor_language");
+      return;
+    }
+    if (props.html.size() > kMaxEditorMessageBytes ||
         props.value.size() > kMaxEditorDocumentBytes ||
         props.baseline.size() > kMaxEditorDocumentBytes) {
       EmitEditorError("editor_document_too_large");
@@ -447,8 +442,8 @@ struct CodeWebViewComponentView
       auto clipboard_text = co_await content.GetTextAsync();
       if (self->disposed_) co_return;
       std::wstring value = clipboard_text.c_str();
-      // Keep the injected payload bounded; the editor document itself is
-      // capped at 2 MiB in the shared UI.
+      // Keep the injected payload bounded at 256 KiB; the page clamps pastes
+      // to 1 MiB and the document budget is 6 MiB (kMaxEditorDocumentBytes).
       constexpr size_t maximum_length = 262144;
       if (value.size() > maximum_length) value.resize(maximum_length);
       auto payload = winrt::Windows::Data::Json::JsonObject{};
@@ -510,11 +505,11 @@ struct CodeWebViewComponentView
         return;
       }
 
-      const auto text = winrt::to_string(payload.GetNamedString(L"text", L""));
       if (!payload.HasKey(L"text")) {
         EmitEditorError("invalid_editor_change");
         return;
       }
+      const auto text = winrt::to_string(payload.GetNamedString(L"text", L""));
       emitted_editor_texts_.push_back(text);
       if (emitted_editor_texts_.size() > 8) emitted_editor_texts_.pop_front();
       if (!EventEmitter()) return;

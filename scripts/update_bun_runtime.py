@@ -44,7 +44,6 @@ from update_common import (
 )
 
 
-PACKAGE_NAME = "@oven/bun-{platform}"
 #: The registry document per platform package: the executable's tarball is
 #: resolved from its own version, because the platform packages are released
 #: under the same number as the umbrella ``bun`` package but are published
@@ -103,12 +102,9 @@ def _license_bytes() -> bytes:
     binary without its licence, so the failure is reported instead.
     """
 
-    try:
-        text = download_bytes(
-            LICENSE_URL, timeout=DEFAULT_TIMEOUT_SECONDS, user_agent=USER_AGENT
-        )
-    except UpdateError:
-        raise
+    text = download_bytes(
+        LICENSE_URL, timeout=DEFAULT_TIMEOUT_SECONDS, user_agent=USER_AGENT
+    )
     if not text:
         raise UpdateError("Downloaded Bun licence is empty")
     return text

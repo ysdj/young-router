@@ -20,9 +20,16 @@ const appRoot = __dirname;
 const workspaceRoot = path.resolve(appRoot, "../..");
 const sharedRoot = path.join(workspaceRoot, "packages/shared");
 
-const rnwPath = fs.realpathSync(
-  path.resolve(require.resolve("react-native-windows/package.json"), ".."),
-);
+// Both RNW trees are matched by their real path.  On Windows `realpathSync`
+// answers native `\\` separators, and letting those into a RegExp source turns
+// `\node_modules` into a newline escape and `\target` into a tab, so the pattern
+// matches nothing -- the generated MSBuild trees then stay in Metro's crawl and
+// the CLI hits exactly the locks these entries exist to avoid.
+const rnwPattern = fs
+  .realpathSync(path.resolve(require.resolve("react-native-windows/package.json"), ".."))
+  .replace(/[/\\]/g, "/")
+  .replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 
 //
 
@@ -64,8 +71,8 @@ const config = {
         `${path.resolve(appRoot, "windows").replace(/[/\\]/g, "/")}.*`,
       ),
       // This prevents the React Native Windows CLI from hitting generated MSBuild-file locks.
-      new RegExp(`${rnwPath}/build/.*`),
-      new RegExp(`${rnwPath}/target/.*`),
+      new RegExp(`${rnwPattern}/build/.*`),
+      new RegExp(`${rnwPattern}/target/.*`),
       /.*\.ProjectImports\.zip/,
     ]),
     //

@@ -12,6 +12,21 @@
  * Core states the same rule (`young_router/public_names.py`), so the pane and
  * the document agree about what one group is.
  */
+const DISPLAYABLE_TRANSPORT_PREFIXES = new Set(["openai", "anthropic", "chatgpt"]);
+
+/**
+ * Remove only the adapter prefix Young Router adds to LiteLLM model ids.
+ * Provider and lane ids may contain slashes themselves, so generic prefix
+ * splitting would make the same model display differently across projections.
+ */
+export function displayUpstreamModel(value: string): string {
+  const text = value.trim();
+  const separator = text.indexOf("/");
+  if (separator < 0) return text;
+  const prefix = text.slice(0, separator).toLowerCase();
+  return DISPLAYABLE_TRANSPORT_PREFIXES.has(prefix) ? text.slice(separator + 1).trim() : text;
+}
+
 export function publicModelKey(name: string): string {
   return name.trim();
 }

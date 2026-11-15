@@ -72,6 +72,47 @@ if (-not $Tree) {
 if (-not $Source) { $Source = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path }
 $Source = (Resolve-Path -LiteralPath $Source).Path
 
+# The Metro server the bundle comes from (see "the bundle" below) is stopped
+# here, ahead of the tree checks and the diff analysis: a checkout refused for
+# native or dependency changes is exactly the one whose server has to be shut
+# down, and that refusal would otherwise come first and leave it running.
+$MetroPort = if ($env:YOUNG_ROUTER_METRO_PORT) { [int]$env:YOUNG_ROUTER_METRO_PORT } else { 8081 }
+$MetroBase = "http://127.0.0.1:$MetroPort"
+$MetroLog = Join-Path ([System.IO.Path]::GetTempPath()) "young-router-metro-$MetroPort.log"
+
+function Get-MetroServerProcesses {
+  Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue |
+    Where-Object {
+      $_.CommandLine -and
+      $_.CommandLine -match 'react-native[\\/]cli\.js' -and
+      $_.CommandLine -match 'start' -and
+      $_.CommandLine -match "--port\s+$MetroPort(\s|$)"
+    }
+}
+
+function Stop-MetroServer {
+  # Two Metros sharing one cache directory wedge each other, and a server that
+  # stopped answering is worse than none: the next run would wait out its
+  # timeout and bundle twice.  One instance per port, always.
+  $servers = @(Get-MetroServerProcesses)
+  foreach ($server in $servers) { Stop-Process -Id $server.ProcessId -Force -ErrorAction SilentlyContinue }
+  if ($servers.Count -gt 0) {
+    $servers | ForEach-Object {
+      Get-CimInstance Win32_Process -Filter "ParentProcessId = $($_.ProcessId)" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -eq 'node.exe' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    }
+    Start-Sleep -Milliseconds 800
+  }
+  return $servers.Count
+}
+
+if ($StopMetro) {
+  $stopped = Stop-MetroServer
+  "stopped $stopped Metro server(s)"
+  exit 0
+}
+
 # A shared folder is a reparse point (Parallels mounts one as a symlink to
 # ``UNC\psf\Home``), and a checkout reached through one cannot hold node_modules:
 # every ancestor is checked rather than the drive letter, because the share is
@@ -371,10 +412,6 @@ if (-not $pnpm) { throw 'pnpm is not on PATH.' }
 # answers the same bundle in 0-1 s, and 3 s after an edit, because only the
 # changed module is transformed.  The server is started on demand and reused by
 # every later run; ``-StopMetro`` shuts it down.
-$MetroPort = if ($env:YOUNG_ROUTER_METRO_PORT) { [int]$env:YOUNG_ROUTER_METRO_PORT } else { 8081 }
-$MetroBase = "http://127.0.0.1:$MetroPort"
-$MetroLog = Join-Path ([System.IO.Path]::GetTempPath()) "young-router-metro-$MetroPort.log"
-
 function Test-MetroServer {
   try {
     $response = Invoke-WebRequest -Uri "$MetroBase/status" -UseBasicParsing -TimeoutSec 5
@@ -382,33 +419,6 @@ function Test-MetroServer {
   } catch {
     return $false
   }
-}
-
-function Get-MetroServerProcesses {
-  Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" -ErrorAction SilentlyContinue |
-    Where-Object {
-      $_.CommandLine -and
-      $_.CommandLine -match 'react-native[\\/]cli\.js' -and
-      $_.CommandLine -match 'start' -and
-      $_.CommandLine -match "--port\s+$MetroPort(\s|$)"
-    }
-}
-
-function Stop-MetroServer {
-  # Two Metros sharing one cache directory wedge each other, and a server that
-  # stopped answering is worse than none: the next run would wait out its
-  # timeout and bundle twice.  One instance per port, always.
-  $servers = @(Get-MetroServerProcesses)
-  foreach ($server in $servers) { Stop-Process -Id $server.ProcessId -Force -ErrorAction SilentlyContinue }
-  if ($servers.Count -gt 0) {
-    $servers | ForEach-Object {
-      Get-CimInstance Win32_Process -Filter "ParentProcessId = $($_.ProcessId)" -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -eq 'node.exe' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    }
-    Start-Sleep -Milliseconds 800
-  }
-  return $servers.Count
 }
 
 function Start-MetroServer {
@@ -420,12 +430,6 @@ function Start-MetroServer {
   Start-Process -FilePath (Get-Command node).Source -WorkingDirectory $AppRoot -WindowStyle Hidden `
     -ArgumentList @($cli, 'start', '--port', "$MetroPort") `
     -RedirectStandardOutput $MetroLog -RedirectStandardError "$MetroLog.err" | Out-Null
-}
-
-if ($StopMetro) {
-  $stopped = Stop-MetroServer
-  "stopped $stopped Metro server(s)"
-  exit 0
 }
 
 $bundleSource = 'metro-server'

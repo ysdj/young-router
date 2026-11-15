@@ -16,8 +16,6 @@ type Presentation = {
   dismiss: () => void;
   /** Keep keyboard focus inside this layer while it is the topmost one. */
   trap?: (event: KeyboardEvent) => void;
-  /** Keys the layer handles itself once Escape and Tab are accounted for. */
-  key?: (event: KeyboardEvent) => void;
 };
 
 const stack: Presentation[] = [];
@@ -34,9 +32,7 @@ const onKeyDown = (event: KeyboardEvent): void => {
   }
   if (event.key === "Tab") {
     top.trap?.(event);
-    return;
   }
-  top.key?.(event);
 };
 
 /**

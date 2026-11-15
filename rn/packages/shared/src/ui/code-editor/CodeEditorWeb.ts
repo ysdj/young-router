@@ -118,7 +118,6 @@ let diffTimer: number | undefined;
 let scrollbarFrame: number | undefined;
 let scrollbarObserver: ResizeObserver | undefined;
 let scrollbarDrag: { pointerId: number; grabOffset: number } | undefined;
-let latestDiff: EditorDiff = { added: 0, changed: 0, deleted: 0 };
 let applyingHostUpdate = false;
 
 /**
@@ -169,6 +168,10 @@ function requestHostPaste(): void {
 function handleEditorShortcut(event: KeyboardEvent): void {
   const editor = aceEditor;
   if (!editor || event.defaultPrevented || (!event.metaKey && !event.ctrlKey) || event.altKey) return;
+  // The search box is a real input inside this document, and this listener runs
+  // in the capture phase, ahead of the field's own handlers: editing keys typed
+  // into the field belong to the field, not to the editor document.
+  if (event.target instanceof Element && event.target.closest(".ace_search")) return;
   const key = event.key.toLowerCase();
   if (key === "a") {
     event.preventDefault();
@@ -245,7 +248,9 @@ function menuActionDisabled(action: MenuAction): boolean {
   const editor = aceEditor;
   if (!editor) return true;
   if (action === "paste") return documentReadOnly;
-  if (action === "cut" || action === "copy") return documentReadOnly || !editor.getCopyText();
+  // Copying changes nothing, so a read-only document can still copy.
+  if (action === "copy") return !editor.getCopyText();
+  if (action === "cut") return documentReadOnly || !editor.getCopyText();
   return false;
 }
 
@@ -543,14 +548,11 @@ function diffLabel(diff: EditorDiff): string {
   return [diff.added > 0 ? `+${diff.added}` : undefined, diff.changed > 0 ? `~${diff.changed}` : undefined, diff.deleted > 0 ? `−${diff.deleted}` : undefined]
     .filter((part): part is string => Boolean(part)).join(" ");
 }
-function computeDiff(): ComputedEditorDiff {
-  if (!aceEditor || !showingDiff) return { added: 0, changed: 0, deleted: 0, entries: [] };
-  const current = normalizedLines(aceEditor.getValue());
-  const original = normalizedLines(baselineText);
+/** The per-hunk counts, plus the sidebar's entries when a sink is given. */
+function summarizeDiff(original: string[], current: string[], entries?: EditorDiffEntry[]): EditorDiff {
   let added = 0;
   let changed = 0;
   let deleted = 0;
-  const entries: EditorDiffEntry[] = [];
   for (const hunk of diffHunks(original, current)) {
     const beforeCount = hunk.beforeEnd - hunk.beforeStart;
     const afterCount = hunk.afterEnd - hunk.afterStart;
@@ -560,6 +562,7 @@ function computeDiff(): ComputedEditorDiff {
     changed += changedLines;
     added += addedLines;
     deleted += deletedLines;
+    if (!entries) continue;
     entries.push({
       kind: beforeCount === 0 ? "added" : afterCount === 0 ? "deleted" : "changed",
       range: afterCount > 0 ? lineRange(current, hunk.afterStart, hunk.afterEnd) : lineRange(original, hunk.beforeStart, hunk.beforeEnd),
@@ -570,7 +573,19 @@ function computeDiff(): ComputedEditorDiff {
       after: previewLines(current, hunk.afterStart, hunk.afterEnd),
     });
   }
-  return { added, changed, deleted, entries };
+  return { added, changed, deleted };
+}
+function computeDiff(): ComputedEditorDiff {
+  if (!aceEditor || !showingDiff) return { added: 0, changed: 0, deleted: 0, entries: [] };
+  const current = normalizedLines(aceEditor.getValue());
+  const original = normalizedLines(baselineText);
+  const entries: EditorDiffEntry[] = [];
+  return { ...summarizeDiff(original, current, entries), entries };
+}
+/** Counts for the change message, which renders no previews. */
+function computeDiffCounts(): EditorDiff {
+  if (!aceEditor || !showingDiff) return { added: 0, changed: 0, deleted: 0 };
+  return summarizeDiff(normalizedLines(baselineText), normalizedLines(aceEditor.getValue()));
 }
 function appendDiffPreview(parent: HTMLElement, prefix: string, preview: EditorDiffPreview, className: string): void {
   if (preview.lines.length === 0) return;
@@ -592,7 +607,6 @@ function appendDiffPreview(parent: HTMLElement, prefix: string, preview: EditorD
 }
 function renderDiffSidebar(): void {
   const summary = computeDiff();
-  latestDiff = summary;
   sidebarTotal.textContent = diffLabel(summary);
   sidebarList.replaceChildren();
   if (!showingDiff) return;
@@ -648,8 +662,7 @@ function reportChange(): void {
   changeTimer = window.setTimeout(() => {
     changeTimer = undefined;
     if (!aceEditor) return;
-    const summary = computeDiff();
-    latestDiff = summary;
+    const summary = computeDiffCounts();
     post({ type: "change", text: aceEditor.getValue(), added: summary.added, changed: summary.changed, deleted: summary.deleted });
   }, CHANGE_SYNC_INTERVAL_MS);
 }
@@ -704,7 +717,6 @@ function createEditor(command: ReplaceDocumentCommand): void {
   aceEditor.setTheme("ace/theme/textmate");
   configureEditor(command);
   aceEditor.session.on("change", reportChange);
-  aceEditor.renderer.on("afterRender", queueEditorScrollbar);
   // Ace's default command set includes undo/redo, Tab indentation, folding,
   // and multi-select. Keep the built-in command/keybinding behavior intact;
   // only the search box extension is loaded explicitly above.
@@ -717,7 +729,6 @@ function replaceDocument(command: ReplaceDocumentCommand): void {
   showingDiff = command.showDiff;
   document.body.classList.toggle("diff-sidebar-enabled", showingDiff);
   baselineText = normalizedText(command.baseline);
-  latestDiff = { added: 0, changed: 0, deleted: 0 };
   sidebarTotal.textContent = "";
   sidebarList.replaceChildren();
   const nextText = normalizedText(command.value);
@@ -750,7 +761,6 @@ function replaceDocument(command: ReplaceDocumentCommand): void {
 function setBaseline(baseline: string): void {
   if (!showingDiff) return;
   baselineText = normalizedText(baseline);
-  latestDiff = { added: 0, changed: 0, deleted: 0 };
   queueDiffSidebar();
 }
 function receive(input: unknown): void {

@@ -81,7 +81,7 @@ export function useRelayDialogSurface(render: DialogRender): boolean {
  * route that owns the panel which asked, and never inside that panel's column.
  */
 export function RelayDialogHost(): React.JSX.Element | null {
-  const [revision, setRevision] = useState(0);
+  const [, setRevision] = useState(0);
   useEffect(() => {
     hostCount += 1;
     notify();
@@ -93,7 +93,10 @@ export function RelayDialogHost(): React.JSX.Element | null {
   useEffect(() => subscribeRelayDialogs(() => setRevision((value) => value + 1)), []);
   const active = [...renders.values()];
   if (active.length === 0) return null;
-  return <React.Fragment key={`relay-dialogs-${revision}`}>
+  // The bump only has to force this host to redraw; it must not key the tree,
+  // because a changed key remounts the published dialogs and a form that is up
+  // loses the draft the user is typing into it.
+  return <React.Fragment>
     {active.map((entry, index) => <React.Fragment key={index}>{entry()}</React.Fragment>)}
   </React.Fragment>;
 }

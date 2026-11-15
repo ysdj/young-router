@@ -55,6 +55,8 @@ type NativeSegmentedProps = {
 type NativePickerProps = {
   labels: string[];
   selectedValue: string;
+  /** Indices listed but not choosable (a relay whose login has lapsed). */
+  disabledIndices?: number[];
   disabled?: boolean;
   compact?: boolean;
   overlayLayer?: boolean;
@@ -72,8 +74,8 @@ export function AppKitSegmentedControl({ labels, selectedValue, disabled, compac
   return <NativeAppKitSegmentedControl ref={ref as never} labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} overlayLayer={overlayLayer} onChange={onChange} style={[styles.segmented, style]} />;
 }
 
-export function AppKitPicker({ labels, selectedValue, disabled, compact, accessibilityLabel, onChange, style }: NativePickerProps): React.JSX.Element {
-  return <NativeAppKitPicker labels={labels} selectedValue={selectedValue} disabled={disabled} compact={compact} accessibilityLabel={accessibilityLabel} onChange={onChange} style={[styles.picker, style]} />;
+export function AppKitPicker({ labels, selectedValue, disabledIndices = [], disabled, compact, overlayLayer = false, accessibilityLabel, onChange, style }: NativePickerProps): React.JSX.Element {
+  return <NativeAppKitPicker labels={labels} selectedValue={selectedValue} disabledIndices={disabledIndices} disabled={disabled} compact={compact} overlayLayer={overlayLayer} accessibilityLabel={accessibilityLabel} onChange={onChange} style={[styles.picker, style]} />;
 }
 
 export function AppKitCheckbox({ label, value, disabled, compact, labelVisible, onValueChange, style }: { label: string; value: boolean; disabled?: boolean; compact?: boolean; labelVisible?: boolean; onValueChange?: (value: boolean) => void; style?: StyleProp<ViewStyle> }): React.JSX.Element {

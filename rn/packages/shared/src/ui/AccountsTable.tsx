@@ -1,6 +1,6 @@
 import React from "react";
 import { Platform, PlatformColor, StyleSheet, Text, View } from "react-native";
-import { NativeTable } from "./NativeControls";
+import { NativeTable, WINDOWS_CONTROL } from "./NativeControls";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
 /**
@@ -15,6 +15,12 @@ import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
  */
 export type AccountsTableRow = { key: string; cells: string[] };
 export type AccountsTableColumn = { label: string; width: number };
+
+// One empty list for both key props, not a fresh `[]` per call site: a new
+// array on every render invalidated `NativeTable`'s memoized lookup Sets and
+// re-rendered every mounted row, which its own empty-list defaults exist to
+// avoid.
+const EMPTY_ROW_KEYS: string[] = [];
 
 export function AccountsTable({
   title,
@@ -56,8 +62,8 @@ export function AccountsTable({
       columns={columns}
       rows={rows}
       selectedKey={selectedKey ?? ""}
-      disabledRowKeys={[]}
-      alertRowKeys={alertRowKeys ?? []}
+      disabledRowKeys={EMPTY_ROW_KEYS}
+      alertRowKeys={alertRowKeys ?? EMPTY_ROW_KEYS}
       compact
       striped
       onSelectionChange={(key) => onSelectionChange?.(key)}
@@ -82,7 +88,7 @@ function color(macos: string, windows: string, fallback: string): ReturnType<typ
 const colors = {
   text: color("labelColor", "TextFillColorPrimary", "#1d1d1f"),
   secondary: color("secondaryLabelColor", "TextFillColorSecondary", "#6e6e73"),
-  separator: color("separatorColor", "ControlStrokeColorDefault", "#d4d4d8"),
+  separator: color("separatorColor", "ControlStrokeColorDefault", WINDOWS_CONTROL.stroke),
   panel: color("controlBackgroundColor", "ControlFillColorDefault", "#ffffff"),
 };
 

@@ -474,7 +474,10 @@ bool RunOwnedModalWindow(
     SetForegroundWindow(owner);
   }
   if (message_result == 0) PostQuitMessage(static_cast<int>(message.wParam));
-  return finished && message_result >= 0;
+  // A viewer that failed to load is not a viewer the user closed: the caller
+  // used to read both as a normal end, so a broken record looked like a
+  // dismissal.
+  return finished && !state->failed && message_result >= 0;
 }
 
 void FailReadOnlyCodeViewer(std::weak_ptr<ReadOnlyCodeViewerState> const& weak_state) noexcept {
@@ -877,13 +880,12 @@ void WinUI3NativeLeaf::SetLocalization(std::map<std::string, std::wstring> strin
   }
   if (window_handle_ != nullptr && !active_route_.empty()) {
     SetWindowTextW(window_handle_, RouteTitle(active_route_).c_str());
-  } else if (window_handle_ != nullptr) {
+  } else if (window_handle_ != nullptr && child_host_) {
     // A child host is titled by its route before any React view exists, so the
-    // AppWindow carries the English fallback until the strings arrive.  Re-title
-    // it from the route the child was started with.
-    if (child_host_) {
-      SetWindowTextW(window_handle_, RouteTitle(active_route_).c_str());
-    }
+    // AppWindow carries the English fallback until the strings arrive.  The
+    // route it was started with is the one it was last opened on; only the
+    // empty-route case reaches here, so that record is what gets re-read.
+    SetWindowTextW(window_handle_, RouteTitle(active_route_).c_str());
   }
   if (tray_visible_) {
     auto tooltip = status_title_.empty() ? Localized("appTitle", L"Young Router") : status_title_;
@@ -1458,7 +1460,8 @@ std::optional<std::pair<size_t, size_t>> WinUI3NativeLeaf::ShowGroupedActionMenu
 std::optional<size_t> WinUI3NativeLeaf::ShowActionMenu(
     std::wstring_view title,
     std::vector<std::wstring> const& items,
-    NativeMenuAnchor anchor) {
+    NativeMenuAnchor anchor,
+    std::vector<size_t> const& disabledIndices) {
   if (!window_handle_ || title.empty() || items.empty() || items.size() > 32) return std::nullopt;
   if (!std::isfinite(anchor.x) || !std::isfinite(anchor.y) || !std::isfinite(anchor.width) || !std::isfinite(anchor.height) ||
       anchor.x < 0 || anchor.y < 0 || anchor.width <= 0 || anchor.height <= 0 ||
@@ -1472,7 +1475,13 @@ std::optional<size_t> WinUI3NativeLeaf::ShowActionMenu(
       DestroyMenu(menu);
       return std::nullopt;
     }
-    AppendMenuW(menu, MF_STRING, static_cast<UINT_PTR>(index + 1), items[index].c_str());
+    // A row the caller marked unavailable stays in the list, greyed: it names
+    // a relay the user knows, and a menu that hid it left nothing to aim at
+    // when the session it needs has simply lapsed.
+    const bool unavailable =
+        std::find(disabledIndices.begin(), disabledIndices.end(), index) != disabledIndices.end();
+    AppendMenuW(menu, MF_STRING | (unavailable ? MF_GRAYED : MF_ENABLED),
+        static_cast<UINT_PTR>(index + 1), items[index].c_str());
   }
   // React Native reports window-local DIPs from the top-left. Convert to
   // physical client pixels and anchor below the button, independent of the
