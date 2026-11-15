@@ -266,7 +266,6 @@ def _image_input_budget(request_kwargs: Optional[dict]) -> Optional[dict[str, An
 
     for key in ("input", "messages"):
         value = request_kwargs.get(key)
-        value_stats = _image_input_stats(value)
         suffix_value = _image_bounding_suffix(value)
         suffix_stats = _image_input_stats(suffix_value)
         if isinstance(value, list):
@@ -274,10 +273,18 @@ def _image_input_budget(request_kwargs: Optional[dict]) -> Optional[dict[str, An
         else:
             prefix_value = []
         prefix_stats = _image_input_stats(prefix_value)
+        # Prefix and suffix partition the value, so their counts already carry
+        # everything a walk of the whole payload would.  A largest-image size is
+        # a maximum: summing the parts reports an image no request carries.
         for name in total:
-            total[name] += value_stats[name]
-            suffix[name] += suffix_stats[name]
+            if name == "largest_inline_image_bytes":
+                total[name] = max(total[name], prefix_stats[name], suffix_stats[name])
+                prefix[name] = max(prefix[name], prefix_stats[name])
+                suffix[name] = max(suffix[name], suffix_stats[name])
+                continue
+            total[name] += prefix_stats[name] + suffix_stats[name]
             prefix[name] += prefix_stats[name]
+            suffix[name] += suffix_stats[name]
 
     if total["image_count"] == 0:
         return None

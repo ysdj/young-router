@@ -50,13 +50,14 @@ from ...config.schema import (
     infer_upstream_fallback_surface,
 )
 
-from ...adapters import veridrop
+from ...adapters import llm_fingerprint as fingerprint_adapter
+from ...adapters import modelprint as modelprint_adapter
 from ...adapters import our_free_model as our_free_model_module
 from ...adapters import qoder as qoder_module
 from ...adapters import workbuddy as workbuddy_module
 from ... import adapters as managed_adapters
 from ...browser_identity import browser_request_headers
-from ...public_names import import_name_case, imported_public_name, public_name_key
+from ...public_names import display_upstream_model, import_name_case, imported_public_name, public_name_key
 from ...values import explicit_bool
 from ...values import int_or_none as _int_or_none
 from ...api_base import api_base_for_surface, isolated_http_opener, service_root
@@ -121,7 +122,7 @@ def _route_key_renamed(route_key: str, public_model: str) -> str:
 
     return " / ".join(
         f"model={public_model}" if segment.strip().startswith("model=") else segment
-        for segment in route_key.split("/")
+        for segment in route_key.split(" / ")
     )
 
 
@@ -353,6 +354,12 @@ def _model_entities(projection: Mapping[str, Any]) -> dict[tuple[str, str], Mapp
     return entities
 
 
+#: The ``tiktoken`` encoder the speed test counts output with.  Built once per
+#: process for the same reason the context guard's encoder is: loading a
+#: vocabulary costs far more than any measurement it then feeds.
+_SPEED_TEST_ENCODER: Any = None
+
+
 class ProvidersModelsDomain:
     """Staged providers/models editing through ``young_router.config``."""
 
@@ -365,7 +372,11 @@ class ProvidersModelsDomain:
     # waits for a first event exactly as long as this deployment lets the proxy
     # wait for one, so the pane's verdict follows Runtime Settings (Timeouts →
     # First-event timeout) instead of a private ceiling. 120s is that setting's
-    # schema default; an explicit env override still wins.
+    # schema default and the proxy's own fallback (the three are pinned
+    # together by ``test_runtime_schema_defaults_match_proxy_defaults``); an
+    # explicit env override still wins.  It read 300 here for as long as the
+    # pane published 120, which made this probe wait two and a half times
+    # longer than the router before calling a route unreachable.
     _MODEL_PROBE_TIMEOUT_SECONDS = 120.0
     _MODEL_PROBE_TIMEOUT_SETTING_KEY = "YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS"
     # Measured on a live edge: roughly half of the TLS connections from this
@@ -390,6 +401,52 @@ class ProvidersModelsDomain:
     # raise this without a rebuild when their edge is consistently slower.
     _MODEL_PROBE_TIMEOUT_ENV = "YOUNG_ROUTER_MODEL_PROBE_TIMEOUT_SECONDS"
     _MAX_MODEL_PROBE_BYTES = 256 * 1024
+    # A "flash" route is pressed for a speed reading instead of an availability
+    # reading: the token rate the route serves its own recommended protocol at,
+    # measured over a bounded window.  The window is what makes two readings
+    # comparable, and its start is bounded because a route that answers
+    # instantly has not been measured at all: the first tokens of a stream are
+    # the model reading the prompt (a rate computed across that wait reports the
+    # queue, not the generation), so the clock starts on the first content token
+    # and the run keeps asking for more until the window closes.  Six seconds
+    # sits inside the 5-8 s band a user will sit through, and one press is one
+    # measurement -- there is no retry ladder here, because a second run under
+    # the same name would report a different number.
+    _SPEED_TEST_WINDOW_SECONDS = 6.0
+    #: The floor and ceiling the window is clamped to.  A deployment may raise
+    #: or lower it without a rebuild -- an edge that stalls at 5 s still answers
+    #: -- but a value outside this band is not a measurement of the same thing
+    #: as every other host's reading, so it is clamped rather than obeyed.
+    _SPEED_TEST_MIN_WINDOW_SECONDS = 5.0
+    _SPEED_TEST_MAX_WINDOW_SECONDS = 8.0
+    _SPEED_TEST_WINDOW_ENV = "YOUNG_ROUTER_SPEED_TEST_WINDOW_SECONDS"
+    #: How many streamed turns one window may cover.  Each round exists because
+    #: the previous answer ended, so this only bounds a route that answers in
+    #: a single token over and over; every ordinary model finishes far fewer
+    #: rounds than this inside six seconds.
+    _SPEED_TEST_MAX_ROUNDS = 32
+    # The output the run asks for.  It is a ceiling, not a target: the window
+    # is what ends the measurement, so this only has to outlast a fast route's
+    # eight seconds (a 300 tok/s route emits ~2400 tokens there) without asking
+    # any upstream for a budget it would refuse.
+    _SPEED_TEST_MAX_OUTPUT_TOKENS = 4096
+    #: The published field names, spelled out because the redactor classifies a
+    #: key by the words in it and a bare ``tokens`` reads as a bearer token
+    #: there: ``{"tokens": 300}`` arrives at the pane as the string
+    #: ``configured``.  A count has to say "count" (``output_token_count``), and
+    #: a rate has to say it too (``output_token_count_per_second``), or the
+    #: number the press measured is replaced by a presence marker on the way out.
+    #:
+    #: The prompt the run streams.  It asks for prose rather than a word: a
+    #: route that answers "OK" and stops would report the rate of one token.
+    _SPEED_TEST_PROMPT = (
+        "Write a continuous explanation of how a computer boots, in as much "
+        "detail as you can. Do not stop early and do not ask questions."
+    )
+    #: The instruction the account door carries beside that prompt.  It is the
+    #: only shape with an ``instructions`` field, and stating the task there is
+    #: what keeps a tuned account from answering briefly.
+    _SPEED_TEST_INSTRUCTIONS = "You are measuring throughput. Answer at length."
     # The inputs a stored probe result is a claim about: which address was
     # called, which model name was asked for, which protocol was tried, and
     # which credential answered.  Editing one of them leaves the finding
@@ -406,13 +463,30 @@ class ProvidersModelsDomain:
             "upstream_protocol_mode",
         }
     )
-    # The deep test runs the staged Veridrop quick suite as its own process.
-    # That program bounds itself (quick mode carries a 60-second overall
-    # budget), so this ceiling is only a backstop: it still outlasts a loaded
-    # edge that stretches the suite's own round trips, and it stays well above
-    # the availability probe's budget so a slow scan never reads as silence.
+    # The deep test runs the staged modelprint probe table against the route.
+    # Upstream's probe set sends ~21 small requests per run and spends no more
+    # than a few thousand tokens, so this ceiling is only a backstop for an
+    # endpoint that stretches every round trip; it stays well above the
+    # availability probe's budget so a slow scan never reads as silence.
     _DEGRADATION_PROBE_TIMEOUT_SECONDS = 300.0
     _DEGRADATION_PROBE_TIMEOUT_ENV = "YOUNG_ROUTER_DEGRADATION_PROBE_TIMEOUT_SECONDS"
+    # What one press of the probe button asks for.  They are separate because
+    # they cost wildly different amounts: reachability is a handful of requests
+    # and a few seconds, identity is the fingerprint table, and precision is a
+    # distribution battery.  A user who wants to know whether a route is alive
+    # should not pay for a fingerprint, and a pane that offers one button for
+    # all three makes the cheap question cost as much as the expensive one.
+    _PROBE_KINDS = ("reachability", "identity", "precision", "speed", "full")
+    #: The kinds that each run on top of the one before it.  Asking for
+    #: ``identity`` includes reachability because a fingerprint of an endpoint
+    #: that never answered says nothing.
+    _PROBE_KIND_LAYERS = {
+        "reachability": ("reachability",),
+        "identity": ("reachability", "identity"),
+        "precision": ("reachability", "precision"),
+        "speed": ("reachability", "speed"),
+        "full": ("reachability", "identity", "precision", "speed"),
+    }
     _API_KEY_TARGET_SEPARATOR = "\x1f"
     # The provider wizard stages the key it is about to give a provider it has
     # not created yet, so one secret target names the wizard's own token
@@ -491,6 +565,10 @@ class ProvidersModelsDomain:
         # the whole provider document; `_validate` answers from here while the
         # digest is unchanged and every draft replacement drops it.
         self._validation_cache: tuple[str, dict[str, Any]] | None = None
+        # The document the last successful validation probe rendered.  The
+        # Apply that follows writes those bytes instead of rendering the
+        # whole configuration a second time.
+        self._render_snapshot: dict[str, str | None] | None = None
         # What the last live read reported for a managed account, per provider
         # id.  A snapshot projects this instead of calling the worker: see
         # `_managed_projection_status`.
@@ -917,7 +995,7 @@ class ProvidersModelsDomain:
         named = str(model.get("account_ref", "")).strip()
         accounts = self._provider_accounts(provider)
         if named:
-            return named if any(entry["ref"] == named for entry in accounts) else named
+            return named
         return accounts[0]["ref"] if accounts else ""
 
     @staticmethod
@@ -1015,11 +1093,12 @@ class ProvidersModelsDomain:
                     else isinstance(model_api_key, str) and bool(model_api_key.strip())
                 )
                 litellm_extra = model.get("litellm_extra", {})
+                if not isinstance(litellm_extra, Mapping):
+                    litellm_extra = {}
                 safe_litellm_extra = {
                     key: redact(value, _key=key)
                     for key, value in litellm_extra.items()
-                    if isinstance(litellm_extra, Mapping)
-                    and key in {"rpm", "tpm", "timeout", "allowed_openai_params", "drop_params", "additional_drop_params"}
+                    if key in {"rpm", "tpm", "timeout", "allowed_openai_params", "drop_params", "additional_drop_params"}
                 }
                 live_probe = self._probe_overlay.get(name, {}).get(self._probe_model_key(model), {})
                 model_info_extra = model.get("model_info_extra", {})
@@ -1057,7 +1136,7 @@ class ProvidersModelsDomain:
                         "name": str(model.get("model_name", "")),
                         "display_name": str(model.get("model_name", "")),
                         "litellm_model": str(model.get("litellm_model", "")),
-                        "upstream_model": str(model.get("litellm_model", "")).split("/", 1)[-1],
+                        "upstream_model": display_upstream_model(model.get("litellm_model", "")),
                         "provider": str(model.get("provider", name)),
                         "api_base": REDACT_TEXT(str(model.get("api_base", ""))),
                         "api_key_name": model_key_name,
@@ -1538,6 +1617,8 @@ class ProvidersModelsDomain:
 
         self._raw = copy.deepcopy(checkpoint["raw"])
         self._draft = copy.deepcopy(checkpoint["draft"])
+        self._validation_cache = None
+        self._render_snapshot = None
         self._pending_provider_keys = copy.deepcopy(checkpoint.get("pending_provider_keys", {}))
         with self._qoder_pat_lock:
             self._pending_qoder_pats = copy.deepcopy(checkpoint.get("pending_qoder_pats", {}))
@@ -1568,6 +1649,8 @@ class ProvidersModelsDomain:
         except Exception as exc:
             raise _safe_problem(exc, "Provider/model configuration is invalid") from None
         self._draft = {"providers": copy.deepcopy(providers), "document": copy.deepcopy(normalized)}
+        self._validation_cache = None
+        self._render_snapshot = None
         self._provider_editor_ids.clear()
         self._model_editor_ids.clear()
         self._probe_overlay.clear()
@@ -1588,6 +1671,8 @@ class ProvidersModelsDomain:
         except Exception as exc:
             raise _safe_problem(exc, "Provider/model configuration is invalid") from None
         self._draft = {"providers": copy.deepcopy(loaded["providers"]), "document": copy.deepcopy(loaded["document"])}
+        self._validation_cache = None
+        self._render_snapshot = None
         self._provider_editor_ids.clear()
         self._model_editor_ids.clear()
         self._probe_overlay.clear()
@@ -1960,6 +2045,7 @@ class ProvidersModelsDomain:
         api_key_name: str | None = None,
         *,
         credential_override: str | None = None,
+        remember_windows: bool = True,
     ) -> dict[str, Any]:
         """Fetch one standard `/v1/models` list without exposing remote details."""
 
@@ -2070,7 +2156,8 @@ class ProvidersModelsDomain:
         # number its own upstream stated instead of an inferred one.
         if model_windows:
             result["model_windows"] = model_windows
-            self._remember_listing_windows(provider_id, model_windows)
+            if remember_windows:
+                self._remember_listing_windows(provider_id, model_windows)
         return result
 
     def _fetch_models(self, data: Mapping[str, Any]) -> dict[str, Any]:
@@ -2213,6 +2300,14 @@ class ProvidersModelsDomain:
                 "models": [],
                 "model_count": 0,
             }
+        if len(body) > self._MAX_MODEL_LIST_BYTES:
+            return {
+                **summary,
+                "available": False,
+                "detail": "The account model endpoint returned an invalid response",
+                "models": [],
+                "model_count": 0,
+            }
         try:
             payload = json.loads(body.decode("utf-8", "replace"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -2268,6 +2363,9 @@ class ProvidersModelsDomain:
             transient,
             token,
             key_name,
+            # The token is not a provider identity, and nothing re-keys the
+            # entry after the wizard creates its provider.
+            remember_windows=False,
         )
 
     def _fetch_relay_resource_models(self, data: Mapping[str, Any]) -> dict[str, Any]:
@@ -2554,6 +2652,507 @@ class ProvidersModelsDomain:
             usable = any(key in decoded for key in ("id", "output", "output_text"))
         return result(usable, "ok" if usable else "invalid_response")
 
+    #: The speed probe asks one question with a fixed answer budget.  Long
+    #: enough that the measurement is about sustained generation rather than
+    #: the first token, short enough that the whole probe is a few seconds.
+    _SPEED_PROBE_MAX_TOKENS = 128
+    _SPEED_PROBE_PROMPT = "Count from 1 to 60, separated by single spaces."
+    _SPEED_PROBE_ATTEMPTS = 2
+
+    @classmethod
+    def _speed_probe(
+        cls,
+        *,
+        surface: str,
+        api_base: str,
+        credential: str,
+        model_name: str,
+        account_id: str = "",
+    ) -> dict[str, Any]:
+        """Measure how fast this route generates, and how long it takes to start.
+
+        Three numbers, each a different complaint a user has about a route:
+
+        * ``first_token_ms`` - how long the endpoint thinks before answering.
+        * ``tokens_per_second`` - the generation rate, from the usage block when
+          the endpoint reports one and from the answer text when it does not.
+        * ``total_ms`` - what one request actually cost end to end.
+
+        The rate is derived from the endpoint's own token accounting whenever it
+        reports it, because counting words in the answer measures the answer's
+        spelling, not the endpoint's speed.  An endpoint that reports no usage
+        gets a rate from the text and says so in ``basis``, so a number taken
+        from a word count is never mistaken for one the endpoint reported.
+
+        A route that does not answer is not slow: it returns ``available``
+        false with the failure's own status, exactly like the reachability
+        probe, so the pane never prints a speed for a route that never spoke.
+        """
+
+        root = service_root(api_base)
+        headers = browser_request_headers()
+        headers["Content-Type"] = "application/json"
+        account_backed = bool(account_id) and surface == "openai/responses"
+        if surface == "anthropic":
+            endpoint = (
+                api_base_for_surface(api_base, surface)
+                if isinstance(root, str) and root
+                else ""
+            )
+            headers["x-api-key"] = credential
+            headers["anthropic-version"] = "2023-06-01"
+            payload = {
+                "model": model_name,
+                "max_tokens": cls._SPEED_PROBE_MAX_TOKENS,
+                "stream": True,
+                "messages": [{"role": "user", "content": cls._SPEED_PROBE_PROMPT}],
+            }
+            headers["Accept"] = "text/event-stream"
+        elif surface == "openai/chat":
+            endpoint = f"{root}/v1/chat/completions" if isinstance(root, str) and root else ""
+            headers["Authorization"] = f"Bearer {credential}"
+            # Streaming is what makes a time-to-first-token observable at all: a
+            # buffered answer arrives in one piece, so the only moment to stamp
+            # is the end, which is the total and not the start.
+            payload = {
+                "model": model_name,
+                "max_tokens": cls._SPEED_PROBE_MAX_TOKENS,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+                "messages": [{"role": "user", "content": cls._SPEED_PROBE_PROMPT}],
+            }
+            headers["Accept"] = "text/event-stream"
+        elif surface == cls._IMAGE_PROBE_SURFACE:
+            # A picture has no token rate to report: the generator answers in
+            # seconds per image, and a "tokens per second" for it would be a
+            # number about nothing.
+            return {
+                "available": False,
+                "status": "unsupported",
+                "surface": surface,
+                "detail": "An image route has no token rate",
+                "basis": "",
+                "first_token_ms": None,
+                "tokens_per_second": None,
+                "total_ms": None,
+                "output_tokens": None,
+            }
+        else:
+            endpoint = (
+                f"{root}/responses"
+                if account_backed and isinstance(root, str) and root
+                else f"{root}/v1/responses" if isinstance(root, str) and root else ""
+            )
+            headers["Authorization"] = f"Bearer {credential}"
+            payload = (
+                {
+                    "model": model_name,
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": cls._SPEED_PROBE_PROMPT}],
+                        }
+                    ],
+                    "max_output_tokens": cls._CHATGPT_MODEL_PROBE_MAX_OUTPUT_TOKENS,
+                    "store": False,
+                    "stream": True,
+                    "instructions": cls._SPEED_PROBE_PROMPT,
+                }
+                if account_backed
+                else {
+                    "model": model_name,
+                    "max_output_tokens": cls._SPEED_PROBE_MAX_TOKENS,
+                    "stream": True,
+                    "input": cls._SPEED_PROBE_PROMPT,
+                }
+            )
+            headers["Accept"] = "text/event-stream"
+            if account_backed:
+                headers["chatgpt-account-id"] = account_id
+
+        def outcome(available: bool, status: str, **values: Any) -> dict[str, Any]:
+            return {
+                "available": available,
+                "status": status,
+                "surface": surface,
+                "basis": "",
+                "first_token_ms": None,
+                "tokens_per_second": None,
+                "total_ms": None,
+                "output_tokens": None,
+                "detail": "",
+                **values,
+            }
+
+        if not endpoint or not credential or not model_name:
+            return outcome(False, "invalid_config")
+
+        # The measurement is wall clock around one request, so it is taken here
+        # rather than from the response's own timing headers: those report what
+        # the upstream believes about itself, and the number a user waits for
+        # includes the network between them and us.
+        started = time.monotonic()
+        chunk_ends: list[int] = []
+        chunk_times: list[float] = []
+        body = b""
+        status: Any = None
+        for attempt in range(cls._SPEED_PROBE_ATTEMPTS):
+            request = urllib.request.Request(
+                endpoint,
+                data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with isolated_http_opener().open(
+                    request, timeout=cls._model_probe_timeout_seconds()
+                ) as response:
+                    status = getattr(response, "status", None)
+                    if status is None:
+                        status = response.getcode()
+                    # Read chunk by chunk and stamp the first chunk that carries
+                    # an answer.  A single `read()` would hand back the whole
+                    # stream at the end, which is the one moment that cannot
+                    # tell a slow starter from a slow generator.
+                    chunks_read: list[bytes] = []
+                    received = 0
+                    # Read a line at a time, not a block at a time.  Measured
+                    # on api.deepseek.com, a blocking 1 KiB read returns only
+                    # once a full kilobyte has arrived — the first "chunk" then
+                    # already carries dozens of tokens, and stamping it reports
+                    # a time to first token that is really a time to first
+                    # kilobyte.  A streamed server writes one SSE frame per
+                    # token, so a line read lands on the token.
+                    while received < cls._MAX_MODEL_PROBE_BYTES:
+                        chunk = response.readline()
+                        if not chunk:
+                            break
+                        chunks_read.append(chunk)
+                        received += len(chunk)
+                        chunk_ends.append(received)
+                        chunk_times.append(time.monotonic())
+                    body = b"".join(chunks_read)
+                break
+            except urllib.error.HTTPError as exc:
+                return outcome(
+                    False, cls._probe_status_for_http_error(exc, account_backed=account_backed)
+                )
+            except Exception as exc:
+                failure = cls._probe_failure_status(exc)
+                if attempt + 1 >= cls._SPEED_PROBE_ATTEMPTS or not cls._probe_transport_retryable(exc):
+                    return outcome(False, failure)
+                time.sleep(cls._MODEL_PROBE_RETRY_DELAY_SECONDS)
+        total_ms = round((time.monotonic() - started) * 1000.0, 1)
+        if not isinstance(status, int) or not 200 <= status < 300:
+            return outcome(False, "http_error", total_ms=total_ms)
+
+        first_offset, text, output_tokens, reported = cls._speed_probe_stream(body, surface)
+        if not text.strip():
+            return outcome(
+                False,
+                "invalid_response",
+                total_ms=total_ms,
+                detail="The endpoint answered without a streamed answer",
+            )
+        if not output_tokens:
+            # The endpoint streamed text but reported no usage.  Counting the
+            # answer's own words is a different measurement, so the basis says
+            # which one produced the rate.
+            output_tokens = len(text.split())
+            reported = False
+        if not output_tokens:
+            return outcome(
+                False,
+                "no_output",
+                total_ms=total_ms,
+                detail="The endpoint answered without generating any tokens",
+            )
+
+        # Time to first token, from the body offset where the first answer
+        # arrived.  The rate is then taken over generation only — from the
+        # first token to the last — because including the wait before it would
+        # report a slow starter as a slow generator, which is a different
+        # complaint about a different part of the route.
+        first_token_ms = cls._offset_to_millis(first_offset, chunk_ends, chunk_times, started)
+        # A rate is only reported when the stream actually arrived progressively.
+        # Measured on api.deepseek.com, the endpoint buffers its SSE frames and
+        # releases them in a burst: 260 frames all landed between 2.0 s and 4.3 s
+        # with inter-frame gaps of 0 ms.  Dividing the token count by that window
+        # produced 290-2500 tokens/sec on identical requests — a number about the
+        # endpoint's flush timing, not its generation.  When the stream carries
+        # no measurable window the rate is left absent rather than invented, and
+        # the two readings that are still sound are reported: time to first token,
+        # and the whole request's cost.
+        generation_ms = total_ms - (first_token_ms or 0.0)
+        measurable = cls._stream_was_progressive(chunk_ends, chunk_times, first_offset)
+        rate = (
+            round(float(output_tokens) / (generation_ms / 1000.0), 1)
+            if measurable and generation_ms > 0
+            else None
+        )
+        return outcome(
+            True,
+            "ok",
+            total_ms=total_ms,
+            first_token_ms=first_token_ms,
+            output_tokens=output_tokens,
+            tokens_per_second=rate,
+            basis=("usage" if reported else "text") if measurable else "",
+            detail="" if measurable else "The endpoint released its stream in one burst; no generation rate can be read from it",
+        )
+
+    #: How much of a stream is read at a time while looking for the first
+    #: token.  Small enough that the stamp is taken near the arrival of the
+    #: chunk that carried it.
+    _SPEED_PROBE_READ_CHUNK = 1024
+
+    #: How much of the stream's span must have arrived progressively before a
+    #: rate is read from it.  A burst arrives inside a window this short.
+    _SPEED_PROGRESSIVE_MIN_SPAN_MS = 150.0
+    _SPEED_PROGRESSIVE_MIN_FRACTION = 0.5
+
+    @classmethod
+    def _stream_was_progressive(
+        cls, ends: Sequence[int], times: Sequence[float], first_offset: int
+    ) -> bool:
+        """Whether the answer arrived over time, or all at once.
+
+        A rate needs a window: if every byte after the first token landed in the
+        same instant, the only thing dividing by it measures is how fast the
+        endpoint flushed a buffer.  So this asks whether the stream kept arriving
+        after the first token, for a span long enough to be a rate rather than a
+        rounding error.
+        """
+
+        if len(times) < 2 or not first_offset:
+            return False
+        after = [moment for end, moment in zip(ends, times) if end > first_offset]
+        if len(after) < 2:
+            return False
+        span_ms = (after[-1] - after[0]) * 1000.0
+        total_ms = (times[-1] - times[0]) * 1000.0
+        if span_ms < cls._SPEED_PROGRESSIVE_MIN_SPAN_MS:
+            return False
+        # Most of the stream must have arrived progressively, not in a final
+        # flush that happened to be preceded by one slow frame.
+        return total_ms <= 0.0 or span_ms / total_ms >= cls._SPEED_PROGRESSIVE_MIN_FRACTION
+
+    @staticmethod
+    def _offset_to_millis(
+        offset: int, ends: Sequence[int], times: Sequence[float], started: float
+    ) -> float | None:
+        """When the byte at ``offset`` arrived, interpolated between reads.
+
+        The stream is read in chunks, so the first token's offset falls inside
+        one of them; the chunk that contained it is the first whose end is at or
+        past it.  Within that chunk the arrival is taken as its end, because the
+        read returned the whole chunk at once and there is no finer moment
+        recorded — the interpolation is between chunks, not inside one.
+
+        Returns ``None`` when no chunk contained the offset, which means the
+        answer was never actually seen arriving and a time for it would be
+        invented.
+        """
+
+        for index, end in enumerate(ends):
+            if offset <= end:
+                return round((times[index] - started) * 1000.0, 1)
+        return None
+
+    @classmethod
+    def _speed_probe_stream(
+        cls, body: bytes, surface: str
+    ) -> tuple[int, str, int, bool]:
+        """Find the first answer token in a streamed answer.
+
+        Returns ``(first_token_offset, text, output_tokens, reported)``, where
+        ``first_token_offset`` is how many bytes of the body had arrived when
+        the first token did — the caller turns that into a timestamp using the
+        chunk boundaries it recorded while reading.
+
+        The three wires spell a delta differently but agree on one thing: the
+        first answer arrives as its own event, separate from the preamble.  So
+        this looks for the first event whose delta carries text, and never for
+        the first byte, because a `message_start` or a role preamble arrives
+        long before any content does.
+        """
+
+        decoded = body.decode("utf-8", "replace")
+        text_parts: list[str] = []
+        reported_tokens = 0
+        first_offset: int | None = None
+        consumed = 0
+        for raw_line in decoded.splitlines(keepends=True):
+            consumed += len(raw_line.encode("utf-8"))
+            line = raw_line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                event = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, Mapping):
+                continue
+            delta_text = cls._stream_delta_text(event, surface)
+            if delta_text:
+                if first_offset is None:
+                    first_offset = consumed
+                text_parts.append(delta_text)
+            usage = cls._stream_usage(event, surface)
+            if usage:
+                reported_tokens = usage
+        return (first_offset or 0, "".join(text_parts), reported_tokens, bool(reported_tokens))
+
+    @staticmethod
+    def _stream_delta_text(event: Mapping[str, Any], surface: str) -> str:
+        """The answer text one streamed event carries, if any."""
+
+        if surface == "anthropic":
+            delta = event.get("delta")
+            if isinstance(delta, Mapping) and delta.get("type") == "text_delta":
+                text = delta.get("text")
+                return text if isinstance(text, str) else ""
+            return ""
+        if surface == "openai/chat":
+            choices = event.get("choices")
+            if isinstance(choices, list) and choices:
+                first = choices[0]
+                delta = first.get("delta") if isinstance(first, Mapping) else None
+                content = delta.get("content") if isinstance(delta, Mapping) else None
+                return content if isinstance(content, str) else ""
+            return ""
+        # The Responses wire, streamed or not.
+        if event.get("type") == "response.output_text.delta":
+            delta = event.get("delta")
+            return delta if isinstance(delta, str) else ""
+        return ""
+
+    @staticmethod
+    def _stream_usage(event: Mapping[str, Any], surface: str) -> int:
+        """The output-token count one streamed event reports, or 0."""
+
+        sources: list[Mapping[str, Any]] = []
+        if surface == "anthropic":
+            # Anthropic reports on `message_delta`, and its field is `output_tokens`.
+            sources.append(event)
+            if isinstance(event.get("message"), Mapping):
+                sources.append(event["message"])
+        elif surface == "openai/chat":
+            # Chat carries usage on a final chunk whose `choices` is empty.
+            if isinstance(event.get("usage"), Mapping):
+                sources.append(event)
+        else:
+            response = event.get("response")
+            if isinstance(response, Mapping) and isinstance(response.get("usage"), Mapping):
+                sources.append(response)
+        for source in sources:
+            usage = source.get("usage")
+            if not isinstance(usage, Mapping):
+                usage = source
+            for field in ("output_tokens", "completion_tokens"):
+                count = usage.get(field)
+                if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+                    return count
+        return 0
+
+    @classmethod
+    def _speed_probe_usage(
+        cls, body: bytes, surface: str, account_backed: bool
+    ) -> tuple[str | None, int, bool]:
+        """The answer text and its token count, from any of the three wires.
+
+        Returns ``(text, output_tokens, reported)`` where ``reported`` says
+        whether the count came from the endpoint's own usage block.  A
+        non-streamed answer is read from JSON; the account door answers only a
+        stream, so its events are summed.
+        """
+
+        decoded_text = body.decode("utf-8", "replace")
+        if account_backed:
+            # The account door streams.  The output text is what the
+            # `response.output_text.delta` events carry, and the usage block
+            # arrives on the terminal event.
+            chunks: list[str] = []
+            reported_tokens = 0
+            for line in decoded_text.splitlines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    event = json.loads(line[5:].strip())
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, Mapping):
+                    continue
+                if event.get("type") == "response.output_text.delta":
+                    delta = event.get("delta")
+                    if isinstance(delta, str):
+                        chunks.append(delta)
+                response = event.get("response")
+                usage = response.get("usage") if isinstance(response, Mapping) else None
+                if isinstance(usage, Mapping):
+                    count = usage.get("output_tokens")
+                    if isinstance(count, int) and not isinstance(count, bool):
+                        reported_tokens = count
+            text = "".join(chunks)
+            if reported_tokens:
+                return text, reported_tokens, True
+            return (text, len(text.split()), False) if text.strip() else (None, 0, False)
+
+        try:
+            decoded = json.loads(decoded_text)
+        except json.JSONDecodeError:
+            return None, 0, False
+        if not isinstance(decoded, Mapping) or isinstance(decoded.get("error"), Mapping):
+            return None, 0, False
+        usage = decoded.get("usage")
+        reported_tokens = 0
+        if isinstance(usage, Mapping):
+            for field in ("output_tokens", "completion_tokens"):
+                count = usage.get(field)
+                if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+                    reported_tokens = count
+                    break
+        text = ""
+        if surface == "openai/chat":
+            choices = decoded.get("choices")
+            if isinstance(choices, list) and choices:
+                first = choices[0]
+                message = first.get("message") if isinstance(first, Mapping) else None
+                content = message.get("content") if isinstance(message, Mapping) else None
+                if isinstance(content, str):
+                    text = content
+        elif surface == "anthropic":
+            blocks = decoded.get("content")
+            if isinstance(blocks, list):
+                text = "".join(
+                    block.get("text", "")
+                    for block in blocks
+                    if isinstance(block, Mapping) and isinstance(block.get("text"), str)
+                )
+        else:
+            value = decoded.get("output_text")
+            if isinstance(value, str):
+                text = value
+            elif isinstance(decoded.get("output"), list):
+                pieces: list[str] = []
+                for item in decoded["output"]:
+                    if not isinstance(item, Mapping):
+                        continue
+                    for content in item.get("content") or []:
+                        if isinstance(content, Mapping) and isinstance(content.get("text"), str):
+                            pieces.append(content["text"])
+                text = "".join(pieces)
+        if not text.strip():
+            return None, reported_tokens, bool(reported_tokens)
+        if reported_tokens:
+            return text, reported_tokens, True
+        return text, len(text.split()), False
+
     @classmethod
     def _model_probe_timeout_seconds(cls) -> float:
         """The first-event budget this deployment gives a real request."""
@@ -2574,6 +3173,549 @@ class ProvidersModelsDomain:
         except Exception:
             pass
         return cls._MODEL_PROBE_TIMEOUT_SECONDS
+
+    # ------------------------------------------------------------------
+    # Token throughput
+    #
+    # A flash route is the one a user picks for speed, so its 探测 button asks
+    # the question that pick is about: how fast does this route emit output.
+    # The press measures exactly one protocol - the route's own recommendation,
+    # read from the two fields the pane shows rather than invented beside them
+    # - and the availability question it used to ask on that same protocol is
+    # not asked again: the speed run *is* evidence that the surface answers, so
+    # a second round of requests would add time to the press and nothing to the
+    # answer.  A surface this app cannot write a request for keeps the ordinary
+    # probe; inventing one would measure this code instead of the route.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_flash_route(model: Mapping[str, Any]) -> bool:
+        """Whether this route is one of the family the speed reading is for.
+
+        The name is the evidence, read the way every other name decision here
+        reads it: this app's own ``openai/``/``anthropic/`` prefix says nothing
+        about the model and is dropped first, while any other first segment is
+        LiteLLM's adapter and stays part of the name.  The word may appear
+        anywhere in it - ``gemini-3.1-flash-lite``, ``glm-5.3-flash`` and
+        ``deepseek-v4.1-flash`` are one family by that word.
+
+        The public alias is deliberately not consulted: a route may expose any
+        client-facing name it likes while targeting a flash model, and the
+        button would then follow the label on screen instead of the model
+        behind it.
+        """
+
+        return "flash" in ProvidersModelsDomain._wire_model_name(model).lower()
+
+    @classmethod
+    def _speed_test_protocol(cls, model: Mapping[str, Any]) -> str:
+        """The one protocol a flash route's 探测 is measured on.
+
+        The protocol the route's own mode names, read from the field the pane
+        draws: 指定协议 (``fixed``) shows the interface protocol the route is
+        pinned to, and 自动适配 (``fallback``) shows the backup it answers with
+        when the client's own wire is refused - both are the same field, so both
+        are one protocol.  One press is one protocol: two numbers under one
+        button would be two answers to a question asked once.
+
+        A surface this app's probe matrix does not carry - a managed worker's
+        own wire, the Images endpoint - returns the empty string, and the
+        caller keeps the ordinary availability probe for that route.
+        """
+
+        declared = str(model.get("upstream_url_surface", "")).strip()
+        inferred = infer_upstream_fallback_surface(model.get("litellm_model"))
+        # The first surface of the probe's own priority list, and deliberately
+        # the same rule stated twice: ``fixed`` answers on the wire the pane's
+        # interface protocol names, while ``fallback`` answers on the wire its
+        # family serves first and keeps the declared one as the backup.  Reading
+        # the same two fields the matrix ranks is what keeps this reading and
+        # the availability finding describing one route instead of disagreeing
+        # about which protocol is "the" protocol.
+        # A declared surface this app cannot write a chat request for - the
+        # Images wire - is final: the route answers there, and the name's family
+        # says nothing about a generator.  Falling through to the family here
+        # would measure a chat wire the route refuses by design.
+        if declared and declared not in cls._PROBE_SURFACES:
+            return ""
+        # The declared surface *is* what the mode names: the pane draws it under
+        # 指定协议 when the mode is fixed and under 备用协议 when it follows the
+        # client, so it is the one protocol this press is about in either mode.
+        # A route whose field was never written is served by its name's family,
+        # and taking that answer keeps the reading on a protocol instead of
+        # falling back to the three-surface availability probe.
+        surface = declared or inferred
+        return surface if surface in cls._PROBE_SURFACES else ""
+
+    @classmethod
+    def _speed_test_window_seconds(cls) -> float:
+        """The measurement window this host runs, clamped to the stated band."""
+
+        raw = os.environ.get(cls._SPEED_TEST_WINDOW_ENV, "").strip()
+        window = cls._SPEED_TEST_WINDOW_SECONDS
+        if raw:
+            try:
+                window = float(raw)
+            except ValueError:
+                window = cls._SPEED_TEST_WINDOW_SECONDS
+        return min(
+            max(window, cls._SPEED_TEST_MIN_WINDOW_SECONDS),
+            cls._SPEED_TEST_MAX_WINDOW_SECONDS,
+        )
+
+    def _speed_test_run(
+        self,
+        *,
+        protocol: str,
+        api_base: str,
+        credential: str,
+        model_name: str,
+        account_id: str = "",
+    ) -> dict[str, Any]:
+        """Stream output on one protocol and report the token rate it arrives at.
+
+        The rate is output tokens divided by the seconds spent emitting them,
+        and three choices make that number mean what it says.
+
+        The clock starts on the first content event, never on the request: a
+        route's first tokens arrive after the prompt has been read, and a rate
+        averaged across that wait reports how busy the queue was rather than how
+        fast the model is.
+
+        The run keeps asking for another turn until the window closes.  A model
+        that finishes a paragraph in two seconds has emitted one answer, not
+        been measured for two seconds, and a rate taken across that answer
+        reports its length rather than the route's speed.  Each round is one
+        streamed request, and the reading sums what the rounds emitted over the
+        time they spent emitting - the prefill between rounds is not generation
+        and does not enter the denominator.
+
+        Both ends are bounded.  A route still streaming when the window closes
+        stops being read and reports what it had emitted by then - the window is
+        the press's promise, so the reading cannot outlast it - and a route that
+        emits nothing before it closes is silence, which is the timeout the
+        availability probe also reports.
+
+        The token count is the one the upstream states for its own output.  Chat
+        and Messages both offer it on the final event, which is why the request
+        asks for it; a stream that states none is counted here instead, and the
+        result says which of the two the number came from, because an estimate
+        and a stated count are not the same claim.
+        """
+
+        checked_at = (
+            datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        )
+        window = self._speed_test_window_seconds()
+        result: dict[str, Any] = {
+            "status": "unavailable",
+            "protocol": protocol,
+            "surface": protocol,
+            "target": model_name or None,
+            "output_token_count_per_second": None,
+            "output_token_count": 0,
+            "counted_by": "",
+            "seconds": 0.0,
+            "window_seconds": round(window, 1),
+            "rounds": 0,
+            "sample": "",
+            "detail": "",
+            "checked_at": checked_at,
+        }
+        root = service_root(api_base)
+        if (
+            protocol not in self._PROBE_SURFACES
+            or not isinstance(root, str)
+            or not root
+            or not credential
+            or not model_name
+        ):
+            # Nothing to ask, which is the finding the availability probe
+            # reports for an incomplete route.  It must keep that name, or the
+            # pane would report the route as slow when it is not configured.
+            result["status"] = "invalid_config"
+            result["detail"] = "The route names no protocol this run can measure"
+            return result
+        request = self._speed_test_request(
+            protocol=protocol,
+            root=root,
+            credential=credential,
+            model_name=model_name,
+            account_id=account_id,
+        )
+        result["original_request"] = copy.deepcopy(request)
+        payload = json.dumps(request["body"], separators=(",", ":")).encode("utf-8")
+        started = time.monotonic()
+        deadline = started + window
+        # Each round contributes one count, and a round's own count is its
+        # upstream state when it made one and this side's tally when it did
+        # not.  The two are never added together: a statement of the round's
+        # output already includes every token that arrived in it.
+        arrived = 0
+        tokens_counted = 0
+        counted_by_upstream = True
+        seconds_emitting = 0.0
+        text: list[str] = []
+        rounds = 0
+        retries = 0
+        ended_by_itself = False
+        failure_status = ""
+        failure_detail = ""
+        while rounds < self._SPEED_TEST_MAX_ROUNDS:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            rounds += 1
+            http_request = urllib.request.Request(
+                request["url"],
+                data=payload,
+                headers=request["headers"],
+                method="POST",
+            )
+            round_first: float | None = None
+            round_last: float | None = None
+            round_text: list[str] = []
+            round_stated = 0
+            round_ended = False
+            try:
+                # The socket budget is what is left of the window, not the
+                # proxy's first-event budget: a stall must be measured as
+                # silence inside the press's own window, or a route that
+                # answers nothing would hold the button for minutes to prove
+                # what the window already proved.
+                with isolated_http_opener().open(
+                    http_request, timeout=max(1.0, remaining)
+                ) as response:
+                    for piece, usage in self._speed_test_events(response):
+                        now = time.monotonic()
+                        round_stated = max(round_stated, usage)
+                        if piece:
+                            round_text.append(piece)
+                            text.append(piece)
+                            if round_first is None:
+                                round_first = now
+                            round_last = now
+                        # The window is the stop condition, not the model's own
+                        # end of turn: reading past it would report a rate the
+                        # press did not promise to wait for.
+                        if now >= deadline:
+                            break
+                    else:
+                        # The stream ended without the window cutting it: the
+                        # answer is complete, and whether it carried output is a
+                        # fact about the route rather than about silence.  A
+                        # ``for`` that ran to completion takes this branch; one
+                        # left by ``break`` does not.
+                        round_ended = True
+            except urllib.error.HTTPError as exc:
+                round_arrived = self._count_tokens("".join(round_text))
+                arrived += round_arrived
+                tokens_counted += round_stated or round_arrived
+                counted_by_upstream = counted_by_upstream and bool(round_stated)
+                failure_status = self._probe_status_for_http_error(
+                    exc, account_backed=bool(account_id)
+                )
+                failure_detail = (
+                    f"The upstream answered HTTP {exc.code} to the speed test"
+                )
+                break
+            except Exception as exc:
+                round_arrived = self._count_tokens("".join(round_text))
+                arrived += round_arrived
+                tokens_counted += round_stated or round_arrived
+                counted_by_upstream = counted_by_upstream and bool(round_stated)
+                if round_first is not None and round_last is not None:
+                    seconds_emitting += max(round_last - round_first, 0.0)
+                first_failure = self._probe_failure_status(exc)
+                # A dropped TLS handshake is this edge's habit, not a verdict
+                # about the route, and nothing was measured by it: asking again
+                # reports the number the round would have.  Every other failure
+                # ends the reading, and one that happened after tokens arrived
+                # keeps them.
+                if (
+                    round_first is None
+                    and retries + 1 < self._MODEL_PROBE_ATTEMPTS
+                    and self._probe_transport_retryable(exc)
+                ):
+                    retries += 1
+                    rounds -= 1
+                    time.sleep(self._MODEL_PROBE_RETRY_DELAY_SECONDS)
+                    continue
+                failure_status = first_failure
+                failure_detail = (
+                    "The route stopped answering during the measurement"
+                    if arrived
+                    else "The route did not answer the speed test"
+                    if first_failure != "refused"
+                    else "The connection was refused before the first token"
+                )
+                break
+            # One round's text is counted as one string, not one delta at a
+            # time: a tokenizer asked about each fragment separately starts a
+            # new encoding every time, and the sum of those is not the count of
+            # the text they make.
+            round_arrived = self._count_tokens("".join(round_text))
+            arrived += round_arrived
+            tokens_counted += round_stated or round_arrived
+            counted_by_upstream = counted_by_upstream and bool(round_stated)
+            ended_by_itself = ended_by_itself or round_ended
+            if round_first is not None and round_last is not None:
+                seconds_emitting += max(round_last - round_first, 0.0)
+            if time.monotonic() >= deadline:
+                break
+        finished = time.monotonic()
+        result["rounds"] = rounds
+        result["sample"] = "".join(text)[:160]
+        if not arrived:
+            # No token arrived at all.  A failure keeps its own name; a stream
+            # that ended by itself carried an empty answer, while one the window
+            # had to cut was silent.  None of the three is a speed, so no rate is
+            # reported for any of them.
+            result["status"] = failure_status or (
+                "invalid_response" if ended_by_itself else "timeout"
+            )
+            result["detail"] = failure_detail or (
+                "The answer ended without any output to measure"
+                if ended_by_itself
+                else "No output arrived within the measurement window"
+            )
+            result["seconds"] = round(finished - started, 3)
+            return result
+        tokens = tokens_counted
+        result["counted_by"] = "upstream" if counted_by_upstream else "estimate"
+        # The denominator is the time the rounds spent emitting, not the wall
+        # clock: the prefill between rounds is not generation, and including it
+        # would report a number that depends on how many rounds happened to fit.
+        seconds = max(seconds_emitting, 0.001)
+        result["status"] = "ok"
+        result["output_token_count"] = tokens
+        result["seconds"] = round(seconds, 3)
+        result["output_token_count_per_second"] = round(tokens / seconds, 1)
+        result["detail"] = f"Measured {tokens} output tokens in {seconds:.1f}s on {protocol}"
+        if failure_status:
+            result["detail"] += f"; the stream ended early ({failure_status})"
+        return result
+
+    @classmethod
+    def _speed_test_request(
+        cls,
+        *,
+        protocol: str,
+        root: str,
+        credential: str,
+        model_name: str,
+        account_id: str = "",
+    ) -> dict[str, Any]:
+        """The one streamed request that asks for output to measure.
+
+        Every surface is asked the same question in its own shape, and every
+        shape states ``stream: true``: a non-streamed answer arrives as one blob
+        whose arrival time is the whole answer's latency, not the rate it was
+        produced at.  The budget is a ceiling rather than a target - the window
+        is what ends the run - so it only has to outlast a fast route's window.
+        """
+
+        account_backed = bool(account_id) and protocol == "openai/responses"
+        headers = browser_request_headers()
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "text/event-stream"
+        if protocol == "anthropic":
+            endpoint = api_base_for_surface(root, protocol)
+            headers["x-api-key"] = credential
+            headers["anthropic-version"] = "2023-06-01"
+            payload: dict[str, Any] = {
+                "model": model_name,
+                "max_tokens": cls._SPEED_TEST_MAX_OUTPUT_TOKENS,
+                "stream": True,
+                "messages": [{"role": "user", "content": cls._SPEED_TEST_PROMPT}],
+            }
+        elif protocol == "openai/chat":
+            endpoint = f"{root}/v1/chat/completions"
+            headers["Authorization"] = f"Bearer {credential}"
+            payload = {
+                "model": model_name,
+                "max_tokens": cls._SPEED_TEST_MAX_OUTPUT_TOKENS,
+                "stream": True,
+                # The upstream's own count is the authority on how many tokens
+                # it produced; without this the count is this side's estimate.
+                "stream_options": {"include_usage": True},
+                "messages": [{"role": "user", "content": cls._SPEED_TEST_PROMPT}],
+            }
+        else:
+            # The account door has no ``/v1`` segment: its base already ends at
+            # the resource root the adapter appends ``responses`` to.
+            endpoint = f"{root}/responses" if account_backed else f"{root}/v1/responses"
+            headers["Authorization"] = f"Bearer {credential}"
+            payload = (
+                {
+                    "model": model_name,
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": cls._SPEED_TEST_PROMPT}
+                            ],
+                        }
+                    ],
+                    "max_output_tokens": max(16, cls._SPEED_TEST_MAX_OUTPUT_TOKENS),
+                    "store": False,
+                    "stream": True,
+                    "instructions": cls._SPEED_TEST_INSTRUCTIONS,
+                }
+                if account_backed
+                else {
+                    "model": model_name,
+                    "max_output_tokens": cls._SPEED_TEST_MAX_OUTPUT_TOKENS,
+                    "stream": True,
+                    "input": cls._SPEED_TEST_PROMPT,
+                }
+            )
+            if account_backed:
+                headers["chatgpt-account-id"] = account_id
+        return {
+            "method": "POST",
+            "url": endpoint,
+            # The pane draws this as the request that was made, and a credential
+            # is not part of that reading.
+            "headers": {
+                "Accept": "text/event-stream",
+                "Content-Type": "application/json",
+                **({"anthropic-version": "2023-06-01"} if protocol == "anthropic" else {}),
+            },
+            "body": payload,
+        }
+
+    @classmethod
+    def _speed_test_events(cls, response: Any) -> Any:
+        """Yield ``(text, reported_total)`` for each event that carries either.
+
+        One reader covers all three wires because all three answer server-sent
+        events: an OpenAI Chat stream names its deltas under ``choices``, a
+        Messages stream under ``delta``, and a Responses stream under ``delta``
+        beside a typed event name.  ``reported_total`` is the upstream's own
+        count of the output it has produced so far, which is preferred over the
+        count made here because the model's tokenizer is the authority on how
+        many tokens it emitted; a stream that states none leaves the count to
+        this side.  An event shape nothing here recognizes contributes nothing
+        and ends nothing, so an unfamiliar envelope costs the reading rather
+        than the press.
+        """
+
+        while True:
+            raw = response.readline()
+            if not raw:
+                return
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                continue
+            if not line.startswith("data:"):
+                # ``event:``, ``id:``, ``retry:`` and the blank line between
+                # events carry no tokens; the ``data:`` line is the payload.
+                continue
+            data = line[len("data:"):].strip()
+            if not data:
+                continue
+            if data == "[DONE]":
+                return
+            try:
+                event = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, Mapping):
+                continue
+            if isinstance(event.get("error"), Mapping):
+                return
+            usage = cls._speed_test_reported_tokens(event)
+            piece = cls._speed_test_delta_text(event)
+            if piece or usage:
+                yield piece, usage
+            if str(event.get("type", "")).strip() in {
+                "response.completed",
+                "response.failed",
+                "response.incomplete",
+                "message_stop",
+            }:
+                return
+
+    @staticmethod
+    def _speed_test_reported_tokens(event: Mapping[str, Any]) -> int:
+        """The output-token count the upstream states in one event, if any."""
+
+        candidates: list[Any] = [event.get("usage")]
+        response = event.get("response")
+        if isinstance(response, Mapping):
+            candidates.append(response.get("usage"))
+        message = event.get("message")
+        if isinstance(message, Mapping):
+            candidates.append(message.get("usage"))
+        delta = event.get("delta")
+        if isinstance(delta, Mapping):
+            candidates.append(delta.get("usage"))
+        for usage in candidates:
+            if not isinstance(usage, Mapping):
+                continue
+            for key in ("output_tokens", "completion_tokens"):
+                value = usage.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                    return value
+        return 0
+
+    @staticmethod
+    def _speed_test_delta_text(event: Mapping[str, Any]) -> str:
+        """The text one streamed event contributes, across the three wires."""
+
+        kind = str(event.get("type", "")).strip()
+        if kind in {"response.output_text.delta", "content_block_delta"}:
+            value = event.get("delta")
+            if isinstance(value, str):
+                return value
+            if isinstance(value, Mapping):
+                text = value.get("text")
+                if isinstance(text, str):
+                    return text
+            return ""
+        blocks = event.get("choices")
+        if isinstance(blocks, Sequence) and not isinstance(blocks, (str, bytes, bytearray)):
+            parts: list[str] = []
+            for block in blocks:
+                if not isinstance(block, Mapping):
+                    continue
+                delta = block.get("delta")
+                if not isinstance(delta, Mapping):
+                    continue
+                content = delta.get("content")
+                if isinstance(content, str):
+                    parts.append(content)
+            if parts:
+                return "".join(parts)
+        return ""
+
+    @staticmethod
+    def _count_tokens(text: str) -> int:
+        """The output-token count of a piece of streamed text.
+
+        The upstream's own usage is the authority and is preferred wherever a
+        stream states one; this is the fallback for the streams that state none
+        - relaying a token count is optional in both the Chat and the Messages
+        shapes, and a route that omits it would otherwise report no rate at all.
+        ``tiktoken`` is the estimate every other counting seam in this app uses,
+        and a build that cannot load it falls back to the four-characters rule
+        rather than failing the measurement: the number is a reading, and one of
+        the right order of magnitude still answers the question.
+        """
+
+        global _SPEED_TEST_ENCODER
+        if not text:
+            return 0
+        try:
+            import tiktoken
+
+            if _SPEED_TEST_ENCODER is None:
+                _SPEED_TEST_ENCODER = tiktoken.get_encoding("o200k_base")
+            return max(1, len(_SPEED_TEST_ENCODER.encode(text, disallowed_special=())))
+        except Exception:
+            return max(1, round(len(text) / 4))
 
     @staticmethod
     def _probe_failure_status(error: BaseException) -> str:
@@ -2713,13 +3855,64 @@ class ProvidersModelsDomain:
                 pass
         return cls._DEGRADATION_PROBE_TIMEOUT_SECONDS
 
+    def _reference_fingerprint(self, model: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        """The fingerprint one route recorded from an endpoint it trusts.
+
+        modelprint is a black-box comparison: a route is named by whichever
+        recorded fingerprint its token values match.  The staged tracker
+        carries that for the models it follows, but it pins each of them to one
+        provider -- a reseller's serving template is not the vendor's -- so a
+        caller who verified the vendor's own endpoint once can record that
+        fingerprint here and a route is compared against it instead.  The
+        record is stored on the route it was captured for, which is what makes
+        it survive a restart without this app inventing a global table.
+        """
+
+        value = model.get("reference_fingerprint")
+        if not isinstance(value, Mapping):
+            return None
+        recorded = value.get("values")
+        model_name = value.get("model")
+        if not isinstance(recorded, Mapping) or not recorded:
+            return None
+        if not isinstance(model_name, str) or not model_name.strip():
+            return None
+        return {
+            "model": model_name.strip(),
+            "values": {str(key): item for key, item in recorded.items()},
+        }
+
+    def _precision_reference(self, model: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        """The single-token fingerprint one route recorded for the precision probe.
+
+        A separate record from :meth:`_reference_fingerprint`: that one is the
+        identity table's token-count vector, this one is a battery of one-token
+        answer distributions.  Both are captured from an endpoint the caller
+        trusts, and neither can stand in for the other, so they are stored under
+        their own key and a route may carry one, both, or neither.
+        """
+
+        value = model.get("precision_reference")
+        if not isinstance(value, Mapping):
+            return None
+        fingerprint = value.get("fingerprint")
+        if not isinstance(fingerprint, Mapping):
+            return None
+        cells = fingerprint.get("cells")
+        if not isinstance(cells, Mapping) or not cells:
+            return None
+        return {
+            "model": str(value.get("model") or "").strip(),
+            "fingerprint": dict(fingerprint),
+        }
+
     def _degradation_requirements(self, protocol: str) -> str:
         """The surface a route must answer on for one protocol's probe.
 
-        The quick suite speaks one protocol per run, so a route that serves
-        only another surface has nothing for it to measure. The Gemini protocol
+        The probe table speaks one protocol per run, so a route that serves
+        only another surface has nothing for it to measure.  The Gemini family
         has no surface in this app's probe matrix, so it carries no
-        precondition and the staged program reports what the address answers.
+        precondition; a protocol the table cannot speak has no plan at all.
         """
 
         return {"anthropic": "anthropic", "openai": "openai/chat"}.get(protocol, "")
@@ -2729,59 +3922,132 @@ class ProvidersModelsDomain:
     ) -> dict[str, Any]:
         """Describe what the model detail pane's deep test will actually run.
 
-        The staged tables say which models upstream keeps a reference for; they
-        do not say which names the suite can measure.  The quick suite compares
-        a response against the request that asked for it, so a route whose name
-        resolves to one of the suite's protocols is probeable whether or not
-        upstream has listed that exact name yet.  ``target`` is therefore the
-        name the scan was pointed at - the staged spelling when there is one,
-        otherwise this route's own - and it is never what decides the plan.
-
-        Each run speaks one protocol on one surface, so the plan still requires
-        that the route answer on that protocol's surface.  The pane's projection
-        asks without a probe - there the plan is the whole answer, and a route
-        that turns out not to answer on that surface reports its own skipped
-        finding - while a running probe passes the surfaces it tested so the
-        scan is never started against a route that cannot carry it.
+        The plan answers two questions before anything is sent: which wire the
+        probe will speak, and whether there is anything to compare the answer
+        against.  A fingerprint comparison needs a reference - a staged
+        baseline for this model or one the route recorded itself - and a route
+        that has neither says so here instead of promising a verdict and then
+        reporting a skip.
         """
 
         wire_name = self._wire_model_name(model)
         public_name = str(model.get("model_name", "")).strip()
-        # The quick suite compares an answer against the chat request that
-        # asked for it, so a route that answers only the Images wire has nothing
-        # for its detectors to read.  Saying so in the plan keeps the pane from
-        # promising a check it would then report as skipped, and keeps the
-        # button from naming a test this route cannot carry.  Read through
-        # ``_serves_images`` so a name newer than the bundled cost map -- known
-        # only from a past probe -- answers here too; the cost map alone left
-        # the pane promising Veridrop and then reporting 真伪: 不适用.
+        # The probe table measures token counts and validation prose from a
+        # chat completion, so a route that answers only the Images wire has
+        # nothing for it to read.  Read through ``_serves_images`` so a name
+        # newer than the bundled cost map -- known only from a past probe --
+        # answers here too.
         if self._serves_images(model):
             return {
                 "includes_degradation": False,
                 "target": None,
                 "protocol": "",
                 "surface": "",
+                "reason": "images",
             }
-        found = veridrop.target(wire_name, public_name)
-        listed = isinstance(found, Mapping)
-        protocol = (
-            str(found.get("protocol", "")) if listed else ""
-        ) or veridrop.protocol_for(wire_name, public_name)
+        protocol = modelprint_adapter.protocol_for(wire_name, public_name)
         surface = self._degradation_requirements(protocol)
+        # A flash route's press is a speed measurement, and it is measured on
+        # the route's own recommended protocol.  When that is the same protocol
+        # the quick suite would scan, the scan is the same requests on the same
+        # wire for a different question - and the press has already answered the
+        # question the button asks.  The plan therefore excludes it, so one
+        # press never spends the window twice on one protocol.
+        if (
+            surface
+            and self._is_flash_route(model)
+            and surface == self._speed_test_protocol(model)
+        ):
+            return {
+                "includes_degradation": False,
+                "target": None,
+                "protocol": "",
+                "surface": "",
+            }
         reachable = surfaces is None or not surface or surface in surfaces
+        target = modelprint_adapter.plan_target(wire_name or public_name)
+        reference = self._reference_fingerprint(model)
+        plan = modelprint_adapter.plan(
+            model=wire_name or public_name,
+            api_base=None,
+            reference_configured=reference is not None,
+        )
         # A route with no upstream name has nothing to scan, whatever its
         # public alias resolves to.
-        includes = bool(wire_name) and bool(protocol) and reachable
-        target = (
-            (str(found.get("model", "")) if listed else "") or wire_name
-            if includes
-            else ""
-        )
+        includes = bool(wire_name) and plan["includes_degradation"] and reachable
         return {
             "includes_degradation": includes,
             "target": target or None,
-            "protocol": protocol if includes else "",
+            "protocol": plan["protocol"] if includes else "",
             "surface": surface if includes else "",
+            "probes": list(plan["probes"]) if includes else [],
+            "reason": "" if includes else (plan["reason"] or "protocol"),
+            # A fingerprint recorded for the precision probe travels with the
+            # plan so the probe does not have to re-read the model document, and
+            # so a pane can say whether that second measurement is available.
+            "precision_reference": self._precision_reference(model),
+        }
+
+    @staticmethod
+    def _probe_not_run(plan: Mapping[str, Any], layer: str) -> dict[str, Any]:
+        """The record for a measurement this press did not ask for.
+
+        It is a distinct status rather than an empty one: a pane that showed
+        "no fingerprint" for a check that was never requested would be
+        reporting its own absence as a finding about the route.
+        """
+
+        return {
+            "status": "not_run",
+            "layer": layer,
+            "target": plan.get("target"),
+            "protocol": plan.get("protocol", ""),
+            "label": None,
+            "verdict": "",
+            "score": None,
+            "cause": "",
+            "detail": "",
+            "engine": {},
+            "detectors": [],
+            "brands": [],
+            "candidates": [],
+        }
+
+    def _capture_precision_reference(
+        self, *, api_base: str, credential: str, model_name: str
+    ) -> dict[str, Any]:
+        """Take the single-token distribution baseline this route is judged against.
+
+        Kept apart from the comparison on purpose: a reference taken from the
+        route under test would compare the route with itself and always agree,
+        which is the one answer a dilution check must never give.  This records
+        what the endpoint says *now* and labels it as such, so a caller decides
+        whether that baseline is one it trusts — an official address is, a
+        reseller's is the thing being questioned.
+        """
+
+        if not api_base or not credential or not model_name:
+            return {"status": "unavailable", "detail": "This route has no address, key or upstream name"}
+        try:
+            reading = fingerprint_adapter.capture_reference(
+                api_base=api_base,
+                api_key=credential,
+                model=model_name,
+            )
+        except fingerprint_adapter.ProbeOverBudget as exc:
+            return {"status": "over_budget", "detail": safe_exception_message(exc)}
+        except (fingerprint_adapter.FingerprintUnavailable, RuntimeError, ValueError) as exc:
+            return {"status": "unavailable", "detail": safe_exception_message(exc)}
+        fingerprint = reading.get("fingerprint")
+        if not isinstance(fingerprint, Mapping):
+            return {"status": "unavailable", "detail": "The probe returned no fingerprint"}
+        return {
+            "status": "captured",
+            "fingerprint": fingerprint,
+            "split_half_jsd": reading.get("split_half_jsd"),
+            "self_consistent": reading.get("self_consistent"),
+            "model": model_name,
+            "captured_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         }
 
     def _degradation_probe(
@@ -2792,8 +4058,17 @@ class ProvidersModelsDomain:
         credential: str,
         model_name: str,
         surface_status: str,
+        reference: Mapping[str, Any] | None = None,
+        layers: Sequence[str] = ("reachability", "identity"),
     ) -> dict[str, Any]:
-        """Run Veridrop's quick suite once against this route and report it."""
+        """Run the staged probe table once against this route and report it.
+
+        ``layers`` names which of the two fingerprint measurements this press
+        asked for.  They are separate because they answer different questions
+        and cost different amounts: the identity table says which model
+        answers, the precision battery says whether its weights are served at
+        the precision the name implies.
+        """
 
         checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         planned_target = plan.get("target")
@@ -2801,7 +4076,7 @@ class ProvidersModelsDomain:
         planned_protocol = plan.get("protocol")
         protocol = planned_protocol if isinstance(planned_protocol, str) else ""
         required_surface = str(plan.get("surface", ""))
-        engine = veridrop.engine()
+        engine = modelprint_adapter.engine()
         result: dict[str, Any] = {
             "status": "skipped",
             "target": target,
@@ -2810,22 +4085,25 @@ class ProvidersModelsDomain:
             "verdict": "",
             "score": None,
             "cause": "",
-            "detail": "This model is not one the staged scan program can probe",
+            "detail": "This route has no fingerprint to compare its answers against",
             "checked_at": checked_at,
             "engine": engine,
             "detectors": [],
             "brands": [],
+            "candidates": [],
         }
-        if not plan.get("includes_degradation"):
+        # A precision-only press does not need the identity plan: it compares
+        # this endpoint against a baseline of its own, so a route the identity
+        # table cannot name (or a build where the tables were never staged) can
+        # still be checked for quantization.
+        if not plan.get("includes_degradation") and "precision" not in layers:
             return result
         if surface_status != "ok":
-            # The route failed the surface its own protocol speaks, so the longer
-            # scan has nothing to measure. A protocol with no surface in this
-            # app's probe matrix (Gemini) carries no precondition and reports
-            # what the address answers; every other protocol is gated here. A
-            # route that answered nowhere is never a finding about what answers
-            # behind its name: the failure keeps its own name - rejected,
-            # silent, or a definitive rejection.
+            # The route failed the surface its own protocol speaks, so the
+            # longer scan has nothing to measure. A route that answered nowhere
+            # is never a finding about what answers behind its name: the
+            # failure keeps its own name - rejected, silent, or a definitive
+            # rejection.
             result["status"] = (
                 "unreachable" if surface_status in {"refused", "timeout", "network_error"} else "error"
             )
@@ -2836,24 +4114,90 @@ class ProvidersModelsDomain:
                 else f"No surface answered the availability probe ({surface_status})"
             )
             return result
-        result["status"] = "unavailable"
-        result["detail"] = "The scan program is not staged in this build"
-        if not engine.get("available"):
+        # The identity layer needs the staged tables; the precision layer does
+        # not — it compares this endpoint against a baseline of its own, so it
+        # can run in a build where the tables were never staged. Gating both on
+        # the same condition made the precision probe silently unavailable for
+        # a reason that had nothing to do with it.
+        needs_tables = "identity" in layers
+        if needs_tables and not engine.get("available"):
+            result["status"] = "unavailable"
+            result["detail"] = "The probe tables are not staged in this build"
             return result
         root = service_root(api_base)
         if not isinstance(root, str) or not root:
             result["status"] = "error"
             result["detail"] = "The route address cannot be resolved for a scan"
             return result
+        # The precision probe is a second, independent measurement: the
+        # identity table says which model answers, this one asks whether the
+        # weights behind it are served at the precision the name implies.  It
+        # needs a fingerprint to compare against, so it runs only when one was
+        # recorded for this route.
+        precision_reference = plan.get("precision_reference")
+        if (
+            "precision" in layers
+            and not (isinstance(precision_reference, Mapping) and precision_reference.get("fingerprint"))
+        ):
+            # Nothing to compare against.  A precision probe is a comparison, and
+            # comparing a route with itself always agrees - the one answer a
+            # dilution check must never give.  So this press records a baseline
+            # and says so, and the comparison waits for a reference taken from an
+            # address the caller trusts.  Capturing here (as an earlier version
+            # did) made a first press compare the route to itself and report
+            # "agree", which is worse than reporting nothing.
+            captured = self._capture_precision_reference(
+                api_base=root, credential=credential, model_name=model_name
+            )
+            result["precision_capture"] = captured
+            result["precision"] = {
+                "status": "captured" if captured.get("status") == "captured" else "unavailable",
+                "detail": (
+                    "Baseline recorded from this route; its next precision check compares against it"
+                    if captured.get("status") == "captured"
+                    else str(captured.get("detail") or "")
+                ),
+                "captured_at": captured.get("captured_at"),
+            }
+            return result
+        if "precision" in layers and isinstance(precision_reference, Mapping) and precision_reference.get("fingerprint"):
+            try:
+                precision = fingerprint_adapter.verify(
+                    api_base=root,
+                    api_key=credential,
+                    model=model_name,
+                    reference=precision_reference["fingerprint"],
+                    timeout_seconds=self._degradation_timeout_seconds(),
+                )
+            except fingerprint_adapter.ProbeOverBudget as exc:
+                # The endpoint could not answer the probe set inside its budget.
+                # That is a fact about the endpoint, not a failed check, so it
+                # keeps its own status instead of reading as an error.
+                precision = {"status": "over_budget", "detail": safe_exception_message(exc)}
+            except (fingerprint_adapter.FingerprintUnavailable, RuntimeError, ValueError) as exc:
+                precision = {"status": "unavailable", "detail": safe_exception_message(exc)}
+            result["precision"] = precision
+        if "identity" not in layers:
+            # The precision answer stands on its own; the identity table was
+            # not asked for, so this record says so instead of carrying an
+            # empty verdict that would read as "no fingerprint found".
+            result["status"] = "skipped"
+            result["detail"] = "This press asked for the precision check only"
+            return result
         try:
-            decision = veridrop.run_quick(
-                base_url=root,
+            decision = modelprint_adapter.run(
+                api_base=root,
                 api_key=credential,
                 model=model_name,
                 protocol=protocol,
+                reference=reference,
                 timeout_seconds=self._degradation_timeout_seconds(),
             )
-        except veridrop.VeridropUnavailable as exc:
+        except modelprint_adapter.ModelPrintUnavailable as exc:
+            # The program is missing, which is a fact about this build rather
+            # than about the route.  It keeps "unavailable" so a pane never
+            # reads its own missing dependency as a verdict on the model.
+            result["status"] = "unavailable"
             result["detail"] = safe_exception_message(exc)
             return result
         except (RuntimeError, ValueError) as exc:
@@ -2864,43 +4208,50 @@ class ProvidersModelsDomain:
         result["score"] = decision.get("score")
         run_error = str(decision.get("run_error") or "").strip()
         if run_error:
-            # The suite ran but upstream refused to validate it (no balance, no
-            # channel for this name). Nothing was measured, so the zero score is
-            # the invalid run's and not the route's: the finding says the check
-            # could not be made instead of naming the model diluted.
+            # The table ran but nothing was measured. The finding says the
+            # check could not be made instead of naming the model diluted.
             result["verdict"] = ""
             result["score"] = None
             result["status"] = "unavailable"
             result["cause"] = "run_error"
             result["detail"] = run_error
             return result
-        detectors = decision.get("detectors")
+        probes = decision.get("probes")
         result["detectors"] = [
             {
                 "name": str(item.get("name", "")),
-                "status": str(item.get("status", "")),
-                "score": item.get("score"),
+                "status": (
+                    "skip"
+                    if str(item.get("name", "")) in set(decision.get("skipped") or ())
+                    else "fail"
+                    if str(item.get("name", "")) in set(decision.get("failed") or ())
+                    else "pass"
+                ),
+                "score": None,
+                "value": str(item.get("value", "")),
             }
-            for item in detectors
+            for item in probes
             if isinstance(item, Mapping)
-        ][:16] if isinstance(detectors, Sequence) and not isinstance(detectors, (str, bytes)) else []
+        ][:24] if isinstance(probes, Sequence) and not isinstance(probes, (str, bytes)) else []
+        candidates = decision.get("candidates")
+        result["candidates"] = [
+            {
+                "model": str(item.get("model", "")),
+                "baseline": str(item.get("baseline", "")),
+                "share": item.get("share"),
+                "hits": item.get("hits"),
+                "total": item.get("total"),
+                "tokenizer_hits": item.get("tokenizer_hits"),
+            }
+            for item in candidates
+            if isinstance(item, Mapping)
+        ][:4] if isinstance(candidates, Sequence) and not isinstance(candidates, (str, bytes)) else []
         brands = decision.get("brands")
         result["brands"] = [str(brand) for brand in brands][:8] if isinstance(brands, Sequence) and not isinstance(brands, (str, bytes)) else []
-        identity = decision.get("identity")
-        label = ", ".join(result["brands"])
-        if not label and isinstance(identity, str):
-            label = identity.strip().splitlines()[0][:80] if identity.strip() else ""
-        result["label"] = label or None
-        summary = str(decision.get("summary") or "").strip()
-        score = decision.get("score")
-        score_text = (
-            f"{float(score):.0f}/100"
-            if isinstance(score, (int, float)) and not isinstance(score, bool)
-            else ""
-        )
-        suffix = f" ({score_text})" if score_text else ""
-        failed = decision.get("failed")
-        failed_names = ", ".join(str(name) for name in failed) if isinstance(failed, Sequence) and not isinstance(failed, (str, bytes)) else ""
+        label = decision.get("label")
+        result["label"] = str(label).strip() if isinstance(label, str) and label.strip() else None
+        result["label_source"] = str(decision.get("label_source") or "")
+        result["label_confidence"] = decision.get("label_confidence")
         verdict = result["verdict"]
         if verdict == "passed":
             result["status"] = "matched"
@@ -2908,18 +4259,13 @@ class ProvidersModelsDomain:
             result["status"] = "mismatch"
         else:
             result["status"] = "unknown"
-        # What failed and what the answer looked like are the two facts a user
-        # acts on, so both ride in the finding's own sentence.
-        findings: list[str] = []
-        if failed_names:
-            findings.append(f"failed {failed_names}")
-        if result["label"] and verdict != "passed":
-            findings.append(f"answered like {result['label']}")
-        outcome_text = {"passed": "passed", "failed": "failed"}.get(verdict, "was inconclusive")
+        measured = decision.get("measured")
+        measured_count = len(measured) if isinstance(measured, Sequence) and not isinstance(measured, (str, bytes)) else 0
+        summary = str(decision.get("summary") or "").strip()
         result["detail"] = (
-            f"The quick suite {outcome_text}{suffix}"
-            + (f" ({'; '.join(findings)})" if findings else "")
-            + (f": {summary}" if summary else "")
+            f"The probe table measured {measured_count} rows and {summary}"
+            if summary
+            else f"The probe table measured {measured_count} rows"
         )
         return result
 
@@ -3153,6 +4499,17 @@ class ProvidersModelsDomain:
         except Exception:
             return False
 
+    @classmethod
+    def _probe_kind(cls, data: Mapping[str, Any]) -> str:
+        """Which question one press asked, and therefore how much it costs.
+
+        The default is ``identity``: it is what this button has always meant,
+        and a caller that does not name a kind keeps the behaviour it had.
+        """
+
+        raw = str(data.get("kind") or data.get("probe_kind") or "").strip().lower()
+        return raw if raw in cls._PROBE_KINDS else "identity"
+
     def _probe_model(
         self,
         provider: Mapping[str, Any],
@@ -3160,7 +4517,9 @@ class ProvidersModelsDomain:
         *,
         provider_id: str,
         model_id: str,
+        kind: str = "identity",
     ) -> dict[str, Any]:
+        layers = self._PROBE_KIND_LAYERS.get(kind, self._PROBE_KIND_LAYERS["identity"])
         provider_name = str(provider.get("name", "")).strip()
         probe_key = model_id
         api_base = self._model_api_base(provider, model)
@@ -3183,6 +4542,27 @@ class ProvidersModelsDomain:
         surfaces = self._probe_surfaces(
             api_base, model, provider, serves_images=self._serves_images(model)
         )
+        # A flash route is pressed for its speed, not for its availability, and
+        # the two questions are answered by the same request: the measurement
+        # streams a real turn on the one protocol the route recommends, so a
+        # surface that emitted tokens answered.  Asking that protocol twice
+        # under one press would make the pane pay twice for one reading, so the
+        # speed run replaces that surface's availability probe instead of
+        # joining it.  The other surfaces keep their own probes: their answers
+        # are what a protocol recommendation compares, and only a flash route
+        # ever reaches this branch.
+        speed_protocol = (
+            self._speed_test_protocol(model)
+            if self._is_flash_route(model) and self._IMAGE_PROBE_SURFACE not in surfaces
+            else ""
+        )
+        speed_test: dict[str, Any] | None = None
+        if speed_protocol:
+            # The recommendation's own surface is measured, so its availability
+            # answer is this run's verdict and the matrix below must not ask it
+            # again.  ``_probe_surfaces`` states what the route may be asked
+            # about; removing one leaves the rest to answer for themselves.
+            surfaces = [surface for surface in surfaces if surface != speed_protocol]
 
         def run_surfaces(targets: Sequence[str]) -> dict[str, dict[str, Any]]:
             with ThreadPoolExecutor(max_workers=max(1, len(targets))) as executor:
@@ -3200,6 +4580,29 @@ class ProvidersModelsDomain:
                 return {surface: future.result() for surface, future in futures.items()}
 
         surface_results = run_surfaces(surfaces)
+        if speed_protocol:
+            # The measurement speaks the recommendation's own surface, and its
+            # answer joins the matrix in the same shape the availability probe
+            # would have used: a route that emitted tokens is a route that
+            # answered there.  It runs after the other surfaces so a press that
+            # finds nothing anywhere still reports that at the same time; the
+            # window it spends is the press's own, and it is bounded.
+            speed_test = self._speed_test_run(
+                protocol=speed_protocol,
+                api_base=api_base,
+                credential=credential,
+                model_name=model_name,
+                account_id=account_id,
+            )
+            surface_results[speed_protocol] = {
+                "surface": speed_protocol,
+                "available": speed_test.get("status") == "ok",
+                "status": str(speed_test.get("status", "unavailable")),
+                "original_request": copy.deepcopy(
+                    speed_test.get("original_request", {})
+                ),
+            }
+            surfaces = [speed_protocol, *surfaces]
         # The modality is not always readable before the first request: LiteLLM's
         # cost map is fixed to the copy bundled with this install, and a provider
         # that ships a model ahead of it (``gpt-image-2.6-flare`` is absent from
@@ -3301,7 +4704,11 @@ class ProvidersModelsDomain:
         # then would silently re-point a working route, so the recommendation
         # waits until the preferred surface answered.
         preferred_surface = priority[0] if priority else ""
-        recommendation_blocked = statuses.get(preferred_surface) == "network_error"
+        recommendation_blocked = statuses.get(preferred_surface) in {
+            "refused",
+            "timeout",
+            "network_error",
+        }
         # The Images wire is not one of the protocols the pane offers, so a
         # route measured on it never produces a protocol recommendation: there
         # is no other surface to move it to, and reporting one would make the
@@ -3361,12 +4768,32 @@ class ProvidersModelsDomain:
             # Nothing answered anywhere, so there is no endpoint to measure and
             # no evidence about what answers behind the name.
             surface_status = "unreachable" if unreachable_surfaces else "error"
-        degradation = self._degradation_probe(
-            plan=deep_probe,
-            api_base=api_base,
-            credential=credential,
-            model_name=model_name,
-            surface_status=surface_status,
+        # The fingerprint layers run only when this press asked for them: a
+        # reachability check that also measured a fingerprint would cost a user
+        # 23 requests to learn that a route answers.
+        degradation = (
+            self._degradation_probe(
+                plan=deep_probe,
+                api_base=api_base,
+                credential=credential,
+                model_name=model_name,
+                surface_status=surface_status,
+                reference=self._reference_fingerprint(model),
+                layers=layers,
+            )
+            if "identity" in layers or "precision" in layers
+            else self._probe_not_run(deep_probe, "identity" if "identity" not in layers else "precision")
+        )
+        speed = (
+            self._speed_probe(
+                surface=deep_probe.get("surface") or (available_surfaces[0] if available_surfaces else ""),
+                api_base=api_base,
+                credential=credential,
+                model_name=model_name,
+                account_id=account_id,
+            )
+            if "speed" in layers and available_surfaces
+            else None
         )
         probe_overlay = {
             # An image route has no protocol to recommend and is still serving:
@@ -3377,6 +4804,9 @@ class ProvidersModelsDomain:
             "summary": summary,
             "checked_at": checked_at,
             "degradation": copy.deepcopy(degradation),
+            "precise": copy.deepcopy((degradation or {}).get("precision")),
+            "speed": copy.deepcopy(speed),
+            "kind": kind,
             "surfaces": {
                 surface: {
                     "available": result.get("available") is True,
@@ -3386,6 +4816,12 @@ class ProvidersModelsDomain:
                 for surface, result in surface_results.items()
             },
         }
+        if speed_test is not None:
+            # The press that measured this route also stored how fast it was:
+            # one finding, kept beside the surfaces it was measured with, so a
+            # window that reopens reads the number the last press measured
+            # instead of a blank where the row states it.
+            probe_overlay["speed_test"] = copy.deepcopy(speed_test)
         # A 429 is the upstream answering on the surface it was asked about: it
         # read the request and refused the pace, not the protocol.  Naming it
         # here keeps the pane from reporting a rate limit as "no usable surface"
@@ -3408,6 +4844,9 @@ class ProvidersModelsDomain:
             "recommended_surface": recommended,
             "summary": summary,
             "degradation": copy.deepcopy(degradation),
+            "precise": copy.deepcopy((degradation or {}).get("precision")),
+            "speed": copy.deepcopy(speed),
+            "kind": kind,
             "detail": "Model probe completed"
             if answered
             else "The configured surface could not be reached; no protocol change is recommended"
@@ -3429,6 +4868,19 @@ class ProvidersModelsDomain:
                 "provider_name": provider_name,
                 "probe_key": probe_key,
                 "probe": probe_overlay,
+                # A baseline captured during this press is written onto the
+                # model document, so the next press compares against it instead
+                # of capturing the same route again.
+                "precision_reference": (
+                    {
+                        "fingerprint": (degradation.get("precision_capture") or {}).get("fingerprint"),
+                        "model": model_name,
+                        "captured_at": (degradation.get("precision_capture") or {}).get("captured_at"),
+                    }
+                    if isinstance(degradation.get("precision_capture"), Mapping)
+                    and (degradation.get("precision_capture") or {}).get("status") == "captured"
+                    else None
+                ),
             },
         }
 
@@ -4077,7 +5529,9 @@ class ProvidersModelsDomain:
         self._last_operation = {
             "operation": "our_free_model_models",
             "provider": provider_id,
-            "display_name": our_free_model_module.OUR_FREE_MODEL_DISPLAY_NAME,
+            "display_name": our_free_model_module.OUR_FREE_MODEL_DISPLAY_NAMES.get(
+                provider_id, our_free_model_module.OUR_FREE_MODEL_DISPLAY_NAME
+            ),
             **document,
         }
 
@@ -4123,7 +5577,9 @@ class ProvidersModelsDomain:
         self._last_operation = {
             "operation": action,
             "provider": provider_id,
-            "display_name": our_free_model_module.OUR_FREE_MODEL_DISPLAY_NAME,
+            "display_name": our_free_model_module.OUR_FREE_MODEL_DISPLAY_NAMES.get(
+                provider_id, our_free_model_module.OUR_FREE_MODEL_DISPLAY_NAME
+            ),
             **document,
         }
 
@@ -4415,7 +5871,16 @@ class ProvidersModelsDomain:
         auth_kind = self._provider_auth_state(provider)["kind"]
         if auth_kind not in managed_adapters.catalog_auth_kinds():
             return None
-        provider_id = managed_adapters.catalog_provider_id(auth_kind)
+        if auth_kind in our_free_model_module.OUR_FREE_MODEL_AUTH_KINDS:
+            # One login reaches both channels, so the auth kind alone names the
+            # anonymous provider; the row's stored channel is the lane whose
+            # catalog readings were recorded under this provider id.
+            provider_id = our_free_model_module.CHANNEL_TO_PROVIDER.get(
+                self._provider_channel_state(provider),
+                our_free_model_module.OUR_FREE_MODEL_PROVIDER,
+            )
+        else:
+            provider_id = managed_adapters.catalog_provider_id(auth_kind)
         if not provider_id:
             return None
         stored = self._catalog_windows.get(provider_id)
@@ -4441,10 +5906,11 @@ class ProvidersModelsDomain:
         model_id = self._wire_model_name(model)
         if not model_id:
             return None
-        provider_id = our_free_model_module.AUTH_KIND_TO_PROVIDER.get(
-            self._provider_auth_state(provider)["kind"]
+        provider_id = our_free_model_module.CHANNEL_TO_PROVIDER.get(
+            self._provider_channel_state(provider),
+            our_free_model_module.OUR_FREE_MODEL_PROVIDER,
         )
-        stored = self._lane_routes.get(provider_id or "")
+        stored = self._lane_routes.get(provider_id)
         return stored.get(model_id) if isinstance(stored, Mapping) else None
 
     def _published_rate(
@@ -4974,6 +6440,7 @@ class ProvidersModelsDomain:
             } and keys
             else None
         )
+        default_surface, default_mode = cls._account_route_defaults(provider)
         for model in models:
             if not isinstance(model, dict):
                 continue
@@ -4983,7 +6450,6 @@ class ProvidersModelsDomain:
             # model is added, so assigning here unconditionally would rewrite
             # the whole group's protocol each time the roster grows — including
             # a surface the user picked against the account's own default.
-            default_surface, default_mode = cls._account_route_defaults(provider)
             if default_surface and not str(model.get("upstream_url_surface", "")).strip():
                 model["upstream_url_surface"] = default_surface
             if not str(model.get("upstream_url_surface", "")).strip():
@@ -5184,6 +6650,8 @@ class ProvidersModelsDomain:
         self,
         provider: Mapping[str, Any],
         model: dict[str, Any],
+        *,
+        staged: bool = True,
     ) -> None:
         """Keep one route's account and its key slot from disagreeing.
 
@@ -5191,7 +6659,9 @@ class ProvidersModelsDomain:
         account through the adapter, or a custom key at the service address.
         A route therefore states at most one of the two, and a route that names
         an account the row no longer owns is refused here rather than written as
-        a deployment nothing can authenticate.
+        a deployment nothing can authenticate.  A document being read may not
+        refuse, so its stale reference is dropped instead and the route falls
+        back to the row's own default.
 
         A route that names neither follows the row's own default, and that
         default is not stored: it is the first account the row owns, which is
@@ -5218,6 +6688,9 @@ class ProvidersModelsDomain:
             return
         accounts = self._provider_accounts(provider)
         if not any(entry["ref"] == named_account for entry in accounts):
+            if not staged:
+                model.pop("account_ref", None)
+                return
             raise DomainError("The selected provider account is unavailable")
         model["account_ref"] = named_account
 
@@ -5240,7 +6713,7 @@ class ProvidersModelsDomain:
         order_mode = str(model.get("order_mode", "manual")).strip() or "manual"
         if order_mode not in MODEL_ORDER_MODES:
             raise DomainError("Order mode must be manual or relay_multiplier")
-        self._normalize_model_account(provider, model)
+        self._normalize_model_account(provider, model, staged=staged)
         explicit_key_id = str(model.get("provider_key_id", "")).strip()
         explicit_key_name = str(model.get("api_key_name", "")).strip()
         key = self._model_provider_key(provider, model)
@@ -5584,14 +7057,6 @@ class ProvidersModelsDomain:
             str(provider["name"]) == current_name
             and str(provider["api_base"]) == current_base
         )
-        previous_auth = self._provider_auth_state(provider)
-        if previous_auth["kind"] != "api_key":
-            try:
-                self._auth_manager().logout(
-                    previous_auth["kind"], previous_auth["credential_ref"]
-                )
-            except Exception:
-                pass
         self._configure_provider_auth(provider, "api_key")
         self._set_provider_source(provider, {"kind": "relay", "station_id": station_id})
         self._sync_provider_identity_to_models(provider)
@@ -6256,12 +7721,17 @@ class ProvidersModelsDomain:
                 # No account named: end every account this provider owns, which
                 # is what deleting the provider and the older single-account
                 # pane both mean.
-                for entry in self._provider_accounts(editable):
+                accounts = self._provider_accounts(editable)
+                for entry in accounts:
                     try:
                         manager.logout(kind, entry["ref"])
                     except Exception:
                         pass
                 self._set_provider_accounts(editable, [])
+                # Every route that named one of those accounts must stop naming
+                # it: with no account left, it has no credential to answer with.
+                for entry in accounts:
+                    self._detach_removed_account(editable, entry["ref"])
                 result = {"status": "signed_out", "configured": False}
             else:
                 credential_ref = self._provider_account_target(
@@ -6540,7 +8010,7 @@ class ProvidersModelsDomain:
         self._last_operation = {
             "operation": "model_import_service_catalog",
             "provider_id": self._safe_provider(edited, provider_index)["id"],
-            "api_key_name": str(self._provider_auth_state(edited).get("kind", "")),
+            "auth_kind": str(self._provider_auth_state(edited).get("kind", "")),
             "imported": added,
         }
 
@@ -6843,7 +8313,7 @@ class ProvidersModelsDomain:
         provider = self._draft["providers"][provider_index]
         if not isinstance(provider, Mapping):
             raise DomainError("The selected provider is unavailable")
-        provider_root = service_root(provider.get("api_base"))
+        provider_root = service_root(self._provider_api_base(provider))
         relay_root = service_root(raw_source.get("api_base"))
         if not provider_root or provider_root != relay_root:
             raise DomainError("Relay API key does not match the provider Base URL")
@@ -6904,6 +8374,7 @@ class ProvidersModelsDomain:
                 "provider_key_id": target_key["id"],
             }
         )
+        self._forget_probe_result(provider, model)
         self._normalize_model_binding(provider, model)
         models[model_index] = model
         providers[provider_index] = provider
@@ -6958,6 +8429,7 @@ class ProvidersModelsDomain:
                 "binding_health": {"status": "independent"},
             }
         )
+        self._forget_probe_result(provider, model)
         models[model_index] = model
         providers[provider_index] = provider
 
@@ -7007,6 +8479,14 @@ class ProvidersModelsDomain:
         imported_models = 0
         imported_keys = 0
         updated_models = 0
+        used_deployment_ids = {
+            str(candidate.get("deployment_id", "")).strip()
+            for candidate_provider in providers
+            if isinstance(candidate_provider, Mapping)
+            for candidate in candidate_provider.get("models", [])
+            if isinstance(candidate, Mapping)
+            and str(candidate.get("deployment_id", "")).strip()
+        }
         for raw_source in sources:
             if not isinstance(raw_source, Mapping):
                 raise DomainError("Relay import source is invalid")
@@ -7033,12 +8513,23 @@ class ProvidersModelsDomain:
                 and str(provider.get("name", "")).strip() == provider_name
                 for provider in providers
             )
+            # The coordinator's own placeholder is not a name the user chose:
+            # `relay-<station_id>` is what an import mints when no provider is
+            # bound yet.  Once the user binds one, that provider is where the
+            # station's keys and routes belong -- a placeholder left over from
+            # an earlier import would otherwise split one station across two
+            # rows, and every later import would keep feeding the stale one.
+            placeholder_name = f"relay-{station_id}"
             joins_station_provider = False
-            if station_provider and (not provider_name or not named_provider_exists):
+            if station_provider and (
+                not provider_name
+                or not named_provider_exists
+                or provider_name == placeholder_name
+            ):
                 provider_name = station_provider
                 joins_station_provider = True
             elif not provider_name:
-                provider_name = f"relay-{station_id}"
+                provider_name = placeholder_name
             # The slug rule guards a name this import would create.  The name of
             # the provider already bound to the station is the document's own
             # (station labels carry spaces and non-ASCII), so it is never
@@ -7164,14 +8655,7 @@ class ProvidersModelsDomain:
                             "model_enabled": True,
                             "upstream_url_surface": "openai/responses",
                         },
-                        {
-                            str(candidate.get("deployment_id", "")).strip()
-                            for candidate_provider in providers
-                            if isinstance(candidate_provider, Mapping)
-                            for candidate in candidate_provider.get("models", [])
-                            if isinstance(candidate, Mapping)
-                            and str(candidate.get("deployment_id", "")).strip()
-                        },
+                        used_deployment_ids,
                     )
                     self._append_model_row(provider, models, model)
                     imported_models += 1
@@ -7379,7 +8863,6 @@ class ProvidersModelsDomain:
                 continue
             deferred_issues[(safe_issue.get("account_id", ""), safe_issue.get("resource_id", ""))] = safe_issue
 
-        affected_models: list[dict[str, str]] = []
         materialized_keys = 0
         materialized_models = 0
         resolved_sources: set[tuple[str, str, str]] = set()
@@ -7654,13 +9137,6 @@ class ProvidersModelsDomain:
                         model["order"] = manual_order
                     model["binding_health"] = {"status": "linked"}
                     materialized_models += 1
-                    affected_models.append(
-                        {
-                            "provider_key_id": key["id"],
-                            "model_id": model_id,
-                            "upstream_model": source_model_id,
-                        }
-                    )
             if provider_base is not None:
                 provider["api_base"] = provider_base
             # A slot's name is the station key's name, and a station rename is a
@@ -7727,7 +9203,6 @@ class ProvidersModelsDomain:
         return {
             "materialized": materialized_models,
             "materialized_provider_keys": materialized_keys,
-            "affected_models": affected_models,
             "issues": issues,
         }
 
@@ -8759,8 +10234,10 @@ class ProvidersModelsDomain:
                 )
         # The request must name this group's routes exactly once each: a row the
         # pane added, removed, or renamed since its snapshot is a stale order.
-        if len(requested) != len(orders) or any(
-            route_id not in matched for route_id in requested
+        if (
+            len(requested) != len(orders)
+            or any(route_id not in matched for route_id in requested)
+            or len({matched[route_id] for route_id in requested}) != len(orders)
         ):
             raise DomainError("The route order changed; refresh and try again")
         changed_providers: dict[int, dict[str, Any]] = {}
@@ -8893,9 +10370,9 @@ class ProvidersModelsDomain:
 
         A public model is the client-facing name several routes share, not a
         record of its own: a rename writes the new ``model_name`` on every
-        route, and the context/output limits are written to each route's
-        ``model_info`` so the managed catalog and the proxy's model metadata
-        read the same numbers.  One staged action keeps the group consistent
+        route, and the context window is written to each route's ``model_info``
+        so the managed catalog and the proxy's model metadata read the same
+        number.  One staged action keeps the group consistent
         instead of leaving the pane to patch its routes one by one.
 
         Stating a name the document already serves **merges** the two groups:
@@ -9023,8 +10500,11 @@ class ProvidersModelsDomain:
         elif name in {"reset", "cancel", "reload", "restore_defaults"}:
             provider_bindings, model_bindings = self._editor_id_bindings()
             self._draft = copy.deepcopy(self._raw)
+            self._validation_cache = None
+            self._render_snapshot = None
             self._restore_editor_id_bindings(provider_bindings, model_bindings)
             self._probe_overlay.clear()
+            self._model_edit_existing_key_ids.clear()
             # A discarded draft takes the wizard keys staged for it: nothing
             # is reserved for a provider that will never be created.
             self._pending_provider_keys.clear()
@@ -9228,7 +10708,6 @@ class ProvidersModelsDomain:
                     return {"valid": False, "errors": ["Provider API keys are invalid"]}
                 models = provider.get("models", [])
                 required_key_ids: set[str] = set()
-                referenced_key_ids: set[str] = set()
                 # Which keys a route names *itself*.  ``_key_for_model`` answers
                 # with the provider's first key for a route that names none, and
                 # that default must not be read as a route depending on a slot the
@@ -9252,7 +10731,6 @@ class ProvidersModelsDomain:
                         key_id = str(key.get("id", "")).strip()
                         if not key_id:
                             continue
-                        referenced_key_ids.add(key_id)
                         if states_a_key:
                             named_key_ids.add(key_id)
                         if _model_is_live(provider, model):
@@ -9349,12 +10827,12 @@ class ProvidersModelsDomain:
             # and save the candidate over it, only to throw both away: the
             # scratch files were never read, and the Apply that followed
             # rendered the identical text a second time.
-            config_api.save_config(
+            self._render_snapshot = config_api.save_config(
                 candidate_providers,
                 self.config_path,
                 document=source,
                 probe=True,
-            )
+            ).get("document")
         except DomainError:
             raise
         except ValueError as error:
@@ -9537,11 +11015,16 @@ class ProvidersModelsDomain:
         if not validation["valid"]:
             raise DomainError("Provider/model configuration is invalid")
         try:
+            # The validation above already rendered this exact document (its
+            # probe answers with the bytes it would write), so the commit hands
+            # those back rather than serialising the whole providers/model_list/
+            # router_settings tree a second time and re-parsing it.
             config_api.save_config(
                 copy.deepcopy(self._draft["providers"]),
                 self.config_path,
                 self._disk_revision,
                 copy.deepcopy(self._draft["document"]),
+                rendered=self._render_snapshot,
             )
         except Exception as exc:
             message = str(exc)
@@ -9612,6 +11095,8 @@ class ProvidersModelsDomain:
         self._normalize_provider_model_bindings(loaded["providers"])
         self._raw = {"providers": copy.deepcopy(loaded["providers"]), "document": copy.deepcopy(loaded["document"])}
         self._draft = copy.deepcopy(self._raw)
+        self._validation_cache = None
+        self._render_snapshot = None
         self._disk_revision = copy.deepcopy(loaded["disk_revision"])
         self._exists = bool(loaded["exists"])
         self._restore_editor_id_bindings(provider_bindings, model_bindings)
@@ -9671,6 +11156,7 @@ class ProvidersModelsDomain:
                 "model": copy.deepcopy(dict(model)),
                 "provider_id": self._editor_id(provider),
                 "model_id": self._editor_id(model, model=True),
+                "kind_probe": self._probe_kind(data),
             }
         if selected is not None:
             indices = [self._provider_index(data)]
@@ -9703,6 +11189,7 @@ class ProvidersModelsDomain:
                 _mapping(prepared.get("model"), "model"),
                 provider_id=str(prepared.get("provider_id", "")),
                 model_id=str(prepared.get("model_id", "")),
+                kind=str(prepared.get("kind_probe") or "identity"),
             )
         protocols = [item for item in prepared.get("protocols", []) if isinstance(item, str)]
         if kind == "none":
@@ -9769,6 +11256,12 @@ class ProvidersModelsDomain:
         if not isinstance(probe, Mapping):
             raise DomainError("The model probe returned invalid state")
         self._probe_overlay.setdefault(provider_name, {})[probe_key] = copy.deepcopy(dict(probe))
+        # Record the baseline this press captured, so the next one measures
+        # against it.  Written only when a capture succeeded: a failure leaves
+        # whatever baseline the route already had untouched.
+        baseline = overlay.get("precision_reference")
+        if isinstance(baseline, Mapping) and baseline.get("fingerprint"):
+            model["precision_reference"] = copy.deepcopy(dict(baseline))
         self.revision += 1
         return result, True
 

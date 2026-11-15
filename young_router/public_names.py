@@ -12,7 +12,36 @@ reader re-spells a name behind their back.
 
 from __future__ import annotations
 
-__all__ = ["IMPORTED_NAME_CASES", "import_name_case", "imported_public_name", "public_name_key"]
+__all__ = [
+    "IMPORTED_NAME_CASES",
+    "display_upstream_model",
+    "import_name_case",
+    "imported_public_name",
+    "public_name_key",
+]
+
+# LiteLLM stores the model name with the transport adapter prefix.  These are
+# the prefixes this app adds when it canonicalizes a route; every other slash
+# is part of the upstream model id (for example ``openrouter/free`` or
+# ``kilo-auto/free``) and must remain visible.
+_DISPLAYABLE_TRANSPORT_PREFIXES = frozenset({"openai", "anthropic", "chatgpt"})
+
+
+def display_upstream_model(value: object) -> str:
+    """Return an upstream id without stripping meaningful slash segments.
+
+    ``litellm_model`` is normally ``<transport>/<upstream-id>``.  A generic
+    ``split('/', 1)`` is wrong because providers and lanes can legitimately
+    publish ids containing a slash.  Only the transport prefixes owned by the
+    router are presentation syntax; unknown prefixes and the rest of the id
+    are retained byte-for-byte after surrounding whitespace is removed.
+    """
+
+    text = str(value or "").strip()
+    if "/" not in text:
+        return text
+    prefix, remainder = text.split("/", 1)
+    return remainder.strip() if prefix in _DISPLAYABLE_TRANSPORT_PREFIXES else text
 
 #: The two spellings an import may file a name under.  ``lower`` is what a
 #: roster is filed as unless the person importing it said otherwise: a client

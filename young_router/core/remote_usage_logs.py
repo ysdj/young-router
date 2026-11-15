@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from ..config.load import load_config
+from .domains.relay_accounts import _payload_refuses_session
 from young_router.api_base import isolated_http_opener, service_root
 from young_router.browser_identity import browser_request_headers
 
@@ -239,6 +240,11 @@ class UsageTarget:
     # the token a read authorizes with lives in memory and is never read back
     # from (or written to) the stored session.
     refresh_token: str = ""
+    # Whether this login can be read right now.  A wired account whose session
+    # has lapsed still names a relay worth showing, but selecting it could only
+    # answer "no credential", so the dropdown lists it greyed instead of hiding
+    # the account the user is about to sign in again.
+    available: bool = True
 
     def credentials(self) -> tuple[str, ...]:
         return (self.api_key, *self.fallback_keys) if self.api_key else self.fallback_keys
@@ -412,7 +418,7 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
     for account_id, account in accounts.items():
         origin = _string(account.get("origin"))
         has_session = bool(account.get("session"))
-        if not account_id or not origin or not has_session:
+        if not account_id or not origin:
             continue
         # The same login reached by its station's provider is already one entry.
         # Its own record can state another root than that provider — a station
@@ -462,11 +468,15 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
         # leaving its name off the entry that is *about* that login was what made
         # a station with two logins look like a station with one.
         label = _string(account.get("label")) or account_id
-        if not keys and not account.get("session"):
-            # No readable credential and no dashboard session: there is nothing
-            # this entry could ever answer, and offering it would be a choice
-            # that always comes back empty.
+        if not account_id:
+            # A station's keys are not a read scope: the ledger belongs to the
+            # login that owns them, and a key the user pasted by hand names no
+            # login.  Listing it offered a choice whose every answer was
+            # "no credential".
             continue
+        # The account stays listed even without a session: it is a relay the
+        # user signed into before, and the entry is how they find it again.
+        # Whether it can be read is answered by ``available`` below.
         targets.append(
             UsageTarget(
                 provider=labels[scope],
@@ -481,6 +491,7 @@ def active_usage_targets(path: pathlib.Path) -> list[UsageTarget]:
                 refresh_token=_string((account.get("session") or {}).get("refresh_token"))
                 if isinstance(account.get("session"), dict)
                 else "",
+                available=bool(account.get("session")),
             )
         )
         if len(targets) >= MAX_TARGETS:
@@ -976,6 +987,12 @@ def _fetch_json_with_headers(
         return "unsupported", None
     if not isinstance(payload, dict):
         return "unsupported", None
+    if _payload_refuses_session(payload):
+        # Some New API deployments return HTTP 200 for an expired session and
+        # put the refusal in the envelope.  Keep this in the usage reader in
+        # lockstep with the relay account probe so renewal is attempted before
+        # the UI settles on a stale signed-in answer.
+        return "refused", None
     if payload.get("success") is False:
         return "unsupported", None
     code = payload.get("code")
@@ -1113,7 +1130,7 @@ def _sub2api_ledger_rows(
     applied_rows = (
         echoed
         if isinstance(echoed, int) and not isinstance(echoed, bool) and echoed > 0
-        else size
+        else 0
     )
     return [item for item in items if isinstance(item, dict)], False, total_rows, applied_rows
 
@@ -1245,9 +1262,10 @@ def _duration_milliseconds(row: Mapping[str, Any]) -> str:
     seconds = row.get("use_time")
     if seconds is None:
         seconds = row.get("duration")
-    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
-        return _safe_number(seconds)
-    return _safe_number(round(float(seconds) * 1000))
+    number = _number(seconds)
+    if number is None:
+        return ""
+    return _safe_number(round(number * 1000))
 
 
 def _usage_envelope(row: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -1440,20 +1458,17 @@ def fetch_target(
     page: int = 1,
     rows_per_page: int | None = None,
 ) -> tuple[str, list[dict[str, Any]], str, int, int]:
-    """Read every one of the account's keys and merge what they report.
+    """Read one page of the account's history through its dashboard session.
 
-    The feed is scoped per key, so one key answers for the traffic it served
-    and nothing else: the key an account happens to list first can legitimately
-    answer zero rows while another is the busiest.  Every key of *this account*
-    is therefore read and their rows merged.  A station's other logins are
-    other targets with their own keys, so this read never answers for a login
-    the user did not select.
+    A Sub2API ledger and a New API ``/log/self`` are readable only through the
+    login that owns them; the per-key feed beside them answers only the traffic
+    one key served, so a reader that walked the keys reported a partial history
+    as the account's.  A station's other logins are other targets with their own
+    sessions, so this read never answers for a login the user did not select.
 
-    Which endpoint shape a station installs is a property of the *station*,
-    not of a key, so it is settled once and the keys are then read against
-    that one shape.  Probing every shape with every key multiplied the
-    requests a refresh costs by the number of keys, and each request is the
-    slow part.
+    Which endpoint shape a station installs is a property of the *station*, not
+    of a login, so it is settled once and the one page is read against that one
+    shape.
     """
 
     fallback_timestamp = fallback_timestamp or _utc_now_iso()
@@ -1627,13 +1642,14 @@ def _fetch_target_safely(
         return "", [], "", 0, 0
 
 
-def usage_sources(path: pathlib.Path) -> list[dict[str, str]]:
+def usage_sources(path: pathlib.Path) -> list[dict[str, object]]:
     """List the selectable read targets without exposing any credential.
 
     The dropdown that names them is what decides the scope of a refresh, so the
-    list must be safe to render: an id and the station's own name.  A source
-    that yields no usable credential is simply absent, which is how the UI says
-    there is nothing to read.
+    list must be safe to render: an id, the station's own name, and whether the
+    login behind it can be read.  ``available`` is false for an account whose
+    session has lapsed: the entry stays (the user knows this relay) but the
+    dropdown greys it, because a read would answer "no credential".
     """
 
     try:
@@ -1641,7 +1657,11 @@ def usage_sources(path: pathlib.Path) -> list[dict[str, str]]:
     except UsageConfigError:
         return []
     return [
-        {"id": target.source_id, "label": target.display()}
+        {
+            "id": target.source_id,
+            "label": target.display(),
+            "available": target.available,
+        }
         for target in targets
     ]
 

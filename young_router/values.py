@@ -23,7 +23,9 @@ def int_or_none(value: Any) -> Optional[int]:
         return value
     if isinstance(value, float) and value.is_integer():
         return int(value)
-    if isinstance(value, str) and value.strip().isdigit():
+    # ``isdecimal``, not ``isdigit``: the latter also answers yes for characters
+    # ``int`` refuses ("²"), which turned "cannot read" into a ValueError.
+    if isinstance(value, str) and value.strip().isdecimal():
         return int(value.strip())
     return None
 

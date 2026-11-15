@@ -10,12 +10,12 @@ from __future__ import annotations
 import copy
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from http.cookies import SimpleCookie
+from http.cookies import CookieError, SimpleCookie
 import hashlib
 import json
 import math
 import os
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from pathlib import Path
 import re
 import ssl
@@ -1296,7 +1296,13 @@ class RelayHTTPClient:
         cookie_values: dict[str, str] = {}
         for header in set_cookie_headers:
             parsed = SimpleCookie()
-            parsed.load(header)
+            try:
+                parsed.load(header)
+            except CookieError:
+                # The stdlib parser is stricter than a browser, and its error
+                # is not one this domain may raise: a header it rejects loses
+                # only its own cookies, not a sign-in the station accepted.
+                continue
             for name, morsel in parsed.items():
                 cookie_values[name] = morsel.value
         cookie = "; ".join(f"{name}={value}" for name, value in sorted(cookie_values.items()))
@@ -1454,12 +1460,6 @@ class RelayAccountsDomain:
         # calls, so they can share the first read.  Every remote write drops
         # the account's entry, so a pass that changed a key observes the change.
         self._apply_read_memo: dict[str, dict[str, Any]] = {}
-        # Every account this Apply has already written to.  A write is what
-        # makes the memo stale, so the entry is dropped when the *write* lands,
-        # not when a pass begins: an Apply runs four passes (execute and
-        # reconcile, once per phase) and only a pass that actually mutated a key
-        # changes what the station would report.
-        self._apply_written_accounts: set[str] = set()
         self._draft_staged = False
         self._import_staged = False
         # Binding counts are derived by the provider/model domain. They are
@@ -1933,7 +1933,14 @@ class RelayAccountsDomain:
     def _decode_storage(
         self,
         loaded: Mapping[str, Any],
-    ) -> tuple[list[dict[str, str]], list[dict[str, Any]], list[dict[str, str]], bool]:
+    ) -> tuple[
+        list[dict[str, str]],
+        list[dict[str, Any]],
+        list[dict[str, str]],
+        list[dict[str, str]],
+        list[dict[str, str]],
+        bool,
+    ]:
         """Validate one durable relay document without mutating disk or state."""
 
         if not isinstance(loaded, Mapping):
@@ -1963,12 +1970,13 @@ class RelayAccountsDomain:
             if not isinstance(raw, Mapping):
                 raise RelayAccountsError("Relay station storage is invalid")
             raw_origin = raw.get("origin", raw.get("base_url", ""))
+            raw_key = _station_origin_key(str(raw_origin))
             fallback_type = next(
                 (
                     str(account.get("type", ""))
                     for account in accounts
                     if isinstance(account, Mapping)
-                    and _station_origin_key(str(account.get("origin", ""))) == _station_origin_key(str(raw_origin))
+                    and _station_origin_key(str(account.get("origin", ""))) == raw_key
                 ),
                 "newapi",
             )
@@ -2022,8 +2030,7 @@ class RelayAccountsDomain:
         cleanup_keys = {(item["account_id"], item["kind"]) for item in pending_cleanups}
         account_ids = {account["id"] for account in accounts}
         has_invalid_cleanup_owner = any(
-            (cleanup["kind"] == "credentials" and cleanup["account_id"] in account_ids)
-            or (cleanup["kind"] == "password" and cleanup["account_id"] not in account_ids)
+            cleanup["kind"] == "credentials" and cleanup["account_id"] in account_ids
             for cleanup in pending_cleanups
         )
         if (
@@ -2054,7 +2061,7 @@ class RelayAccountsDomain:
         )
         return stations, accounts, pending_cleanups, removed_stations, removed_accounts, migrated
 
-    def _decode_removals(self, raw: object, *, label: str, present: set[str]) -> list[dict[str, str]]:
+    def _decode_removals(self, raw: object, *, label: str, present: Collection[str]) -> list[dict[str, str]]:
         """Validate one tombstone list, dropping ids the document holds again.
 
         A document that carries both a row and a tombstone for the same id says
@@ -2271,6 +2278,7 @@ class RelayAccountsDomain:
                 moved["station_id"] = target_id
                 self._accounts[account_index] = _private_account(moved)
             self._stations.pop(index)
+            self._remember_removal(station_ids=(source_id,))
             return
 
         self._stations[index] = {
@@ -2311,6 +2319,7 @@ class RelayAccountsDomain:
         self._accounts[index] = _private_account(updated)
         if old_station_id and old_station_id != station["id"] and self._station_account_count(old_station_id) == 0:
             self._stations = [item for item in self._stations if item["id"] != old_station_id]
+            self._remember_removal(station_ids=(old_station_id,))
 
     def _new_pending_operation(
         self,
@@ -3123,11 +3132,12 @@ class RelayAccountsDomain:
         self._update_pending_operation(operation, state="remote_applied")
         self._persist_journal()
 
-    def _apply_create_metadata(self, account: Mapping[str, Any], operation: dict[str, Any]) -> None:
+    def _apply_create_metadata(self, account: Mapping[str, Any], operation: dict[str, Any]) -> bool:
         changes = operation.get("changes", {})
         resource_id = str(operation.get("resource_id", ""))
         remote_id = self._api_key_remote_id(account, resource_id)
         resource = self._selected_resource(account, resource_id)
+        wrote = False
         name = changes.get("name")
         if isinstance(name, str) and resource.get("name") != name:
             if account["type"] == "newapi":
@@ -3139,8 +3149,11 @@ class RelayAccountsDomain:
                     path=f"/api/v1/keys/{quote(remote_id, safe='')}",
                     body={"name": name},
                 )
+            wrote = True
         group_id = changes.get("group_id")
-        if group_id:
+        if group_id and str(resource.get("group_id", "")) != _group_id(
+            group_id, required=account["type"] != "newapi"
+        ):
             if account["type"] == "newapi":
                 self._set_newapi_key_metadata(account, remote_id, {"group": _group_id(group_id)})
             else:
@@ -3154,7 +3167,8 @@ class RelayAccountsDomain:
                     path=f"/api/v1/keys/{quote(remote_id, safe='')}",
                     body={"group_id": upstream_group_id},
                 )
-        if changes.get("enabled") is False:
+            wrote = True
+        if changes.get("enabled") is False and resource.get("enabled") is not False:
             if account["type"] == "newapi":
                 self._api_key_request(
                     account,
@@ -3169,6 +3183,8 @@ class RelayAccountsDomain:
                     path=f"/api/v1/keys/{quote(remote_id, safe='')}",
                     body={"status": "inactive"},
                 )
+            wrote = True
+        return wrote
 
     @staticmethod
     def _resource_matches_changes(resource: Mapping[str, Any], changes: Mapping[str, Any]) -> bool:
@@ -3242,7 +3258,6 @@ class RelayAccountsDomain:
         """Drop an account's remembered read, because a write just changed it."""
 
         self._apply_read_memo.pop(account_id, None)
-        self._apply_written_accounts.add(account_id)
 
     def begin_apply_reads(self) -> None:
         """Start one Apply's read memo.
@@ -3257,13 +3272,11 @@ class RelayAccountsDomain:
         """
 
         self._apply_read_memo.clear()
-        self._apply_written_accounts.clear()
 
     def end_apply_reads(self) -> None:
         """Drop the memo so the next Apply observes fresh station facts."""
 
         self._apply_read_memo.clear()
-        self._apply_written_accounts.clear()
 
     def execute_pending_operations(
         self,
@@ -3353,11 +3366,11 @@ class RelayAccountsDomain:
                         issues.append(self._apply_issue("created_resource_unresolved", account_id=account_id, resource_id=str(operation.get("resource_id", ""))))
                         continue
                     account = account_result[1]
-                    self._apply_create_metadata(account, operation)
-                    # The metadata write just changed this key (its name, group,
-                    # or enabled flag), so the key list read before it no longer
-                    # describes the account: a later pass must read again.
-                    self._mark_account_written(account_id)
+                    if self._apply_create_metadata(account, operation):
+                        # The metadata write just changed this key (its name, group,
+                        # or enabled flag), so the key list read before it no longer
+                        # describes the account: a later pass must read again.
+                        self._mark_account_written(account_id)
                     self._update_pending_operation(operation, state="remote_applied", error="")
                     self._persist_journal()
                 except Exception:
@@ -3650,8 +3663,10 @@ class RelayAccountsDomain:
             return bool(account.get("remember_password")) and bool(account.get("password"))
         if field != "session":
             raise RelayAccountsError("The requested relay credential is unavailable")
-        self._index(target)
-        secrets = self._session_secrets.get(target, {})
+        account = self._accounts[self._index(target)]
+        secrets = self._session_secrets.get(target) or (
+            account.get("session") if isinstance(account.get("session"), Mapping) else {}
+        )
         return bool(secrets.get("cookie") or secrets.get("access_token"))
 
     def stage_secret(self, field: str, target: str | None, value: str) -> None:
@@ -4178,7 +4193,7 @@ class RelayAccountsDomain:
             # whose real state is simply "nothing remembered" -- at the cost of
             # one more login attempt on an account that was never going to sign
             # in.  The login is recorded as the secret-free non-answer it is.
-            return self.set_login_status(account_id, "signed_out")
+            return self.settle_login_status(account_id, "signed_out")
         remaining = self._login_refusal_remaining(account_id)
         if remaining > 0:
             raise RelayLoginBackoffError(remaining)
@@ -4966,7 +4981,8 @@ class RelayAccountsDomain:
         # the caller is about:
         #
         # * a caller naming resources (an Apply) reads exactly those, because
-        #   it is judging those keys and may not use a stored list;
+        #   it is judging those keys and may not use a stored list; an Apply
+        #   that names none re-reads the keys it would otherwise remember;
         # * a pane refresh reads only the keys it has no catalog for -- an
         #   answer that describes no group is still an answer, and re-reading
         #   every key on every open was one gateway request per key (19 of them
@@ -4981,7 +4997,7 @@ class RelayAccountsDomain:
                 if entry[2] and entry[5] not in group_models
                 and (
                     (only_resources is not None and entry[3] in named)
-                    or (only_resources is None and entry[3] not in previous_models)
+                    or (only_resources is None and (for_apply or entry[3] not in previous_models))
                 )
             ]
         if gateway_items:
@@ -5589,6 +5605,10 @@ class RelayAccountsDomain:
             )
             self._accounts[index] = _private_account(account)
             if not _for_apply:
+                # An answered error can replace the rows, so the staged edits
+                # in flight must be painted back over it for the panes; an
+                # Apply-time read stays the station's own answer.
+                self._reapply_pending_resource_changes(index)
                 self._persist()
                 self.revision += 1
             return _public_account(self._accounts[index])
@@ -6302,6 +6322,15 @@ class RelayAccountsDomain:
             self._draft_staged = True
         return _public_account(self._accounts[index])
 
+    def _operations_of(self, account_id: str) -> list[dict[str, Any]]:
+        """The journal rows this account staged, in their journal order."""
+
+        return [
+            operation
+            for operation in self._pending_operations
+            if operation.get("account_id") == account_id
+        ]
+
     def _restore_auto_grouping_draft(self, account_id: str) -> dict[str, Any] | None:
         baseline = self._auto_grouping_draft_baselines.pop(account_id, None)
         if baseline is None:
@@ -6312,7 +6341,13 @@ class RelayAccountsDomain:
         restored["groups"] = copy.deepcopy(baseline["groups"])
         restored["auto_grouping"] = baseline["auto_grouping"] is True
         self._accounts[index] = _private_account(restored)
-        self._pending_operations = copy.deepcopy(baseline["pending_operations"])
+        # Revert this account's rows to the snapshot and leave every other
+        # account's staged work where it is.
+        self._pending_operations = [
+            operation
+            for operation in self._pending_operations
+            if operation.get("account_id") != account_id
+        ] + copy.deepcopy(baseline["pending_operations"])
         self._persist_journal()
         self._draft_staged = bool(baseline["draft_staged"]) or bool(self._pending_operations)
         return _public_account(self._accounts[index])
@@ -6338,7 +6373,14 @@ class RelayAccountsDomain:
                     "resources": copy.deepcopy(account.get("resources", [])),
                     "groups": copy.deepcopy(account.get("groups", [])),
                     "auto_grouping": account.get("auto_grouping") is True,
-                    "pending_operations": copy.deepcopy(self._pending_operations),
+                    # Only this account's journal rows.  The list is
+                    # store-wide, and another account's edits staged after
+                    # this switch was turned on are not this switch's to
+                    # revert: restoring the whole list dropped them without a
+                    # word.
+                    "pending_operations": copy.deepcopy(
+                        self._operations_of(canonical_account_id)
+                    ),
                     "draft_staged": self._draft_staged,
                 },
             )
@@ -6717,13 +6759,14 @@ class RelayAccountsDomain:
             except Exception:
                 issues.append(self._apply_issue("refresh_failed", account_id=account_id))
                 continue
-            refreshed += 1
             refreshed_resources.extend(
                 [account_id, resource_id]
                 for resource_id in sorted(self._fresh_catalogs.get(account_id, ()))
             )
             if result.get("resource_status") != "ready":
                 issues.append(self._apply_issue("refresh_failed", account_id=account_id))
+            else:
+                refreshed += 1
         return {
             "refreshed_accounts": refreshed,
             "refreshed_resources": refreshed_resources,
@@ -6759,11 +6802,6 @@ class RelayAccountsDomain:
                 "/v1/models",
                 headers={"Authorization": f"Bearer {key}"},
             )
-        except RelayAccountsError:
-            # The gateway request is authenticated by the selected API key, not
-            # by the dashboard session. A rejected key must not clear a valid
-            # dashboard login.
-            return None
         except Exception:
             # One key's catalog is optional: a station that breaks this probe
             # still reports its keys, and the dashboard catalog covers the
@@ -6900,27 +6938,6 @@ class RelayAccountsDomain:
                 except (TypeError, ValueError):
                     continue
                 held_sources.add((str(account_id), str(resource_id)))
-        # Whether every source this caller named is carried by a slot.  The
-        # document is then the whole answer: the credential is the only thing a
-        # binding needs from the relay, and the slot persists it, so a station
-        # round trip could not change an answer already on disk.
-        covered_by_slots = bool(held_sources)
-        if covered_by_slots:
-            for raw in raw_sources:
-                if not isinstance(raw, Mapping):
-                    covered_by_slots = False
-                    break
-                try:
-                    source_key = (
-                        _account_id(raw.get("account_id")),
-                        _resource_id(raw.get("resource_id")),
-                    )
-                except Exception:
-                    covered_by_slots = False
-                    break
-                if source_key not in held_sources:
-                    covered_by_slots = False
-                    break
         refresh_issues: list[dict[str, str]] = []
         # The keys this call's own station read already answered for.  Their
         # catalogs are in the account state below, so asking the gateway for the

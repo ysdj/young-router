@@ -300,8 +300,6 @@ def _continuation_request_payload(
         if key in ("messages", "client_metadata", "metadata", "stream_options"):
             continue
         payload[key] = request_data.get(key)
-    for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
-        payload.pop(key, None)
     payload["messages"] = _continuation_messages(messages, tail)
     # The continuation is the router's own call, not the client's turn: it must
     # not inherit the fallback bookkeeping, or a ceiling would be recorded as a
@@ -397,6 +395,8 @@ async def _stream_native_continuation_rounds(
         return
     from litellm.proxy.proxy_server import llm_router
 
+    from . import streaming as _streaming_module
+
     router_method = getattr(llm_router, "acompletion", None) if llm_router else None
     if router_method is None:
         return
@@ -415,7 +415,15 @@ async def _stream_native_continuation_rounds(
             continuation_prompt_chars=len(str(payload.get("messages"))),
         )
         try:
-            response = await router_method(**payload)
+            # A continuation round is a dispatch like any other: the route it
+            # picks can be absent, and that phase has no clock of its own.
+            response = await _streaming_module._await_upstream_dispatch(
+                router_method(**payload),
+                payload,
+                fallback_budget_seconds=_routing_module._stream_start_timeout_seconds_for_request(
+                    payload
+                ),
+            )
             response = await _responses_request_module._await_streaming_fallback_candidate_response(
                 response,
                 payload,

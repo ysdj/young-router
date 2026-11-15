@@ -230,13 +230,16 @@ def _login_provider_credentials(provider: dict[str, Any]) -> list[dict[str, Any]
 
 
 def _credential_scopes(provider: dict[str, Any]) -> list[tuple[dict[str, Any], str]]:
-    """``(provider copy, credential id)`` pairs to write routes for.
+    """``(provider copy, credential id)`` pairs one provider's credentials scope to.
 
-    A provider that is not account-backed states one credential, so it scopes to
-    itself and keeps its routes exactly as they were.  A login-backed provider
-    scopes once per credential, and each scope is written as the provider that
-    credential really is: an account speaks the adapter's protocol, a custom key
-    speaks the plain one against the provider's own address.
+    The write itself no longer goes through this: ``save_config`` resolves one
+    credential per route through ``_model_credential`` and
+    ``_account_backed_scope``, because a route names the account it serves with
+    rather than every credential the provider holds.  The pairing is kept as
+    the question the provider pane's tests ask -- which scope each credential
+    would produce -- so the rules for an account-backed row (its own protocol)
+    and a custom key (the plain one, against the provider's address) are still
+    stated in one place.
     """
 
     if str(provider.get("auth_kind", "") or "") != "openai_login":
@@ -281,11 +284,6 @@ def _account_backed_scope(
             # plain OpenAI transport at the provider's own address.
             "auth_kind": "api_key",
             "auth_credential_ref": "",
-            "extra": {
-                key_name: value
-                for key_name, value in (provider.get("extra") or {}).items()
-                if key_name != "x-young-router-provider-auth"
-            },
             "api_base": str(provider.get("api_base", "") or "").strip()
             or SERVICE_LOGIN_BASE_URLS.get(str(provider.get("auth_kind", "") or ""), ""),
             "api_keys": [key] if key else [],
@@ -383,17 +381,22 @@ def save_config(
     document: Any = None,
     *,
     probe: bool = False,
+    rendered: Any = None,
 ) -> dict[str, Any]:
     """Render and validate one provider document, then write it.
 
     ``probe`` renders and validates the complete candidate without touching the
-    caller's files.  Validation already does this to prove a draft is writable
-    -- it writes the current document into a scratch directory and saves the
-    candidate over it -- and then the real Apply repeated the whole render and
-    parse.  A probe answers that question once, and the answer carries the
-    rendered text the caller would have written, so the commit can validate and
-    write from a single pass.
+    caller's files, and its answer carries the rendered text under
+    ``document``.  ``rendered`` is that same answer handed back: the commit
+    writes exactly those bytes instead of rendering and re-parsing the complete
+    providers/model_list/router_settings document a second time.  The revision
+    check still runs -- the file may have moved since the probe -- so a draft
+    that raced another writer is refused as it always was.
     """
+    _assert_expected_revision(path, expected_revision)
+    if rendered is not None:
+        return _commit_rendered(path, rendered)
+
     # Loading the editor only needs PyYAML. Import the write path here because
     # it reaches LiteLLM and otherwise adds seconds to every editor open.
     from .dump import (
@@ -406,7 +409,6 @@ def save_config(
         _write_atomic,
     )
 
-    _assert_expected_revision(path, expected_revision)
     source_document = (
         config_document_from_path(path)
         if document is None
@@ -479,7 +481,10 @@ def save_config(
             enabled, entry = _entry_from_editor(
                 scoped_model,
                 scoped,
-                model_index,
+                # Zero-based, which is what the callee adds one to when it
+                # names a model in an error: the counter above is already the
+                # model's position, and passing it as is named the next one.
+                model_index - 1,
                 # The provider's anchor exists only for the address the
                 # provider section itself wrote; a credential scope that
                 # states its own address writes it out in full.
@@ -619,6 +624,63 @@ def save_config(
     }
 
 
+def _commit_rendered(path: pathlib.Path, rendered: Any) -> dict[str, Any]:
+    """Write the document a probe already rendered.
+
+    The probe validated this exact text (it parsed both halves before
+    answering), so the commit's only remaining questions are about the files:
+    whether the backup can be taken and whether the companion document exists.
+    """
+
+    from .dump import _write_atomic
+
+    document = normalize_config_document(rendered)
+    config_text = document.get(CONFIG_DOCUMENT_CONFIG_KEY)
+    if not isinstance(config_text, str):
+        raise ValueError("Rendered configuration document is invalid")
+    disabled_text = document.get(CONFIG_DOCUMENT_DISABLED_KEY)
+    if disabled_text is not None and not isinstance(disabled_text, str):
+        raise ValueError("Rendered disabled-model document is invalid")
+
+    stamp = _backup_stamp()
+    backup: pathlib.Path | None = None
+    if path.exists():
+        backup = _write_backup(path, stamp)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if path.exists() or path.is_symlink():
+            raise ValueError(
+                "config.yaml changed on disk since this editor window loaded. "
+                "Close and reopen Providers & Models, then apply your changes again."
+            )
+    _write_atomic(path, config_text)
+
+    disabled_path = _disabled_models_path(path)
+    disabled_backup = ""
+    if disabled_text is not None:
+        if disabled_path.exists():
+            disabled_backup = str(_write_backup(disabled_path, stamp))
+        _write_atomic(disabled_path, disabled_text)
+    elif disabled_path.exists():
+        disabled_backup = str(_write_backup(disabled_path, stamp))
+        disabled_path.unlink()
+
+    return {
+        "providers": 0,
+        "active": 0,
+        "disabled": 0,
+        "backup": str(backup) if backup is not None else "",
+        "disabled_path": str(disabled_path) if disabled_text is not None else "",
+        "disabled_backup": disabled_backup,
+        "revision": _config_revision(path),
+        "dropped_group_references": [],
+        "document": {
+            CONFIG_DOCUMENT_CONFIG_KEY: config_text,
+            CONFIG_DOCUMENT_DISABLED_KEY: disabled_text,
+        },
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Load and save Young Router provider configuration.")
     parser.add_argument("command", choices=["load", "save"])
@@ -643,8 +705,6 @@ def main() -> int:
                 payload.get("expected_revision"),
                 payload.get("document"),
             )
-        else:
-            raise ValueError("Unsupported configuration editor command.")
         json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
         print()
         return 0

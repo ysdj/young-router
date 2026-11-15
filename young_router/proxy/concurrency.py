@@ -146,11 +146,52 @@ def file_path() -> Optional[str]:
     return os.path.join(os.path.dirname(cooldowns), "deployment-concurrency.json")
 
 
+def _windows_pid_alive(pid: int) -> Optional[bool]:
+    """The same question on Windows, where ``os.kill`` is not a probe.
+
+    There ``os.kill(pid, 0)`` is ``TerminateProcess(handle, 0)``: every signal
+    but the two console events ends the process.  Asking whether a lease's owner
+    existed therefore ended it -- and the owner of a lease being pruned is often
+    the very worker doing the pruning.  The process is opened for a query
+    instead, the way the Core's own probe does it; anything this cannot settle
+    is ``None``, which leaves the lease to its age.
+    """
+
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+        kernel32.GetExitCodeProcess.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        process_query_limited_information = 0x1000
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            # Access denied still names a process that is there.
+            error_access_denied = 5
+            return ctypes.get_last_error() == error_access_denied  # type: ignore[attr-defined]
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return None
+            still_active = 259
+            return exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return None
+
+
 def _pid_alive(pid: Any) -> Optional[bool]:
     """Whether a lease's owner still exists; ``None`` when it cannot be told."""
 
     if not isinstance(pid, int) or pid <= 0:
         return None
+    if os.name == "nt":
+        return _windows_pid_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -395,7 +436,7 @@ def claim(
     return True
 
 
-def queue(lease_key: str, deployment_key: str, requested_at: float) -> bool:
+def queue(turn_key: str, deployment_key: str, requested_at: float) -> bool:
     """Join the line for *deployment_key*, keeping the place already held.
 
     One ticket per turn, naming the route it is waiting on.  Re-entering (a
@@ -403,24 +444,22 @@ def queue(lease_key: str, deployment_key: str, requested_at: float) -> bool:
     new place, which is what makes the wait survive between attempts.
     """
 
-    if not lease_key or not deployment_key:
+    if not turn_key or not deployment_key:
         return False
     if not isinstance(requested_at, (int, float)) or not math.isfinite(requested_at):
         return False
 
     def join(
-        leases: dict[str, Any],
+        _leases: dict[str, Any],
         waiters: dict[str, Any],
         now: float,
     ) -> bool:
-        if lease_key in leases:
-            return True
-        state = waiters.get(lease_key)
+        state = waiters.get(turn_key)
         if isinstance(state, dict) and state.get("deployment") == deployment_key:
             state["pid"] = os.getpid()
             state["requested_at"] = float(requested_at)
             return True
-        waiters[lease_key] = {
+        waiters[turn_key] = {
             "deployment": deployment_key,
             "requested_at": float(requested_at),
             "pid": os.getpid(),

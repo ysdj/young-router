@@ -16,10 +16,11 @@ request that carries the fetched copy is the only one that pays for it.
 
 Three boundaries this module keeps:
 
-* **Nothing inside the signed prefix moves.**  A replayed item that follows an
-  ``encrypted_content`` item is part of a prefix the upstream signed; rewriting
-  it changes the bytes the client will send forever after.  Only the mutable
-  suffix is rewritten, so a task on a signed-history route keeps its cache.
+* **The signed items themselves never move.**  A replayed item that follows an
+  ``encrypted_content`` item is part of a prefix the upstream signed, and
+  rewriting it changes the bytes the client will send forever after.  Every
+  item is still rewritable, including the ones before a signed item: this pass
+  only replaces image parts, and no signed item carries one.
 * **A removed image stays recoverable.**  Every id this module omits can be
   served from the task's own replayed history (``store.fetched``), and the
   scanned items carry the bytes, so the fetch tool never reads a transcript,
@@ -695,6 +696,33 @@ def _decode_data_url(value: Any) -> Optional[Tuple[str, bytes]]:
         return None
 
 
+def _decode_image_result(value: Any) -> Optional[Tuple[str, bytes]]:
+    """A generated picture's bytes, bare base64 or behind a ``data:`` URL.
+
+    The wire keeps an ``image_generation_call`` result as base64 on its own; a
+    replay that came through a data-URL rewrite carries the same bytes with a
+    header.  The bytes name their own format, so the record does not mislabel
+    them.
+    """
+
+    decoded = _decode_data_url(value)
+    if decoded is not None:
+        return decoded
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        raw = base64.b64decode("".join(value.split()), validate=True)
+    except (ValueError, TypeError):
+        return None
+    if raw[:2] == b"\xff\xd8":
+        return "image/jpeg", raw
+    if raw[:3] == b"GIF":
+        return "image/gif", raw
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp", raw
+    return "image/png", raw
+
+
 # The line the fetch tool writes before an image it returns, in either language:
 # ``[图片 IMG-004 取回的原图｜…]`` / ``[Image IMG-004 fetched original | …]``.
 # An image behind it is a *copy* of an existing occurrence, not a new one, so it
@@ -887,6 +915,7 @@ def scan(
     known_files = _file_path_ids(file_paths)
     viewed_by_call: Dict[str, str] = {}
     found: List[_Found] = []
+    next_id = 1
     # A picture is *unseen* when it sits after the last item the assistant
     # produced.  The assistant has not answered since, so no earlier request of
     # this turn can have carried those bytes to it: replacing such a picture
@@ -913,12 +942,12 @@ def scan(
         # A hosted image-generation result keeps its bytes in a required field
         # that cannot become text, so it is not a candidate for replacement.
         if item.get("type") == "image_generation_call":
-            data = _decode_data_url(item.get("result"))
+            data = _decode_image_result(item.get("result"))
             if data is None:
                 continue
             found.append(
                 _found_image(
-                    image_id=_numbered(len([item for item in found if item.copy_of is None]) + 1),
+                    image_id=_numbered(next_id),
                     key=f"{index}:result",
                     item=index,
                     part=None,
@@ -930,6 +959,7 @@ def scan(
                     unseen=index > last_answer,
                 )
             )
+            next_id += 1
             continue
         if known_files:
             opened = _viewed_file_id(item, known_files)
@@ -997,7 +1027,7 @@ def scan(
                 continue
             found.append(
                 _found_image(
-                    image_id=_numbered(len([item for item in found if item.copy_of is None]) + 1),
+                    image_id=_numbered(next_id),
                     key=f"{index}:{part_index}",
                     item=index,
                     part=part_index,
@@ -1010,6 +1040,7 @@ def scan(
                     unseen=index > last_answer,
                 )
             )
+            next_id += 1
     return found
 
 
@@ -1161,10 +1192,10 @@ def _duplicate_placeholder(
 # honoured for exactly the next request: the turn after that has a newer message
 # and the picture is a placeholder again.
 _ASK_PATTERNS = (
-    re.compile(r"需要\s*(IMG-\d{3}(?:[、,，\s]+IMG-\d{3})*)"),
-    re.compile(r"need(?:s|ed)?\s+(IMG-\d{3}(?:[\s,，、]+IMG-\d{3})*)"),
+    re.compile(r"需要\s*(IMG-\d{3,}(?:[、,，\s]+IMG-\d{3,})*)"),
+    re.compile(r"need(?:s|ed)?\s+(IMG-\d{3,}(?:[\s,，、]+IMG-\d{3,})*)"),
 )
-_ASK_ID = re.compile(r"IMG-\d{3}")
+_ASK_ID = re.compile(r"IMG-\d{3,}")
 # How many originals one ask may bring back.  A model that asks for everything
 # has not understood the point, and honouring it would cost the turn the bytes
 # the pass exists to save.
@@ -1290,19 +1321,42 @@ def _has_codex_client_evidence(request_kwargs: Mapping[str, Any]) -> bool:
     )
 
 
+def _language_text(value: Any) -> List[str]:
+    """The strings one request value carries, with image payloads left out.
+
+    Base64 has no character outside ASCII, so no byte of an image can decide
+    the language -- while on the replays this pass exists for, reading those
+    bytes again is most of the request.
+    """
+
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Mapping):
+        generated = value.get("type") == "image_generation_call"
+        found: List[str] = []
+        for key, part in value.items():
+            if isinstance(key, str):
+                found.append(key)
+            if key == "image_url" or (generated and key == "result"):
+                continue
+            found.extend(_language_text(part))
+        return found
+    if isinstance(value, (list, tuple)):
+        texts: List[str] = []
+        for part in value:
+            texts.extend(_language_text(part))
+        return texts
+    return []
+
+
 def _language(request_kwargs: Mapping[str, Any]) -> str:
     """The task's language, from the client's own instruction block."""
 
-    blob = json.dumps(
-        {
-            key: request_kwargs.get(key)
-            for key in ("instructions", "input", "messages")
-            if request_kwargs.get(key) is not None
-        },
-        ensure_ascii=False,
-        default=str,
-    )
-    return _LANG_ZH if re.search(r"[\u4e00-\u9fff]", blob) else _LANG_EN
+    for key in ("instructions", "input", "messages"):
+        for text in _language_text(request_kwargs.get(key)):
+            if re.search(r"[\u4e00-\u9fff]", text):
+                return _LANG_ZH
+    return _LANG_EN
 
 
 # Codex names its task inside ``x-codex-turn-metadata`` as JSON, and that is
@@ -1391,9 +1445,10 @@ def rewrite_for_size(
     the window is full -- so the choice is a placeholder or a dead turn.
 
     Unlike the setting, this pass also reaches the images of the turn being
-    answered, all but the newest result's, because a task with one user message
-    keeps every picture it ever viewed in that one turn (see
-    ``newest_picture_item`` / ``keep_picture_item`` in ``_rewrite``).
+    answered, all but the oldest tool result's, because a task with one user
+    message keeps every picture it ever viewed in that one turn (see
+    ``keep_picture_item`` and its ``newest_picture_item`` fallback in
+    ``_rewrite``).
     """
 
     return _rewrite(request_kwargs, forced=True, keep=keep)
@@ -1411,7 +1466,9 @@ def _with_codex_image_context(request_kwargs: dict) -> Optional[dict]:
     return _rewrite(request_kwargs)
 
 
-def _declined(request_kwargs: Any, reason: str) -> None:
+def _declined(
+    request_kwargs: Any, reason: str, images: Optional[int] = None
+) -> None:
     """Say why this request was left alone, once per decision.
 
     A pass that silently declines is indistinguishable from a pass that is off,
@@ -1428,7 +1485,7 @@ def _declined(request_kwargs: Any, reason: str) -> None:
         _trace_module._route_trace(
             "codex_image_context_declined",
             reason=reason,
-            images=_image_count_of(request_kwargs),
+            images=images,
             enabled=enabled(),
             mode=mode(),
             keep_recent=keep_recent(),
@@ -1436,13 +1493,6 @@ def _declined(request_kwargs: Any, reason: str) -> None:
         )
     except Exception:
         return
-
-
-def _image_count_of(request_kwargs: Mapping[str, Any]) -> Optional[int]:
-    try:
-        return len(scan(request_kwargs.get("input")))
-    except Exception:
-        return None
 
 
 def _rewrite(
@@ -1485,14 +1535,13 @@ def _rewrite(
     # of history frozen and nothing would ever be omitted.  The invariant is
     # narrower -- the signed items themselves are never touched, because this
     # pass only ever replaces image parts, and no signed item carries one.
-    mutable_from = 0
     # The task is read here because the scan needs it: a picture the model
     # opened with the client's own viewer is named by the file the *previous*
     # request wrote for it, and that map is this task's own.
     thread_id = _thread_id(request_kwargs)
     images = scan(input_items, file_paths=_stored_file_paths(thread_id))
     if not images:
-        _declined(request_kwargs, "no_images")
+        _declined(request_kwargs, "no_images", 0)
         return None
     # The turn being answered is the last one in the replay, whether or not it
     # carried an image: an image from an earlier turn is older than it even
@@ -1606,14 +1655,12 @@ def _rewrite(
     unchecked = set(selection.get("unchecked") or set())
     pinned = set(selection.get("pinned") or set())
 
-    lang = _language(request_kwargs)
     replacements: Dict[int, Dict[int, str]] = {}
     omitted: List[_Found] = []
     sent_content: Dict[str, _Found] = {}
     omitted_keys: set = set()
     for image in images:
         image_id = image.image_id or ""
-        in_mutable = image.item >= mutable_from
         aged = image.turn < current_turn and (current_turn - image.turn) > keep
         if (
             forced
@@ -1626,9 +1673,7 @@ def _rewrite(
         ):
             aged = True
         # The turn being answered: its tool results are omitted inside it, its
-        # upload is not.  ``in_current_turn`` also decides which placeholder
-        # wording is honest -- a picture this same turn produced was seen in this
-        # turn, not an earlier one.
+        # upload is not.
         in_current_turn = image.turn >= current_turn and current_turn > 0
         # A picture the model has not been shown yet is never replaced by a
         # placeholder -- unless a byte-identical copy earlier in this same
@@ -1668,12 +1713,12 @@ def _rewrite(
             # original is the answer to its question.
             sent_content[image.content_id or ""] = image
             continue
-        drop = image_id in unchecked or (automatic and aged and big)
-        if drop and not in_mutable:
-            # A frozen image stays, but it still counts as sent: a placeholder
-            # elsewhere may name it.
-            sent_content[image.content_id or ""] = image
-            continue
+        # A generated picture has no part to swap for a placeholder, so it is
+        # never retired: its bytes would stay in the request while the note
+        # below claimed they had been omitted.
+        drop = image.part is not None and (
+            image_id in unchecked or (automatic and aged and big)
+        )
         if not drop:
             sent_content[image.content_id or ""] = image
             continue
@@ -1729,6 +1774,7 @@ def _rewrite(
                 for image in images
             )
             else "nothing_omitted",
+            len(images),
         )
         return None
 
@@ -1750,6 +1796,9 @@ def _rewrite(
         # no change to the client's configuration.  A remote gateway has no such
         # path to offer, so there it keeps saying "ask the user".
         kind = "file"
+    # Only a rewrite needs the language: a request this pass leaves alone writes
+    # no placeholder, so it is read after that decision rather than before it.
+    lang = _language(request_kwargs)
     _PLACEHOLDER_KIND[lang] = kind
     # Text parts inserted *before* a part of their item: the label of an image
     # that is still sent.
@@ -1781,10 +1830,9 @@ def _rewrite(
     # be matched to the picture in front of the model.  This is an *insertion*
     # before the image, never a replacement: an upload with no Codex tag around
     # it would otherwise be swapped for the label and the image would vanish.
-    # Only the mutable suffix may change, so a frozen image stays byte-identical.
     omitted_keys_all = {image.key for image in omitted}
     for image in images:
-        if image.key in omitted_keys_all or image.item < mutable_from:
+        if image.key in omitted_keys_all:
             continue
         if image.part is None:
             continue

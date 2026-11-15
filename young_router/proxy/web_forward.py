@@ -123,8 +123,7 @@ def _exchange(
             # A client can send this header itself, and it is the one that
             # decides whether Core gates the page: the copy appended below is
             # this hop's own statement, so any inbound one is dropped rather
-            # than trusted (and `dict()` would otherwise keep whichever came
-            # last).
+            # than trusted.
             if name.decode("latin-1").lower() not in HOP_BY_HOP
             and name.decode("latin-1").lower() != PUBLISHED_HOST_HEADER.lower()
         ]
@@ -146,9 +145,20 @@ def _exchange(
         outbound.append(("Host", f"{address}:{port}"))
         if page_host:
             outbound.append((PUBLISHED_HOST_HEADER, page_host))
-        if body:
+        # Core reads a body by ``Content-Length`` and calls a request that
+        # states none invalid, so a body-less POST still states its zero; a
+        # body-less GET or HEAD states nothing, which is what ``http.client``
+        # sends for one.
+        if body or method not in ("GET", "HEAD"):
             outbound.append(("Content-Length", str(len(body))))
-        connection.request(method, path, body=body or None, headers=dict(outbound))
+        # One ``putheader`` per pair: a browser can state a header twice (a
+        # second ``Cookie``, a repeated ``X-Forwarded-For``) and the mapping
+        # ``request()`` takes would pass on the last copy alone.  ``putrequest``
+        # must not add its own ``Host`` and ``Accept-Encoding``.
+        connection.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+        for name, value in outbound:
+            connection.putheader(name, value)
+        connection.endheaders(body or None)
         response = connection.getresponse()
         payload = response.read()
         # ``getheaders()`` is already ``str`` here, unlike the request side:
@@ -203,7 +213,7 @@ async def forward(scope: dict[str, Any], receive: Any, send: Any, endpoint: tupl
     method = str(scope.get("method") or "GET").upper()
     raw_path = str(scope.get("path") or "/")
     query = scope.get("query_string") or b""
-    path = raw_path if query else raw_path
+    path = raw_path
     if query:
         path = f"{raw_path}?{query.decode('latin-1')}"
     chunks: list[bytes] = []

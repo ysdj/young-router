@@ -107,6 +107,7 @@ def store(thread_id: Any, request_kwargs: Dict[str, Any]) -> int:
     if not safe:
         return 0
     images: List[Dict[str, Any]] = []
+    folder = os.path.join(files_dir(), safe)
     # The same file map the pass scanned with, read before this write replaces
     # it: the cache must number the pictures exactly as the request the model
     # reads was numbered, or an id the placeholders name answers nothing.
@@ -126,13 +127,19 @@ def store(thread_id: Any, request_kwargs: Dict[str, Any]) -> int:
                 "name": image.name,
                 "kind": image.kind,
                 "base64": base64.b64encode(image.raw).decode("ascii"),
+                # The name is known before the bytes are written, so the replay
+                # can be published first: the sweeper drops every folder no
+                # fresh replay names, and would otherwise delete this one while
+                # it is being filled.
+                "file": os.path.join(
+                    folder, f"{image.image_id}{_ext_for(image.mime)}"
+                ),
             }
         )
     if not images:
         return 0
     root = cache_dir()
     os.makedirs(root, exist_ok=True)
-    _write_files(safe, images)
     target = _path_for(safe)
     temporary = f"{target}.tmp.{os.getpid()}"
     # The task's own language travels with it: the fetch tool writes the line
@@ -154,12 +161,13 @@ def store(thread_id: Any, request_kwargs: Dict[str, Any]) -> int:
         except OSError:
             pass
         return 0
+    _write_files(safe, images)
     sweep()
     return len(images)
 
 
 def _write_files(thread_id: str, images: List[Dict[str, Any]]) -> None:
-    """Write each stored image as a file and note the path on its record.
+    """Write each stored image to the path its record already names.
 
     Best effort: a host where the file cannot be written simply keeps offering
     the tool-shaped fetch, so a failed write must not lose the replay.
@@ -172,9 +180,11 @@ def _write_files(thread_id: str, images: List[Dict[str, Any]]) -> None:
         return
     for image in images:
         encoded = image.get("base64")
+        path = image.get("file")
         if not isinstance(encoded, str) or not encoded:
             continue
-        path = os.path.join(folder, f"{image.get('id')}{_ext_for(image.get('mime'))}")
+        if not isinstance(path, str) or not path:
+            continue
         try:
             raw = base64.b64decode(encoded)
             temporary = f"{path}.tmp.{os.getpid()}"
@@ -183,7 +193,6 @@ def _write_files(thread_id: str, images: List[Dict[str, Any]]) -> None:
             os.replace(temporary, path)
         except (OSError, ValueError):
             continue
-        image["file"] = path
 
 
 def paths(thread_id: Any, environ: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -446,11 +455,3 @@ def _recent_threads(environ: Optional[Dict[str, str]] = None) -> List[str]:
         except OSError:
             continue
     return [name for _, name in sorted(entries, reverse=True)[:REPLAY_CACHE_MAX_TASKS]]
-
-
-def known_ids(thread_id: Any, environ: Optional[Dict[str, str]] = None) -> List[str]:
-    return [
-        str(image.get("id"))
-        for image in load(thread_id, environ)
-        if isinstance(image.get("id"), str)
-    ]

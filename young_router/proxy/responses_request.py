@@ -233,9 +233,14 @@ _REPLAY_PAYLOAD_BYTES_METADATA_KEY = "young_router_replay_payload_bytes"
 
 
 def _request_replay_payload_bytes(request_kwargs: Optional[dict]) -> Optional[int]:
-    """Serialized byte weight of a Responses replay payload (best effort).
+    """Serialized byte weight of the body this request has to upload (best effort).
 
-    The weight covers the request ``input`` replay prefix plus ``instructions``.
+    The weight covers the Responses ``input`` replay prefix plus ``instructions``,
+    or -- for a Chat-shaped body, which has no ``input`` -- ``messages``.  The
+    dispatch budget uses it to allow for the upload time, and a Claude-sized
+    ``messages`` history is exactly as real an upload as a signed Responses
+    prefix; a budget that only counted the latter would cut the former.
+
     Callers derive stream-start budgets from it several times per request, and
     serializing a multi-megabyte encrypted prefix on every call would dominate
     the request path, so the value is cached inside an existing proxy metadata
@@ -243,7 +248,13 @@ def _request_replay_payload_bytes(request_kwargs: Optional[dict]) -> Optional[in
     new key is ever added to the payload that is forwarded upstream.
     """
 
-    if not isinstance(request_kwargs, dict) or "input" not in request_kwargs:
+    if not isinstance(request_kwargs, dict):
+        return None
+    if "input" in request_kwargs:
+        counted_keys = ("input", "instructions")
+    elif "messages" in request_kwargs:
+        counted_keys = ("messages", "system", "tools")
+    else:
         return None
     metadata: Optional[dict] = None
     for metadata_key in ("litellm_metadata", "metadata"):
@@ -260,7 +271,7 @@ def _request_replay_payload_bytes(request_kwargs: Optional[dict]) -> Optional[in
             return cached
     payload = {
         key: request_kwargs[key]
-        for key in ("input", "instructions")
+        for key in counted_keys
         if request_kwargs.get(key) is not None
     }
     try:
@@ -649,60 +660,31 @@ async def _await_streaming_fallback_candidate_response(
     request_kwargs: dict,
     outer_request_kwargs: Optional[dict] = None,
 ) -> Any:
-    is_fallback_candidate = _request_is_fallback_attempt(
-        request_kwargs
-    ) or _request_is_fallback_attempt(outer_request_kwargs)
-    if (
-        request_kwargs.get("stream") is not True
-        or not is_fallback_candidate
-    ):
-        if inspect.isawaitable(response):
-            timeout_seconds = (
-                _routing_module._stream_start_timeout_seconds_for_request(request_kwargs)
-                if request_kwargs.get("stream") is True
-                else 0.0
-            )
-            try:
-                if timeout_seconds > 0:
-                    return await asyncio.wait_for(response, timeout=timeout_seconds)
-                return await response
-            except Exception as exc:
-                if isinstance(exc, asyncio.TimeoutError):
-                    exc = _streaming_module._stream_start_timeout_exception(
-                        request_kwargs,
-                        start_seconds=timeout_seconds,
-                        saw_chunk=False,
-                        buffered_chunks=0,
-                    )
-                if _routing_module._is_request_scoped_priority_deployment_failover_error(
-                    exc,
-                    request_kwargs,
-                ):
-                    _routing_module._mark_exception_for_deployment_failover(exc, request_kwargs)
-                raise exc
-        return response
-
-    timeout_seconds = _routing_module._stream_start_timeout_seconds_for_request(request_kwargs)
-    try:
-        if inspect.isawaitable(response):
+    if inspect.isawaitable(response):
+        timeout_seconds = (
+            _routing_module._stream_start_timeout_seconds_for_request(request_kwargs)
+            if request_kwargs.get("stream") is True
+            else 0.0
+        )
+        try:
             if timeout_seconds > 0:
                 return await asyncio.wait_for(response, timeout=timeout_seconds)
             return await response
-        return response
-    except Exception as exc:
-        if isinstance(exc, asyncio.TimeoutError):
-            exc = _streaming_module._stream_start_timeout_exception(
+        except Exception as exc:
+            if isinstance(exc, asyncio.TimeoutError):
+                exc = _streaming_module._stream_start_timeout_exception(
+                    request_kwargs,
+                    start_seconds=timeout_seconds,
+                    saw_chunk=False,
+                    buffered_chunks=0,
+                )
+            if _routing_module._is_request_scoped_priority_deployment_failover_error(
+                exc,
                 request_kwargs,
-                start_seconds=timeout_seconds,
-                saw_chunk=False,
-                buffered_chunks=0,
-            )
-        if _routing_module._is_request_scoped_priority_deployment_failover_error(
-            exc,
-            request_kwargs,
-        ):
-            _routing_module._mark_exception_for_deployment_failover(exc, request_kwargs)
-        raise exc
+            ):
+                _routing_module._mark_exception_for_deployment_failover(exc, request_kwargs)
+            raise exc
+    return response
 
 
 def _header_value(headers: Any, name: str) -> Optional[str]:
@@ -875,7 +857,7 @@ def _with_browser_compatible_headers(request_kwargs: dict) -> Optional[dict]:
         merged_headers[key] = value
         changed = True
 
-    if not changed and existing_headers is request_kwargs.get("extra_headers"):
+    if not changed:
         return None
 
     modified_kwargs = request_kwargs.copy()
@@ -1172,22 +1154,6 @@ def _responses_context_truncation_attempts(
     return 0
 
 
-def _request_already_attempted_responses_context_truncation_fallback(
-    request_kwargs: Optional[dict],
-) -> bool:
-    for metadata_key in ("litellm_metadata", "metadata"):
-        metadata = _request_context_module._request_metadata_dict(request_kwargs, metadata_key)
-        if (
-            metadata is not None
-            and metadata.get(
-                _RESPONSES_CONTEXT_TRUNCATION_FALLBACK_METADATA_KEY
-            )
-            is True
-        ):
-            return True
-    return False
-
-
 def _explicit_responses_truncation(
     request_kwargs: Optional[dict],
 ) -> Any:
@@ -1297,9 +1263,9 @@ def _request_can_attempt_responses_context_truncation_fallback(
         return False
     if _request_disables_responses_truncation_fallback(request_kwargs):
         return False
-    return not _request_already_attempted_responses_context_truncation_fallback(
+    return _responses_context_truncation_attempts(
         request_kwargs
-    )
+    ) < len(_context_window_module._RETRY_FRACTIONS)
 
 
 def _request_has_codex_client_evidence(request_kwargs: Optional[dict]) -> bool:
@@ -1336,14 +1302,6 @@ def _request_has_codex_client_evidence(request_kwargs: Optional[dict]) -> bool:
         for key, value in metadata.items():
             key_text = str(key).lower()
             if key_text.startswith("x-codex-") and isinstance(value, str) and value.strip():
-                return True
-        for key in (
-            "x-codex-turn-metadata",
-            "x-codex-window-id",
-            "x-codex-installation-id",
-        ):
-            value = metadata.get(key)
-            if isinstance(value, str) and value.strip():
                 return True
     return False
 
@@ -1615,6 +1573,7 @@ def _request_is_codex_gpt_responses_route(request_kwargs: Optional[dict]) -> boo
 def _codex_openrouter_native_search_request(
     request_kwargs: dict,
     _declared_tools: List[dict],
+    copy_input: bool = True,
 ) -> tuple[dict, bool]:
     """Convert Codex hosted search declarations to OpenRouter's native type."""
 
@@ -1638,7 +1597,13 @@ def _codex_openrouter_native_search_request(
             hosted_replaced = True
 
     input_value = request_kwargs.get("input")
-    updated_input = copy.deepcopy(input_value) if isinstance(input_value, list) else None
+    updated_input = None
+    if copy_input and isinstance(input_value, list):
+        # Only a leading additional_tools item is rewritten, so shallow
+        # per-item copies avoid copying the whole replay prefix.
+        updated_input = [
+            dict(item) if isinstance(item, dict) else item for item in input_value
+        ]
     if isinstance(updated_input, list):
         normalized_input: list[Any] = []
         leading_additional_tools = True
@@ -1715,9 +1680,12 @@ def _codex_openrouter_search_capability_probe_request(
         for tool in declared_tools
     ):
         return request_kwargs
+    # The support decision reads only route state, so the probe does not need
+    # the replay input normalized or copied.
     probe, _hosted_replaced = _codex_openrouter_native_search_request(
         request_kwargs,
         declared_tools,
+        copy_input=False,
     )
     return probe
 
@@ -1762,20 +1730,20 @@ def _with_codex_openrouter_native_web_search_tool(
         _codex_tool_is_provider_native_web_search(tool)
         for tool in top_level_tools
     )
-    nested_tools = _codex_declared_tools({"input": request_kwargs.get("input")})
-    has_nested_search_declaration = any(
-        _codex_tool_is_web_search_declaration(tool)
-        for tool in nested_tools
-    )
-    has_hosted_search_declaration = any(
-        _codex_tool_is_hosted_web_search(tool) for tool in declared_tools
-    )
-    if (
-        has_top_level_native
-        and not has_nested_search_declaration
-        and not has_hosted_search_declaration
-    ):
-        return None
+    if has_top_level_native:
+        nested_tools = _codex_declared_tools({"input": request_kwargs.get("input")})
+        has_nested_search_declaration = any(
+            _codex_tool_is_web_search_declaration(tool)
+            for tool in nested_tools
+        )
+        has_hosted_search_declaration = any(
+            _codex_tool_is_hosted_web_search(tool) for tool in declared_tools
+        )
+        if (
+            not has_nested_search_declaration
+            and not has_hosted_search_declaration
+        ):
+            return None
 
     modified_kwargs, hosted_replaced = _codex_openrouter_native_search_request(
         request_kwargs,
@@ -1989,11 +1957,14 @@ def _codex_quote_unquoted_function_keys(value: str) -> str:
     containers: list[str] = []
     quote: Optional[str] = None
     escaped = False
+    last_significant = ""
     index = 0
     while index < len(value):
         character = value[index]
         if quote is not None:
             output.append(character)
+            if not character.isspace():
+                last_significant = character
             if escaped:
                 escaped = False
             elif character == "\\":
@@ -2005,27 +1976,30 @@ def _codex_quote_unquoted_function_keys(value: str) -> str:
         if character in {"\"", "'"}:
             quote = character
             output.append(character)
+            last_significant = character
             index += 1
             continue
         if character == "{":
             containers.append("object")
             output.append(character)
+            last_significant = character
             index += 1
             continue
         if character == "[":
             containers.append("array")
             output.append(character)
+            last_significant = character
             index += 1
             continue
         if character in {"}", "]"}:
             if containers:
                 containers.pop()
             output.append(character)
+            last_significant = character
             index += 1
             continue
         if containers and containers[-1] == "object":
-            previous = "".join(output).rstrip()[-1:] or ""
-            if previous in {"{", ","}:
+            if last_significant in {"{", ","}:
                 match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", value[index:])
                 if match is not None:
                     end = index + len(match.group(0))
@@ -2034,9 +2008,12 @@ def _codex_quote_unquoted_function_keys(value: str) -> str:
                         lookahead += 1
                     if lookahead < len(value) and value[lookahead] == ":":
                         output.append(json.dumps(match.group(0), ensure_ascii=False))
+                        last_significant = '"'
                         index = end
                         continue
         output.append(character)
+        if not character.isspace():
+            last_significant = character
         index += 1
     return "".join(output)
 
@@ -2061,16 +2038,29 @@ def _codex_function_arguments_object(value: Any) -> Optional[dict[str, Any]]:
         without_placeholders = without_placeholders[2:].lstrip()
         add_candidate(without_placeholders)
 
+    import ast
+
     for candidate in candidates:
+        # Valid arguments are the common case; try the text as it arrived
+        # before scanning it to build the repaired variants it would discard.
+        try:
+            parsed = json.loads(candidate)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+        try:
+            parsed = ast.literal_eval(candidate)
+        except (SyntaxError, TypeError, ValueError, MemoryError, RecursionError):
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
         transformed = _codex_quote_unquoted_function_keys(candidate)
         variants = (
-            candidate,
             _codex_remove_trailing_commas(candidate),
             transformed,
             _codex_remove_trailing_commas(transformed),
         )
-        import ast
-
         for variant in variants:
             try:
                 parsed = json.loads(variant)
@@ -2704,6 +2694,18 @@ def _with_streaming_plaintext_headers(request_kwargs: dict) -> Optional[dict]:
 
 
 def _with_stream_request_timeout(request_kwargs: dict) -> Optional[dict]:
+    """Keep LiteLLM's own read ceiling from cutting a long answer.
+
+    ``stream_timeout`` is the only per-request timeout this proxy can state: the
+    router collapses whatever it is handed into a single number before the
+    provider sees it (measured on 1.106.4 -- an ``httpx.Timeout`` in ``timeout``
+    fails ``_SECONDS`` validation, and a ``stream_timeout`` always wins over
+    ``timeout`` for ``stream: true`` and is validated as seconds), so a
+    per-phase connect budget cannot travel this way.  That budget is enforced
+    where the response object is awaited instead, in
+    ``streaming._await_upstream_dispatch``.
+    """
+
     if request_kwargs.get("stream") is not True:
         return None
     if _request_has_explicit_stream_timeout(request_kwargs):

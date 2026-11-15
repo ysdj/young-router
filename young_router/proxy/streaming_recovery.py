@@ -238,7 +238,6 @@ async def _stream_streaming_error_fallback(
     # visible output or a terminal event is a completed route attempt, not a
     # same-route retry; keep advancing while each failure adds a new excluded
     # deployment.  The configured deployment pool therefore bounds the loop.
-    max_retries = _routing_module._same_deployment_retries()
     delay_seconds = _routing_module._stream_route_exhaustion_retry_delay_seconds()
     attempt = 0
     allow_repeated_attempt = False
@@ -598,7 +597,18 @@ async def _stream_route_recovery_poll_attempt(
                     )
                     continue
                 else:
-                    raise
+                    # The answer has started: this wake-up is only the
+                    # keepalive interval, not a verdict on the route.  Raising
+                    # the bare timeout here dropped an answer whose model was
+                    # quiet for longer than the interval between two frames;
+                    # the stream's own idle watchdog is what ends one that has
+                    # really stopped, exactly as in the native attempt below.
+                    yield _route_recovery_sse_keepalive(
+                        attempt,
+                        request_data=request_data,
+                        phase="attempt",
+                    )
+                    continue
 
             if started_delivery:
                 if (delivered_chunk := delivered(chunk)) is not None:
@@ -769,7 +779,6 @@ async def _yield_native_stream_after_terminal(
                     failure_request,
                 )
                 raise chunk_exception
-            saw_chunk = True
             buffered_chunks.append(chunk)
             saw_terminal = saw_terminal or _native_stream_chunk_is_terminal(
                 chunk,
@@ -1823,8 +1832,18 @@ async def _stream_route_recovery_poll(
 
             # Read the current exception, not the flag from the top of the
             # iteration: the round that just failed is the one holding the park.
-            if single_route_group and _routing_module._is_no_deployments_available_error(
-                last_exception
+            #
+            # A route at its cap is exempt from both counters below (see
+            # ``opening_refusal_was_a_cap``): the pool answer it produces is
+            # this installation saying "busy", and the poll is how the turn
+            # waits for a slot.  The rewrite that added the router-cooldown
+            # wait dropped this exemption, which put a busy route back on a
+            # two-wait budget.
+            if (
+                single_route_group
+                and not opening_refusal_was_a_cap
+                and not _routing_module._is_model_concurrency_rejection_error(last_exception)
+                and _routing_module._is_no_deployments_available_error(last_exception)
             ):
                 router_cooldown_seconds = _route_recovery_poll_router_cooldown_seconds(
                     last_exception

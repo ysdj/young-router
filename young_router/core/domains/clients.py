@@ -167,16 +167,16 @@ class ClientSettingsDomain:
 
     # -- registry -----------------------------------------------------------
 
-    def _read(self, document: str) -> tuple[str, bool]:
+    def _read(self, document: str) -> tuple[str, bytes | None]:
         path = self._paths[document]
         try:
             data = read_bytes(path)
         except PersistenceError:
             raise DomainError("The client configuration could not be read") from None
         if data is None:
-            return "", False
+            return "", None
         try:
-            return data.decode("utf-8"), True
+            return data.decode("utf-8"), data
         except UnicodeDecodeError:
             raise DomainError("The client configuration must be UTF-8") from None
 
@@ -232,7 +232,7 @@ class ClientSettingsDomain:
     def snapshot(self) -> dict[str, Any]:
         # The pane reads the file listing through the explicit ``files``
         # operation.  This snapshot stays file-free so refreshing every
-        # window never re-probes seven unrelated client files.
+        # window never re-probes the registered client files.
         return {"domain": self.name, "revision": self.revision}
 
     def draft_state(self) -> object:
@@ -372,9 +372,9 @@ class ClientSettingsDomain:
         baseline: dict[str, bytes | None] = {}
         signatures: dict[str, tuple[int, int, int] | None] = {}
         for spec in _DOCUMENT_SPECS:
-            text, _exists = self._read(spec["id"])
+            text, data = self._read(spec["id"])
             documents[spec["id"]] = text
-            baseline[spec["id"]] = self._file_bytes(spec["id"])
+            baseline[spec["id"]] = data
             signatures[spec["id"]] = self._signature(spec["id"])
         self._draft = documents
         self._baseline = copy.deepcopy(documents)

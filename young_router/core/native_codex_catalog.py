@@ -219,8 +219,10 @@ def _read_client_version(executable: Path) -> str:
 
     manifest = _codex_cli_package_manifest(executable)
     declared = manifest.get("version")
-    if isinstance(declared, str) and _VERSION_PATTERN.search(declared):
-        return _VERSION_PATTERN.search(declared).group(1)  # type: ignore[union-attr]
+    if isinstance(declared, str):
+        declared_match = _VERSION_PATTERN.search(declared)
+        if declared_match:
+            return declared_match.group(1)
     try:
         completed = subprocess.run(
             [os.fspath(executable), "--version"],

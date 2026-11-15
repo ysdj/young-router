@@ -399,7 +399,7 @@ async def _responses_chat_bridge_text_stream_from_chat_stream(
         reasoning_delta = _chat_stream_delta_reasoning(chunk)
         if reasoning_delta:
             saw_reasoning = True
-            if not deliver_reasoning:
+            if not deliver_reasoning or message_index is not None:
                 dropped_reasoning = True
         delta = _chat_stream_delta_text(chunk)
         # Reasoning frames only ever precede the answer, and the item order the
@@ -745,21 +745,19 @@ async def _responses_chat_bridge_direct_stream_response(
     start_timeout_seconds = _routing_module._stream_start_timeout_seconds_for_request(
         bridge_kwargs
     )
-    if start_timeout_seconds > 0:
-        try:
-            chat_response = await asyncio.wait_for(
-                acompletion(**payload),
-                timeout=start_timeout_seconds,
-            )
-        except asyncio.TimeoutError as exc:
-            raise _streaming_module._stream_start_timeout_exception(
-                bridge_kwargs,
-                start_seconds=start_timeout_seconds,
-                saw_chunk=False,
-                buffered_chunks=0,
-            ) from exc
-    else:
-        chat_response = await acompletion(**payload)
+    # The bridge's own dispatch, bounded the same way as every other hop.  It
+    # used to be a bare ``wait_for`` on the first-event budget, which is a
+    # different question -- that clock times the first frame of a response that
+    # exists, and a host that never answers never produces one.  ``wait_for``
+    # also moves the call into a child task, whose context is a copy; this proxy
+    # keeps the route that answered in a ContextVar.  The old budget stays as
+    # the fallback so turning the connect budget off does not mean "wait
+    # forever".
+    chat_response = await _streaming_module._await_upstream_dispatch(
+        acompletion(**payload),
+        bridge_kwargs,
+        fallback_budget_seconds=start_timeout_seconds,
+    )
     if _responses_output_module._response_is_async_iterable(chat_response):
         return responses_chat_bridge_stream(bridge_kwargs, chat_response)
 
@@ -888,9 +886,18 @@ async def _execute_responses_chat_bridge_call(
         response = original_function(**active_bridge_kwargs)
         if inspect.isawaitable(response):
             response = await response
+        selected_deployment_marker = (
+            _routing_module._selected_deployment_marker_from_response(response)
+        )
         response = _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(
             response,
             active_bridge_kwargs,
+        )
+        # A stream sanitizer returns a bare generator, so the route marker the
+        # stream-recovery hooks read has to be put back on it.
+        response = _routing_module._wrap_response_with_selected_deployment_marker(
+            response,
+            selected_deployment_marker,
         )
         response = await _responses_surfaces_module._ensure_responses_chat_bridge_non_empty_response(
             response,
@@ -976,7 +983,6 @@ async def _execute_responses_chat_bridge_call(
 async def _postprocess_generic_bridge_response(
     response: Any,
     request_kwargs: dict,
-    original_function: Any,
 ) -> Any:
     return _image_inputs_module._sanitize_response_echoed_request_images_for_delivery(
         response,
@@ -1010,7 +1016,6 @@ async def _execute_responses_context_truncation_fallback(
         response = await _postprocess_generic_bridge_response(
             response,
             retry_kwargs,
-            original_function,
         )
     except Exception as retry_exception:
         _trace_module._request_route_trace(
@@ -1287,7 +1292,6 @@ async def _execute_bridged_upstream_attempt(
     return await _postprocess_generic_bridge_response(
         response,
         active_bridge_kwargs,
-        original_function,
     )
 
 
@@ -1380,6 +1384,7 @@ async def _execute_responses_tool_adapter_call(
                     exception=_routing_module._trace_exception(retry_exc),
                 )
                 exc = retry_exc
+                bridge_kwargs = xhigh_retry_kwargs
         native_error_bridge_kwargs = _responses_surfaces_module._with_responses_external_web_search_bridge_after_native_error(
             exc,
             bridge_kwargs,
@@ -1708,7 +1713,6 @@ def _wrap_generic_function_for_deployment_failover(
             response = await _postprocess_generic_bridge_response(
                 response,
                 kwargs,
-                surface_adapted_original_function,
             )
             return _with_responses_context_truncation_fallback_stream(
                 response,
@@ -1750,7 +1754,6 @@ def _wrap_generic_function_for_deployment_failover(
                     return await _postprocess_generic_bridge_response(
                         response,
                         forced_choice_retry_kwargs,
-                        surface_adapted_original_function,
                     )
                 except Exception as retry_exc:
                     exc = retry_exc
@@ -1787,8 +1790,6 @@ def _wrap_generic_function_for_deployment_failover(
             if context_truncation_fallback is not None:
                 response, _retry_kwargs = context_truncation_fallback
                 return response
-            if _routing_module._is_context_size_error(original_exception):
-                raise original_exception
             if _routing_module._protocol_fallback_attempt_active(decision_kwargs):
                 _routing_module._mark_exception_for_deployment_failover(
                     exc,
@@ -1872,7 +1873,6 @@ def _wrap_generic_function_for_deployment_failover(
                     return await _postprocess_generic_bridge_response(
                         response,
                         xhigh_retry_kwargs,
-                        surface_adapted_original_function,
                     )
                 except Exception as retry_exc:
                     _trace_module._request_route_trace(
@@ -2278,7 +2278,7 @@ def _ordered_deployment_fallback_entry(
             "fallback_model_concurrency_filter", request_kwargs, model_group=model_group,
             concurrency_filtered=concurrency_filtered,
             concurrency_all_candidates=bool(
-                concurrency_saturated and not concurrency_filtered
+                concurrency_saturated and not concurrency_available
             ),
             concurrency_saturated=concurrency_saturated,
         )

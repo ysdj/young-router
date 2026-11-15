@@ -92,8 +92,11 @@ class YoungRouterHook(CustomLogger):
                 # The shrink drops whole turns, and a turn it drops can be the
                 # one that carried a call whose answer is still in the replay.
                 # Pairing ran on the body before that, so the answer is now an
-                # orphan the wire refuses.  Pairing again on what the shrink
-                # produced is the only place that sees what is left.
+                # orphan the wire refuses -- ``messages.22.content.5:
+                # unexpected `tool_use_id` found in `tool_result` blocks`` on a
+                # 1279-item body the pass had cut to 133.  Pairing again on
+                # what the shrink produced is the only place that sees the
+                # result and the call that is left.
                 repaired = _tool_history_module.paired_request(fitted_messages)
                 return repaired if repaired is not None else fitted_messages
             return paired
@@ -205,7 +208,9 @@ class YoungRouterHook(CustomLogger):
         # A client-facing failure callback may also run; a second failure row
         # is honest duplication, a missing one is a lie.
         # A failed turn has no attempt in flight either; its slot goes back the
-        # moment the failure is known, not when the lease expires.
+        # moment the failure is known, not when the lease expires.  A streaming
+        # turn is no exception: a recovery round claims the slot its next
+        # attempt needs, and the stream releases again when the body ends.
         _routing_module._release_request_concurrency_slots(kwargs)
         # A listing or health read that failed never became a turn.  Left
         # logged, every ``/v1/models`` read a client or this app's own
@@ -216,15 +221,6 @@ class YoungRouterHook(CustomLogger):
         if _routing_module._is_local_control_plane_read(kwargs):
             return
         _trace_codex_fast_tier_result(kwargs, response_obj, outcome="failure")
-        # A turn that ends failed has no attempt in flight either.  The success
-        # callback is where a delivered answer gives its slot back, and a
-        # failure that reached the failover machinery already released there;
-        # a failure that never did would otherwise hold its route's slot for the
-        # whole lease window.  A streaming turn keeps its slot -- the
-        # client-facing stream owns that boundary, and its recovery rounds keep
-        # claiming under the same turn.
-        if kwargs.get("stream") is not True:
-            _routing_module._release_request_concurrency_slots(kwargs)
         if _routing_module._should_suppress_recent_failure_log(kwargs, response_obj):
             return
         _state_module._append_recent_request(
@@ -998,19 +994,7 @@ def _trace_codex_fast_tier_result(
 
 
 def _trace_codex_fast_tier_injected(request_kwargs: dict) -> None:
-    _trace_module._route_trace(
-        "codex_fast_default_service_tier_injected",
-        request_id=_routing_module._trace_request_id(request_kwargs),
-        session=_routing_module._trace_session_context(request_kwargs),
-        model_group=_responses_execution_module._request_model_group(request_kwargs),
-        deployment_id=_routing_module._deployment_id_from_request(request_kwargs),
-        route_key=_routing_module._deployment_route_key_from_request(request_kwargs),
-        codex_fast_default_injected=True,
-        service_tier=_codex_fast_tier_module._codex_fast_default_service_tier(
-            request_kwargs
-        ),
-        requested_service_tier=_codex_fast_tier_module._codex_fast_default_service_tier(
-            request_kwargs
-        ),
-        source="codex_config_fast_default",
-    )
+    # One event, one implementation: ``patches`` traces the same injection from
+    # the failover wrapper, and two copies had already drifted (this one looked
+    # the tier up twice and recorded a row even when no tier was injected).
+    _patches_module._trace_codex_fast_tier_injected(request_kwargs)

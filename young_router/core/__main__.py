@@ -319,9 +319,8 @@ def run(argv: list[str] | None = None) -> int:
                 locale_provider=locale,
                 auto_login=not args.web_require_password,
             )
-            # Printed once at start and then again whenever the URL file is
-            # missing, so a person can always find the address without reading
-            # a log.
+            # Printed once at start, so a person can always find the address
+            # without reading a log.
             _publish_web_url(args.web_url_file, server.web_host_url)
             print(server.web_host_url, flush=True)
         webdav_scheduler.start()
@@ -352,12 +351,17 @@ def run(argv: list[str] | None = None) -> int:
         except Exception:
             pass
         try:
+            if client_model_sync is not None:
+                client_model_sync.stop()
+        except Exception:
+            pass
+        try:
             image_context_sweeper.stop()
         except Exception:
             pass
         try:
             # SIGTERM is how a host or a script *replaces* Core; the app
-            # quitting on its own goes through ``/v1/host/shutdown``.  The stop
+            # quitting on its own goes through ``/ipc/host/shutdown``.  The stop
             # is the same one, so the record says which it was: a reader that
             # finds ``stopped`` needs to know whether a person asked for it.
             core.shutdown(stopped_by="core_replaced")

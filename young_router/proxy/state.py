@@ -11,19 +11,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-# Windows has no ``fcntl``: the advisory lock it guards here is a cooperative
-# one between this app's own processes, and the platform without it already
-# runs a single Core launcher.  Taken with the same guard the other shipped
-# modules use, because this module is imported by the launcher, which must not
-# reach the workers' runtime for a name like this one.
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows does not provide POSIX flock.
-    fcntl = None  # type: ignore[assignment]
-
-from ..atomic_io import atomic_write_text
 from .. import runtime_store
-from ..log_rotation import append_bounded_log
 from .launcher_settings import (
     _DEPLOYMENT_COOLDOWN_FILE_ENV,
     _RECENT_REQUESTS_LOG_ENV,
@@ -569,17 +557,6 @@ def _session_deployment_affinity_file_path() -> Optional[str]:
     if not runtime_root:
         return None
     return os.path.join(runtime_root, ".litellm-runtime", "session-deployment-affinity.json")
-
-
-def _canonical_json(payload: dict[str, Any]) -> str:
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
-
-
-def _atomic_write_json(path: str, payload: dict[str, Any]) -> None:
-    atomic_write_text(
-        path,
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-    )
 
 
 def _locked_json_state_update(path: str, callback: Any, *, read_only: bool = False) -> Any:

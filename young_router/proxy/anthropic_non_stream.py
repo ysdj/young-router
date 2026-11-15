@@ -16,6 +16,7 @@ the path that replayed this turn into the ceiling nine times on 2026-11-11.
 
 from __future__ import annotations
 
+import codecs
 import copy
 import functools
 import json
@@ -265,15 +266,19 @@ async def _streamed_events(stream: AsyncIterator[Any]) -> AsyncIterator[dict]:
     """
 
     buffer = ""
+    # A read may also end inside a character: three of the bytes of one arrive
+    # now and the last with the next read.  Decoding each read on its own
+    # raised on that, and the whole read -- its complete frames included -- was
+    # dropped, so an answer in any script wider than ASCII lost text while the
+    # message was still returned as a success.  The decoder keeps the partial
+    # sequence for the read that completes it.
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     async for chunk in stream:
         if isinstance(chunk, dict):
             yield chunk
             continue
         if isinstance(chunk, (bytes, bytearray)):
-            try:
-                text = bytes(chunk).decode("utf-8")
-            except UnicodeDecodeError:
-                continue
+            text = decoder.decode(bytes(chunk))
         elif isinstance(chunk, str):
             text = chunk
         else:
@@ -290,6 +295,7 @@ async def _streamed_events(stream: AsyncIterator[Any]) -> AsyncIterator[dict]:
             buffer = buffer[boundary.end() :]
             for payload in _frame_payloads(block):
                 yield payload
+    buffer += decoder.decode(b"", True)
     if buffer.strip():
         for payload in _frame_payloads(buffer):
             yield payload

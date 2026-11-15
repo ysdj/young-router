@@ -490,6 +490,12 @@ class IPCError(RuntimeError):
     """An IPC transport error with no raw endpoint/body details."""
 
 
+def _url_host(address: str) -> str:
+    """The host part of a URL, bracketed when it is an IPv6 literal."""
+
+    return f"[{address}]" if ":" in address else address
+
+
 @dataclass(frozen=True)
 class IpcEndpoint:
     kind: str
@@ -500,7 +506,7 @@ class IpcEndpoint:
 
     @property
     def url(self) -> str:
-        return f"http://{self.address}:{self.port}/ipc"
+        return f"http://{_url_host(self.address)}:{self.port}/ipc"
 
     @property
     def bootstrap_token(self) -> str:
@@ -560,6 +566,10 @@ class _PreparedResponse:
 
     status: int
     body: bytes
+    #: The same body already gzip-coded, when the server holds those bytes.
+    #: A cached snapshot carries the compressed result from the revision it
+    #: belongs to; only its small request-id envelope is compressed per poll.
+    gzip_body: bytes | None = None
 
 
 @dataclass
@@ -758,8 +768,15 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         *,
         session_token: str | None = None,
         clear_session: bool = False,
+        browser_session: bool = False,
     ) -> None:
-        self._send_encoded(status, _encode_response_body(payload), session_token=session_token, clear_session=clear_session)
+        self._send_encoded(
+            status,
+            _encode_response_body(payload),
+            session_token=session_token,
+            clear_session=clear_session,
+            browser_session=browser_session,
+        )
 
     def _send_encoded(
         self,
@@ -768,6 +785,8 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         *,
         session_token: str | None = None,
         clear_session: bool = False,
+        browser_session: bool = False,
+        gzip_body: bytes | None = None,
     ) -> None:
         """Answer with bytes that are already the body this route sends."""
         # A body this handler never read would otherwise become the next
@@ -782,7 +801,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         encoding = ""
         accept_encoding = self.headers.get("Accept-Encoding", "")
         if len(encoded) >= COMPRESSIBLE_BODY_BYTES and _accepts_encoding(accept_encoding, "gzip"):
-            compressed = gzip.compress(encoded, 6)
+            compressed = gzip_body if gzip_body is not None else gzip.compress(encoded, 6)
             if len(compressed) < len(encoded):
                 encoded, encoding = compressed, "gzip"
         # An error also leaves the peer free to reuse the connection: the
@@ -796,7 +815,10 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Encoding", encoding)
             self.send_header("Vary", "Accept-Encoding")
         if session_token:
-            self.send_header("X-LiteLLM-Core-Session", session_token)
+            # A page's lease is HttpOnly on purpose; echoing it in this
+            # readable header would hand the same credential back to script.
+            if not browser_session:
+                self.send_header("X-LiteLLM-Core-Session", session_token)
             self.send_header("Set-Cookie", self._browser_session_cookie_header(session_token))
         elif clear_session:
             # Sign-out: the browser is told to forget the cookie it holds, so
@@ -946,25 +968,6 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                     self._owner._browser_files[capability] = path
                     self._owner._browser_file_sessions[capability] = token
             except (CoreError, ProtocolError, ValueError, OSError, binascii.Error):
-                self._send_error(400, code="invalid_file_capability", message="The selected file is unavailable")
-                return
-            self._send(200, {"protocol_version": PROTOCOL_VERSION, "token": capability})
-            return
-        if route == "/ipc/host/file-download":
-            token = self._session_authorization()
-            if not self._owner._valid_session(token):
-                self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
-                return
-            try:
-                data = decode_message(self._read_body())
-                if set(data) != {"purpose", "name"} or data.get("purpose") != "export" or not isinstance(data.get("name"), str):
-                    raise CoreError("invalid_file_capability", "The selected file is unavailable")
-                name = Path(data["name"]).name
-                if not name or name in {".", ".."} or len(name.encode("utf-8")) > 255:
-                    raise CoreError("invalid_file_capability", "The selected file is unavailable")
-                path = Path(tempfile.gettempdir()) / f"young-router-export-{secrets.token_urlsafe(12)}.json"
-                capability = self._owner.register_file_capability(str(path), "export")
-            except (CoreError, ProtocolError, ValueError, OSError):
                 self._send_error(400, code="invalid_file_capability", message="The selected file is unavailable")
                 return
             self._send(200, {"protocol_version": PROTOCOL_VERSION, "token": capability})
@@ -1270,14 +1273,14 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                 request_id = data["request_id"][:256]
             self._send_error(400, request_id=request_id, code=exc.code, message=exc.message)
             return
-        response = self._owner.handle_request(request, session_token=token)
+        response = self._owner.handle_request(
+            request,
+            session_token=token,
+            accepts_gzip=_accepts_encoding(self.headers.get("Accept-Encoding", ""), "gzip"),
+        )
         if isinstance(response, _PreparedResponse):
-            self._send_encoded(response.status, response.body)
+            self._send_encoded(response.status, response.body, gzip_body=response.gzip_body)
             return
-        if response.ok and request.method == "snapshot" and isinstance(response.result, Mapping):
-            # The first poll of a revision pays for the validation and the
-            # encoding; every later one is answered from these bytes.
-            self._owner.remember_snapshot_result(response.result)
         self._send(200 if response.ok else 400, response.to_mapping())
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib handler hook
@@ -1342,12 +1345,13 @@ class CoreIPCServer:
         self._bootstrap_consumed = False
         self._sessions: dict[str, _Session] = {}
         self._subscriptions: dict[str, _Subscription] = {}
-        #: ``(revision, projected_revision, result bytes)`` of the last
-        #: snapshot answered to a poll.  Both revisions are part of the key: a
-        #: body answered while a write lane was held carries the last committed
-        #: projection under the current head, and serving it after the lane
-        #: freed would hand a window state Core had already left.
-        self._snapshot_body: tuple[int, int, bytes] | None = None
+        #: ``(revision, projected_revision, result bytes, gzip bytes)`` of the
+        #: last snapshot answered to a poll; the compressed form is filled in
+        #: when a client first accepts gzip.  Both revisions are part of the
+        #: key: a body answered while a write lane was held carries the last
+        #: committed projection under the current head, and serving it after
+        #: the lane freed would hand a window state Core had already left.
+        self._snapshot_body: tuple[int, int, bytes, bytes | None] | None = None
         self._editor_capabilities: dict[str, _EditorCapability] = {}
         self._secret_capabilities: dict[str, _SecretCapability] = {}
         self._secret_read_capabilities: dict[str, _SecretReadCapability] = {}
@@ -1383,6 +1387,10 @@ class CoreIPCServer:
         self._web_sessions_path = Path(web_sessions_path).expanduser() if web_sessions_path is not None else None
         self._web_sessions: dict[str, float] = {}
         self._web_sessions_written: dict[str, float] = {}
+        # Serialized apart from ``_lock``: the file write must not stall the
+        # requests that take it, but two writes must not let an older snapshot
+        # land after a newer one.
+        self._web_sessions_write_lock = threading.Lock()
         self._lock = threading.RLock()
 
     @property
@@ -1765,8 +1773,8 @@ class CoreIPCServer:
         if not port:
             return ""
         if launch:
-            return f"http://{self.address}:{port}{WEB_UI_PREFIX}/#launch={launch}"
-        return f"http://{self.address}:{port}{WEB_UI_PREFIX}/"
+            return f"http://{_url_host(self.address)}:{port}{WEB_UI_PREFIX}/#launch={launch}"
+        return f"http://{_url_host(self.address)}:{port}{WEB_UI_PREFIX}/"
 
     @property
     def web_launch_url(self) -> str:
@@ -1786,7 +1794,7 @@ class CoreIPCServer:
             launch = self._web_launch_token
         if not port:
             return ""
-        return f"http://{self.address}:{port}{WEB_UI_PREFIX}/#launch={launch}" if launch else ""
+        return f"http://{_url_host(self.address)}:{port}{WEB_UI_PREFIX}/#launch={launch}" if launch else ""
 
     def _web_page_port(self) -> int:
         """The port the page is published on, which is not this listener's.
@@ -2175,6 +2183,7 @@ class CoreIPCServer:
         handler._send_error(401, code="unauthorized", message="Core IPC authentication failed")
 
     def _issue_session(self, handler: _CoreRequestHandler, token: str, *, consumed_bootstrap: bool) -> None:
+        browser_session = False
         with self._lock:
             now = time.monotonic()
             if consumed_bootstrap and hmac.compare_digest(token, self._bootstrap_token):
@@ -2185,8 +2194,7 @@ class CoreIPCServer:
                 # revisions are intentionally bound to this session.
                 existing.expires_at = now + existing.ttl_seconds
                 session_token = existing.token
-                if existing.browser:
-                    self._record_web_session(session_token)
+                browser_session = existing.browser
             else:
                 session_token = secrets.token_urlsafe(32)
                 self._sessions[session_token] = _Session(
@@ -2194,6 +2202,8 @@ class CoreIPCServer:
                     expires_at=now + self.session_ttl_seconds,
                     ttl_seconds=self.session_ttl_seconds,
                 )
+        if browser_session and self._record_web_session(session_token):
+            self._save_web_sessions()
         handler._send(
             200,
             {
@@ -2202,6 +2212,7 @@ class CoreIPCServer:
                 "session": {"expires_in": int(existing.ttl_seconds if existing is not None else self.session_ttl_seconds)},
             },
             session_token=session_token,
+            browser_session=browser_session,
         )
 
     def _handle_web_login(self, handler: _CoreRequestHandler) -> None:
@@ -2219,7 +2230,12 @@ class CoreIPCServer:
             handler._send(401, {"ok": False, "error": {"code": "invalid_password", "message": "Web password is incorrect"}})
             return
         session_token = self._mint_web_session()
-        handler._send(200, {"ok": True, "session": {"expires_in": int(self.web_session_ttl_seconds)}}, session_token=session_token)
+        handler._send(
+            200,
+            {"ok": True, "session": {"expires_in": int(self.web_session_ttl_seconds)}},
+            session_token=session_token,
+            browser_session=True,
+        )
 
     def _handle_web_logout(self, handler: _CoreRequestHandler) -> None:
         """End this browser's page session and clear its cookie.
@@ -2232,10 +2248,13 @@ class CoreIPCServer:
         follows reads as "show me the gate".
         """
 
+        recorded = False
         with self._lock:
             tokens = {value for value in (handler._authorization(), handler._browser_session_cookie()) if value}
             for token in tokens:
-                self._drop_session(token)
+                recorded = self._drop_session(token) or recorded
+        if recorded:
+            self._save_web_sessions(force=True)
         handler._send(200, {"ok": True}, clear_session=True)
 
     def _handle_web_launch(self, handler: _CoreRequestHandler) -> None:
@@ -2263,7 +2282,12 @@ class CoreIPCServer:
             handler._send(401, {"ok": False, "error": {"code": "invalid_launch", "message": "This launch address is not valid"}})
             return
         session_token = self._mint_web_session()
-        handler._send(200, {"ok": True, "session": {"expires_in": int(self.web_session_ttl_seconds)}}, session_token=session_token)
+        handler._send(
+            200,
+            {"ok": True, "session": {"expires_in": int(self.web_session_ttl_seconds)}},
+            session_token=session_token,
+            browser_session=True,
+        )
 
     def _accepts_web_password(self, submitted: str) -> bool:
         expected = self._web_password_value()
@@ -2291,28 +2315,40 @@ class CoreIPCServer:
         now = time.monotonic()
         with self._lock:
             session = self._sessions.get(token)
-            if session is None and self._resume_web_session(token):
-                # A Core that was replaced -- a deploy, the app's own restart --
-                # starts with no sessions at all.  The recorded digest is what
-                # makes the cookie this browser already holds still mean
-                # something, so the page keeps its seat instead of meeting the
-                # key form again.
-                session = self._sessions.get(token)
+        if session is None:
+            # A Core that was replaced -- a deploy, the app's own restart --
+            # starts with no sessions at all.  The recorded digest is what
+            # makes the cookie this browser already holds still mean
+            # something, so the page keeps its seat instead of meeting the
+            # key form again.
+            self._resume_web_session(token)
+        recorded = False
+        record = False
+        valid = False
+        with self._lock:
+            session = self._sessions.get(token)
             if session is None or session.expires_at < now:
-                self._drop_session(token)
+                recorded = self._drop_session(token)
+            elif not hmac.compare_digest(session.token, token):
                 return False
-            if not hmac.compare_digest(session.token, token):
-                return False
-            # Event polling and normal host operations are authenticated
-            # activity. Keep their session alive so a healthy Core is never
-            # reaped solely because its host has been idle in the foreground.
-            session.expires_at = now + session.ttl_seconds
-            if session.browser:
-                self._record_web_session(token)
-            return True
+            else:
+                # Event polling and normal host operations are authenticated
+                # activity. Keep their session alive so a healthy Core is never
+                # reaped solely because its host has been idle in the foreground.
+                session.expires_at = now + session.ttl_seconds
+                record = session.browser
+                valid = True
+        if recorded:
+            self._save_web_sessions(force=True)
+        if record and self._record_web_session(token):
+            self._save_web_sessions()
+        return valid
 
-    def _drop_session(self, token: str) -> None:
-        """Forget one lease and everything that was minted under it."""
+    def _drop_session(self, token: str) -> bool:
+        """Forget one lease and everything that was minted under it.
+
+        Returns whether a recorded browser lease was removed.
+        """
 
         with self._lock:
             session = self._sessions.pop(token, None)
@@ -2352,8 +2388,7 @@ class CoreIPCServer:
                 subscription = self._subscriptions.get(subscription_id)
                 if subscription is not None and hmac.compare_digest(subscription.session_token, token):
                     self._subscriptions.pop(subscription_id, None)
-            if recorded:
-                self._save_web_sessions(force=True)
+            return recorded
 
     def _mint_web_session(self) -> str:
         """One browser page's lease: 30 days, in memory and recorded."""
@@ -2367,24 +2402,29 @@ class CoreIPCServer:
                 browser=True,
             )
             self._web_sessions[browser_session_digest(token)] = time.time() + self.web_session_ttl_seconds
-            self._save_web_sessions()
+        self._save_web_sessions()
         return token
 
-    def _record_web_session(self, token: str) -> None:
+    def _record_web_session(self, token: str) -> bool:
         """Move a live browser lease's recorded expiry forward.
 
         Every authenticated call renews the lease, and the record only has to
         be as fresh as the next restart that reads it: an hour of slack costs
         nothing and keeps the file from being rewritten on every event poll.
+
+        Returns whether the record changed and so needs writing.
         """
 
         digest = browser_session_digest(token)
         with self._lock:
+            session = self._sessions.get(token)
+            if session is None or not session.browser:
+                return False
             expiry = time.time() + self.web_session_ttl_seconds
             if expiry - self._web_sessions.get(digest, 0.0) < WEB_SESSION_PERSIST_INTERVAL_SECONDS:
-                return
+                return False
             self._web_sessions[digest] = expiry
-            self._save_web_sessions()
+            return True
 
     def _resume_web_session(self, token: str) -> bool:
         """Adopt a browser lease this process did not mint.
@@ -2401,8 +2441,8 @@ class CoreIPCServer:
             if expiry is None:
                 return False
             if expiry <= now:
-                self._web_sessions.pop(digest, None)
-                self._save_web_sessions(force=True)
+                # The caller's drop removes the expired digest and persists
+                # that removal once ``_lock`` is released.
                 return False
             self._sessions[token] = _Session(
                 token=token,
@@ -2448,33 +2488,39 @@ class CoreIPCServer:
     def _save_web_sessions(self, *, force: bool = False) -> None:
         """Write the browser sessions a later process may resume."""
 
-        now = time.time()
-        with self._lock:
-            live = {digest: expiry for digest, expiry in self._web_sessions.items() if expiry > now}
-            if len(live) > MAX_PERSISTED_WEB_SESSIONS:
-                newest = sorted(live.items(), key=lambda item: item[1], reverse=True)[:MAX_PERSISTED_WEB_SESSIONS]
-                live = dict(newest)
-            self._web_sessions = live
-            path = self._web_sessions_path
-            if path is None:
-                return
-            if not force and live == self._web_sessions_written:
-                return
-            payload = {
-                "version": WEB_SESSION_STORE_VERSION,
-                "sessions": [
-                    {"digest": digest, "expires_at": int(expiry)}
-                    for digest, expiry in sorted(live.items(), key=lambda item: item[1], reverse=True)
-                ],
-            }
-            try:
-                atomic_write_json(path, payload)
-            except PersistenceError:
-                # A record that cannot be written is bookkeeping, not a
-                # request: this page keeps its lease, and only a restart that
-                # cannot find the record asks for the key again.
-                return
-            self._web_sessions_written = dict(live)
+        with self._web_sessions_write_lock:
+            while True:
+                now = time.time()
+                with self._lock:
+                    live = {digest: expiry for digest, expiry in self._web_sessions.items() if expiry > now}
+                    if len(live) > MAX_PERSISTED_WEB_SESSIONS:
+                        newest = sorted(live.items(), key=lambda item: item[1], reverse=True)[:MAX_PERSISTED_WEB_SESSIONS]
+                        live = dict(newest)
+                    self._web_sessions = live
+                    path = self._web_sessions_path
+                    if path is None:
+                        return
+                    if not force and live == self._web_sessions_written:
+                        return
+                    force = False
+                    payload = {
+                        "version": WEB_SESSION_STORE_VERSION,
+                        "sessions": [
+                            {"digest": digest, "expires_at": int(expiry)}
+                            for digest, expiry in sorted(live.items(), key=lambda item: item[1], reverse=True)
+                        ],
+                    }
+                try:
+                    atomic_write_json(path, payload)
+                except PersistenceError:
+                    # A record that cannot be written is bookkeeping, not a
+                    # request: this page keeps its lease, and only a restart that
+                    # cannot find the record asks for the key again.
+                    return
+                with self._lock:
+                    self._web_sessions_written = dict(live)
+                    if self._web_sessions == live:
+                        return
 
     def _register_import_plan(self, prepared: PreparedImport, *, session_token: str) -> str:
         token = secrets.token_urlsafe(32)
@@ -2573,7 +2619,7 @@ class CoreIPCServer:
                 session.subscriptions.add(subscription_id)
         return subscription_id
 
-    def _prepared_snapshot(self, request_id: str) -> "_PreparedResponse | None":
+    def _prepared_snapshot(self, request_id: str, *, accepts_gzip: bool = False) -> "_PreparedResponse | None":
         """The cached answer for this state, or ``None`` to build one.
 
         The cache is keyed by the pair the store states about a snapshot: the
@@ -2592,17 +2638,28 @@ class CoreIPCServer:
             or cached[1] != self.core.projected_revision
         ):
             return None
-        return _PreparedResponse(200, self._snapshot_envelope(request_id, cached[2]))
+        compressed = cached[3]
+        if accepts_gzip and compressed is None:
+            compressed = gzip.compress(cached[2], 6)
+            if self._snapshot_body is cached:
+                self._snapshot_body = (cached[0], cached[1], cached[2], compressed)
+        prefix = self._snapshot_prefix(request_id)
+        gzip_body = None
+        if compressed is not None:
+            # ``gzip`` permits concatenated members, so the cached result
+            # keeps its compression while only the small request-id envelope
+            # is compressed for this poll.
+            gzip_body = gzip.compress(prefix, 6) + compressed + gzip.compress(b"}", 6)
+        return _PreparedResponse(200, prefix + cached[2] + b"}", gzip_body)
 
-    def _snapshot_envelope(self, request_id: str, result: bytes) -> bytes:
-        prefix = (
+    def _snapshot_prefix(self, request_id: str) -> bytes:
+        return (
             b'{"protocol_version":'
             + str(PROTOCOL_VERSION).encode("ascii")
             + b',"request_id":'
             + _encode_json(request_id)
             + b',"ok":true,"result":'
         )
-        return prefix + result + b"}"
 
     def remember_snapshot_result(self, result: Mapping[str, Any]) -> None:
         """Keep this state's encoded result, so its next poll is a copy."""
@@ -2613,6 +2670,7 @@ class CoreIPCServer:
             self.core.revision,
             projected_revision if type(projected_revision) is int else self.core.projected_revision,
             _encode_json(result),
+            None,
         )
 
     def next_event(self, subscription_id: str, *, session_token: str, timeout: float) -> dict[str, Any] | None:
@@ -2645,14 +2703,20 @@ class CoreIPCServer:
         except queue.Empty:
             return None
 
-    def handle_request(self, request: RequestEnvelope, *, session_token: str) -> "ResponseEnvelope | _PreparedResponse":
+    def handle_request(
+        self,
+        request: RequestEnvelope,
+        *,
+        session_token: str,
+        accepts_gzip: bool = False,
+    ) -> "ResponseEnvelope | _PreparedResponse":
         if not self._valid_session(session_token):
             return ResponseEnvelope.failure(request.request_id, "unauthorized", "Core IPC authentication failed")
         snapshot_result: dict[str, Any] | None = None
         try:
             params = request.params
             if request.method == "snapshot":
-                prepared = self._prepared_snapshot(request.request_id)
+                prepared = self._prepared_snapshot(request.request_id, accepts_gzip=accepts_gzip)
                 if prepared is not None:
                     return prepared
                 result: Any = {"snapshot": self.core.snapshot()}
@@ -2775,11 +2839,16 @@ class CoreIPCServer:
                 source = params.get("source_token")
                 if not isinstance(source, str):
                     raise CoreError("invalid_file_capability", "The selected file is unavailable")
-                prepared = self.core.prepare_import(
-                    source_token=source,
-                    revision=params["revision"],
-                )
-                self.discard_browser_file(source)
+                # The upload is spent whichever way the preview goes: a
+                # refused preview would otherwise leave its temporary file
+                # behind until the process stops.
+                try:
+                    prepared = self.core.prepare_import(
+                        source_token=source,
+                        revision=params["revision"],
+                    )
+                finally:
+                    self.discard_browser_file(source)
                 result = {
                     "revision": prepared.revision,
                     "import_plan_token": self._register_import_plan(
@@ -2857,7 +2926,7 @@ class CoreIPCClient:
         self._subscription_threads: list[tuple[threading.Event, threading.Thread]] = []
 
     def _url(self, path: str) -> str:
-        return f"http://{self.endpoint.address}:{self.endpoint.port}{path}"
+        return f"http://{_url_host(self.endpoint.address)}:{self.endpoint.port}{path}"
 
     def _http(self, path: str, *, payload: bytes | None = None, token: str) -> tuple[int, bytes, Mapping[str, str]]:
         request = urllib.request.Request(self._url(path), data=payload, method="POST" if payload is not None else "GET")
@@ -2949,13 +3018,17 @@ class CoreIPCClient:
         return capability
 
     def subscribe(self, callback: Callable[[dict[str, Any]], None], *, topics: Sequence[str] | None = None) -> Callable[[], None]:
-        result = self.call("subscribe", {"topics": list(topics)} if topics is not None else {})
-        if not isinstance(result, Mapping) or not isinstance(result.get("subscription_id"), str):
-            raise IPCError("Core IPC returned an invalid subscription")
-        subscription_id = str(result["subscription_id"])
+        def new_subscription() -> str:
+            result = self.call("subscribe", {"topics": list(topics)} if topics is not None else {})
+            if not isinstance(result, Mapping) or not isinstance(result.get("subscription_id"), str):
+                raise IPCError("Core IPC returned an invalid subscription")
+            return str(result["subscription_id"])
+
+        subscription_id = new_subscription()
         stop = threading.Event()
 
         def poll() -> None:
+            nonlocal subscription_id
             while not stop.is_set():
                 query = f"/ipc/events?subscription_id={subscription_id}&timeout={EVENT_POLL_TIMEOUT_SECONDS}"
                 try:
@@ -2966,6 +3039,16 @@ class CoreIPCClient:
                     # normal disconnect and keep the poll cancellable.
                     if stop.wait(0.2):
                         return
+                    continue
+                if status == 410:
+                    # A replacement Core holds none of the ids it minted
+                    # before, so re-polling this one can never deliver an
+                    # event; ask for a fresh id instead.
+                    try:
+                        subscription_id = new_subscription()
+                    except IPCError:
+                        if stop.wait(0.2):
+                            return
                     continue
                 if status != 200:
                     if stop.wait(0.2):

@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 import yaml
 
 from ..api_base import normalize_configured_api_base
+from ..atomic_io import restrict_mode
 from ..public_names import public_name_key
 
 # PyYAML's pure-Python scanner is ~10x slower than the libyaml one, and this
@@ -304,7 +305,7 @@ def _normalized_api_keys(provider: dict[str, Any]) -> list[dict[str, Any]]:
     return keys
 
 
-def _api_key_by_name(provider: dict[str, Any], key_name: str) -> dict[str, Any] | None:
+def _api_key_by_name(keys: list[dict[str, Any]], key_name: str) -> dict[str, Any] | None:
     """The one key this name identifies, or ``None`` when no key carries it.
 
     An empty name is not a lookup: a model that names no key follows the
@@ -316,16 +317,16 @@ def _api_key_by_name(provider: dict[str, Any], key_name: str) -> dict[str, Any] 
 
     if not key_name:
         return None
-    for item in _normalized_api_keys(provider):
+    for item in keys:
         if item["name"] == key_name:
             return item
     return None
 
 
-def _api_key_by_id(provider: dict[str, Any], provider_key_id: str) -> dict[str, Any] | None:
+def _api_key_by_id(keys: list[dict[str, Any]], provider_key_id: str) -> dict[str, Any] | None:
     if not provider_key_id:
         return None
-    for item in _normalized_api_keys(provider):
+    for item in keys:
         if item["id"] == provider_key_id:
             return item
     return None
@@ -490,10 +491,11 @@ def _entry_from_editor(
     api_base = normalize_configured_api_base(provider.get("api_base", ""))
     provider_key_id = _provider_key_id(model.get("provider_key_id"))
     key_name = str(model.get("api_key_name", "")).strip()
+    keys = _normalized_api_keys(provider)
     api_key_item = (
-        _api_key_by_id(provider, provider_key_id)
+        _api_key_by_id(keys, provider_key_id)
         if provider_key_id
-        else _api_key_by_name(provider, key_name)
+        else _api_key_by_name(keys, key_name)
     )
     api_key = ""
     if api_key_item is None and (key_name or provider_key_id):
@@ -517,7 +519,6 @@ def _entry_from_editor(
         # shows before Apply is then what the next read still shows: the row
         # stays where the user left it, no slot the user did not pick owns it,
         # a relay slot never adopts it, and deleting a key never deletes it.
-        keys = _normalized_api_keys(provider)
         api_key = str(model.get("api_key", "")).strip() or (keys[0]["value"] if keys else "")
         api_key_name = ""
         provider_key_id = ""
@@ -991,7 +992,7 @@ def _unique_model_groups(active_entries: list[dict[str, Any]], existing_groups: 
 def _write_atomic(path: pathlib.Path, text: str) -> None:
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
-        os.fchmod(fd, 0o600)
+        restrict_mode(fd, tmp_name)
         with os.fdopen(fd, "w", encoding="utf-8") as tmp:
             tmp.write(text.rstrip() + "\n")
             tmp.flush()

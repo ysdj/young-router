@@ -381,12 +381,16 @@ def _request_has_provider_native_web_search_event(
 def _mark_provider_native_web_search_event(
     request_kwargs: Optional[dict],
     value: Any,
+    dumped: Any = None,
 ) -> bool:
     if not isinstance(request_kwargs, dict):
         return False
     raw_native = _provider_native_web_search_event_value(value)
     if not raw_native:
-        dumped = _streaming_module._stream_chunk_dump(value)
+        # Serializing a chunk that is not a plain dict decodes its SSE payload,
+        # so a caller that already had to do it hands the result over here.
+        if not isinstance(dumped, dict):
+            dumped = _streaming_module._stream_chunk_dump(value)
         chunk_type = dumped.get("type") if isinstance(dumped, dict) else None
         native_tool_declared = any(
             isinstance(tool, dict)
@@ -517,7 +521,13 @@ def _raw_dsml_tool_call_items(text: str) -> list[dict[str, Any]]:
                     value = html.unescape(parameter.group(3))
                     attributes = parameter.group(2) or ""
                     if re.search(r'\bstring="false"', attributes, re.IGNORECASE):
-                        value = json.loads(value)
+                        # The body is the model's own text.  One that is not
+                        # JSON after all stays the string it is: raising here
+                        # went through every caller and ended the stream.
+                        try:
+                            value = json.loads(value)
+                        except ValueError:
+                            pass
                     arguments[key] = value
                 call_id = f"dsml_call_{time.time_ns()}"
                 items.append({
@@ -674,7 +684,7 @@ def _provider_hidden_web_search_primary_reasoning_item(item: Any) -> bool:
     index_match = re.search(r"-(\d+)$", item_id)
     return index_match is None or index_match.group(1) == "0"
 
-def _provider_hidden_web_search_query(request_kwargs: Optional[dict]) -> str:
+def _provider_hidden_web_search_query() -> str:
     # The provider's encrypted ``tco_*`` item proves that native search ran,
     # but does not reveal its internal query planning.  Do not present the
     # user's whole prompt (or a guessed rewrite) as if it were the real query.
@@ -696,7 +706,7 @@ def _provider_hidden_web_search_call_item(
     search_item = _external_web_search_call_item_for_action(
         {
             "type": "search",
-            "query": _provider_hidden_web_search_query(request_kwargs),
+            "query": _provider_hidden_web_search_query(),
         },
         source_urls,
     )
@@ -1058,10 +1068,10 @@ class _ProviderHiddenWebSearchStreamAdapter:
         return payload
 
     def consume(self, chunk: Any) -> list[Any]:
-        _mark_provider_native_web_search_event(self.request_kwargs, chunk)
+        dumped = _streaming_module._stream_chunk_dump(chunk) if self.enabled else None
+        _mark_provider_native_web_search_event(self.request_kwargs, chunk, dumped=dumped)
         if not self.enabled:
             return [chunk]
-        dumped = _streaming_module._stream_chunk_dump(chunk)
         if not isinstance(dumped, dict) or not dumped:
             return [chunk]
         self._observe_sequence_number(dumped.get("sequence_number"))
@@ -1077,8 +1087,6 @@ class _ProviderHiddenWebSearchStreamAdapter:
             item = dumped.get("item")
             if _provider_hidden_web_search_reasoning_item(item):
                 events.extend(self._start_for_item(item, dumped.get("output_index")))
-                if chunk_type == "response.output_item.done" and not self._search_items:
-                    return events
                 return events
         if _is_public_reasoning_summary_stream_event(chunk_type):
             if _provider_hidden_web_search_reasoning_item_id(
@@ -1386,10 +1394,13 @@ def _sanitize_response_web_search_call_items(
             continue
         if _is_provider_hosted_web_search_item(item):
             clean_item = _provider_hosted_web_search_call_item(item, response_source_urls)
+            # An item with neither a query nor a source URL has no
+            # web_search_call form to show, so drop it as the stream sanitizer
+            # does instead of forwarding a provider type clients cannot render.
             if clean_item is not None:
                 clean_output.append(clean_item)
-                changed = True
-                continue
+            changed = True
+            continue
         if (
             isinstance(request_kwargs, dict)
             and _tools_module._request_has_web_search_tool(request_kwargs)
@@ -1623,16 +1634,14 @@ def _sanitize_reasoning_output_item(item: Any) -> Optional[Any]:
             return clean_item
         clean_item.pop("content", None)
         return clean_item
-    readable: list[Any] = []
-    if isinstance(parts, list):
-        readable = [
-            part
-            for part in parts
-            if isinstance(part, dict)
-            and part.get("type") == "reasoning_text"
-            and isinstance(part.get("text"), str)
-            and part["text"]
-        ]
+    readable: list[Any] = [
+        part
+        for part in parts
+        if isinstance(part, dict)
+        and part.get("type") == "reasoning_text"
+        and isinstance(part.get("text"), str)
+        and part["text"]
+    ]
     if readable:
         # The item's own summary stays exactly as the route wrote it: at the
         # opening frame it is still empty and arrives later as its own deltas,
@@ -1693,6 +1702,13 @@ def _message_visible_text(item: Any) -> str:
         if value_type in {"input_text", "summary_text"} or (
             isinstance(value_type, str) and value_type.startswith("reasoning")
         ):
+            return
+        # A refusal is a part a client renders, so it is visible text even
+        # though it carries no ``text`` field.
+        if value_type == "refusal":
+            refusal = value.get("refusal")
+            if isinstance(refusal, str) and refusal.strip():
+                chunks.append(refusal.strip())
             return
         text = value.get("text")
         if isinstance(text, str) and text.strip():
@@ -1756,21 +1772,16 @@ def _sanitize_response_reasoning_items(
             continue
         if (
             has_structured_output
-            and reasoning_fragments
             and isinstance(item, dict)
             and item.get("type") == "message"
-            and _message_visible_text(item) in reasoning_fragments
         ):
-            changed = True
-            continue
-        if (
-            has_structured_output
-            and isinstance(item, dict)
-            and item.get("type") == "message"
-            and not _message_visible_text(item)
-        ):
-            changed = True
-            continue
+            visible_text = _message_visible_text(item)
+            if reasoning_fragments and visible_text in reasoning_fragments:
+                changed = True
+                continue
+            if not visible_text:
+                changed = True
+                continue
         clean_output.append(item)
     if changed:
         payload["output"] = clean_output
@@ -2431,11 +2442,17 @@ async def _external_web_search_bridge_stream(
     created_response["status"] = "in_progress"
     created_response["output"] = []
 
+    sequence_number = 0
+
     def encode(event: dict[str, Any]) -> dict[str, Any]:
+        # Clients order a Responses stream by one non-decreasing counter, so
+        # number every event this bridge yields from the same one.
+        nonlocal sequence_number
+        sequence_number += 1
+        event["sequence_number"] = sequence_number
         return _JSONStreamEvent(event)
 
     yield encode({"type": "response.created", "response": created_response})
-    sequence_number = 0
     for index, item in enumerate(output):
         if not isinstance(item, dict):
             continue
@@ -2464,12 +2481,10 @@ async def _external_web_search_bridge_stream(
                 "response.web_search_call.searching",
                 "response.web_search_call.completed",
             ):
-                sequence_number += 1
                 lifecycle_event = {
                     "type": event_type,
                     "item_id": item_id,
                     "output_index": index,
-                    "sequence_number": sequence_number,
                 }
                 action = item.get("action")
                 if isinstance(action, dict):

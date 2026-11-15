@@ -164,6 +164,12 @@ def with_descendant_cleanup_barrier(
     return modified_kwargs if changed else None
 
 
+# The string ``reasoning`` spelling and the block's ``effort`` name the same
+# ladder, so one set decides for both whether thinking was asked for: a split
+# here flips the progress barrier with the spelling alone.
+_THINKING_OFF_VALUES = frozenset({"", "none", "off", "null", "false", "minimal"})
+
+
 def _request_thinks(request_kwargs: dict) -> bool:
     """Whether this turn asks the model to think before it answers.
 
@@ -173,22 +179,18 @@ def _request_thinks(request_kwargs: dict) -> bool:
 
     reasoning = request_kwargs.get("reasoning")
     if isinstance(reasoning, str):
-        return reasoning.strip().casefold() not in {"", "none", "off", "null", "false"}
+        return reasoning.strip().casefold() not in _THINKING_OFF_VALUES
     if isinstance(reasoning, dict):
         effort = reasoning.get("effort")
-        if isinstance(effort, str) and effort.strip().casefold() not in {
-            "", "none", "off", "null", "false", "minimal",
-        }:
+        if isinstance(effort, str) and effort.strip().casefold() not in _THINKING_OFF_VALUES:
             return True
         summary = reasoning.get("summary")
-        if isinstance(summary, str) and summary.strip().casefold() not in {
-            "", "none", "off", "null", "false",
-        }:
+        if isinstance(summary, str) and summary.strip().casefold() not in _THINKING_OFF_VALUES:
             return True
         return False
     summary = request_kwargs.get("model_reasoning_summary")
     if isinstance(summary, str):
-        return summary.strip().casefold() not in {"", "none", "off", "null", "false"}
+        return summary.strip().casefold() not in _THINKING_OFF_VALUES
     return False
 
 

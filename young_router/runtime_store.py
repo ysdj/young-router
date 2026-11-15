@@ -108,9 +108,16 @@ class _Handle:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=NORMAL")
         connection.execute("PRAGMA busy_timeout=%d" % int(BUSY_TIMEOUT_SECONDS * 1000))
+        # Cached only once the schema is known to exist.  Caching first meant a
+        # schema that failed once (another process still creating the file)
+        # left this thread a connection every later call returned as ready.
+        try:
+            self._ensure_schema(connection)
+        except BaseException:
+            connection.close()
+            raise
         self._local.connection = connection
         self._local.pid = pid
-        self._ensure_schema(connection)
         return connection
 
     def _ensure_schema(self, connection: sqlite3.Connection) -> None:
@@ -169,7 +176,9 @@ def _legacy_payload(path: Path | str) -> dict[str, Any] | None:
     try:
         with open(target, "r", encoding="utf-8") as handle:
             text = handle.read()
-    except OSError:
+    except (OSError, UnicodeError):
+        # Bytes that are not UTF-8 are no document either; a decode error is a
+        # ``ValueError``, so it used to leave through neither handler here.
         return None
     try:
         payload = json.loads(text)
@@ -236,6 +245,15 @@ def read_text(path: Path | str) -> str | None:
         return None
     connection = _handle(path).connection()
     row = _row(connection, name)
+    if row is None:
+        # Importing is a write; take the write lock only when it is needed.
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = _row(connection, name) or _import(connection, path, name)
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
     return row[0] if row is not None else None
 
 
@@ -324,6 +342,14 @@ def delete_document(path: Path | str) -> bool:
     """Remove the document from the store, and the file it came from, if any."""
 
     connection = _handle(path).connection()
+    # The file goes first: while it is still there the row's absence only means
+    # the next read imports the document back, so a delete that cannot remove
+    # the file reports the failure and leaves the row to be read.
+    try:
+        os.unlink(os.path.expanduser(os.fspath(path)))
+        removed_file = True
+    except FileNotFoundError:
+        removed_file = False
     connection.execute("BEGIN IMMEDIATE")
     try:
         removed = connection.execute("DELETE FROM documents WHERE name=?", (_name(path),)).rowcount
@@ -331,14 +357,7 @@ def delete_document(path: Path | str) -> bool:
     except BaseException:
         connection.execute("ROLLBACK")
         raise
-    try:
-        os.unlink(os.path.expanduser(os.fspath(path)))
-        removed = True
-    except FileNotFoundError:
-        pass
-    except OSError:
-        pass
-    return bool(removed)
+    return bool(removed) or removed_file
 
 
 #: How many request rows one log keeps.  The JSONL it replaces rotated at 10 MB,
@@ -362,8 +381,14 @@ def _import_records(connection: sqlite3.Connection, path: Path | str, name: str,
             size = handle.tell()
             handle.seek(max(0, size - 4 * 1024 * 1024))
             payload = handle.read()
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         payload = b""
+    except OSError:
+        # The file is there and could not be read this time (a lock, a
+        # permission): that is not "nothing to adopt".  Leave the import
+        # unmarked so the next call tries again, instead of recording a history
+        # that was never read as imported.
+        return
     if payload:
         # The tail may start mid-line; every complete line after it is a row.
         text = payload.decode("utf-8", "replace")
@@ -411,7 +436,11 @@ def append_record(path: Path | str, body: str, *, keep: int = DEFAULT_RECORD_RET
 
 
 def _ensure_records_imported(path: Path | str, keep: int = DEFAULT_RECORD_RETENTION) -> None:
-    """Adopt a file-based build's log the first time this one is read or written."""
+    """Adopt a file-based build's log the first time this one is read or written.
+
+    The import is one-shot, so a reader must not size it by its display limit:
+    that would drop the rest of the history for every later call.
+    """
 
     name = _name(path)
     connection = _handle(path).connection()
@@ -430,7 +459,7 @@ def _ensure_records_imported(path: Path | str, keep: int = DEFAULT_RECORD_RETENT
 def read_records(path: Path | str, *, limit: int) -> list[str]:
     """The newest ``limit`` records, oldest first."""
 
-    _ensure_records_imported(path, max(int(limit), 1))
+    _ensure_records_imported(path)
     name = _name(path)
     connection = _handle(path).connection()
     rows = connection.execute(
@@ -442,7 +471,7 @@ def read_records(path: Path | str, *, limit: int) -> list[str]:
 def records_after(path: Path | str, seq: int, *, limit: int) -> list[str]:
     """Records appended after ``seq``, oldest first."""
 
-    _ensure_records_imported(path, max(int(limit), 1))
+    _ensure_records_imported(path)
     name = _name(path)
     connection = _handle(path).connection()
     rows = connection.execute(
@@ -479,24 +508,10 @@ def has_records(path: Path | str) -> bool:
         return False
 
 
-def clear_records(path: Path | str) -> None:
-    name = _name(path)
-    connection = _handle(path).connection()
-    with _records_lock:
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            connection.execute("DELETE FROM records WHERE name=?", (name,))
-            connection.execute("COMMIT")
-        except BaseException:
-            connection.execute("ROLLBACK")
-            raise
-
-
 __all__ = [
     "DEFAULT_RECORD_RETENTION",
     "DATABASE_NAME",
     "append_record",
-    "clear_records",
     "database_path",
     "has_records",
     "latest_record_seq",

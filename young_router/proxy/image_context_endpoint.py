@@ -125,7 +125,18 @@ def register(app: Any) -> None:
     async def handler(request: Request) -> JSONResponse:
         if not authorized(request.headers.get("authorization")):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        status, payload = answer(await request.body())
+        # ``request.body()`` keeps whatever the caller sends until ``answer`` can
+        # measure it, so an oversized upload would be held in memory in full.
+        # Read in chunks and stop just past the cap, which then judges a buffer
+        # that is already bounded.
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in request.stream():
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > MAX_BODY_BYTES:
+                break
+        status, payload = answer(b"".join(chunks))
         return JSONResponse(payload, status_code=status)
 
     handler.__annotations__ = {"request": Request, "return": JSONResponse}

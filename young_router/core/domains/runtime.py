@@ -145,13 +145,21 @@ DEFAULT_MASTER_KEY = "sk-young-router"
 #: would restructure the document around it rather than set a key.
 _MASTER_KEY_VALUE = re.compile(r"[A-Za-z0-9._~+/=:@!*(),;-]{1,256}")
 #: The first top-level ``general_settings:`` block a document holds.
-_MASTER_KEY_BLOCK = re.compile(r"^general_settings:[^\n]*\n(?:[ \t]+[^\n]*\n)*", re.MULTILINE)
+_MASTER_KEY_BLOCK = re.compile(r"^general_settings:[^\n]*\n(?:[ \t]+[^\n]*(?:\n|$))*", re.MULTILINE)
 
 
 def master_key_is_valid(key: object) -> bool:
     """Whether one value can be written as a plain scalar master key."""
 
-    return isinstance(key, str) and _MASTER_KEY_VALUE.fullmatch(key) is not None
+    if not isinstance(key, str) or _MASTER_KEY_VALUE.fullmatch(key) is None:
+        return False
+    # The value is written unquoted, so YAML has to read the same string back:
+    # otherwise a key such as ``123``, ``on`` or ``~`` turns into a number, a
+    # bool or null and the document is refused on Apply instead of here.
+    try:
+        return yaml.safe_load(f"master_key: {key}") == {"master_key": key}
+    except yaml.YAMLError:
+        return False
 
 
 def master_key_from_document(text: str) -> str:
@@ -235,6 +243,11 @@ def _setting_line_in_document(text: str, name: str, value: str) -> str:
     line_match = setter.search(block)
     if line_match is None:
         head = block.split("\n", 1)[0]
+        stated = head.partition(":")[2].strip()
+        # A header holding a flow mapping -- ``general_settings: {}`` -- cannot
+        # take an indented line after it, so it becomes a block mapping.
+        if stated.startswith(("{", "[")):
+            head = f"{head.partition(':')[0]}:"
         updated = f"{head}\n{indent}{name}: {value}\n{body}"
     else:
         updated = (
@@ -862,8 +875,10 @@ class RuntimeSettingsDomain:
         current = _file_bytes(self.settings_path)
         key_current = _file_bytes(self.master_key_path)
         key_moved = False
-        if key_current != self._master_key_bytes and key_current is not None:
-            key_moved = master_key_from_document(key_current.decode("utf-8", "replace")) != self._master_key
+        if key_current != self._master_key_bytes:
+            # A document that existed when this draft loaded and is gone now
+            # no longer states the key this pane shows.
+            key_moved = key_current is None or master_key_from_document(key_current.decode("utf-8", "replace")) != self._master_key
         return {
             "changed": current != self._baseline_bytes or key_moved,
             "exists": current is not None,

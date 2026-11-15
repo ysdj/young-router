@@ -3,6 +3,10 @@ from __future__ import annotations
 # Only this module jitters: the model-concurrency queue polls a shared file, and
 # sixteen workers waking in lockstep would turn a wait into the load.
 import random
+# Store transactions run on an already-open connection, so a busy store or a
+# failed commit raises ``sqlite3.Error``; only reaching the connection is
+# mapped to the ``OSError`` that means "this host has no shared state".
+import sqlite3
 
 from . import responses_output as _responses_output_module
 from . import image_inputs as _image_inputs_module
@@ -97,6 +101,7 @@ from .base import (
     _RECOVERY_POLICY_SERVER_ENV,
     _RECOVERY_POLICY_STREAM_IDLE_TIMEOUT_ENV,
     _RECOVERY_POLICY_STREAM_START_TIMEOUT_ENV,
+    _RECOVERY_POLICY_UNREACHABLE_ENV,
     _RECOVERY_POLICY_VALUES,
     _RECOVERY_POLICY_RECOVERY,
     _RECOVERY_MAX_DEFAULT_SECONDS,
@@ -140,6 +145,9 @@ from .base import (
     _STREAM_NO_PROGRESS_SECONDS_ENV,
     _STREAM_START_TIMEOUT_DEFAULT_SECONDS,
     _STREAM_START_TIMEOUT_SECONDS_ENV,
+    _UPSTREAM_CONNECT_TIMEOUT_DEFAULT_SECONDS,
+    _UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV,
+    _UPSTREAM_UPLOAD_FLOOR_BYTES_PER_SECOND,
     _HEAVY_REPLAY_STREAM_START_TIMEOUT_DEFAULT_SECONDS,
     _HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS_ENV,
     _HEAVY_REPLAY_STREAM_START_DEFAULT_THRESHOLD_BYTES,
@@ -448,11 +456,11 @@ def _remember_request_time(
         for key, (recorded_at, _) in list(store.items()):
             if recorded_at < stale_before:
                 store.pop(key, None)
+        if not replace and request_id in store:
+            return
         if len(store) >= _FIRST_STREAM_OUTPUT_TIMES_MAX:
             oldest = min(store, key=lambda key: store[key][0])
             store.pop(oldest, None)
-        if not replace and request_id in store:
-            return
         store[request_id] = (now, observed_at)
 
 
@@ -472,14 +480,14 @@ def _claim_traced_deployment_success(request_id: str) -> bool:
         for seen, claimed_at in list(_TRACED_DEPLOYMENT_SUCCESSES.items()):
             if claimed_at < now - _TRACED_DEPLOYMENT_SUCCESSES_TTL_SECONDS:
                 _TRACED_DEPLOYMENT_SUCCESSES.pop(seen, None)
+        if key in _TRACED_DEPLOYMENT_SUCCESSES:
+            return False
         if len(_TRACED_DEPLOYMENT_SUCCESSES) >= _FIRST_STREAM_OUTPUT_TIMES_MAX:
             oldest = min(
                 _TRACED_DEPLOYMENT_SUCCESSES,
                 key=lambda seen: _TRACED_DEPLOYMENT_SUCCESSES[seen],
             )
             _TRACED_DEPLOYMENT_SUCCESSES.pop(oldest, None)
-        if key in _TRACED_DEPLOYMENT_SUCCESSES:
-            return False
         _TRACED_DEPLOYMENT_SUCCESSES[key] = now
         return True
 
@@ -767,8 +775,12 @@ def _time_to_first_token_ms(
     request_kwargs: Optional[dict],
     start_time: Any,
     end_time: Any = None,
+    completion_start: Optional[tuple[Optional[datetime], Optional[str]]] = None,
 ) -> Optional[int]:
-    completion_start_time, source = _completion_start_time(request_kwargs, end_time)
+    if completion_start is not None:
+        completion_start_time, source = completion_start
+    else:
+        completion_start_time, source = _completion_start_time(request_kwargs, end_time)
     if source is None or completion_start_time is None:
         return None
     observed_request_start = _request_started_time(request_kwargs)
@@ -910,6 +922,59 @@ def _stream_start_timeout_seconds() -> float:
         _STREAM_START_TIMEOUT_DEFAULT_SECONDS,
         minimum=0.0,
     )
+
+
+def _upstream_connect_timeout_seconds() -> float:
+    """How long reaching an upstream may take before this attempt is over.
+
+    This is the budget for the one phase no stream watchdog times: the TCP
+    handshake, the TLS exchange, the upload of the body and the wait for the
+    response head.  Everything after the response object exists is the
+    first-event and stream-idle budgets' job.  ``0`` disables the cap and
+    restores the transport's own behaviour.
+
+    It cannot be handed to LiteLLM as a per-phase ``httpx.Timeout``: the router
+    collapses every timeout into one number before the provider sees it (see
+    ``responses_request._with_stream_request_timeout``), so this value is
+    enforced by this proxy around the dispatch itself --
+    ``streaming._await_upstream_dispatch``.
+    """
+
+    return _env_float_seconds(
+        _UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV,
+        _UPSTREAM_CONNECT_TIMEOUT_DEFAULT_SECONDS,
+        minimum=0.0,
+    )
+
+
+def _upstream_dispatch_budget_seconds(request_data: Optional[dict]) -> float:
+    """The connect budget, widened by the time this body needs to be uploaded.
+
+    A handshake budget alone would cut a legitimate heavy replay: a signed
+    history of a few megabytes has to travel before the upstream can write even
+    its first header, and the budget is spent waiting on the same socket.  The
+    allowance is one megabyte per second -- far below any link this proxy is
+    meant to run on, so it only ever rescues uploads, never hides a dead host:
+    an unreachable route sends nothing at all and pays the bare budget.
+    """
+
+    connect_seconds = _upstream_connect_timeout_seconds()
+    if connect_seconds <= 0:
+        return 0.0
+    weight = 0
+    try:
+        weight = (
+            _responses_request_module._request_replay_payload_bytes(request_data)
+            or 0
+        )
+    except Exception:
+        weight = 0
+    upload_seconds = float(max(0, weight)) / _UPSTREAM_UPLOAD_FLOOR_BYTES_PER_SECOND
+    budget = connect_seconds + upload_seconds
+    request_timeout = _request_timeout_seconds()
+    if request_timeout > 0:
+        budget = min(budget, request_timeout)
+    return budget
 
 
 def _heavy_replay_stream_start_timeout_seconds() -> float:
@@ -1062,8 +1127,8 @@ def _same_deployment_retry_budget(exception: Exception) -> int:
 
     Left at zero, a single-route group turns a coin flip into a failed turn,
     because there is no sibling to advance to and the cooldown wait has nothing
-    to wait for.  One extra attempt turns it back into a coin flip, and after
-    that the ordinary failure accounting takes over.
+    to wait for.  Two extra attempts bring it from a coin flip to roughly one
+    failure in nine, and after that the ordinary failure accounting takes over.
     """
 
     configured = _same_deployment_retries()
@@ -1263,6 +1328,22 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
         # outlast the process that owns it, so the failure is terminal here.
         return _RECOVERY_POLICY_ERROR
 
+    if _is_upstream_unreachable_error(exception):
+        # Nothing was ever exchanged with this host: the handshake, the name
+        # lookup, or the response head never happened.  That is the one
+        # connectivity shape a sibling route answers instead, and the one a
+        # replay cannot disprove, so it outranks the generic network policy
+        # (``recovery``, which deliberately keeps a route that dropped a live
+        # body) and the slow-failure rule below -- an unreachable host is not
+        # slow, it is absent, and the turn learns nothing by waiting longer.
+        # Measured 2026-11-15: without this branch a dead route was selected
+        # first on every turn of that group, and it was recorded as
+        # ``recovery`` so no cooldown ever accrued.
+        return _recovery_policy_setting(
+            _RECOVERY_POLICY_UNREACHABLE_ENV,
+            _RECOVERY_POLICY_COOLDOWN,
+        )
+
     if _is_slow_failure(exception) and not (
         _is_context_size_error(exception)
         or _is_request_body_size_rejection_error(exception)
@@ -1401,7 +1482,7 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
         # ``upstream_route_failure`` after every other route had already
         # refused for its own reason.
         return _RECOVERY_POLICY_RECOVERY
-    if status_code in {400, 401, 403, 404, 405, 409, 422}:
+    if status_code in {400, 401, 404, 405, 409, 422}:
         return _recovery_policy_setting(
             _RECOVERY_POLICY_REQUEST_ERROR_ENV,
             _RECOVERY_POLICY_ERROR,
@@ -1749,7 +1830,10 @@ def _clean_deployment_cooldown_state(
         return None
     try:
         failures = int(cleaned.get("failures") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # ``int(inf)`` is an OverflowError, and JSON reads ``1e999`` as inf: one
+        # such entry made every shared cooldown update raise, so it could never
+        # be pruned either.
         failures = 0
     cleaned["failures"] = max(0, failures)
     cleaned["cooldown_until"] = cooldown_until
@@ -1768,8 +1852,7 @@ def _sync_deployment_cooldowns_from_shared_locked(
             expired_keys.append(cooldown_key)
             continue
         shared[cooldown_key] = cleaned
-        if cleaned is not state:
-            cooldowns[cooldown_key] = cleaned
+        cooldowns[cooldown_key] = cleaned
     for cooldown_key in expired_keys:
         cooldowns.pop(cooldown_key, None)
 
@@ -1793,7 +1876,7 @@ def _deployment_cooldown_update_shared(callback: Any) -> Any:
 
     try:
         return _state_module._locked_json_state_update(path, update)
-    except OSError:
+    except (OSError, sqlite3.Error):
         return None
 
 
@@ -1886,7 +1969,11 @@ def _prune_session_affinity_entries(
     return dict(keep)
 
 
-def _session_affinity_update_shared(callback: Any) -> Any:
+def _session_affinity_update_shared(
+    callback: Any,
+    *,
+    read_only: bool = False,
+) -> Any:
     """Run ``callback(entries, now)`` against worker-shared affinity state."""
 
     path = _state_module._session_deployment_affinity_file_path()
@@ -1906,8 +1993,10 @@ def _session_affinity_update_shared(callback: Any) -> Any:
         return result
 
     try:
-        return _state_module._locked_json_state_update(path, update)
-    except OSError:
+        return _state_module._locked_json_state_update(
+            path, update, read_only=read_only
+        )
+    except (OSError, sqlite3.Error):
         return None
 
 
@@ -1981,7 +2070,7 @@ def _session_affinity_deployment_id(
             return (deployment_id,)
         return (None,)
 
-    result = _session_affinity_update_shared(lookup)
+    result = _session_affinity_update_shared(lookup, read_only=True)
     if isinstance(result, tuple):
         return result[0]
     with _SESSION_DEPLOYMENT_AFFINITY_LOCK:
@@ -2288,8 +2377,7 @@ def _sync_codex_compaction_capabilities_from_shared_locked(
             states.pop(cache_key, None)
             continue
         shared[cache_key] = cleaned
-        if cleaned is not state:
-            states[cache_key] = cleaned
+        states[cache_key] = cleaned
     with _CODEX_COMPACTION_CAPABILITY_LOCK:
         _CODEX_COMPACTION_CAPABILITIES.clear()
         _CODEX_COMPACTION_CAPABILITIES.update(
@@ -2312,7 +2400,7 @@ def _codex_compaction_capability_update_shared(callback: Any) -> Any:
 
     try:
         return _state_module._locked_json_state_update(path, update)
-    except OSError:
+    except (OSError, sqlite3.Error):
         return None
 
 
@@ -2744,8 +2832,7 @@ def _sync_image_generation_tool_unsupported_from_shared_locked(
             states.pop(cache_key, None)
             continue
         shared[cache_key] = cleaned
-        if cleaned is not state:
-            states[cache_key] = cleaned
+        states[cache_key] = cleaned
     with _IMAGE_GENERATION_TOOL_UNSUPPORTED_LOCK:
         _IMAGE_GENERATION_TOOL_UNSUPPORTED.clear()
         _IMAGE_GENERATION_TOOL_UNSUPPORTED.update(
@@ -2768,7 +2855,7 @@ def _image_generation_tool_unsupported_update_shared(callback: Any) -> Any:
 
     try:
         return _state_module._locked_json_state_update(path, update)
-    except OSError:
+    except (OSError, sqlite3.Error):
         return None
 
 
@@ -3016,8 +3103,7 @@ def _sync_web_search_tool_unsupported_from_shared_locked(
             states.pop(cache_key, None)
             continue
         shared[cache_key] = cleaned
-        if cleaned is not state:
-            states[cache_key] = cleaned
+        states[cache_key] = cleaned
     with _WEB_SEARCH_TOOL_UNSUPPORTED_LOCK:
         _WEB_SEARCH_TOOL_UNSUPPORTED.clear()
         _WEB_SEARCH_TOOL_UNSUPPORTED.update(
@@ -3040,7 +3126,7 @@ def _web_search_tool_unsupported_update_shared(callback: Any) -> Any:
 
     try:
         return _state_module._locked_json_state_update(path, update)
-    except OSError:
+    except (OSError, sqlite3.Error):
         return None
 
 
@@ -3482,8 +3568,7 @@ def _sync_reasoning_parameters_compat_from_shared_locked(
             states.pop(cache_key, None)
             continue
         shared[cache_key] = cleaned
-        if cleaned is not state:
-            states[cache_key] = cleaned
+        states[cache_key] = cleaned
     with _REASONING_PARAMETERS_COMPAT_LOCK:
         _REASONING_PARAMETERS_COMPAT.clear()
         _REASONING_PARAMETERS_COMPAT.update(
@@ -3491,7 +3576,11 @@ def _sync_reasoning_parameters_compat_from_shared_locked(
         )
 
 
-def _reasoning_parameters_compat_update_shared(callback: Any) -> Any:
+def _reasoning_parameters_compat_update_shared(
+    callback: Any,
+    *,
+    read_only: bool = False,
+) -> Any:
     path = _deployment_cooldown_file_path()
     if not path:
         return None
@@ -3505,8 +3594,10 @@ def _reasoning_parameters_compat_update_shared(callback: Any) -> Any:
         return result, now
 
     try:
-        return _state_module._locked_json_state_update(path, update)
-    except OSError:
+        return _state_module._locked_json_state_update(
+            path, update, read_only=read_only
+        )
+    except (OSError, sqlite3.Error):
         return None
 
 
@@ -3539,7 +3630,7 @@ def _reasoning_parameters_compat_cached(
             return None
         return state
 
-    result = _reasoning_parameters_compat_update_shared(read)
+    result = _reasoning_parameters_compat_update_shared(read, read_only=True)
     state = result[0] if isinstance(result, tuple) else None
     if state is None:
         with _REASONING_PARAMETERS_COMPAT_LOCK:
@@ -3623,7 +3714,7 @@ def _record_reasoning_parameters_compat(
     result = _reasoning_parameters_compat_update_shared(record)
     if result is None:
         with _REASONING_PARAMETERS_COMPAT_LOCK:
-            _REASONING_PARAMETERS_COMPAT.setdefault(cache_key, state.copy())
+            _REASONING_PARAMETERS_COMPAT[cache_key] = state.copy()
     _trace_module._route_trace(
         "reasoning_parameters_compat_recorded",
         request_id=_trace_request_id(request_kwargs),
@@ -3722,8 +3813,7 @@ def _sync_protocol_fallbacks_from_shared_locked(
             expired_keys.append(cache_key)
             continue
         shared[cache_key] = cleaned
-        if cleaned is not state:
-            fallbacks[cache_key] = cleaned
+        fallbacks[cache_key] = cleaned
     for cache_key in expired_keys:
         fallbacks.pop(cache_key, None)
     with _PROTOCOL_FALLBACK_LOCK:
@@ -3731,7 +3821,11 @@ def _sync_protocol_fallbacks_from_shared_locked(
         _PROTOCOL_FALLBACKS.update({key: value.copy() for key, value in shared.items()})
 
 
-def _protocol_fallback_update_shared(callback: Any) -> Any:
+def _protocol_fallback_update_shared(
+    callback: Any,
+    *,
+    read_only: bool = False,
+) -> Any:
     path = _deployment_cooldown_file_path()
     if not path:
         return None
@@ -3745,8 +3839,10 @@ def _protocol_fallback_update_shared(callback: Any) -> Any:
         return result, now
 
     try:
-        return _state_module._locked_json_state_update(path, update)
-    except OSError:
+        return _state_module._locked_json_state_update(
+            path, update, read_only=read_only
+        )
+    except (OSError, sqlite3.Error):
         return None
 
 
@@ -3924,13 +4020,16 @@ def _protocol_fallback_cached_surface(
             return None
         return state
 
-    result = _protocol_fallback_update_shared(read)
+    result = _protocol_fallback_update_shared(read, read_only=True)
     state = result[0] if isinstance(result, tuple) else None
     if state is None:
         with _PROTOCOL_FALLBACK_LOCK:
             state = _clean_protocol_fallback_state(
                 _PROTOCOL_FALLBACKS.get(cache_key), now=time.time()
             )
+            if state is not None and state.get("fallback_surface") != configured_surface:
+                _PROTOCOL_FALLBACKS.pop(cache_key, None)
+                state = None
     if not isinstance(state, dict):
         return ""
     fallback_surface = _normalized_request_surface(state.get("fallback_surface"))
@@ -4194,8 +4293,14 @@ def _usage_summary(response_obj: Any, request_kwargs: dict[str, Any]) -> dict[st
             ("input_tokens", "input_tokens"),
             ("output_tokens", "output_tokens"),
         ):
-            value = usage.get(source_key)
-            if isinstance(value, int):
+            # A count spelled as text is read like the cache counts beside it;
+            # a reported zero stays a zero rather than an empty cell, and a
+            # flag is not a count.
+            raw = usage.get(source_key)
+            if raw is None or isinstance(raw, bool):
+                continue
+            value = _usage_int(raw)
+            if value or isinstance(raw, (int, float)):
                 result[target_key] = value
         input_tokens = _usage_int(result.get("input_tokens", result.get("prompt_tokens")))
         cached, written = _usage_cache_counts(usage, input_tokens)
@@ -4455,6 +4560,10 @@ def _request_log_record(
         or _event_time(start_time)
         or _event_time(request_started_at)
     )
+    completion_start_time, ttft_source = _completion_start_time(
+        request_kwargs,
+        end_time,
+    )
 
     record: dict[str, Any] = {
         "ts": request_timestamp
@@ -4465,14 +4574,10 @@ def _request_log_record(
             request_kwargs,
             start_time,
             end_time,
+            (completion_start_time, ttft_source),
         ),
-        "time_to_first_token_source": _completion_start_time(
-            request_kwargs,
-            end_time,
-        )[1],
-        "first_stream_output_at": _event_time(
-            _completion_start_time(request_kwargs, end_time)[0]
-        ),
+        "time_to_first_token_source": ttft_source,
+        "first_stream_output_at": _event_time(completion_start_time),
         "call_type": _state_module._safe_log_text(request_kwargs.get("call_type"), limit=80),
         # The two wires this turn used: what the client called in on, and what
         # the request actually left on.  The outbound name is the adapted wire
@@ -4661,18 +4766,6 @@ def _deployment_cooldown_keys(
     return []
 
 
-def _deployment_cooldown_keys_for_request(
-    *,
-    deployment_id: Optional[str],
-    route_key: Optional[str],
-    request_kwargs: Optional[dict],
-) -> list[str]:
-    return _deployment_cooldown_keys(
-        deployment_id=deployment_id,
-        route_key=route_key,
-    )
-
-
 def _deployment_cooldown_key_from_request(request_kwargs: Optional[dict]) -> Optional[str]:
     return _deployment_cooldown_key(
         deployment_id=_deployment_id_from_request(request_kwargs),
@@ -4688,10 +4781,9 @@ def _deployment_cooldown_key_from_deployment(deployment: Any) -> Optional[str]:
 
 
 def _deployment_cooldown_keys_from_request(request_kwargs: Optional[dict]) -> list[str]:
-    return _deployment_cooldown_keys_for_request(
+    return _deployment_cooldown_keys(
         deployment_id=_deployment_id_from_request(request_kwargs),
         route_key=_deployment_route_key_from_request(request_kwargs),
-        request_kwargs=request_kwargs,
     )
 
 
@@ -4777,14 +4869,7 @@ def _normalized_deployment_surface(value: Any) -> str:
 
 
 def _normalized_request_surface(value: Any) -> str:
-    surface = _normalized_deployment_surface(value)
-    if surface in {
-        _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES,
-        _UPSTREAM_URL_SURFACE_OPENAI_CHAT,
-        _UPSTREAM_URL_SURFACE_ANTHROPIC,
-    }:
-        return surface
-    return ""
+    return _normalized_deployment_surface(value)
 
 
 def _request_current_upstream_surface(request_kwargs: Optional[dict]) -> str:
@@ -5287,9 +5372,17 @@ def _with_active_model_concurrency(
     whether anything was filtered.  An empty first list is returned as an empty
     list: the caller decides what a pool with no free slot means, because a
     group that has only one route still has to be served by it.
+
+    The cap governs streaming turns, which can be held open with keepalives
+    while they wait.  A non-streaming request has no such window -- its caller
+    is blocked on one answer with a client-side timeout it did not choose --
+    so it is admitted to the route as it stands rather than queued behind a
+    slot that may free after its own deadline.
     """
 
     if not deployments or not isinstance(deployments, list):
+        return deployments, [], False
+    if not isinstance(request_kwargs, dict) or request_kwargs.get("stream") is not True:
         return deployments, [], False
     counts = _concurrency_module.counts()
     if counts is None:
@@ -5912,11 +6005,6 @@ def _selected_deployment_request_marker(deployment: Any) -> Optional[dict]:
         model_group = deployment.get(key)
         if isinstance(model_group, str) and model_group.strip():
             model_info.setdefault("model_group", model_group.strip())
-    request_params = {
-        key: value
-        for key, value in litellm_params.items()
-        if key in {"api_key"}
-    }
     litellm_params = {
         key: value
         for key, value in litellm_params.items()
@@ -5932,7 +6020,6 @@ def _selected_deployment_request_marker(deployment: Any) -> Optional[dict]:
     return {
         "model_info": model_info,
         "litellm_params": litellm_params,
-        "request_params": request_params,
     }
 
 
@@ -5987,13 +6074,10 @@ def _apply_selected_deployment_marker_to_request(
         request_kwargs[_REQUEST_LOG_ID_KEY] = pending_request_id.strip()
     model_info = marker.get("model_info")
     litellm_params = marker.get("litellm_params")
-    request_params = marker.get("request_params")
     if not isinstance(model_info, dict) or not model_info:
         return False
     if not isinstance(litellm_params, dict):
         litellm_params = {}
-    if not isinstance(request_params, dict):
-        request_params = {}
 
     selected_model_info = model_info.copy()
     selected_litellm_params = litellm_params.copy()
@@ -6691,12 +6775,17 @@ def _quota_reset_absolute_seconds(text: str) -> Optional[float]:
         else:
             offset_hours, offset_minutes = digits, "0"
         try:
-            delta = timedelta(
-                hours=int(offset_hours or 0), minutes=int(offset_minutes or 0)
+            tzinfo = timezone(
+                sign
+                * timedelta(hours=int(offset_hours or 0), minutes=int(offset_minutes or 0))
             )
         except ValueError:
-            delta = timedelta(0)
-        tzinfo = timezone(sign * delta)
+            # Not an offset a clock can have (a day or more): the digits after
+            # the time were something else, so the stamp is read as UTC, the
+            # way it is when no offset is written.  ``timezone`` is what
+            # refuses it, and it used to sit below this handler -- so upstream
+            # text with such a token raised out of error classification.
+            tzinfo = timezone.utc
     try:
         reset_at = datetime(
             int(match.group(1)),
@@ -6899,6 +6988,67 @@ def _exception_indicates_network_connectivity_error(exception: Exception) -> boo
 
 
 _NETWORK_CONNECTIVITY_MARKER_ATTR = "_young_router_network_connectivity"
+
+#: Failures that mean the upstream was never reached at all.  Deliberately
+#: narrower than ``_exception_indicates_network_connectivity_error``: that table
+#: also holds "connection reset", "connection closed" and "stream ended", which
+#: describe a body this proxy had already been handed, and those must keep the
+#: network policy (keep the route, another attempt may resume).  Only wording
+#: that can appear before a single byte of response travelled belongs here.
+_UPSTREAM_UNREACHABLE_ERROR_MARKERS = (
+    "cannot connect to host",
+    "connect call failed",
+    "failed to connect",
+    "connection refused",
+    "connect timeout",
+    "connecttimeout",
+    "connection timed out",
+    "network is unreachable",
+    "network unreachable",
+    "no route to host",
+    "temporary failure in name resolution",
+    "name or service not known",
+    "nodename nor servname provided",
+)
+
+
+def _is_upstream_unreachable_error(exception: Exception) -> bool:
+    """Whether this attempt never reached the upstream it was addressed to.
+
+    ``_is_network_recovery_exception`` answers a different question -- "should
+    the client's stream stay open while another attempt runs" -- and it is true
+    for a dropped body as well.  This one answers "was this host ever there",
+    and only the connect-phase shapes qualify: DNS, the handshake, the TLS
+    exchange, and the wait for the response head.  A route that answered and
+    then dropped, reset, or truncated keeps the network policy.
+    """
+
+    if _is_local_shutdown_exception(exception):
+        return False
+    if _is_ssl_verification_error(exception):
+        # A certificate this proxy rejected is a configuration answer, not an
+        # outage: the host is reachable and the route needs its certificate or
+        # its hostname fixed before a replay can mean anything.
+        return False
+
+    pending = [exception]
+    seen: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        candidate_id = id(candidate)
+        if candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        text = _exception_text(candidate)
+        if text and any(
+            marker in text for marker in _UPSTREAM_UNREACHABLE_ERROR_MARKERS
+        ):
+            return True
+        for attr in ("__cause__", "__context__", "original_exception"):
+            nested = getattr(candidate, attr, None)
+            if isinstance(nested, Exception) and id(nested) not in seen:
+                pending.append(nested)
+    return False
 
 
 def _is_network_recovery_exception(exception: Exception) -> bool:
@@ -7978,10 +8128,6 @@ def _is_priority_deployment_failover_error(exception: Exception) -> bool:
         return False
     if _is_image_generation_tool_runtime_fallback_error(exception):
         return True
-    if _is_model_concurrency_rejection_error(exception):
-        # A sibling deployment holds a different cap, so this attempt advances
-        # instead of ending the turn on the route that happened to be full.
-        return True
     if _is_upstream_surface_failover_error(exception):
         return True
     if getattr(exception, "stream_incomplete", False):
@@ -8081,15 +8227,6 @@ def _exception_indicates_timeout_or_long_wait(exception: Exception) -> bool:
     return False
 
 
-def _should_count_deployment_failure_for_cooldown(
-    exception: Exception,
-    request_kwargs: Optional[dict] = None,
-) -> bool:
-    if _is_sanitized_upstream_route_failure_error(exception):
-        return False
-    return _recovery_policy_for_exception(exception) == _RECOVERY_POLICY_COOLDOWN
-
-
 def _cooldown_failure_declined(
     exception: Exception,
     request_kwargs: Optional[dict],
@@ -8113,6 +8250,25 @@ def _cooldown_failure_declined(
         reason=reason,
         exception=_trace_exception(exception),
     )
+
+
+def _should_count_deployment_failure_for_cooldown(
+    exception: Exception,
+    request_kwargs: Optional[dict] = None,
+) -> bool:
+    """The classification the cooldown gate applies, as a question.
+
+    Production reaches this answer inside
+    ``_record_deployment_failure_for_cooldown``, which also records *why* a
+    failure was declined; the tests ask it directly so one case can name the
+    classification without standing up a whole request.  It is the same two
+    conditions, kept here rather than duplicated in each test.
+    """
+
+    del request_kwargs
+    if _is_sanitized_upstream_route_failure_error(exception):
+        return False
+    return _recovery_policy_for_exception(exception) == _RECOVERY_POLICY_COOLDOWN
 
 
 def _record_deployment_failure_for_cooldown(
@@ -8145,7 +8301,9 @@ def _record_deployment_failure_for_cooldown(
             exception, request_kwargs, f"policy:{recovery_policy}"
         )
         return
-    if getattr(exception, _DEPLOYMENT_COOLDOWN_FAILURE_RECORDED_ATTR, False):
+    if not force and getattr(
+        exception, _DEPLOYMENT_COOLDOWN_FAILURE_RECORDED_ATTR, False
+    ):
         _cooldown_failure_declined(
             exception, request_kwargs, "already_recorded_for_this_attempt"
         )
@@ -8166,10 +8324,9 @@ def _record_deployment_failure_for_cooldown(
     route_key = _responses_execution_module._failed_deployment_route_key(exception) or _deployment_route_key_from_request(
         request_kwargs
     )
-    cooldown_keys = _deployment_cooldown_keys_for_request(
+    cooldown_keys = _deployment_cooldown_keys(
         deployment_id=deployment_id,
         route_key=route_key,
-        request_kwargs=request_kwargs,
     )
     if not cooldown_keys:
         _cooldown_failure_declined(
@@ -9264,7 +9421,7 @@ def _sanitized_upstream_route_failure_message(
         )
     status_code = _exception_status_code(exception)
     relay_message = _upstream_relay_capacity_message(exception)
-    if _is_upstream_relay_capacity_error(exception):
+    if relay_message is not None:
         reason = "upstream relay channel unavailable"
     elif _is_upstream_deployment_failover_error(exception):
         reason = "upstream auth or balance error"
@@ -9443,11 +9600,7 @@ def _raise_sanitized_upstream_route_failure(
         excluded_deployment_ids=(request_kwargs or {}).get("_excluded_deployment_ids"),
         exception=_trace_exception(exception),
         upstream_relay_message=_upstream_relay_capacity_message(exception),
-        client_message=_sanitized_upstream_route_failure_message(
-            model,
-            exception,
-            request_kwargs,
-        ),
+        client_message=_sanitized_failure_sentence(sanitized),
     )
     raise sanitized from exception
 
@@ -9904,8 +10057,8 @@ def _is_upstream_request_shape_rejected_error(exception: Exception) -> bool:
     unsupported, the deployment refusing parameters its validator does not
     know, and a gateway answering with its own HTML 400 -- and all three are a
     verdict on the shape of what was sent, never on the conversation.  Grouped
-    so the terminal event can say which of the two it is instead of telling the
-    reader the router could not classify a refusal it had just named.
+    so the terminal event can say which of the three it is instead of telling
+    the reader the router could not classify a refusal it had just named.
     """
 
     return (

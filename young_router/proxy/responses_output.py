@@ -266,13 +266,13 @@ def _response_item_set(item: Any, key: str, value: Any) -> None:
             pass
 
 
-def _responses_custom_tool_item_id(value: Any, *, output: bool = False) -> Any:
+def _responses_custom_tool_item_id(value: Any) -> Any:
     if not isinstance(value, str) or not value:
         return value
-    expected_prefix = "ctco_" if output else "ctc_"
+    expected_prefix = "ctc_"
     if value.startswith(expected_prefix):
         return value
-    replaced_prefix = "fco_" if output else "fc_"
+    replaced_prefix = "fc_"
     suffix = value[len(replaced_prefix) :] if value.startswith(replaced_prefix) else value
     return f"{expected_prefix}{suffix}"
 
@@ -578,19 +578,6 @@ def _stream_function_arguments_event_item_id(event: Any) -> Optional[str]:
     return None
 
 
-def _response_event_set(event: Any, key: str, value: Any) -> None:
-    if isinstance(event, dict):
-        event[key] = value
-        return
-    try:
-        setattr(event, key, value)
-    except Exception:
-        try:
-            event.__dict__[key] = value
-        except Exception:
-            pass
-
-
 def _normalize_custom_tool_input_event(
     event: Any,
     custom_tool_item_ids: set[str],
@@ -611,7 +598,7 @@ def _normalize_custom_tool_input_event(
     if raw_item_id != item_id:
         for key in ("item_id", "id"):
             if _web_search_native_module._response_item_get(converted, key) == raw_item_id:
-                _response_event_set(converted, key, item_id)
+                _response_item_set(converted, key, item_id)
     if event_type.endswith(".delta"):
         delta = _web_search_native_module._response_item_get(event, "delta")
         if not isinstance(delta, str) or not item_id:
@@ -619,8 +606,8 @@ def _normalize_custom_tool_input_event(
         input_delta = input_delta_tracker.append_arguments_delta(item_id, delta)
         if not input_delta:
             return None
-        _response_event_set(converted, "type", "response.custom_tool_call_input.delta")
-        _response_event_set(converted, "delta", input_delta)
+        _response_item_set(converted, "type", "response.custom_tool_call_input.delta")
+        _response_item_set(converted, "delta", input_delta)
         return converted
 
     arguments = _web_search_native_module._response_item_get(event, "arguments")
@@ -628,8 +615,8 @@ def _normalize_custom_tool_input_event(
         return None
     input_text = _custom_tool_input_from_chat_arguments(arguments)
     input_delta_tracker.complete_arguments(item_id, arguments)
-    _response_event_set(converted, "type", "response.custom_tool_call_input.done")
-    _response_event_set(converted, "input", input_text)
+    _response_item_set(converted, "type", "response.custom_tool_call_input.done")
+    _response_item_set(converted, "input", input_text)
     if isinstance(converted, dict):
         converted.pop("arguments", None)
     else:
@@ -701,17 +688,41 @@ def _streaming_completion_message(response: Any) -> Any:
     return None
 
 
+#: What a message must carry to be worth an output item.  The chunk guard below
+#: and the terminal-done guard here answer one question -- does this message
+#: hold anything a client renders -- so they read one list.  They used to keep
+#: two: ``thinking_blocks`` and ``annotations`` opened an item and then were
+#: not counted when the finished message was judged empty, which left a blank
+#: activity row nobody could see the cause of.
+_MESSAGE_OUTPUT_PAYLOAD_KEYS = (
+    "content",
+    "reasoning_content",
+    "thinking_blocks",
+    "tool_calls",
+    "function_call",
+    "annotations",
+)
+
+
+def _payload_carries_output(payload: Any) -> bool:
+    """Whether one delta/message holds anything worth an output item."""
+
+    for key in _MESSAGE_OUTPUT_PAYLOAD_KEYS:
+        value = _web_search_native_module._response_item_get(payload, key)
+        if isinstance(value, str):
+            if value:
+                return True
+        elif value not in (None, "", [], {}):
+            return True
+    return False
+
+
 def _streaming_completion_should_skip_empty_message_events(response: Any) -> bool:
     message = _streaming_completion_message(response)
     if message is None or _payload_has_visible_text(message):
         return False
 
-    message_payload = _streaming_module._jsonable(message)
-    return bool(
-        _web_search_native_module._response_item_get(message_payload, "tool_calls")
-        or _web_search_native_module._response_item_get(message_payload, "function_call")
-        or _web_search_native_module._response_item_get(message_payload, "reasoning_content")
-    )
+    return _payload_carries_output(_streaming_module._jsonable(message))
 
 
 def _chat_completion_chunk_has_output_payload(chunk: Any) -> bool:
@@ -728,21 +739,7 @@ def _chat_completion_chunk_has_output_payload(chunk: Any) -> bool:
     delta = _web_search_native_module._response_item_get(choices[0], "delta")
     if delta is None:
         return False
-    for key in (
-        "content",
-        "reasoning_content",
-        "thinking_blocks",
-        "tool_calls",
-        "function_call",
-        "annotations",
-    ):
-        value = _web_search_native_module._response_item_get(delta, key)
-        if isinstance(value, str):
-            if value:
-                return True
-        elif value not in (None, "", [], {}):
-            return True
-    return False
+    return _payload_carries_output(delta)
 
 
 def _normalize_tool_search_output_item_event(
@@ -833,6 +830,16 @@ def _normalize_response_stream_tool_bridge_chunk(
     return chunk
 
 
+class _PendingToolSearchNormalizationState:
+    """Bookkeeping that has to outlive one queue-normalization pass."""
+
+    def __init__(self) -> None:
+        self.custom_tool_item_ids: set[str] = set()
+        self.input_delta_tracker = _CustomToolInputDeltaTracker()
+        self.done_item_ids: set[str] = set()
+        self.last_event: Any = None
+
+
 def _normalize_pending_tool_search_events(
     iterator: Any,
     namespace_by_name: Optional[dict[str, str]] = None,
@@ -851,21 +858,39 @@ def _normalize_pending_tool_search_events(
             getattr(iterator, "request_input", None),
             getattr(iterator, "responses_api_request", None),
         )
-    custom_tool_item_ids: set[str] = set()
-    input_delta_tracker = _CustomToolInputDeltaTracker()
+    state = getattr(iterator, "_pending_tool_search_normalization_state", None)
+    if not isinstance(state, _PendingToolSearchNormalizationState):
+        state = _PendingToolSearchNormalizationState()
+        try:
+            iterator._pending_tool_search_normalization_state = state
+        except Exception:
+            # Without a place to keep the cursor the whole queue is re-walked
+            # below; a fresh tracker still covers the current call.
+            pass
+    start = 0
+    if state.last_event is not None:
+        for index in range(len(pending) - 1, -1, -1):
+            if pending[index] is state.last_event:
+                start = index + 1
+                break
     normalized_pending: List[Any] = []
-    for event in pending:
+    for event in pending[start:]:
         normalized = _normalize_response_stream_tool_bridge_chunk(
             event,
             namespace_by_name,
             custom_tool_names,
-            custom_tool_item_ids,
-            input_delta_tracker,
+            state.custom_tool_item_ids,
+            state.input_delta_tracker,
         )
         if normalized is not None:
             normalized_pending.append(normalized)
-    pending[:] = normalized_pending
-    _append_missing_pending_tool_search_done_events(pending)
+    pending[start:] = normalized_pending
+    _append_missing_pending_tool_search_done_events(
+        pending,
+        pending[start:],
+        state.done_item_ids,
+    )
+    state.last_event = pending[-1] if pending else None
 
 
 def _release_completed_web_search_events(iterator: Any) -> None:
@@ -943,7 +968,7 @@ def _first_answer_frame_index(pending: list[Any]) -> int:
     """Where the answer starts, so a search can be placed ahead of it.
 
     Everything a provider says before the answer -- its reasoning item and that
-    item's summary frames -- stays in front: those describe how the search was
+    item's text frames -- stays in front: those describe how the search was
     decided, and the client renders them in the ``output_index`` order the
     provider itself assigned.
     """
@@ -952,7 +977,7 @@ def _first_answer_frame_index(pending: list[Any]) -> int:
         if _response_item_is_reasoning_output_event(event):
             continue
         if _response_event_type(event).startswith(
-            "response.reasoning_summary"
+            ("response.reasoning_summary", "response.reasoning_text")
         ):
             continue
         return index
@@ -1007,10 +1032,16 @@ def _response_item_is_web_search_output_event(event: Any) -> bool:
 
 
 
-def _append_missing_pending_tool_search_done_events(pending: list[Any]) -> None:
+def _append_missing_pending_tool_search_done_events(
+    pending: list[Any],
+    events: Optional[list[Any]] = None,
+    done_item_ids: Optional[set[str]] = None,
+) -> None:
     added: dict[str, tuple[int, dict[str, Any]]] = {}
-    done_ids: set[str] = set()
-    for event in pending:
+    done_ids = done_item_ids if done_item_ids is not None else set()
+    if events is None:
+        events = pending
+    for event in events:
         event_type = _web_search_native_module._response_item_get(event, "type")
         item = _web_search_native_module._response_item_get(event, "item")
         item_type = _web_search_native_module._response_item_get(item, "type")
@@ -1041,6 +1072,7 @@ def _append_missing_pending_tool_search_done_events(pending: list[Any]) -> None:
                 "item": done_item,
             }
         )
+        done_ids.update(_streaming_module._stream_output_item_identity_keys(done_item))
 
 
 # ---------------------------------------------------------------------------

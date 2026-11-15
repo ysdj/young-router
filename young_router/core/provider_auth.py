@@ -93,7 +93,6 @@ class ProviderAuthManager:
         self._lock = threading.RLock()
         self._states: dict[str, dict[str, Any]] = {}
         self._threads: dict[str, threading.Thread] = {}
-        self._cancel: set[str] = set()
         # One sign-in attempt per credential profile is current; every other
         # attempt for that profile is stale and must stop writing.  The number
         # is the generation, not a flag: LiteLLM's device-code poll cannot be
@@ -220,13 +219,23 @@ class ProviderAuthManager:
         except FileNotFoundError:
             pass
 
-    def active_openai_ref(self) -> str:
-        """Return the account selected for the single ChatGPT proxy slot."""
+    def active_openai_ref(
+        self, known_ref: str = "", known_auth: Mapping[str, Any] | None = None
+    ) -> str:
+        """Return the account selected for the single ChatGPT proxy slot.
+
+        ``status`` passes the credential it has just read; reading that same
+        file again only to learn whether it is the active one doubles the I/O
+        for every projected provider row.
+        """
 
         active = self._read_active_openai_ref()
         if active:
-            auth_file = self._secure_chatgpt_auth_file(active)
-            auth = read_json(auth_file)
+            if active == known_ref and known_auth is not None:
+                auth = known_auth
+            else:
+                auth_file = self._secure_chatgpt_auth_file(active)
+                auth = read_json(auth_file)
             if isinstance(auth, dict) and isinstance(auth.get("access_token"), str) and auth.get("access_token"):
                 return active
             self._clear_active_openai_ref(active)
@@ -280,15 +289,16 @@ class ProviderAuthManager:
                 # The id token already states it; nothing else is read from it.
                 account = _chatgpt_account_identity(auth)
                 identity = {"account": account} if account else {}
+                active = self.active_openai_ref(ref, auth) == ref
                 if isinstance(expires_at, (int, float)) and time.time() >= float(expires_at):
-                    return {"status": "expired", "configured": True, "active": self.active_openai_ref() == ref, "expires_at": expires_at, **identity}
-                return {"status": "signed_in", "configured": True, "active": self.active_openai_ref() == ref, "expires_at": expires_at, **identity}
+                    return {"status": "expired", "configured": True, "active": active, "expires_at": expires_at, **identity}
+                return {"status": "signed_in", "configured": True, "active": active, "expires_at": expires_at, **identity}
             with self._lock:
                 state = dict(self._states.get(ref, {}))
             result: dict[str, Any] = {
                 "status": state.get("status", "signed_out") if state.get("status") in _SAFE_STATUS else "signed_out",
                 "configured": False,
-                "active": self.active_openai_ref() == ref,
+                "active": self.active_openai_ref(ref, auth) == ref,
             }
             if state.get("status") == "authorizing":
                 # Device-code issuance is asynchronous, so this projection is
@@ -319,7 +329,6 @@ class ProviderAuthManager:
             # superseded worker now goes stale instead of blocking the new one.
             generation = self._attempts.get(ref, 0) + 1
             self._attempts[ref] = generation
-            self._cancel.discard(ref)
             self._set_state(ref, kind=kind, status="authorizing", configured=False, last_error="")
             thread = threading.Thread(
                 target=self._run_chatgpt,
@@ -334,7 +343,6 @@ class ProviderAuthManager:
     def cancel(self, credential_ref: str) -> dict[str, Any]:
         ref = self._cancel_ref(credential_ref)
         with self._lock:
-            self._cancel.add(ref)
             # Cancelling supersedes the attempt: a worker that asked to poll
             # before this point must not write the credential it obtains, and
             # must not overwrite the signed-out state this call stores.
@@ -418,13 +426,19 @@ class ProviderAuthManager:
             record = auth._build_auth_record(tokens)
             if not isinstance(record, dict) or not isinstance(record.get("access_token"), str) or not record["access_token"]:
                 raise ValueError("ChatGPT login returned an invalid token record")
+            # The credential and the account slot it names are written in one
+            # critical section, and the slot is claimed only while this attempt
+            # is still current: a cancel landing between the two writes would
+            # otherwise select the account the person just cancelled.
             with self._lock:
                 if self._attempts.get(ref, 0) != generation:
                     return
                 atomic_write_json(auth_file, record, mode=0o600)
-            self._secure_chatgpt_auth_file(ref)
-            if not self.active_openai_ref():
-                self._write_active_openai_ref(ref)
+                self._secure_chatgpt_auth_file(ref)
+                if self._attempts.get(ref, 0) != generation:
+                    return
+                if not self.active_openai_ref():
+                    self._write_active_openai_ref(ref)
             if not current():
                 return
             self._set_state(ref, kind="openai_login", status="signed_in", configured=True, expires_at=record.get("expires_at"), user_code="", verification_uri="")
@@ -436,5 +450,4 @@ class ProviderAuthManager:
             with self._lock:
                 if self._threads.get(ref) is threading.current_thread():
                     self._threads.pop(ref, None)
-                    self._cancel.discard(ref)
 

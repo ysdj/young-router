@@ -311,7 +311,12 @@ def _image_metadata_contract(value: Mapping[str, Any]) -> dict[str, Any]:
         item = value.get(key)
         if isinstance(item, str) and item.strip():
             metadata[key] = item.strip()
-    input_limits = value.get("inputLimits")
+    # A stored contract carries the snake-case key written below, while the
+    # catalog record it was derived from states ``inputLimits``; reading only
+    # one spelling drops the limits on the next cache reload.
+    input_limits = value.get("input_limits")
+    if input_limits is None and "inputLimits" in value:
+        input_limits = value.get("inputLimits")
     if isinstance(input_limits, Mapping):
         safe_limits: dict[str, Any] = {}
         for key, item in list(input_limits.items())[:16]:
@@ -562,7 +567,7 @@ def _merge_records(target: dict[str, dict[str, Any]], incoming: Mapping[str, Map
             continue
 
         merged = dict(current)
-        if priority >= (current_priority or 0) and record.get("context_known", True):
+        if priority >= (current_priority or 0):
             merged.update(record)
 
         # A hard-limit source can win the context fields while carrying no
@@ -814,20 +819,12 @@ class RecordLookupIndex(dict):
             return {}
         self.image_records()
         tails = self.image_tails or {}
-        positions = self.record_position_index()
         matched: dict[str, tuple[int, int]] = {}
         for candidate in candidates:
             tail = candidate.rsplit("/", 1)[-1]
             for position, key, priority in tails.get(tail, ()):
                 if key not in matched and (key == candidate or key.endswith(f"/{candidate}")):
                     matched[key] = (priority, position)
-            if candidate in matched:
-                continue
-            exact = self.get(candidate)
-            if isinstance(exact, Mapping) and isinstance(exact.get("image_model_metadata"), Mapping):
-                position = positions.get(candidate)
-                if position is not None:
-                    matched[candidate] = (_positive_int(exact.get("priority")) or 0, position)
         return matched
 
 
@@ -875,6 +872,13 @@ def _consensus_reasoning(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]
     if not capabilities:
         return {}
 
+    defaults = {
+        capability.default_level
+        for capability in capabilities
+        if capability.default_level is not None
+    }
+    agreed_default = defaults.pop() if len(defaults) == 1 else None
+
     agreed: dict[str, Any] = {}
     reasoning_values = {capability.reasoning for capability in capabilities}
     if len(reasoning_values) == 1:
@@ -901,16 +905,20 @@ def _consensus_reasoning(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]
         ]
         if levels:
             agreed["supported_reasoning_levels"] = levels
+        if agreed_default is not None and agreed_default in levels:
+            agreed["default_reasoning_level"] = agreed_default
         return agreed
 
     ladder: dict[str, Any] = {}
     served_any = False
+    served_levels: set[str] = set()
     for level in _CODEX_REASONING_LEVELS:
         serving = [capability for capability in mapped if level in capability.supported_levels]
         if len(serving) * 2 <= len(mapped):
             ladder[level] = None
             continue
         served_any = True
+        served_levels.add(level)
         values = [
             (capability.thinking_level_map or {}).get(level) for capability in serving
         ]
@@ -925,6 +933,10 @@ def _consensus_reasoning(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]
         # record it already selected rather than this merge.
         return {}
     agreed["thinking_level_map"] = ladder
+    # The selected record's default is replaced along with its ladder, so keep
+    # the one every copy agrees on when the merged ladder still serves it.
+    if agreed_default is not None and agreed_default in served_levels:
+        agreed["default_reasoning_level"] = agreed_default
     return agreed
 
 
@@ -974,9 +986,13 @@ def _lookup(records: Mapping[str, Mapping[str, Any]], model_id: str) -> dict[str
         selected["max_context_window"] = maximum
         selected["effective_context_window_percent"] = percent
         consensus = _consensus_reasoning(top_records)
-        for key in _REASONING_RECORD_KEYS:
-            selected.pop(key, None)
-        selected.update(consensus)
+        if consensus:
+            for key in _REASONING_RECORD_KEYS:
+                selected.pop(key, None)
+            selected.update(consensus)
+        # An empty answer is the merge declining (the copies agree on nothing):
+        # the selected record keeps what it states.  Clearing its keys anyway
+        # left the route with no reasoning metadata at all.
         return selected
     return direct_match[2] if direct_match is not None else None
 
@@ -1233,6 +1249,11 @@ def _installed_litellm_version() -> str | None:
 #: from spending the same eight-second ceiling twice.
 _CONTEXT_REFRESH_LOCK = threading.Lock()
 
+#: Serializes the cache's read-merge-write.  ``_cache_payload`` reads what the
+#: file already holds before the write replaces it, so two registries writing
+#: at once can otherwise interleave those halves and lose the other's reading.
+_CACHE_WRITE_LOCK = threading.Lock()
+
 
 class ModelContextRegistry:
     """Resolve model context policy and periodically refresh its metadata."""
@@ -1464,6 +1485,7 @@ class ModelContextRegistry:
         between one pane refresh and the next catalog write.
         """
 
+        stored = self._read_cache()
         return {
             "fetched_at": self._cache_fetched_at,
             "records": self._records,
@@ -1475,16 +1497,16 @@ class ModelContextRegistry:
             # pane's domain is the only one that performs those reads, and the
             # managed catalog is written by the other; without this they answer
             # one model with two numbers.
-            "stated_windows": self._merged_stated_windows(),
+            "stated_windows": self._merged_stated_windows(stored),
             # What a probe measured, merged for the same reason the windows are:
             # the two domains open this file and only one of them ever probes.
-            "image_generators": self._merged_image_generators(),
+            "image_generators": self._merged_image_generators(stored),
         }
 
-    def _merged_stated_windows(self) -> dict[str, int]:
+    def _merged_stated_windows(self, payload: Mapping[str, Any]) -> dict[str, int]:
         """This registry's readings merged over the ones the file already holds."""
 
-        stored = self._read_cache().get("stated_windows")
+        stored = payload.get("stated_windows")
         if not isinstance(stored, Mapping):
             return dict(self._stated)
         merged = {
@@ -1501,10 +1523,10 @@ class ModelContextRegistry:
         merged.update(self._stated)
         return merged
 
-    def _merged_image_generators(self) -> dict[str, bool]:
+    def _merged_image_generators(self, payload: Mapping[str, Any]) -> dict[str, bool]:
         """This registry's findings merged over the ones the file already holds."""
 
-        stored = self._read_cache().get("image_generators")
+        stored = payload.get("image_generators")
         if not isinstance(stored, Mapping):
             return dict(self._image_generators)
         merged = {
@@ -1519,11 +1541,15 @@ class ModelContextRegistry:
         if self.cache_path is None:
             return
         try:
-            atomic_write_json(self.cache_path, self._cache_payload())
-            # This instance's records are now what the file states, so the
-            # next lookup must not read the write back as someone else's.
-            self._cache_file_identity = self._cache_file_state()
-            self._remove_legacy_caches()
+            # The lock spans the read in ``_cache_payload`` and the write, so a
+            # second writer merges over what this one stored instead of over a
+            # copy taken before it.
+            with _CACHE_WRITE_LOCK:
+                atomic_write_json(self.cache_path, self._cache_payload())
+                # This instance's records are now what the file states, so the
+                # next lookup must not read the write back as someone else's.
+                self._cache_file_identity = self._cache_file_state()
+                self._remove_legacy_caches()
         except PersistenceError:
             pass
 
@@ -1628,7 +1654,7 @@ class ModelContextRegistry:
             isinstance(record, Mapping) and record.get("source") == _PI_SOURCE
             for record in cached.values()
         )
-        parsed = _source_records(cached, source="cache", priority=1)
+        parsed: dict[str, dict[str, Any]] = {}
         # Preserve the source and priority carried by a valid cache entry.
         for model_id, raw in cached.items():
             if not isinstance(model_id, str) or not isinstance(raw, Mapping):
@@ -1739,8 +1765,9 @@ class ModelContextRegistry:
         deployments = self._route_index().get(public_name_key(public_name))
         if not deployments:
             return []
-        # Copy per call like the previous per-call parse did, so a caller can
-        # never mutate the cached deployment mappings.
+        # A fresh top-level mapping per call.  The nested ``litellm_params``/
+        # ``model_info`` mappings are shared with the cached index, so callers
+        # must treat the result as read-only.
         return [dict(deployment) for deployment in deployments]
 
     def search_tool_capability_for(self, public_name: str) -> str | None:
@@ -1793,27 +1820,42 @@ class ModelContextRegistry:
 
         return self._load_route_model_ids(public_name)
 
+    @staticmethod
+    def _deployment_model_id(deployment: Mapping[str, Any]) -> str:
+        """The id one route addresses, with the adapter's prefix made explicit.
+
+        A route states ``model: claude-fable-5`` beside
+        ``custom_llm_provider: anthropic``, and the record that names it is
+        stored provider-qualified; the prefix is what lets an exact lookup
+        find it.
+        """
+
+        params = deployment.get("litellm_params")
+        if not isinstance(params, Mapping):
+            return ""
+        model_id = params.get("model")
+        if not isinstance(model_id, str) or not model_id.strip():
+            return ""
+        normalized_id = model_id.strip()
+        provider = params.get("custom_llm_provider")
+        if (
+            isinstance(provider, str)
+            and provider.strip()
+            and not normalized_id.casefold().startswith(
+                f"{provider.strip().casefold()}/"
+            )
+        ):
+            normalized_id = f"{provider.strip()}/{normalized_id}"
+        return normalized_id
+
     def _load_route_model_ids(self, public_name: str) -> list[str]:
         if self.runtime_config_path is None:
             return []
         result: list[str] = []
         for deployment in self._load_route_deployments(public_name):
-            params = deployment.get("litellm_params")
-            if not isinstance(params, Mapping):
-                continue
-            model_id = params.get("model")
-            if isinstance(model_id, str) and model_id.strip():
-                normalized_id = model_id.strip()
-                provider = params.get("custom_llm_provider")
-                if (
-                    isinstance(provider, str)
-                    and provider.strip()
-                    and not normalized_id.casefold().startswith(
-                        f"{provider.strip().casefold()}/"
-                    )
-                ):
-                    normalized_id = f"{provider.strip()}/{normalized_id}"
-                result.append(normalized_id)
+            model_id = self._deployment_model_id(deployment)
+            if model_id:
+                result.append(model_id)
         return result
 
     def refresh_if_due(self, *, force: bool = False, sync_cache: bool = True) -> bool:
@@ -1831,6 +1873,10 @@ class ModelContextRegistry:
 
         if sync_cache:
             self._sync_cache()
+        else:
+            # The cache still has to be loaded even when this caller cannot
+            # adopt a replacement: the merge below starts from its records.
+            self._load_cache()
         if not self.refresh_enabled:
             return False
         _, refresh_hours = self._runtime_values()
@@ -2067,6 +2113,36 @@ class ModelContextRegistry:
                 records.append(record)
         return records
 
+    def _narrowest_resolved_window(self, public_name: str) -> int | None:
+        """The narrowest window among the routes the registry resolved itself.
+
+        A stated window answers for the route it was read from and replaces
+        that route's answer (``_stated_contexts``); it does not answer for the
+        whole group.  A reading from one unresolved route therefore cannot
+        replace a window another route of the group resolved lower -- the group
+        is only as usable as its narrowest route.
+        """
+
+        windows: list[int] = []
+        for deployment in self._load_route_deployments(public_name):
+            model_id = self._deployment_model_id(deployment)
+            if not model_id:
+                continue
+            record = self._resolve_context_record(model_id)
+            if record is None:
+                continue
+            stated = self._wire_context(deployment)
+            if stated is not None and self._inference_is_contradicted(model_id, stated):
+                # This record is the outlier the route's upstream reading
+                # replaces, so it is not a floor for the group.
+                continue
+            windows.append(int(record["context_window"]))
+        if not windows:
+            return None
+        # A zero states that the route holds no conversation, and it narrows
+        # the group exactly as ``_context_record_from_records`` reads it.
+        return min(windows) if all(window > 0 for window in windows) else 0
+
     @staticmethod
     def _context_record_from_records(
         records: Sequence[Mapping[str, Any]],
@@ -2110,6 +2186,8 @@ class ModelContextRegistry:
         whose inferred window an upstream contradicts takes the upstream's too:
         the inference is a suffix match over provider copies that disagreed, and
         the route's own catalog is the one piece of evidence about the route.
+        Where that answer belongs to only some routes of the group, the others
+        keep their resolved windows: the group still reports its narrowest route.
         Both surfaces read this one answer, which is what keeps the pane's field
         and the recommendation beside it from naming two different numbers for a
         model nothing knows.
@@ -2137,6 +2215,11 @@ class ModelContextRegistry:
         if not stated:
             return resolved
         window = min(stated)
+        # The readings answer for their own routes; the routes the registry did
+        # resolve keep their window in the group's minimum.
+        floor = self._narrowest_resolved_window(public_name)
+        if floor is not None:
+            window = min(window, floor)
         return ContextRecord(
             context_window=window,
             max_context_window=window,
@@ -2212,6 +2295,11 @@ class ModelContextRegistry:
         self._sync_cache()
         if refresh:
             self.refresh_if_due()
+        return self._image_metadata_for_model_id(model_id)
+
+    def _image_metadata_for_model_id(self, model_id: str) -> dict[str, Any] | None:
+        """The lookup itself, for callers that already synced the cache."""
+
         candidates = _candidate_ids(model_id)
         if not candidates:
             return None
@@ -2256,11 +2344,12 @@ class ModelContextRegistry:
         images.
         """
 
-        if any(self.image_metadata_for_model_id(model_id) for model_id in model_ids):
+        self._sync_cache()
+        if any(self._image_metadata_for_model_id(model_id) for model_id in model_ids):
             return True
         if _litellm_states_image_generation(model_ids):
             return True
-        return self.is_remembered_image_generator(model_ids)
+        return self._remembered_image_generator(model_ids)
 
     def is_remembered_image_generator(self, model_ids: Sequence[str]) -> bool:
         """Whether a probe already established that one of these ids is a generator.
@@ -2273,6 +2362,9 @@ class ModelContextRegistry:
         """
 
         self._sync_cache()
+        return self._remembered_image_generator(model_ids)
+
+    def _remembered_image_generator(self, model_ids: Sequence[str]) -> bool:
         for model_id in model_ids:
             for key in _image_generator_keys(model_id):
                 if self._image_generators.get(key) is True:
@@ -2314,7 +2406,7 @@ class ModelContextRegistry:
             self.refresh_if_due()
         resolved: dict[str, dict[str, Any]] = {}
         for model_id in model_ids:
-            metadata = self.image_metadata_for_model_id(model_id)
+            metadata = self._image_metadata_for_model_id(model_id)
             if metadata:
                 resolved[str(model_id).strip()] = metadata
         return resolved

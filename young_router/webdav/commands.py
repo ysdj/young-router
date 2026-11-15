@@ -9,6 +9,7 @@ from typing import Any
 from .core import (
     BUNDLE_MISSING_STATUS,
     CONFIG_BUNDLE_MAX_BYTES,
+    INCOMPATIBLE_BUNDLE_CODE,
     Settings,
     SyncError,
     WebDAVClient,
@@ -34,7 +35,10 @@ from .core import (
     smart_sync_plan,
 )
 from .operations import (
+    archive_remote_bundle,
+    conflict_merge,
     decide_sync,
+    install_merged_files,
     print_manifest_summary,
     publish_remote_digests,
     pull_bundle,
@@ -111,6 +115,7 @@ def command_push(args: argparse.Namespace) -> int:
     print(f"Pushed Young Router config to {_redact_url(remote_bundle_url)}")
     print(f"Bundle bytes: {bundle_size}")
     print_manifest_summary("Local snapshot", manifest)
+    clear_conflict_record(default_conflict_file())
     return 0
 
 
@@ -136,6 +141,7 @@ def command_pull(args: argparse.Namespace) -> int:
         print(f"Removed: {path}")
     for path in result["backups"]:
         print(f"Backup: {path}")
+    clear_conflict_record(default_conflict_file())
     return 0
 
 
@@ -144,22 +150,42 @@ def command_sync(args: argparse.Namespace) -> int:
     settings = load_settings(args.settings)
     client = WebDAVClient(settings)
     local = local_snapshot(config_path)
-    remote = remote_snapshot(client, settings, read_remote_manifest(client, settings))
+    archived_remote: str | None = None
+    try:
+        remote_manifest = read_remote_manifest(client, settings)
+    except SyncError as exc:
+        if exc.code != INCOMPATIBLE_BUNDLE_CODE:
+            raise
+        # A bundle from another app identity or archive version cannot be
+        # compared.  Keep it under a dated sibling name before this machine's
+        # state replaces it, the same way the app's sync does.
+        archived_remote = archive_remote_bundle(client, settings)
+        remote_manifest = None
+    remote = remote_snapshot(client, settings, remote_manifest)
     base = baseline_snapshot(args.state)
 
     print_manifest_summary("Local snapshot", local.manifest)
     if remote.manifest is None:
         bundle_size, pushed_manifest = push_bundle(client, settings, config_path, args.state, "sync-push")
-        print(f"Remote snapshot: missing manifest; pushed local config to {_redact_url(bundle_url(settings))}")
+        if archived_remote is None:
+            print(f"Remote snapshot: missing manifest; pushed local config to {_redact_url(bundle_url(settings))}")
+        else:
+            print(f"Remote snapshot: kept the unreadable bundle as {archived_remote}; pushed local config to {_redact_url(bundle_url(settings))}")
         print(f"Bundle bytes: {bundle_size}")
         print_manifest_summary("Synced snapshot", pushed_manifest)
+        clear_conflict_record(default_conflict_file())
         return 0
 
     print_manifest_summary("Remote snapshot", remote.manifest)
     plan, remote = decide_sync(client, settings, local, remote, base)
     if plan == "unchanged":
-        # The bytes matched, so this side's digests describe the remote too.
-        agreed = SyncSnapshot(remote.manifest, remote.digests or local.digests)
+        # The bytes matched, so this side's digests describe the remote too, and
+        # the files on disk are the content both ends agreed on.
+        agreed = SyncSnapshot(
+            remote.manifest,
+            remote.digests or local.digests,
+            local.files if local.files is not None else remote.files,
+        )
         save_sync_state(args.state, settings, agreed, "sync")
         if remote.digests is None:
             publish_remote_digests(client, settings, agreed)
@@ -176,17 +202,38 @@ def command_sync(args: argparse.Namespace) -> int:
         return 0
 
     if plan == "conflict":
-        # Two sides that both moved cannot be settled here: the CLI has no reader
-        # to compare them.  Keep the remote side for the pane that does, and name
-        # the choice the reader has to make.
+        # Two sides that both moved: try the merge first, which settles the
+        # ordinary case -- different rows of one document -- without a reader.
+        # Only a real collision is left for the app's comparison window.
+        merged_files = None
+        try:
+            merged_files = conflict_merge(client, settings, local, remote, base)
+        except Exception:
+            # A merge that cannot even be attempted is the conflict it was
+            # asked about, not a failed sync: the choice below is the answer.
+            merged_files = None
+        if merged_files is not None:
+            result = install_merged_files(client, settings, config_path, args.state, merged_files)
+            print(
+                "WebDAV sync: merged both sides' edits and pushed them to "
+                f"{_redact_url(bundle_url(settings))}"
+            )
+            for path in result["installed"]:
+                print(f"Installed: {path}")
+            for path in result["removed"]:
+                print(f"Removed: {path}")
+            for path in result["backups"]:
+                print(f"Backup: {path}")
+            clear_conflict_record(default_conflict_file())
+            return 0
         conflict_path = default_conflict_file()
         try:
             remember_remote_bundle(client, settings, conflict_path)
         except Exception:
             clear_conflict_record(conflict_path)
         raise SyncError(
-            "WebDAV sync stopped because both ends changed; compare them in the app "
-            "and keep one side",
+            "WebDAV sync stopped because both ends changed the same content; compare them "
+            "in the app and keep one side",
             "webdav_sync_conflict",
         )
 
@@ -245,8 +292,18 @@ def command_status(args: argparse.Namespace) -> int:
             print(f"Baseline digests: {'present' if base.digests is not None else 'missing (bytes are compared)'}")
             if local.manifest is not None and remote.manifest is not None:
                 # What a sync would do with these three snapshots: the same one
-                # comparison the unattended loop asks.
-                print("Sync plan: " + smart_sync_plan(local, remote, base))
+                # comparison the unattended loop asks.  A conflict is answered
+                # by direction alone, so the documents are asked here too --
+                # that is one bundle download, which is exactly what the sync
+                # itself does before it decides between merging and asking.
+                plan = smart_sync_plan(local, remote, base)
+                if plan == "conflict":
+                    try:
+                        mergeable = conflict_merge(client, settings, local, remote, base) is not None
+                    except Exception:
+                        mergeable = False
+                    plan += " (the next sync merges both sides)" if mergeable else " (the two sides collide)"
+                print("Sync plan: " + plan)
     except Exception as exc:
         print(f"Sync baseline: could not read state: {exc}")
 
@@ -320,6 +377,20 @@ def command_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+def _named_cause(exc: Exception) -> str | None:
+    """The cause a pane can name, when this exception carries one.
+
+    ``WebDAVHTTPError`` keeps the remote server's HTTP status in ``code`` -- an
+    ``int`` where a cause is a token, so it stays in the message.  Only this
+    app's own names (``webdav_sync_conflict`` and friends) are written to the
+    status file, which is what the pane turns into a sentence: a conflict
+    recorded without its name reads as a disconnected server.
+    """
+
+    code = getattr(exc, "code", None)
+    return code if isinstance(code, str) and code.startswith("webdav_") else None
+
+
 def _run_recorded_command(args: argparse.Namespace) -> int:
     command = str(args.command)
     handlers = {
@@ -331,8 +402,8 @@ def _run_recorded_command(args: argparse.Namespace) -> int:
     handler = handlers[command]
     try:
         result = handler(args)
-    except Exception:
-        save_sync_status(args.status, command, False)
+    except Exception as exc:
+        save_sync_status(args.status, command, False, _named_cause(exc))
         raise
     save_sync_status(args.status, command, result == 0)
     return result

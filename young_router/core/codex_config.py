@@ -133,10 +133,25 @@ SUPPORTED_FEATURE_KEYS = (
 )
 
 
+_INSTALLED_SURFACE_CACHE_LOCK = threading.Lock()
+_INSTALLED_SURFACE_CACHE: dict[str, tuple[float, tuple[str, ...]]] = {}
+#: A plugin install is the only thing that changes these names, so an editor
+#: refresh can reuse the walk and parse for a moment instead of repeating them.
+_INSTALLED_SURFACE_CACHE_SECONDS = 5.0
+
+
 def _installed_surface_feature_keys() -> tuple[str, ...]:
     """Return feature names declared by the installed Desktop CUA runtime."""
 
-    cache_root = codex_home() / "plugins" / "cache" / "openai-bundled"
+    home = codex_home()
+    cache_key = str(home)
+    now = time.monotonic()
+    with _INSTALLED_SURFACE_CACHE_LOCK:
+        cached = _INSTALLED_SURFACE_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] < _INSTALLED_SURFACE_CACHE_SECONDS:
+            return cached[1]
+
+    cache_root = home / "plugins" / "cache" / "openai-bundled"
     paths = sorted(cache_root.glob("*/*/.mcp.json"))
     resources = next(
         (
@@ -181,7 +196,7 @@ def _installed_surface_feature_keys() -> tuple[str, ...]:
         env = server.get("env") if isinstance(server, dict) else None
         surfaces = env.get("CUA_REPL_ENABLED_SURFACES") if isinstance(env, dict) else None
         if isinstance(surfaces, str):
-            return tuple(
+            keys = tuple(
                 sorted(
                     f"{surface}_use"
                     for surface in (
@@ -190,14 +205,20 @@ def _installed_surface_feature_keys() -> tuple[str, ...]:
                     if surface
                 )
             )
-    return ()
+            with _INSTALLED_SURFACE_CACHE_LOCK:
+                _INSTALLED_SURFACE_CACHE[cache_key] = (time.monotonic(), keys)
+            return keys
+    keys = ()
+    with _INSTALLED_SURFACE_CACHE_LOCK:
+        _INSTALLED_SURFACE_CACHE[cache_key] = (time.monotonic(), keys)
+    return keys
 
 
 # Codex's built-in provider IDs cannot be overridden through
-# ``model_providers``.  The three locally selectable built-ins are called out
+# ``model_providers``.  The built-ins this editor knows about are called out
 # explicitly in the configuration schema/product UI; rejecting only these
 # avoids guessing at an ever-changing complete built-in catalog.
-RESERVED_PROVIDER_IDS = frozenset({"openai", "ollama", "lmstudio"})
+RESERVED_PROVIDER_IDS = frozenset({"openai", "amazon-bedrock", "ollama", "lmstudio"})
 
 
 class EditorError(ValueError):
@@ -248,16 +269,27 @@ def _remove_legacy_forced_token_budget(
             return config_text
     except OSError:
         return config_text
+
+    def mark_migrated() -> None:
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("", encoding="utf-8")
+        except OSError:
+            pass
+
     features = parse_toml_text(config_text).get("features")
     if not (isinstance(features, dict) and features.get("token_budget") is True):
+        # A pass that finds nothing still counts as the one cleanup this home
+        # gets; a value added afterwards belongs to the user and must survive.
+        mark_migrated()
         return config_text
-    config_text = remove_table_value(config_text, ("features",), "token_budget")
-    try:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text("", encoding="utf-8")
-    except OSError:
-        pass
-    return config_text
+    updated = remove_table_value(config_text, ("features",), "token_budget")
+    if updated == config_text:
+        # ``features`` is an inline table, which cannot be edited in place;
+        # leave the home unmarked so this value is not mistaken for migrated.
+        return config_text
+    mark_migrated()
+    return updated
 
 
 MANAGED_OWNER_FILENAME = "litellm.owner"
@@ -514,7 +546,9 @@ def clear_local_model_listing_cache() -> None:
         _LISTING_CACHE.clear()
 
 
-def _local_model_listing(api_key: str) -> list[Any] | None:
+def _local_model_listing(
+    api_key: str, config_path: pathlib.Path | None = None
+) -> list[Any] | None:
     """The ``data`` list from this machine's authenticated ``/models`` answer.
 
     A transport, authentication, response-shape, or size failure answers
@@ -524,7 +558,7 @@ def _local_model_listing(api_key: str) -> list[Any] | None:
 
     if not isinstance(api_key, str) or not api_key.strip():
         return None
-    url = f"{local_base_url().rstrip('/')}/models"
+    url = f"{local_base_url(config_path).rstrip('/')}/models"
     key = (url, hashlib.sha256(api_key.encode("utf-8")).hexdigest())
     hit, cached = _cached_listing(key)
     if hit:
@@ -588,7 +622,9 @@ def _usable_listing_name(item: object) -> str | None:
     return name
 
 
-def local_exposed_models(api_key: str) -> tuple[list[str], bool]:
+def local_exposed_models(
+    api_key: str, config_path: pathlib.Path | None = None
+) -> tuple[list[str], bool]:
     """Read the model IDs LiteLLM currently exposes on its local API.
 
     The configured ``model_list`` is intentionally not a catalog source.  A
@@ -613,7 +649,7 @@ def local_exposed_models(api_key: str) -> tuple[list[str], bool]:
     itself is untouched and keeps the order its ``model_list`` declares.
     """
 
-    data = _local_model_listing(api_key)
+    data = _local_model_listing(api_key, config_path)
     if data is None:
         return [], False
 
@@ -1343,6 +1379,10 @@ def structured_config(config: dict[str, Any], auth: dict[str, Any]) -> dict[str,
     for provider_id, provider in sorted(_get_mapping(config.get("model_providers")).items()):
         if not isinstance(provider, dict):
             continue
+        if str(provider_id).lower() in RESERVED_PROVIDER_IDS:
+            # A built-in row cannot be saved or deleted through this list, so
+            # showing it would leave the form holding a row it cannot round-trip.
+            continue
         providers.append(
             {
                 "id": str(provider_id),
@@ -1442,7 +1482,9 @@ def structured_config(config: dict[str, Any], auth: dict[str, Any]) -> dict[str,
         "agents_max_depth": str(agents["max_depth"])
         if isinstance(agents.get("max_depth"), int)
         else None,
-        "file_opener": _get_text(config.get("file_opener")),
+        # file_opener is a core scalar; listing it here too would give the
+        # form two controls.  The advanced apply path still accepts it for
+        # payloads that already carry it there.
         "mcp_oauth_credentials_store": _get_text(config.get("mcp_oauth_credentials_store")),
     }
     return structured
@@ -1456,7 +1498,7 @@ def _runtime_context(
         runtime_config = load_yaml(config_path)
         models = configured_models(runtime_config)
         key = local_api_key(runtime_config)
-        exposed_models, menu_enabled = local_exposed_models(key)
+        exposed_models, menu_enabled = local_exposed_models(key, config_path)
     except EditorError as exc:
         # The Codex editor must remain usable to repair an existing Codex file
         # even if the LiteLLM source is temporarily invalid/unavailable.
@@ -1480,8 +1522,9 @@ def editor_payload(
     validation_errors: list[str] | None = None,
     warnings: list[str] | None = None,
 ) -> dict[str, Any]:
+    runtime_path = runtime_config_path or default_config_path()
     models, exposed_models, menu_enabled, local_key, runtime_warnings = _runtime_context(
-        runtime_config_path or default_config_path()
+        runtime_path
     )
     all_warnings = list(warnings or []) + runtime_warnings
     errors = list(validation_errors or [])
@@ -1493,7 +1536,7 @@ def editor_payload(
         # its authenticated model endpoint is unavailable.
         "exposed_models": exposed_models,
         "young_router_enabled": menu_enabled,
-        "local_base_url": local_base_url(),
+        "local_base_url": local_base_url(runtime_path),
         "local_api_key": local_key,
         "validation_errors": errors,
         "validation_error": errors[0] if errors else None,
@@ -1901,7 +1944,7 @@ def _apply_agents_patch(text: str, value: object) -> str:
             text = remove_table_value(text, ("agents",), key)
         elif key == "interrupt_message" and isinstance(item, bool):
             text = set_table_value(text, ("agents",), key, item)
-        elif key != "interrupt_message" and isinstance(item, int) and item > 0:
+        elif key != "interrupt_message" and not isinstance(item, bool) and isinstance(item, int) and item > 0:
             text = set_table_value(text, ("agents",), key, item)
         else:
             raise EditorError(f"agents.{key} has an invalid value")
@@ -2053,7 +2096,7 @@ def _apply_direct_connection_patch(text: str, value: object) -> str:
     if provider_id == "openai":
         return _patch_optional_string(text, None, "openai_base_url", base_url)
 
-    if provider_id in {"amazon-bedrock", "ollama", "lmstudio"}:
+    if provider_id in RESERVED_PROVIDER_IDS:
         raise EditorError(
             "The selected built-in provider does not use an editable endpoint URL"
         )
@@ -2193,8 +2236,6 @@ def apply_structured_patch(
         if key in patch_data:
             core_patch[key] = patch_data[key]
     for key, value in core_patch.items():
-        if key not in CORE_SCALAR_KEYS:
-            raise EditorError(f"{key} is not editable in the structured UI")
         if value is None:
             result = remove_top_level_value(result, key)
         elif key in {
@@ -2232,7 +2273,20 @@ def apply_structured_patch(
     if "agents" in patch_data:
         result = _apply_agents_patch(result, patch_data["agents"])
     if "advanced" in patch_data:
-        result = _apply_advanced_patch(result, patch_data["advanced"])
+        advanced_patch = patch_data["advanced"]
+        if (
+            "file_opener" in patch_data
+            and isinstance(advanced_patch, dict)
+            and "file_opener" in advanced_patch
+        ):
+            # file_opener is a core scalar; an older payload that also carries
+            # it under advanced must not overwrite the core edit.
+            advanced_patch = {
+                key: value
+                for key, value in advanced_patch.items()
+                if key != "file_opener"
+            }
+        result = _apply_advanced_patch(result, advanced_patch)
 
     # A structured form represents the complete state of each visible list.
     # Remove only managed entries absent from that form, preserving unknown
@@ -2246,7 +2300,12 @@ def apply_structured_patch(
             and item.get("delete") is not True
         }
         for provider_id in list(_get_mapping(parse_toml_text(result).get("model_providers"))):
-            if provider_id not in desired_providers:
+            # Reserved built-in tables are never editable rows, so a full-form
+            # save must preserve them rather than treat them as deleted.
+            if (
+                provider_id not in desired_providers
+                and str(provider_id).lower() not in RESERVED_PROVIDER_IDS
+            ):
                 result = remove_table(result, ("model_providers", str(provider_id)))
     if "mcp_servers" in patch_data:
         desired_servers = {
@@ -2355,7 +2414,7 @@ def _restore_file(path: pathlib.Path, original: tuple[bool, str, int]) -> None:
 
 
 def atomic_write_editor_files(config_text: str, auth_text: str) -> tuple[pathlib.Path, pathlib.Path]:
-    """Commit config/auth together with rollback if the second replace fails."""
+    """Commit config/auth together with rollback if either replace fails."""
 
     home = codex_home()
     config_path = home / "config.toml"
@@ -2366,26 +2425,21 @@ def atomic_write_editor_files(config_text: str, auth_text: str) -> tuple[pathlib
     old_auth_text, auth_existed, auth_mode = _safe_read_text(auth_path, "Codex auth file")
     old_config = (config_existed, old_config_text, config_mode)
     old_auth = (auth_existed, old_auth_text, auth_mode)
-    auth_written = False
-    config_written = False
     try:
         # Auth first means a brief reader sees a usable credential for either
         # the old or new config, never a new config with stale credentials.
         atomic_write(auth_path, auth_text, 0o600)
-        auth_written = True
         atomic_write(config_path, config_text, 0o600)
-        config_written = True
     except Exception:
         # Best effort restoration is intentionally performed for both paths:
         # an OS error can occur after os.replace but before the caller sees a
-        # successful return.  Preserve the original modes on rollback.
+        # successful return.  Preserve the original modes on rollback, and
+        # undo in the reverse of the write order.
         restoration_error: Exception | None = None
-        for target, original, changed in (
-            (config_path, old_config, config_written or True),
-            (auth_path, old_auth, auth_written),
+        for target, original in (
+            (config_path, old_config),
+            (auth_path, old_auth),
         ):
-            if not changed:
-                continue
             try:
                 _restore_file(target, original)
             except Exception as exc:  # pragma: no cover - catastrophic FS path

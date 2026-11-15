@@ -164,7 +164,7 @@ def validate_config(config: Mapping[str, Any]) -> list[str]:
             if base_url and not _is_http_url(base_url):
                 raise ClaudeDesktopConfigError("inferenceGatewayBaseUrl must be an http or https URL")
         auth_scheme = config.get("inferenceGatewayAuthScheme")
-        if auth_scheme is not None and auth_scheme not in {"bearer", "x-api-key"}:
+        if auth_scheme is not None and (not isinstance(auth_scheme, str) or auth_scheme not in {"bearer", "x-api-key"}):
             raise ClaudeDesktopConfigError("inferenceGatewayAuthScheme must be bearer or x-api-key")
         credential_kind = config.get("inferenceCredentialKind")
         if credential_kind is not None:
@@ -250,8 +250,11 @@ class ClaudeDesktopConfig:
         self._raw = copy.deepcopy(config)
         self._draft = copy.deepcopy(config)
         self._exists = config_exists
-        self._baseline_meta_bytes = meta_text.encode("utf-8") if meta_exists else None
-        self._baseline_config_bytes = config_text.encode("utf-8") if config_exists else None
+        # Baselines come from the raw disk bytes because that is what
+        # external_disk_state and apply compare; decoded text has normalized
+        # line endings, so a CRLF file would never match its own baseline.
+        self._baseline_meta_bytes = _current_bytes(self.desktop_meta_path) if meta_exists else None
+        self._baseline_config_bytes = _current_bytes(config_path) if config_exists and config_path is not None else None
 
     def reload(self) -> dict[str, Any]:
         self._load_from_disk()
@@ -494,8 +497,6 @@ class ClaudeDesktopConfig:
             self._ensure_target()
         config_text = json.dumps(self._draft, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         meta_text = json.dumps(self._meta_draft, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-        if self.desktop_config_path is None:
-            raise ClaudeDesktopConfigError("Claude Desktop configuration target is unavailable")
         _atomic_write(self.desktop_config_path, config_text)
         meta_written = self._meta_draft != self._meta or self._baseline_meta_bytes is None
         if meta_written:
@@ -545,7 +546,7 @@ class ClaudeDeveloperSettings:
         self._raw = copy.deepcopy(value)
         self._draft = copy.deepcopy(value)
         self._exists = exists
-        self._baseline_bytes = text.encode("utf-8") if exists else None
+        self._baseline_bytes = _current_bytes(self.path) if exists else None
         return self.snapshot()
 
     def snapshot(self) -> dict[str, Any]:

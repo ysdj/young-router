@@ -17,6 +17,7 @@ import sys
 import tempfile
 from typing import Any
 
+from ..atomic_io import restrict_mode
 from ..config.load import (
     CONFIG_DOCUMENT_CONFIG_KEY,
     CONFIG_DOCUMENT_DISABLED_KEY,
@@ -197,7 +198,7 @@ def _write_package(path: Path, payload: dict[str, object]) -> None:
         raise ConfigurationPackageError("Configuration package exceeds the 16 MiB limit.")
     fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
-        os.fchmod(fd, 0o600)
+        restrict_mode(fd, temporary_name)
         with os.fdopen(fd, "wb") as handle:
             handle.write(encoded)
             handle.flush()

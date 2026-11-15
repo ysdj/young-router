@@ -63,6 +63,19 @@ _MIN_ELIDABLE_CHARS = 400
 #: Share of the chars-to-tokens ratio an elision is credited with.
 _ELIDE_SAFETY = 1.0
 
+#: The turn being answered is normally kept verbatim, but a single tool output
+#: can be larger than the whole window on its own (a build log, a dumped file).
+#: Eliding history cannot fit that, and sending it anyway is a refusal the
+#: client retries forever, so the overrun is cut out of the body instead: this
+#: share of it stays, split unevenly between the head and the tail, and the
+#: marker in the middle names exactly how many characters left.
+_TRUNCATE_KEEP_SHARE = 0.7
+_TRUNCATE_HEAD_SHARE = 0.7
+
+#: A body smaller than this is not worth splitting: the marker would cost the
+#: room the split was meant to win.
+_MIN_TRUNCATABLE_CHARS = 8000
+
 _TEXT_FIELDS = ("input_text", "output_text", "text", "summary_text")
 
 #: Ratios tried, in order, when the *upstream* rejects a prompt the router was
@@ -476,6 +489,134 @@ def _messages_text(content: Any) -> str:
     return ""
 
 
+def _truncation_marker(removed: int, kind: str) -> str:
+    """What the model is told about the middle that did not fit."""
+
+    return (
+        f"[young-router: {removed} characters of this {kind} were removed because "
+        "the request exceeded the upstream input window; the beginning and the "
+        "end of it are kept]"
+    )
+
+
+def _truncated_text(text: str, keep: int, kind: str) -> Optional[str]:
+    """``text`` with ``keep`` characters of it kept, or None when it shrinks nothing."""
+
+    if not isinstance(text, str) or keep < 0:
+        return None
+    if len(text) <= keep + _MIN_TRUNCATABLE_CHARS:
+        return None
+    head_chars = int(keep * _TRUNCATE_HEAD_SHARE)
+    tail_chars = max(keep - head_chars, 0)
+    head = text[:head_chars]
+    tail = text[len(text) - tail_chars :] if tail_chars else ""
+    marker = _truncation_marker(len(text) - len(head) - len(tail), kind)
+    return f"{head}\n\n{marker}\n\n{tail}"
+
+
+def _truncated_item(
+    item: Mapping[str, Any], *, want_chars: int
+) -> Tuple[Optional[Dict[str, Any]], int]:
+    """Cut the largest bodies this item carries until ``want_chars`` is freed.
+
+    Block types, ids and positions are untouched: a ``tool_result`` keeps its
+    ``tool_use_id`` and a text block stays a text block, so the replay is still
+    a valid turn.  Reasoning is skipped -- its signature covers the text, and a
+    body the signature no longer matches is a request upstream refuses.
+    """
+
+    content = item.get("content")
+    if not isinstance(content, list):
+        return None, 0
+    rewritten: List[Any] = []
+    remaining = want_chars
+    freed = 0
+    changed = False
+    for block in content:
+        if not isinstance(block, Mapping) or remaining <= 0:
+            rewritten.append(block)
+            continue
+        kind = block.get("type")
+        if kind == "tool_result" and not _carries_image(block):
+            text = _messages_text(block.get("content"))
+            if len(text) >= _MIN_TRUNCATABLE_CHARS:
+                keep = max(len(text) - remaining, _MIN_TRUNCATABLE_CHARS)
+                cut = _truncated_text(text, keep, "tool output")
+                if cut is not None:
+                    updated = dict(block)
+                    updated["content"] = cut
+                    rewritten.append(updated)
+                    gained = len(text) - len(cut)
+                    freed += gained
+                    remaining -= max(gained, 0)
+                    changed = True
+                    continue
+        elif kind == "text":
+            text = block.get("text")
+            if isinstance(text, str) and len(text) >= _MIN_TRUNCATABLE_CHARS:
+                keep = max(len(text) - remaining, _MIN_TRUNCATABLE_CHARS)
+                cut = _truncated_text(text, keep, "message")
+                if cut is not None:
+                    updated = dict(block)
+                    updated["text"] = cut
+                    rewritten.append(updated)
+                    gained = len(text) - len(cut)
+                    freed += gained
+                    remaining -= max(gained, 0)
+                    changed = True
+                    continue
+        rewritten.append(block)
+    if not changed:
+        return None, 0
+    result = dict(item)
+    result["content"] = rewritten
+    return result, freed
+
+
+def _truncated_tail(items: List[Any], *, count: int, limit: int) -> Optional[Tuple[List[Any], int]]:
+    """Fit a payload whose protected turn is itself over the window.
+
+    ``_elidable`` never touches the turn being answered, which is right until
+    that turn alone exceeds the window: the pass then reports a size it knows
+    will be refused.  Measured on a live thread, the last turn carried
+    1,690,305 tokens against a 1,000,000-token window after every older item
+    had been elided -- the request was sent anyway, one route answered 502 and
+    the turn only survived because a second route happened to take it.
+
+    Only the overrun is cut, and only out of bodies that can lose their middle
+    without changing what the replay *is*.
+    """
+
+    protected = _protected_index(items)
+    if protected >= len(items) or count <= limit:
+        return None
+    total_chars = len(_strings_joined(items))
+    if total_chars <= 0:
+        return None
+    chars_per_token = max(total_chars / max(count, 1), 0.25)
+    # The bodies cut here tokenize denser than the payload average, so the
+    # ratio alone under-credits the cut and the pass would stop one body short.
+    want_chars = int((count - limit) * chars_per_token / _TRUNCATE_KEEP_SHARE) + 2048
+    order = sorted(
+        (index for index in range(protected, len(items)) if isinstance(items[index], Mapping)),
+        key=lambda index: len(_item_text(items[index])),
+        reverse=True,
+    )
+    rewritten = list(items)
+    freed = 0
+    for index in order:
+        if freed >= want_chars:
+            break
+        updated, gained = _truncated_item(items[index], want_chars=want_chars - freed)
+        if updated is None or gained <= 0:
+            continue
+        rewritten[index] = updated
+        freed += gained
+    if freed <= 0:
+        return None
+    return rewritten, freed
+
+
 def _elided_message_turn(item: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """Replace the bodies this turn carries that cost the window.
 
@@ -610,19 +751,6 @@ def _droppable(items: List[Any]) -> List[int]:
     protected = _protected_index(items)
     calls: Dict[str, int] = {}
     outputs: Dict[str, int] = {}
-    # Reasoning a finished round trip left behind is the one body inside the
-    # protected turn that can go: it is a replay of what the model already
-    # thought, not an output it is in the middle of using.  A long Codex or Pi
-    # thread keeps one user message near its start and then hundreds of
-    # assistant round trips, so the protected turn *is* most of the replay;
-    # with reasoning excluded from ``_droppable`` a 1.36M-token thread had
-    # nothing to drop and every resend met the same ``prompt is too long``.
-    reasoning: List[int] = [
-        index
-        for index in range(protected, len(items))
-        if isinstance(items[index], Mapping)
-        and items[index].get("type") == "reasoning"
-    ]
     for index, item in enumerate(items):
         if not isinstance(item, Mapping) or index >= protected:
             continue
@@ -642,7 +770,6 @@ def _droppable(items: List[Any]) -> List[int]:
         grouped.append((min(call_index, output_index), sorted((call_index, output_index))))
     grouped.sort()
     dropped: List[int] = []
-    dropped.extend(reasoning)
     dropped.extend(_droppable_tool_exchanges(items, protected))
     for index, item in enumerate(items):
         if index >= protected:
@@ -675,7 +802,8 @@ def _exchange_partner(items: List[Any], index: int) -> Optional[int]:
 
     ``_droppable`` lists both halves of a pair, and the loop that consumes the
     list must not stop between them: a call without its answer (or the other
-    way round) is a replay the wire refuses.
+    way round) is a replay the wire refuses.  A turn that carries a call and
+    the next turn carrying its answer are the two shapes here.
     """
 
     if not (0 <= index < len(items)):
@@ -698,6 +826,8 @@ def _exchange_partner(items: List[Any], index: int) -> Optional[int]:
     }
     if not calls and not answers:
         return None
+    # The partner is the neighbouring turn, in whichever direction the pair
+    # was written.
     for other in (index + 1, index - 1):
         if not (0 <= other < len(items)):
             continue
@@ -831,7 +961,7 @@ def _fitted_items(items: List[Any], *, count: int, target: int) -> Optional[List
         # adjacent indices, so a break between them drops the call and keeps
         # the answer -- the replay then goes out with ``unexpected
         # `tool_use_id` found in `tool_result` blocks``, which no resend can
-        # satisfy.  Take the pair together.
+        # satisfy.  Take the pair together: look ahead past the partner.
         order = _droppable(rewritten)
         position = 0
         while position < len(order):
@@ -842,9 +972,7 @@ def _fitted_items(items: List[Any], *, count: int, target: int) -> Optional[List
             group = [index] if partner is None else [index, partner]
             for member in group:
                 if rewritten[member] is not None:
-                    freed += int(
-                        len(_item_text(rewritten[member])) / chars_per_token
-                    )
+                    freed += int(len(_item_text(rewritten[member])) / chars_per_token)
                     rewritten[member] = None
                     changed = True
             position += 1
@@ -1220,13 +1348,34 @@ def apply(data: Any) -> Optional[Dict[str, Any]]:
         fitted_count = next_count
         # Stop at the target, not at the last count that was still under the
         # limit.  A live thread was elided to 983,041 against a 1,000,000
-        # window -- 1.7% of margin -- and the relay counted the same bytes
+        # window -- 1.7% of margin -- and the relay counted the same bytes 20%
         # higher, so the replay was refused and the next attempt started over.
         if next_count is None or next_count <= target:
             current_count = next_count if next_count is not None else current_count
             break
         current, current_count = shorter, next_count
     final = result if result is not None else data
+    # The protected turn is the last thing elision refuses to touch.  When it
+    # is on its own larger than the window, dropping history cannot fit the
+    # request and the pass used to send a size it knew upstream would refuse:
+    # a live thread shipped 1,690,305 tokens against a 1,000,000-token window,
+    # got a 502 from one route and survived only because another took it.  Cut
+    # the overrun out of the bodies instead, so the turn is servable wherever
+    # it lands.
+    truncated = False
+    if fitted_count is not None and fitted_count > limit:
+        payload_key, tail_items = payload_items(final)
+        if payload_key is not None and tail_items is not None:
+            fitted_tail = _truncated_tail(tail_items, count=fitted_count, limit=limit)
+            if fitted_tail is not None:
+                new_items, _freed_chars = fitted_tail
+                candidate = dict(final)
+                candidate[payload_key] = new_items
+                recounted = measure_tokens(candidate, router)
+                if recounted is not None and recounted < fitted_count:
+                    final = candidate
+                    fitted_count = recounted
+                    truncated = True
     if final is original:
         return None
     if fitted_count is not None:
@@ -1239,6 +1388,7 @@ def apply(data: Any) -> Optional[Dict[str, Any]]:
         router=router,
         image_pass=rewritten_images is not None,
         after_count=fitted_count,
+        truncated=truncated,
     )
     return dict(final)
 
@@ -1270,6 +1420,7 @@ def _trace(
     router: Any,
     image_pass: bool = False,
     after_count: Optional[int] = None,
+    truncated: bool = False,
 ) -> None:
     from . import routing as _routing_module
     from . import trace as _trace_module
@@ -1279,23 +1430,28 @@ def _trace(
             after_count = count_tokens(after, router)
         _before_key, before_items = payload_items(before)
         _after_key, after_items = payload_items(after)
+        trace_fields = {
+            "model": before.get("model"),
+            "window": window,
+            "before": count,
+            "after": after_count,
+            # The token count and the wire size are both answers to "will this
+            # be accepted", and only the pair shows which one the elision moved.
+            "image_bytes_before": _inline_image_bytes(before_items),
+            "image_bytes_after": _inline_image_bytes(after_items),
+            "image_pass": image_pass,
+            "before_facts": _turn_facts(before_items),
+            "after_facts": _turn_facts(after_items),
+            "items_before": len(before_items or []),
+            "items_after": len(after_items or []),
+        }
+        if truncated:
+            trace_fields["truncated"] = True
         _trace_module._route_trace(
             TRACE_EVENT,
             request_id=_routing_module._trace_request_id(dict(before)),
             session=_routing_module._trace_session_context(dict(before)),
-            model=before.get("model"),
-            window=window,
-            before=count,
-            after=after_count,
-            # The token count and the wire size are both answers to "will this
-            # be accepted", and only the pair shows which one the elision moved.
-            image_bytes_before=_inline_image_bytes(before_items),
-            image_bytes_after=_inline_image_bytes(after_items),
-            image_pass=image_pass,
-            before_facts=_turn_facts(before_items),
-            after_facts=_turn_facts(after_items),
-            items_before=len(before_items or []),
-            items_after=len(after_items or []),
+            **trace_fields,
         )
     except Exception:
         # A trace must never decide a request.

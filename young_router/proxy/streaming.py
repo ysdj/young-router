@@ -51,12 +51,10 @@ from .base import (
     _normalize_response_completed_event_usage,
     _proxy_shutdown_in_progress,
     asyncio,
-    copy,
     datetime,
     inspect,
     json,
     os,
-    time,
     timezone,
 )
 
@@ -350,6 +348,8 @@ def _normalize_sse_response_completed_text(
             "response.completed" not in text
             and "image_generation_call" not in text
             and "response.output_item.added" not in text
+            and "response.output_item.done" not in text
+            and "function_call_arguments" not in text
             and "output_text" not in text
             and "content_part" not in text
         )
@@ -537,6 +537,108 @@ def _response_opening_events(
     ]
 
 
+def _align_sse_response_identity_block(
+    block: str,
+    announced_id: str,
+) -> Optional[str]:
+    """One encoded SSE block, rewritten under ``announced_id`` or dropped."""
+
+    if "data:" not in block:
+        return block
+    data_values: list[str] = []
+    for line in block.splitlines():
+        if not line.startswith("data:"):
+            continue
+        value = line[len("data:") :]
+        if value.startswith(" "):
+            value = value[1:]
+        data_values.append(value)
+    payload_text = "\n".join(data_values).strip()
+    if not payload_text or payload_text == "[DONE]":
+        return block
+    try:
+        payload = json.loads(payload_text)
+    except Exception:
+        return block
+    if not isinstance(payload, dict):
+        return block
+    response = payload.get("response")
+    response_id = response.get("id") if isinstance(response, dict) else None
+    if payload.get("type") in _RESPONSE_OPENING_FRAME_TYPES and response_id != announced_id:
+        # A second opening carrying the upstream's id would give the client
+        # two ids for one turn.
+        return None
+    if not isinstance(response, dict) or response_id == announced_id:
+        return block
+    rewritten = dict(payload)
+    response = dict(response)
+    response["id"] = announced_id
+    rewritten["response"] = response
+    normalized_data = json.dumps(rewritten, ensure_ascii=False)
+    next_lines: list[str] = []
+    replaced_data = False
+    for line in block.splitlines():
+        if line.startswith("data:"):
+            if not replaced_data:
+                next_lines.append(f"data: {normalized_data}")
+                replaced_data = True
+            continue
+        next_lines.append(line)
+    line_separator = "\r\n" if "\r\n" in block else "\n"
+    return line_separator.join(next_lines)
+
+def _align_sse_response_identity_text(
+    text: str,
+    announced_id: str,
+) -> Optional[str]:
+    """Every encoded SSE block in ``text``, aligned; ``None`` when none is left."""
+
+    output: list[str] = []
+    dropped = False
+    index = 0
+    while index < len(text):
+        newline_index = text.find("\n\n", index)
+        crlf_index = text.find("\r\n\r\n", index)
+        candidates = [
+            (position, delimiter)
+            for position, delimiter in (
+                (newline_index, "\n\n"),
+                (crlf_index, "\r\n\r\n"),
+            )
+            if position >= 0
+        ]
+        if not candidates:
+            block, delimiter = text[index:], ""
+        else:
+            position, delimiter = min(candidates, key=lambda item: item[0])
+            block = text[index:position]
+        aligned = _align_sse_response_identity_block(block, announced_id)
+        if aligned is None:
+            dropped = True
+        else:
+            output.append(aligned + delimiter)
+        if not delimiter:
+            break
+        index = position + len(delimiter)
+    if dropped and not output:
+        return None
+    return "".join(output)
+
+def _align_sse_response_identity_chunk(
+    chunk: str | bytes,
+    announced_id: str,
+) -> Optional[str | bytes]:
+    if not isinstance(chunk, bytes):
+        return _align_sse_response_identity_text(chunk, announced_id)
+    try:
+        text = chunk.decode("utf-8")
+    except Exception:
+        return chunk
+    aligned = _align_sse_response_identity_text(text, announced_id)
+    if aligned is None:
+        return None
+    return chunk if aligned == text else aligned.encode("utf-8")
+
 def _align_announced_response_identity(
     delivered: Any,
     request_data: Optional[dict] = None,
@@ -548,6 +650,8 @@ def _align_announced_response_identity(
         return delivered
     if not _request_is_responses_stream(request_data):
         return delivered
+    if isinstance(delivered, (str, bytes)):
+        return _align_sse_response_identity_chunk(delivered, announced_id)
     if not isinstance(delivered, dict):
         return delivered
     frame_type = _stream_chunk_type(delivered)
@@ -604,7 +708,13 @@ def _responses_stream_chunk_adapted_for_delivery(
     reasoning-visibility check reads ``request_data``, and without it a client
     that asked for a summary had its thinking silently dropped.
     """
-    input_token_upper_bound = _codex_request_input_token_upper_bound(request_data)
+    # The bound rebuilds and serializes the whole request; only a frame that
+    # states the completion can use it, and this runs once per delivered frame.
+    input_token_upper_bound = (
+        _codex_request_input_token_upper_bound(request_data)
+        if _responses_stream_chunk_is_completed(chunk)
+        else None
+    )
     if isinstance(chunk, _JSONStreamEvent):
         _normalize_response_function_call_arguments(chunk)
         invalid_reason = _payload_invalid_function_call_reason(chunk)
@@ -1095,6 +1205,20 @@ def _stream_chunk_dumps(chunk: Any) -> list[dict[str, Any]]:
         return [dumped] if isinstance(dumped, dict) else []
     return []
 
+def _stream_chunk_completed_dump(chunk: Any) -> dict[str, Any]:
+    """The frame that states the completion, not the first frame of the read.
+
+    A coalesced read is named by its last frame, so its ``response`` payload
+    belongs to that frame; looking in the first frame finds nothing when a
+    delta or lifecycle event travelled ahead of ``response.completed``.
+    """
+
+    dumps = _stream_chunk_dumps(chunk)
+    for dumped in reversed(dumps):
+        if dumped.get("type") in _RESPONSES_STREAM_COMPLETED_TYPES:
+            return dumped
+    return dumps[-1] if dumps else {}
+
 def _stream_chunk_type(chunk: Any) -> str:
     """The frame type this chunk is read as.
 
@@ -1148,8 +1272,9 @@ def _stream_chunk_is_native_terminal(chunk: Any) -> bool:
     return False
 
 def _responses_stream_chunk_is_completed(chunk: Any) -> bool:
-    return _stream_chunk_type(chunk) in _RESPONSES_STREAM_COMPLETED_TYPES or (
-        _stream_chunk_type(chunk) == "response"
+    chunk_type = _stream_chunk_type(chunk)
+    return chunk_type in _RESPONSES_STREAM_COMPLETED_TYPES or (
+        chunk_type == "response"
         and _stream_chunk_response_status(chunk).lower() == "completed"
     )
 
@@ -1159,7 +1284,7 @@ def _responses_completed_chunk_has_usable_output(
 ) -> bool:
     if not _responses_stream_chunk_is_completed(chunk):
         return False
-    dumped = _stream_chunk_dump(chunk)
+    dumped = _stream_chunk_completed_dump(chunk)
     response = dumped.get("response")
     if _responses_request_module._request_has_structured_codex_compaction(
         request_data
@@ -1214,8 +1339,6 @@ def _stream_failure_ended_without_terminal(exception: Exception) -> bool:
     the layers above own it -- synthesizing there would replace a tested
     classified stop with a generic one.
     """
-
-    from . import routing as _routing_module
 
     if _routing_module._is_context_size_error(exception):
         # A prompt the route refused for its size has a cause the reader must
@@ -1345,13 +1468,32 @@ def _incomplete_stopped_below_client_budget(
         return False
     return output_tokens < max(1, budget - 128)
 
+# The reason must stand as its own token: ``max_tokens`` inside a longer word
+# names something else, and ``length`` is also how an input ceiling is worded.
+_OUTPUT_TOKEN_LIMIT_REASON_PATTERNS = tuple(
+    (reason, re.compile(rf"(?<![a-z0-9_]){re.escape(reason)}(?![a-z0-9_])"))
+    for reason in sorted(_OUTPUT_TOKEN_LIMIT_INCOMPLETE_REASONS)
+)
+
+# A message about the *input* ceiling is not an output limit, and several of
+# its spellings (``context_length_exceeded``, ``maximum context length is N
+# tokens``) contain ``length``; taken for an output limit they would let a
+# truncated turn leave as a normal completion.
+_CONTEXT_LENGTH_INCOMPLETE_RE = re.compile(
+    r"context[\s_-]*(?:length|window|limit)"
+    r"|(?:maximum|exceeds?|exceeded)[\s_-]+context"
+    r"|(?:input|prompt)[\s_-]*length"
+    r"|reduce[\s_-]+(?:the[\s_-]+)?length"
+)
 
 def _output_limit_incomplete_reason_from_text(value: str) -> Optional[str]:
     lowered = value.strip().lower()
     if not lowered:
         return None
-    for reason in _OUTPUT_TOKEN_LIMIT_INCOMPLETE_REASONS:
-        if reason in lowered:
+    if _CONTEXT_LENGTH_INCOMPLETE_RE.search(lowered):
+        return None
+    for reason, pattern in _OUTPUT_TOKEN_LIMIT_REASON_PATTERNS:
+        if pattern.search(lowered):
             return reason
     return None
 
@@ -1608,7 +1750,7 @@ def _remember_completed_response_output_items(
 def _completed_response_output_items(chunk: Any) -> list[tuple[int, Any]]:
     if not _responses_stream_chunk_is_completed(chunk):
         return []
-    dumped = _stream_chunk_dump(chunk)
+    dumped = _stream_chunk_completed_dump(chunk)
     response = dumped.get("response")
     if not isinstance(response, dict):
         return []
@@ -2563,7 +2705,7 @@ def _synthesized_native_stream_error_chunk(
         _responses_execution_module._request_model_group(request_data)
         or request_data.get("model")
     )
-    error_code = _native_stream_error_code(exception)
+    error_code = _native_stream_error_code(exception, request_data)
     message = _native_stream_error_message(model, exception, request_data)
     # A refusal the client can act on is not a server failure.  Labelling a
     # context-window refusal ``server_error`` is what made a client reconnect
@@ -2574,7 +2716,6 @@ def _synthesized_native_stream_error_chunk(
         in {
             "context_length_exceeded",
             "invalid_prompt",
-            "upstream_prompt_rejected",
             "image_generation_tool_unavailable",
             "upstream_account_restricted",
             "upstream_client_outdated",
@@ -2602,7 +2743,10 @@ def _synthesized_native_stream_error_chunk(
         }
     }
 
-def _native_stream_error_code(exception: Exception) -> str:
+def _native_stream_error_code(
+    exception: Exception,
+    request_data: Optional[dict] = None,
+) -> str:
     if _routing_module._is_sanitized_upstream_route_failure_error(exception):
         # The sentence is the one the router decided on; the code has to agree
         # with it.  A wrapper's own class says nothing about the cause, and a
@@ -2668,6 +2812,10 @@ def _native_stream_error_code(exception: Exception) -> str:
         return "upstream_stream_incomplete"
     if _routing_module._is_route_cut_stream_error(exception):
         return "upstream_stream_truncated"
+    if _routing_module._request_body_size_rejected(request_data):
+        # Every candidate route refused these bytes, so ``invalid_prompt`` is
+        # the code that stops a client resending the identical body.
+        return "invalid_prompt"
     return "upstream_route_failure"
 
 def _native_stream_error_message(
@@ -2810,6 +2958,16 @@ def _native_stream_error_message(
             "answered that the model does not exist). Disable the stale "
             "provider route or choose another model; sending this turn again "
             "meets the same answer."
+        )
+    if _routing_module._is_image_generation_all_deployments_unsupported_error(
+        exception
+    ):
+        # The wire type says ``invalid_request_error``, and the Anthropic shape
+        # below carries no error code at all: this sentence is the only thing
+        # that tells the reader the tool itself was refused.
+        return (
+            "All configured deployments for this model rejected the "
+            "image_generation tool."
         )
     if getattr(exception, "stream_incomplete", False):
         # Keeps the phrase the chat-completions terminal test pins, and adds the
@@ -3258,6 +3416,88 @@ def _stream_chunk_has_deliverable_route_recovery_output(
     if _responses_stream_chunk_is_incomplete_terminal(dumped):
         return True
     return False
+
+
+async def _await_upstream_dispatch(
+    awaitable: Any,
+    request_data: dict,
+    *,
+    fallback_budget_seconds: float = 0.0,
+) -> Any:
+    """Await one upstream attempt's *dispatch*, bounded.
+
+    The helper LiteLLM calls per hop returns the response object: for a
+    streaming call that moment is exactly "the host was reached, the body was
+    uploaded, and the response head arrived".  Every stream budget in this
+    module starts after it, so until now nothing timed it, and an unreachable
+    host was bounded only by the operating system's SYN ladder times LiteLLM's
+    own retry -- 271 s on the live gateway on 2026-11-15, on a route that had
+    sent and received nothing.
+
+    The budget is ``_upstream_dispatch_budget_seconds``: the connect budget plus
+    an upload allowance for the bytes this request carries, so a heavy replay
+    is not cut and an absent host is not waited on.  A timeout is this proxy's
+    own verdict about the route, so it is raised as the start-timeout shape the
+    failover, cooldown and recovery machinery already agree on: a sibling may
+    answer, the route is parked, and the client is told no upstream event
+    arrived rather than that its bytes were refused.
+
+    ``fallback_budget_seconds`` is for the callers that already bounded this
+    await with the first-event budget: when the operator turns the connect
+    budget off, that older bound is what should remain -- not "wait forever".
+    """
+
+    budget_seconds = _routing_module._upstream_dispatch_budget_seconds(request_data)
+    if budget_seconds <= 0:
+        budget_seconds = fallback_budget_seconds
+    if budget_seconds <= 0:
+        return await awaitable
+    # Two wrong tools, both rejected by measurement rather than taste:
+    #
+    # ``asyncio.wait_for`` and a hand-rolled ``ensure_future`` both move the
+    # dispatch into a *child task*, whose context is a copy -- so every
+    # ``ContextVar`` write the attempt makes stays inside it.  This proxy keeps
+    # the route that answered in one of those (``_CURRENT_SELECTED_DEPLOYMENT_BOX``),
+    # and a copy silently turns "route-peer answered" into "no route identity":
+    # the log row, the cooldown key and the delivery marker all lose their
+    # route.  ``tests/test_hooks_streaming_compaction.py`` catches it.
+    #
+    # ``asyncio.timeout`` cancels the *current* task's await instead, so the
+    # dispatch keeps running in the caller's own context.  It also separates the
+    # two ways a ``TimeoutError`` can appear: since 3.11 ``asyncio.TimeoutError``
+    # is the builtin one, and ``wait_for`` would rewrite an upstream that raised
+    # its own ``TimeoutError`` into this proxy's verdict, losing the real cause.
+    # ``asyncio.timeout`` raises only on its own expiry and passes an inner
+    # ``TimeoutError`` through untouched.
+    try:
+        async with asyncio.timeout(budget_seconds):
+            return await awaitable
+    except TimeoutError as exc:
+        if _is_dispatch_budget_expiry(exc):
+            raise _stream_start_timeout_exception(
+                request_data,
+                start_seconds=budget_seconds,
+                saw_chunk=False,
+                buffered_chunks=0,
+            ) from None
+        raise
+
+
+def _is_dispatch_budget_expiry(exception: TimeoutError) -> bool:
+    """Whether this ``TimeoutError`` is the dispatch budget's own verdict.
+
+    ``asyncio.timeout`` raises its ``TimeoutError`` with no message of its own,
+    while the failures this proxy already classifies (and every upstream that
+    wraps one) carry a reason on ``body`` or at least a sentence.  The check
+    exists so a route's own timeout keeps its own reason and its own route
+    identity instead of being reported as this proxy's silence.
+    """
+
+    if getattr(exception, "body", None) is not None:
+        return False
+    return not str(exception).strip()
+
+
 def _stream_start_timeout_exception(
     request_data: dict,
     *,
@@ -3447,8 +3687,6 @@ async def _stream_with_idle_timeout(
     response: Any,
     request_data: dict,
     *,
-    stream_started_at: Optional[float] = None,
-    saw_visible_output: bool = False,
     initial_chunk_count: int = 0,
 ) -> AsyncIterator[Any]:
     idle_timeout_seconds = _resolved_stream_timeout_seconds(
@@ -3464,7 +3702,6 @@ async def _stream_with_idle_timeout(
     iterator = response.__aiter__()
     chunk_count = max(0, initial_chunk_count)
     saw_chunk = chunk_count > 0
-    visible_output_seen = saw_visible_output
     idle_deadline = (
         time.monotonic() + idle_timeout_seconds
         if saw_chunk and idle_timeout_seconds > 0
@@ -3528,11 +3765,6 @@ async def _stream_with_idle_timeout(
                 request_data,
                 observed_at,
             )
-        if not visible_output_seen:
-            visible_output_seen = _stream_chunk_has_visible_output(chunk) or (
-                _request_is_responses_stream(request_data)
-                and _responses_completed_chunk_has_usable_output(chunk, request_data)
-            )
         yield chunk
 
 def _should_emit_codex_responses_initial_sse_keepalive(
@@ -3564,10 +3796,6 @@ def _is_codex_responses_initial_sse_keepalive(chunk: Any) -> bool:
     if isinstance(chunk, dict) and chunk.get("type") == "response.metadata":
         metadata = chunk.get("metadata")
         return isinstance(metadata, dict) and metadata.get("phase") == "initial_wait"
-    if isinstance(chunk, bytes):
-        chunk = chunk.decode("utf-8", errors="replace")
-    if isinstance(chunk, str):
-        return chunk.startswith(": young_router initial_wait ")
     return False
 
 async def _cancel_pending_read(task: Optional[asyncio.Task[Any]]) -> None:
@@ -3587,8 +3815,6 @@ async def _cancel_pending_read(task: Optional[asyncio.Task[Any]]) -> None:
 async def _yield_codex_responses_initial_keepalive_stream(
     response: Any,
     request_data: dict,
-    *,
-    stream_started_at: Optional[float] = None,
 ) -> AsyncIterator[Any]:
     """Open a Codex Responses SSE stream before a slow upstream first event.
 
@@ -3702,7 +3928,6 @@ async def _yield_codex_responses_initial_keepalive_stream(
         async for chunk in _stream_with_idle_timeout(
             iterator,
             request_data,
-            stream_started_at=stream_started_at,
             initial_chunk_count=1,
         ):
             yield chunk
@@ -3875,6 +4100,11 @@ def _build_streaming_error_fallback_payload(
         "temperature",
         "top_p",
         "stream_timeout",
+        # A replay is the same caller's silence profile, not this process's
+        # default: a continuation that raised its idle budget would otherwise
+        # be torn down mid-reasoning on the route that took over.
+        "stream_idle_timeout_seconds",
+        "stream_start_timeout_seconds",
         "api_base",
         "api_key",
         "api_version",
@@ -4342,13 +4572,16 @@ async def _streaming_error_fallback_response(
         stream_start_timeout_seconds = _routing_module._stream_start_timeout_seconds_for_request(
             payload,
         )
-        if stream_start_timeout_seconds > 0:
-            response = await asyncio.wait_for(
-                router_method(**dispatch_kwargs),
-                timeout=stream_start_timeout_seconds,
-            )
-        else:
-            response = await router_method(**dispatch_kwargs)
+        # The retry hop dispatches through the same budget as the first one: the
+        # route this round picks is just as capable of being absent, and the
+        # first-event clock still cannot see the phase that decides that.  The
+        # start budget stays as the fallback for an operator who turned the
+        # connect budget off.
+        response = await _await_upstream_dispatch(
+            router_method(**dispatch_kwargs),
+            payload,
+            fallback_budget_seconds=stream_start_timeout_seconds,
+        )
         _routing_module._apply_current_selected_deployment_to_request(
             payload,
             selected_box=selected_deployment_box,
@@ -4882,8 +5115,7 @@ class _ResponsesStreamCompletionState:
             )
             self.pending_by_index.pop(index, None)
         elif json_item.get("type") == "function_call":
-            if json_item.get("type") == "function_call":
-                json_item.setdefault("arguments", "")
+            json_item.setdefault("arguments", "")
             self.pending_by_index[index] = json_item
 
     def _identity_keys_for_item(self, json_item: dict[str, Any], item_id: str) -> list[str]:
@@ -5188,8 +5420,6 @@ async def _yield_validated_structured_codex_compaction_stream(
     buffer: List[Any],
     response: Any,
     request_data: dict,
-    *,
-    stream_started_at: Optional[float] = None,
 ) -> AsyncIterator[Any]:
     """Buffer a remote compaction until its required encrypted result is final."""
     events: List[Any] = []
@@ -5261,7 +5491,6 @@ async def _yield_validated_structured_codex_compaction_stream(
         async for chunk in _stream_with_idle_timeout(
             response,
             request_data,
-            stream_started_at=stream_started_at,
             initial_chunk_count=len(buffer),
         ):
             if remember(chunk) is not None:
@@ -5401,8 +5630,6 @@ async def _yield_native_stream_with_output_limit_continuation(
         async for chunk in _stream_with_idle_timeout(
             response,
             request_data,
-            stream_started_at=stream_started_at,
-            saw_visible_output=visible_output_delivered,
             initial_chunk_count=len(buffer),
         ):
             chunk_exception = _stream_chunk_error_exception(chunk)
@@ -5478,7 +5705,7 @@ async def _yield_native_stream_with_output_limit_continuation(
         # The route stopped at its own ceiling.  Ask it for the rest and splice
         # the continuation into this same answer; the withheld frame is sent
         # only when there is nothing more to ask for.
-        continued = False
+        continuation_closed = False
         async for chunk in _stream_continuation_module._stream_native_continuation_rounds(
             request_data,
             "".join(delivered_text_parts),
@@ -5490,7 +5717,10 @@ async def _yield_native_stream_with_output_limit_continuation(
             ceiling_chunk=withheld_ceiling_terminal,
             answered_output_tokens=answered_output_tokens,
         ):
-            continued = True
+            # The same test the continuation applies before it hands over a
+            # route's closing frame: that frame is the only terminal it yields.
+            if _native_stream_chunk_is_terminal(chunk, request_data, set()):
+                continuation_closed = True
             yield remember_delivered_text(chunk)
         # The continuation owns the answer's last frame: when it reached a
         # natural stop it already emitted that frame, and when it ran out of
@@ -5498,7 +5728,12 @@ async def _yield_native_stream_with_output_limit_continuation(
         # answer is still unfinished.  Re-emitting the withheld frame on top of
         # a natural stop would tell the client an answer that finished had hit
         # the ceiling.
-        if not continued:
+        #
+        # "It closed the answer" is not "it yielded something": rounds that add
+        # text and hit the ceiling again, or one that fails after it started
+        # writing, yield frames and no terminal.  Reading those as closed left
+        # the client a stream with no end.
+        if not continuation_closed:
             yield withheld_ceiling_terminal
             # The frame that closes the withheld one travels with it.  Sending
             # the ceiling alone left the client on an answer that never ended,
@@ -5558,7 +5793,6 @@ async def _yield_guarded_original_stream(
             buffer,
             response,
             request_data,
-            stream_started_at=stream_started_at,
         ):
             yield chunk
         return
@@ -5578,7 +5812,6 @@ async def _yield_guarded_original_stream(
     seen_output_item_ids: set[str] = set()
     pending_tool_items: dict[str, tuple[int, dict[str, Any]]] = {}
     completed_output_items: dict[int, dict[str, Any]] = {}
-    client_open_tool_output_indexes: set[int] = set()
     # A Responses stream reports its outcome through a terminal ``completed``
     # event rather than through LiteLLM's stream-completion callback, so this
     # branch has to name the serving route itself. Without it a Responses
@@ -5623,36 +5856,7 @@ async def _yield_guarded_original_stream(
             request_data,
         )
 
-    def remember_client_tool_call_exposure(chunk: Any) -> None:
-        """Track which tool calls the client was actually told about.
-
-        A Responses client opens a tool call on ``response.output_item.added`` and
-        closes it on ``response.output_item.done``; the bridge takeover replays
-        neither for items the router consumed.  The router's own pending map is
-        not enough: a synthesized or replayed item can be closed in that map
-        without the client ever having seen the opening event.
-        """
-        dumped = _stream_chunk_dump(chunk)
-        if not isinstance(dumped, dict):
-            return
-        chunk_type = _stream_chunk_type(dumped)
-        if chunk_type not in {"response.output_item.added", "response.output_item.done"}:
-            return
-        item = dumped.get("item")
-        if not _stream_output_item_is_tool_call(
-            _web_search_native_module._response_item_get(item, "type")
-        ):
-            return
-        output_index = dumped.get("output_index")
-        if not isinstance(output_index, int):
-            return
-        if chunk_type == "response.output_item.added":
-            client_open_tool_output_indexes.add(output_index)
-        else:
-            client_open_tool_output_indexes.discard(output_index)
-
     def deliver_client_chunk(chunk: Any) -> Any:
-        remember_client_tool_call_exposure(chunk)
         return _responses_stream_chunk_for_delivery(
             completion_state.chunk_for_delivery(chunk, request_data),
             request_data,
@@ -5741,16 +5945,6 @@ async def _yield_guarded_original_stream(
             _response_item_has_assistant_text(item)
             for item in completed_output_items.values()
         )
-
-    def stream_chunk_has_visible_assistant_text_output(chunk: Any) -> bool:
-        dumped = _stream_chunk_dump(chunk)
-        chunk_type = _stream_chunk_type(dumped)
-        text_fragment, _is_done_text = _stream_chunk_text_fragment(dumped)
-        if text_fragment.strip():
-            return True
-        if chunk_type in {"response.output_item.added", "response.output_item.done"}:
-            return _response_item_has_assistant_text(dumped.get("item"))
-        return False
 
     def terminal_completed_output_items(
         *,
@@ -5961,6 +6155,7 @@ async def _yield_guarded_original_stream(
                     return
                 break
             if empty_completed and not answer_output_seen:
+                empty_completion_ended_stream = True
                 break
             saw_responses_completed = True
             record_responses_stream_success()
@@ -5974,7 +6169,6 @@ async def _yield_guarded_original_stream(
                 pending_tool_items,
             ):
                 remember(synthetic_chunk)
-                remember_client_tool_call_exposure(synthetic_chunk)
                 yield synthetic_chunk
             for delivered_chunk in deliverable_client_chunks(chunk):
                 yield delivered_chunk
@@ -5991,6 +6185,7 @@ async def _yield_guarded_original_stream(
                 remember(synthetic_chunk)
                 yield synthetic_chunk
             if terminal_events:
+                await _close_async_iterator_safely(response)
                 return
             output_limit_terminal = (
                 _responses_incomplete_terminal_reason(chunk)
@@ -6012,6 +6207,7 @@ async def _yield_guarded_original_stream(
                         yield failed_terminal_event(
                             "upstream stopped at its own output limit below the requested budget"
                         )
+                        await _close_async_iterator_safely(response)
                         return
                     raise _responses_incomplete_stream_exception(
                         "upstream stopped at its own output limit below the requested budget",
@@ -6024,10 +6220,12 @@ async def _yield_guarded_original_stream(
                 if completed is not None:
                     remember(completed)
                     yield completed
+                    await _close_async_iterator_safely(response)
                     return
                 yield failed_terminal_event(
                     "output token limit terminal response event without usable output"
                 )
+                await _close_async_iterator_safely(response)
                 return
             if (
                 not completed_output_has_visible_assistant_text()
@@ -6040,9 +6238,11 @@ async def _yield_guarded_original_stream(
                 if completed is not None:
                     remember(completed)
                     yield completed
+                    await _close_async_iterator_safely(response)
                     return
             if visible_output_seen:
                 yield failed_terminal_event("terminal response event before response.completed")
+                await _close_async_iterator_safely(response)
                 return
             raise _responses_incomplete_stream_exception(
                 "terminal response event before response.completed",
@@ -6080,8 +6280,6 @@ async def _yield_guarded_original_stream(
         async for chunk in _stream_with_idle_timeout(
             response,
             request_data,
-            stream_started_at=stream_started_at,
-            saw_visible_output=visible_output_seen,
             initial_chunk_count=len(buffer),
         ):
             _web_search_native_module._mark_provider_native_web_search_event(
@@ -6116,15 +6314,18 @@ async def _yield_guarded_original_stream(
                     if completed is not None:
                         remember(completed)
                         yield completed
+                        await _close_async_iterator_safely(response)
                         return
                 terminal_events = completed_custom_tool_terminal_events()
                 for synthetic_chunk in terminal_events:
                     remember(synthetic_chunk)
                     yield synthetic_chunk
                 if terminal_events:
+                    await _close_async_iterator_safely(response)
                     return
                 if visible_output_seen and not saw_responses_completed:
                     yield failed_terminal_event("stream error after visible output", chunk_exception)
+                    await _close_async_iterator_safely(response)
                     return
                 raise chunk_exception
             remember(chunk)
@@ -6164,6 +6365,7 @@ async def _yield_guarded_original_stream(
                         return
                     break
                 if empty_completed and not answer_output_seen:
+                    empty_completion_ended_stream = True
                     break
                 saw_responses_completed = True
                 record_responses_stream_success()
@@ -6189,6 +6391,7 @@ async def _yield_guarded_original_stream(
                     remember(synthetic_chunk)
                     yield synthetic_chunk
                 if terminal_events:
+                    await _close_async_iterator_safely(response)
                     return
                 output_limit_terminal = (
                     _responses_incomplete_terminal_reason(chunk)
@@ -6210,6 +6413,7 @@ async def _yield_guarded_original_stream(
                             yield failed_terminal_event(
                                 "upstream stopped at its own output limit below the requested budget"
                             )
+                            await _close_async_iterator_safely(response)
                             return
                         raise _responses_incomplete_stream_exception(
                             "upstream stopped at its own output limit below the requested budget",
@@ -6222,10 +6426,12 @@ async def _yield_guarded_original_stream(
                     if completed is not None:
                         remember(completed)
                         yield completed
+                        await _close_async_iterator_safely(response)
                         return
                     yield failed_terminal_event(
                         "output token limit terminal response event without usable output"
                     )
+                    await _close_async_iterator_safely(response)
                     return
                 if (
                     not completed_output_has_visible_assistant_text()
@@ -6238,9 +6444,11 @@ async def _yield_guarded_original_stream(
                     if completed is not None:
                         remember(completed)
                         yield completed
+                        await _close_async_iterator_safely(response)
                         return
                 if visible_output_seen:
                     yield failed_terminal_event("terminal response event before response.completed")
+                    await _close_async_iterator_safely(response)
                     return
                 raise _responses_incomplete_stream_exception(
                     "terminal response event before response.completed",
@@ -6273,11 +6481,13 @@ async def _yield_guarded_original_stream(
             if synthetic_completed is not None:
                 remember(synthetic_completed)
                 yield synthetic_completed
+                await _close_async_iterator_safely(response)
                 return
             # Nothing usable arrived, so there is no partial turn to keep.  A
             # clean body close is still read as a finished turn, so state the
             # restart as the retryable stop it is.
             yield _synthesized_failed_response_event(request_data, exc)
+            await _close_async_iterator_safely(response)
             return
         if saw_image_generation_activity:
             completed = completed_image_generation_terminal_event(
@@ -6286,15 +6496,18 @@ async def _yield_guarded_original_stream(
             if completed is not None:
                 remember(completed)
                 yield completed
+                await _close_async_iterator_safely(response)
                 return
         terminal_events = completed_custom_tool_terminal_events()
         for synthetic_chunk in terminal_events:
             remember(synthetic_chunk)
             yield synthetic_chunk
         if terminal_events:
+            await _close_async_iterator_safely(response)
             return
         if visible_output_seen and not saw_responses_completed:
             yield failed_terminal_event("stream error after visible output", exc)
+            await _close_async_iterator_safely(response)
             return
         raise
 
@@ -6305,6 +6518,7 @@ async def _yield_guarded_original_stream(
         if completed is not None:
             remember(completed)
             yield completed
+        await _close_async_iterator_safely(response)
         return
 
     if not saw_responses_completed:
@@ -6313,6 +6527,7 @@ async def _yield_guarded_original_stream(
             remember(synthetic_chunk)
             yield synthetic_chunk
         if terminal_events:
+            await _close_async_iterator_safely(response)
             return
 
     if not saw_responses_completed and pending_tool_items:
@@ -6323,8 +6538,8 @@ async def _yield_guarded_original_stream(
             completion_state.model,
         ):
             remember(synthetic_chunk)
-            remember_client_tool_call_exposure(synthetic_chunk)
             yield synthetic_chunk
+        await _close_async_iterator_safely(response)
         return
 
     if not saw_responses_completed:
@@ -6365,12 +6580,14 @@ async def _yield_guarded_original_stream(
                 if synthetic_completed is not None:
                     remember(synthetic_completed)
                     yield synthetic_completed
+                    await _close_async_iterator_safely(response)
                     return
                 # The answer never began.  Closing the body without a terminal
                 # is read as a finished turn by the client, which is how a
                 # restart ended a main thread that still had subagents running.
                 # State the restart so the turn is resent instead.
                 yield _synthesized_failed_response_event(request_data, incomplete_exception)
+                await _close_async_iterator_safely(response)
                 return
             if synthesize_completed_on_clean_eof_after_visible_output:
                 terminal_items = terminal_completed_output_items()
@@ -6380,13 +6597,18 @@ async def _yield_guarded_original_stream(
                     completion_state.model,
                     fallback_text=synthesized_text(),
                 )
-                remember(synthetic_completed)
-                yield synthetic_completed
-                return
+                # Thinking alone leaves nothing to complete, so fall through to
+                # the failed terminal instead of yielding None to the client.
+                if synthetic_completed is not None:
+                    remember(synthetic_completed)
+                    yield synthetic_completed
+                    await _close_async_iterator_safely(response)
+                    return
             yield failed_terminal_event(
                 "stream ended before response.completed",
                 incomplete_exception,
             )
+            await _close_async_iterator_safely(response)
             return
         terminal_items = terminal_completed_output_items()
         synthetic_completed = (
@@ -6402,6 +6624,7 @@ async def _yield_guarded_original_stream(
         if synthetic_completed is not None:
             remember(synthetic_completed)
             yield synthetic_completed
+            await _close_async_iterator_safely(response)
             return
         raise _responses_incomplete_stream_exception(
             "stream ended before response.completed",
@@ -6690,23 +6913,18 @@ async def _yield_start_buffered_stream_with_error_fallback(
         async for chunk in response:
             yield chunk
         return
-    if (
-        _routing_module._is_failed_responses_stream_response(response)
-        or bool(getattr(response, "_young_router_terminal_failed_stream", False))
-    ):
+    if _routing_module._is_failed_responses_stream_response(response):
         async for chunk in response:
             yield chunk
         return
     if _responses_request_module._request_has_structured_codex_compaction(
         request_data
     ):
-        stream_started_at = time.monotonic()
         try:
             async for chunk in _yield_validated_structured_codex_compaction_stream(
                 [],
                 response,
                 request_data,
-                stream_started_at=stream_started_at,
             ):
                 yield chunk
         except Exception as exception:
@@ -6731,6 +6949,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
     saw_visible_output = False
     saw_delivered_output = False
     stream_exhausted = True
+    empty_completion_ended_stream = False
     stream_started_at = time.monotonic()
     completion_state = _ResponsesStreamCompletionState(request_data)
     raw_tool_call_text_filter = _web_search_native_module._RawToolCallTextFilter()
@@ -6746,13 +6965,11 @@ async def _yield_start_buffered_stream_with_error_fallback(
         stream = _stream_with_idle_timeout(
             response,
             request_data,
-            stream_started_at=stream_started_at,
         )
         if _should_emit_codex_responses_initial_sse_keepalive(request_data):
             stream = _yield_codex_responses_initial_keepalive_stream(
                 response,
                 request_data,
-                stream_started_at=stream_started_at,
             )
         async for chunk in stream:
             _web_search_native_module._mark_provider_native_web_search_event(
@@ -6824,6 +7041,7 @@ async def _yield_start_buffered_stream_with_error_fallback(
             if is_responses_stream:
                 if _responses_stream_chunk_is_completed(chunk):
                     if _responses_completed_chunk_is_empty(chunk, request_data) and not saw_visible_output:
+                        empty_completion_ended_stream = True
                         break
                     saw_responses_completed = True
                     saw_visible_output = saw_visible_output or _responses_completed_chunk_has_usable_output(
@@ -6831,14 +7049,6 @@ async def _yield_start_buffered_stream_with_error_fallback(
                         request_data,
                     )
                 elif _responses_stream_chunk_is_incomplete_terminal(chunk):
-                    if _is_young_router_terminal_failure_event(chunk):
-                        for delivered_frame in _delivered_frames(
-                            buffer,
-                            request_data,
-                        ):
-                            yield delivered_frame
-                        await _close_async_iterator_safely(response)
-                        return
                     completed_compat_chunk = (
                         _responses_output_limit_terminal_state_as_completed_chunk(
                             chunk,
@@ -6951,7 +7161,11 @@ async def _yield_start_buffered_stream_with_error_fallback(
             yield completed_compat
             return
         incomplete_exception = _responses_incomplete_stream_exception(
-            "stream ended before response.completed",
+            (
+                "the completion carried no answer"
+                if empty_completion_ended_stream
+                else "stream ended before response.completed"
+            ),
             buffer=buffer,
             request_data=request_data,
         )

@@ -47,7 +47,6 @@ time with the same bytes.
 
 from __future__ import annotations
 
-import json
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -449,7 +448,11 @@ def _refresh_requirements_from_shared(now: float, *, force: bool = False) -> Non
             from .. import runtime_store
 
             payload = runtime_store.read_document(path)
-        except (OSError, ValueError):
+        except Exception:
+            # A store that cannot answer reads the same as one with nothing to
+            # say: the copy on hand is still valid, and the next turn can ask
+            # again.  Transaction failures surface as ``sqlite3.Error``, which
+            # is not an ``OSError``.
             return
         entries = (
             payload.get(_REQUIREMENT_STATE_KEY)
@@ -514,7 +517,11 @@ def _record_replay_requirement(request_kwargs: Any) -> None:
                 path,
                 lambda payload: _record_into_payload(payload, cache_key, entry),
             )
-        except OSError:
+        except Exception:
+            # Remembering this route is best-effort: the answer has already
+            # been delivered, and a store that could not commit must not turn
+            # it into a failure.  Its transaction errors are ``sqlite3.Error``,
+            # not ``OSError``.
             pass
     _trace_module._route_trace(
         "responses_reasoning_text_replay_recorded",

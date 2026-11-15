@@ -45,9 +45,12 @@ long the loop runs anyway.
 CONFLICT_CODE = "webdav_sync_conflict"
 """The failure that means a person has to choose, not try again later.
 
-Both ends moved, so no unattended run can settle it: the pane shows the two
-sides and waits.  Retrying it on the interval is what turned a conflict on lv
-into a proxy reload every two minutes overnight.
+Both ends moved and the merge could not combine them -- one row's field changed
+on both sides, an edit against a removal -- so no unattended run can settle it:
+the pane shows the two sides and waits.  Everything the merge *can* settle is
+settled in the run itself, which is why this code is now rare rather than the
+answer to every pair of moved sides.  Retrying it on the interval is what
+turned a conflict on lv into a proxy reload every two minutes overnight.
 """
 
 UNSAVED_CODE = "webdav_sync_unsaved"
@@ -246,9 +249,10 @@ class WebDAVSyncScheduler:
                 self._run()
                 continue
             if delay is None:
-                if self._wait(None) or self._stop.is_set():
-                    continue
-                return
+                # Nothing is scheduled until the settings change: sleep until a
+                # kick (or stop) wakes the event, then let the loop head decide.
+                self._wait(None)
+                continue
             if self._wait(delay):
                 continue
             # The wait elapsed: recompute, which fires when the time is up.

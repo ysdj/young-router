@@ -63,7 +63,7 @@ def _settings_updates(data: Mapping[str, Any]) -> dict[str, Any]:
     updates = {_SETTINGS_ALIASES.get(key, key): value for key, value in updates.items()}
     for key in _SETTINGS_RETIRED:
         updates.pop(key, None)
-    unknown = set(updates).difference(set(_SETTINGS_FIELDS) | {"enabled", "keep_password", "clear_password"})
+    unknown = set(updates).difference(set(_SETTINGS_FIELDS) | {"enabled", "clear_password"})
     if unknown:
         raise DomainError("WebDAV settings contain an unsupported field")
     return updates
@@ -103,6 +103,10 @@ class WebDAVSettingsDomain:
         self._last_probe = "unknown"
         self._conflict_cache: dict[str, Any] | None = None
         self._conflict_cache_identity: object = object()
+        self._status_cache: dict[str, Any] | None = None
+        self._status_cache_identity: object = object()
+        self._sync_state_cache: dict[str, str] | None = None
+        self._sync_state_cache_identity: object = object()
         self.revision = 0
         self.reload()
 
@@ -295,36 +299,54 @@ class WebDAVSettingsDomain:
 
         from ...webdav import core as webdav_core
 
+        # A snapshot is read many times a second and the status file changes
+        # only when a run finishes, so the parsed answer is kept until the file
+        # does: re-reading it per poll would put that cost on the window's
+        # refresh path.
+        identity = self._disk_identity_of(self.status_path)
+        if self._status_cache_identity == identity:
+            return self._status_cache
+        result: dict[str, Any] | None = None
         try:
             status = webdav_core.read_status_file(self.status_path)
         except Exception:
-            return None
+            status = {}
         checked_at = status.get("checked_at")
-        if not isinstance(checked_at, str) or not checked_at.strip():
-            return None
-        action = status.get("action")
-        code = status.get("code")
-        return {
-            "action": action if isinstance(action, str) else "",
-            "ok": status.get("ok") is True,
-            # Why a failed run stopped: the pane states the cause and the step
-            # that clears it, so "failed" alone never reaches the reader.
-            "code": code if isinstance(code, str) else "",
-            "at": checked_at,
-        }
+        if isinstance(checked_at, str) and checked_at.strip():
+            action = status.get("action")
+            code = status.get("code")
+            result = {
+                "action": action if isinstance(action, str) else "",
+                "ok": status.get("ok") is True,
+                # Why a failed run stopped: the pane states the cause and the step
+                # that clears it, so "failed" alone never reaches the reader.
+                "code": code if isinstance(code, str) else "",
+                "at": checked_at,
+            }
+        self._status_cache_identity = identity
+        self._status_cache = result
+        return result
 
     def _last_sync(self) -> dict[str, str] | None:
         from ...webdav import core as webdav_core
 
+        # Kept by file identity for the same reason as the status file above:
+        # the sync state is rewritten only when a run records a new baseline.
+        identity = self._disk_identity_of(self.state_path)
+        if self._sync_state_cache_identity == identity:
+            return self._sync_state_cache
+        result: dict[str, str] | None = None
         try:
             state = webdav_core.load_sync_state(self.state_path)
         except Exception:
-            return None
+            state = {}
         updated_at = state.get("updated_at")
         action = state.get("action")
-        if not isinstance(updated_at, str) or not updated_at.strip():
-            return None
-        return {"at": updated_at, "action": action if isinstance(action, str) else ""}
+        if isinstance(updated_at, str) and updated_at.strip():
+            result = {"at": updated_at, "action": action if isinstance(action, str) else ""}
+        self._sync_state_cache_identity = identity
+        self._sync_state_cache = result
+        return result
 
     def draft_state(self) -> object:
         return {

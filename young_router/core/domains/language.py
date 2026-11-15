@@ -63,7 +63,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "language.simplified_chinese": "简体中文",
         "claude.title": "Claude Settings",
         "claude.model": "Model",
-        "claude.gateway": "LiteLLM gateway",
+        "claude.gateway": "Young Router gateway",
         "claude.permissions": "Permissions",
         "claude.sandbox": "Bash sandbox",
         "claude.filesystem": "File system access",
@@ -126,7 +126,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "language.simplified_chinese": "简体中文",
         "claude.title": "Claude 设置",
         "claude.model": "模型",
-        "claude.gateway": "LiteLLM 网关",
+        "claude.gateway": "漾路由网关",
         "claude.permissions": "权限",
         "claude.sandbox": "Bash 沙箱",
         "claude.filesystem": "文件系统访问",
@@ -312,17 +312,12 @@ class LanguageSettingsDomain:
         return create_translator(self.choice, self.system_locale)(key, values)
 
 
-def create_domain(*args: Any, **kwargs: Any) -> LanguageSettingsDomain:
-    return LanguageSettingsDomain(*args, **kwargs)
-
-
 __all__ = [
     "DOMAIN_NAME",
     "LANGUAGE_OPTIONS",
     "LanguageSettingsDomain",
     "LanguageSettingsError",
     "MESSAGES",
-    "create_domain",
     "create_translator",
     "normalize_system_language",
     "resolve_language",

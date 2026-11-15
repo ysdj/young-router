@@ -83,7 +83,6 @@ REFUSED_ALIAS_TOKENS = frozenset(
 #: in that table -- so the second spelling is the one that leaves the row reading
 #: just the model's own name.  The reasoning ladder is identical for both.
 ALIAS_FAMILY = "claude-mythos-"
-ALIAS_PREFIX = ALIAS_FAMILY
 
 #: Aliases this app published before ``mythos``.  A client's request can still
 #: name one after an upgrade -- its picker holds the id it was given -- so the
@@ -206,7 +205,7 @@ def legacy_alias_index(public_names: Iterable[str]) -> dict[str, str]:
     """Alias -> public name for the families earlier releases published.
 
     The digest is the same one ``claude_desktop_alias`` derives; only the
-    prefix differs, so a picker that still holds ``claude-mythos-<digest>``
+    prefix differs, so a picker that still holds ``claude-fable-<digest>``
     reaches the route it named before this app renamed the family.
     """
 
@@ -321,7 +320,6 @@ def public_model_names(router: object) -> list[str]:
 
 __all__ = [
     "ALIAS_FAMILY",
-    "ALIAS_PREFIX",
     "LEGACY_ALIAS_FAMILIES",
     "REFUSED_ALIAS_TOKENS",
     "alias_index",

@@ -51,6 +51,7 @@ from .protocol import (
     make_resync_event,
 )
 from .security import REDACTED, _key_text, redact, safe_exception_message, safe_error_message
+from ..public_names import display_upstream_model
 
 
 CORE_METADATA_VERSION = 1
@@ -630,7 +631,7 @@ def _relay_dependency_policy_name(value: object) -> str:
     """The provider-side policy one relay action or journal entry states.
 
     The relay domain owns the vocabulary a user chooses (``delete_models``,
-    ``detach_only``, ...) while the provider domain owns the effect (``delete``,
+    ``detach_disabled``, ...) while the provider domain owns the effect (``delete``,
     ``detach``, ...).  Both the dispatch that stages a key write and the Apply
     that executes it read the policy through this one table, so a journaled
     delete cannot be read with a different meaning than the one it was staged
@@ -831,7 +832,7 @@ def _safe_issue_path(value: object) -> str:
         return ""
     if len(text) > 160 or text.startswith(("/", "~", "\\")) or re.match(r"^[A-Za-z]:[\\/]", text):
         return "configuration"
-    if "/" in text or "\\" in text or ".." in text.split("."):
+    if "/" in text or "\\" in text or ".." in text:
         return "configuration"
     return text if re.fullmatch(r"[A-Za-z0-9_.\[\]-]+", text) else "configuration"
 
@@ -983,7 +984,9 @@ def _document_master_key(path: Path) -> str:
 
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeError):
+        # Bytes that are not UTF-8 are "unreadable" too; the decode error is a
+        # ``ValueError``, so it used to leave this function instead.
         return ""
     try:
         from .domains.runtime import master_key_from_document
@@ -1218,6 +1221,11 @@ class UnavailableDomain:
 
 
 
+#: How long a sign-in window waits before it offers the station a jar again
+#: after a request that never got an answer.  The page polls once a second.
+_BROWSER_JAR_RETRY_SECONDS = 3.0
+
+
 def _storage_user_id(storage: Mapping[str, str]) -> str:
     """The station's account id, wherever that fork kept it.
 
@@ -1346,10 +1354,6 @@ class _BudgetLock:
     def overruns(self) -> tuple[dict[str, object], ...]:
         with self._stats:
             return tuple(self._overruns)
-
-    def reset_overruns(self) -> None:
-        with self._stats:
-            self._overruns.clear()
 
 
 def _log_lock_overrun(record: Mapping[str, object], budget: float) -> None:
@@ -1691,13 +1695,6 @@ class CoreStore:
             else:
                 self._domain_holds.pop(ident, None)
 
-    def _foreign_domain_writer(self) -> bool:
-        """Whether another thread is inside a domain write right now."""
-
-        ident = threading.get_ident()
-        with self._lock:
-            return any(holder != ident for holder in self._domain_holds)
-
     @contextlib.contextmanager
     def _domain_scope(self, *names: str):
         """Hold the write lane of every named domain for one mutation.
@@ -1763,11 +1760,6 @@ class CoreStore:
             frames = []
             self._lane_frames.frames = frames
         return frames
-
-    def has_io_gate(self) -> bool:
-        """Whether a domain built over this store may lend its lane out."""
-
-        return True
 
     @contextlib.contextmanager
     def _release_lane_for_io(self):
@@ -1959,6 +1951,12 @@ class CoreStore:
             self._revision = int(value)  # type: ignore[arg-type]
             if settings_value is not None:
                 self._settings_advanced_at = int(settings_value)  # type: ignore[arg-type]
+            elif self._settings_advanced_at > self._revision:
+                # A failed mutation rolled the revision back but not the floor
+                # it raised.  Above the restored revision, the floor makes
+                # ``_revision_covers_settings`` false for every caller, so a
+                # write staged before the failure is refused as stale.
+                self._settings_advanced_at = self._revision
             self._snapshot_cache = None
 
     @classmethod
@@ -2054,22 +2052,23 @@ class CoreStore:
         runtime_settings = RuntimeSettingsDomain(
             resolved_runtime_settings_path, config_path=config_path
         )
+        runtime_settings_values = runtime_settings.snapshot()["values"]
         our_free_model_runtime = OurFreeModelRuntime(
             resolved_runtime_root,
             settings={
-                "defaultMaxTokens": runtime_settings.snapshot()["values"][
+                "defaultMaxTokens": runtime_settings_values[
                     "YOUNG_ROUTER_OUR_FREE_MODEL_MAX_TOKENS"
                 ],
-                "exposeRegionModels": runtime_settings.snapshot()["values"][
+                "exposeRegionModels": runtime_settings_values[
                     "YOUNG_ROUTER_OUR_FREE_MODEL_EXPOSE_REGION_MODELS"
                 ],
-                "probeIntervalMinutes": runtime_settings.snapshot()["values"][
+                "probeIntervalMinutes": runtime_settings_values[
                     "YOUNG_ROUTER_OUR_FREE_MODEL_REFRESH_INTERVAL_MINUTES"
                 ],
-                "standaloneProbe": runtime_settings.snapshot()["values"][
+                "standaloneProbe": runtime_settings_values[
                     "YOUNG_ROUTER_OUR_FREE_MODEL_PROBE_ON_REFRESH"
                 ],
-                "sourceDir": runtime_settings.snapshot()["values"][
+                "sourceDir": runtime_settings_values[
                     "YOUNG_ROUTER_OUR_FREE_MODEL_SOURCE_DIR"
                 ],
             },
@@ -2181,8 +2180,6 @@ class CoreStore:
         try:
             relay_path = None
             if config_path is not None:
-                from ..webdav import core as webdav_core
-
                 relay_path = webdav_core.relay_accounts_path(Path(config_path).expanduser())
             relay_accounts_domain = RelayAccountsDomain(runtime_root, storage_path=relay_path)
         except Exception:
@@ -2198,7 +2195,7 @@ class CoreStore:
             LogsDomain(
                 resolved_runtime_root,
                 config_path=resolved_config_path,
-                runtime_settings_path=runtime_settings_path,
+                runtime_settings_path=resolved_runtime_settings_path,
                 relay_accounts=relay_accounts_domain,
             )
         )
@@ -3104,8 +3101,8 @@ class CoreStore:
         change pays only the probe.
         """
 
-        changed = False
-        for adapter in self._domains.values():
+        changed: list[str] = []
+        for name, adapter in self._domains.items():
             detector = getattr(adapter, "external_disk_state", None)
             if not callable(detector):
                 continue
@@ -3114,12 +3111,14 @@ class CoreStore:
             except Exception:
                 continue
             if isinstance(state, Mapping) and state.get("changed"):
-                changed = True
-                break
+                changed.append(name)
         if not changed:
             return
         with self._mutation_scope():
-            self._refresh_external_disk_state()
+            # The refresh reads each domain it adopts again, so naming the ones
+            # this pass saw move keeps that second read on those files instead
+            # of reading every other document for an answer already held here.
+            self._refresh_external_disk_state(changed)
 
     def _service_row_is_live(self) -> None:
         """Project the controller's live answer into this read.
@@ -3127,7 +3126,9 @@ class CoreStore:
         The managed proxy can outlive a replaced Core briefly.  This is a
         read-only projection that deliberately neither persists nor emits:
         snapshot callers need the live status without creating a synthetic Core
-        state transition.  The caller holds ``self._lock``.
+        state transition.  Called with ``self._lock`` not held: the probe may
+        spend an endpoint timeout, and the answer is republished for the next
+        snapshot.
         """
 
         reload_thread = self._service_reload_thread
@@ -3158,7 +3159,9 @@ class CoreStore:
         """Every domain projection a snapshot summarizes.
 
         This is the expensive half, and it is a function of the shared revision
-        alone, which is what makes it memoizable.  The caller holds the lock.
+        alone, which is what makes it memoizable.  The caller holds the mutation
+        lane, never the state lock; ``_projection_scope`` holds the domain locks
+        too.
         """
 
         # Relay snapshots display reverse dependency counts, while the
@@ -3213,10 +3216,10 @@ class CoreStore:
     def _assemble_snapshot(self, domains: Mapping[str, Any]) -> dict[str, Any]:
         """Combine the memoized domain half with the live halves of a snapshot.
 
-        The service row is read on every call because the controller answers it
-        live and a planned restart is not a revision.  ``disk`` is read here for
-        the same reason: the watcher publishes a detected change without a
-        mutation.  Everything copied out belongs to the caller.
+        The service row is copied here; it was refreshed from the controller by
+        ``snapshot`` before this lock was taken.  ``disk`` is read here because
+        the watcher publishes a detected change without a mutation.  Everything
+        copied out belongs to the caller.
         """
 
         # ``disk`` is live, so it is read here on every call: the watcher
@@ -4368,8 +4371,6 @@ class CoreStore:
         sent to the station on every poll.
         """
 
-        from .domains.relay_accounts import RelayAccountsError, RelayTransportError
-
         with self._lock:
             entry = self._browser_logins.get(str(login_id))
             if entry is not None:
@@ -4398,17 +4399,15 @@ class CoreStore:
             current = self._browser_logins.get(str(login_id))
             if current is None:
                 return {"status": "closed"}
-            if current["last_cookie"] == entry["last_cookie"] and current.get("last_error"):
-                return {"status": "waiting", "detail": current["last_error"]}
         return {"status": "waiting"}
 
     def _verify_browser_jar(self, login_id: str, entry: Mapping[str, Any]) -> dict[str, Any] | None:
         """Offer one jar to the station; answer a finished login, or None.
 
-        The jar is only sent when it changed since the last attempt, so a page
-        polling once a second does not turn into one station login attempt a
-        second.  ``None`` means "still waiting"; a returned mapping ends the
-        sign-in.
+        The jar is only sent when it changed since the last attempt the station
+        answered, so a page polling once a second does not turn into one
+        station login attempt a second.  ``None`` means "still waiting"; a
+        returned mapping ends the sign-in.
         """
 
         from . import relay_browser
@@ -4434,7 +4433,8 @@ class CoreStore:
         signature = f"{header}\u0000{token}\u0000{user_id}"
         if entry.get("last_cookie") == signature:
             return None
-        entry["last_cookie"] = signature
+        if time.monotonic() < float(entry.get("jar_retry_at") or 0.0):
+            return None
         with self._lock:
             relay = self._domains.get("relay_accounts")
             verifier = getattr(relay, "verify_browser_session", None) if relay is not None else None
@@ -4449,13 +4449,22 @@ class CoreStore:
                 user_id=user_id,
             )
         except RelayTransportError:
+            # The station never answered, so nothing was learned about this jar.
+            # It used to be remembered before the station was asked: the jar is
+            # final once the person has signed in, so one blip on that poll made
+            # every later one skip it and the window waited forever.  It is
+            # offered again, after a pause rather than on the next poll.
+            entry["jar_retry_at"] = time.monotonic() + _BROWSER_JAR_RETRY_SECONDS
             return None
         except RelayAccountsError:
             # The station answered and did not accept this jar: the window stays
             # up and the person is still signing in.
+            entry["last_cookie"] = signature
             return None
         except Exception:
+            entry["last_cookie"] = signature
             return None
+        entry["last_cookie"] = signature
         return self._accept_browser_session(entry, verified)
 
     def _accept_browser_session(self, entry: Mapping[str, Any], verified: Mapping[str, Any]) -> dict[str, Any]:
@@ -4887,8 +4896,14 @@ class CoreStore:
                     )
                     model_display_name = model.get("display_name", model.get("name", public_model))
                     upstream_model = model.get("upstream_model", model.get("litellm_model", ""))
-                    if isinstance(upstream_model, str) and "/" in upstream_model:
-                        upstream_model = upstream_model.split("/", 1)[1]
+                    if not isinstance(upstream_model, str):
+                        upstream_model = str(upstream_model or "")
+                    # A slash is not automatically an adapter prefix: relay and
+                    # managed lanes publish ids such as ``openrouter/free``.
+                    # Core's detailed projection already supplies the normalized
+                    # value; this fallback is only for legacy/partial rows and
+                    # must apply the same known-prefix rule.
+                    upstream_model = display_upstream_model(upstream_model)
                     order_value = model.get("order", 0)
                     try:
                         order = int(order_value) if not isinstance(order_value, bool) else 0
@@ -5537,7 +5552,11 @@ class CoreStore:
         from ..webdav import operations as webdav_operations
 
         should_emit = False
-        with self._domain_scope("webdav", "providers_models", "relay_accounts"):
+        # ``runtime`` is declared for the master key a pull may install: the
+        # run adopts that domain too, so an edit staged in its pane while the
+        # bundle lands must not interleave with the reload and baseline it
+        # replaces.
+        with self._domain_scope("webdav", "providers_models", "relay_accounts", "runtime"):
             self._refresh_external_disk_state()
             self._check_revision(expected_revision)
             webdav = self._domains.get("webdav")
@@ -5660,8 +5679,15 @@ class CoreStore:
                     plan, remote = webdav_operations.decide_sync(client, settings, local, remote, base)
                     if plan == "unchanged":
                         # Byte equality proved the remote holds these same
-                        # digests, so they can be stated for it.
-                        agreed = webdav_core.SyncSnapshot(remote.manifest, remote.digests or local.digests)
+                        # digests, so they can be stated for it.  The documents
+                        # on disk are the content both ends agreed on, and
+                        # keeping them is what lets a later stopped run merge
+                        # instead of asking.
+                        agreed = webdav_core.SyncSnapshot(
+                            remote.manifest,
+                            remote.digests or local.digests,
+                            local.files if local.files is not None else remote.files,
+                        )
                         webdav_core.save_sync_state(state_path, settings, agreed, "sync")
                         if remote.digests is None:
                             webdav_operations.publish_remote_digests(client, settings, agreed)
@@ -5670,22 +5696,50 @@ class CoreStore:
                         webdav_operations.push_bundle(client, settings, config_path, state_path, "sync-push")
                         outcome = "push"
                     elif plan == "conflict":
-                        # Both ends moved, so neither is a version of the other:
-                        # the run writes nothing, keeps the remote side beside
-                        # the sync state, and stops.  The pane compares the two
-                        # and sends back the side the reader picks.
+                        # Both ends moved, so neither snapshot is a version of
+                        # the other -- but the two edits are usually of
+                        # different rows of one document (a route added here, a
+                        # station's key re-bound there).  The documents are
+                        # merged first, and only a real collision -- one field
+                        # of one row changed on both sides, an edit against a
+                        # removal, a merge this app would not load -- leaves the
+                        # reader the choice the pane offers.
+                        merged_files: dict[str, bytes] | None = None
                         try:
-                            webdav_operations.remember_remote_bundle(client, settings, conflict_path)
+                            merged_files = webdav_operations.conflict_merge(
+                                client, settings, local, remote, base
+                            )
                         except Exception:
-                            # Failing to keep the comparison is not the cause the
-                            # reader has to act on: the conflict is, and the
-                            # pane can still state it with the choice and no
-                            # diff.
-                            webdav_core.clear_conflict_record(conflict_path)
-                        raise webdav_core.SyncError(
-                            "WebDAV sync stopped because both ends changed",
-                            "webdav_sync_conflict",
-                        )
+                            # A merge that cannot even be attempted is a
+                            # conflict, not a failed sync: the choice below is
+                            # the answer either way.
+                            merged_files = None
+                        if merged_files is not None:
+                            webdav_operations.install_merged_files(
+                                client, settings, config_path, state_path, merged_files
+                            )
+                            pulled = True
+                            outcome = "merge"
+                            # The pane's own summary: this run settled both
+                            # edits, so no comparison window is offered.
+                            action_summary = {"outcome": outcome, "sections": list(sections)}
+                        else:
+                            # Nothing can combine these two sides: the run
+                            # writes nothing, keeps the remote side beside the
+                            # sync state, and stops.  The pane compares the two
+                            # and sends back the side the reader picks.
+                            try:
+                                webdav_operations.remember_remote_bundle(client, settings, conflict_path)
+                            except Exception:
+                                # Failing to keep the comparison is not the cause the
+                                # reader has to act on: the conflict is, and the
+                                # pane can still state it with the choice and no
+                                # diff.
+                                webdav_core.clear_conflict_record(conflict_path)
+                            raise webdav_core.SyncError(
+                                "WebDAV sync stopped because both ends changed the same content",
+                                "webdav_sync_conflict",
+                            )
                     else:
                         # The comparison above already read both manifests; a
                         # second one would only restate what this branch
@@ -5719,12 +5773,23 @@ class CoreStore:
                         # the runtime pane is where that key is stated.  A key
                         # that arrived from another machine is this machine's key
                         # now, so the pane's baseline has to follow it instead of
-                        # reporting a file this sync itself rewrote.  A pane with
-                        # uncommitted edits keeps them: the poll states the file
-                        # changed, and the reader decides.
-                        if not self._drafts.get("runtime", {}).get("dirty"):
-                            reloaded.append(("runtime", runtime_adapter))
+                        # reporting a file this sync itself rewrote.
+                        reloaded.append(("runtime", runtime_adapter))
                     for name, adapter in reloaded:
+                        if self._drafts.get(name, {}).get("dirty"):
+                            # The bundle replaced the file under edits this run
+                            # cannot adopt: reloading would discard what the pane
+                            # never applied, and clearing the marker below would
+                            # leave it no prompt to reconcile.  State the change
+                            # instead, with a new generation, so the pane asks.
+                            record = self._disk.setdefault(
+                                name, {"changed": False, "generation": 0, "keep_draft": False}
+                            )
+                            record["generation"] = int(record.get("generation", 0)) + 1
+                            record["keep_draft"] = False
+                            record["changed"] = True
+                            self._disk_identities[name] = self._external_disk_identity(adapter)
+                            continue
                         adapter.reload()
                         self._baselines[name] = self._adapter_draft_state(name)
                         self._disk[name] = {
@@ -5765,7 +5830,14 @@ class CoreStore:
                         "archived_remote": archived_remote,
                         "sections": list(sections),
                     }
-                self._advance_projection_revision()
+                if pulled:
+                    # A pull replaces the settings documents themselves, so a
+                    # caller holding a pre-pull revision is applying over a
+                    # change it has not seen and must be refused, not told the
+                    # write landed over a draft this run already replaced.
+                    self._advance_revision()
+                else:
+                    self._advance_projection_revision()
                 self._persist_metadata()
                 status_handler = self._service_handlers.get("status")
                 if status_handler is not None:
@@ -6141,7 +6213,7 @@ class CoreStore:
                 )
                 action_draft_before = self._adapter_draft_state(name)
                 payload = data.get("payload")
-                if name == "providers_models" and action_type.replace("-", "_").replace(".", "_") in {
+                if name == "providers_models" and normalized_action in {
                     "providers_import_selected",
                     "provider_import_selected",
                     "import_selected",
@@ -6813,24 +6885,27 @@ class CoreStore:
         through its process environment, which no document digest covers.
         """
 
+        if "runtime" in applied:
+            # A ``runtime`` apply reaches the proxy through its *process
+            # environment*.  A rolling restart reuses the running master,
+            # which can never acquire an environment variable it was not
+            # started with (verified: a worker forked after SIGHUP still
+            # reads the original value), so only a replaced process can
+            # serve one.  The proxy key is the same case: LiteLLM reads
+            # ``master_key`` once at startup, so a client presenting the new
+            # key is accepted only by a new process.
+            #
+            # Decided before the providers rule below, whatever else the commit
+            # carries: that rule compares document digests, which no
+            # environment setting moves, so a runtime change applied together
+            # with a provider edit used to get a rolling reload -- or nothing.
+            self._schedule_service_reload_after_apply(replace_process=True)
+            return
         if "providers_models" not in applied:
             if applied:
-                # A ``runtime`` apply reaches the proxy through its *process
-                # environment*.  A rolling restart reuses the running master,
-                # which can never acquire an environment variable it was not
-                # started with (verified: a worker forked after SIGHUP still
-                # reads the original value), so only a replaced process can
-                # serve one.  Anything else is a document the workers can
-                # simply reload.
-                self._schedule_service_reload_after_apply(replace_process="runtime" in applied)
-            return
-        if self._applied_master_key_changed(applied):
-            # The proxy key is LiteLLM's ``master_key``, read once at startup.
-            # A rolling reload hands the new document to fresh workers of the
-            # *same* master, so the process boundary is what decides whether a
-            # client presenting the new key is accepted: it takes the same full
-            # replacement a runtime environment change takes.
-            self._schedule_service_reload_after_apply(replace_process=True)
+                # Any other domain wrote a document the workers can simply
+                # reload.
+                self._schedule_service_reload_after_apply()
             return
         stager = self._service_handlers.get("stage_runtime_config")
         try:
@@ -6845,20 +6920,6 @@ class CoreStore:
             # the whole drain budget to load the bytes it is serving now.
             return
         self._schedule_service_reload_after_apply()
-
-    def _applied_master_key_changed(self, applied: Sequence[str]) -> bool:
-        """Whether this commit changed the key the proxy authenticates with.
-
-        The runtime adapter answers it from the Apply it just performed; a
-        domain that does not track the key answers ``False``, so this stays a
-        fact about the commit rather than a guess about the document.
-        """
-
-        if "runtime" not in applied:
-            return False
-        adapter = self._domains.get("runtime")
-        changed = getattr(adapter, "master_key_changed", None)
-        return bool(changed()) if callable(changed) else False
 
     def _schedule_service_reload_after_apply(self, *, replace_process: bool = False) -> None:
         """Queue the post-apply LiteLLM restart without blocking the commit.
@@ -7006,8 +7067,9 @@ class CoreStore:
             # scheduler sets it with: a commit that arrives while this pass runs
             # therefore sets it again and is owed its own pass, instead of being
             # swallowed by the restart already in flight.
-            replace_process = self._service_reload_replace_process
-            self._service_reload_replace_process = False
+            with self._service_reload_guard:
+                replace_process = self._service_reload_replace_process
+                self._service_reload_replace_process = False
         self._request_emit()
         try:
             with self._service_transition_guard:
@@ -7106,9 +7168,9 @@ class CoreStore:
 
         A restart is where the proxy's port and master key can change, so a
         client that already points at the proxy is rewritten there instead of
-        being left on a closed port or a retired key.  The caller holds
-        ``self._lock``; the write happens before the revision is published so
-        every open window sees the new file and the new state together.
+        being left on a closed port or a retired key.  The caller holds a write
+        lane and never the store lock: this method must not be called with
+        ``self._lock`` held.
         """
 
         adapter = codex if codex is not None else self._domains.get("codex")
@@ -7271,10 +7333,18 @@ class CoreStore:
                     # while the proxy is being replaced, never the failure it
                     # is replacing.
                     self._service_proxy_operations += 1
-                    self._publish_service_transition()
-                    self._advance_projection_revision()
-                    self._persist_metadata()
-                    published = True
+                    try:
+                        self._publish_service_transition()
+                        self._advance_projection_revision()
+                        self._persist_metadata()
+                        published = True
+                    except BaseException:
+                        # The finally below only covers the replacement itself;
+                        # a persist failure here would otherwise leave the count
+                        # raised and stop this store from ever projecting a real
+                        # service state again.
+                        self._service_proxy_operations = max(0, self._service_proxy_operations - 1)
+                        raise
                 if published:
                     # Sent here, not requested: the replacement below may take
                     # minutes, and every window has to see the proxy leave its
@@ -8339,7 +8409,8 @@ class CoreStore:
         two domains and must move together: a pass that is on with no fetch tool
         leaves the model holding placeholders it can never open, and a fetch
         tool with the pass off is a tool that can never answer.  The caller
-        holds ``self._lock``.
+        holds a write lane and never the store lock: this method must not be
+        called with ``self._lock`` held.
         """
 
         if "codex" not in applied and "runtime" not in applied:
@@ -8354,7 +8425,7 @@ class CoreStore:
             # A Codex document this app cannot rewrite must not fail the commit
             # that just succeeded: the pass itself is served by the proxy.
             return
-        if not changed or adapter is None:
+        if not changed:
             return
         self._baselines["codex"] = self._adapter_draft_state("codex")
         self._disk["codex"] = {

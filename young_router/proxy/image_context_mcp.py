@@ -187,6 +187,10 @@ def handle(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             },
         )
     if method in {"tools/list", "tools/list_changed"}:
+        # A notification has no id, so an answer to one is an unsolicited
+        # frame that a strict client rejects as a protocol error.
+        if request_id is None:
+            return None
         return _result(request_id, {"tools": [_tool_spec()]})
     if method == "tools/call":
         name = params.get("name")

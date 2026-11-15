@@ -17,7 +17,7 @@ from typing import Any
 
 from ..log_tabs import LOG_TABS
 from ... import runtime_store
-from ..persistence import PersistenceError, atomic_write_json, read_json
+from ..persistence import PersistenceError
 from ..security import REDACT_TEXT
 from ...log_rotation import (
     LOG_BACKUP_SEGMENTS_ENV,
@@ -25,11 +25,6 @@ from ...log_rotation import (
     MIN_LOG_MAX_BYTES,
     append_bounded_log,
 )
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows does not provide POSIX flock.
-    fcntl = None
 
 
 DOMAIN_NAME = "logs"
@@ -61,6 +56,7 @@ MENU_ACTIONS = frozenset(
         "open-data-management",
         "open-logs",
         "toggle-autostart",
+        "toggle-codex-model-catalog",
         "service-start",
         "service-stop",
         "service-restart",
@@ -366,11 +362,10 @@ def _trace_value(value: object, limit: int = 160) -> str:
     if isinstance(value, str):
         return REDACT_TEXT(value)[:limit]
     if isinstance(value, Mapping):
-        return ", ".join(
-            f"{key}={_trace_value(item, limit=80)}"
-            for key, item in value.items()
-            if _trace_value(item, limit=80)
-        )[:limit]
+        entries = (
+            (key, _trace_value(item, limit=80)) for key, item in value.items()
+        )
+        return ", ".join(f"{key}={text}" for key, text in entries if text)[:limit]
     if isinstance(value, list):
         return ", ".join(
             item for item in (_trace_value(item, limit=80) for item in value) if item
@@ -615,7 +610,7 @@ def _trace_detail(raw: Mapping[str, Any]) -> str:
             ("reason", reason, ""),
         )
 
-    if event.startswith("responses_chat_bridge_preemptive") or event == "responses_chat_bridge_preemptive":
+    if event.startswith("responses_chat_bridge_preemptive"):
         return _trace_detail_parts(("reason", reason, ""))
 
     if event == "responses_chat_bridge_reasoning_replay_repaired":
@@ -798,7 +793,6 @@ def _safe_recovery_record(
 
 def _safe_cooldown_record(
     raw: Mapping[str, Any],
-    cooldown_key: str,
     configured_deployments: Mapping[str, Mapping[str, str]],
     *,
     remaining_seconds: float,
@@ -824,12 +818,6 @@ def _safe_cooldown_record(
     details = [value for value in (projected.get("detail"), f"failures={failure_count}" if failure_count > 0 else "") if value]
     if details:
         projected["detail"] = " · ".join(details)
-    if not projected:
-        return {
-            "timestamp": _safe_scalar(timestamp),
-            "status": "cooldown",
-            "detail": _safe_scalar(f"cooldown={_whole_seconds(remaining_seconds) or 0}s"),
-        }
     return projected
 
 
@@ -1298,10 +1286,6 @@ DEFAULT_REQUEST_STALE_SECONDS = 900.0
 MAX_REQUEST_STALE_SECONDS = 86400.0
 
 
-def _line_byte_size(line: str) -> int:
-    return len(line.encode("utf-8")) + 1
-
-
 def _request_stale_seconds_value(value: object) -> float:
     try:
         parsed = float(value)  # type: ignore[arg-type]
@@ -1753,11 +1737,18 @@ def _split_merged_service_lines(lines: list[str]) -> list[str]:
         if SERVICE_EMBEDDED_TIMESTAMP.search(payload) is None:
             expanded.append(raw)
             continue
-        stamp = stripped[: match.end()].strip().split("]", 1)[0] + "]"
-        for part in SERVICE_EMBEDDED_TIMESTAMP.split(payload):
+        prefix = stripped[: match.end()].strip()
+        parts = SERVICE_EMBEDDED_TIMESTAMP.split(payload)
+        markers = SERVICE_EMBEDDED_TIMESTAMP.findall(payload)
+        for index, part in enumerate(parts):
             part = part.strip()
-            if part:
-                expanded.append(f"{stamp} {part}")
+            if not part:
+                continue
+            # A split on the marker drops it, so each later part is headed by
+            # the marker that introduced it; using the first record's stamp for
+            # all of them dated every glued tail at the first event's time.
+            head = prefix if index == 0 else markers[index - 1]
+            expanded.append(f"{head} {part}")
     return expanded
 
 
@@ -1913,6 +1904,9 @@ class LogsDomain:
         self._runtime_log_max_bytes: int | None = None
         self._runtime_log_backup_segments: int | None = None
         self._online_usage_records: list[dict[str, Any]] = []
+        # The relay the held page came from: a page is only kept across a failed
+        # read of that same relay, never shown under another one.
+        self._online_usage_records_source = ""
         # Inclusive relay timestamps in the user's selected range.
         self._online_usage_since: float | None = None
         self._online_usage_until: float | None = None
@@ -1963,9 +1957,6 @@ class LogsDomain:
         self._filters: dict[str, str] = {}
         self._limits: dict[str, int] = {}
         self._source_signatures: dict[str, tuple[object, ...]] = {}
-        # The first view reads its own source, while the later empty-state polls
-        # can stay on the unchanged-view fast path.
-        self._view_built: set[str] = {"online-usage"}
         self._view_revisions: dict[str, int] = {tab: 0 for tab in LOG_TABS}
         self._tabs: dict[str, dict[str, Any]] = {
             tab: self._empty_tab(tab) for tab in LOG_TABS
@@ -1995,41 +1986,6 @@ class LogsDomain:
             configured_public_models,
             configured_route_models,
         )
-
-    @staticmethod
-    def _request_tail_boundary_reached(path: Path, offset: int) -> bool:
-        """Whether a cached read ended exactly on a line boundary.
-
-        A read that stopped inside a line cannot be extended: the partial line
-        is already part of the cached window, so the tail is rebuilt from the
-        file instead of resumed.
-        """
-
-        if offset <= 0:
-            return True
-        try:
-            with path.open("rb") as handle:
-                handle.seek(offset - 1)
-                return handle.read(1) == b"\n"
-        except OSError:
-            return False
-
-    def _read_appended_lines(self, path: Path, offset: int) -> tuple[list[str], int]:
-        """Read the complete lines appended after ``offset``.
-
-        A line still being written stays for the next refresh: it can never
-        project a record, and resuming exactly at the last newline keeps the
-        cached window aligned with the file.
-        """
-
-        with path.open("rb") as handle:
-            handle.seek(offset)
-            data = handle.read(self.maximum_read_bytes)
-        end = data.rfind(b"\n")
-        if end < 0:
-            return [], 0
-        consumed = end + 1
-        return data[:consumed].decode("utf-8", errors="replace").splitlines(), consumed
 
     def _requests_records(
         self,
@@ -2118,7 +2074,6 @@ class LogsDomain:
         # A fresh domain starts with an empty view, and the source choices
         # belong to that first answer too; otherwise the pane would only show
         # a relay after someone left and re-entered the tab.
-        self._view_built.add(tab)
         return value
 
     def _online_usage_reader_instance(self) -> object:
@@ -2486,7 +2441,11 @@ class LogsDomain:
         path = self._path(tab)
         if path is None:
             return False, []
-        if tab == "requests" and tab not in self._cleared:
+        if tab == "requests":
+            # Cleared or not: ``_requests_records`` is the reader that knows the
+            # clear cursor is a store sequence.  Sending a cleared tab to the
+            # file reader below read a file the proxy no longer appends to, so
+            # the tab stayed empty for every request that arrived afterwards.
             configured_deployments = _configured_deployments(self.config_path)
             records = self._requests_records(
                 path,
@@ -2530,11 +2489,10 @@ class LogsDomain:
                 if projected:
                     records.append(projected)
             cooldowns = cooldown_payload.get("cooldowns") if isinstance(cooldown_payload, Mapping) else None
-            for cooldown_key, value in active_cooldown_states(cooldowns, now=now):
+            for _, value in active_cooldown_states(cooldowns, now=now):
                 remaining = max(0.0, float(value.get("cooldown_until") or 0) - now)
                 projected = _safe_cooldown_record(
                     value,
-                    cooldown_key,
                     configured_deployments,
                     remaining_seconds=remaining,
                     now=now,
@@ -2633,6 +2591,11 @@ class LogsDomain:
                 )
                 if record:
                     records.append(record)
+            elif tab == "service":
+                # ``_group_service_lines`` already stripped the ANSI sequences
+                # and redacted each row, so the same regex work is not spent a
+                # second time across up to four line limits of rows.
+                records.append(line[:MAX_TEXT_LOG_CHARS])
             elif tab not in {"requests", "route-trace"}:
                 records.append(
                     REDACT_TEXT(ANSI_CONTROL_SEQUENCE.sub("", line))[:MAX_TEXT_LOG_CHARS]
@@ -2702,12 +2665,7 @@ class LogsDomain:
 
     def _refresh(self, tab: str, *, force: bool = False) -> None:
         if tab in self._paused:
-            previous = dict(
-                self._tabs.get(
-                    tab,
-                    self._empty_tab(tab),
-                )
-            )
+            previous = dict(self._tabs[tab])
             previous["paused"] = True
             previous["filter"] = self._filters.get(tab, "")
             if tab in self._cleared:
@@ -2716,7 +2674,7 @@ class LogsDomain:
             self._store_tab(tab, self._fit_view_records(previous))
             return
         signature = self._source_signature(tab)
-        if not force and tab in self._view_built and self._source_signatures.get(tab) == signature:
+        if not force and self._source_signatures.get(tab) == signature:
             return
         available, records = self._records(tab)
         value: dict[str, Any] = {
@@ -2768,7 +2726,6 @@ class LogsDomain:
         fitted = self._fit_view_records(value)
         self._store_tab(tab, fitted)
         self._source_signatures[tab] = signature
-        self._view_built.add(tab)
 
     def _store_tab(self, tab: str, value: dict[str, Any]) -> None:
         if self._tabs.get(tab) == value:
@@ -2799,8 +2756,6 @@ class LogsDomain:
             used += extra
         metadata["records"] = list(reversed(selected))
         metadata["line_count"] = len(metadata["records"])
-        if value.get("tab") == "online-usage":
-            metadata["_response_trimmed"] = True
         return metadata
 
     def snapshot(self) -> dict[str, Any]:
@@ -2918,10 +2873,17 @@ class LogsDomain:
             ][-self._line_limit(tab) :]
             # A station that could not be read is not a station with no history:
             # keeping the last good page is what stops one failed poll from
-            # blanking a table that was already on screen.
+            # blanking a table that was already on screen.  Only that relay's
+            # own page can be kept, because these rows are labelled with the
+            # relay whose read answers next.
             transient = not answered_rows and reason in _TRANSIENT_USAGE_REASONS
-            if not (transient and self._online_usage_records):
+            if not (
+                transient
+                and self._online_usage_records
+                and self._online_usage_records_source == source_id
+            ):
                 self._online_usage_records = answered_rows
+                self._online_usage_records_source = source_id
             self._online_usage_reason = str(reason)[:512]
         except Exception:
             if request and request != self._online_usage_request:
@@ -2929,7 +2891,12 @@ class LogsDomain:
             # A read that failed is not a station that answered nothing, so the
             # rows already on screen stay: clearing them turned one slow or
             # dropped poll into a table that went blank a while after it had
-            # filled, with nothing to act on.
+            # filled, with nothing to act on.  A page from another relay is not
+            # this relay's answer, so it goes with the total that described it.
+            if self._online_usage_records_source != source_id:
+                self._online_usage_records = []
+                self._online_usage_records_source = source_id
+                self._online_usage_total = 0
             self._online_usage_reason = "Online usage logs are unavailable."
             self._online_usage_refreshed = True
             self._online_usage_revision += 1
@@ -2966,6 +2933,10 @@ class LogsDomain:
             self._online_usage_page = 1
             self._discard_clear(tab)
             self._source_signatures.pop(tab, None)
+            # Page one of that result set is read here, as a page turn does:
+            # the rows on screen are still those of the page the pager named
+            # before, under a pager that now claims the first one.
+            self._read_online_usage_page(str(tab))
             self.revision += 1
             self._refresh(tab, force=True)
             return self.snapshot()

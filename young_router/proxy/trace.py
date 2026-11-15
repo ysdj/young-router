@@ -387,10 +387,11 @@ def _trace_responses_input_shape(request_kwargs: Optional[dict]) -> dict[str, An
                 }
                 else 0
             )
+            tool_call = _trace_tool_call_item(item)
             tool_call_input_text_len = (
                 _trace_text_length(item.get("input"))
                 + _trace_text_length(item.get("arguments"))
-                if _trace_tool_call_item(item) is not None
+                if tool_call is not None
                 else 0
             )
             text_len = (
@@ -403,7 +404,8 @@ def _trace_responses_input_shape(request_kwargs: Optional[dict]) -> dict[str, An
                 add_count(role_counts, role)
             if content_kind is not None:
                 add_count(content_type_counts, content_kind)
-            for part_type in _trace_content_part_types(content):
+            part_types = _trace_content_part_types(content)
+            for part_type in part_types:
                 add_count(part_type_counts, part_type)
             if isinstance(status, str):
                 add_count(status_counts, status)
@@ -418,8 +420,13 @@ def _trace_responses_input_shape(request_kwargs: Optional[dict]) -> dict[str, An
                 }
             ) or role == "tool":
                 tool_output_count += 1
-            if _trace_tool_call_item(item) is not None:
+            if tool_call is not None:
                 tool_call_count += 1
+            nested_tool_calls = item.get("tool_calls")
+            if isinstance(nested_tool_calls, list):
+                for nested_call in nested_tool_calls:
+                    if _trace_tool_call_item(nested_call) is not None:
+                        tool_call_count += 1
             if text_len:
                 text_lengths.append(text_len)
             if index < 8 or index >= max(8, len(source) - 8):
@@ -430,7 +437,6 @@ def _trace_responses_input_shape(request_kwargs: Optional[dict]) -> dict[str, An
                     "content_kind": content_kind,
                     "text_len": text_len,
                 }
-                part_types = _trace_content_part_types(content)
                 if part_types:
                     sample["part_types"] = part_types
                 if isinstance(status, str):
@@ -458,7 +464,12 @@ def _trace_responses_input_shape(request_kwargs: Optional[dict]) -> dict[str, An
     total_text_len = sum(text_lengths)
     longest_text_len = max(text_lengths) if text_lengths else 0
     p95_text_len = (
-        text_lengths_sorted[min(len(text_lengths_sorted) - 1, int(len(text_lengths_sorted) * 0.95))]
+        text_lengths_sorted[
+            min(
+                len(text_lengths_sorted) - 1,
+                max(0, math.ceil(len(text_lengths_sorted) * 0.95) - 1),
+            )
+        ]
         if text_lengths_sorted
         else 0
     )
@@ -489,10 +500,15 @@ def _trace_limited_value(value: Any, *, limit: int = 240, depth: int = 0) -> Any
     if depth >= 4:
         return _sanitize_trace_text(str(value), limit=limit)
     if isinstance(value, list):
-        return [
+        limited_items = [
             _trace_limited_value(item, limit=limit, depth=depth + 1)
             for item in value[:20]
         ]
+        if len(value) > 20:
+            # The dict branch below says where it stopped; an unmarked slice
+            # would read as the whole list.
+            limited_items.append({"_truncated": True})
+        return limited_items
     if isinstance(value, dict):
         limited: dict[str, Any] = {}
         for index, (key, item) in enumerate(value.items()):
@@ -733,7 +749,7 @@ def _trace_interface_summary(
     model_info = _request_context_module._request_model_info(request_kwargs)
     api_base = _responses_request_module._request_api_base(request_kwargs)
     call_type_value = call_type if call_type is not None else request_kwargs.get("call_type")
-    method_value = method_name if method_name is not None else None
+    method_value = method_name
     if method_value is None:
         method_value = _trace_function_name(request_kwargs.get("original_generic_function"))
     return {
@@ -1107,7 +1123,6 @@ def _trace_tool_call_item(item: Any) -> Optional[dict[str, Any]]:
 
 def _trace_tool_call_summary(
     response: Any,
-    request_kwargs: Optional[dict] = None,
     *,
     max_calls: int = 20,
 ) -> dict[str, Any]:
@@ -1200,7 +1215,7 @@ def _trace_response_summary(
     request_kwargs: Optional[dict] = None,
 ) -> dict[str, Any]:
     return {
-        "tool_calls": _trace_tool_call_summary(response, request_kwargs),
+        "tool_calls": _trace_tool_call_summary(response),
     }
 
 
@@ -1235,10 +1250,11 @@ def _request_route_trace(
 
     ``source_request`` is the request the trace is about.  ``trace_request`` is the
     more specific attempt request when the caller has one (a bridge or retry
-    request); it answers first and ``source_request`` answers whatever it leaves
-    empty.  ``model_group`` overrides the group when the caller already holds
-    it.  The deployment identity is stated only when the caller asks for it,
-    so a trace keeps exactly the fields it always carried.
+    request); it answers first, and ``source_request`` answers the request id,
+    the session, and the model group when it leaves them empty.  ``model_group``
+    overrides the group when the caller already holds it.  The deployment
+    identity is not read from ``source_request`` and is stated only when the
+    caller asks for it, so a trace keeps exactly the fields it always carried.
     """
 
     primary = trace_request or source_request
@@ -1249,7 +1265,8 @@ def _request_route_trace(
     payload: dict[str, Any] = {
         "request_id": _routing_module._trace_request_id(primary)
         or _routing_module._trace_request_id(source_request),
-        "session": _routing_module._trace_session_context(primary),
+        "session": _routing_module._trace_session_context(primary)
+        or _routing_module._trace_session_context(source_request),
         "model_group": model_group,
     }
     if include_route_identity:

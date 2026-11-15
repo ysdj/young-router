@@ -38,7 +38,6 @@ from ._shared_api import (
     anthropic_base_url,
     desktop_accepts_model_name,
     normalise_route,
-    on_local_api,
     one_saved_route,
     read_generated_models,
     read_route_setting,
@@ -51,6 +50,12 @@ from ._shared_api import (
 
 DOMAIN_NAME = "claude"
 _CLAUDE_NONSTREAM_FALLBACK_ENV = "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK"
+#: Claude Preview and Claude Browser tools are resolved back to ``auto`` even
+#: in a bypass-permissions session, so with auto mode offered they wait for a
+#: verdict this gateway cannot carry and are denied as unanswered; with auto
+#: mode disabled they fall back to ordinary permission prompts.  ``"disable"``
+#: is the only value the client accepts for this key.
+_CLAUDE_DISABLE_AUTO_MODE = "disableAutoMode"
 SETTINGS_FILENAME = "settings.json"
 DEFAULT_SETTINGS_DIR = ".claude"
 
@@ -561,6 +566,11 @@ def _network_list_key(key: object) -> bool:
     }
 
 
+def _gateway_url_key(key: object) -> bool:
+    text = str(key).lower()
+    return text.endswith(("base_url", "baseurl")) or ("gateway" in text and "url" in text)
+
+
 def redact(value: object, *, _key: object = "") -> object:
     """Return a JSON-safe projection with credentials, paths, and domains removed."""
 
@@ -572,6 +582,12 @@ def redact(value: object, *, _key: object = "") -> object:
         if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
             return [_REDACTED] if value else []
         return _REDACTED if value else value
+    if _gateway_url_key(_key):
+        # The snapshot already refuses a gateway URL whose query carries a
+        # credential; the redacted projections must not hand it back.
+        if value in (None, "", False):
+            return value
+        return _REDACTED if _public_gateway_url(value) is None else value
     if isinstance(value, Mapping):
         return {str(key): redact(item, _key=key) for key, item in value.items()}
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
@@ -724,6 +740,21 @@ def _code_auto_compact_window(max_input_tokens: object) -> int | str:
     if not isinstance(max_input_tokens, int) or isinstance(max_input_tokens, bool):
         return "auto"
     return max(_CODE_AUTO_COMPACT_MIN, min(max_input_tokens, _CODE_AUTO_COMPACT_MAX))
+
+
+def _route_from_state(state: Mapping[str, Any], client: str) -> dict[str, str] | None:
+    entry = state.get(client)
+    if not isinstance(entry, Mapping):
+        return None
+    return normalise_route(entry.get("last_route"))
+
+
+def _generated_models_from_state(state: Mapping[str, Any], client: str) -> list[str]:
+    entry = state.get(client)
+    models = entry.get("generated_models") if isinstance(entry, Mapping) else None
+    if not isinstance(models, list):
+        return []
+    return [item.strip() for item in models if isinstance(item, str) and item.strip()]
 
 
 def _claude_client(data: Mapping[str, Any]) -> str:
@@ -1061,26 +1092,29 @@ def _validate_structured_patch(data: Mapping[str, Any]) -> None:
             "worktree",
         )
         _normalise_worktree({"worktree": worktree}, allow_unset=True)
-    if "permissions" in data:
+    # A null block is the delete marker `_deep_merge` understands, so it must
+    # pass validation on its way to the normaliser rather than fail as a
+    # non-object.
+    if data.get("permissions") is not None:
         _reject_unknown_patch_fields(
             data["permissions"],
             ("defaultMode", *_PERMISSION_DISABLE_LITERAL_FIELDS, *_PERMISSION_LIST_FIELDS),
             "permissions",
         )
-    if "sandbox" not in data:
+    if data.get("sandbox") is None:
         return
     sandbox = _reject_unknown_patch_fields(
         data["sandbox"],
         (*_SANDBOX_BOOLEAN_FIELDS, *_SANDBOX_LIST_FIELDS, "filesystem", "network"),
         "sandbox",
     )
-    if "filesystem" in sandbox:
+    if sandbox.get("filesystem") is not None:
         _reject_unknown_patch_fields(
             sandbox["filesystem"],
             (*_FILESYSTEM_BOOLEAN_FIELDS, *_FILESYSTEM_LIST_FIELDS),
             "sandbox.filesystem",
         )
-    if "network" in sandbox:
+    if sandbox.get("network") is not None:
         _reject_unknown_patch_fields(
             sandbox["network"],
             (*_NETWORK_BOOLEAN_FIELDS, *_NETWORK_LIST_FIELDS, *_NETWORK_PORT_FIELDS),
@@ -1281,6 +1315,11 @@ class ClaudeSettingsDomain:
         self.app_state_root = _app_state_root(
             runtime_root, runtime_settings_path, runtime_config_path
         )
+        # The installation this domain describes.  A registry read on its
+        # behalf (the published window) has to answer from the same documents,
+        # or a domain built against a test or portable root would read the
+        # user's own catalog cache.
+        self._runtime_root = self.app_state_root
         # The app's own proxy endpoint, resolved once per document load rather
         # than per snapshot: it reads the runtime settings and the large
         # runtime configuration while snapshots are polled with a window open.
@@ -1309,6 +1348,7 @@ class ClaudeSettingsDomain:
         self.reload()
 
     def reload(self) -> dict[str, Any]:
+        self.refresh_local_api_endpoint()
         text, exists = self._loader(self.settings_path)
         try:
             loaded = json.loads(text) if text.strip() else {}
@@ -1637,7 +1677,9 @@ class ClaudeSettingsDomain:
         value = self._draft.get("modelPicker")
         return isinstance(value, Mapping) and value.get("replaceBuiltInOptions") is True
 
-    def desktop_model_list_enabled(self) -> bool:
+    def desktop_model_list_enabled(
+        self, state: Mapping[str, Any] | None = None
+    ) -> bool:
         """Whether Claude Desktop's picker list is the one this app generated.
 
         Claude Desktop has a single model list, so "the switch is on" is the
@@ -1657,7 +1699,11 @@ class ClaudeSettingsDomain:
 
         if self._desktop is None:
             return False
-        generated = set(read_generated_models(self.app_state_root, "claudeDesktop"))
+        generated = set(
+            _generated_models_from_state(state, "claudeDesktop")
+            if state is not None
+            else read_generated_models(self.app_state_root, "claudeDesktop")
+        )
         if not generated:
             return False
         current = set(self._desktop.snapshot().get("model_names") or [])
@@ -1710,7 +1756,11 @@ class ClaudeSettingsDomain:
         try:
             from ..model_catalog import _image_filter_registry
 
-            window = int(_image_filter_registry().record_for(name).context_window)
+            window = int(
+                _image_filter_registry(
+                    self._runtime_root, self.runtime_config_path
+                ).record_for(name).context_window
+            )
         except Exception:
             return None
         if window <= 0:
@@ -1763,19 +1813,22 @@ class ClaudeSettingsDomain:
     def _code_route_window(self, name: str) -> object:
         """The window this app states for one of its own routes.
 
-        ``_published_window`` first, then the ``max_input_tokens`` the app's own
-        model rows carry -- the two readings ``_code_picker`` and
-        ``_code_model_settings`` already take, kept in one place so a launch id
-        cannot be spelled from a third, wider one.
+        The route's own ``max_input_tokens`` first, then ``_published_window``
+        -- the precedence ``record_for`` already documents: a window declared
+        on the route wins over registry metadata, and the registry answers only
+        where the route states nothing.  Reversed, a route that declares 1M was
+        spelled with the unknown-model placeholder's plain id whenever the
+        registry held no record for it, so the session got the client's 200k
+        default on top of a route this app publishes at 1M.
         """
 
-        window = self._published_window(name)
-        if window is not None:
-            return window
         for row in self._public_model_rows():
             if str(row.get("id") or "") == name:
-                return row.get("max_input_tokens")
-        return None
+                declared = row.get("max_input_tokens")
+                if isinstance(declared, int) and not isinstance(declared, bool) and declared > 0:
+                    return declared
+                break
+        return self._published_window(name)
 
     def _code_published_id(self, name: str) -> str:
         """The id this app publishes for a route, or ``name`` unchanged.
@@ -1886,9 +1939,7 @@ class ClaudeSettingsDomain:
         known = {str(row.get("id")): row for row in self._public_model_rows()}
         rows: list[dict[str, Any]] = []
         for name in names:
-            window = self._published_window(name)
-            if window is None:
-                window = (known.get(name) or {}).get("max_input_tokens")
+            window = (known.get(name) or {}).get("max_input_tokens")
             model_id = self._code_picker_id(name, window)
             # A list written before the ids were aliases carried the public
             # name, and a field the user typed there is theirs: adopt it onto
@@ -1921,15 +1972,15 @@ class ClaudeSettingsDomain:
                     # replaced whenever the route's window moved out from under
                     # it (a 500k route left on the 200k tier read back as 200k).
                     # A target none of these three names is a person's and stays.
+                    # The published number is capped at 1M, and the tier
+                    # comparison reads that same ceiling.
                     current_window = _CODE_BEHAVES_AS_WINDOWS.get(current)
-                    if (
-                        current in (None, "")
-                        or current_window is None
-                        or (
-                            isinstance(window, int)
-                            and not isinstance(window, bool)
-                            and current_window < window
-                        )
+                    if current in (None, "") or (
+                        isinstance(window, int)
+                        and not isinstance(window, bool)
+                        and isinstance(current_window, int)
+                        and not isinstance(current_window, bool)
+                        and current_window < min(window, 1_000_000)
                     ):
                         row["behavesAs"] = behaves_as
             rows.append(row)
@@ -1959,10 +2010,9 @@ class ClaudeSettingsDomain:
         tier, and the session showed 200k for a route published at 1M.  So the
         row's id carries the number and so does the id a session actually runs.
 
-        An entry already written under the public name is kept rather than
-        moved: nothing this app generates launches with that spelling any more,
-        but a person who types it (``claude --model <name>``) still gets the
-        number they had, and an entry nobody wrote is never invented.
+        An entry under a superseded spelling is retired when it holds nothing
+        but the window this app writes and that value agrees; an entry with any
+        other field or a different number is the user's and is kept.
         """
 
         settings: dict[str, Any] = {}
@@ -1975,9 +2025,7 @@ class ClaudeSettingsDomain:
             route = known.get(name)
             if route is None:
                 continue
-            window = self._published_window(name)
-            if window is None:
-                window = route.get("max_input_tokens")
+            window = route.get("max_input_tokens")
             model_id = self._code_picker_id(name, window)
             base_id = claude_aliases.context_suffix_free(model_id)
             desired = _code_auto_compact_window(window)
@@ -1994,7 +2042,7 @@ class ClaudeSettingsDomain:
                 # 500k.
                 if stored == desired or stored == "auto":
                     entry["autoCompactWindow"] = desired
-                elif launch_id == base_id:
+                elif launch_id == base_id and base_id != model_id:
                     # The id a session runs states what this app publishes for
                     # the route.  A number this app wrote there while the route
                     # sat on another tier is its own stale claim, not a choice:
@@ -2010,9 +2058,7 @@ class ClaudeSettingsDomain:
         # writes is retired, and only when it now agrees -- a value that differs
         # is theirs.  The ids a current route is launched by are not stale.
         for name in names:
-            window = self._published_window(name)
-            if window is None:
-                window = (known.get(name) or {}).get("max_input_tokens")
+            window = (known.get(name) or {}).get("max_input_tokens")
             model_id = self._code_picker_id(name, window)
             launched = {model_id, claude_aliases.context_suffix_free(model_id)}
             current = settings.get(model_id)
@@ -2211,14 +2257,27 @@ class ClaudeSettingsDomain:
 
         return self._code_uses_local_api(self._draft)
 
+    def _names_local_api(self, configured: object) -> bool:
+        """Whether a client names the endpoint this domain already resolved.
+
+        The shared comparison resolves the endpoint from the default config,
+        which re-reads the runtime settings and provider document on every
+        polled snapshot.
+        """
+
+        base_url = self._local_api_base_url
+        if not base_url or not isinstance(configured, str) or not configured.strip():
+            return False
+        current = configured.strip().rstrip("/").lower()
+        expected = base_url.rstrip("/").lower()
+        return current in {expected, expected.removesuffix("/v1")}
+
     def _code_uses_local_api(self, document: Mapping[str, Any]) -> bool:
         """The same question for a document that is still a candidate."""
 
-        if not self._local_api_base_url:
-            return False
         env = document.get("env")
         base_url = env.get("ANTHROPIC_BASE_URL") if isinstance(env, Mapping) else None
-        return on_local_api(base_url, versioned=False)
+        return self._names_local_api(base_url)
 
     def code_nonstream_fallback_enabled(self) -> bool:
         """True when Claude Code is told not to re-send a failed stream whole."""
@@ -2244,7 +2303,12 @@ class ClaudeSettingsDomain:
 
         if not isinstance(self._raw, dict):
             self._raw = {}
-        for document in (self._raw, self._draft):
+        # Stage the change in copies: validation and the on-disk check below can
+        # still refuse it, and a refused toggle must not leave either document
+        # claiming a value that was never written.
+        raw = dict(self._raw)
+        draft = dict(self._draft) if isinstance(self._draft, dict) else None
+        for document in (raw, draft):
             if not isinstance(document, dict):
                 continue
             env = dict(_mapping(document.get("env", {}), "env"))
@@ -2253,13 +2317,92 @@ class ClaudeSettingsDomain:
             else:
                 env.pop(_CLAUDE_NONSTREAM_FALLBACK_ENV, None)
             document["env"] = env
-        errors = validate_settings(self._raw)
+        errors = validate_settings(raw)
         if errors:
             raise ClaudeSettingsError(errors[0])
         if _current_bytes(self.settings_path) != self._baseline_bytes:
             raise ClaudeSettingsError(
                 "Claude Settings changed on disk; reload and try again"
             )
+        self._raw = raw
+        if draft is not None:
+            self._draft = draft
+        text = json.dumps(self._raw, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        _atomic_write(self.settings_path, text)
+        self._exists = True
+        self._baseline_bytes = text.encode("utf-8")
+
+    def _code_auto_mode_disabled(
+        self, document: Mapping[str, Any] | None = None
+    ) -> bool:
+        """Whether the client document turns auto mode off.
+
+        The client accepts the key at both levels, so both are read; the pane
+        must show the value the client would honour, not only the one it writes.
+        """
+
+        source = self._draft if document is None else document
+        if str(source.get(_CLAUDE_DISABLE_AUTO_MODE) or "").strip().lower() == "disable":
+            return True
+        permissions = source.get("permissions")
+        if isinstance(permissions, Mapping):
+            return (
+                str(permissions.get(_CLAUDE_DISABLE_AUTO_MODE) or "")
+                .strip()
+                .lower()
+                == "disable"
+            )
+        return False
+
+    def code_auto_mode_enabled(self) -> bool:
+        """False when Claude Code is told not to offer auto mode at all."""
+
+        return not self._code_auto_mode_disabled()
+
+    def set_code_auto_mode(self, enabled: bool) -> None:
+        """Write Claude Code's auto-mode switch and persist it.
+
+        Claude Preview and Claude Browser tools are resolved back to ``auto``
+        even in a bypass-permissions session, so with auto mode on they wait for
+        a ``safeguard_results`` verdict that a gateway cannot carry and are
+        denied as unanswered.  Disabling auto mode is the client's own switch
+        for that: those tools then fall back to ordinary permission prompts,
+        while the session's own mode is left alone.  The disk document is
+        ``_raw`` so toggling saves no unrelated draft edit; the draft receives
+        the same key so the pane and the next Apply agree.
+        """
+
+        if not isinstance(self._raw, dict):
+            self._raw = {}
+        raw = dict(self._raw)
+        draft = dict(self._draft) if isinstance(self._draft, dict) else None
+        for document in (raw, draft):
+            if not isinstance(document, dict):
+                continue
+            if enabled:
+                document.pop(_CLAUDE_DISABLE_AUTO_MODE, None)
+                permissions = document.get("permissions")
+                if isinstance(permissions, Mapping) and (
+                    _CLAUDE_DISABLE_AUTO_MODE in permissions
+                ):
+                    cleaned = dict(permissions)
+                    cleaned.pop(_CLAUDE_DISABLE_AUTO_MODE, None)
+                    if cleaned:
+                        document["permissions"] = cleaned
+                    else:
+                        document.pop("permissions", None)
+            else:
+                document[_CLAUDE_DISABLE_AUTO_MODE] = "disable"
+        errors = validate_settings(raw)
+        if errors:
+            raise ClaudeSettingsError(errors[0])
+        if _current_bytes(self.settings_path) != self._baseline_bytes:
+            raise ClaudeSettingsError(
+                "Claude Settings changed on disk; reload and try again"
+            )
+        self._raw = raw
+        if draft is not None:
+            self._draft = draft
         text = json.dumps(self._raw, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         _atomic_write(self.settings_path, text)
         self._exists = True
@@ -2268,9 +2411,11 @@ class ClaudeSettingsDomain:
     def desktop_uses_local_api(self) -> bool:
         if self._desktop is None or not self._local_api_base_url:
             return False
-        return on_local_api(self._desktop.gateway_url(), versioned=False)
+        return self._names_local_api(self._desktop.gateway_url())
 
-    def _route_named(self, model: str) -> dict[str, str] | None:
+    def _route_named(
+        self, model: str, rows: Sequence[Mapping[str, Any]] | None = None
+    ) -> dict[str, str] | None:
         """Resolve a client's own model name back to one saved route.
 
         Only a name exactly one saved route answers resolves.  Two providers
@@ -2280,10 +2425,11 @@ class ClaudeSettingsDomain:
 
         if not model:
             return None
-        try:
-            _, rows = saved_routes(self.runtime_config_path)
-        except DomainError:
-            return None
+        if rows is None:
+            try:
+                _, rows = saved_routes(self.runtime_config_path)
+            except DomainError:
+                return None
         matches = [row for row in rows if str(row.get("model") or "").strip() == model]
         if len(matches) != 1:
             return None
@@ -2296,7 +2442,13 @@ class ClaudeSettingsDomain:
             }
         )
 
-    def client_route(self, client: str) -> dict[str, str] | None:
+    def client_route(
+        self,
+        client: str,
+        *,
+        state: Mapping[str, Any] | None = None,
+        rows: Sequence[Mapping[str, Any]] | None = None,
+    ) -> dict[str, str] | None:
         """The saved route this client is on, or the one it last left for us.
 
         The remembered route answers while the client points at this app's
@@ -2307,7 +2459,11 @@ class ClaudeSettingsDomain:
         by hand is never reported as this app's choice.
         """
 
-        remembered = read_route_setting(self.app_state_root, client)
+        remembered = (
+            _route_from_state(state, client)
+            if state is not None
+            else read_route_setting(self.app_state_root, client)
+        )
         if client == "claudeDesktop":
             if self.desktop_uses_local_api():
                 return remembered
@@ -2315,14 +2471,14 @@ class ClaudeSettingsDomain:
                 self._desktop.snapshot().get("model_names", []) if self._desktop is not None else []
             )
             model = str(model_names[0]).strip() if model_names else ""
-            return self._route_named(model) or remembered
+            return self._route_named(model, rows) or remembered
         if self.code_uses_local_api():
             return remembered
         env = self._code_env()
         model = _string(env.get("ANTHROPIC_MODEL"), "env.ANTHROPIC_MODEL") or _string(
             self._draft.get("model"), "model"
         )
-        return self._route_named(model or "") or remembered
+        return self._route_named(model or "", rows) or remembered
 
     def _prefer_one_million_context(self) -> None:
         """Show the 1M option, not a standard 200k row, for a 1M route.
@@ -2356,6 +2512,7 @@ class ClaudeSettingsDomain:
             self._desktop.patch({"modelPrefer1mContext": True})
             self._desktop.apply()
         except Exception:
+            self._desktop.reset_draft()
             return
 
     def _publishes_one_million_context(self) -> bool:
@@ -2408,9 +2565,18 @@ class ClaudeSettingsDomain:
             self._desktop.apply()
             store_generated_models(self.app_state_root, "claudeDesktop", [])
         except Exception:
+            # The empty list is already staged; leaving it there would make the
+            # pane report it and the next Apply wipe a profile this pass never
+            # managed to write.
+            self._desktop.reset_draft()
             return
 
     def snapshot(self) -> dict[str, Any]:
+        state = _shared_api._read_state(self.app_state_root)
+        try:
+            _, saved = saved_routes(self.runtime_config_path)
+        except DomainError:
+            saved = []
         return {
             "domain": self.name,
             "revision": self._revision,
@@ -2423,26 +2589,34 @@ class ClaudeSettingsDomain:
             "clients": {
                 "claudeCode": {
                     "uses_local_api": self.code_uses_local_api(),
-                    "designated_route": self.client_route("claudeCode"),
+                    "designated_route": self.client_route(
+                        "claudeCode", state=state, rows=saved
+                    ),
                     "model_list_enabled": self.code_model_list_enabled(),
                     "nonstream_fallback_enabled": self.code_nonstream_fallback_enabled(),
+                    "auto_mode_enabled": self.code_auto_mode_enabled(),
                 },
                 "claudeDesktop": {
                     "uses_local_api": self.desktop_uses_local_api(),
-                    "designated_route": self.client_route("claudeDesktop"),
-                    "model_list_enabled": self.desktop_model_list_enabled(),
+                    "designated_route": self.client_route(
+                        "claudeDesktop", state=state, rows=saved
+                    ),
+                    "model_list_enabled": self.desktop_model_list_enabled(state),
                 },
             },
             # The saved routes the designate control offers.  Only identity and
             # the labels the menu shows: no endpoint, no key.
-            "models": self._saved_route_rows(),
+            "models": self._saved_route_rows(saved),
         }
 
-    def _saved_route_rows(self) -> list[dict[str, Any]]:
-        try:
-            _, rows = saved_routes(self.runtime_config_path)
-        except DomainError:
-            return []
+    def _saved_route_rows(
+        self, rows: Sequence[Mapping[str, Any]] | None = None
+    ) -> list[dict[str, Any]]:
+        if rows is None:
+            try:
+                _, rows = saved_routes(self.runtime_config_path)
+            except DomainError:
+                return []
         return [
             {
                 "model": str(row.get("model") or ""),
@@ -2693,6 +2867,18 @@ class ClaudeSettingsDomain:
             if not isinstance(enabled, bool):
                 raise DomainError("The Claude non-streaming fallback switch is invalid")
             self.set_code_nonstream_fallback(enabled)
+            self._revision += 1
+            return self.snapshot()
+        if name in {
+            "claude_auto_mode_set",
+            "claudeautomodeset",
+            "auto_mode_set",
+            "automodeset",
+        }:
+            enabled = data.get("enabled")
+            if not isinstance(enabled, bool):
+                raise DomainError("The Claude auto-mode switch is invalid")
+            self.set_code_auto_mode(enabled)
             self._revision += 1
             return self.snapshot()
         candidate = copy.deepcopy(self._draft)
@@ -2959,10 +3145,6 @@ class ClaudeSettingsDomain:
         self._revision += 1
 
 
-def create_domain(*args: Any, **kwargs: Any) -> ClaudeSettingsDomain:
-    return ClaudeSettingsDomain(*args, **kwargs)
-
-
 __all__ = [
     "ClaudeDeployment",
     "ClaudeSettingsDomain",
@@ -2971,7 +3153,6 @@ __all__ = [
     "DOMAIN_NAME",
     "RISK_CONFIRMATION_CODES",
     "apply_litellm_deployment",
-    "create_domain",
     "default_settings_path",
     "redact",
     "risk_confirmation_codes",

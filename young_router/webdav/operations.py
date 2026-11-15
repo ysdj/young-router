@@ -7,6 +7,7 @@ from typing import Any
 from collections.abc import Sequence
 
 from .core import (
+    BUNDLE_MISSING_STATUS,
     CONFIG_BUNDLE_MAX_BYTES,
     DIGESTS_MAX_BYTES,
     MANIFEST_MAX_BYTES,
@@ -18,6 +19,7 @@ from .core import (
     _validate_bundle_header,
     archived_bundle_name,
     build_digest_record,
+    bundle_from_files,
     bundle_snapshot,
     bundle_url,
     collection_url,
@@ -55,15 +57,17 @@ def read_remote_manifest(client: WebDAVClient, settings: Settings) -> dict[str, 
             client.get(remote_manifest_url, max_bytes=MANIFEST_MAX_BYTES).decode("utf-8")
         )
     except WebDAVHTTPError as exc:
-        if exc.code in {403, 404, 405, 500, 502, 503, 504}:
+        if exc.code in BUNDLE_MISSING_STATUS | {500, 502, 503, 504}:
             try:
                 return read_manifest_from_remote_bundle(client, settings)
             except WebDAVHTTPError as bundle_exc:
-                if bundle_exc.code == 404:
+                if bundle_exc.code in BUNDLE_MISSING_STATUS:
                     return None
                 raise
         raise
-    except json.JSONDecodeError as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        # Bytes that do not decode are not JSON either; the decode runs first
+        # and its error is not a ``JSONDecodeError``.
         raise SyncError(f"Remote manifest is not valid JSON: {exc}") from exc
     if not isinstance(remote_manifest, dict):
         raise SyncError("Remote manifest must be a JSON object")
@@ -192,8 +196,6 @@ def read_manifest_from_remote_bundle(client: WebDAVClient, settings: Settings) -
         manifest, _files = read_config_bundle(
             client.get(remote_bundle_url, max_bytes=CONFIG_BUNDLE_MAX_BYTES)
         )
-    except WebDAVHTTPError:
-        raise
     except SyncError:
         raise
     except Exception as exc:
@@ -361,7 +363,11 @@ def pull_bundle(
                 # too.  Stating them for the run keeps the next comparison off
                 # the raw bytes, and publishing them keeps the other machine's
                 # next run off them as well.
-                agreed = SyncSnapshot(remote.manifest, remote.digests or local.digests)
+                agreed = SyncSnapshot(
+                    remote.manifest,
+                    remote.digests or local.digests,
+                    local.files if local.files is not None else remote.files,
+                )
                 if state_path is not None:
                     save_sync_state(state_path, settings, agreed, action)
                 if remote.digests is None:
@@ -382,4 +388,72 @@ def pull_bundle(
     # A pull has the bundle in hand, so the record can always be stated for the
     # manifest it came with -- even when this run installed nothing new.
     publish_remote_digests(client, settings, snapshot)
+    return result
+
+
+def conflict_merge(
+    client: WebDAVClient,
+    settings: Settings,
+    local: SyncSnapshot,
+    remote: SyncSnapshot,
+    base: SyncSnapshot,
+) -> dict[str, bytes] | None:
+    """The documents that settle a stopped sync, or ``None`` when it must ask.
+
+    ``smart_sync_plan`` answers by direction, and two sides that both moved have
+    none.  This is the second question, asked of the content once both sides are
+    in hand: can the edits be combined?  The three sides are the baseline's
+    saved text, this machine's files, and the remote bundle.
+
+    The bundle is read here rather than in the caller because this is the same
+    download the conflict branch makes anyway -- it is what the pane compares
+    after the run -- so a merge that succeeds costs nothing extra and a merge
+    that fails has already paid for the choice it offers.  A side that does not
+    carry its own text (an earlier version's state file, a manifest without a
+    matching bundle) answers ``None``: the caller keeps the conflict.
+
+    Every answer here is whole-side: one document that cannot be combined ends
+    the merge, because installing half of it and asking about the rest would
+    leave the two machines further apart than they started.
+    """
+
+    from . import merge as merge_module
+
+    if remote.files is None:
+        if remote.manifest is None:
+            return None
+        from_bundle = remote_snapshot_from_bundle(client, settings, remote.manifest)
+        if from_bundle is None:
+            return None
+        remote = from_bundle
+    if remote.files is None or local.files is None or base.files is None:
+        return None
+    merged = merge_module.merge_sync_files(base.files, local.files, remote.files)
+    if not merged or "config.yaml" not in merged:
+        # A merge without the document every side must have is not something
+        # ``install_bundle`` could accept; asking is the honest answer.
+        return None
+    return merged
+
+
+def install_merged_files(
+    client: WebDAVClient,
+    settings: Settings,
+    config_path: pathlib.Path,
+    state_path: pathlib.Path | None,
+    files: dict[str, bytes],
+) -> dict[str, Any]:
+    """Write the merged documents, then publish them to the other side.
+
+    The install half is the pull's own writer, fed a bundle built from the merge
+    result: the file it replaces is backed up, the relay store is merged rather
+    than overwritten, and a document this app would not load is refused.  The
+    push half is what makes the merge converge -- the peer's next run sees one
+    side that moved (this upload) and takes it -- and it states the merged
+    content as the baseline both ends now agree on.
+    """
+
+    bundle_data = bundle_from_files(files)
+    result = install_bundle(bundle_data, config_path)
+    push_bundle(client, settings, config_path, state_path, "sync-merge")
     return result

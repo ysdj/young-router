@@ -554,7 +554,6 @@ def encode_message(value: Mapping[str, Any] | RequestEnvelope | ResponseEnvelope
         payload = value.to_mapping()
     else:
         payload = _mapping(value, "message")
-        _validate_json_value(payload)
     try:
         encoded = _encode_json(payload) + b"\n"
     except (TypeError, ValueError) as exc:
@@ -576,7 +575,7 @@ def _encode_json(payload: Any) -> bytes:
     the payload said: ``nan``/``inf`` are rejected, and only ``str`` keys are
     accepted (``allow_nan=False`` plus ``json.dumps``'s own key rule).
 
-    ``_reject_json_value`` performs that check over the same tree the encoder
+    ``_assert_json_encodable`` performs that check over the same tree the encoder
     is about to walk, and a snapshot's numbers are all finite, so it costs one
     pass that the standard encoder was paying anyway.
     """

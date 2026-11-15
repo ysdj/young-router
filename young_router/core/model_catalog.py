@@ -130,14 +130,14 @@ def catalog_names_from_editor(payload: object) -> list[str]:
     return names
 
 
-def _fallback_reasoning_profile(name: str) -> tuple[str, tuple[dict[str, str], ...]]:
+def _fallback_reasoning_profile() -> tuple[str, tuple[dict[str, str], ...]]:
     return "medium", _REASONING_LEVELS
 
 
 def _fallback_catalog_model(name: str, priority: int) -> dict[str, Any]:
     """Keep the catalog usable when no native Codex executable is installed."""
 
-    default_reasoning_level, supported_reasoning_levels = _fallback_reasoning_profile(name)
+    default_reasoning_level, supported_reasoning_levels = _fallback_reasoning_profile()
     return {
         "slug": name,
         "display_name": name,
@@ -199,7 +199,7 @@ def select_inherited_profile(native_models: Sequence[Mapping[str, Any]]) -> dict
     pin the returned slug and keep using it while the client still offers it.
     """
 
-    candidates: list[tuple[int, int, dict[str, Any]]] = []
+    candidates: list[tuple[int, int, Mapping[str, Any]]] = []
     for index, raw_model in enumerate(native_models):
         if not isinstance(raw_model, Mapping):
             continue
@@ -211,10 +211,10 @@ def select_inherited_profile(native_models: Sequence[Mapping[str, Any]]) -> dict
             continue
         if not profile_has_instructions(raw_model):
             continue
-        candidates.append((_profile_priority(raw_model), index, copy.deepcopy(dict(raw_model))))
+        candidates.append((_profile_priority(raw_model), index, raw_model))
     if candidates:
         candidates.sort(key=lambda item: (item[0], item[1]))
-        return candidates[0][2]
+        return copy.deepcopy(dict(candidates[0][2]))
     # A catalog with an unexpected visibility spelling still has to yield
     # usable instructions, so fall back to the first profile that carries
     # them; hidden-only catalogs are the only case where that can pick a
@@ -225,28 +225,38 @@ def select_inherited_profile(native_models: Sequence[Mapping[str, Any]]) -> dict
     return None
 
 
-def _native_profile_for_name(
-    name: str,
+def _native_profiles_by_name(
     native_models: Sequence[Mapping[str, Any]],
-    base_slug: str | None = None,
-) -> tuple[dict[str, Any] | None, bool]:
-    """Find an exact native profile, or an agent profile for a custom route."""
+) -> dict[str, Mapping[str, Any]]:
+    """Index native profiles by slug without copying the profiles themselves."""
 
-    by_name: dict[str, tuple[dict[str, Any], bool]] = {}
+    by_name: dict[str, Mapping[str, Any]] = {}
     for raw_model in native_models:
         if not isinstance(raw_model, Mapping):
             continue
         slug = raw_model.get("slug")
         if not isinstance(slug, str) or not slug.strip():
             continue
-        model = copy.deepcopy(dict(raw_model))
-        normalized_slug = slug.strip().casefold()
-        by_name.setdefault(normalized_slug, (model, True))
+        by_name.setdefault(slug.strip().casefold(), raw_model)
+    return by_name
+
+
+def _native_profile_for_name(
+    name: str,
+    native_models: Sequence[Mapping[str, Any]],
+    base_slug: str | None = None,
+    native_profiles: Mapping[str, Mapping[str, Any]] | None = None,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Find an exact native profile, or an agent profile for a custom route."""
+
+    by_name = native_profiles
+    if by_name is None:
+        by_name = _native_profiles_by_name(native_models)
 
     for candidate in _name_candidates(name):
         exact = by_name.get(candidate)
         if exact is not None:
-            return exact
+            return copy.deepcopy(dict(exact)), True
 
     # A public alias may not exist in the native list. In that case inherit the
     # pinned base profile (the one this app resolved and has been using), or
@@ -256,8 +266,8 @@ def _native_profile_for_name(
     pinned = str(base_slug or "").strip().casefold()
     if pinned:
         chosen = by_name.get(pinned)
-        if chosen is not None and profile_has_instructions(chosen[0]):
-            return copy.deepcopy(chosen[0]), False
+        if chosen is not None and profile_has_instructions(chosen):
+            return copy.deepcopy(dict(chosen)), False
     selected = select_inherited_profile(native_models)
     if selected is not None:
         return selected, False
@@ -327,8 +337,11 @@ _IMAGE_FILTER_REGISTRY_LOCK = threading.RLock()
 _IMAGE_FILTER_REGISTRY: tuple[str, ModelContextRegistry] | None = None
 
 
-def _image_filter_registry() -> ModelContextRegistry:
-    """The registry the client-picker filter reads, built from this install.
+def _image_filter_registry(
+    runtime_root: Path | str | None = None,
+    runtime_config_path: Path | str | None = None,
+) -> ModelContextRegistry:
+    """The registry the client-picker filter reads, built from one install.
 
     Resolved exactly as ``proxy.reasoning`` resolves its own: the same runtime
     document, the same settings file, the same cache and the same retired
@@ -336,6 +349,11 @@ def _image_filter_registry() -> ModelContextRegistry:
     records, or a route could read as an image model in one and a chat model in
     the other.  Refresh stays off: this is a read of whatever the pane already
     fetched, not a second fetcher racing it.
+
+    ``runtime_root`` and ``runtime_config_path`` name the installation and its
+    provider document, so a domain built against another pair reads that pair's
+    records rather than the process's own -- the same rule ``_app_state_root``
+    applies to the rest of a domain's state.
     """
 
     global _IMAGE_FILTER_REGISTRY
@@ -343,9 +361,14 @@ def _image_filter_registry() -> ModelContextRegistry:
     from .. import config_paths as _config_paths
     from .model_contexts import legacy_context_cache_paths
 
-    root = _config_paths.runtime_root()
+    root = _config_paths.runtime_root(runtime_root)
+    config_path = (
+        Path(runtime_config_path).expanduser()
+        if runtime_config_path is not None
+        else _config_paths.provider_config_path(root)
+    )
     cache = default_context_cache_path(root)
-    key = str(cache)
+    key = f"{cache}\0{config_path}"
     with _IMAGE_FILTER_REGISTRY_LOCK:
         if _IMAGE_FILTER_REGISTRY is not None and _IMAGE_FILTER_REGISTRY[0] == key:
             return _IMAGE_FILTER_REGISTRY[1]
@@ -359,7 +382,7 @@ def _image_filter_registry() -> ModelContextRegistry:
             else Path.home() / ".codex"
         )
         registry = ModelContextRegistry(
-            runtime_config_path=_config_paths.provider_config_path(root),
+            runtime_config_path=config_path,
             runtime_settings_path=(
                 Path(configured_settings).expanduser()
                 if configured_settings
@@ -503,8 +526,11 @@ def _catalog_model(
     registry: ModelContextRegistry,
     native_models: Sequence[Mapping[str, Any]],
     base_slug: str | None = None,
+    native_profiles: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    native_model, exact_native_match = _native_profile_for_name(name, native_models, base_slug)
+    native_model, exact_native_match = _native_profile_for_name(
+        name, native_models, base_slug, native_profiles
+    )
     if native_model is None:
         # The native profile is an enhancement, not a second hard-coded model
         # schema. Keep the existing minimal contract for hosts without Codex.
@@ -586,6 +612,7 @@ def catalog_payload(
 ) -> dict[str, Any]:
     context_registry = registry or ModelContextRegistry()
     resolved_native = load_native_catalog() if native_models is None else native_models
+    native_profiles = _native_profiles_by_name(resolved_native)
     # Codex's models-manager discards this array's order and sorts the picker by
     # ``priority`` ascending, so the number is the row's position in the list a
     # person reads.  ``names`` arrives in the one order every generated picker
@@ -593,7 +620,14 @@ def catalog_payload(
     # reproduces that order rather than inventing a second one.
     return {
         "models": [
-            _catalog_model(name, index + 1, context_registry, resolved_native, base_slug)
+            _catalog_model(
+                name,
+                index + 1,
+                context_registry,
+                resolved_native,
+                base_slug,
+                native_profiles,
+            )
             for index, name in enumerate(names)
         ]
     }
@@ -695,22 +729,6 @@ def catalog_is_current(
         )
         if any(not isinstance(item, Mapping) for item in existing_models):
             return False
-        existing_fallback = not any(
-            profile_has_instructions(item) for item in existing_models
-        )
-        if existing_fallback and base_slug and any(
-            isinstance(item, Mapping)
-            and str(item.get("slug") or "").strip().casefold()
-            == base_slug.strip().casefold()
-            and profile_has_instructions(item)
-            for item in resolved_native
-        ):
-            expected = catalog_payload(
-                names,
-                registry=registry,
-                native_models=resolved_native,
-                base_slug=base_slug,
-            )
         if existing != expected and [
             item.get("slug") for item in existing_models
         ] != [item.get("slug") for item in expected["models"]]:
@@ -723,16 +741,6 @@ def catalog_is_current(
         )
         if existing != expected:
             return expected_native and not existing_native
-        if expected_native and not existing_native:
-            # A transient unreadable client catalog may already have been
-            # written over this file. Repair that downgrade as soon as the
-            # installed client again supplies its instructions.
-            return False
-        if existing_native and not expected_native:
-            # During a client update, its catalog may be temporarily unreadable.
-            # Keep the instructions already in use rather than downgrading a
-            # restored thread to the fallback context Codex re-estimates.
-            return True
         return True
     except PersistenceError:
         return False

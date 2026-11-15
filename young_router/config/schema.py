@@ -515,7 +515,13 @@ def _menu_order(value: Any, field: str) -> int | float:
             raise ValueError(f"{field} is invalid") from exc
     else:
         raise ValueError(f"{field} is invalid")
-    if not math.isfinite(result):
+    try:
+        finite = math.isfinite(result)
+    except OverflowError:
+        # An integer too large to be a float: YAML reads a long digit literal as
+        # one, and the callers answer only ``ValueError`` with "is invalid".
+        finite = False
+    if not finite:
         raise ValueError(f"{field} is invalid")
     return int(result) if isinstance(result, float) and result.is_integer() else result
 
@@ -776,10 +782,17 @@ def _validate_current_schema(data: dict[str, Any], path: pathlib.Path) -> None:
                 f"use {CURRENT_HOOK_CALLBACK}"
             )
 
-    providers = _as_dict(data.get("providers"))
+    # A providers section the app cannot read as a mapping is refused rather
+    # than read as "no providers": the next save rewrites the file from that
+    # empty set and drops every provider row it could not understand.
+    providers = data.get("providers", {})
+    if not isinstance(providers, dict):
+        raise ValueError(f"{path.name} providers must be an object")
     seen_provider_key_ids: set[str] = set()
     for provider_name, raw_provider in providers.items():
-        provider = _as_dict(raw_provider)
+        if not isinstance(raw_provider, dict):
+            raise ValueError(f"{path.name} provider {provider_name} must be an object")
+        provider = raw_provider
         if "api_key" in provider:
             raise ValueError(
                 f"{path.name} provider {provider_name} uses unsupported scalar api_key; "
@@ -934,12 +947,15 @@ def _validate_current_schema(data: dict[str, Any], path: pathlib.Path) -> None:
                     raise ValueError(
                         f"{path.name} {section_name}[{index}] {limit_key} must be a positive integer"
                     )
-            if MODEL_CONCURRENCY_KEY in model_info:
+            concurrency = model_info.get(MODEL_CONCURRENCY_KEY)
+            # A stated null means the same as an absent key here — follow the
+            # runtime default — so it must not refuse the whole file; the
+            # limit loop above reads ``null`` the same way.
+            if concurrency is not None:
                 # ``0`` is meaningful here and is the one value the positive
                 # limit above cannot state: it says this route is unlimited,
                 # which is different from saying nothing (follow the runtime
                 # default).
-                concurrency = model_info.get(MODEL_CONCURRENCY_KEY)
                 try:
                     parsed_concurrency = _menu_order(concurrency, "Route concurrency")
                 except ValueError as exc:

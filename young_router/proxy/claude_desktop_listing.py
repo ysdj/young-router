@@ -121,7 +121,6 @@ def _public_context_window(name: str) -> int | None:
 
 def _published_context(
     public_id: str,
-    row: Mapping[str, object],
     public_window: Callable[[str], int | None],
 ) -> object:
     """The ``max_input_tokens`` one discovery row states.
@@ -142,12 +141,11 @@ def _published_context(
     a 500k or 272k route.  A window this app cannot resolve, or a generator's
     ``0``, states nothing.
 
-    Only an alias row is rewritten: a Claude-shaped route is already listed
-    under the id it sends and keeps its own row and metadata.
+    Both row kinds state this window: ``_kept_row`` states it for an id the
+    client keeps as written, and keeps the number the canonical row gave only
+    when this resolution has no answer.
     """
 
-    if desktop_keeps_model_id(public_id):
-        return row.get("max_input_tokens")
     try:
         window = public_window(public_id)
         if not isinstance(window, int) or isinstance(window, bool):
@@ -176,11 +174,15 @@ def _states_one_million(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= _ONE_MILLION
 
 
-def _kept_row(public_id: str, row: Mapping[str, object]) -> dict[str, object]:
+def _kept_row(
+    public_id: str,
+    row: Mapping[str, object],
+    published: object,
+) -> dict[str, object]:
     """One discovery row for an id the client already keeps as written.
 
-    The row is the router's own: id, display name, and the window the canonical
-    listing stated.  One thing is this view's to decide -- a route stated at 1M
+    The row is the router's own: id, display name, and the window the route is
+    published at.  One thing is this view's to decide -- a route stated at 1M
     is published under the client's ``[1m]`` spelling, exactly as an alias row
     is.  ``max_input_tokens`` at 1M alone is a row the picker answers with two
     entries for one route (``Opus 5.5`` and ``Opus 5.5 1M``): the plain one
@@ -193,7 +195,14 @@ def _kept_row(public_id: str, row: Mapping[str, object]) -> dict[str, object]:
     """
 
     kept = dict(row)
-    if not _states_one_million(row.get("max_input_tokens")):
+    # The resolution Core's Code picker names the id by
+    # (``_code_route_window``): reading the canonical row alone publishes one
+    # id here and launches another there whenever the two numbers disagree.
+    window = row.get("max_input_tokens") if published is None else published
+    if not _states_one_million(window):
+        # A row stating 1M for a route published below it is the second picker
+        # entry the suffix exists to avoid, so the number follows the window.
+        kept["max_input_tokens"] = window
         return kept
     kept["max_input_tokens"] = _ONE_MILLION
     if context_suffix_free(public_id) == public_id:
@@ -233,10 +242,12 @@ def desktop_model_rows(
         if _route_is_image(public_id):
             continue
         if desktop_keeps_model_id(public_id):
-            rows.append(_kept_row(public_id, row))
+            rows.append(
+                _kept_row(public_id, row, _published_context(public_id, window_for))
+            )
             continue
         display_name = row.get("display_name") or names.get(public_id) or public_id
-        published = _published_context(public_id, row, window_for)
+        published = _published_context(public_id, window_for)
         # Claude Desktop's 1M row is a name before it is a number: an id
         # carrying its own ``[1m]`` suffix is read at 1M by the session, and a
         # suffixed id is not a row that "offers 1M" to the picker, so no second

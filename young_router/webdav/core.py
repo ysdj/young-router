@@ -72,6 +72,13 @@ MERGE_ON_PULL = frozenset({RELAY_ACCOUNTS_FILE})
 SENSITIVE_QUERY_KEYS = {"x-vercel-protection-bypass"}
 SYNC_STATE_VERSION = 1
 SYNC_DIGESTS_VERSION = 1
+#: How much of the agreed documents the state file keeps.  They are there for
+#: the three-way merge a stopped sync runs, so a record too large to be worth
+#: reading on every run simply leaves the merge unanswerable -- the sync then
+#: stops and offers the comparison, exactly as it did before documents were
+#: kept.  The bound is well under ``CONFIG_BUNDLE_MAX_BYTES`` because this is a
+#: copy of files that already exist, not the bundle.
+SYNC_STATE_CONTENTS_MAX_BYTES = 8 * 1024 * 1024
 DEFAULT_SYNC_INTERVAL_MINUTES = 30
 DEFAULT_TIMEOUT_SECONDS = 30.0
 WEBDAV_REQUEST_RETRY_ATTEMPTS = 3
@@ -564,19 +571,6 @@ def _relay_rows_by_id(document: dict[str, Any], key: str) -> dict[str, dict[str,
     }
 
 
-def _relay_tombstones(document: dict[str, Any], key: str) -> dict[str, dict[str, Any]]:
-    """One document's removal tombstones, keyed by the id they name."""
-
-    rows = document.get(key)
-    if not isinstance(rows, list):
-        return {}
-    return {
-        row["id"]: row
-        for row in rows
-        if isinstance(row, dict) and isinstance(row.get("id"), str) and row["id"]
-    }
-
-
 def _relay_row_is_removed(
     row: dict[str, Any],
     removed_stations: dict[str, dict[str, Any]],
@@ -643,10 +637,10 @@ def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
     incoming_accounts = _relay_rows_by_id(incoming_document, "accounts")
     local_stations = _relay_rows_by_id(local_document, "stations")
     incoming_stations = _relay_rows_by_id(incoming_document, "stations")
-    local_removed_stations = _relay_tombstones(local_document, "removed_stations")
-    local_removed_accounts = _relay_tombstones(local_document, "removed_accounts")
-    incoming_removed_stations = _relay_tombstones(incoming_document, "removed_stations")
-    incoming_removed_accounts = _relay_tombstones(incoming_document, "removed_accounts")
+    local_removed_stations = _relay_rows_by_id(local_document, "removed_stations")
+    local_removed_accounts = _relay_rows_by_id(local_document, "removed_accounts")
+    incoming_removed_stations = _relay_rows_by_id(incoming_document, "removed_stations")
+    incoming_removed_accounts = _relay_rows_by_id(incoming_document, "removed_accounts")
     if not local_accounts and not local_stations and not (local_removed_stations or local_removed_accounts):
         # Nothing local to preserve and nothing local to defend: the incoming
         # copy is the answer.
@@ -771,7 +765,12 @@ def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
     # entry of an account nobody can see any more.  Dropping the second kind is
     # how a merge left credentials behind for good.
     merged_account_ids = {account.get("id") for account in merged_accounts}
-    merged_cleanups: list[dict[str, Any]] = []
+    # One row per (account, kind): that pair is the row's identity, and the
+    # store refuses a file that states it twice.  Both machines hold the same
+    # tombstone as soon as a deletion has synced once, so concatenating the two
+    # lists wrote a relay store the next start could not load.  The local row
+    # is the one kept, like every other record this merge preserves.
+    cleanups_by_key: dict[tuple[str, Any], dict[str, Any]] = {}
     for cleanup in [
         *local_document.get("pending_credential_cleanups", []),
         *incoming_document.get("pending_credential_cleanups", []),
@@ -786,10 +785,9 @@ def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
                 continue
         elif owner not in merged_account_ids or owner in incoming_accounts:
             continue
-        merged_cleanups.append(cleanup)
-    cleanup_keys = {
-        (cleanup.get("account_id"), cleanup.get("kind")) for cleanup in merged_cleanups
-    }
+        cleanups_by_key.setdefault((owner, cleanup.get("kind")), cleanup)
+    merged_cleanups = list(cleanups_by_key.values())
+    cleanup_keys = set(cleanups_by_key)
     incoming_cleanup_keys = {
         (cleanup.get("account_id"), cleanup.get("kind"))
         for cleanup in incoming_document.get("pending_credential_cleanups", [])
@@ -819,7 +817,7 @@ def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
     merged["removed_stations"] = merged_tombstones["removed_stations"]
     merged["removed_accounts"] = merged_tombstones["removed_accounts"]
     merged["pending_credential_cleanups"] = merged_cleanups
-    merged.setdefault("version", local_document.get("version", 3))
+    merged["version"] = local_document.get("version", incoming_document.get("version", 3))
     return json.dumps(merged, ensure_ascii=False, indent=2).encode("utf-8")
 
 
@@ -923,12 +921,19 @@ def validate_config_bytes(name: str, data: bytes, required_key: str) -> dict[str
         raise SyncError(f"{name} does not use the current Young Router schema: {exc}") from exc
 
 
-def local_summary(config_path: pathlib.Path) -> dict[str, int]:
-    config = _load_yaml_mapping(config_path)
-    disabled_path = disabled_models_path(config_path)
-    disabled: dict[str, Any] = {}
-    if disabled_path.exists():
-        disabled = _load_yaml_mapping(disabled_path)
+def local_summary(
+    config_path: pathlib.Path,
+    parsed: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, int]:
+    if parsed is None:
+        config = _load_yaml_mapping(config_path)
+        disabled_path = disabled_models_path(config_path)
+        disabled: dict[str, Any] = {}
+        if disabled_path.exists():
+            disabled = _load_yaml_mapping(disabled_path)
+    else:
+        config = parsed.get("config.yaml", {})
+        disabled = parsed.get("config.disabled-models.yaml", {})
     providers = config.get("providers") if isinstance(config.get("providers"), dict) else {}
     model_list = config.get("model_list") if isinstance(config.get("model_list"), list) else []
     disabled_list = disabled.get("disabled_model_list") if isinstance(disabled.get("disabled_model_list"), list) else []
@@ -1082,6 +1087,7 @@ def bundle_snapshot(manifest: dict[str, Any], files: dict[str, bytes]) -> SyncSn
             name: (content_digest(name, files[name]) if name in files else None)
             for name in _expected_bundle_files()
         },
+        dict(files),
     )
 
 
@@ -1103,6 +1109,7 @@ def _sync_snapshot(
     files: list[dict[str, Any]] = []
     digests: dict[str, str | None] = {}
     contents: dict[str, bytes] = {}
+    parsed: dict[str, dict[str, Any]] = {}
     for archive_name, path, required, required_key in sync_targets(config_path):
         if not path.exists():
             if required:
@@ -1111,7 +1118,7 @@ def _sync_snapshot(
             digests[archive_name] = None
             continue
         data = path.read_bytes()
-        validate_config_bytes(archive_name, data, required_key)
+        parsed[archive_name] = validate_config_bytes(archive_name, data, required_key)
         stat_result = path.stat()
         files.append(
             {
@@ -1134,17 +1141,17 @@ def _sync_snapshot(
         "version": ARCHIVE_VERSION,
         "format": CONFIG_BUNDLE_FORMAT,
         "created_at": _utc_now(),
-        "summary": local_summary(config_path),
+        "summary": local_summary(config_path, parsed),
         "files": files,
     }
     return manifest, digests, contents
 
 
 def local_snapshot(config_path: pathlib.Path) -> SyncSnapshot:
-    """This machine's side of a comparison: its manifest and compared digests."""
+    """This machine's side of a comparison: its manifest, digests, and files."""
 
-    manifest, digests, _contents = _sync_snapshot(config_path)
-    return SyncSnapshot(manifest, digests)
+    manifest, digests, contents = _sync_snapshot(config_path)
+    return SyncSnapshot(manifest, digests, contents)
 
 
 def _manifest_fingerprints(manifest: dict[str, Any] | None) -> dict[str, str | None]:
@@ -1178,10 +1185,19 @@ class SyncSnapshot:
     earlier version, a state file written before digests existed.  That is a
     different value from an empty record, and it is what makes the comparison
     fall back to bytes for exactly that side instead of for all of them.
+
+    ``files`` are the documents themselves, when this side knows them: the
+    files on disk for the local side, the bundle's own content for the remote
+    one, and the content the last run agreed on for the baseline.  A comparison
+    decides direction from digests alone; the merge that keeps a sync from
+    stopping on two sides that both moved needs the ancestor's text as well as
+    the two copies, so a side that only knows its fingerprints says so by
+    leaving this ``None``.
     """
 
     manifest: dict[str, Any] | None
     digests: dict[str, str | None] | None = None
+    files: dict[str, bytes] | None = None
 
     @property
     def fingerprints(self) -> dict[str, str | None]:
@@ -1348,11 +1364,12 @@ def smart_sync_plan(
     Every caller -- the interval loop, the pane's button, the CLI -- asks this
     one question, and there is no direction to consult.  A side that moved alone
     is the side to take, because that snapshot is the one change this sync is
-    meant to carry.  Both sides moving is a real conflict: nothing here can know
-    which of the two edits the reader meant to keep, so the run stops and the
-    pane shows both sides.  Without a baseline nothing says either side moved;
-    the later snapshot wins there, so a first sync between two machines still
-    finishes.
+    meant to carry.  Both sides moving is not a direction, and nothing here can
+    know which of the two edits the reader meant to keep: the run asks the
+    content next (``webdav.merge``), and only a document whose edits collide
+    reaches the pane as a choice.  Without a baseline nothing says either side
+    moved; the later snapshot wins there, so a first sync between two machines
+    still finishes.
 
     What counts as a move is the compared digest, not the file's bytes: the
     relay store is rewritten whenever a machine reads a balance or refreshes a
@@ -1365,10 +1382,12 @@ def smart_sync_plan(
     A file the two sides already agree on is not a question, even when both of
     them moved to that same content since the baseline: taking either side keeps
     the reader's work.  The files they disagree on are what decides the
-    direction -- one side's moves are the snapshot to carry, both sides' moves
-    are a choice the reader has to make.  That rule is the same whether or not
-    the two snapshots name the same files, so there is one loop over the union
-    of them rather than a bundle-level rule that restates it.
+    direction -- one side's moves are the snapshot to carry, and one file both
+    sides moved is the conflict the merge is handed.  That rule is the same
+    whether or not the two snapshots name the same files, so there is one loop
+    over the union of them rather than a bundle-level rule that restates it.
+    This function never reads a document: "both moved" is as far as digests can
+    answer, and the merge decides the rest.
 
     One move on each side is not yet a choice when the two moves are different
     files.  The relay store is the file a pull merges rather than replaces: a
@@ -1503,7 +1522,42 @@ def save_sync_state(
             for name, value in snapshot.digests.items()
             if isinstance(name, str) and (value is None or isinstance(value, str))
         }
-    _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"))
+    # The documents themselves, so the next stopped run has an ancestor to
+    # merge against.  Without them "both ends changed" is only a choice, which
+    # is what this file is for: a merge needs the text both ends agreed on, and
+    # the remote copy of it is gone the moment the run that downloaded it ends.
+    # Optional and bounded, so a state file an earlier version wrote still
+    # loads and a document too large to keep only costs the merge -- the run
+    # then stops and asks, exactly as it did before documents were kept.
+    contents = _snapshot_contents(snapshot)
+    if contents:
+        data["contents"] = contents
+        if len(_state_bytes(data)) > SYNC_STATE_CONTENTS_MAX_BYTES:
+            data.pop("contents", None)
+    _atomic_write(path, _state_bytes(data))
+
+
+def _state_bytes(data: dict[str, Any]) -> bytes:
+    return json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+
+
+def _snapshot_contents(snapshot: SyncSnapshot) -> dict[str, str] | None:
+    """One side's documents as text, or ``None`` when it does not know them."""
+
+    if snapshot.files is None:
+        return None
+    texts: dict[str, str] = {}
+    for name, data in snapshot.files.items():
+        if not isinstance(name, str) or not isinstance(data, bytes):
+            continue
+        try:
+            texts[name] = data.decode("utf-8")
+        except UnicodeDecodeError:
+            # A document that is not text is not one this sync carries; the
+            # bundle itself refuses those, so this only keeps a hand-made
+            # state honest.
+            continue
+    return texts
 
 
 def save_sync_status(path: pathlib.Path, action: str, ok: bool, code: str | None = None) -> None:
@@ -1537,13 +1591,18 @@ def baseline_snapshot(path: pathlib.Path) -> SyncSnapshot:
     """The last agreed snapshot, with the digests its own run compared by.
 
     One read of the state file answers the whole side: the manifest it agreed
-    on and the compared digests saved beside it.  A state file an earlier
+    on, the compared digests saved beside it, and -- when the run that wrote it
+    still kept them -- the documents themselves.  A state file an earlier
     version wrote has the manifest and no digests, which is a side that
-    compares by bytes -- not a side that is missing.
+    compares by bytes -- not a side that is missing.  Content that does not
+    describe this manifest (a record written before a file was added, a
+    hand-edited state) is dropped as a whole: an ancestor with a file silently
+    left out of it would read as a deletion.
     """
 
     state = load_sync_state(path)
-    return SyncSnapshot(_stored_manifest(state), _stored_digests(state))
+    manifest = _stored_manifest(state)
+    return SyncSnapshot(manifest, _stored_digests(state), _stored_contents(state, manifest))
 
 
 def _stored_manifest(state: dict[str, Any]) -> dict[str, Any] | None:
@@ -1563,6 +1622,48 @@ def _stored_digests(state: dict[str, Any]) -> dict[str, str | None] | None:
             return None
         digests[name] = value
     return digests
+
+
+def _stored_contents(
+    state: dict[str, Any],
+    manifest: dict[str, Any] | None,
+) -> dict[str, bytes] | None:
+    """The documents this baseline holds, when the record still describes them.
+
+    A file the manifest says was present has to be here, and a file it says was
+    absent must not be: an ancestor missing a document it names would read as
+    "this side deleted it", and a merge would answer with a deletion nobody
+    made.  Anything else -- no record, an earlier version's state file, a
+    damaged one -- is ``None``, and the sync keeps the choice it had before
+    merged documents existed.
+    """
+
+    stored = state.get("contents")
+    if not isinstance(stored, dict) or not isinstance(manifest, dict):
+        return None
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        return None
+    expected: dict[str, bool] = {}
+    for entry in files:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            return None
+        expected[entry["path"]] = bool(entry.get("present"))
+    if not expected:
+        return None
+    contents: dict[str, bytes] = {}
+    for name, present in expected.items():
+        text = stored.get(name)
+        if not present:
+            if text is not None:
+                return None
+            continue
+        if not isinstance(text, str):
+            return None
+        contents[name] = text.encode("utf-8")
+    if set(contents) != {name for name, present in expected.items() if present}:
+        return None
+    return contents
 
 
 def default_conflict_file(root: pathlib.Path | str | None = None) -> pathlib.Path:
@@ -1695,8 +1796,53 @@ def create_bundle(config_path: pathlib.Path) -> tuple[bytes, SyncSnapshot]:
     }
     return (
         json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8"),
-        SyncSnapshot(manifest, digests),
+        SyncSnapshot(manifest, digests, contents),
     )
+
+
+def bundle_from_files(contents: dict[str, bytes]) -> bytes:
+    """A bundle carrying these documents, for a sync that merged both sides.
+
+    ``install_bundle`` is the one writer of a pulled side: it backs up the file
+    it replaces, merges the relay store, and refuses a document that does not
+    validate.  A merge that has to be installed therefore states itself in the
+    same form instead of writing files by its own rules, and the manifest is
+    computed from these very bytes -- exactly as ``create_bundle`` computes it
+    from the bytes on disk.
+    """
+
+    now = _utc_now()
+    files: list[dict[str, Any]] = []
+    parsed: dict[str, dict[str, Any]] = {}
+    for name, (_required, required_key) in _expected_bundle_files().items():
+        data = contents.get(name)
+        entry: dict[str, Any] = {"path": name, "present": data is not None}
+        if data is not None:
+            parsed[name] = validate_config_bytes(name, data, required_key)
+            entry.update(
+                {
+                    "bytes": len(data),
+                    "sha256": _sha256_bytes(data),
+                    # A merged file is this machine's own copy from here on:
+                    # the mode it lands with is the one every writer here
+                    # uses, not the mode the peer happened to have.
+                    "mode": 0o600,
+                    "modified_at": now,
+                    "content": data.decode("utf-8"),
+                }
+            )
+        files.append(entry)
+    if "config.yaml" not in parsed:
+        raise SyncError("WebDAV sync bundle is missing required file config.yaml")
+    bundle = {
+        "app": APP_NAME,
+        "version": ARCHIVE_VERSION,
+        "format": CONFIG_BUNDLE_FORMAT,
+        "created_at": now,
+        "summary": local_summary(pathlib.Path("config.yaml"), parsed),
+        "files": files,
+    }
+    return json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
 
 
 def _expected_bundle_files() -> dict[str, tuple[bool, str]]:
@@ -1868,10 +2014,6 @@ def install_bundle(bundle_data: bytes, config_path: pathlib.Path) -> dict[str, A
     manifest, files = read_config_bundle(bundle_data)
     if "config.yaml" not in files:
         raise SyncError("WebDAV sync bundle is missing config.yaml")
-
-    validate_config_bytes("config.yaml", files["config.yaml"], "model_list")
-    if "config.disabled-models.yaml" in files:
-        validate_config_bytes("config.disabled-models.yaml", files["config.disabled-models.yaml"], "disabled_model_list")
 
     backups: list[str] = []
     installed: list[str] = []
@@ -2258,13 +2400,16 @@ class WebDAVClient:
                 config_lines.append(f"header = {_curl_config_quote(f'{key}: {value}')}" )
             if data is not None:
                 data_fd, data_path = tempfile.mkstemp(prefix="litellm-webdav-data-", suffix=".bin")
+                # fdopen owns data_fd once it returns, so only its own
+                # failure needs the explicit close.
                 try:
-                    with os.fdopen(data_fd, "wb") as handle:
-                        handle.write(data)
-                    os.chmod(data_path, 0o600)
+                    handle = os.fdopen(data_fd, "wb")
                 except Exception:
                     os.close(data_fd)
                     raise
+                with handle:
+                    handle.write(data)
+                os.chmod(data_path, 0o600)
                 # curl reads the quoted form as a literal filename that includes the
                 # quotes, so it fails with a read error instead of uploading. mkstemp
                 # paths never contain spaces, so the bare form is both safe and correct.

@@ -43,12 +43,15 @@ def register(config_path: str | None = None) -> int:
     path = config_path or runtime_config_path()
     if not path:
         return 0
-    try:
-        import yaml
+    import yaml
 
+    try:
         with open(path, "r", encoding="utf-8") as handle:
             document = yaml.safe_load(handle)
-    except (OSError, ValueError):
+    except (OSError, ValueError, yaml.YAMLError):
+        # A document that does not parse registers nothing, like one that is
+        # not there.  ``YAMLError`` is not a ``ValueError``: it used to leave
+        # this import-time call and take the worker's start with it.
         return 0
     if not isinstance(document, Mapping):
         return 0

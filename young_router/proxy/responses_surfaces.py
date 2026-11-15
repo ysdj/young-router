@@ -271,7 +271,6 @@ def _with_responses_chat_bridge_compatible_tools(
 def _with_responses_tool_adapter_compatible_tools(
     bridge_kwargs: dict,
     bridge_metadata: dict,
-    outer_request_kwargs: Optional[dict] = None,
 ) -> None:
     if _routing_module._protocol_fallback_relax_tool_choice(bridge_kwargs):
         bridge_metadata[_PROTOCOL_FALLBACK_RELAX_TOOL_CHOICE_KEY] = True
@@ -506,8 +505,6 @@ def _model_info_has_chat_bridge_mode(model_info: dict) -> bool:
     )
     if mode in _UPSTREAM_URL_SURFACE_CHAT_BRIDGE_VALUES:
         return True
-    if mode == _UPSTREAM_URL_SURFACE_OPENAI_RESPONSES:
-        return False
     return False
 
 
@@ -1230,7 +1227,6 @@ def _responses_tool_adapter_preemptive_kwargs(
     _with_responses_tool_adapter_compatible_tools(
         bridge_kwargs,
         bridge_metadata,
-        outer_for_tool_plan,
     )
     bridge_input, input_stats = _responses_tools_module._responses_chat_bridge_input(
         bridge_kwargs.get("input"),
@@ -1459,7 +1455,6 @@ def _responses_tool_adapter_retry_kwargs(
     _with_responses_tool_adapter_compatible_tools(
         bridge_kwargs,
         bridge_metadata,
-        outer_request_kwargs,
     )
     bridge_input, input_stats = (
         _responses_tools_module._responses_chat_bridge_input(

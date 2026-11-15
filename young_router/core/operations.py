@@ -365,6 +365,10 @@ class CoreServiceController:
         # The last positive liveness answer: (port, when, healthy).  Reset with
         # the status cache so an operation's own probe starts clean.
         self._health_cache: tuple[int, float, bool] | None = None
+        # A stopped snapshot asks for the configured port on every poll, and
+        # resolving it rebuilds the whole proxy environment; keep the integer
+        # until an operation changes the document it came from.
+        self._configured_port_cache: int | None = None
         # Set by ``attach_workbuddy`` when Core owns a WorkBuddy worker; a
         # bare controller (tests, CLI probes) simply has none.
         self._workbuddy: object | None = None
@@ -548,6 +552,7 @@ class CoreServiceController:
     def _invalidate_status_cache(self) -> None:
         self._status_cache = None
         self._health_cache = None
+        self._configured_port_cache = None
 
     @staticmethod
     def _process_alive(pid: int) -> bool:
@@ -1047,7 +1052,7 @@ class CoreServiceController:
         source = _provider_config_source(self.paths)
         try:
             text = source.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeError):
             return ""
         try:
             return master_key_from_document(text)
@@ -1055,13 +1060,22 @@ class CoreServiceController:
             return ""
 
     def _configured_port(self, env: Mapping[str, str] | None = None) -> int:
-        source = env if env is not None else self._runtime_env(strict=False)
+        if env is None:
+            if self._configured_port_cache is not None:
+                return self._configured_port_cache
+            source = self._runtime_env(strict=False)
+        else:
+            source = env
         value = source.get("LITELLM_PORT", DEFAULT_LOCAL_PORT)
         try:
             port = int(value)
         except ValueError:
-            return DEFAULT_LOCAL_PORT
-        return port if 1 <= port <= 65535 else DEFAULT_LOCAL_PORT
+            port = DEFAULT_LOCAL_PORT
+        if not 1 <= port <= 65535:
+            port = DEFAULT_LOCAL_PORT
+        if env is None:
+            self._configured_port_cache = port
+        return port
 
     def _recorded_port(self) -> int | None:
         """The port the managed service actually bound, if recorded."""
@@ -1780,7 +1794,7 @@ class CoreServiceController:
             time.sleep(0.05)
 
     def stop(self) -> dict[str, Any]:
-        pid = self._pid()
+        pid = self._pid() or self._recorded_proxy_is_orphaned()
         if pid is None:
             # Do not erase an active replacement Core's ownership evidence.
             return self.status()
@@ -1824,9 +1838,13 @@ class CoreServiceController:
         self._stage_runtime_config()
         self.reset_transient_routing_state()
         if self._rolling_restart(pid):
-            # Not the drain bound: this waits for the workers the reload just
-            # replaced to answer again, and a reload that took four hours to
-            # answer would be a reload that failed.
+            # A positive answer is memoized, so drop the pre-roll one before
+            # probing; otherwise the wait can finish on an answer recorded
+            # before the reload was even signalled.
+            self._invalidate_status_cache()
+            # Not the drain bound: a reload that cannot answer liveness within
+            # this window is a reload that failed, and four hours is not a
+            # bound a settings apply can hold a window open for.
             deadline = time.monotonic() + _RELOAD_READY_WAIT_SECONDS
             while time.monotonic() < deadline:
                 if self._health():

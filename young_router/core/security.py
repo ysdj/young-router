@@ -243,10 +243,6 @@ def is_secret_key(key: object) -> bool:
     return _key_classification(_key_text(key))[0]
 
 
-def is_path_key(key: object) -> bool:
-    return _key_classification(_key_text(key))[1]
-
-
 def redact(value: object, *, known_secrets: Sequence[str] = (), _key: object = "") -> object:
     """Return a JSON-safe projection with secrets and local paths removed.
 
@@ -256,7 +252,7 @@ def redact(value: object, *, known_secrets: Sequence[str] = (), _key: object = "
     """
 
     normalized_key = _key_text(_key)
-    if normalized_key and normalized_key not in NON_SECRET_TOKEN_COUNTER_KEYS:
+    if normalized_key:
         secret_key, path_key = _key_classification(normalized_key)
         if secret_key or path_key:
             if value in (None, "", False):
@@ -304,6 +300,10 @@ def _plain_string_is_safe(value: str, secret_values: set[str]) -> bool:
 
     if not value:
         return True
+    # REDACT_TEXT caps its result at 512 characters, so a longer string is
+    # never returned as it is and has to take that path to be cut the same way.
+    if len(value) > 512:
+        return False
     if secret_values and any(secret in value for secret in secret_values):
         return False
     # Whitespace is joined; that join is the one rewrite that can happen to a
@@ -344,6 +344,10 @@ def REDACT_TEXT(value: str, *, secret_values: set[str] | None = None) -> str:
     # cannot match, so the rewrite is unchanged wherever it can apply.
     if "-" in text:
         text = _TEXT_CREDENTIAL_PREFIX.sub(REDACTED, text)
+    # The bearer rule needs the word, not a hyphen: a token is ``[A-Za-z0-9._~-]``
+    # and most carry none.  Sharing the hyphen guard let ``Bearer AbC123xyzQ``
+    # through unmasked, which is the one form the prefix rule above cannot see.
+    if "bearer" in text.lower():
         text = _TEXT_BEARER.sub("Bearer " + REDACTED, text)
     if "http" in text:
         text = _redact_url_text(text)
@@ -408,9 +412,19 @@ def _redact_url_text(value: str) -> str:
             parsed = urlsplit(raw)
         except ValueError:
             return raw
-        host = parsed.hostname or ""
-        if parsed.port:
-            host = f"{host}:{parsed.port}"
+        try:
+            # ``port`` is parsed on read, and a port that is not a number
+            # raises here rather than in ``urlsplit``.
+            port = parsed.port
+        except ValueError:
+            # The authority is kept as written, without any userinfo, and the
+            # query is still redacted: a malformed port is no reason to let a
+            # token in the same URL through (or to raise out of a redactor).
+            host = parsed.netloc.rsplit("@", 1)[-1]
+        else:
+            host = parsed.hostname or ""
+            if port:
+                host = f"{host}:{port}"
         query = []
         for key, item in parse_qsl(parsed.query, keep_blank_values=True):
             lowered = key.lower()
@@ -451,7 +465,6 @@ __all__ = [
     "REDACTED",
     "SECRET_KEY_MARKERS",
     "REDACT_TEXT",
-    "is_path_key",
     "is_secret_key",
     "redact",
     "safe_error_message",

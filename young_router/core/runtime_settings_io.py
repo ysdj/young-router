@@ -233,13 +233,10 @@ def validate_values(values: object, specs: dict[str, RuntimeSettingSpec]) -> dic
     unknown = sorted(set(values) - set(specs))
     if unknown:
         raise PackageError("Unknown runtime setting(s): " + ", ".join(unknown))
-    normalized = {
+    return {
         key: normalize_payload_value(specs[key], raw)
         for key, raw in values.items()
     }
-    effective = {key: _default_payload_value(spec) for key, spec in specs.items()}
-    effective.update(normalized)
-    return normalized
 
 
 def _read_limited_utf8(path: Path, label: str, *, missing_is_empty: bool = False) -> str:
@@ -279,10 +276,10 @@ def _read_persisted_values(path: Path, specs: dict[str, RuntimeSettingSpec]) -> 
     return raw_values
 
 
-def read_settings_file(path: Path, specs: dict[str, RuntimeSettingSpec]) -> dict[str, str]:
-    """Read a complete effective settings snapshot for the Runtime Settings UI."""
-
-    raw_values = _read_persisted_values(path, specs)
+def _effective_values(
+    raw_values: dict[str, str], specs: dict[str, RuntimeSettingSpec]
+) -> dict[str, str]:
+    """Expand persisted raw values into the effective settings snapshot."""
 
     values = {key: _default_payload_value(spec) for key, spec in specs.items()}
     for key, raw in raw_values.items():
@@ -319,11 +316,17 @@ def read_settings_file(path: Path, specs: dict[str, RuntimeSettingSpec]) -> dict
     return validate_values(values, specs)
 
 
+def read_settings_file(path: Path, specs: dict[str, RuntimeSettingSpec]) -> dict[str, str]:
+    """Read a complete effective settings snapshot for the Runtime Settings UI."""
+
+    return _effective_values(_read_persisted_values(path, specs), specs)
+
+
 def read_configured_settings_file(path: Path, specs: dict[str, RuntimeSettingSpec]) -> dict[str, str]:
     """Return validated persisted values without retired keys."""
 
     raw_values = _read_persisted_values(path, specs)
-    effective = read_settings_file(path, specs)
+    effective = _effective_values(raw_values, specs)
     configured: dict[str, str] = {}
     for key, raw in raw_values.items():
         spec = specs[key]

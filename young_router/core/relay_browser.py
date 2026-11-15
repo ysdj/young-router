@@ -309,18 +309,12 @@ async def _cdp_messages(ws_url: str, commands: list[Mapping[str, Any]], *, timeo
 
 
 def _run(coroutine: Any) -> Any:
-    """Run one CDP exchange from this thread, whatever loop policy it has."""
+    """Run one CDP exchange from this thread."""
 
-    try:
-        return asyncio.run(coroutine)
-    except RuntimeError:
-        # A thread that already owns a loop (an embedder's) cannot `asyncio.run`
-        # again; a fresh loop in this thread is still the right answer here.
-        loop = asyncio.new_event_loop()
-        try:
-            return loop.run_until_complete(coroutine)
-        finally:
-            loop.close()
+    # No retry: a second loop cannot run while this thread's loop is running,
+    # and a coroutine that already raised cannot be awaited again -- so a retry
+    # would only replace the real error with a misleading one.
+    return asyncio.run(coroutine)
 
 
 def read_cookies(port: int, *, timeout: float = 5.0) -> list[dict[str, Any]]:
@@ -345,10 +339,7 @@ def read_cookies(port: int, *, timeout: float = 5.0) -> list[dict[str, Any]]:
     answers = _run(
         _cdp_messages(
             ws_url,
-            [
-                {"id": 1, "method": "Storage.getCookies", "params": {}},
-                {"id": 2, "method": "Browser.getVersion", "params": {}},
-            ],
+            [{"id": 1, "method": "Storage.getCookies", "params": {}}],
             timeout=timeout,
         )
     )
@@ -597,8 +588,9 @@ def active_page_target(port: int, origin: str) -> Mapping[str, Any] | None:
     on, and a page that reloads into `/login` is the same target with a new URL.
     Matching only the original host froze the mirror on the last frame it saw
     and refused every click that followed — the person was typing into a
-    photograph.  So the station wins when it is there, and otherwise the newest
-    page that is not a browser-internal one does.
+    photograph.  So the station wins when it is there, and otherwise the last
+    page target `/json/list` reports does.  That list comes in the browser's
+    order, which is not creation time, so there is no "newest" to pick.
     """
 
     station = _page_target(port, origin)

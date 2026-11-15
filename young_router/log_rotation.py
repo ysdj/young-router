@@ -10,6 +10,8 @@ try:
 except ImportError:  # pragma: no cover - Windows uses a single Core launcher.
     fcntl = None  # type: ignore[assignment]
 
+from .atomic_io import restrict_mode
+
 
 LOG_MAX_BYTES_ENV = "YOUNG_ROUTER_LOG_MAX_BYTES"
 DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024
@@ -92,7 +94,6 @@ def _shift_backup_segments(path: str, segments: int) -> None:
 
 
 def _write_backup(
-    descriptor: int,
     path: str,
     size: int,
     maximum: int,
@@ -134,11 +135,12 @@ def _with_rotation_lock(path: str, operation: object) -> object:
         os.close(lock_descriptor)
 
 
-def _is_managed_log_stream(stream: object) -> bool:
+def _is_managed_log_stream(stream: object, path: str | None = None) -> bool:
     configured = os.getenv("YOUNG_ROUTER_SERVICE_LOG", "").strip()
     if not configured:
         return False
-    path = _stream_path(stream)
+    if path is None:
+        path = _stream_path(stream)
     if path is None:
         return False
     try:
@@ -151,7 +153,7 @@ def write_bounded_stream(stream: object, text: str, *, maximum_bytes: int | None
     """Write one console fragment while enforcing the current/backup file cap."""
 
     path = _stream_path(stream)
-    if path is None or not _is_managed_log_stream(stream):
+    if path is None or not _is_managed_log_stream(stream, path):
         return stream.write(text)  # type: ignore[attr-defined]
     maximum = maximum_bytes if maximum_bytes is not None else log_max_bytes()
 
@@ -160,7 +162,7 @@ def write_bounded_stream(stream: object, text: str, *, maximum_bytes: int | None
         descriptor = stream.fileno()  # type: ignore[attr-defined]
         size = os.fstat(descriptor).st_size
         if size + len(text.encode("utf-8")) > maximum:
-            _write_backup(descriptor, path, size, maximum)
+            _write_backup(path, size, maximum)
             os.ftruncate(descriptor, 0)
             os.lseek(descriptor, 0, os.SEEK_SET)
         written = stream.write(text)  # type: ignore[attr-defined]
@@ -191,7 +193,6 @@ def append_bounded_log(
             size = os.fstat(descriptor).st_size
             if size + len(data) > maximum:
                 _write_backup(
-                    descriptor,
                     path,
                     size,
                     maximum,
@@ -200,7 +201,7 @@ def append_bounded_log(
                 os.ftruncate(descriptor, 0)
             os.lseek(descriptor, 0, os.SEEK_END)
             os.write(descriptor, data)
-            os.fchmod(descriptor, 0o600)
+            restrict_mode(descriptor, path)
         finally:
             os.close(descriptor)
 

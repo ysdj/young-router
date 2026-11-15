@@ -114,12 +114,15 @@ def _direct_model_id(value: str) -> str:
 def _installed_codex_cli(codex_home: Path) -> Path | None:
     """Find the Codex executable belonging to this home, then the installed app."""
 
-    for path in (
+    candidates = [
         codex_home / "plugins" / "cache" / "openai-bundled" / "codex-cli"
         / "CodexCLI.app" / "Contents" / "MacOS" / "codex",
-        Path("/Applications/ChatGPT.app/Contents/Resources/codex-cli")
-        / "CodexCLI.app" / "Contents" / "MacOS" / "codex",
-    ):
+    ]
+    candidates.extend(
+        resources / "codex-cli" / "CodexCLI.app" / "Contents" / "MacOS" / "codex"
+        for resources in _CODEX_APP_RESOURCES
+    )
+    for path in candidates:
         if path.is_file() and os.access(path, os.X_OK):
             return path
     return None
@@ -233,7 +236,10 @@ def _installed_surface_plugins(
         surfaces = env.get("CUA_REPL_ENABLED_SURFACES") if isinstance(env, Mapping) else None
         if not isinstance(surfaces, str):
             surfaces = _runtime_surfaces_from_cache(
-                codex_home / "plugins" / "cache" / _BUNDLED_MARKETPLACE.parts[0],
+                # The cache is keyed by the marketplace's *name*; its first
+                # path part is "plugins", which named a directory that is never
+                # there, so this fallback found nothing.
+                codex_home / "plugins" / "cache" / _BUNDLED_MARKETPLACE.name,
                 name,
             )
         if isinstance(surfaces, str):
@@ -497,11 +503,13 @@ def _image_context_python_path() -> str:
     return os.pathsep.join(roots)
 
 
-def image_context_settings() -> dict[str, Any]:
+def image_context_settings(path: Path | None = None) -> dict[str, Any]:
     """Read the runtime settings that decide this pass.
 
     Read at dispatch time rather than cached: the settings file is the
     operator's, and a value changed there must reach the next write.
+    ``path`` is the domain's configured settings file; without it the home
+    default is read.
     """
 
     from .. import runtime_settings_io
@@ -509,7 +517,7 @@ def image_context_settings() -> dict[str, Any]:
     values: Mapping[str, Any] = {}
     try:
         values = runtime_settings_io.read_settings_file(
-            _default_runtime_settings_path(), runtime_settings_io.load_specs()
+            path or _default_runtime_settings_path(), runtime_settings_io.load_specs()
         )
     except Exception:
         values = {}
@@ -534,7 +542,10 @@ def _remove_legacy_computer_mcp(text: str) -> str:
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("[") and stripped.endswith("]"):
-            in_target = stripped == "[mcp_servers.computer-use]"
+            in_target = (
+                stripped == "[mcp_servers.computer-use]"
+                or stripped.startswith("[mcp_servers.computer-use.")
+            )
         if not in_target:
             retained.append(line)
     now = tomllib.loads("".join(retained))
@@ -1160,7 +1171,10 @@ class CodexSettingsDomain:
             return False
         base_slug = self._catalog_base_profile(native_models)
         signature = self._catalog_candidate_signature(names, native_models, base_slug)
-        if signature == self._catalog_current_signature:
+        if signature == self._catalog_current_signature and pointer == self.model_catalog_path:
+            # Only a pointer that names the current file makes the other
+            # spellings dead: a retired copy the applied config still names is
+            # the file Codex is loading.
             self._remove_retired_catalog_copies()
             return False
         catalog_current = catalog_is_current(
@@ -1180,8 +1194,18 @@ class CodexSettingsDomain:
         if migrated:
             # Write the current file before moving the pointer so a failure in
             # between leaves Codex with a loadable config, never a dangling one.
-            if self._repair_catalog_pointer(str(self.model_catalog_path)):
-                self._remove_retired_catalog_copies()
+            if not self._repair_catalog_pointer(str(self.model_catalog_path)):
+                # The applied config still names the retired file, so that file
+                # stays and this view is not settled.  Recording the signature
+                # here sent the next refresh down the fast path above, which
+                # deleted the very catalog the pointer names.  The move is
+                # retried on the next refresh; only a rewritten catalog is a
+                # change worth a revision until it succeeds.
+                if catalog_current:
+                    return False
+                self.revision += 1
+                return True
+            self._remove_retired_catalog_copies()
         else:
             self._remove_retired_catalog_copies()
         self._catalog_current_signature = self._catalog_candidate_signature(
@@ -1507,8 +1531,8 @@ class CodexSettingsDomain:
             model = str(data.get("model") or "").strip()
             if model:
                 patch["model"] = model
-            store_route_setting(self.app_state_root, "codex", data)
             self._draft = self._sync(config_text, auth_text, patch)
+            store_route_setting(self.app_state_root, "codex", data)
         elif name in {"use_saved_model", "usesavedmodel"}:
             # Restore the client directly onto one saved provider route: the
             # chosen model, that provider's own endpoint, and the route's key.
@@ -1868,10 +1892,9 @@ class CodexSettingsDomain:
         # none) falls back to this app's own row.
         fallback_id = LOCAL_API_PROVIDER_ID
         if active and active.lower() not in RESERVED_PROVIDER_IDS:
-            entry = next(
-                (item for item in providers if str(item.get("id") or "").strip() == active),
-                None,
-            )
+            # The row this client names is not in the table (the lookup above
+            # found none), so one is created rather than updating the app's row.
+            entry = None
             fallback_id = active
         if entry is None:
             entry = {"id": fallback_id, "name": fallback_id}
@@ -1996,7 +2019,9 @@ class CodexSettingsDomain:
         from ...proxy import image_context as _image_context_module
 
         enabled_now = _image_context_module.fetch_mode() == "stdio" and bool(
-            image_context_settings().get("enabled")
+            image_context_settings(
+                self.runtime_settings_path or _default_runtime_settings_path()
+            ).get("enabled")
         )
         structured = self._draft.get("structured")
         structured = structured if isinstance(structured, Mapping) else {}
@@ -2041,6 +2066,15 @@ class CodexSettingsDomain:
         from ._shared import local_proxy_endpoint
 
         previous_base_url = self._local_api_base_url
+        config_text, auth_text, _, _ = self._editor_documents_from_disk()
+        # An unapplied draft is the user's own copy of the document, not the
+        # client's file.  This pass runs on the file, and its patch carries
+        # every provider row it reads, so it must not publish staged edits.
+        if (
+            str(self._draft.get("config_text", "")),
+            str(self._draft.get("auth_text", "{}\n")),
+        ) != (config_text, auth_text):
+            return False
         # Resolved against this installation's own records, so a start that had
         # to step past an occupied port rewrites the client onto the port it
         # actually bound instead of the preference the document already names.
@@ -2081,6 +2115,11 @@ class CodexSettingsDomain:
             ),
             bool,
         )
+        # The built-in OpenAI provider has no editable table, so no row here
+        # can ever carry the opt-in; treating it as missing would rewrite the
+        # client on every restart.
+        if active == "openai":
+            search_missing = False
         # ``web_search`` is the switch Codex actually reads, so an operator who
         # turned search off at the top level is just as decided as one who
         # wrote ``false`` on the row: leaving the opt-in absent cannot turn that
@@ -2096,7 +2135,6 @@ class CodexSettingsDomain:
         )
         if search_missing:
             patch["web_search"] = structured.get("web_search") or "live"
-        config_text, auth_text, _, _ = self._editor_documents_from_disk()
         written = self._sync(config_text, auth_text, patch)
         if isinstance(self._draft.get("config_text"), str) and isinstance(self._draft.get("auth_text"), str):
             staged = self._sync(str(self._draft["config_text"]), str(self._draft["auth_text"]), patch)

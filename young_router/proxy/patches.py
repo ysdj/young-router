@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import os
 import re
+import sys
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -37,6 +39,7 @@ from .base import (
     _CURRENT_VERIFIED_FALLBACK_DEPLOYMENT_IDS,
     _CURRENT_ROUTING_REQUEST_KWARGS,
     _GENERIC_HELPER_PATCH_ATTR,
+    _CHAT_DISPATCH_BUDGET_PATCH_ATTR,
     _ORDER_PEER_FAILOVER_PATCH_ATTR,
     _RESPONSES_COMPLETION_STREAM_COMPLETED_PATCH_ATTR,
     _RESPONSES_COMPLETION_STREAM_DEFAULT_DONE_PATCH_ATTR,
@@ -279,6 +282,17 @@ def _install_latin1_response_headers_patch() -> None:
         )
     except Exception:
         return
+
+    # LiteLLM's callback capability cache is computed before the application
+    # imports this module.  It otherwise decides that our response-header
+    # hook is absent and never invokes it.  Recompute the cached capability
+    # after registering the hook, without replacing LiteLLM's detector.
+    callback_detector = getattr(ProxyBaseLLMRequestProcessing, "_callback_capabilities", None)
+    if callable(callback_detector):
+        try:
+            callback_detector()
+        except Exception:
+            pass
 
     original_get_custom_headers = getattr(
         ProxyBaseLLMRequestProcessing,
@@ -526,9 +540,27 @@ def _install_anthropic_responses_tool_arguments_patch() -> None:
     """
 
     try:
-        from litellm.llms.anthropic.pass_through.responses_adapters.streaming_iterator import (
-            AnthropicResponsesStreamWrapper,
-        )
+        try:
+            stream_module = importlib.import_module(
+                "litellm.llms.anthropic.pass_through.responses_adapters.streaming_iterator"
+            )
+        except Exception:
+            # LiteLLM renamed this package to ``experimental_pass_through``
+            # without keeping an import-compatible alias.  Keep the patch and
+            # callers that still import the old path on the same wrapper.
+            new_base = "litellm.llms.anthropic.experimental_pass_through"
+            old_base = "litellm.llms.anthropic.pass_through"
+            for suffix in (
+                "",
+                ".responses_adapters",
+                ".responses_adapters.streaming_iterator",
+            ):
+                new_name = new_base + suffix
+                old_name = old_base + suffix
+                module = importlib.import_module(new_name)
+                sys.modules.setdefault(old_name, module)
+            stream_module = sys.modules[old_base + ".responses_adapters.streaming_iterator"]
+        AnthropicResponsesStreamWrapper = stream_module.AnthropicResponsesStreamWrapper
     except Exception:
         return
 
@@ -578,12 +610,7 @@ def _install_anthropic_responses_tool_arguments_patch() -> None:
                     and arguments
                     and arguments != already
                 ):
-                    if arguments.startswith(already):
-                        suffix = arguments[len(already):]
-                    elif already:
-                        suffix = ""
-                    else:
-                        suffix = arguments
+                    suffix = arguments[len(already):] if arguments.startswith(already) else ""
                     if suffix:
                         original_process_event(
                             self,
@@ -760,9 +787,10 @@ def _request_local_cooling_only_candidate_deployment(
     configured -- the failure mode the cooldown must never produce.  The route
     whose cooldown ends first is the one that has waited longest, so it is the
     one handed back; the request then either succeeds or fails over through the
-    ordinary peer machinery.  Only a request that is neither a recovery poll
-    nor a fallback attempt reaches here, so the deliberate cooldown wait and
-    the ordered peer chain keep their own semantics.
+    ordinary peer machinery.  A recovery poll or a fallback attempt whose
+    peers are all cooling is also served here -- a cooled route is the only
+    answer left; the deliberate cooldown wait and the ordered peer chain are
+    applied before this point.
     """
 
     if not isinstance(model, str) or not model.strip():
@@ -1138,6 +1166,53 @@ async def _call_deployment_with_reasoning_parameters_compat(
         raise last_exc
 
 
+def _trace_selected_deployment(
+    request_kwargs: dict,
+    deployment: dict,
+    surface: str,
+    function_name: Optional[str],
+) -> None:
+    """Record the route a turn was given, on whichever wire it is served.
+
+    The request log and the UI row built from it key the selected route on this
+    event, so a turn whose route needs no surface adaptation has to record it
+    too, with no wire named.
+    """
+
+    image_request = _routing_module._request_is_standalone_image_generation(
+        request_kwargs,
+        function_name,
+    )
+    trace_deployment = deployment
+    if image_request and isinstance(deployment.get("model_info"), dict):
+        trace_deployment = deployment.copy()
+        trace_deployment["model_info"] = {
+            key: value
+            for key, value in deployment["model_info"].items()
+            if key != _UPSTREAM_URL_SURFACE_KEY
+        }
+    _trace_module._route_trace(
+        "selected_deployment",
+        request_id=_routing_module._trace_request_id(request_kwargs),
+        session=_routing_module._trace_session_context(request_kwargs),
+        model_group=_responses_execution_module._request_model_group(request_kwargs),
+        function_name=function_name,
+        deployment=_routing_module._trace_deployment(
+            trace_deployment,
+            surface="" if image_request else surface,
+        ),
+        request=_trace_module._trace_request_summary(
+            request_kwargs,
+            call_type=function_name,
+            method_name=function_name,
+        ),
+        target_order=_responses_request_module._request_target_order(request_kwargs),
+        excluded_deployment_ids=sorted(
+            _responses_request_module._request_excluded_deployment_ids(request_kwargs)
+        ),
+    )
+
+
 def _install_selected_deployment_marker_patch() -> None:
     try:
         from litellm.router import Router
@@ -1199,6 +1274,7 @@ def _install_selected_deployment_marker_patch() -> None:
             _routing_module._remember_request_adapted_surface(kwargs, surface)
             if not surface:
                 _routing_module._remember_selected_deployment(deployment)
+                _trace_selected_deployment(kwargs, deployment, surface, function_name)
                 force_browser_headers = _responses_request_module._request_forces_browser_compatible_headers(kwargs)
                 result = original_update_kwargs_with_deployment(
                     self,
@@ -1240,37 +1316,7 @@ def _install_selected_deployment_marker_patch() -> None:
                 surface=surface,
             )
             force_browser_headers = _responses_request_module._request_forces_browser_compatible_headers(kwargs)
-            image_request = _routing_module._request_is_standalone_image_generation(
-                kwargs,
-                function_name,
-            )
-            trace_deployment = deployment
-            if image_request and isinstance(deployment.get("model_info"), dict):
-                trace_deployment = deployment.copy()
-                trace_deployment["model_info"] = {
-                    key: value
-                    for key, value in deployment["model_info"].items()
-                    if key != _UPSTREAM_URL_SURFACE_KEY
-                }
-            request_summary = _trace_module._trace_request_summary(
-                kwargs,
-                call_type=function_name,
-                method_name=function_name,
-            )
-            _trace_module._route_trace(
-                "selected_deployment",
-                request_id=_routing_module._trace_request_id(kwargs),
-                session=_routing_module._trace_session_context(kwargs),
-                model_group=_responses_execution_module._request_model_group(kwargs),
-                function_name=function_name,
-                deployment=_routing_module._trace_deployment(
-                    trace_deployment,
-                    surface="" if image_request else surface,
-                ),
-                request=request_summary,
-                target_order=_responses_request_module._request_target_order(kwargs),
-                excluded_deployment_ids=sorted(_responses_request_module._request_excluded_deployment_ids(kwargs)),
-            )
+            _trace_selected_deployment(kwargs, deployment, surface, function_name)
             result = original_update_kwargs_with_deployment(
                 self,
                 deployment,
@@ -1732,7 +1778,6 @@ def _install_generic_deployment_failover_patch() -> None:
         target_order = kwargs.get("_target_order")
         excluded_deployment_ids = kwargs.get("_excluded_deployment_ids")
         external_web_search_internal = _request_is_external_web_search_internal_call(kwargs)
-        max_retries = 0 if external_web_search_internal else _routing_module._same_deployment_retries()
         retry_delay_seconds = _routing_module._stream_route_exhaustion_retry_delay_seconds()
         retry_attempt = 0
         _trace_module._route_trace(
@@ -1783,12 +1828,27 @@ def _install_generic_deployment_failover_patch() -> None:
         )
         while True:
             try:
-                response = await original_helper(
+                # One hop's dispatch: the await that ends when the upstream has
+                # answered with a response object.  Streaming attempts bound it
+                # with the connect budget, because no stream watchdog times
+                # that phase and an unreachable host otherwise spends the
+                # operating system's SYN ladder here (271 s live, 2026-11-15).
+                # A whole-body call is left alone: its helper returns only
+                # after the answer is complete, and a dispatch budget there
+                # would cut legitimate long answers.
+                dispatch = original_helper(
                     self,
                     model,
                     wrapped_original_function,
                     **kwargs,
                 )
+                if kwargs.get("stream") is True:
+                    response = await _streaming_module._await_upstream_dispatch(
+                        dispatch,
+                        kwargs,
+                    )
+                else:
+                    response = await dispatch
                 if _context_window_module.request_was_shrunk():
                     # This payload reached the deployment only because a size
                     # refusal was answered with a shorter one.  Remembering it
@@ -1928,7 +1988,16 @@ def _install_generic_deployment_failover_patch() -> None:
                 # a class the upstream itself contradicts (a coin flip on the
                 # same payload) gets its one extra attempt even when the
                 # configured budget is the default zero.
-                retry_budget = _routing_module._same_deployment_retry_budget(exc)
+                #
+                # The proxy's own web-search call keeps none: its caller is the
+                # turn that asked for the search, which has its own way on.
+                # The per-failure budget replaced a per-call one and lost this
+                # zero with it.
+                retry_budget = (
+                    0
+                    if external_web_search_internal
+                    else _routing_module._same_deployment_retry_budget(exc)
+                )
                 if (
                     retry_attempt < retry_budget
                     and _routing_module._should_retry_final_upstream_route_error(exc, kwargs)
@@ -2072,6 +2141,45 @@ def _install_generic_deployment_failover_patch() -> None:
     setattr(patched_generic_helper, _GENERIC_HELPER_PATCH_ATTR, True)
     setattr(patched_generic_helper, "_original_helper", original_helper)
     Router._ageneric_api_call_with_fallbacks_helper = patched_generic_helper
+
+
+def _install_chat_dispatch_budget_patch() -> None:
+    """Give the chat-completions hop the same dispatch budget.
+
+    ``acompletion`` does not go through ``_ageneric_api_call_with_fallbacks_helper``:
+    its chain is ``async_function_with_fallbacks`` → ``async_function_with_retries``
+    → ``make_call`` → ``_acompletion``.  Measured 2026-11-15 with a real Router
+    and an upstream that accepts the connection and then says nothing: the
+    Responses hop was cut by the dispatch budget, the chat hop was not, and it
+    hung for the whole 45 s the probe allowed.  The chat wire is not a side
+    path here -- it is what the Responses→Chat bridge sends, and it is what a
+    plain ``/v1/chat/completions`` client of this gateway sends.
+
+    ``make_call`` is the per-deployment dispatch: it returns the response object
+    (for a streaming call, once the head has arrived) and nothing above it in
+    the chain touches a socket.
+    """
+
+    try:
+        from litellm.router import Router
+    except Exception:
+        return
+
+    original_make_call = getattr(Router, "make_call", None)
+    if original_make_call is None or getattr(
+        original_make_call, _CHAT_DISPATCH_BUDGET_PATCH_ATTR, False
+    ):
+        return
+
+    async def patched_make_call(self: Any, original_function: Any, *args: Any, **kwargs: Any) -> Any:
+        dispatch = original_make_call(self, original_function, *args, **kwargs)
+        if kwargs.get("stream") is not True:
+            return await dispatch
+        return await _streaming_module._await_upstream_dispatch(dispatch, kwargs)
+
+    setattr(patched_make_call, _CHAT_DISPATCH_BUDGET_PATCH_ATTR, True)
+    setattr(patched_make_call, "_original_make_call", original_make_call)
+    Router.make_call = patched_make_call
 
 
 def _install_same_deployment_retry_policy_patch() -> None:
@@ -2990,7 +3098,7 @@ def _install_responses_chat_bridge_reasoning_replay_patch() -> None:
 _RESPONSES_BRIDGE_CACHE_USAGE_PATCH_ATTR = "_young_router_bridge_cache_usage_patch"
 
 
-def _bridge_usage_with_provider_cache_hits(usage: Any) -> Any:
+def _bridge_usage_with_provider_cache_hits(usage: Any) -> bool:
     """Carry a provider's own cache-hit count across the chat bridge.
 
     LiteLLM builds ``input_tokens_details.cached_tokens`` from
@@ -3005,7 +3113,7 @@ def _bridge_usage_with_provider_cache_hits(usage: Any) -> Any:
     ``cached_tokens: 0``.
 
     Only a missing number is filled in: an OpenAI-shaped usage is already
-    correct and is passed through untouched.
+    correct and is left untouched.  Returns whether a count was filled in.
     """
 
     details = getattr(usage, "prompt_tokens_details", None)
@@ -3017,7 +3125,7 @@ def _bridge_usage_with_provider_cache_hits(usage: Any) -> Any:
     else:
         reported = int(getattr(details, "cached_tokens", 0) or 0)
     if reported:
-        return usage
+        return False
 
     hit = 0
     for key in ("prompt_cache_hit_tokens", "cache_read_input_tokens"):
@@ -3028,7 +3136,7 @@ def _bridge_usage_with_provider_cache_hits(usage: Any) -> Any:
         if hit:
             break
     if not hit:
-        return usage
+        return False
 
     input_tokens = 0
     if isinstance(usage, dict):
@@ -3047,8 +3155,8 @@ def _bridge_usage_with_provider_cache_hits(usage: Any) -> Any:
         else:
             usage.prompt_tokens_details = details
     except Exception:
-        return usage
-    return usage
+        return False
+    return True
 
 
 _USAGE_CACHE_READ_NO_OVERWRITE_ATTR = "_young_router_usage_cache_read_no_overwrite"
@@ -3152,19 +3260,15 @@ def _install_responses_bridge_cache_usage_patch() -> None:
             else kwargs.get("chat_completion_response")
         )
         usage = getattr(chat_response, "usage", None) if chat_response is not None else None
+        details = getattr(usage, "prompt_tokens_details", None)
+        cached_tokens_before = getattr(details, "cached_tokens", None) if details else None
         repaired = _bridge_usage_with_provider_cache_hits(usage)
-        if repaired is not usage:
-            try:
-                chat_response.usage = repaired
-            except Exception:
-                pass
         try:
-            details = getattr(usage, "prompt_tokens_details", None)
             _trace_module._route_trace(
                 "responses_bridge_cache_usage",
                 provider_cache_hit=getattr(usage, "prompt_cache_hit_tokens", None),
-                cached_tokens_before=(getattr(details, "cached_tokens", None) if details else None),
-                repaired=repaired is not usage,
+                cached_tokens_before=cached_tokens_before,
+                repaired=repaired,
             )
         except Exception:
             pass
@@ -3699,6 +3803,7 @@ def install_all() -> None:
     _install_selected_deployment_marker_patch()
     _install_order_peer_failover_patch()
     _install_generic_deployment_failover_patch()
+    _install_chat_dispatch_budget_patch()
     _install_same_deployment_retry_policy_patch()
     _install_responses_websocket_http_bridge_patch()
     _install_stream_chunk_restamp_patch()

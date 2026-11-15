@@ -147,24 +147,6 @@ def store_generated_models(runtime_root: object, client: str, names: object) -> 
     _write_state(runtime_root, state)
 
 
-def same_route(left: Mapping[str, str] | None, right: Mapping[str, str] | None) -> bool:
-    """Identity of a saved route, including the deployment it pins."""
-
-    if left is None or right is None:
-        return False
-    if left.get("model") != right.get("model") or left.get("provider") != right.get("provider"):
-        return False
-    # A route pinned to one deployment is a different route from the same model
-    # on another; an unnamed deployment is the model's own first row.
-    return (left.get("deployment_id") or "") == (right.get("deployment_id") or "")
-
-
-def route_label(route: Mapping[str, str] | None) -> str:
-    if route is None:
-        return ""
-    return f"{route.get('provider', '')} / {route.get('model', '')}".strip(" /")
-
-
 def endpoint(config_path: Path | None = None) -> tuple[str, str]:
     """This app's proxy base URL (with ``/v1``) and its master key.
 
@@ -174,26 +156,6 @@ def endpoint(config_path: Path | None = None) -> tuple[str, str]:
     """
 
     return local_proxy_endpoint(config_path)
-
-
-def on_local_api(configured: object, *, versioned: bool = True) -> bool:
-    """Whether a client's configured base URL already names this proxy.
-
-    Both spellings address the same gateway: a client that appends
-    ``/messages`` itself stores the unversioned root, while one that appends
-    the endpoint stores the base with ``/v1``.
-    """
-
-    if not isinstance(configured, str) or not configured.strip():
-        return False
-    try:
-        base_url, _ = endpoint()
-    except Exception:
-        return False
-    current = configured.strip().rstrip("/").lower()
-    expected = base_url.rstrip("/").lower()
-    unversioned = expected.removesuffix("/v1")
-    return current in {expected, unversioned} if not versioned else current == expected
 
 
 def saved_routes(runtime_config_path: object) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -354,12 +316,9 @@ __all__ = [
     "endpoint",
     "names_a_claude_model",
     "normalise_route",
-    "on_local_api",
     "one_saved_route",
     "read_generated_models",
     "read_route_setting",
-    "route_label",
-    "same_route",
     "saved_route_api_key",
     "saved_routes",
     "store_generated_models",

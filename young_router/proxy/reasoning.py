@@ -333,10 +333,11 @@ def _without_reasoning_parameters(value: Any) -> Any:
     """Return the same request with every client reasoning parameter removed.
 
     A route that cannot translate a client reasoning request does not need one:
-    the model keeps its provider default thinking behavior while the optional
-    ``reasoning``/``reasoning_effort`` fields are the only part of the request
-    the upstream rejected. Return the original object when there is nothing to
-    remove, so callers can treat identity as "no change".
+    the model keeps its provider default thinking behavior while the client's
+    ``reasoning``/``reasoning_effort`` fields and the Messages wire's
+    ``output_config.effort`` are the only part of the request the upstream
+    rejected. Return the original object when there is nothing to remove, so
+    callers can treat identity as "no change".
     """
 
     if not isinstance(value, dict):
@@ -347,6 +348,18 @@ def _without_reasoning_parameters(value: Any) -> Any:
     for key, item in value.items():
         if key in {"reasoning_effort", "reasoning"}:
             changed = True
+            continue
+        if key == "output_config" and isinstance(item, dict):
+            # Claude clients on the Messages wire state depth as
+            # ``output_config.effort``; the rest of the config is not reasoning
+            # and has to survive the strip.
+            if "effort" not in item:
+                updated[key] = item
+                continue
+            changed = True
+            remaining = {k: v for k, v in item.items() if k != "effort"}
+            if remaining:
+                updated[key] = remaining
             continue
         if key in {"extra_body", "litellm_params"} and isinstance(item, dict):
             stripped = _without_reasoning_parameters(item)

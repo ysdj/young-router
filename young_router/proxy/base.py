@@ -16,18 +16,16 @@ import threading
 import time
 from urllib.parse import urlparse
 
-# ``state.py`` takes this name from here, and Windows has no ``fcntl``: the
-# advisory lock it guards is a cooperative one between this app's own
-# processes, and the platform without it already runs a single Core launcher.
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows does not provide POSIX flock.
-    fcntl = None  # type: ignore[assignment]
-
 from .. import browser_identity as _browser_identity
 from ..lifecycle import app_quit_grace_seconds
-from .. import lifecycle as _proxy_lifecycle_module
 from ..values import int_or_none as _int_or_none
+# The frame limit is stated once, in the module the launcher can import without
+# loading this runtime; a second copy here could only drift from it.
+from .launcher_settings import (
+    _WEBSOCKET_MAX_FRAME_BYTES_ENV,
+    _WEBSOCKET_MAX_FRAME_DEFAULT_BYTES,
+    _websocket_max_frame_bytes,
+)
 from typing import Any, AsyncIterator, Dict, List, Mapping, Optional, Union
 import litellm
 from litellm.integrations.custom_logger import CustomLogger
@@ -62,7 +60,9 @@ _STREAM_ERROR_FALLBACK_START_BUFFER_CHUNKS = 20
 #: what some relays send instead.
 _CHAT_REASONING_DELTA_KEYS = ("reasoning_content", "reasoning")
 _STALL_TIMEOUT_SECONDS_ENV = "YOUNG_ROUTER_STALL_TIMEOUT_SECONDS"
-_STALL_TIMEOUT_DEFAULT_SECONDS = 300.0
+# Matches the settings document's 120, like the first-event budget below: the
+# number the pane publishes has to be the number this process obeys.
+_STALL_TIMEOUT_DEFAULT_SECONDS = 120.0
 # How long an attempt may run before its failure stops being read as the
 # request's own verdict.  A route that thinks for a minute and only then
 # refuses answered about its own capacity, its own account, or its own link --
@@ -86,13 +86,28 @@ _STREAM_KEEPALIVE_DEFAULT_INTERVAL_SECONDS = 15.0
 _STREAM_NO_PROGRESS_SECONDS_ENV = "YOUNG_ROUTER_STREAM_NO_PROGRESS_SECONDS"
 _STREAM_NO_PROGRESS_DEFAULT_SECONDS = 900.0
 _SESSION_DEPLOYMENT_AFFINITY_ENV = "YOUNG_ROUTER_SESSION_DEPLOYMENT_AFFINITY"
-_SESSION_DEPLOYMENT_AFFINITY_FILE_ENV = (
-    "YOUNG_ROUTER_SESSION_DEPLOYMENT_AFFINITY_FILE"
-)
 _SESSION_DEPLOYMENT_AFFINITY_MAX_ENTRIES = 512
 _SESSION_DEPLOYMENT_AFFINITY_TTL_SECONDS = 7 * 24 * 3600.0
 _STREAM_START_TIMEOUT_SECONDS_ENV = "YOUNG_ROUTER_STREAM_START_TIMEOUT_SECONDS"
-_STREAM_START_TIMEOUT_DEFAULT_SECONDS = 300.0
+# The schema document is the contract the settings pane shows, and it states
+# 120: a route that accepted the socket and then sends no frame for two minutes
+# is wedged, not thinking.  This default disagreed with it for long enough that
+# the pane published a number no process ever used.
+_STREAM_START_TIMEOUT_DEFAULT_SECONDS = 120.0
+# The phase no stream watchdog covers: TCP handshake, TLS, upload, and the wait
+# for the response head.  ``_stream_with_idle_timeout`` starts its clock on the
+# first frame of an already-returned response, so without this budget an
+# unreachable host is bounded only by the kernel's SYN ladder (127 s) times
+# LiteLLM's own retry (2), and the turn sat on a dead route for 271 s on
+# 2026-11-15 while every other budget in this list was still unspent.
+_UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV = "YOUNG_ROUTER_UPSTREAM_CONNECT_TIMEOUT_SECONDS"
+_UPSTREAM_CONNECT_TIMEOUT_DEFAULT_SECONDS = 10.0
+#: Floor throughput used to widen the connect budget for a body that has to be
+#: uploaded before the upstream can answer.  One megabyte per second is far
+#: below any link this proxy runs on, so the allowance only rescues a heavy
+#: replay; a host that is simply absent still pays the bare budget, because it
+#: accepts no bytes at all.
+_UPSTREAM_UPLOAD_FLOOR_BYTES_PER_SECOND = 1024.0 * 1024.0
 _HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS_ENV = (
     "YOUNG_ROUTER_HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS"
 )
@@ -101,32 +116,7 @@ _HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV = (
     "YOUNG_ROUTER_HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES"
 )
 _HEAVY_REPLAY_STREAM_START_DEFAULT_THRESHOLD_BYTES = 1024.0 * 1024.0
-_WEBSOCKET_MAX_FRAME_BYTES_ENV = "YOUNG_ROUTER_WEBSOCKET_MAX_FRAME_BYTES"
-_WEBSOCKET_MAX_FRAME_DEFAULT_BYTES = 64.0 * 1024.0 * 1024.0
 _WEBSOCKET_FRAME_LIMIT_PATCH_ATTR = "_young_router_websocket_frame_limit_patch"
-
-
-def _websocket_max_frame_bytes() -> int:
-    """Maximum inbound WebSocket frame size for the managed proxy.
-
-    Codex sends each Responses turn request -- including the immutable replay
-    prefix with its signed image bytes -- as one text frame.  uvicorn's default
-    16 MiB limit closes such connections with code 1009 before the request
-    reaches the pipeline, which Codex reports as ``websocket closed by server
-    before response.completed`` followed by its reconnect ladder.
-    """
-
-    import os
-
-    raw = os.getenv(_WEBSOCKET_MAX_FRAME_BYTES_ENV, "").strip()
-    if raw:
-        try:
-            parsed = int(raw)
-        except ValueError:
-            parsed = 0
-        if parsed > 0:
-            return parsed
-    return int(_WEBSOCKET_MAX_FRAME_DEFAULT_BYTES)
 
 
 _UVICORN_SHUTDOWN_PATCH_ATTR = "_young_router_shutdown_patch"
@@ -136,20 +126,17 @@ _UVICORN_SHUTDOWN_PATCH_ATTR = "_young_router_shutdown_patch"
 # quit grace is zero; this is only the floor that keeps the coroutine alive.
 _MIN_SHUTDOWN_PATCH_GRACE_SECONDS = 0.001
 
-# LiteLLM drains its own in-flight requests inside the lifespan shutdown, which
-# runs before uvicorn ever reaches ``_wait_tasks_to_complete`` below.  That is a
-# second drain with its own fixed default of thirty seconds, so a quit with one
-# turn still streaming spent that whole window there regardless of what the
-# app-exit grace here says.  The bound is LiteLLM's own environment variable,
-# re-read on every drain, so the short grace has to be pushed into it.  This is
-# the app-exit path only: a restart or an install kills the tree instead of
-# draining it, so nothing there reads this bound.
+# LiteLLM drains its own in-flight requests inside the lifespan shutdown, with
+# its own bound (thirty seconds by default) read from this environment variable
+# on every drain.  By then the shutdown patch below has already closed every
+# open stream, so that drain finds nothing in flight; the variable is only
+# cleared, so a value inherited from the host cannot change it.
 _LITELLM_DRAIN_TIMEOUT_ENV = "GRACEFUL_SHUTDOWN_TIMEOUT"
 
-# How long a marked app-exit worker stays alive so an open stream can write the
-# terminal that ends its turn.  This is not a wait for the answer: it is the
-# window in which the streaming task observes the shutdown marker and flushes
-# the one event the client needs before the process goes away.
+# How long a worker that is shutting down stays alive so an open stream can
+# write the terminal that ends its turn.  This is not a wait for the answer: it
+# is the window in which the streaming task observes the shutdown marker and
+# flushes the one event the client needs before the process goes away.
 _APP_EXIT_TERMINAL_GRACE_SECONDS = 2.0
 
 
@@ -198,21 +185,14 @@ async def _close_connections_after_terminals(server: Any) -> None:
     await asyncio.sleep(0.05)
 
 
-def _bind_litellm_drain_to_app_quit_grace() -> None:
-    """Point LiteLLM's own lifespan drain at the app-exit grace.
+def _keep_litellm_drain_default() -> None:
+    """Leave LiteLLM's own lifespan drain at its default bound.
 
-    A deliberate proxy replacement keeps LiteLLM's default because its accepted
-    turns still have a client waiting on them; only a worker that the Core has
-    marked as an app exit is shortened, so a settings apply and a recovery
-    teardown keep the drain that was written for them.
+    Nothing in this app sets the variable; a value the process inherited from
+    its host must not shorten (or stretch) the drain behind this shutdown.
     """
 
-    if _proxy_lifecycle_module.app_exit_in_progress():
-        os.environ[_LITELLM_DRAIN_TIMEOUT_ENV] = repr(float(app_quit_grace_seconds()))
-    else:
-        # This worker is not part of an app exit, so a value an earlier
-        # generation left behind must not shorten a drain that is still owed.
-        os.environ.pop(_LITELLM_DRAIN_TIMEOUT_ENV, None)
+    os.environ.pop(_LITELLM_DRAIN_TIMEOUT_ENV, None)
 
 
 def _close_connections_without_a_request(server: Any) -> None:
@@ -259,11 +239,13 @@ def _close_connections_without_a_request(server: Any) -> None:
 def _install_uvicorn_shutdown_marker_patch() -> None:
     """Record uvicorn's teardown so a stream it truncates is not read as upstream.
 
-    Uvicorn stops accepting new connections and lets active responses finish
-    before cancelling their ASGI tasks at ``timeout_graceful_shutdown``.  The
-    patch extends that grace to the managed service's drain limit and marks
-    only a timeout-driven cancellation as local teardown, so upstream errors
-    during a normal drain still use route failover and recovery.
+    Uvicorn stops accepting new connections, asks every connection to close, and
+    then waits for the active responses up to ``timeout_graceful_shutdown``
+    before it cancels their tasks.  This worker does not wait for them
+    (``app_quit_grace_seconds`` is zero): the shutdown is marked first, each
+    open stream is given the terminal-flush window to close its own turn as
+    completed, and the connections are closed after that.  The bound uvicorn
+    was started with is narrowed to that window for as long as this runs.
     """
 
     try:
@@ -283,10 +265,7 @@ def _install_uvicorn_shutdown_marker_patch() -> None:
         original_instance_wait = self.__dict__.get("_wait_tasks_to_complete")
         original_timeout = self.config.timeout_graceful_shutdown
         shutdown_marked = False
-        # LiteLLM's own lifespan drain runs before this class's shutdown
-        # continues, so the app-exit bound has to be in place first or that
-        # drain would sit out its own full default.
-        _bind_litellm_drain_to_app_quit_grace()
+        _keep_litellm_drain_default()
 
         # Uvicorn's own shutdown closes every client connection before it gives
         # the in-flight work any grace at all, so a stream that is still
@@ -371,12 +350,11 @@ def _install_websocket_frame_limit_patch() -> None:
 
     Only the default value is replaced: an explicit ``ws_max_size`` passed by
     the operator still wins, and ``YOUNG_ROUTER_WEBSOCKET_MAX_FRAME_BYTES``
-    tunes the raised default.  Safe to call repeatedly and from interpreter
-    startup (sitecustomize) so every launch path -- ``macos_proxy`` and the
-    LiteLLM CLI -- patches ``uvicorn.Config`` before any instance is built.
+    tunes the raised default.  Safe to call repeatedly.  ``install_all`` runs it
+    when ``litellm.proxy.proxy_server`` is imported, which the LiteLLM CLI does
+    before it builds a ``uvicorn.Config``; the POSIX launcher (``macos_proxy``)
+    never loads this module and passes ``ws_max_size`` itself.
     """
-
-    import inspect
 
     try:
         import uvicorn
@@ -474,8 +452,6 @@ _DEPLOYMENT_COOLDOWN_ORDINARY_ENABLED_ENV = (
 _DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED_ENV = (
     "YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_COMPACTION_ENABLED"
 )
-_DEPLOYMENT_COOLDOWN_FILE_ENV = "YOUNG_ROUTER_DEPLOYMENT_COOLDOWN_FILE"
-_ROUTE_RECOVERY_STATE_FILE_ENV = "YOUNG_ROUTER_ROUTE_RECOVERY_STATE_FILE"
 _DEPLOYMENT_COOLDOWN_DEFAULT_FAILURES = 2
 _DEPLOYMENT_COOLDOWN_DEFAULT_SECONDS = 300.0
 _DEPLOYMENT_COOLDOWN_ORDINARY_DEFAULT_ENABLED = True
@@ -502,6 +478,12 @@ _RECOVERY_POLICY_VALUES = {
 _RECOVERY_POLICY_BALANCE_ENV = "YOUNG_ROUTER_RECOVERY_POLICY_BALANCE"
 _RECOVERY_POLICY_RATE_LIMIT_ENV = "YOUNG_ROUTER_RECOVERY_POLICY_RATE_LIMIT"
 _RECOVERY_POLICY_SERVER_ENV = "YOUNG_ROUTER_RECOVERY_POLICY_SERVER"
+# Its own key, not a reuse of the network policy: the network policy answers for
+# a route that dropped a live body (keep it, another attempt may resume), while
+# this one answers for a host that was never reached at all (park it, the next
+# request must not pay it again).  One key for both would force the two
+# opposite decisions to share a default.
+_RECOVERY_POLICY_UNREACHABLE_ENV = "YOUNG_ROUTER_RECOVERY_POLICY_UNREACHABLE"
 _RECOVERY_POLICY_NETWORK_ENV = "YOUNG_ROUTER_RECOVERY_POLICY_NETWORK"
 _RECOVERY_POLICY_STREAM_START_TIMEOUT_ENV = (
     "YOUNG_ROUTER_RECOVERY_POLICY_STREAM_START_TIMEOUT"
@@ -549,6 +531,11 @@ _UPSTREAM_QUOTA_RESET_MARKERS = (
     "retry at",
     "available after",
 )
+# Hosts that get browser-shaped headers before they are asked, rather than
+# after refusing once.  The entry is a reserved example domain (the tests'
+# fixture host): a public repository names no real station, so in practice
+# every host that needs these headers is served by the retry that follows a
+# Cloudflare browser-signature block (``_should_retry_with_browser_compatible_headers``).
 _BROWSER_COMPATIBLE_HEADER_HOSTS = {"headers.example"}
 _BROWSER_COMPATIBLE_HEADERS_RETRY_METADATA_KEY = (
     "_browser_compatible_headers_retry"
@@ -675,6 +662,7 @@ _XHIGH_REASONING_COMPAT_RETRY_METADATA_KEY = (
     "xhigh_reasoning_compat_retry_attempted"
 )
 _GENERIC_HELPER_PATCH_ATTR = "_generic_deployment_failover_patch"
+_CHAT_DISPATCH_BUDGET_PATCH_ATTR = "_young_router_chat_dispatch_budget_patch"
 _ORDER_PEER_FAILOVER_PATCH_ATTR = "_order_peer_failover_patch"
 _SELECTED_DEPLOYMENT_MARKER_PATCH_ATTR = "_selected_deployment_marker_patch"
 _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY = (
@@ -820,7 +808,13 @@ def _is_local_shutdown_exception(exception: Exception) -> bool:
             nested = getattr(candidate, attr, None)
             if isinstance(nested, Exception) and id(nested) not in seen:
                 pending.append(nested)
-    return _proxy_shutdown_in_progress()
+    if _proxy_shutdown_in_progress():
+        # The depth flag falls back to zero when the shutdown returns, but the
+        # wrapper and the transport error under it are classified separately
+        # and may be read after that.  Stamp the verdict while it is known.
+        _mark_exception_as_local_shutdown(exception)
+        return True
+    return False
 
 
 _ROUTE_FAILURE_POLICY_ATTR = "_young_router_route_failure_recovery_policy"
@@ -885,7 +879,6 @@ _ROUTE_TRACE_PREVIEW_CHARS_ENV = "YOUNG_ROUTER_ROUTE_TRACE_PREVIEW_CHARS"
 _ROUTE_TRACE_PREVIEW_DEFAULT_CHARS = 2000
 _ROUTE_TRACE_PREVIEW_MAX_CHARS = 2000
 _ROUTE_TRACE_LIST_SCAN_ITEMS = 40
-_RECENT_REQUESTS_LOG_ENV = "LITELLM_RECENT_REQUESTS_LOG"
 # The one identifier that is stable for every attempt of one client turn: this
 # proxy's own attempt marker, or the trace id LiteLLM stamps on the request.
 # The attempt lease is keyed by the turn and the deployment, so the fallbacks
@@ -1024,8 +1017,9 @@ def _responses_usage_for_codex(
         total_tokens = input_tokens + output_tokens
 
     input_details = _object_get(usage, "input_tokens_details")
+    prompt_details = _object_get(usage, "prompt_tokens_details")
     if input_details is None:
-        input_details = _object_get(usage, "prompt_tokens_details")
+        input_details = prompt_details
     output_details = _object_get(usage, "output_tokens_details")
     if output_details is None:
         output_details = _object_get(usage, "completion_tokens_details")
@@ -1042,6 +1036,9 @@ def _responses_usage_for_codex(
     # value can only be a more complete report, never a different quantity.
     cached_tokens = max(
         _int_or_zero(_object_get(input_details, "cached_tokens")),
+        _int_or_zero(_object_get(prompt_details, "cached_tokens")),
+        _int_or_zero(_object_get(prompt_details, "cache_read_tokens")),
+        _int_or_zero(_object_get(prompt_details, "cache_hit_tokens")),
         _int_or_zero(_object_get(usage, "cached_tokens")),
         _int_or_zero(_object_get(usage, "prompt_cache_hit_tokens")),
         _int_or_zero(_object_get(usage, "cache_read_input_tokens")),
@@ -1057,7 +1054,10 @@ def _responses_usage_for_codex(
     cache_write_tokens = max(
         _int_or_zero(_object_get(input_details, "cache_write_tokens")),
         _int_or_zero(_object_get(input_details, "cache_creation_tokens")),
+        _int_or_zero(_object_get(prompt_details, "cache_write_tokens")),
+        _int_or_zero(_object_get(prompt_details, "cache_creation_tokens")),
         _int_or_zero(_object_get(usage, "cache_creation_input_tokens")),
+        _int_or_zero(_object_get(usage, "cache_write_tokens")),
     )
     # The relays these models are served from count their own way, and a count
     # that is too low is not harmless: Codex shows it as context used and

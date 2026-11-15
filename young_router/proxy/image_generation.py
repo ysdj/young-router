@@ -258,7 +258,8 @@ def _image_generation_path_is_usable(value: str, current_path: str) -> bool:
         path = Path(path_text).expanduser()
         if not path.is_file():
             return False
-        header = path.read_bytes()[:32]
+        with path.open("rb") as handle:
+            header = handle.read(32)
     except (OSError, ValueError):
         return False
     if header.startswith(b"\x89PNG\r\n\x1a\n") and len(header) >= 24:
@@ -348,7 +349,8 @@ def _image_generation_payload_has_current_reference(
             return
         if isinstance(node, str):
             for match in _IMAGE_GENERATION_PATH_RE.finditer(node):
-                if _image_generation_path_is_usable(match.group(0), current_path):
+                candidate = match.group(0).removeprefix("file://")
+                if os.path.abspath(os.path.expanduser(candidate)) == os.path.abspath(current_path):
                     found = True
                     return
         elif isinstance(node, dict):
@@ -433,10 +435,10 @@ def _image_generation_materialize_result(
     request_data: Optional[dict],
 ) -> Optional[Path]:
     result = item.get("result")
-    if not _image_generation_result_is_valid(result):
-        return None
     image_bytes = _image_generation_result_bytes(result)
-    extension = _image_generation_result_extension(result)
+    if not _image_generation_result_is_valid(image_bytes):
+        return None
+    extension = _image_generation_result_extension(image_bytes)
     if image_bytes is None or extension is None:
         return None
     configured_home = os.environ.get("CODEX_HOME", "").strip()
@@ -495,16 +497,14 @@ def _image_generation_attach_paths_to_payload(
         nonlocal changed
         if isinstance(value, dict):
             if value.get("type") == "image_generation_call":
-                result = value.get("result")
-                if _image_generation_result_is_valid(result):
-                    output_path = _image_generation_materialize_result(value, request_data)
-                    if output_path is not None and value.get("saved_path") != str(output_path):
-                        value["saved_path"] = str(output_path)
-                        changed = True
-                    if output_path is not None:
-                        path_text = str(output_path)
-                        if path_text not in discovered_paths:
-                            discovered_paths.append(path_text)
+                output_path = _image_generation_materialize_result(value, request_data)
+                if output_path is not None and value.get("saved_path") != str(output_path):
+                    value["saved_path"] = str(output_path)
+                    changed = True
+                if output_path is not None:
+                    path_text = str(output_path)
+                    if path_text not in discovered_paths:
+                        discovered_paths.append(path_text)
             for nested in value.values():
                 walk(nested)
         elif isinstance(value, list):
@@ -765,26 +765,7 @@ def _image_generation_stream_chunks_for_delivery(
 
 
 def _response_has_image_generation_result_payload(response: Any) -> bool:
-    def walk(value: Any) -> bool:
-        if value is None:
-            return False
-        if isinstance(value, list):
-            return any(walk(item) for item in value)
-        if isinstance(value, dict):
-            if (
-                value.get("type") == "image_generation_call"
-                and _image_generation_result_is_valid(value.get("result"))
-            ):
-                return True
-            return any(walk(item) for item in value.values())
-        if hasattr(value, "model_dump"):
-            try:
-                return walk(value.model_dump())
-            except Exception:
-                return False
-        return False
-
-    return walk(response)
+    return _response_has_image_generation_result(response)
 
 
 def _normalize_image_generation_result_status(value: Any) -> None:

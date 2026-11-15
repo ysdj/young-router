@@ -513,6 +513,13 @@ class _TextExtractor(HTMLParser):
     }
     _CELL = {"td", "th"}
     _HEADING = {"h1", "h2", "h3", "h4", "h5", "h6"}
+    # Void elements never emit an end tag.  The scope depth counts start tags
+    # against end tags, so counting these would leave <article>/<main> open
+    # after its closing tag and keep the page's trailer.
+    _VOID = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+    }
     # A *run* of short, mostly-link blocks is a menu.  Long blocks are kept
     # even when they are links (a reference list, a table of API names), and a
     # single short link block is content -- the run is what tells them apart.
@@ -555,7 +562,7 @@ class _TextExtractor(HTMLParser):
             self._scope = tag
             self._scope_depth = 1
             self._scoped = True
-        elif self._scope is not None:
+        elif self._scope is not None and tag not in self._VOID:
             self._scope_depth += 1
         if tag == "a":
             # Adjacent links are separate words ("jsoref Eomm lukekarrys"),
@@ -703,7 +710,9 @@ def _meta_refresh_target(html: str) -> Optional[str]:
     return target or None
 
 
-async def local_page(url: str, client: Any) -> Optional[tuple[str, str]]:
+async def local_page(
+    url: str, client: Any, seen: Optional[set[str]] = None
+) -> Optional[tuple[str, str]]:
     """Read one page over plain HTTP, for a result the backend could not serve.
 
     Only readable text is returned: scripts never run, so a page that renders
@@ -712,6 +721,13 @@ async def local_page(url: str, client: Any) -> Optional[tuple[str, str]]:
     """
 
     from ..browser_identity import browser_request_headers
+
+    seen = seen if seen is not None else set()
+    if url in seen:
+        # A meta refresh may point at itself or loop A -> B -> A; following it
+        # again would recurse until RecursionError.
+        return None
+    seen.add(url)
 
     try:
         response = await client.get(
@@ -736,7 +752,7 @@ async def local_page(url: str, client: Any) -> Optional[tuple[str, str]]:
             # difference between npm's canonical CLI URL (a 77-byte stub that
             # only refreshes to /cli/v12/...) reading as an empty page and
             # reading as the documentation it points at.
-            followed = await local_page(urljoin(url, meta), client)
+            followed = await local_page(urljoin(url, meta), client, seen)
             if followed is not None:
                 return followed
         extractor = _TextExtractor()
@@ -1069,7 +1085,7 @@ def page_fetcher(client: Any, params: Optional[Mapping[str, Any]] = None) -> Any
                 "alpha_search_fetch_fallback",
                 url=url,
                 backend_status=status,
-                local=bool(entry),
+                vendor=bool(entry),
             )
         cache[url] = entry
         return entry
@@ -1160,7 +1176,9 @@ def _answer_segments(output: str) -> list[str]:
     return ["\n".join(segment) for segment in segments]
 
 
-def _segment_request(segment: str) -> Optional[dict[str, Any]]:
+def _segment_request(
+    segment: str, session: Optional[dict[str, str]] = None
+) -> Optional[dict[str, Any]]:
     """The ``open``/``find`` request an upstream answer segment reports."""
 
     match = _ANSWER_SOURCE_RE.search(segment)
@@ -1173,7 +1191,7 @@ def _segment_request(segment: str) -> Optional[dict[str, Any]]:
     if not isinstance(arguments, Mapping):
         return None
     request: dict[str, Any] = {"command": match.group(1)}
-    url = resolve_reference(str(arguments.get("ref_id") or ""))
+    url = resolve_reference(str(arguments.get("ref_id") or ""), session)
     if url is None:
         return None
     request["url"] = url
@@ -1187,7 +1205,9 @@ def _segment_request(segment: str) -> Optional[dict[str, Any]]:
 
 
 def _drop_repaired_segments(
-    output: str, unserved: Mapping[str, list[dict[str, Any]]]
+    output: str,
+    unserved: Mapping[str, list[dict[str, Any]]],
+    session: Optional[dict[str, str]] = None,
 ) -> str:
     """Remove the upstream text of the commands being answered here instead.
 
@@ -1203,7 +1223,7 @@ def _drop_repaired_segments(
         return output
     kept: list[str] = []
     for segment in _answer_segments(output):
-        request = _segment_request(segment)
+        request = _segment_request(segment, session)
         if request is not None and any(
             request.get("url") == item.get("url")
             and request.get("pattern") == item.get("pattern")
@@ -1353,16 +1373,34 @@ async def _anthropic_search(
         return None, "这次调用没有要搜索的关键词"
 
     session = _session_for(_session_key(body))
+    # One tool call may carry up to four queries; they are independent, so they
+    # are issued together instead of paying each round trip in sequence.
+    responses = await asyncio.gather(
+        *[
+            _post_messages_with_search(base, key, model, query, client)
+            for query in queries
+        ],
+        return_exceptions=True,
+    )
     grouped: list[tuple[Optional[str], list[dict[str, Any]]]] = []
     claimed: set[str] = set()
-    for query in queries:
-        status, payload = await _post_messages_with_search(
-            base, key, model, query, client
-        )
+    for query, response in zip(queries, responses):
+        if isinstance(response, Exception):
+            return None, "Claude 搜索接口不可用"
+        status, payload = response
         if status != 200:
             return None, f"Claude 搜索接口不可用（{status}）"
+        raw = _anthropic_search_results(payload)
+        # Judge this query against its own returned pages, before the shared
+        # URL set can empty it: a later query whose hits were all claimed by
+        # an earlier one still answered its own question.
+        if not _anthropic_search_answered_the_query(raw, [query]):
+            # This deployment's engine answered about something else.  Say so
+            # and let the caller ask the next deployment rather than handing
+            # the model a result set that only looks like an answer.
+            return None, "搜索结果与查询无关"
         rows: list[dict[str, Any]] = []
-        for result in _anthropic_search_results(payload):
+        for result in raw:
             url = str(result.get("url") or "").strip()
             if not url or url in claimed:
                 continue
@@ -1370,11 +1408,6 @@ async def _anthropic_search(
             rows.append(result)
             if len(claimed) >= MAX_RESULTS:
                 break
-        if not _anthropic_search_answered_the_query(rows, [query]):
-            # This deployment's engine answered about something else.  Say so
-            # and let the caller ask the next deployment rather than handing
-            # the model a result set that only looks like an answer.
-            return None, "搜索结果与查询无关"
         grouped.append((query, rows))
         if len(claimed) >= MAX_RESULTS:
             break
@@ -1471,7 +1504,7 @@ def _anthropic_search_results(payload: Any) -> list[dict[str, Any]]:
                 {
                     "title": str(item.get("title") or "").strip() or _domain(url),
                     "url": url,
-                    "snippet": _published_label(item.get("page_age")),
+                    "date": _published_label(item.get("page_age")),
                 }
             )
     return results
@@ -1794,7 +1827,9 @@ async def _search(body: Mapping[str, Any], model: str) -> dict[str, Any]:
         merged["output"] = "\n\n".join(
             part
             for part in (
-                _drop_repaired_segments(str(payload.get("output") or ""), unserved),
+                _drop_repaired_segments(
+                    str(payload.get("output") or ""), unserved, session
+                ),
                 page_text,
             )
             if part

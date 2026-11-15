@@ -42,6 +42,22 @@ class AtomicWriteError(OSError):
         self.reason = reason
 
 
+def restrict_mode(descriptor: int, path: Path | str, mode: int = PRIVATE_MODE) -> None:
+    """Apply ``mode`` to an open file, by descriptor where the platform can.
+
+    Windows Python has no ``os.fchmod`` before 3.13, and the bundled runtime
+    there is older: a writer that called it unguarded raised ``AttributeError``
+    on that host only.  ``chmod`` on the path the descriptor was opened from is
+    the same best-effort restriction, so every writer asks here instead of
+    spelling the guard (or forgetting it) itself.
+    """
+
+    if hasattr(os, "fchmod"):
+        os.fchmod(descriptor, mode)
+    else:
+        os.chmod(path, mode)
+
+
 def atomic_write_bytes(
     path: Path | str,
     data: bytes,
@@ -110,13 +126,7 @@ def _replace(target: Path, data: bytes, *, mode: int, parent_mode: int | None) -
     descriptor: int | None = None
     try:
         descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
-        # Windows Python does not expose fchmod; chmod on the still-private
-        # temporary path provides the same best-effort mode restriction before
-        # the atomic replace.
-        if hasattr(os, "fchmod"):
-            os.fchmod(descriptor, mode)
-        else:
-            os.chmod(temporary, mode)
+        restrict_mode(descriptor, temporary, mode)
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = None
             handle.write(data)
@@ -188,4 +198,5 @@ __all__ = [
     "REASON_WRITE",
     "atomic_write_bytes",
     "atomic_write_text",
+    "restrict_mode",
 ]

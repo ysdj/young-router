@@ -401,7 +401,7 @@ def _responses_bridge_provider_native_web_search_tool(tool: Any) -> Optional[dic
     if tool.get("type") not in _PROVIDER_NATIVE_WEB_SEARCH_TOOL_TYPES:
         return None
     return copy.deepcopy(tool)
-def _responses_input_tool_search_output_tool_names(value: Any) -> list[str]:
+def _responses_input_tool_search_output_tool_names(tools: list[dict]) -> list[str]:
     names: list[str] = []
 
     def add_name(name: Any) -> None:
@@ -420,7 +420,7 @@ def _responses_input_tool_search_output_tool_names(value: Any) -> list[str]:
             for child_tool in child_tools:
                 visit_tool(child_tool)
 
-    for tool in _responses_input_tool_search_output_tools(value):
+    for tool in tools:
         visit_tool(tool)
     return names
 
@@ -667,6 +667,7 @@ def _with_contiguous_responses_chat_tool_records(
             index += 1
             continue
 
+        group_start = index
         calls: list[Any] = []
         pending_calls: list[set[str]] = []
         while index < len(items):
@@ -684,7 +685,6 @@ def _with_contiguous_responses_chat_tool_records(
 
         outputs: list[Any] = []
         barriers: list[Any] = []
-        barrier_indices: list[int] = []
         while index < len(items) and pending_calls:
             item = items[index]
             item_type = item.get("type") if isinstance(item, dict) else None
@@ -707,14 +707,12 @@ def _with_contiguous_responses_chat_tool_records(
             if item_type in call_types:
                 break
             barriers.append(item)
-            barrier_indices.append(index)
             index += 1
 
         if pending_calls:
             # This is not a complete group whose calls and outputs are in this
             # replay. Leave it untouched rather than changing a partial record.
-            rewritten.extend(calls)
-            index = barrier_indices[0] if barrier_indices else index
+            rewritten.extend(items[group_start:index])
             continue
 
         rewritten.extend(calls)
@@ -1091,8 +1089,9 @@ def _responses_chat_bridge_sanitize_tools(
     if not isinstance(tools, list):
         return None, None, {"changed": False}
 
+    discovered_input_tools = _responses_input_tool_search_output_tools(input_value)
     tool_search_output_tool_names = _responses_input_tool_search_output_tool_names(
-        input_value
+        discovered_input_tools
     )
     suppress_tool_search_bridge = bool(tool_search_output_tool_names)
     sanitized: list[dict] = []
@@ -1167,7 +1166,7 @@ def _responses_chat_bridge_sanitize_tools(
         elif isinstance(tool_type, str) and tool_type not in dropped_types:
             dropped_types.append(tool_type)
 
-    for discovered_tool in _responses_input_tool_search_output_tools(input_value):
+    for discovered_tool in discovered_input_tools:
         converted = _responses_bridge_function_tool(discovered_tool)
         discovered_tools = [converted] if converted is not None else []
         if converted is None:

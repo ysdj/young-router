@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Import explicitly selected provider/model configuration into editor JSON.
 
-The command deliberately knows no third-party application locations.  It reads
-only an explicit file, or CODEX_HOME/config.toml (and, for the built-in OpenAI
-provider only, CODEX_HOME/auth.json).  Its JSON output is intended for the
-native editor's in-memory draft; this command never writes configuration.
+The command deliberately knows no third-party application location the caller
+did not point it at: an explicit file, CODEX_HOME/config.toml (and, for the
+built-in OpenAI provider only, CODEX_HOME/auth.json),
+CLAUDE_CONFIG_DIR/settings.json, or an explicit CC Switch link on stdin.  Its
+JSON output is intended for the native editor's in-memory draft; this command
+never writes configuration.
 """
 from __future__ import annotations
 
@@ -643,7 +645,7 @@ def _import_litellm(data: dict[str, Any]) -> _Drafts | None:
             _add_editor_model(
                 provider,
                 raw_model,
-                default_surface=_surface_from_values(
+                default_surface=_declared_surface(
                     provider_data.get("wire_api"), provider_data.get("provider_type")
                 ),
                 provider_enabled=provider.enabled,
@@ -1063,10 +1065,8 @@ def _generic_candidates(data: dict[str, Any]) -> list[tuple[str, dict[str, Any]]
             for index, item in enumerate(raw_providers, start=1)
             if isinstance(item, dict)
         )
-    elif isinstance(raw_providers, dict):
-        for name, item in raw_providers.items():
-            if isinstance(item, dict) and _first_text(item, BASE_URL_KEYS):
-                candidates.append((_label(name) or "imported", item))
+    # A dict ``providers`` never reaches this fallback: _import_litellm claims
+    # that shape before the generic importer runs.
 
     for container_name in ("data", "channels", "accounts", "endpoints"):
         raw_items = data.get(container_name)
@@ -1102,7 +1102,7 @@ def _import_generic(data: dict[str, Any]) -> _Drafts:
             _add_editor_model(
                 provider,
                 model,
-                default_surface=_surface_from_values(source.get("wire_api"), source.get("provider_type")),
+                default_surface=_declared_surface(source.get("wire_api"), source.get("provider_type")),
                 provider_enabled=provider.enabled,
             )
     return drafts
@@ -1185,8 +1185,6 @@ def _result(drafts: _Drafts, source: str) -> dict[str, Any]:
             "skipped": drafts.skipped,
         },
     }
-    if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > MAX_OUTPUT_BYTES:
-        raise ImportError("The imported provider and model draft is too large.")
     return result
 
 
@@ -1315,13 +1313,18 @@ def main(argv: list[str] | None = None) -> int:
             if args.link_stdin
             else import_explicit(pathlib.Path(args.input).expanduser())
         )
+        # The printed document is the one that has to fit: render it once and
+        # measure that same text instead of serializing the draft twice.
+        text = json.dumps(result, ensure_ascii=False)
+        if len(text.encode("utf-8")) > MAX_OUTPUT_BYTES:
+            raise ImportError("The imported provider and model draft is too large.")
     except ImportError as exc:
         print(f"External provider import failed: {exc}", file=sys.stderr)
         return 1
     except Exception:
         print("External provider import failed: the configuration could not be imported.", file=sys.stderr)
         return 1
-    print(json.dumps(result, ensure_ascii=False))
+    print(text)
     return 0
 
 

@@ -528,6 +528,23 @@ def _append_model_to_provider(
         )
         providers.append(provider_index[provider])
     provider_entry = provider_index[provider]
+    # Which account this entry answers with, when its own credential names one.
+    # The account is the provider's, so it is registered before the row check
+    # below: a later deployment of a row that already exists returns there, and
+    # registering only after it kept the first credential's account and lost
+    # every other one -- with its routes -- on the next save.
+    account_ref = _account_from_credential(model)
+    if account_ref:
+        accounts = provider_entry.get("auth_accounts")
+        known = {
+            _string_value(_as_dict(item).get("ref")).strip()
+            for item in _as_list(accounts)
+        }
+        if account_ref not in known:
+            provider_entry["auth_accounts"] = [
+                *_as_list(accounts),
+                {"ref": account_ref, "label": "", "enabled": True},
+            ]
     row_id = _credential_row_id(model, provider_entry) if rows is not None else ""
     if row_id:
         existing = rows.get((provider, row_id))
@@ -559,22 +576,11 @@ def _append_model_to_provider(
     # credential value, because there the value is the only evidence left.  Two
     # keys that read alike are never one key: a route bound to a linked slot must
     # not answer with a hand-made slot that happens to hold the same credential.
-    # Which account this entry answers with, when its own credential names one.
-    # It is recorded on the row and the entry alike, so a later save writes the
-    # account the pane shows and a second save is not a rewrite.
-    account_ref = _account_from_credential(model)
+    # The account is recorded on the row as well (the provider's list has it
+    # from above), so a later save writes the account the pane shows and a
+    # second save is not a rewrite.
     if account_ref:
         model["account_ref"] = account_ref
-        accounts = provider_entry.get("auth_accounts")
-        known = {
-            _string_value(_as_dict(item).get("ref")).strip()
-            for item in _as_list(accounts)
-        }
-        if account_ref not in known:
-            provider_entry["auth_accounts"] = [
-                *_as_list(accounts),
-                {"ref": account_ref, "label": "", "enabled": True},
-            ]
     provider_key_rows = [
         {
             "id": _string_value(_as_dict(item).get("id")).strip()
@@ -667,8 +673,11 @@ def config_document_from_path(
     *,
     allow_missing: bool = False,
 ) -> dict[str, str | None]:
+    # A missing file is an empty document, stated as one: the empty string
+    # parses to nothing, which is not a mapping, so ``allow_missing`` raised
+    # the very error it exists to avoid.
     config_text = (
-        ""
+        "model_list: []\n"
         if allow_missing and not path.exists()
         else path.read_text(encoding="utf-8")
     )
