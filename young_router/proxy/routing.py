@@ -653,6 +653,23 @@ def _request_started_time(request_kwargs: Optional[dict]) -> Optional[datetime]:
 
 
 
+def _local_wall_clock(value: datetime) -> datetime:
+    """Attach the host's zone to a naive stamp LiteLLM handed over.
+
+    Its callbacks mix aware UTC with a naive local wall clock, and the two are
+    not interchangeable: reading the naive one as UTC reported every request
+    that reached this path as eight hours slower than it was (measured on the
+    gateway: 3,907 of 12,919 rows sat within two minutes of 28,800,000 ms, and
+    a live turn showed ``time_to_first_token_ms: 28803314`` on a 7.6s turn).
+    ``_event_time`` already reads the naive value as local; this keeps the
+    arithmetic on the same footing instead of subtracting two zones apart.
+    """
+
+    if value.tzinfo is None:
+        return value.astimezone()
+    return value
+
+
 def _event_time(value: Any) -> Optional[str]:
     if isinstance(value, datetime):
         if value.tzinfo is None:
@@ -714,12 +731,10 @@ def _completion_start_time(
             return None, None
     if not isinstance(completion_start_time, datetime):
         return None, None
-    if completion_start_time.tzinfo is None:
-        completion_start_time = completion_start_time.replace(tzinfo=timezone.utc)
+    completion_start_time = _local_wall_clock(completion_start_time)
     normalized_end_time = end_time
     if isinstance(normalized_end_time, datetime):
-        if normalized_end_time.tzinfo is None:
-            normalized_end_time = normalized_end_time.replace(tzinfo=timezone.utc)
+        normalized_end_time = _local_wall_clock(normalized_end_time)
         if source != "stream_output_observed" and completion_start_time == normalized_end_time:
             # LiteLLM fills a missing completion_start_time with end_time. Keep
             # that distinguishable from an actually observed first token.
@@ -740,8 +755,7 @@ def _time_to_first_token_ms(
         start_time = observed_request_start
     if not isinstance(start_time, datetime):
         return None
-    if start_time.tzinfo is None:
-        start_time = start_time.replace(tzinfo=timezone.utc)
+    start_time = _local_wall_clock(start_time)
     try:
         return max(0, int((completion_start_time - start_time).total_seconds() * 1000))
     except Exception:

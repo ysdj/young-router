@@ -1699,6 +1699,28 @@ class HookTraceLoggingTests(HookTestCase):
         self.assertNotIn(hooks._FIRST_STREAM_OUTPUT_TIME_KEY, request)
         self.assertEqual(hooks._first_stream_output_time(request), observed)
 
+    def test_ttft_reads_a_naive_completion_start_as_local_wall_clock(self) -> None:
+        """LiteLLM's callback hands over a naive local stamp, not a UTC one.
+
+        Reading it as UTC put every turn that reached this path eight hours
+        away from its own start: on the gateway 3,907 of 12,919 recorded rows
+        sat within two minutes of 28,800,000 ms, and a live 7.6s turn logged
+        ``time_to_first_token_ms: 28803314``.  The number a reader takes as
+        latency has to be the difference the two stamps actually describe.
+        """
+
+        hooks, _ = load_hook_module()
+        start = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+        first_output = start + timedelta(milliseconds=87)
+        naive_local = first_output.astimezone().replace(tzinfo=None)
+
+        self.assertEqual(
+            hooks._time_to_first_token_ms(
+                {"completion_start_time": naive_local}, start
+            ),
+            87,
+        )
+
     def test_ttft_uses_proxy_observed_request_start(self) -> None:
         hooks, _ = load_hook_module()
         started = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
