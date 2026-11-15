@@ -686,8 +686,29 @@ def _event_time(value: Any) -> Optional[str]:
     return None
 
 
-def _duration_ms(start_time: Any, end_time: Any) -> Optional[int]:
+def _duration_ms(
+    start_time: Any,
+    end_time: Any,
+    request_kwargs: Optional[dict] = None,
+) -> Optional[int]:
+    """How long the caller waited, measured from when the request arrived.
+
+    LiteLLM's ``start_time`` is stamped later than the caller's arrival -- the
+    pre-call work (pairing, the context-window pass, route selection) has
+    already run by then -- so a duration taken from it under-reported every
+    turn by exactly the wait before the upstream was called.  Measured on the
+    gateway against wall clock: a turn that took 6,638 ms was logged as 4,698
+    ms, and the missing 1,820 ms was the time to first token.  ``ttft`` already
+    prefers the start this proxy recorded on arrival; the duration has to use
+    the same one or the two columns describe different requests.
+    """
+
+    observed_request_start = _request_started_time(request_kwargs)
+    if observed_request_start is not None:
+        start_time = observed_request_start
     if isinstance(start_time, datetime) and isinstance(end_time, datetime):
+        start_time = _local_wall_clock(start_time)
+        end_time = _local_wall_clock(end_time)
         try:
             return max(0, int((end_time - start_time).total_seconds() * 1000))
         except Exception:
@@ -4439,7 +4460,7 @@ def _request_log_record(
         "ts": request_timestamp
         or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "status": status,
-        "duration_ms": _duration_ms(start_time, end_time),
+        "duration_ms": _duration_ms(start_time, end_time, request_kwargs),
         "time_to_first_token_ms": _time_to_first_token_ms(
             request_kwargs,
             start_time,

@@ -1699,6 +1699,35 @@ class HookTraceLoggingTests(HookTestCase):
         self.assertNotIn(hooks._FIRST_STREAM_OUTPUT_TIME_KEY, request)
         self.assertEqual(hooks._first_stream_output_time(request), observed)
 
+    def test_duration_is_measured_from_the_arrival_not_litellm_start(self) -> None:
+        """The wait before the upstream is called is part of the turn.
+
+        LiteLLM stamps ``start_time`` after the pre-call work has run, so a
+        duration taken from it dropped the wait that preceded the upstream.
+        Measured on the gateway against wall clock: a turn that took 6,638 ms
+        was logged as 4,698 ms, and the missing 1,820 ms was the time to first
+        token -- the column a reader takes as "how long did this take" was
+        short by exactly the wait it was meant to include.
+        """
+
+        hooks, _ = load_hook_module()
+        arrival = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+        litellm_start = arrival + timedelta(milliseconds=1800)
+        end = arrival + timedelta(milliseconds=6638)
+        kwargs = {
+            "litellm_call_id": "duration-arrival-test",
+            hooks._REQUEST_STARTED_TIME_KEY: arrival,
+        }
+
+        hooks._record_request_started_time(kwargs)
+
+        self.assertEqual(
+            hooks._duration_ms(litellm_start, end, kwargs),
+            6638,
+        )
+        # Without a recorded arrival the callback's own start is all there is.
+        self.assertEqual(hooks._duration_ms(litellm_start, end), 4838)
+
     def test_ttft_reads_a_naive_completion_start_as_local_wall_clock(self) -> None:
         """LiteLLM's callback hands over a naive local stamp, not a UTC one.
 
