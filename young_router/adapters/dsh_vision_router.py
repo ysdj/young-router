@@ -4,7 +4,7 @@ Upstream (https://github.com/ysr666/dsh-vision-router) is a Node module and
 cannot be imported into the Python LiteLLM process, so
 ``scripts/update_dsh_vision_router.py`` stages its npm ``latest`` release into
 the Core bundle and ``dsh_vision_worker.mjs`` calls it through the bundled
-Node.js runtime — the same arrangement as Veridrop and
+Node.js runtime — the same arrangement as the modelprint and
 WorkBuddy bridges.  The provider chain this module routes through is therefore
 the one upstream computes: a release that changes the free OVH models, their
 order, or the local Ollama/LM Studio shapes changes what Core routes to without
@@ -131,6 +131,12 @@ _ACTIVE_PROVIDER: ContextVar[dict[str, Any] | None] = ContextVar(
 )
 _ACTIVE_REQUEST_PROMPT: ContextVar[str | None] = ContextVar(
     "dsh_vision_router_active_request_prompt",
+    default=None,
+)
+# One image turn walks the same providers for every image, so the chain is
+# resolved once per request instead of once per image.
+_ACTIVE_PROVIDER_CHAIN: ContextVar[list[dict[str, Any]] | None] = ContextVar(
+    "dsh_vision_router_active_provider_chain",
     default=None,
 )
 
@@ -402,7 +408,7 @@ def _provider_from_entry(
         if isinstance(reasoning_effort, str) and reasoning_effort.strip().lower() in _REASONING_EFFORTS
         else None
     )
-    return {
+    provider = {
         "name": str(entry.get("name") or entry.get("provider") or default_name),
         "base_url": base_url.strip().rstrip("/"),
         "model": model.strip(),
@@ -414,6 +420,12 @@ def _provider_from_entry(
         "top_p": float(top_p) if top_p is not None else None,
         "reasoning_effort": reasoning_effort,
     }
+    # A configured row may carry the instruction its release expects to be sent
+    # with every image; the bridge forwards it, so the degrade path must too.
+    system = entry.get("system")
+    if isinstance(system, str) and system.strip():
+        provider["system"] = system
+    return provider
 
 
 def _upstream_pair_entries(entry: Any) -> list[dict[str, Any]]:
@@ -531,10 +543,26 @@ def _upstream_config_document() -> dict[str, Any]:
         local_ollama = {**local_ollama, "enabled": True}
     if _router_local_enabled(config, "localLmStudio", _DSH_VISION_ROUTER_LOCAL_LM_STUDIO_ENABLED_ENV):
         local_lm_studio = {**local_lm_studio, "enabled": True}
+    http_providers = (
+        config.get("httpProviders") if isinstance(config.get("httpProviders"), list) else []
+    )
+    # Earlier dsh-vision-router revisions exported a compact single-provider
+    # profile.  The worker only reads the list shapes, so it is translated here
+    # or the profile silently routes nothing at all.
+    single = config.get("provider")
+    if isinstance(single, dict):
+        http_providers = [*http_providers, single]
+    elif isinstance(single, str) and isinstance(config.get("model"), str):
+        pair = {
+            "provider": single,
+            "model": config["model"],
+            "fallbacks": config.get("fallbacks", []),
+        }
+        http_providers = [*http_providers, *_upstream_pair_entries(pair)]
     return {
         "backend": _router_backend(),
         "freeFallback": _router_free_fallback(config),
-        "httpProviders": config.get("httpProviders") if isinstance(config.get("httpProviders"), list) else [],
+        "httpProviders": http_providers,
         "providers": config.get("providers") if isinstance(config.get("providers"), list) else [],
         "localOllama": local_ollama,
         "localLmStudio": local_lm_studio,
@@ -548,7 +576,22 @@ def _configured_provider_chain() -> list[dict[str, Any]]:
         return []
     upstream_chain = _upstream_provider_chain()
     if upstream_chain is not None:
-        return [item for item in upstream_chain if isinstance(item, dict)]
+        upstream_providers: list[dict[str, Any]] = []
+        for item in upstream_chain:
+            if not isinstance(item, dict):
+                continue
+            if not str(item.get("base_url") or "").strip():
+                # The worker also lists dsh's own adapter pairs, which carry no
+                # URL this process could post to.  An empty one would silently
+                # become the default OVH endpoint with a model it does not serve.
+                _trace_module._route_trace(
+                    "dsh_vision_router_unsupported_provider_entry",
+                    provider=item.get("name"),
+                    model=item.get("model"),
+                )
+                continue
+            upstream_providers.append(item)
+        return upstream_providers
     local_providers: list[dict[str, Any]] = []
 
     if backend != _BACKEND_API:
@@ -584,24 +627,33 @@ def _configured_provider_chain() -> list[dict[str, Any]]:
         return local_providers
 
     providers: list[dict[str, Any]] = list(local_providers)
+    # Every entry below defaults its budget from the same setting; reading and
+    # parsing the settings document once keeps a long chain from doing it per
+    # entry.
+    configured_max_tokens = _router_max_tokens()
 
     for key, value in (("providers", config.get("providers")), ("httpProviders", config.get("httpProviders"))):
         if not isinstance(value, list):
             continue
         for entry in value:
-            item = _provider_from_entry(entry)
+            item = _provider_from_entry(entry, default_max_tokens=configured_max_tokens)
             if item is not None:
                 _append_provider_if_new(providers, item)
                 continue
             if key == "providers":
                 for pair in _upstream_pair_entries(entry):
-                    _append_provider_if_new(providers, _provider_from_entry(pair))
+                    _append_provider_if_new(
+                        providers,
+                        _provider_from_entry(pair, default_max_tokens=configured_max_tokens),
+                    )
 
     # Accept a compact single HTTP provider object as a convenience for JSON
     # profiles exported by earlier dsh-vision-router revisions.
     single = config.get("provider")
     if isinstance(single, dict):
-        item = _provider_from_entry(single, default_name="configured")
+        item = _provider_from_entry(
+            single, default_name="configured", default_max_tokens=configured_max_tokens
+        )
         if item is not None:
             _append_provider_if_new(providers, item)
     elif isinstance(single, str) and isinstance(config.get("model"), str):
@@ -611,7 +663,10 @@ def _configured_provider_chain() -> list[dict[str, Any]]:
             "fallbacks": config.get("fallbacks", []),
         }
         for entry in _upstream_pair_entries(pair):
-            _append_provider_if_new(providers, _provider_from_entry(entry))
+            _append_provider_if_new(
+                providers,
+                _provider_from_entry(entry, default_max_tokens=configured_max_tokens),
+            )
 
     if backend != _BACKEND_API and _router_free_fallback(config):
         seen = {(item["base_url"], item["model"]) for item in providers}
@@ -626,7 +681,7 @@ def _configured_provider_chain() -> list[dict[str, Any]]:
                     "api_key": "",
                     "api_key_env": "",
                     "format": "openai",
-                    "max_tokens": _router_max_tokens(),
+                    "max_tokens": configured_max_tokens,
                     "temperature": None,
                     "top_p": None,
                     "reasoning_effort": None,
@@ -687,19 +742,28 @@ def _chat_completion_payload(reference: str, provider: Optional[dict[str, Any]] 
     question = _ACTIVE_REQUEST_PROMPT.get()
     if isinstance(question, str) and question.strip() and question.strip() not in prompt:
         prompt = f"{prompt.rstrip()}\n\nUser request:\n{question.strip()}"
+    messages: list[dict[str, Any]] = []
+    # A provider row may carry its own instruction (upstream forwards it), and
+    # losing it changes the answer shape that release was written for.
+    system = active.get("system")
+    if isinstance(system, str) and system.strip():
+        messages.append({"role": "system", "content": system})
+    messages.append(
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                _image_part(reference),
+            ],
+        }
+    )
     payload = {
         "model": active.get("model") or "",
         "stream": False,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    _image_part(reference),
-                ],
-            }
-        ],
-        "max_tokens": active.get("max_tokens", _router_max_tokens()),
+        "messages": messages,
+        # A staged row says null when upstream named no budget; the wire rejects
+        # that, and the configured budget is what the degrade chain uses too.
+        "max_tokens": active.get("max_tokens") or _router_max_tokens(),
     }
     if active.get("temperature") is not None:
         payload["temperature"] = active["temperature"]
@@ -952,7 +1016,7 @@ def _post_anthropic_completion(payload: dict[str, Any]) -> str:
     system, messages = _anthropic_messages(payload.get("messages"))
     request_body: dict[str, Any] = {
         "model": payload.get("model") or "",
-        "max_tokens": payload.get("max_tokens", _router_max_tokens()),
+        "max_tokens": payload.get("max_tokens") or _router_max_tokens(),
         "messages": messages,
     }
     if system:
@@ -1003,7 +1067,9 @@ async def _dsh_describe_image(reference: str) -> str:
     backend = _router_backend()
     if backend == _BACKEND_OFF or not _router_enabled():
         return ""
-    providers = _configured_provider_chain()
+    providers = _ACTIVE_PROVIDER_CHAIN.get()
+    if providers is None:
+        providers = _configured_provider_chain()
     last_error: Optional[Exception] = None
     for provider in providers:
         try:
@@ -1160,13 +1226,20 @@ async def dsh_vision_router_request_kwargs(request_kwargs: dict) -> Optional[dic
     if not references:
         return None
     descriptions: list[tuple[int, str]] = []
+    # Every image in the turn walks the same chain, so it is resolved once here
+    # rather than per image; resolving it per image re-reads and re-parses the
+    # same settings document and rebuilds the worker's cache key for one answer.
+    # A disabled router describes nothing, so it must not ask the worker at all.
+    chain = _configured_provider_chain() if _router_enabled() else []
     prompt_token = _ACTIVE_REQUEST_PROMPT.set(_request_vision_prompt(request_kwargs))
+    chain_token = _ACTIVE_PROVIDER_CHAIN.set(chain)
     try:
         for index, reference in enumerate(references, start=1):
             description = await _dsh_describe_image(reference)
             descriptions.append((index, description))
     finally:
         _ACTIVE_REQUEST_PROMPT.reset(prompt_token)
+        _ACTIVE_PROVIDER_CHAIN.reset(chain_token)
     if not any(description for _, description in descriptions):
         raise RuntimeError("dsh-vision-router produced no visual context")
     routed_kwargs = _copy_request_kwargs_for_router(request_kwargs)

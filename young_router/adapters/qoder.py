@@ -30,7 +30,6 @@ import math
 import os
 from pathlib import Path
 import secrets
-import socket
 import subprocess
 import threading
 import time
@@ -69,10 +68,8 @@ QODER_DISPLAY_NAMES = {
     QODER_GLOBAL_PROVIDER: "Qoder Global",
 }
 
-# The product-neutral spelling of the same facts (see ``workbuddy.AUTH_KINDS``).
-AUTH_KINDS = QODER_AUTH_KINDS
+# The product-neutral spelling of the same fact (see ``workbuddy.DISPLAY_NAMES``).
 DISPLAY_NAMES = QODER_DISPLAY_NAMES
-PROVIDERS = QODER_PROVIDERS
 # The operation name this integration's catalog read answers under.
 MODELS_OPERATION = "qoder_models"
 # Variable names the managed proxy resolves for each region.  They are
@@ -234,12 +231,6 @@ def validated_provider(value: object) -> str:
     if provider not in QODER_PROVIDERS:
         raise ValueError("Unknown Qoder provider")
     return provider
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        return int(probe.getsockname()[1])
 
 
 class QoderRuntime:
@@ -509,21 +500,52 @@ class QoderRuntime:
             raise QoderUnavailable("The Qoder worker state could not be stored") from exc
 
     def _read_ready(self, process: subprocess.Popen[bytes]) -> dict[str, Any] | None:
-        """Read the worker's one-line readiness record without blocking Core."""
+        """Read the worker's one-line readiness record within the start deadline.
+
+        ``readline()`` on the worker's pipe returns only when a byte arrives or
+        the pipe closes, so testing a deadline around it never fires: a worker
+        that starts and prints nothing would hold this runtime's lock (and
+        every Core call behind it) forever.  The read therefore runs on its own
+        thread and this loop only waits on its answer until the deadline, which
+        also lets an exit with no output be reported as the failure it is.
+        """
 
         if process.stdout is None:
             return None
+        answer: list[bytes | None] = []
+        reader = threading.Thread(
+            target=lambda: answer.append(process.stdout.readline()),
+            name="young-router-qoder-ready",
+            daemon=True,
+        )
+        reader.start()
         deadline = time.monotonic() + _QODER_START_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
-            line = process.stdout.readline()
-            if line:
+            if answer:
+                line = answer[0]
+                if not line:
+                    return None
                 try:
                     payload = json.loads(line.decode("utf-8", "replace"))
                 except json.JSONDecodeError:
                     return None
                 return payload if payload.get("ready") is True else None
             if process.poll() is not None:
-                return None
+                # The worker exited: a line already written to the pipe is
+                # still its answer, so give the reader a moment to deliver it
+                # before the exit is reported as the failure it is.
+                reader.join(0.2)
+                if not answer:
+                    return None
+                line = answer[0]
+                if not line:
+                    return None
+                try:
+                    payload = json.loads(line.decode("utf-8", "replace"))
+                except json.JSONDecodeError:
+                    return None
+                return payload if payload.get("ready") is True else None
+            time.sleep(0.02)
         return None
 
     def _proxy_environment(self) -> dict[str, str]:
@@ -561,6 +583,9 @@ class QoderRuntime:
         self._models_cache = {}
         for name in (API_BASE_ENV, API_KEY_ENV):
             for variable in name.values():
+                # A stopped worker's address must not stay the fallback that
+                # resolves a Core-side reference to a port nobody serves.
+                _PUBLISHED_ENVIRONMENT.pop(variable, None)
                 os.environ.pop(variable, None)
         if process is None:
             return
@@ -845,16 +870,6 @@ class QoderRuntime:
         except Exception:
             result["opened"] = False
         return result
-
-
-def unsupported_status() -> dict[str, Any]:
-    """Status document used when the integration is not staged."""
-
-    return {"available": False, "detail": "integration_unstaged", "providers": {}}
-
-
-def script_available() -> bool:
-    return available() and worker_path().is_file()
 
 
 def managed_runtime(runtime_root: Path | str | None = None) -> QoderRuntime:

@@ -139,13 +139,13 @@ function installedDesktopApp(library, region) {
   // The library publishes the desktop bundles in a documented probe order and
   // names the two regions in the same order, so the pairing is read from those
   // two lists rather than from an app name written here.  A pinned
-  // WORKBUDDY_APP_EXECUTABLE leads the list, which is why the CN slot is taken
-  // from it when it is set: the user pointed at one product, and that product
-  // is the domestic build the variable documents.
+  // WORKBUDDY_APP_EXECUTABLE is taken for the CN slot only when it is set: the
+  // user pointed at one product, and that product is the domestic build the
+  // variable documents, so the international slot keeps its own candidate.
   const pinned = (process.env[APP_EXECUTABLE_ENV] ?? '').trim()
   const candidates = library.workbuddyAppExecutableCandidates()
   const index = library.WORKBUDDY_REGIONS.indexOf(region)
-  const executable = pinned !== '' ? pinned : candidates[index]
+  const executable = pinned !== '' && index === 0 ? pinned : candidates[index]
   if (typeof executable !== 'string' || executable === '') return undefined
   try {
     if (!existsSync(executable)) return undefined
@@ -168,7 +168,7 @@ function installedDesktopApp(library, region) {
 /** Load the staged third-party library (or a developer-supplied entry). */
 async function loadLibrary(entry) {
   const configured = process.env.YOUNG_ROUTER_WORKBUDDY_ENTRY ?? ''
-  const candidate = entry || configured || join(dirname(pathToFileURL(import.meta.url).pathname), 'connect-workbuddy', 'index.js')
+  const candidate = entry || configured || join(dirname(pathToFileURL(import.meta.url).pathname), 'connect-workbuddy', 'lib', 'index.js')
   const resolved = resolve(candidate)
   try {
     return { library: await import(pathToFileURL(resolved).href), entry: resolved }
@@ -410,9 +410,7 @@ class RegionRuntime {
 
   /** Forward one OpenAI request to the library's shim. */
   async forward(req, res, url, providerPath) {
-    const chunks = []
-    for await (const chunk of req) chunks.push(chunk)
-    const body = Buffer.concat(chunks)
+    const body = await readBody(req)
     const target = `${this.shim.baseUrl()}${url.pathname.slice(providerPath.length) || '/'}${url.search}`
     const upstream = await fetch(target, {
       method: req.method,

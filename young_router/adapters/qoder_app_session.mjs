@@ -142,7 +142,7 @@ async function keychainPassword(service) {
 }
 
 /** The Chromium key a Keychain password derives (AES-128-CBC, `saltysalt`). */
-export function chromiusKeyFromPassword(password) {
+export function chromiumKeyFromPassword(password) {
   return pbkdf2Sync(password, CHROMIUM_SALT, CHROMIUM_ITERATIONS, 16, 'sha1')
 }
 
@@ -239,6 +239,27 @@ async function windowsChromiumKey(profile) {
 }
 
 /**
+ * The keys one profile provides, fetched only as they are asked for: every
+ * `security find-generic-password` is a subprocess that may show the keychain's
+ * permission sheet, so the key that decrypts the envelope ends the search.
+ */
+async function* profileKeys(profile, platform, readKeychain) {
+  if (platform === 'win32') {
+    const key = await windowsChromiumKey(profile.profile)
+    if (key) yield key
+    return
+  }
+  if (platform !== 'darwin') return
+  for (const product of profile.products) {
+    for (const service of keychainServices(product)) {
+      const password = await readKeychain(service)
+      if (password === '') continue
+      yield chromiumKeyFromPassword(password)
+    }
+  }
+}
+
+/**
  * Read one profile's sign-in, or `undefined` when it cannot be read.
  *
  * `undefined` covers every reason a session is not usable: no file, no key,
@@ -258,20 +279,7 @@ export async function readProfileSession(profile, options = {}) {
   } catch {
     return undefined
   }
-  const keys = []
-  if (platform === 'win32') {
-    const key = await windowsChromiumKey(profile.profile)
-    if (key) keys.push(key)
-  } else if (platform === 'darwin') {
-    for (const product of profile.products) {
-      for (const service of keychainServices(product)) {
-        const password = await readKeychain(service)
-        if (password === '') continue
-        keys.push(chromiusKeyFromPassword(password))
-      }
-    }
-  }
-  for (const key of keys) {
+  for await (const key of profileKeys(profile, platform, readKeychain)) {
     const session = parseSession(decryptEnvelope(blob, key))
     if (session === undefined) continue
     const region = session.region ?? profile.regionHint ?? regionOfProfileDirectory(profile.directory)
@@ -303,8 +311,13 @@ export async function readDesktopSessions(options = {}) {
 
 /** The session one region's desktop app is signed into, or `undefined`. */
 export async function readDesktopSession(region, options = {}) {
-  const sessions = await readDesktopSessions(options)
-  return sessions[region]
+  // Building every region would read every profile's envelope and its keys; a
+  // caller that wants one region stops at the profile that states it.
+  for (const profile of profileCandidates(options)) {
+    const session = await readProfileSession(profile, options)
+    if (session?.region === region) return session
+  }
+  return undefined
 }
 
 /**
@@ -435,14 +448,46 @@ const APP_BUNDLE_IDS = Object.freeze({
 })
 
 /**
+ * The Windows install one region's app has, when one is found.
+ *
+ * Windows has no bundle to read an id from: the product names the app ships
+ * under name both its folder and its executable, in `%LOCALAPPDATA%\Programs`
+ * for a per-user install and `%PROGRAMFILES%` for an all-users one.
+ */
+function windowsDesktopApp(region, products, home) {
+  const local = process.env.LOCALAPPDATA || join(home, 'AppData', 'Local')
+  const roots = [
+    join(local, 'Programs'),
+    process.env.ProgramFiles ?? '',
+    process.env['ProgramFiles(x86)'] ?? '',
+  ]
+  for (const root of roots) {
+    if (root === '') continue
+    for (const product of products) {
+      for (const name of products) {
+        const executable = join(root, product, `${name}.exe`)
+        if (!existsSync(executable)) continue
+        return { appName: product, bundle: executable, product: region === 'cn' ? 'Qoder CN' : 'Qoder' }
+      }
+    }
+  }
+  return undefined
+}
+
+/**
  * The desktop app one region's sign-in belongs to, when it is installed.
  *
  * The pane offers to open this for a signed-out region: the sign-in happens in
- * that app, and this one can only hand the user over.  Discovery reads the
- * bundle id rather than a product name, because the CN build has been shipped
- * under two names and a guessed path finds neither.
+ * that app, and this one can only hand the user over.  macOS reads the bundle
+ * id rather than a product name, because the CN build has been shipped under
+ * two names and a guessed path finds neither; Windows has no bundle, so the
+ * product names are what its folders are matched by.
  */
 export function desktopApp(region, { platform = process.platform, home = homedir() } = {}) {
+  if (platform === 'win32') {
+    const products = KNOWN_PROFILES.find((entry) => entry.region === region)?.products ?? []
+    return windowsDesktopApp(region, products, home)
+  }
   const bundleIds = APP_BUNDLE_IDS[region] ?? []
   const roots = platform === 'darwin'
     ? ['/Applications', join(home, 'Applications')]

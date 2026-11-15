@@ -1,0 +1,22 @@
+{
+ "model": "deepseek-v4-pro",
+ "host": "DeepSeek",
+ "protocol": "openai",
+ "captured_at": "2026-11-15",
+ "source": "https://api.deepseek.com",
+ "runs": 2,
+ "values": {
+  "tok-english": "49",
+  "tok-chinese": "53",
+  "tok-code": "62",
+  "tok-emoji": "83",
+  "template-offset": "+84 (delta 7)",
+  "err-temperature": "accepts 2.0 (ceiling >= 2)",
+  "err-maxtokens": "{\"message\": \"Invalid max_tokens value, the valid range of max_tokens is [1, 393216] (request_id: …)\", \"type\": \"invalid_request_error\", \"param\": null, \"code\": \"invalid_request_error\"}",
+  "err-code-family": "no upstream error (accepts 2.0)",
+  "finish-vocab": "stop · length"
+ },
+ "unstable": {
+  "lp-geometry": "δ=0.32 · span=0.61 · k=10"
+ }
+}

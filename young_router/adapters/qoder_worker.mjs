@@ -28,8 +28,9 @@
  * reports it and that provider stays disabled until a PAT is stored.
  *
  * Protocol (all routes require ``Authorization: Bearer <--token>``):
- *   GET  /control/status                          account state per region
- *   GET  /control/models?provider=<id>[&refresh=1] rich catalog per region
+ *   GET  /control/status[?refresh=1]              account state per region
+ *   GET  /control/models?provider=<id>            rich catalog per region
+ *   GET  /control/app?provider=<id>               the desktop app that owns the sign-in
  *   POST /control/login                            store and verify a PAT
  *   POST /control/logout                           forget the stored PAT
  *   POST /control/shutdown                         stop the listener
@@ -44,6 +45,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, w
 import { pathToFileURL } from 'node:url'
 import { basename, dirname, join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { AsyncLocalStorage } from 'node:async_hooks'
 
 import {
   OPENAPI_BY_REGION,
@@ -102,6 +104,17 @@ function signedOutMessage(region) {
  * revoked) drops the cache and re-reads once — see ``_desktopSession``.
  */
 const DESKTOP_SESSION_TTL_MS = 120_000
+
+/**
+ * The desktop session one upstream call answers its own exchanges from.
+ *
+ * Requests overlap — the pane polls status while a chat streams — so the
+ * session cannot be a field on the region: whichever call finished first would
+ * clear it, and a call still waiting for its exchange would then go to the
+ * network carrying a device token the exchange endpoint refuses.  The scope
+ * follows the call's own async chain instead.
+ */
+const desktopScope = new AsyncLocalStorage()
 
 function parseArguments(argv) {
   const options = { port: 0, token: '', root: '', entry: '' }
@@ -275,7 +288,6 @@ function creditsOf(usage) {
 
 /** The default context window one catalog row declares, or the plugin default. */
 function contextWindowOf(model) {
-  const tiers = contextTiersOf(model)
   const declared = model.context_config
   if (declared && typeof declared === 'object') {
     const entries = Object.values(declared).filter(entry => entry && typeof entry.token_count === 'number')
@@ -421,8 +433,6 @@ class RegionRuntime {
     this.catalogError = ''
     /** The desktop session ``credential()`` last answered, if any. */
     this._desktopSessionCache = undefined
-    /** Set while one client call runs under the desktop session. */
-    this._activeDesktop = undefined
   }
 
   /**
@@ -450,9 +460,9 @@ class RegionRuntime {
   }
 
   /** The app session this region serves with, cached briefly. */
-  async _desktopSession({ refresh = false } = {}) {
+  async _desktopSession() {
     const now = Date.now()
-    if (!refresh && this._desktopSessionCache !== undefined) {
+    if (this._desktopSessionCache !== undefined) {
       const cached = this._desktopSessionCache
       if (now - cached.at < DESKTOP_SESSION_TTL_MS) return cached.value
     }
@@ -485,7 +495,7 @@ class RegionRuntime {
    */
   async _upstreamFetch(url, init) {
     const target = String(url)
-    const active = this._activeDesktop
+    const active = desktopScope.getStore()
     if (active !== undefined) {
       if (target.includes('/algo/api/v3/user/jobToken')) {
         // The identity document the cosy handshake carries.  `expireTime` is
@@ -538,10 +548,9 @@ class RegionRuntime {
     return undefined
   }
 
-  /** Mark which credential the next client call runs under. */
-  _useCredential(credential) {
-    this._activeDesktop = credential?.source === 'app' ? credential.desktop : undefined
-    return credential?.pat
+  /** Run one client call with ``credential``'s desktop session in scope. */
+  _call(credential, run) {
+    return desktopScope.run(credential?.source === 'app' ? credential.desktop : undefined, run)
   }
 
   /**
@@ -567,9 +576,9 @@ class RegionRuntime {
         ...(this.catalogError !== '' ? { catalogError: this.catalogError } : {}),
       }
     }
-    const token = this._useCredential(credential)
+    const token = credential.pat
     try {
-      const holder = await this.client.ensureSession(token)
+      const holder = await this._call(credential, () => this.client.ensureSession(token))
       const jobToken = holder?.jobToken ?? {}
       const nickname = typeof jobToken.name === 'string' && jobToken.name.trim() !== ''
         ? jobToken.name.trim()
@@ -598,7 +607,7 @@ class RegionRuntime {
       }
       if (withCredits) {
         try {
-          const usage = await this.client.fetchUsage(token)
+          const usage = await this._call(credential, () => this.client.fetchUsage(token))
           result.credits = creditsOf(usage)
           // The usage document is the account's own statement of its plan; the
           // job-token exchange carries one only for the PAT path, so a session
@@ -634,8 +643,6 @@ class RegionRuntime {
         ...(this.fetchedAtMs > 0 ? { catalogFetchedAtMs: this.fetchedAtMs } : {}),
         ...(this.catalogError !== '' ? { catalogError: this.catalogError } : {}),
       }
-    } finally {
-      this._activeDesktop = undefined
     }
   }
 
@@ -649,33 +656,26 @@ class RegionRuntime {
       this.catalogError = ''
       throw new Error(signedOutMessage(this.region))
     }
-    const token = this._useCredential(credential)
+    const token = credential.pat
     let models
     try {
-      models = await this.client.fetchModels(token)
+      models = await this._call(credential, () => this.client.fetchModels(token))
     } catch (error) {
+      this.catalogError = String(error?.message ?? error)
       if (errorStatus(error).kind === 'auth' && credential.source === 'app') {
         // One retry on a re-read session: the desktop app may have rotated the
         // token between this read and the request above.
         this._desktopSessionCache = undefined
         const retried = await this.credential()
         if (retried?.source === 'app') {
-          const retryToken = this._useCredential(retried)
-          try {
-            models = await this.client.fetchModels(retryToken)
-          } finally {
-            this._activeDesktop = undefined
-          }
+          models = await this._call(retried, () => this.client.fetchModels(retried.pat))
         } else {
-          this._activeDesktop = undefined
           throw error
         }
       } else {
-        this._activeDesktop = undefined
         throw error
       }
     }
-    this._activeDesktop = undefined
     this.models = models.map(normalizeModel).filter(model => typeof model.id === 'string' && model.id !== '')
     this.source = 'live'
     this.fetchedAtMs = Date.now()
@@ -694,7 +694,6 @@ class RegionRuntime {
     // start from a clean client, then keep the session this validation just
     // exchanged so the status read below reuses it.
     this.client = this._newClient()
-    this._activeDesktop = undefined
     await this.client.fetchModels(value)
     writeStoredPat(this.root, this.id, value)
     try {
@@ -721,7 +720,6 @@ class RegionRuntime {
     // re-read the desktop app on the next ask: the user may have signed it out.
     this.client = this._newClient()
     this._desktopSessionCache = undefined
-    this._activeDesktop = undefined
     this.models = []
     this.source = 'none'
     this.fetchedAtMs = 0
@@ -804,9 +802,9 @@ class RegionRuntime {
       wroteBytes = true
     }
 
-    const token = this._useCredential(credential)
+    const token = credential.pat
     try {
-      await this.client.chatStream(token, key, messages, {
+      await this._call(credential, () => this.client.chatStream(token, key, messages, {
         ...(tools === undefined ? {} : { tools }),
         // The same rule the plugin's shim applies: an explicit effort turns
         // thinking on (unless it is ``off``), and a client that only asked for
@@ -848,7 +846,7 @@ class RegionRuntime {
             aggregatedReasoning += delta.reasoningContent
           }
         },
-      })
+      }))
       if (wantsStream) {
         const done = makeChunk(id, created, model)
         done.choices[0].finish_reason = finishReason ?? 'stop'
@@ -906,8 +904,6 @@ class RegionRuntime {
       json(res, failure.status, {
         error: { message: failure.message, code: failure.code, type: 'qoder_error' },
       }, error?.retryAfterMs)
-    } finally {
-      this._activeDesktop = undefined
     }
   }
 }
@@ -1113,7 +1109,7 @@ async function main() {
   // stays signed out without a logged failure: "no credential yet" is a normal
   // state, not a broken startup.
   for (const runtime of runtimes.values()) {
-    if (runtime.credential() === undefined) continue
+    if ((await runtime.credential()) === undefined) continue
     void runtime.refresh().catch(error => {
       console.error('[warm]', runtime.id, String(error?.message ?? error))
     })
@@ -1157,7 +1153,7 @@ async function main() {
 
 // Importable for the tests below without starting a listener: the entry point
 // runs only when this file is the process's main module.
-export { loadUpstream, normalizeModel, creditsOf, errorStatus, contextWindowOf }
+export { loadUpstream, normalizeModel, creditsOf, errorStatus }
 
 if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
   main().catch(error => {

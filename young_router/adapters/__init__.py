@@ -1,5 +1,6 @@
 """Adapters and worker scripts for the third-party integrations this app
-bundles (Veridrop, WorkBuddy, Qoder, Our Free Model, dsh-vision-router).
+bundles (modelprint, the precision probe, WorkBuddy, Qoder, Our Free Model,
+dsh-vision-router).
 
 A staged worker that serves a model endpoint publishes the base URL it is
 reachable at as an ``os.environ/`` *reference*, never as a literal URL: the

@@ -63,16 +63,30 @@ if [[ "${YOUNG_ROUTER_ALLOW_CONCURRENT_INSTALL:-}" != "1" ]]; then
 import fcntl
 import os
 import sys
+import time
 
 lock = open(sys.argv[1], "a+")
 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
 with open(sys.argv[2], "x"):
     pass
 os.set_inheritable(lock.fileno(), False)
+# The owner file only announces that the lock was taken: the lock itself has to
+# last for the whole build, so this helper stays alive until the shell's cleanup
+# kills it.  A helper that fell off the end here would drop the flock at once and
+# serialize nothing.  Watching the parent as well means an interrupted shell
+# cannot leave a flock behind that every later build would wait on forever.
+parent = os.getppid()
+while os.getppid() == parent:
+    time.sleep(0.2)
 PY
   INSTALL_LOCK_PID=$!
   while [[ ! -e "$INSTALL_LOCK_OWNER" ]]; do
-    kill -0 "$INSTALL_LOCK_PID" 2>/dev/null || wait "$INSTALL_LOCK_PID"
+    if ! kill -0 "$INSTALL_LOCK_PID" 2>/dev/null; then
+      lock_status=0
+      wait "$INSTALL_LOCK_PID" 2>/dev/null || lock_status=$?
+      echo "Young Router: the install lock helper exited with status $lock_status before it took $INSTALL_LOCK" >&2
+      exit 1
+    fi
     sleep 0.01
   done
   rm -f "$INSTALL_LOCK_OWNER"
@@ -95,6 +109,7 @@ PREVIOUS_APP=""
 FAILED_APP=""
 STAGING_PIDS=()
 COPY_PIDS=()
+TEST_PIDS=()
 INSTALL_PREPARED=0
 RETIRED_HOST=""
 HOST_RETIRED=0
@@ -110,13 +125,12 @@ PROXY_READY_TIMEOUT_SECONDS="${YOUNG_ROUTER_PROXY_READY_TIMEOUT_SECONDS:-360}"
 # How long the stop below may spend waiting for a killed process to be gone
 # before it reports what survived; a SIGKILL cannot be escalated further.
 STOP_TIMEOUT_SECONDS="${YOUNG_ROUTER_STOP_TIMEOUT_SECONDS:-20}"
-REQUIRED_HEALTH_CHECKS=3
 LAUNCH_RETRY_SECONDS=1
 LAST_STARTUP_STATE=""
 # Set when the Core runtime this build copies came from the assembled cache
 # entry rather than from a caller-supplied runtime source.  The cached entry
-# was completed with the staged Veridrop revision's dependencies when it was
-# assembled, so the assembly step below only has to re-verify them.
+# carries everything its assembly already resolved, so the assembly step below
+# only has to re-verify it.
 RUNTIME_FROM_CACHE=0
 
 cleanup() {
@@ -253,7 +267,6 @@ stop_installed_app() {
   # so the grace only added a second to every install.  A proxy drain is not
   # waited for here either: that budget belongs to a replacement the Core
   # performs on purpose (``young_router/lifecycle.py``).
-  [[ -n "$OLD_PIDS" ]] || OLD_PIDS="$bundle_pids"
   APP_PROCESSES_STOP_POLLS=$(( STOP_TIMEOUT_SECONDS * 20 )) \
   survivors="$("$APP_PROCESSES" stop $bundle_pids)" || true
   if [[ -z "$survivors" ]]; then
@@ -311,10 +324,6 @@ proxy_port_for_app() {
   return 1
 }
 
-app_is_ready() {
-  [[ "$(startup_state_for_app "$1")" == "running" ]]
-}
-
 startup_state_for_app() {
   local app_pid="$1"
   local port
@@ -348,7 +357,7 @@ report_startup_state() {
 wait_for_started_app() {
   local rejected_pids="$1"
   local launch_deadline=$((SECONDS + START_TIMEOUT_SECONDS)) global_deadline=$((SECONDS + PROXY_READY_TIMEOUT_SECONDS))
-  local app_pids app_pid candidate_pid ready_pid next_launch_at=0 state launcher
+  local app_pids app_pid candidate_pid ready_pid next_launch_at=0 state
   while :; do
     app_pids="$(installed_pids)"
     candidate_pid=""
@@ -379,7 +388,6 @@ wait_for_started_app() {
     # starting the replacement. Retry only while no replacement process
     # exists; never request a forced new instance.
     if [[ -z "$candidate_pid" && $SECONDS -ge $next_launch_at ]]; then
-      launcher=launch
       open "$DESTINATION" >/dev/null 2>&1 || true
       next_launch_at=$((SECONDS + LAUNCH_RETRY_SECONDS))
     fi
@@ -481,7 +489,8 @@ NODE_RUNTIME_WORK="$RUNTIME_WORK/node"
 mkdir -p "$STAGING_CACHE"
 CONNECT_WORKBUDDY_WORK="$STAGING_CACHE/connect-workbuddy"
 CONNECT_QODER_WORK="$STAGING_CACHE/connect-qoder"
-VERIDROP_WORK="$STAGING_CACHE/veridrop"
+MODELPRINT_WORK="$STAGING_CACHE/modelprint"
+LLM_FINGERPRINT_WORK="$STAGING_CACHE/llm-fingerprint-detector"
 OUR_FREE_MODEL_WORK="$STAGING_CACHE/our-free-model"
 DSH_VISION_ROUTER_WORK="$STAGING_CACHE/dsh-vision-router"
 # The image-context pass copies Context Attachment Manager's placeholder wording
@@ -497,8 +506,36 @@ STAGING_PIDS+=("$!")
 "${STAGE_PYTHON[@]}" "$PROJECT_ROOT/scripts/update_connect_qoder.py" \
   --output "$CONNECT_QODER_WORK" &
 STAGING_PIDS+=("$!")
-"${STAGE_PYTHON[@]}" "$PROJECT_ROOT/scripts/update_veridrop.py" \
-  --output "$VERIDROP_WORK" &
+# The deep test's tables are versioned with the values they produced, so a
+# release built from a stale pair reports differences that are not there.  The
+# check runs first and reports whether upstream moved; staging then always runs,
+# so a build never packages whatever happened to be in the cache.
+if ! "${STAGE_PYTHON[@]}" "$PROJECT_ROOT/scripts/update_modelprint.py" \
+  --output "$MODELPRINT_WORK" --check; then
+  MODELPRINT_CHECK=$?
+  if [[ "$MODELPRINT_CHECK" == "4" ]]; then
+    echo "Could not reach the modelprint upstream; the deep test's tables cannot be verified." >&2
+    exit 5
+  fi
+  printf 'modelprint tables moved upstream; restaging.\n'
+fi
+"${STAGE_PYTHON[@]}" "$PROJECT_ROOT/scripts/update_modelprint.py" \
+  --output "$MODELPRINT_WORK" &
+STAGING_PIDS+=("$!")
+# The precision probe is a TypeScript library, so it is staged and built with
+# its own toolchain.  Same gate as the tables above: ask upstream whether it
+# moved before staging, and never treat an unreachable upstream as current.
+if ! "${STAGE_PYTHON[@]}" "$PROJECT_ROOT/scripts/update_llm_fingerprint.py" \
+  --output "$LLM_FINGERPRINT_WORK" --check; then
+  LLM_FINGERPRINT_CHECK=$?
+  if [[ "$LLM_FINGERPRINT_CHECK" == "4" ]]; then
+    echo "Could not reach the precision probe's upstream; it cannot be verified." >&2
+    exit 5
+  fi
+  printf 'the precision probe moved upstream; restaging.\n'
+fi
+"${STAGE_PYTHON[@]}" "$PROJECT_ROOT/scripts/update_llm_fingerprint.py" \
+  --output "$LLM_FINGERPRINT_WORK" &
 STAGING_PIDS+=("$!")
 "${STAGE_PYTHON[@]}" "$PROJECT_ROOT/scripts/update_dsh_vision_router.py" \
   --output "$DSH_VISION_ROUTER_WORK" &
@@ -593,9 +630,9 @@ BUN_RUNTIME_ARGS=("$PROJECT_ROOT/scripts/update_bun_runtime.py"
   --output "$NODE_RUNTIME_WORK")
 "${STAGE_PYTHON[@]}" "${BUN_RUNTIME_ARGS[@]}" &
 STAGING_PIDS+=("$!")
-# The authenticity deep test runs the latest upstream Veridrop, so every
-# artifact build re-checks its default branch instead of packaging a stale
-# copy of the scan program.
+# The authenticity deep test runs the latest upstream modelprint tables, so
+# every artifact build re-checks its default branch instead of packaging a
+# stale fingerprint set.
 # WorkBuddy access is driven through the published third-party package, so
 # every artifact build re-resolves its latest release instead of shipping a
 # stale protocol copy.
@@ -661,21 +698,26 @@ fi
 if [[ -f node_modules/typescript/bin/tsc ]]; then
   pnpm run test &
   RN_TESTS_PID=$!
+  TEST_PIDS+=("$RN_TESTS_PID")
   pnpm run contract-check &
   RN_CONTRACT_PID=$!
+  TEST_PIDS+=("$RN_CONTRACT_PID")
   pnpm run code-editor:build &
   RN_EDITOR_PID=$!
+  TEST_PIDS+=("$RN_EDITOR_PID")
   # The browser page ships inside Core, so it is a build product of this
   # artifact like the code editor's HTML: a build without it would install a
   # General pane naming an address nothing answers.
   pnpm run build:web &
   RN_WEB_PID=$!
+  TEST_PIDS+=("$RN_WEB_PID")
   pnpm run typecheck:no-editor &
   RN_TYPECHECK_PID=$!
+  TEST_PIDS+=("$RN_TYPECHECK_PID")
 else
   pnpm run check:macos &
   STATIC_CHECKS_PID=$!
-  TEST_PIDS=("$STATIC_CHECKS_PID")
+  TEST_PIDS+=("$STATIC_CHECKS_PID")
 fi
 wait_static_checks() {
   local failed=0 pid
@@ -828,7 +870,8 @@ start_copy() {
 # there ships a pane pointing at nothing.  It is built from the same shared UI
 # the two native hosts load, and the build refuses rather than omitting it.
 start_copy copy_tree "$PROJECT_ROOT/rn/apps/web/dist" "$CORE/web"
-start_copy copy_tree "$VERIDROP_WORK" "$CORE/young_router/adapters/veridrop"
+start_copy copy_tree "$MODELPRINT_WORK" "$CORE/young_router/adapters/modelprint"
+start_copy copy_tree "$LLM_FINGERPRINT_WORK" "$CORE/young_router/adapters/llm-fingerprint-detector"
 start_copy copy_tree "$CONNECT_WORKBUDDY_WORK" "$CORE/young_router/adapters/connect-workbuddy"
 start_copy copy_tree "$CONNECT_QODER_WORK" "$CORE/young_router/adapters/connect-qoder"
 start_copy copy_tree "$DSH_VISION_ROUTER_WORK" "$CORE/young_router/adapters/dsh-vision-router"
@@ -867,7 +910,8 @@ else
   RUNTIME_CACHE_KEY="$UV_RUNTIME-litellm-$LITELLM_VERSION"
   RUNTIME_CACHE_ENTRY="$RUNTIME_CACHE/$RUNTIME_CACHE_KEY"
   if [[ ! -x "$RUNTIME_CACHE_ENTRY/python/bin/python3.12" \
-    || ! -d "$RUNTIME_CACHE_ENTRY/site-packages" ]]; then
+    || ! -d "$RUNTIME_CACHE_ENTRY/site-packages" \
+    || ! -f "$RUNTIME_CACHE_ENTRY/.complete" ]]; then
     rm -rf "$RUNTIME_CACHE_ENTRY"
     mkdir -p "$RUNTIME_CACHE_ENTRY/bin" "$RUNTIME_CACHE_ENTRY/site-packages"
     UV_PYTHON_INSTALL_DIR="$RUNTIME_WORK/python-installs" \
@@ -888,20 +932,14 @@ else
     cp "$PROJECT_ROOT/scripts/runtime/python-wrapper.sh" "$RUNTIME_CACHE_ENTRY/bin/python"
     cp "$PROJECT_ROOT/scripts/runtime/litellm-wrapper.sh" "$RUNTIME_CACHE_ENTRY/bin/litellm"
     chmod 0755 "$RUNTIME_CACHE_ENTRY/bin/python" "$RUNTIME_CACHE_ENTRY/bin/litellm"
-    # The staged scan program is imported into the Core's own interpreter, so
-    # whatever it imports and the runtime does not already carry is added to
-    # that runtime - and only that: a dependency the runtime already has is
-    # never upgraded under the release's own pins.  Doing it here, before the
-    # entry is finished, is what lets the entry be the whole answer: the same
-    # resolve was previously re-run against every build's Core copy, because
-    # the result lived in the copy and not in the cache it came from.
-    "$RUNTIME_CACHE_ENTRY/python/bin/python3.12" "$PROJECT_ROOT/scripts/update_veridrop.py" \
-      --output "$VERIDROP_WORK" \
-      --install-deps "$RUNTIME_CACHE_ENTRY/site-packages" \
-      --python "$RUNTIME_CACHE_ENTRY/python/bin/python3.12" || {
-      echo "Could not complete the bundled Veridrop dependencies." >&2
-      exit 5
-    }
+    # The deep test's tables are data: the probe table runs in the Core's own
+    # interpreter with the standard library, so no wheel is resolved into the
+    # bundled runtime for it.
+    # The entry is assembled in place, so the interpreter exists long before
+    # the wheels do.  Without this marker a run killed mid-assembly leaves a
+    # tree that looks complete to the test above and fails only its verify
+    # pass, on every later build, until the cache is deleted by hand.
+    touch "$RUNTIME_CACHE_ENTRY/.complete"
   else
     printf 'Reusing cached Core runtime: %s\n' "$RUNTIME_CACHE_ENTRY"
   fi
@@ -925,36 +963,6 @@ fi
 # never overwrite the claim for the release this build is packaging.
 cp "$PROJECT_ROOT/LITELLM_VERSION" "$CORE/runtime/LITELLM_VERSION"
 mkdir -p "$CORE/runtime/bin"
-
-# The staged scan program is imported into the Core's own interpreter, so what
-# it imports and the bundled runtime does not already carry is added to that
-# runtime here - and only that: a dependency the runtime already has is never
-# upgraded under the release's own pins.  The cached runtime was completed with
-# these dependencies when it was assembled, so this build only has to prove the
-# copied Core still carries them; a caller-supplied runtime that was never
-# through that step is completed here.
-if [[ "$RUNTIME_FROM_CACHE" == "1" ]]; then
-  MISSING_VERIDROP_DEPS="$("$CORE/runtime/python/bin/python3.12" \
-    "$PROJECT_ROOT/scripts/update_veridrop.py" \
-    --output "$VERIDROP_WORK" \
-    --missing-deps "$CORE/runtime/site-packages" 2>/dev/null)"
-  if [[ -n "$MISSING_VERIDROP_DEPS" ]]; then
-    echo "The cached Core runtime is missing dependencies the staged Veridrop revision imports: $MISSING_VERIDROP_DEPS" >&2
-    exit 5
-  fi
-else
-  "$CORE/runtime/python/bin/python3.12" "$PROJECT_ROOT/scripts/update_veridrop.py" \
-    --output "$VERIDROP_WORK" \
-    --install-deps "$CORE/runtime/site-packages" \
-    --python "$CORE/runtime/python/bin/python3.12" || {
-    echo "Could not complete the bundled Veridrop dependencies." >&2
-    exit 5
-  }
-fi
-# The dependency pass operates on the staged tree and may replace its package
-# payload while resolving missing wheels; restore the upstream license beside
-# the copied package before the bundle checks inspect the assembled Core.
-cp -p "$VERIDROP_WORK/LICENSE" "$CORE/young_router/adapters/veridrop/LICENSE"
 
 # Published JavaScript packages include declaration files, source maps, tests,
 # docs and demo media for npm consumers. The shipped workers execute only the
@@ -1024,12 +1032,20 @@ fi
   echo "Bundled Core launcher is missing." >&2
   exit 5
 }
-[[ -f "$CORE/young_router/adapters/veridrop/src/relay_detector/cli.py" ]] || {
-  echo "The bundled Veridrop scan program is missing." >&2
+[[ -f "$CORE/young_router/adapters/modelprint/manifest.json" ]] || {
+  echo "The bundled modelprint fingerprint tables are missing." >&2
   exit 5
 }
-[[ -f "$CORE/young_router/adapters/veridrop/LICENSE" ]] || {
-  echo "The bundled Veridrop license text is missing." >&2
+[[ -f "$CORE/young_router/adapters/modelprint/LICENSE" ]] || {
+  echo "The bundled modelprint license text is missing." >&2
+  exit 5
+}
+[[ -f "$CORE/young_router/adapters/llm-fingerprint-detector/dist/index.js" ]] || {
+  echo "The bundled precision probe was not built." >&2
+  exit 5
+}
+[[ -f "$CORE/young_router/adapters/llm-fingerprint-detector/LICENSE" ]] || {
+  echo "The bundled precision probe license text is missing." >&2
   exit 5
 }
 [[ -f "$CORE/young_router/adapters/workbuddy_stream.mjs" ]] || {
@@ -1162,28 +1178,36 @@ fi
 # be imported here would otherwise surface as a failed deep test long after the
 # build.  The check names the same objects the adapter imports, so a release
 # that renames one fails here rather than at probe time.
-if ! VERIDROP_SMOKE_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 "$CORE/runtime/bin/python" -c "
-import sys
-sys.path.insert(0, '$CORE/young_router/adapters/veridrop/src')
-from relay_detector.models import DetectionReport, ExecutionConfig, Mode, Protocol, mask_api_key
-from relay_detector.scorer import compute_total, effective_verdict, fatal_run_error, summary_text
-import relay_detector.protocols.anthropic
-import relay_detector.protocols.openai
-import relay_detector.protocols.gemini
-import relay_detector.protocols.anthropic as a, relay_detector.protocols.openai as o, relay_detector.protocols.gemini as g
-for proto in (a, o, g):
-    for name in ('build_detectors', 'build_runner', 'make_client'):
-        assert hasattr(proto, name), (proto.__name__, name)
-assert ExecutionConfig.for_mode(Mode.QUICK, max_concurrent=3) is not None
-print('young-router-veridrop-import-ok')
+if ! MODELPRINT_SMOKE_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 "$CORE/runtime/bin/python" -c "
+import hashlib, json, sys
+root = '$CORE/young_router/adapters/modelprint'
+manifest = json.load(open(root + '/manifest.json', encoding='utf-8'))
+texts = manifest['probe_texts']
+digests = manifest['probe_text_digests']
+assert set(texts) == set(digests) and texts, 'no pinned probe texts staged'
+for name, text in texts.items():
+    assert hashlib.sha256(text.encode('utf-8')).hexdigest() == digests[name], name
+assert manifest['supported_models'], 'no supported model staged'
+assert manifest['official_baselines'], 'no official baseline staged'
+sys.path.insert(0, '$CORE')
+from young_router.adapters import modelprint as adapter
+assert adapter.available(), 'the staged tables do not verify'
+assert adapter.protocol_for('claude-opus-5') == 'anthropic'
+assert adapter.protocol_for('gpt-5.6-sol') == 'openai'
+import json as _json
+_lfd = '$CORE/young_router/adapters/llm-fingerprint-detector'
+_lfd_manifest = _json.load(open(_lfd + '/manifest.json', encoding='utf-8'))
+assert _lfd_manifest['thresholds'] == {'JSD_MATCH_THRESHOLD': 0.25, 'JSD_MISMATCH_THRESHOLD': 0.35}, _lfd_manifest['thresholds']
+assert open(_lfd + '/dist/index.js', encoding='utf-8').read().strip(), 'the precision probe has no build output'
+print('young-router-modelprint-tables-ok')
 " 2>&1)"; then
-  echo "The bundled Veridrop program could not be imported: $VERIDROP_SMOKE_OUTPUT" >&2
+  echo "The bundled modelprint tables could not be verified: $MODELPRINT_SMOKE_OUTPUT" >&2
   exit 5
 fi
-case "$VERIDROP_SMOKE_OUTPUT" in
-  *young-router-veridrop-import-ok*) ;;
+case "$MODELPRINT_SMOKE_OUTPUT" in
+  *young-router-modelprint-tables-ok*) ;;
   *)
-    echo "The bundled Veridrop import smoke test printed no confirmation." >&2
+    echo "The bundled modelprint smoke test printed no confirmation." >&2
     exit 5
     ;;
 esac

@@ -27,7 +27,7 @@ from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from ..core.persistence import PersistenceError, read_json
+from ..core.persistence import PersistenceError, atomic_write_json, read_json
 from ..node_runtime import bundled_executable, node_command as node_runtime_command
 
 
@@ -311,7 +311,7 @@ def provider_for_channel(channel: object) -> str:
     tag = str(channel or "").strip().casefold()
     if tag in UNSERVED_CHANNELS:
         return ""
-    return CHANNEL_TO_PROVIDER.get(tag, OUR_FREE_MODEL_PROVIDER)
+    return CHANNEL_TO_PROVIDER.get(tag, "")
 
 
 def provider_for_channel_tag(channel: object) -> str:
@@ -605,7 +605,9 @@ class OurFreeModelRuntime:
         else:
             raise OurFreeModelUnavailable(f"The {OUR_FREE_MODEL_DISPLAY_NAME} worker did not start in time")
         ready_path = self.root / "online.json"
-        if ready_path.stat().st_mode & 0o077:
+        # Windows reports a synthetic mode (0o666 for a writable file), so this
+        # test would call every readiness file public there.
+        if os.name != "nt" and ready_path.stat().st_mode & 0o077:
             raise OurFreeModelUnavailable(f"The {OUR_FREE_MODEL_DISPLAY_NAME} readiness file is not private")
         ready = read_json(ready_path, default={})
         try:
@@ -618,6 +620,7 @@ class OurFreeModelRuntime:
         self._port = control_port
         self._gateway_port = gateway_port
         handoff.close()
+        self._persist_worker_identity()
 
     def _worker_failure(self, process: subprocess.Popen[bytes], port: int) -> str:
         try:
@@ -626,6 +629,72 @@ class OurFreeModelRuntime:
             text = ""
         last = next((line.strip() for line in reversed(text.splitlines()) if line.strip()), "")
         return f"Exit {process.returncode}: {last}" if last else f"Exit {process.returncode}"
+
+    def _identity_path(self) -> Path:
+        return self.root / "worker.json"
+
+    def _persist_worker_identity(self) -> None:
+        """Remember the address and bearer a running worker answers with.
+
+        The bearer exists only in this process's memory and in the worker's own
+        environment, so without this record a `--no-start` status read -- a
+        separate process, with a fresh runtime -- could only answer that no
+        worker is running while one serves every request.  The file is private
+        (0600) and holds no more than the token the worker was already given.
+        """
+
+        try:
+            atomic_write_json(
+                self._identity_path(),
+                {"control_port": self._port, "gateway_port": self._gateway_port, "token": self._token},
+            )
+        except PersistenceError:
+            return
+
+    def _remembered_environment(self) -> dict[str, str]:
+        """The fragment of a worker another process started, if it is still up."""
+
+        try:
+            stored = read_json(self._identity_path(), default={})
+        except PersistenceError:
+            return {}
+        if not isinstance(stored, Mapping):
+            return {}
+        token = str(stored.get("token", "") or "").strip()
+        gateway_port = stored.get("gateway_port")
+        control_port = stored.get("control_port")
+        if (
+            not token
+            or type(gateway_port) is not int
+            or type(control_port) is not int
+            or gateway_port <= 0
+            or control_port <= 0
+        ):
+            return {}
+        try:
+            with urlopen(
+                Request(
+                    f"http://127.0.0.1:{control_port}/health",
+                    headers={"Accept": "application/json"},
+                ),
+                timeout=2.0,
+            ) as response:
+                response.read()
+        except Exception:
+            # The record outlived the worker it names.  A stale file must not
+            # make this read claim a lane nobody serves.
+            return {}
+        base = f"http://127.0.0.1:{gateway_port}"
+        return {
+            **{API_BASE_ENV[provider]: f"{base}/v1" for provider in OUR_FREE_MODEL_PROVIDERS},
+            **{API_KEY_ENV[provider]: token for provider in OUR_FREE_MODEL_PROVIDERS},
+        }
+
+    def _forget_worker_identity(self) -> None:
+        try:
+            self._identity_path().unlink()
+        except OSError:
+            pass
 
     def _proxy_environment(self) -> dict[str, str]:
         if not self._token:
@@ -652,7 +721,13 @@ class OurFreeModelRuntime:
             source_dir = str(self.settings.get(_SOURCE_STATE, "")).strip()
             if source_dir:
                 os.environ["YOUNG_ROUTER_OUR_FREE_MODEL_SOURCE_DIR"] = source_dir
-            return self._proxy_environment() if self._gateway_port else {}
+            if self._gateway_port:
+                return self._proxy_environment()
+        # A status read (`managed --no-start`) runs in its own process: it made
+        # a fresh runtime, and the worker it is asked about was started by
+        # another one.  The address and bearer that worker published are on
+        # disk, so the read answers with them instead of "no worker".
+        return self._remembered_environment()
 
     def _publish_environ_locked(self) -> None:
         values = self._proxy_environment()
@@ -668,6 +743,9 @@ class OurFreeModelRuntime:
 
     def _stop(self) -> None:
         process = self._process
+        if process is not None:
+            # The identity record describes a worker that is going away.
+            self._forget_worker_identity()
         self._process = None
         self._port = 0
         self._gateway_port = 0
@@ -768,7 +846,7 @@ class OurFreeModelRuntime:
             # the two answer different questions: ``routes`` is the availability
             # split the picker groups by, this is the upstream the row is
             # actually served from.
-            "channels": _channel_membership(document.get("channels")),
+            "channels": channels,
             # Which surface each row answers on.  Stated per row because the
             # upstream routes per row: a provider-level default cannot describe
             # a roster whose inner split is its own.
@@ -833,17 +911,6 @@ class OurFreeModelRuntime:
         return parsed
 
 
-def unsupported_status() -> dict[str, Any]:
-    """Every channel row reports the same absence: one worker serves them all."""
-
-    return {
-        "providers": {
-            provider: {"provider": provider, "state": "missing"}
-            for provider in OUR_FREE_MODEL_PROVIDERS
-        }
-    }
-
-
 __all__ = [
     "API_BASE_ENV",
     "API_KEY_ENV",
@@ -874,7 +941,6 @@ __all__ = [
     "node_command",
     "published_environment",
     "staged_root",
-    "unsupported_status",
     "validated_provider",
     "worker_path",
 ]

@@ -29,9 +29,9 @@ import json
 import math
 import os
 from pathlib import Path
+import queue
 import re
 import secrets
-import socket
 import subprocess
 import threading
 import time
@@ -39,8 +39,9 @@ from typing import Any, Mapping
 
 from ..node_runtime import node_command as node_runtime_command
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
+from ..api_base import isolated_http_opener
 from ..browser_identity import browser_request_headers
 from ..core.persistence import PersistenceError, atomic_write_json, read_json
 
@@ -70,12 +71,10 @@ WORKBUDDY_DISPLAY_NAMES = {
     WORKBUDDY_GLOBAL_PROVIDER: "WorkBuddy Global",
 }
 
-# The product-neutral spelling of the same facts.  A domain that projects more
-# than one managed account integration reads these names, so a second
+# The product-neutral spelling of the same fact.  A domain that projects more
+# than one managed account integration reads this name, so a second
 # integration does not have to teach every caller its product prefix.
-AUTH_KINDS = WORKBUDDY_AUTH_KINDS
 DISPLAY_NAMES = WORKBUDDY_DISPLAY_NAMES
-PROVIDERS = WORKBUDDY_PROVIDERS
 # The operation name this integration's catalog read answers under.  A caller
 # that routes by module reads it here rather than spelling the product.
 MODELS_OPERATION = "workbuddy_models"
@@ -262,12 +261,6 @@ def validated_provider(value: object) -> str:
     if provider not in WORKBUDDY_PROVIDERS:
         raise ValueError("Unknown WorkBuddy provider")
     return provider
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        return int(probe.getsockname()[1])
 
 
 class WorkBuddyRuntime:
@@ -524,20 +517,41 @@ class WorkBuddyRuntime:
     def _read_ready(self, process: subprocess.Popen[bytes]) -> dict[str, Any] | None:
         """Read the worker's one-line readiness record without blocking Core."""
 
-        if process.stdout is None:
+        stdout = process.stdout
+        if stdout is None:
             return None
+        # ``readline`` on a pipe blocks until a line or EOF arrives, so the
+        # deadline cannot bound the read itself: the read runs on its own
+        # thread and only the wait for its answer is timed.  A worker that
+        # hangs before printing the line would otherwise hold this thread - and
+        # the runtime lock it was called under - forever.
+        lines: queue.Queue[bytes] = queue.Queue()
+
+        def read_line() -> None:
+            try:
+                lines.put(stdout.readline())
+            except (OSError, ValueError):
+                # A teardown closing the pipe under the read answers the way
+                # an EOF does: no readiness line arrived.
+                lines.put(b"")
+
+        threading.Thread(
+            target=read_line,
+            name="young-router-workbuddy-ready",
+            daemon=True,
+        ).start()
         deadline = time.monotonic() + _WORKBUDDY_START_TIMEOUT_SECONDS
-        while time.monotonic() < deadline:
-            line = process.stdout.readline()
-            if line:
-                try:
-                    payload = json.loads(line.decode("utf-8", "replace"))
-                except json.JSONDecodeError:
-                    return None
-                return payload if payload.get("ready") is True else None
-            if process.poll() is not None:
-                return None
-        return None
+        try:
+            line = lines.get(timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Empty:
+            return None
+        if not line:
+            return None
+        try:
+            payload = json.loads(line.decode("utf-8", "replace"))
+        except json.JSONDecodeError:
+            return None
+        return payload if payload.get("ready") is True else None
 
     def _proxy_environment(self) -> dict[str, str]:
         base = f"http://127.0.0.1:{self._port}"
@@ -621,7 +635,7 @@ class WorkBuddyRuntime:
             headers={**browser_request_headers(), "Authorization": f"Bearer {self._token}"},
         )
         try:
-            with urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed loopback URL
+            with isolated_http_opener().open(request, timeout=timeout) as response:
                 payload = response.read()
         except (HTTPError, URLError, OSError, TimeoutError) as exc:
             raise WorkBuddyUnavailable("The WorkBuddy worker did not answer") from exc
@@ -688,8 +702,10 @@ class WorkBuddyRuntime:
             f"/control/models?provider={name}{suffix}",
             timeout=_WORKBUDDY_MODELS_TIMEOUT_SECONDS,
         )
-        # A catalog read answers the account question too, so the status
-        # document it carries replaces the one the status cache holds.
+        # A catalog read answers the account question too, but only for the
+        # region it names, so it cannot fill the both-region status document
+        # this cache holds: that cache is dropped and the next status read asks
+        # the worker again.
         self._status_cache = None
         if document.get("available") is not True:
             self._models_cache.pop(name, None)
@@ -771,16 +787,6 @@ class WorkBuddyRuntime:
         except Exception:
             result["opened"] = False
         return result
-
-
-def unsupported_status() -> dict[str, Any]:
-    """Status document used when the integration is not staged."""
-
-    return {"available": False, "detail": "integration_unstaged", "providers": {}}
-
-
-def script_available() -> bool:
-    return available() and worker_path().is_file()
 
 
 def managed_runtime(runtime_root: Path | str | None = None) -> WorkBuddyRuntime:

@@ -58,7 +58,8 @@ $StagingCache = if ($env:YOUNG_ROUTER_STAGING_CACHE) {
 }
 New-Item -ItemType Directory -Force -Path $StagingCache | Out-Null
 $NodeRuntime = Join-Path $StagingCache "node-runtime"
-$VeridropWork = Join-Path $StagingCache "veridrop"
+$ModelPrintWork = Join-Path $StagingCache "modelprint"
+$LlmFingerprintWork = Join-Path $StagingCache "llm-fingerprint-detector"
 $ConnectWorkBuddyWork = Join-Path $StagingCache "connect-workbuddy"
 $ConnectQoderWork = Join-Path $StagingCache "connect-qoder"
 $OurFreeModelWork = Join-Path $StagingCache "our-free-model"
@@ -102,12 +103,24 @@ try {
   & uv run --no-project --python 3.12 $BunRuntimeUpdater `
     --output $NodeRuntime
   if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled Bun runtime." }
-  # The authenticity deep test runs the latest upstream Veridrop, so every
-  # artifact build re-checks its default branch instead of packaging a stale
-  # copy of the scan program.
-  $VeridropUpdater = Join-Path $ProjectRoot "scripts\update_veridrop.py"
-  & uv run --no-project --python 3.12 $VeridropUpdater --output $VeridropWork
-  if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled Veridrop scan program." }
+  # The deep test's tables are versioned with the values they produced, so a
+  # release built from a stale pair reports differences that are not there.  The
+  # check runs first and reports whether upstream moved; staging then always
+  # runs, so a build never packages whatever happened to be in the cache.
+  # Exit code 4 means upstream was unreachable, and a build must not treat that
+  # as "we are current".
+  $ModelPrintUpdater = Join-Path $ProjectRoot "scripts\update_modelprint.py"
+  & uv run --no-project --python 3.12 $ModelPrintUpdater --output $ModelPrintWork --check
+  if ($LASTEXITCODE -eq 4) { throw "Could not reach the modelprint upstream; the deep test's tables cannot be verified." }
+  & uv run --no-project --python 3.12 $ModelPrintUpdater --output $ModelPrintWork
+  if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled modelprint tables." }
+  # The precision probe is a TypeScript library, so it is staged and built with
+  # its own toolchain.  Same gate: ask upstream whether it moved first.
+  $LlmFingerprintUpdater = Join-Path $ProjectRoot "scripts\update_llm_fingerprint.py"
+  & uv run --no-project --python 3.12 $LlmFingerprintUpdater --output $LlmFingerprintWork --check
+  if ($LASTEXITCODE -eq 4) { throw "Could not reach the precision probe's upstream; it cannot be verified." }
+  & uv run --no-project --python 3.12 $LlmFingerprintUpdater --output $LlmFingerprintWork
+  if ($LASTEXITCODE -ne 0) { throw "Could not update the bundled precision probe." }
   # WorkBuddy access is driven through the published third-party package, so
   # every artifact build re-resolves its latest release.
   $ConnectWorkBuddyUpdater = Join-Path $ProjectRoot "scripts\update_connect_workbuddy.py"
@@ -177,7 +190,8 @@ try {
   New-Item -ItemType Directory -Path $Core | Out-Null
   Copy-CoreSource (Join-Path $ProjectRoot "sitecustomize.py") (Join-Path $Core "sitecustomize.py")
   Copy-CoreSource (Join-Path $ProjectRoot "young_router") (Join-Path $Core "young_router")
-  Copy-CoreSource $VeridropWork (Join-Path $Core "young_router\adapters\veridrop")
+  Copy-CoreSource $ModelPrintWork (Join-Path $Core "young_router\adapters\modelprint")
+  Copy-CoreSource $LlmFingerprintWork (Join-Path $Core "young_router\adapters\llm-fingerprint-detector")
   Copy-CoreSource $ConnectWorkBuddyWork (Join-Path $Core "young_router\adapters\connect-workbuddy")
   Copy-CoreSource $ConnectQoderWork (Join-Path $Core "young_router\adapters\connect-qoder")
   Copy-CoreSource $OurFreeModelWork (Join-Path $Core "young_router\adapters\our-free-model")
@@ -332,14 +346,6 @@ try {
   } else {
     Install-LiteLLM
   }
-  # The staged scan program is imported into the Core's own interpreter, so what
-  # it imports and the bundled runtime does not already carry is added to that
-  # runtime here - and only that: a dependency the runtime already has is never
-  # upgraded under the release's own pins.
-  $VeridropDeps = & (Join-Path $RuntimeBin "python.exe") (Join-Path $ProjectRoot "scripts\update_veridrop.py") `
-    --output $VeridropWork --install-deps (Join-Path $RuntimeBin "Lib\site-packages") `
-    --python (Join-Path $RuntimeBin "python.exe") 2>&1
-  if ($LASTEXITCODE -ne 0) { throw "Could not complete the bundled Veridrop dependencies: $VeridropDeps" }
   Copy-Item -LiteralPath (Join-Path $NodeRuntime "node.exe") -Destination $RuntimeBin -Force
   Copy-Item -LiteralPath (Join-Path $NodeRuntime "bun.exe") -Destination $RuntimeBin -Force
   Copy-Item -LiteralPath (Join-Path $NodeRuntime "BUN_VERSION") -Destination $RuntimeBin -Force
@@ -360,27 +366,36 @@ set "RUNTIME_ROOT=%~dp0"
 '@
   Set-Content -LiteralPath (Join-Path $RuntimeBin "litellm.cmd") -Value $LiteLLMCommand -Encoding ascii
   Copy-Item -LiteralPath (Join-Path $ProjectRoot "LITELLM_VERSION") -Destination (Join-Path $Core "runtime\LITELLM_VERSION") -Force
-  if (-not (Test-Path (Join-Path $Core "young_router\adapters\veridrop\src\relay_detector\cli.py"))) {
-    throw "The bundled Veridrop scan program is missing."
-  }
-  if (-not (Test-Path (Join-Path $Core "young_router\adapters\veridrop\LICENSE"))) {
-    throw "The bundled Veridrop license text is missing."
-  }
-  # The staged program is imported into the Core's own interpreter, so the
-  # bundle proves that import - and the dependency set the runtime was
-  # completed with - before the app is packaged.
-  $VeridropRoot = Join-Path $Core "young_router\adapters\veridrop"
-  $VeridropImport = & (Join-Path $RuntimeBin "python.exe") -c @"
-import sys
-sys.path.insert(0, r'$VeridropRoot\src')
-import relay_detector.cli
-import relay_detector.protocols.anthropic
-import relay_detector.protocols.openai
-import relay_detector.protocols.gemini
-print('young-router-veridrop-import-ok')
-"@ 2>&1
-  if ($LASTEXITCODE -ne 0 -or ($VeridropImport -join "`n") -notmatch "young-router-veridrop-import-ok") {
-    throw "The bundled Veridrop program could not be imported: $VeridropImport"
+  # Both probe engines are checked here, before the app is packaged: a table
+  # set whose pinned texts no longer hash to their recorded digests, or a
+  # precision build that never ran, would otherwise surface as a failed deep
+  # test long after the build.
+  $ModelPrintRoot = Join-Path $Core "young_router\adapters\modelprint"
+  $LlmFingerprintRoot = Join-Path $Core "young_router\adapters\llm-fingerprint-detector"
+  $ProbeSmokeScript = @"
+import hashlib, json, sys
+root = r'$ModelPrintRoot'
+manifest = json.load(open(root + '/manifest.json', encoding='utf-8'))
+texts = manifest['probe_texts']
+digests = manifest['probe_text_digests']
+assert set(texts) == set(digests) and texts, 'no pinned probe texts staged'
+for name, text in texts.items():
+    assert hashlib.sha256(text.encode('utf-8')).hexdigest() == digests[name], name
+assert manifest['supported_models'], 'no supported model staged'
+sys.path.insert(0, r'$Core')
+from young_router.adapters import modelprint as adapter
+assert adapter.available(), 'the staged tables do not verify'
+assert adapter.protocol_for('claude-opus-5') == 'anthropic'
+assert adapter.protocol_for('gpt-5.6-sol') == 'openai'
+lfd = r'$LlmFingerprintRoot'
+lfd_manifest = json.load(open(lfd + '/manifest.json', encoding='utf-8'))
+assert lfd_manifest['thresholds'] == {'JSD_MATCH_THRESHOLD': 0.25, 'JSD_MISMATCH_THRESHOLD': 0.35}, lfd_manifest['thresholds']
+assert open(lfd + '/dist/index.js', encoding='utf-8').read().strip(), 'the precision probe has no build output'
+print('young-router-modelprint-tables-ok')
+"@
+  $ProbeSmoke = & (Join-Path $RuntimeBin "python.exe") -c $ProbeSmokeScript 2>&1
+  if ($LASTEXITCODE -ne 0 -or ($ProbeSmoke -join "`n") -notmatch "young-router-modelprint-tables-ok") {
+    throw "The bundled probe tables could not be verified: $ProbeSmoke"
   }
   if (-not (Test-Path (Join-Path $Core "young_router\adapters\workbuddy_stream.mjs"))) {
     throw "The Windows build output does not contain young_router/adapters/workbuddy_stream.mjs."
@@ -530,8 +545,14 @@ print('young-router-veridrop-import-ok')
     $RawHostIsLauncher = (Get-Content -Raw -LiteralPath $LauncherMarker).Trim() -eq
       (Get-FileHash -LiteralPath $RawHostExe -Algorithm SHA256).Hash
   }
+  # Core is refreshed from the staged tree and copied into the payload below,
+  # so taking the release's copy here would write the whole runtime twice.
+  $ReleaseCore = Join-Path $WindowsRelease "Core"
   Get-ChildItem -LiteralPath $WindowsRelease -Force |
-    Where-Object { -not ($RawHostIsLauncher -and $_.Name -eq "YoungRouter.exe" -and $_.PSIsContainer -eq $false) } |
+    Where-Object {
+      -not ($RawHostIsLauncher -and $_.Name -eq "YoungRouter.exe" -and $_.PSIsContainer -eq $false) -and
+      -not ($_.Name -eq "Core" -and $_.PSIsContainer)
+    } |
     ForEach-Object {
       Copy-Item -LiteralPath $_.FullName -Destination $PackagePayload -Recurse -Force
     }
@@ -579,7 +600,6 @@ print('young-router-veridrop-import-ok')
   # ``young_router`` while the tests ran against the current one.  The staged
   # source tree is copied over it here, before the payload is used, so one build
   # always ships exactly the Core that was just tested.
-  $ReleaseCore = Join-Path $WindowsRelease "Core"
   if (Test-Path $ReleaseCore) {
     Copy-CoreSource $CoreRoot $ReleaseCore
     # The copy merges rather than replaces, so a release the staged tree dropped
@@ -595,7 +615,9 @@ print('young-router-veridrop-import-ok')
       Get-ChildItem -LiteralPath $ReleaseCoreSource -Recurse -File -Include "*.pyc", "*.pyo" |
         Remove-Item -Force -ErrorAction SilentlyContinue
     }
-    Copy-Item -Path (Join-Path $ReleaseCore "*") -Destination (Join-Path $PackagePayload "Core") -Recurse -Force
+    $PayloadCore = Join-Path $PackagePayload "Core"
+    New-Item -ItemType Directory -Force -Path $PayloadCore | Out-Null
+    Copy-Item -Path (Join-Path $ReleaseCore "*") -Destination $PayloadCore -Recurse -Force
   }
 
   # The WinUI host links Windows App SDK and can fail before WinMain when a

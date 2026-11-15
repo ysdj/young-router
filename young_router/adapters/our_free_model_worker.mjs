@@ -6,8 +6,8 @@
 
 import { createServer } from 'node:http'
 import { existsSync } from 'node:fs'
-import { open, readFile, rename, unlink } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { open, readFile, rename } from 'node:fs/promises'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const MAX_BODY_BYTES = 1024 * 1024
@@ -189,6 +189,11 @@ function channelMembership(runtime) {
 }
 
 async function main(argv) {
+  // Read before the first await: a Core killed while this worker is still
+  // starting up has already reparented it by the time the servers are up, so a
+  // baseline read there would latch the reparent target -- the one value the
+  // watch below can never mismatch.
+  const parent = process.ppid
   const options = parseArguments(argv)
   if (options.help) {
     usage()
@@ -197,7 +202,7 @@ async function main(argv) {
   if (!Number.isInteger(options.port) || options.port < 1 || options.port > 65535) {
     throw new Error('--port must be between 1 and 65535')
   }
-  if (!options.root || !resolve(options.root).startsWith('/') && !/^[A-Za-z]:[\\/]/.test(options.root)) {
+  if (!options.root || !isAbsolute(options.root)) {
     throw new Error('--root must be an absolute path')
   }
   const token = process.env.YOUNG_ROUTER_OUR_FREE_MODEL_TOKEN ?? ''
@@ -372,8 +377,6 @@ async function main(argv) {
   await ready.close()
   await rename(readyStaging, readyPath)
   await lease.close()
-  await unlink(handoffPath).catch(() => {})
-  await unlink(leasePath).catch(() => {})
 
   const close = async () => {
     if (closing) return closing
@@ -402,13 +405,12 @@ async function main(argv) {
   // killed parent orphans its children instead of hanging them up.  Measured
   // on this app, one install path that replaced the bundle mid-start left
   // seventeen of these behind, each still holding its gateway and control
-  // ports for hours.  The lease that proves the Core is alive is the file it
-  // handed over, and its own removal happened above -- so the process's
+  // ports for hours.  The lease that proves the Core is alive is the descriptor
+  // handed over at startup, and it is checked only there -- so the process's
   // parent identity is what is left to watch.  ``process.ppid`` is read fresh
   // on every tick rather than captured once, because it is answered from the
   // live parent record: it reported the original pid for a while and then the
   // reparented one, so a single read at startup cannot decide this.
-  const parent = process.ppid
   const orphanWatch = setInterval(() => {
     if (process.ppid === parent) return
     clearInterval(orphanWatch)

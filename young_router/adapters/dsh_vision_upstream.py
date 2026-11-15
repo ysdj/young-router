@@ -29,6 +29,7 @@ import os
 from pathlib import Path
 import subprocess
 import threading
+import time
 from typing import Any
 
 from ..node_runtime import node_command as _node_command
@@ -41,6 +42,12 @@ _WORKER_FILE_NAME = "dsh_vision_worker.mjs"
 #: The worker answers one line per request; a hung import must not hold a
 #: request open, and the first import loads sharp and the whole peer closure.
 _CALL_TIMEOUT_SECONDS = 20.0
+#: How long a failed ask is remembered before the worker is asked again.  A
+#: failure used to be cached like an answer -- for the life of the process -- so
+#: one worker that died mid-conversation degraded every later image turn until
+#: the proxy restarted.  The pause keeps a package that is really missing from
+#: costing a process start per request.
+_FAILURE_RETRY_SECONDS = 30.0
 
 
 class VisionWorkerUnavailable(RuntimeError):
@@ -78,7 +85,8 @@ class _Worker:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._process: subprocess.Popen[str] | None = None
-        self._cache: dict[str, list[dict[str, Any]] | None] = {}
+        self._cache: dict[str, list[dict[str, Any]]] = {}
+        self._failed_at: dict[str, float] = {}
 
     def _ensure_process(self) -> subprocess.Popen[str]:
         process = self._process
@@ -132,17 +140,24 @@ class _Worker:
         with self._lock:
             if key in self._cache:
                 return self._cache[key]
+            failed_at = self._failed_at.get(key)
+            if failed_at is not None and time.monotonic() - failed_at < _FAILURE_RETRY_SECONDS:
+                return None
             try:
                 providers = self._ask(config)
             except VisionWorkerUnavailable:
-                self._cache[key] = None
+                self._failed_at[key] = time.monotonic()
                 return None
             except (OSError, ValueError, json.JSONDecodeError):
                 # A worker that died mid-conversation is restarted on the next
-                # miss; drop the process so this one is never reused.
+                # ask; drop the process so this one is never reused.
                 self._stop_process()
-                self._cache[key] = None
+                self._failed_at[key] = time.monotonic()
                 return None
+            if providers is None:
+                self._failed_at[key] = time.monotonic()
+                return None
+            self._failed_at.pop(key, None)
             self._cache[key] = providers
             return providers
 
@@ -171,10 +186,6 @@ class _Worker:
         if not isinstance(providers, list):
             raise VisionWorkerUnavailable("the vision worker answered without a provider list")
         return [row for row in providers if isinstance(row, dict)]
-
-    def invalidate(self) -> None:
-        with self._lock:
-            self._cache.clear()
 
     def shutdown(self) -> None:
         with self._lock:
@@ -210,10 +221,6 @@ def provider_chain(config: dict[str, Any]) -> list[dict[str, Any]] | None:
     return _WORKER.chain(config)
 
 
-def invalidate_cache() -> None:
-    _WORKER.invalidate()
-
-
 def shutdown() -> None:
     _WORKER.shutdown()
 
@@ -221,7 +228,6 @@ def shutdown() -> None:
 __all__ = [
     "VisionWorkerUnavailable",
     "available",
-    "invalidate_cache",
     "node_command",
     "package_root",
     "provider_chain",
