@@ -1913,6 +1913,155 @@ class ProvidersModelsDomainTests(unittest.TestCase):
         self.assertEqual("mismatch", model["probe"]["degradation"]["status"])
         self.assertFalse(snapshot["drafts"]["providers_models"]["dirty"])
 
+    def _speed_reading(self, events: list[tuple[float, str]], tokens: int = 3) -> dict:
+        """Run one speed check against a fake clock and a fake stream.
+
+        The clock advances a fixed step per read, so the ordering the reading
+        depends on is deterministic without pinning the exact call count: the
+        assertions are about what the numbers mean, not about how many times
+        the implementation happened to look at a clock.
+        """
+
+        domain = ProvidersModelsDomain.__new__(ProvidersModelsDomain)
+        ticks = iter(range(0, 10_000))
+        # Two seconds per clock read: strictly ordered, and fast enough that the
+        # window closes inside the first round, so one run measures one round
+        # instead of as many as the clock allows.
+        clock = lambda: next(ticks) * 2.0
+
+        class Response:
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_args: object) -> bool:
+                return False
+
+        class Opener:
+            def open(self, *_args: object, **_kwargs: object) -> Response:
+                return Response()
+
+        with mock.patch(
+            "young_router.core.domains.providers_models.isolated_http_opener",
+            return_value=Opener(),
+        ), mock.patch.object(
+            ProvidersModelsDomain, "_speed_test_events", return_value=iter(events)
+        ), mock.patch.object(
+            ProvidersModelsDomain, "_count_tokens", return_value=tokens
+        ), mock.patch.object(
+            ProvidersModelsDomain, "_speed_test_request",
+            return_value={
+                "method": "POST",
+                "url": "https://example.test/v1/chat/completions",
+                "headers": {},
+                "display_headers": {},
+                "body": {},
+            },
+        ), mock.patch(
+            "young_router.core.domains.providers_models.time.monotonic", side_effect=clock
+        ), mock.patch(
+            "young_router.core.domains.providers_models.time.sleep"
+        ):
+            return domain._speed_test_run(
+                protocol="openai/chat",
+                api_base="https://example.test/v1",
+                credential="replace-me-secret",
+                model_name="default-chat",
+            )
+
+    def test_the_speed_check_reports_the_wait_before_the_first_token(self) -> None:
+        """Time to first token is the wait a user feels, and it is its own field.
+
+        It is taken on the first round only.  Later rounds re-prefill the same
+        prompt, so their first token measures the queue on the second request
+        rather than this route's own startup.
+        """
+
+        reading = self._speed_reading([("", 0), ("one ", 0), ("two ", 0), ("three", 0)])
+
+        self.assertEqual("ok", reading["status"])
+        self.assertIsNotNone(reading["first_token_seconds"])
+        # The prefill happened before the first content piece, so the wait is
+        # strictly positive rather than zero.
+        self.assertGreater(reading["first_token_seconds"], 0.0)
+        self.assertEqual(3, reading["output_token_count"])
+        # A rate is divided over emission, never across the wait for it: a rate
+        # that included the prefill would report how busy the queue was.
+        self.assertGreater(reading["output_token_count_per_second"], 0.0)
+
+    def test_a_silent_route_reports_no_rate_and_no_first_token(self) -> None:
+        """Silence is a finding, and it is never reported as a speed."""
+
+        reading = self._speed_reading([("", 0)], tokens=0)
+
+        # The stream ended by itself without emitting anything, which is an
+        # empty answer rather than silence inside the window.
+        self.assertEqual("invalid_response", reading["status"])
+        self.assertIsNone(reading["first_token_seconds"])
+        self.assertIsNone(reading["output_token_count_per_second"])
+        self.assertEqual(0, reading["output_token_count"])
+
+    def test_a_newer_press_supersedes_the_one_that_is_running(self) -> None:
+        """Choosing another check stops the old one before its expensive layers.
+
+        A probe is a run of network reads.  The check is consulted between its
+        phases -- never inside one -- because each phase is a bounded read of
+        its own, and the point is to stop before the fingerprint table and the
+        precision battery rather than to interrupt a request mid-flight.
+        """
+
+        domain = ProvidersModelsDomain.__new__(ProvidersModelsDomain)
+
+        # No check is a run nobody replaced: it goes all the way.
+        self.assertFalse(domain._probe_superseded(None))
+        self.assertTrue(domain._probe_superseded(lambda: True))
+        self.assertFalse(domain._probe_superseded(lambda: False))
+        # A cancelled run names its own status: it is not a failure of the
+        # route and not a finding about it either.
+        record = domain._cancelled_probe()
+        self.assertEqual("cancelled", record["status"])
+        self.assertIn("replaced", record["detail"])
+
+    def test_a_superseded_press_stops_before_the_fingerprint_layers(self) -> None:
+        """The expensive layers never run for a press that was replaced."""
+
+        domain = ProvidersModelsDomain.__new__(ProvidersModelsDomain)
+        ran: list[str] = []
+
+        def never(*_args: object, **_kwargs: object) -> object:
+            ran.append("degradation")
+            raise AssertionError("a superseded press must not run the fingerprint layers")
+
+        with mock.patch.object(ProvidersModelsDomain, "_degradation_probe", side_effect=never), mock.patch.object(
+            ProvidersModelsDomain, "_speed_test_run", side_effect=never
+        ), mock.patch.object(
+            ProvidersModelsDomain, "_probe_surfaces", return_value=["openai/chat"]
+        ), mock.patch.object(
+            ProvidersModelsDomain, "_surface_probe",
+            return_value={"surface": "openai/chat", "available": True, "status": "ok"},
+        ), mock.patch.object(
+            ProvidersModelsDomain, "_model_api_base", return_value="https://example.test/v1"
+        ), mock.patch.object(
+            ProvidersModelsDomain, "_model_credential", return_value=("k", "replace-me-secret")
+        ), mock.patch.object(
+            ProvidersModelsDomain, "_wire_model_name", return_value="default-chat"
+        ), mock.patch.object(
+            ProvidersModelsDomain, "_account_ref_for_probe", return_value=None
+        ), mock.patch.object(
+            ProvidersModelsDomain, "_serves_images", return_value=False
+        ):
+            result = domain._probe_model(
+                {"name": "p"},
+                {"litellm_model": "openai/default-chat"},
+                provider_id="p",
+                model_id="m",
+                kind="full",
+                stop_check=lambda: True,
+            )
+
+        self.assertEqual([], ran)
+        self.assertEqual("cancelled", result["status"])
+        self.assertEqual("full", result["kind"])
+
     def test_a_staged_program_failure_is_a_finding_not_a_python_error(self) -> None:
         """An unstaged program or a failed run reports its own cause."""
 
@@ -2514,67 +2663,6 @@ class ProvidersModelsDomainTests(unittest.TestCase):
         self.assertEqual("", finding["verdict"])
         self.assertIn("No surface answered", finding["detail"])
 
-    def test_the_speed_probe_reads_the_endpoint_s_own_token_count(self) -> None:
-        """A rate from the usage block is the endpoint's number, not a guess.
-
-        ``basis`` is part of the finding: a rate divided out of the endpoint's
-        own usage and a rate counted from the words it wrote are different
-        claims, and a reader has to be able to tell which one they have.
-        """
-
-        domain = ProvidersModelsDomain.__new__(ProvidersModelsDomain)
-        body = json.dumps(
-            {
-                "choices": [{"message": {"content": "1 2 3 4 5"}}],
-                "usage": {"completion_tokens": 100, "prompt_tokens": 12},
-            }
-        ).encode("utf-8")
-
-        text, tokens, reported = domain._speed_probe_usage(body, "openai/chat", False)
-
-        self.assertEqual("1 2 3 4 5", text)
-        self.assertEqual(100, tokens)
-        self.assertTrue(reported)
-
-    def test_the_speed_probe_falls_back_to_the_answer_s_own_words(self) -> None:
-        """An endpoint that reports no usage still gets a rate, and says how.
-
-        Counting the answer's words is not the same measurement as reading the
-        endpoint's usage block, so the count is marked unreported and the pane
-        can label it.  A rate with no basis is a number about nothing.
-        """
-
-        domain = ProvidersModelsDomain.__new__(ProvidersModelsDomain)
-        body = json.dumps(
-            {"choices": [{"message": {"content": "one two three"}}]}
-        ).encode("utf-8")
-
-        text, tokens, reported = domain._speed_probe_usage(body, "openai/chat", False)
-
-        self.assertEqual("one two three", text)
-        self.assertEqual(3, tokens)
-        self.assertFalse(reported)
-
-    def test_the_speed_probe_refuses_a_rate_for_an_image_route(self) -> None:
-        """A picture has no token rate, and printing one would be a number about nothing."""
-
-        domain = ProvidersModelsDomain.__new__(ProvidersModelsDomain)
-
-        with mock.patch.object(
-            ProvidersModelsDomain, "isolated_http_opener", create=True
-        ) as opener:
-            reading = domain._speed_probe(
-                surface="openai/images",
-                api_base="https://example.test/v1",
-                credential="replace-me-secret",
-                model_name="gpt-image-2.6-flare",
-            )
-
-        self.assertEqual([], opener.call_args_list)
-        self.assertFalse(reading["available"])
-        self.assertEqual("unsupported", reading["status"])
-        self.assertIsNone(reading["tokens_per_second"])
-
     def test_a_probe_kind_names_which_layers_a_press_runs(self) -> None:
         """The button asks one of four questions, and each names its own layers.
 
@@ -2615,6 +2703,14 @@ class ProvidersModelsDomainTests(unittest.TestCase):
         self.assertEqual("identity", domain._probe_kind({"kind": "nonsense"}))
         self.assertEqual("speed", domain._probe_kind({"kind": "speed"}))
         self.assertEqual("speed", domain._probe_kind({"probe_kind": "SPEED"}))
+        # The pane sends a press's own options under ``values``, the same place
+        # every other per-press choice travels.  Reading only the top level made
+        # every menu row fall back to the default, so choosing 测速 or 量化 ran
+        # the identity check instead - a silent wrong answer, not a visible one.
+        self.assertEqual("speed", domain._probe_kind({"values": {"kind": "speed"}}))
+        self.assertEqual("precision", domain._probe_kind({"values": {"kind": "precision"}}))
+        self.assertEqual("identity", domain._probe_kind({"values": {}}))
+        self.assertEqual("identity", domain._probe_kind({"values": {"kind": "nonsense"}}))
 
     def test_the_identity_layer_does_not_run_when_only_precision_was_asked(self) -> None:
         """A precision-only press must not spend the fingerprint table's requests."""

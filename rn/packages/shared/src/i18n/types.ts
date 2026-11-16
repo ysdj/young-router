@@ -670,6 +670,7 @@ export type TranslationKey =
   | "providers.probeInlineInvalidConfig"
   | "providers.probeInlineModelUnavailable"
   | "providers.speedTestHint"
+  | "providers.speedTestWindow"
   | "providers.speedTestMeasuring"
   | "providers.speedTestPrefix"
   | "providers.speedTestTokensPerSecond"

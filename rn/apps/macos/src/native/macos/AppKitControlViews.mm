@@ -211,6 +211,38 @@ NSImage *ButtonSymbolImage(const std::string &symbol)
       : [NSImage imageWithSystemSymbolName:symbolName accessibilityDescription:nil];
 }
 
+// Centers a menu indicator inside the title's own line box.
+//
+// A trailing image is laid out as part of the button's content line, so one
+// taller than the text grows that line downward and pushes the title with it.
+// Measured on the probe button: 11 px of bezel above the label against 6 below,
+// where a button with no indicator measured 7 and 10.  Drawing the glyph into a
+// canvas the height of the font's own line keeps the line unchanged, so the
+// title sits where every other button's does.
+NSImage *ButtonTrailingSymbolImage(NSImage *symbol, NSFont *font)
+{
+  if (symbol == nil || font == nil) {
+    return symbol;
+  }
+  const CGFloat lineHeight = ceil(font.ascender - font.descender);
+  if (lineHeight <= 0.0 || symbol.size.height <= 0.0) {
+    return symbol;
+  }
+  const NSSize canvasSize = NSMakeSize(symbol.size.width, MAX(lineHeight, symbol.size.height));
+  NSImage *centered = [[NSImage alloc] initWithSize:canvasSize];
+  [centered lockFocus];
+  [symbol drawInRect:NSMakeRect(0.0, (canvasSize.height - symbol.size.height) / 2.0,
+                                symbol.size.width, symbol.size.height)
+            fromRect:NSZeroRect
+           operation:NSCompositingOperationSourceOver
+            fraction:1.0];
+  [centered unlockFocus];
+  // Templates follow the bezel's ink instead of the artwork's own colors.
+  // `template` is a C++ keyword, so this file cannot use the dot syntax.
+  [centered setTemplate:YES];
+  return centered;
+}
+
 NSFont *TableCellFont()
 {
   return [NSFont systemFontOfSize:LiteLLMUIFontSize weight:NSFontWeightRegular];
@@ -1823,6 +1855,11 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
     NSImageSymbolConfiguration *configuration =
         [NSImageSymbolConfiguration configurationWithPointSize:LiteLLMUIFontSize - 3.5 weight:NSFontWeightMedium];
     symbolImage = [symbolImage imageWithSymbolConfiguration:configuration];
+    // The button's font is only assigned when its style changes, so a first
+    // layout can reach here without one; the line box is the same size either
+    // way, and guessing it is better than skipping the correction.
+    symbolImage = ButtonTrailingSymbolImage(
+        symbolImage, _button.font ?: [NSFont systemFontOfSize:LiteLLMUIFontSize]);
   }
   const BOOL showsTitle = symbolImage == nil || _symbolWithTitle;
   NSImage *image = _busy ? AppKitBusySpinner.frames[(NSUInteger)_busyStep] : symbolImage;

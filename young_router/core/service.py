@@ -1548,6 +1548,10 @@ class CoreStore:
         # the same lie in the other direction.
         self._service_start_operations = 0
         self._last_actions: dict[str, dict[str, Any]] = {}
+        # One counter per route: the probe a route is currently running is the
+        # one whose generation still matches, and every earlier run's check
+        # starts answering True when a newer press replaces it.
+        self._probe_generations: dict[str, int] = {}
         # The image-context cache's own day, applied from outside the request
         # path: the store sweeps on writes, which is what stops when the pass
         # is off.  Created on request and started by the entry point.
@@ -5922,6 +5926,21 @@ class CoreStore:
             self._request_emit()
         return result
 
+    def _supersede_probe(self, prepared: Mapping[str, Any]) -> Callable[[], bool]:
+        """Make this probe the current one for its route, and answer its check.
+
+        The generation is a counter per route: whatever press started last owns
+        the route, and every earlier run's check starts answering ``True`` the
+        moment that happens.  A route that never gets a second press keeps
+        reading its own generation and runs to completion.
+        """
+
+        key = f"{prepared.get('provider_id', '')}\x1f{prepared.get('model_id', '')}"
+        with self._lock:
+            generation = self._probe_generations.get(key, 0) + 1
+            self._probe_generations[key] = generation
+        return lambda: self._probe_generations.get(key, 0) != generation
+
     def _dispatch_probe_job(self, name: str, payload: object) -> dict[str, Any]:
         """Start one probe as a job and answer with its id.
 
@@ -8494,8 +8513,26 @@ class CoreStore:
                 prepared = None
 
         if prepared is not None:
+            # One press supersedes the last one for the same route.  A probe is
+            # a run of network reads -- the speed window, the fingerprint table,
+            # the precision battery -- and choosing another check while one runs
+            # used to be ignored by the pane and leave the old read spending its
+            # budget.  The generation recorded here is what the running probe
+            # compares itself against at each phase boundary, so an interrupted
+            # run stops before the expensive layers instead of after them.
+            stop_check = None
+            if name == "providers_models" and isinstance(prepared, Mapping):
+                if prepared.get("kind") == "model":
+                    stop_check = self._supersede_probe(prepared)
+            # The check travels with the payload rather than on the adapter:
+            # two probes for different routes run on the job pool at the same
+            # time, and one adapter attribute let the second press clear the
+            # first one's check the moment it finished.
+            performed = dict(prepared)
+            if stop_check is not None:
+                performed["probe_stop"] = stop_check
             try:
-                value = perform(prepared)
+                value = perform(performed)
             except Exception as exc:
                 return {"ok": False, "protocols": [], "detail": safe_exception_message(exc)}
             with self._domain_scope(name):

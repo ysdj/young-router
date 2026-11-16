@@ -931,7 +931,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const probeTitle = degradationIncluded',
             '? translate("providers.deepTest")',
             ': translate("providers.probe");',
-            '<ProbeMenuButton title={probeTitle} busy={probing} tooltip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} onProbe={probeKind} translate={translate} />',
+            '<ProbeMenuButton title={probeTitle} busy={probing} tooltip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} activeKind={probePresentation.kind} onProbe={probeKind} translate={translate} />',
             'function probeDegradationLine(degradation: UnknownRecord, translate: Translate, detailed = false): string {',
             'function probeDegradationDetails(degradation: UnknownRecord, translate: Translate): string {',
             'const degradation = asRecord(result?.degradation ?? probe.degradation);',
@@ -942,7 +942,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'titleWidth="tight"',
             'accessibilityRole="link" accessibilityLabel={probePresentation.compactSentence}',
             'const degradationSentence = degradationMeasured ? probeDegradationLine(degradation, translate, true) : "";',
-            'const tooltip = joinProbeSummary([compactSentence, availabilitySentence, degradationSentence, preciseSentence, speedSentence]);',
+            'const tooltip = joinProbeSummary([compactSentence, availabilitySentence, degradationSentence, preciseSentence, speedReading.detail]);',
             '? translate("providers.probeInlineReady")',
             '? translate("providers.probeInlinePartial")',
             '? translate("providers.probeInlineRefused")',
@@ -1024,7 +1024,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const BUSY_SPINNER_SIZE = 12;',
         ):
             self.assertIn(marker, self.native_controls)
-        self.assert_ui_has('titleWidth={titleWidth} toolTip={toolTip} onPress={onPress} style={style} />;')
+        # A caller may ask for the host's own trailing chevron: the probe button
+        # is a menu button, and that is how this app draws one.
+        self.assert_ui_has('titleWidth={titleWidth} toolTip={toolTip} symbol={symbol} symbolWithTitle={symbolWithTitle} symbolTrailing={symbolTrailing} accessibilityLabel={accessibilityLabel} onPress={onPress} style={style} />;')
         for marker in (
             '"providers.probe": "探测"',
             '"providers.deepTest": "探测"',
@@ -1040,7 +1042,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn(marker, self.en)
 
     def test_unprobed_models_do_not_render_a_status_placeholder(self) -> None:
-        self.assert_ui_has('return { compact: "", compactSentence: "", tooltip: "", full: "", speedRate: "" };')
+        self.assert_ui_has('return { compact: "", compactSentence: "", tooltip: "", full: "", speedRate: "", kind: undefined };')
         self.assertIn('export function nativeControlTextWidth(label: string): number {', self.native_controls)
         self.assertIn('if (plainLink) return Math.ceil(nativeControlTextWidth(title)) + 2;', self.native_controls)
         self.assert_ui_has('{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding}')
@@ -1273,19 +1275,24 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )
 
     def test_provider_probe_button_reports_progress_without_graying_out(self) -> None:
-        # The button is a split control: the button itself keeps its one-press
-        # meaning, and the chevron beside it opens the menu of the other
-        # questions.  Both live in one component so the two can never disagree
-        # about what a press runs.
+        # The probe button is this app's own menu button: the title with the
+        # host's trailing chevron, one control, one hit target.
         self.assert_ui_has(
-            '<ProbeMenuButton title={probeTitle} busy={probing} tooltip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} onProbe={probeKind} translate={translate} />'
+            '<ProbeMenuButton title={probeTitle} busy={probing} tooltip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} activeKind={probePresentation.kind} onProbe={probeKind} translate={translate} />'
         )
         # The probe keeps its own name while it runs: the button carries the
         # progress as a leading spinner instead of a swapped title.
         self.assert_ui_not_has('title={probing ? translate("providers.probing")')
-        self.assert_ui_has(
-            "onPress={() => onProbe(\"identity\")} />",
-        )
+        # The whole control opens the menu of checks, so a plain press can never
+        # silently run a check the user did not choose.
+        # A dropdown opens downward; the up-down glyph reads as a sort control.
+        self.assert_ui_has('symbol="chevron-down"')
+        # A symbol without `symbolWithTitle` is an icon-only button: the title
+        # disappears and the control becomes a bare chevron.  Both halves are
+        # what makes it the menu button this app draws.
+        self.assert_ui_has("symbolWithTitle")
+        self.assert_ui_has("onPress={openMenu}")
+        self.assert_ui_not_has('onPress={() => onProbe(\"identity\")}')
         self.assert_ui_has('{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding}')
         self.assert_ui_not_has("probeSummaryTrigger")
         self.assert_ui_not_has('styles.probeSummary}')

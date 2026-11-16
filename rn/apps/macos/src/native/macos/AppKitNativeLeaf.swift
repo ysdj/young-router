@@ -1693,44 +1693,47 @@ private enum NativeRelayOriginPolicy {
             item.tag = index
             menu.addItem(item)
         }
-        // React Native's macOS measureInWindow result uses the host view's
-        // coordinate system. Preserve that native Y coordinate for an ordinary
-        // AppKit content view; converting it a second time moves a top toolbar
-        // menu to the bottom of the dialog. A flipped host still needs the
-        // button's visual lower edge.
-        let pointY = contentView.isFlipped ? y + height : y
-        let point = NSPoint(x: x, y: pointY)
-        _ = menu.popUp(positioning: nil, at: point, in: contentView)
+        // The rectangle arrives in React Native's own space, which is measured
+        // from the top.  Handing its Y straight to `popUp` reads it from the
+        // bottom in an unflipped content view, and the menu opened near the
+        // window's lower edge instead of under the button that asked for it.
+        // The grouped menu below always used the converter; this one did not,
+        // so the two halves of the same control disagreed about where a menu
+        // belongs.
+        _ = menu.popUp(
+            positioning: nil,
+            at: menuAnchorPoint(contentView: contentView, anchor: anchor),
+            in: contentView
+        )
         return target.selectedIndex
     }
 
-    /// The point a menu opens at.  X comes from the caller's button rectangle
-    /// (its left edge), Y from the pointer: the menu hangs *below the button*
-    /// in the content view's own direction, so it never depends on which
-    /// vertical space a caller's measurement used and never opens to the
-    /// side.  Without a pointer inside the window the rectangle alone decides.
+    /// The point a menu opens at: the button's own left edge, one button height
+    /// below its top, in the content view's own direction.
+    ///
+    /// It used to take Y from the pointer.  That put the menu where the mouse
+    /// was — the middle of the button it was opened from — so the button and the
+    /// row beneath it were drawn over by the menu's first rows instead of the
+    /// menu hanging below the control.  The rectangle the caller sends is the
+    /// button; the lower edge of that rectangle is the only anchor that makes a
+    /// menu read as belonging to it.
     private func menuAnchorPoint(contentView: NSView, anchor: [String: NSNumber]) -> NSPoint {
         let bounds = contentView.bounds
         let anchorX = min(max(anchor["x"]?.doubleValue ?? 0, 0), max(bounds.maxX - 1, 0))
         let anchorHeight = max(anchor["height"]?.doubleValue ?? 0, 0)
-        if let mouse = contentView.window?.mouseLocationOutsideOfEventStream {
-            let pointer = contentView.convert(mouse, from: nil)
-            if bounds.contains(pointer) {
-                // The pointer sits on the button that asked for the menu; one
-                // button height below it clears the button's own bounds.
-                // "Below" is +y only in a flipped view: in the settings shell's
-                // unflipped backdrop the pointer's y is already the button's
-                // lower edge, so the anchor is that point itself.
-                let below = contentView.isFlipped ? pointer.y + anchorHeight : pointer.y
-                let top = min(max(below, 0), max(bounds.maxY - 1, 0))
-                return NSPoint(x: anchorX, y: top)
-            }
-        }
         let anchorY = anchor["y"]?.doubleValue ?? 0
-        let topDownY = contentView.isFlipped ? anchorY + anchorHeight : anchorY
+        // The rectangle is measured from the top.  A flipped content view counts
+        // the same way, so its lower edge is `y + height`; an unflipped one
+        // counts from the bottom, so that edge has to be mirrored into it.  The
+        // unmirrored value is what put a menu at the window's lower edge when
+        // it was opened without a pointer over the button — by keyboard, or by
+        // an accessibility press.
+        let belowButton = contentView.isFlipped
+            ? anchorY + anchorHeight
+            : bounds.maxY - (anchorY + anchorHeight)
         return NSPoint(
             x: anchorX,
-            y: min(max(topDownY, 0), max(bounds.maxY - 1, 0))
+            y: min(max(belowButton, 0), max(bounds.maxY - 1, 0))
         )
     }
 

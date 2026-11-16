@@ -2660,500 +2660,6 @@ class ProvidersModelsDomain:
     _SPEED_PROBE_ATTEMPTS = 2
 
     @classmethod
-    def _speed_probe(
-        cls,
-        *,
-        surface: str,
-        api_base: str,
-        credential: str,
-        model_name: str,
-        account_id: str = "",
-    ) -> dict[str, Any]:
-        """Measure how fast this route generates, and how long it takes to start.
-
-        Three numbers, each a different complaint a user has about a route:
-
-        * ``first_token_ms`` - how long the endpoint thinks before answering.
-        * ``tokens_per_second`` - the generation rate, from the usage block when
-          the endpoint reports one and from the answer text when it does not.
-        * ``total_ms`` - what one request actually cost end to end.
-
-        The rate is derived from the endpoint's own token accounting whenever it
-        reports it, because counting words in the answer measures the answer's
-        spelling, not the endpoint's speed.  An endpoint that reports no usage
-        gets a rate from the text and says so in ``basis``, so a number taken
-        from a word count is never mistaken for one the endpoint reported.
-
-        A route that does not answer is not slow: it returns ``available``
-        false with the failure's own status, exactly like the reachability
-        probe, so the pane never prints a speed for a route that never spoke.
-        """
-
-        root = service_root(api_base)
-        headers = browser_request_headers()
-        headers["Content-Type"] = "application/json"
-        account_backed = bool(account_id) and surface == "openai/responses"
-        if surface == "anthropic":
-            endpoint = (
-                api_base_for_surface(api_base, surface)
-                if isinstance(root, str) and root
-                else ""
-            )
-            headers["x-api-key"] = credential
-            headers["anthropic-version"] = "2023-06-01"
-            payload = {
-                "model": model_name,
-                "max_tokens": cls._SPEED_PROBE_MAX_TOKENS,
-                "stream": True,
-                "messages": [{"role": "user", "content": cls._SPEED_PROBE_PROMPT}],
-            }
-            headers["Accept"] = "text/event-stream"
-        elif surface == "openai/chat":
-            endpoint = f"{root}/v1/chat/completions" if isinstance(root, str) and root else ""
-            headers["Authorization"] = f"Bearer {credential}"
-            # Streaming is what makes a time-to-first-token observable at all: a
-            # buffered answer arrives in one piece, so the only moment to stamp
-            # is the end, which is the total and not the start.
-            payload = {
-                "model": model_name,
-                "max_tokens": cls._SPEED_PROBE_MAX_TOKENS,
-                "stream": True,
-                "stream_options": {"include_usage": True},
-                "messages": [{"role": "user", "content": cls._SPEED_PROBE_PROMPT}],
-            }
-            headers["Accept"] = "text/event-stream"
-        elif surface == cls._IMAGE_PROBE_SURFACE:
-            # A picture has no token rate to report: the generator answers in
-            # seconds per image, and a "tokens per second" for it would be a
-            # number about nothing.
-            return {
-                "available": False,
-                "status": "unsupported",
-                "surface": surface,
-                "detail": "An image route has no token rate",
-                "basis": "",
-                "first_token_ms": None,
-                "tokens_per_second": None,
-                "total_ms": None,
-                "output_tokens": None,
-            }
-        else:
-            endpoint = (
-                f"{root}/responses"
-                if account_backed and isinstance(root, str) and root
-                else f"{root}/v1/responses" if isinstance(root, str) and root else ""
-            )
-            headers["Authorization"] = f"Bearer {credential}"
-            payload = (
-                {
-                    "model": model_name,
-                    "input": [
-                        {
-                            "type": "message",
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": cls._SPEED_PROBE_PROMPT}],
-                        }
-                    ],
-                    "max_output_tokens": cls._CHATGPT_MODEL_PROBE_MAX_OUTPUT_TOKENS,
-                    "store": False,
-                    "stream": True,
-                    "instructions": cls._SPEED_PROBE_PROMPT,
-                }
-                if account_backed
-                else {
-                    "model": model_name,
-                    "max_output_tokens": cls._SPEED_PROBE_MAX_TOKENS,
-                    "stream": True,
-                    "input": cls._SPEED_PROBE_PROMPT,
-                }
-            )
-            headers["Accept"] = "text/event-stream"
-            if account_backed:
-                headers["chatgpt-account-id"] = account_id
-
-        def outcome(available: bool, status: str, **values: Any) -> dict[str, Any]:
-            return {
-                "available": available,
-                "status": status,
-                "surface": surface,
-                "basis": "",
-                "first_token_ms": None,
-                "tokens_per_second": None,
-                "total_ms": None,
-                "output_tokens": None,
-                "detail": "",
-                **values,
-            }
-
-        if not endpoint or not credential or not model_name:
-            return outcome(False, "invalid_config")
-
-        # The measurement is wall clock around one request, so it is taken here
-        # rather than from the response's own timing headers: those report what
-        # the upstream believes about itself, and the number a user waits for
-        # includes the network between them and us.
-        started = time.monotonic()
-        chunk_ends: list[int] = []
-        chunk_times: list[float] = []
-        body = b""
-        status: Any = None
-        for attempt in range(cls._SPEED_PROBE_ATTEMPTS):
-            request = urllib.request.Request(
-                endpoint,
-                data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-                headers=headers,
-                method="POST",
-            )
-            try:
-                with isolated_http_opener().open(
-                    request, timeout=cls._model_probe_timeout_seconds()
-                ) as response:
-                    status = getattr(response, "status", None)
-                    if status is None:
-                        status = response.getcode()
-                    # Read chunk by chunk and stamp the first chunk that carries
-                    # an answer.  A single `read()` would hand back the whole
-                    # stream at the end, which is the one moment that cannot
-                    # tell a slow starter from a slow generator.
-                    chunks_read: list[bytes] = []
-                    received = 0
-                    # Read a line at a time, not a block at a time.  Measured
-                    # on api.deepseek.com, a blocking 1 KiB read returns only
-                    # once a full kilobyte has arrived — the first "chunk" then
-                    # already carries dozens of tokens, and stamping it reports
-                    # a time to first token that is really a time to first
-                    # kilobyte.  A streamed server writes one SSE frame per
-                    # token, so a line read lands on the token.
-                    while received < cls._MAX_MODEL_PROBE_BYTES:
-                        chunk = response.readline()
-                        if not chunk:
-                            break
-                        chunks_read.append(chunk)
-                        received += len(chunk)
-                        chunk_ends.append(received)
-                        chunk_times.append(time.monotonic())
-                    body = b"".join(chunks_read)
-                break
-            except urllib.error.HTTPError as exc:
-                return outcome(
-                    False, cls._probe_status_for_http_error(exc, account_backed=account_backed)
-                )
-            except Exception as exc:
-                failure = cls._probe_failure_status(exc)
-                if attempt + 1 >= cls._SPEED_PROBE_ATTEMPTS or not cls._probe_transport_retryable(exc):
-                    return outcome(False, failure)
-                time.sleep(cls._MODEL_PROBE_RETRY_DELAY_SECONDS)
-        total_ms = round((time.monotonic() - started) * 1000.0, 1)
-        if not isinstance(status, int) or not 200 <= status < 300:
-            return outcome(False, "http_error", total_ms=total_ms)
-
-        first_offset, text, output_tokens, reported = cls._speed_probe_stream(body, surface)
-        if not text.strip():
-            return outcome(
-                False,
-                "invalid_response",
-                total_ms=total_ms,
-                detail="The endpoint answered without a streamed answer",
-            )
-        if not output_tokens:
-            # The endpoint streamed text but reported no usage.  Counting the
-            # answer's own words is a different measurement, so the basis says
-            # which one produced the rate.
-            output_tokens = len(text.split())
-            reported = False
-        if not output_tokens:
-            return outcome(
-                False,
-                "no_output",
-                total_ms=total_ms,
-                detail="The endpoint answered without generating any tokens",
-            )
-
-        # Time to first token, from the body offset where the first answer
-        # arrived.  The rate is then taken over generation only — from the
-        # first token to the last — because including the wait before it would
-        # report a slow starter as a slow generator, which is a different
-        # complaint about a different part of the route.
-        first_token_ms = cls._offset_to_millis(first_offset, chunk_ends, chunk_times, started)
-        # A rate is only reported when the stream actually arrived progressively.
-        # Measured on api.deepseek.com, the endpoint buffers its SSE frames and
-        # releases them in a burst: 260 frames all landed between 2.0 s and 4.3 s
-        # with inter-frame gaps of 0 ms.  Dividing the token count by that window
-        # produced 290-2500 tokens/sec on identical requests — a number about the
-        # endpoint's flush timing, not its generation.  When the stream carries
-        # no measurable window the rate is left absent rather than invented, and
-        # the two readings that are still sound are reported: time to first token,
-        # and the whole request's cost.
-        generation_ms = total_ms - (first_token_ms or 0.0)
-        measurable = cls._stream_was_progressive(chunk_ends, chunk_times, first_offset)
-        rate = (
-            round(float(output_tokens) / (generation_ms / 1000.0), 1)
-            if measurable and generation_ms > 0
-            else None
-        )
-        return outcome(
-            True,
-            "ok",
-            total_ms=total_ms,
-            first_token_ms=first_token_ms,
-            output_tokens=output_tokens,
-            tokens_per_second=rate,
-            basis=("usage" if reported else "text") if measurable else "",
-            detail="" if measurable else "The endpoint released its stream in one burst; no generation rate can be read from it",
-        )
-
-    #: How much of a stream is read at a time while looking for the first
-    #: token.  Small enough that the stamp is taken near the arrival of the
-    #: chunk that carried it.
-    _SPEED_PROBE_READ_CHUNK = 1024
-
-    #: How much of the stream's span must have arrived progressively before a
-    #: rate is read from it.  A burst arrives inside a window this short.
-    _SPEED_PROGRESSIVE_MIN_SPAN_MS = 150.0
-    _SPEED_PROGRESSIVE_MIN_FRACTION = 0.5
-
-    @classmethod
-    def _stream_was_progressive(
-        cls, ends: Sequence[int], times: Sequence[float], first_offset: int
-    ) -> bool:
-        """Whether the answer arrived over time, or all at once.
-
-        A rate needs a window: if every byte after the first token landed in the
-        same instant, the only thing dividing by it measures is how fast the
-        endpoint flushed a buffer.  So this asks whether the stream kept arriving
-        after the first token, for a span long enough to be a rate rather than a
-        rounding error.
-        """
-
-        if len(times) < 2 or not first_offset:
-            return False
-        after = [moment for end, moment in zip(ends, times) if end > first_offset]
-        if len(after) < 2:
-            return False
-        span_ms = (after[-1] - after[0]) * 1000.0
-        total_ms = (times[-1] - times[0]) * 1000.0
-        if span_ms < cls._SPEED_PROGRESSIVE_MIN_SPAN_MS:
-            return False
-        # Most of the stream must have arrived progressively, not in a final
-        # flush that happened to be preceded by one slow frame.
-        return total_ms <= 0.0 or span_ms / total_ms >= cls._SPEED_PROGRESSIVE_MIN_FRACTION
-
-    @staticmethod
-    def _offset_to_millis(
-        offset: int, ends: Sequence[int], times: Sequence[float], started: float
-    ) -> float | None:
-        """When the byte at ``offset`` arrived, interpolated between reads.
-
-        The stream is read in chunks, so the first token's offset falls inside
-        one of them; the chunk that contained it is the first whose end is at or
-        past it.  Within that chunk the arrival is taken as its end, because the
-        read returned the whole chunk at once and there is no finer moment
-        recorded — the interpolation is between chunks, not inside one.
-
-        Returns ``None`` when no chunk contained the offset, which means the
-        answer was never actually seen arriving and a time for it would be
-        invented.
-        """
-
-        for index, end in enumerate(ends):
-            if offset <= end:
-                return round((times[index] - started) * 1000.0, 1)
-        return None
-
-    @classmethod
-    def _speed_probe_stream(
-        cls, body: bytes, surface: str
-    ) -> tuple[int, str, int, bool]:
-        """Find the first answer token in a streamed answer.
-
-        Returns ``(first_token_offset, text, output_tokens, reported)``, where
-        ``first_token_offset`` is how many bytes of the body had arrived when
-        the first token did — the caller turns that into a timestamp using the
-        chunk boundaries it recorded while reading.
-
-        The three wires spell a delta differently but agree on one thing: the
-        first answer arrives as its own event, separate from the preamble.  So
-        this looks for the first event whose delta carries text, and never for
-        the first byte, because a `message_start` or a role preamble arrives
-        long before any content does.
-        """
-
-        decoded = body.decode("utf-8", "replace")
-        text_parts: list[str] = []
-        reported_tokens = 0
-        first_offset: int | None = None
-        consumed = 0
-        for raw_line in decoded.splitlines(keepends=True):
-            consumed += len(raw_line.encode("utf-8"))
-            line = raw_line.strip()
-            if not line.startswith("data:"):
-                continue
-            payload = line[5:].strip()
-            if not payload or payload == "[DONE]":
-                continue
-            try:
-                event = json.loads(payload)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(event, Mapping):
-                continue
-            delta_text = cls._stream_delta_text(event, surface)
-            if delta_text:
-                if first_offset is None:
-                    first_offset = consumed
-                text_parts.append(delta_text)
-            usage = cls._stream_usage(event, surface)
-            if usage:
-                reported_tokens = usage
-        return (first_offset or 0, "".join(text_parts), reported_tokens, bool(reported_tokens))
-
-    @staticmethod
-    def _stream_delta_text(event: Mapping[str, Any], surface: str) -> str:
-        """The answer text one streamed event carries, if any."""
-
-        if surface == "anthropic":
-            delta = event.get("delta")
-            if isinstance(delta, Mapping) and delta.get("type") == "text_delta":
-                text = delta.get("text")
-                return text if isinstance(text, str) else ""
-            return ""
-        if surface == "openai/chat":
-            choices = event.get("choices")
-            if isinstance(choices, list) and choices:
-                first = choices[0]
-                delta = first.get("delta") if isinstance(first, Mapping) else None
-                content = delta.get("content") if isinstance(delta, Mapping) else None
-                return content if isinstance(content, str) else ""
-            return ""
-        # The Responses wire, streamed or not.
-        if event.get("type") == "response.output_text.delta":
-            delta = event.get("delta")
-            return delta if isinstance(delta, str) else ""
-        return ""
-
-    @staticmethod
-    def _stream_usage(event: Mapping[str, Any], surface: str) -> int:
-        """The output-token count one streamed event reports, or 0."""
-
-        sources: list[Mapping[str, Any]] = []
-        if surface == "anthropic":
-            # Anthropic reports on `message_delta`, and its field is `output_tokens`.
-            sources.append(event)
-            if isinstance(event.get("message"), Mapping):
-                sources.append(event["message"])
-        elif surface == "openai/chat":
-            # Chat carries usage on a final chunk whose `choices` is empty.
-            if isinstance(event.get("usage"), Mapping):
-                sources.append(event)
-        else:
-            response = event.get("response")
-            if isinstance(response, Mapping) and isinstance(response.get("usage"), Mapping):
-                sources.append(response)
-        for source in sources:
-            usage = source.get("usage")
-            if not isinstance(usage, Mapping):
-                usage = source
-            for field in ("output_tokens", "completion_tokens"):
-                count = usage.get(field)
-                if isinstance(count, int) and not isinstance(count, bool) and count > 0:
-                    return count
-        return 0
-
-    @classmethod
-    def _speed_probe_usage(
-        cls, body: bytes, surface: str, account_backed: bool
-    ) -> tuple[str | None, int, bool]:
-        """The answer text and its token count, from any of the three wires.
-
-        Returns ``(text, output_tokens, reported)`` where ``reported`` says
-        whether the count came from the endpoint's own usage block.  A
-        non-streamed answer is read from JSON; the account door answers only a
-        stream, so its events are summed.
-        """
-
-        decoded_text = body.decode("utf-8", "replace")
-        if account_backed:
-            # The account door streams.  The output text is what the
-            # `response.output_text.delta` events carry, and the usage block
-            # arrives on the terminal event.
-            chunks: list[str] = []
-            reported_tokens = 0
-            for line in decoded_text.splitlines():
-                line = line.strip()
-                if not line.startswith("data:"):
-                    continue
-                try:
-                    event = json.loads(line[5:].strip())
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(event, Mapping):
-                    continue
-                if event.get("type") == "response.output_text.delta":
-                    delta = event.get("delta")
-                    if isinstance(delta, str):
-                        chunks.append(delta)
-                response = event.get("response")
-                usage = response.get("usage") if isinstance(response, Mapping) else None
-                if isinstance(usage, Mapping):
-                    count = usage.get("output_tokens")
-                    if isinstance(count, int) and not isinstance(count, bool):
-                        reported_tokens = count
-            text = "".join(chunks)
-            if reported_tokens:
-                return text, reported_tokens, True
-            return (text, len(text.split()), False) if text.strip() else (None, 0, False)
-
-        try:
-            decoded = json.loads(decoded_text)
-        except json.JSONDecodeError:
-            return None, 0, False
-        if not isinstance(decoded, Mapping) or isinstance(decoded.get("error"), Mapping):
-            return None, 0, False
-        usage = decoded.get("usage")
-        reported_tokens = 0
-        if isinstance(usage, Mapping):
-            for field in ("output_tokens", "completion_tokens"):
-                count = usage.get(field)
-                if isinstance(count, int) and not isinstance(count, bool) and count > 0:
-                    reported_tokens = count
-                    break
-        text = ""
-        if surface == "openai/chat":
-            choices = decoded.get("choices")
-            if isinstance(choices, list) and choices:
-                first = choices[0]
-                message = first.get("message") if isinstance(first, Mapping) else None
-                content = message.get("content") if isinstance(message, Mapping) else None
-                if isinstance(content, str):
-                    text = content
-        elif surface == "anthropic":
-            blocks = decoded.get("content")
-            if isinstance(blocks, list):
-                text = "".join(
-                    block.get("text", "")
-                    for block in blocks
-                    if isinstance(block, Mapping) and isinstance(block.get("text"), str)
-                )
-        else:
-            value = decoded.get("output_text")
-            if isinstance(value, str):
-                text = value
-            elif isinstance(decoded.get("output"), list):
-                pieces: list[str] = []
-                for item in decoded["output"]:
-                    if not isinstance(item, Mapping):
-                        continue
-                    for content in item.get("content") or []:
-                        if isinstance(content, Mapping) and isinstance(content.get("text"), str):
-                            pieces.append(content["text"])
-                text = "".join(pieces)
-        if not text.strip():
-            return None, reported_tokens, bool(reported_tokens)
-        if reported_tokens:
-            return text, reported_tokens, True
-        return text, len(text.split()), False
-
-    @classmethod
     def _model_probe_timeout_seconds(cls) -> float:
         """The first-event budget this deployment gives a real request."""
 
@@ -3343,10 +2849,24 @@ class ProvidersModelsDomain:
             model_name=model_name,
             account_id=account_id,
         )
-        result["original_request"] = copy.deepcopy(request)
+        result["original_request"] = {
+            "method": request["method"],
+            "url": request["url"],
+            "headers": copy.deepcopy(request["display_headers"]),
+            "body": copy.deepcopy(request["body"]),
+        }
         payload = json.dumps(request["body"], separators=(",", ":")).encode("utf-8")
         started = time.monotonic()
+        # The window is the generation window the copy promises - six seconds of
+        # *output* speed - so it starts when output starts.  Pinned to the
+        # request instead, a route that thinks for longer than the window could
+        # never be measured at all: measured on api.deepseek.com, the first token
+        # arrived 12-22 s after the request on a reasoning model, so every run
+        # ended as a timeout and the button never produced a number.  The wait
+        # itself is reported as the time to first token, which is the reading
+        # that wait is actually about.
         deadline = started + window
+        window_shared = False
         # Each round contributes one count, and a round's own count is its
         # upstream state when it made one and this side's tally when it did
         # not.  The two are never added together: a statement of the round's
@@ -3359,6 +2879,7 @@ class ProvidersModelsDomain:
         rounds = 0
         retries = 0
         ended_by_itself = False
+        first_token_seconds: float | None = None
         failure_status = ""
         failure_detail = ""
         while rounds < self._SPEED_TEST_MAX_ROUNDS:
@@ -3394,6 +2915,20 @@ class ProvidersModelsDomain:
                             text.append(piece)
                             if round_first is None:
                                 round_first = now
+                                if not window_shared:
+                                    # First output of the run: open the
+                                    # generation window here and give this route
+                                    # the full measurement it promises.
+                                    window_shared = True
+                                    deadline = max(deadline, now + window)
+                                # Time to first token, taken on the first round
+                                # only: that is the wait before this route says
+                                # anything at all.  Later rounds re-prefill the
+                                # same prompt, so their first token measures the
+                                # queue on the second request rather than the
+                                # route's own startup.
+                                if rounds == 1:
+                                    first_token_seconds = max(now - started, 0.0)
                             round_last = now
                         # The window is the stop condition, not the model's own
                         # end of turn: reading past it would report a rate the
@@ -3466,6 +3001,9 @@ class ProvidersModelsDomain:
         finished = time.monotonic()
         result["rounds"] = rounds
         result["sample"] = "".join(text)[:160]
+        result["first_token_seconds"] = (
+            round(first_token_seconds, 3) if first_token_seconds is not None else None
+        )
         if not arrived:
             # No token arrived at all.  A failure keeps its own name; a stream
             # that ended by itself carried an empty answer, while one the window
@@ -3486,7 +3024,26 @@ class ProvidersModelsDomain:
         # The denominator is the time the rounds spent emitting, not the wall
         # clock: the prefill between rounds is not generation, and including it
         # would report a number that depends on how many rounds happened to fit.
-        seconds = max(seconds_emitting, 0.001)
+        if seconds_emitting <= 0.0:
+            # Output arrived, but all at once: there is no generation window to
+            # divide by, and a rate taken over a millisecond floor is a number
+            # about this side's clock rather than the route's speed.  The wait
+            # and the count are still real, so they are what gets reported.
+            result["status"] = "ok"
+            result["first_token_seconds"] = (
+                round(first_token_seconds, 3) if first_token_seconds is not None else None
+            )
+            result["output_token_count"] = tokens
+            result["counted_by"] = "upstream" if counted_by_upstream else "estimate"
+            result["seconds"] = 0.0
+            result["detail"] = (
+                f"Measured {tokens} output tokens; they arrived in one burst, "
+                "so no generation rate can be read from them"
+            )
+            if failure_status:
+                result["detail"] += f"; the stream ended early ({failure_status})"
+            return result
+        seconds = seconds_emitting
         result["status"] = "ok"
         result["output_token_count"] = tokens
         result["seconds"] = round(seconds, 3)
@@ -3576,9 +3133,14 @@ class ProvidersModelsDomain:
         return {
             "method": "POST",
             "url": endpoint,
-            # The pane draws this as the request that was made, and a credential
-            # is not part of that reading.
-            "headers": {
+            # What is actually sent, credential included: this is the one the
+            # run hands to the opener.
+            "headers": dict(headers),
+            # What the pane draws, which is the same request without the
+            # credential.  The two are separate keys because they were one, and
+            # the sanitized copy being the only one made every speed test go out
+            # unauthenticated and read as "the upstream answered 401".
+            "display_headers": {
                 "Accept": "text/event-stream",
                 "Content-Type": "application/json",
                 **({"anthropic-version": "2023-06-01"} if protocol == "anthropic" else {}),
@@ -4499,6 +4061,34 @@ class ProvidersModelsDomain:
         except Exception:
             return False
 
+    @staticmethod
+    def _probe_superseded(stop_check: object) -> bool:
+        """Whether a newer press for this route has replaced this run.
+
+        Checked between the probe's phases, not inside them: each phase is one
+        bounded read of its own, and the point of the check is to stop before
+        the expensive ones rather than to interrupt a request mid-flight.
+
+        The check is passed in rather than read from the instance: two probes
+        for different routes run on the job pool at the same time, and one
+        attribute shared by both is one press clearing another's.
+        """
+
+        return bool(stop_check()) if callable(stop_check) else False
+
+    @classmethod
+    def _cancelled_probe(self) -> dict[str, Any]:
+        """The record a superseded run leaves behind.
+
+        ``cancelled`` is its own status: not a failure of the route, and not a
+        finding either, because the press that asked for it was replaced.
+        """
+
+        return {
+            "status": "cancelled",
+            "detail": "A newer press replaced this check before it finished",
+        }
+
     @classmethod
     def _probe_kind(cls, data: Mapping[str, Any]) -> str:
         """Which question one press asked, and therefore how much it costs.
@@ -4507,7 +4097,19 @@ class ProvidersModelsDomain:
         and a caller that does not name a kind keeps the behaviour it had.
         """
 
-        raw = str(data.get("kind") or data.get("probe_kind") or "").strip().lower()
+        # The pane sends the press's own options under ``values``, which is how
+        # every other per-press choice travels; reading only the top level made
+        # every menu row fall back to the default, so choosing 测速 or 量化 ran
+        # the identity check instead.
+        options = data.get("values")
+        nested = options if isinstance(options, Mapping) else {}
+        raw = str(
+            data.get("kind")
+            or data.get("probe_kind")
+            or nested.get("kind")
+            or nested.get("probe_kind")
+            or ""
+        ).strip().lower()
         return raw if raw in cls._PROBE_KINDS else "identity"
 
     def _probe_model(
@@ -4518,6 +4120,7 @@ class ProvidersModelsDomain:
         provider_id: str,
         model_id: str,
         kind: str = "identity",
+        stop_check: object = None,
     ) -> dict[str, Any]:
         layers = self._PROBE_KIND_LAYERS.get(kind, self._PROBE_KIND_LAYERS["identity"])
         provider_name = str(provider.get("name", "")).strip()
@@ -4551,9 +4154,14 @@ class ProvidersModelsDomain:
         # joining it.  The other surfaces keep their own probes: their answers
         # are what a protocol recommendation compares, and only a flash route
         # ever reaches this branch.
+        # The speed check runs when the press asked for it, and only then.  A
+        # flash route used to be measured because its name promises a rate, but
+        # the menu now offers that reading as its own row: running it under
+        # 「连通性」 would spend the press's whole window measuring something the
+        # user did not ask for, and the row beside it would say nothing.
         speed_protocol = (
             self._speed_test_protocol(model)
-            if self._is_flash_route(model) and self._IMAGE_PROBE_SURFACE not in surfaces
+            if "speed" in layers and self._IMAGE_PROBE_SURFACE not in surfaces
             else ""
         )
         speed_test: dict[str, Any] | None = None
@@ -4580,6 +4188,18 @@ class ProvidersModelsDomain:
                 return {surface: future.result() for surface, future in futures.items()}
 
         surface_results = run_surfaces(surfaces)
+        if self._probe_superseded(stop_check):
+            # Another press owns this route now.  Stop before the layers that
+            # cost the most, and say so rather than reporting the half of the
+            # matrix this run happened to finish.
+            return {
+                **self._cancelled_probe(),
+                "ok": False,
+                "protocols": [],
+                "provider_id": provider_id,
+                "model_id": model_id,
+                "kind": kind,
+            }
         if speed_protocol:
             # The measurement speaks the recommendation's own surface, and its
             # answer joins the matrix in the same shape the availability probe
@@ -4771,6 +4391,15 @@ class ProvidersModelsDomain:
         # The fingerprint layers run only when this press asked for them: a
         # reachability check that also measured a fingerprint would cost a user
         # 23 requests to learn that a route answers.
+        if self._probe_superseded(stop_check):
+            return {
+                **self._cancelled_probe(),
+                "ok": False,
+                "protocols": [],
+                "provider_id": provider_id,
+                "model_id": model_id,
+                "kind": kind,
+            }
         degradation = (
             self._degradation_probe(
                 plan=deep_probe,
@@ -4784,17 +4413,7 @@ class ProvidersModelsDomain:
             if "identity" in layers or "precision" in layers
             else self._probe_not_run(deep_probe, "identity" if "identity" not in layers else "precision")
         )
-        speed = (
-            self._speed_probe(
-                surface=deep_probe.get("surface") or (available_surfaces[0] if available_surfaces else ""),
-                api_base=api_base,
-                credential=credential,
-                model_name=model_name,
-                account_id=account_id,
-            )
-            if "speed" in layers and available_surfaces
-            else None
-        )
+
         probe_overlay = {
             # An image route has no protocol to recommend and is still serving:
             # the verdict is that the endpoint it really uses answered.
@@ -4805,7 +4424,6 @@ class ProvidersModelsDomain:
             "checked_at": checked_at,
             "degradation": copy.deepcopy(degradation),
             "precise": copy.deepcopy((degradation or {}).get("precision")),
-            "speed": copy.deepcopy(speed),
             "kind": kind,
             "surfaces": {
                 surface: {
@@ -4845,8 +4463,11 @@ class ProvidersModelsDomain:
             "summary": summary,
             "degradation": copy.deepcopy(degradation),
             "precise": copy.deepcopy((degradation or {}).get("precision")),
-            "speed": copy.deepcopy(speed),
             "kind": kind,
+            # The reading this press produced.  It is also stored beside the
+            # surfaces for the next window; a press that showed nothing until
+            # the pane re-read the route answered a question and then hid it.
+            "speed_test": copy.deepcopy(speed_test),
             "detail": "Model probe completed"
             if answered
             else "The configured surface could not be reached; no protocol change is recommended"
@@ -11190,6 +10811,7 @@ class ProvidersModelsDomain:
                 provider_id=str(prepared.get("provider_id", "")),
                 model_id=str(prepared.get("model_id", "")),
                 kind=str(prepared.get("kind_probe") or "identity"),
+                stop_check=prepared.get("probe_stop"),
             )
         protocols = [item for item in prepared.get("protocols", []) if isinstance(item, str)]
         if kind == "none":

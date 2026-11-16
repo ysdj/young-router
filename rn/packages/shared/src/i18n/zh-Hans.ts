@@ -671,6 +671,7 @@ export const zhHans: Record<TranslationKey, string> = {
   // 本身就是「这一面答不答」的答案，两件事都做等于一次点击付两遍钱。窗口写出来，
   // 点击才不是一件神秘的事：它解释了为什么按钮要停几秒，也解释了为什么不同路由
   // 的数字可以比较。
+  "providers.speedTestWindow": "{protocol} · {window} 秒窗口 · {rounds} 轮",
   "providers.speedTestHint": "按这条路由自己的协议连续测量 6 秒的输出速度（token/秒）",
   "providers.speedTestMeasuring": "正在测速...",
   "providers.speedTestPrefix": "速度:",

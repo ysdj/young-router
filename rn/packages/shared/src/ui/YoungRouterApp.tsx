@@ -7180,6 +7180,10 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     void Promise.resolve().then(action).finally(() => mutationInFlight.current.delete(key));
   };
   const probingModelKeys = useRef(new Set<string>());
+  // The press that owns each route.  A probe that is superseded before it
+  // answers still answers; this is what decides whether that answer is the one
+  // the route is showing.
+  const probeSequences = useRef(new Map<string, number>());
   const [, setProbeActivityRevision] = useState(0);
   // A result is kept with the inputs it was measured on: a route the user has
   // since edited never shows a verdict about the route it replaced.
@@ -7295,7 +7299,14 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   }, [workspaceService]);
   async function probeModel(targetProviderId: string, targetModelId: string, inputs: string, options?: { confirmRecommendation?: boolean; kind?: ProbeKind }): Promise<void> {
     const key = modelProbeKey(targetProviderId, targetModelId);
-    if (probingModelKeys.current.has(key)) return;
+    // Choosing another check while one runs supersedes it instead of being
+    // ignored: a press that did nothing because an earlier read was still
+    // spending its window left the pane unable to answer the question the user
+    // had just asked.  The sequence number is what keeps the older run's answer
+    // -- which arrives later, and describes a check nobody asked for any more
+    // -- from landing on the route the newer one just measured.
+    const sequence = (probeSequences.current.get(key) ?? 0) + 1;
+    probeSequences.current.set(key, sequence);
     probingModelKeys.current.add(key);
     // Asking again takes the previous finding away: it answered the question
     // this press replaced.  Both copies go — the one this pane measured and
@@ -7314,6 +7325,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     // The probe is over the moment its answer is in hand: the button reports
     // this question's progress, so it stands down here instead of staying
     // disabled through the write the answer goes on to ask for.
+    if (probeSequences.current.get(key) !== sequence) {
+      // A newer press owns this route: its answer is the one that counts, and
+      // this run's result is stale by definition.
+      return;
+    }
     probingModelKeys.current.delete(key);
     setProbeActivityRevision((value) => value + 1);
     setProbeResults((current) => ({ ...current, [key]: { inputs, result } }));
@@ -9334,7 +9350,7 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
     <View style={styles.modelBreadcrumb}><NativeButton title={providerLabel} link disabled={busy} onPress={onProviderClick} style={styles.breadcrumbProvider} /><Text style={styles.breadcrumbSeparator}>&gt;</Text><Text numberOfLines={1} style={styles.inspectorHeading}>{displayLabel(upstreamName, translate("common.notAvailable"))}</Text></View>
     <View style={styles.inspectorDivider} />
     <View style={styles.inspectorBody}>
-      <View style={styles.inspectorEnabledRow}><View style={styles.inspectorEnableControl}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy || !providerEnabled} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} /></View><ProbeMenuButton title={probeTitle} busy={probing} tooltip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} onProbe={probeKind} translate={translate} />{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding} onPress={openProbeDetails} accessibilityRole="link" accessibilityLabel={probePresentation.compactSentence}><TooltipText numberOfLines={1} ellipsizeMode="tail" tooltip={probePresentation.tooltip} style={styles.inspectorProbeFindingText}>{probePresentation.compactSentence}</TooltipText></Pressable> : null}</View>
+      <View style={styles.inspectorEnabledRow}><View style={styles.inspectorEnableControl}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy || !providerEnabled} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} /></View><ProbeMenuButton title={probeTitle} busy={probing} tooltip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} activeKind={probePresentation.kind} onProbe={probeKind} translate={translate} />{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding} onPress={openProbeDetails} accessibilityRole="link" accessibilityLabel={probePresentation.compactSentence}><TooltipText numberOfLines={1} ellipsizeMode="tail" tooltip={probePresentation.tooltip} style={styles.inspectorProbeFindingText}>{probePresentation.compactSentence}</TooltipText></Pressable> : null}</View>
       {/* The row's switch is disabled when its provider is off, so the reason
           has to be stated in words: a greyed 启用 box under a stopped provider
           otherwise reads as the app refusing the setting for no stated cause.
@@ -9751,6 +9767,10 @@ function validationIssueMatchesModel(issue: UnknownRecord, provider: UnknownReco
 type ProbeKind = "reachability" | "identity" | "precision" | "speed" | "full";
 
 const PROBE_KIND_ORDER: ProbeKind[] = ["reachability", "speed", "identity", "precision", "full"];
+
+function isProbeKind(value: string): value is ProbeKind {
+  return (PROBE_KIND_ORDER as string[]).includes(value);
+}
 
 function isProbeSurface(value: string): value is "openai/responses" | "openai/chat" | "anthropic" {
   return value === "openai/responses" || value === "openai/chat" || value === "anthropic";
@@ -15887,7 +15907,9 @@ function ProbeMenuButton({ title, tooltip, busy, disabled, activeKind, onProbe, 
     };
     const node = buttonRef.current;
     if (node && typeof node.measureInWindow === "function") {
-      node.measureInWindow(open);
+      node.measureInWindow((x: number, y: number, width: number, height: number) => {
+        open({ x, y, width, height });
+      });
       return;
     }
     // A host that cannot measure the button still offers the menu.  The anchor
@@ -15902,7 +15924,12 @@ function ProbeMenuButton({ title, tooltip, busy, disabled, activeKind, onProbe, 
     titleWidth="tight"
     busy={busy}
     toolTip={tooltip}
-    symbol="chevron-up-down"
+    // The same menu-button shape the 指定路由 control already draws: the title,
+    // a trailing downward chevron, and both symbol flags.  A symbol without
+    // `symbolWithTitle` is an icon-only button - the title is dropped and the
+    // control becomes a bare chevron, which is what a first attempt shipped.
+    symbol="chevron-down"
+    symbolWithTitle
     symbolTrailing
     accessibilityLabel={translate("providers.probeMenuTitle")}
     disabled={disabled && !busy}
@@ -15921,8 +15948,8 @@ async function hostChromeActionMenu(
   return bridge.showActionMenu(title, items, anchor);
 }
 
-const ActionButton = React.forwardRef<HostInstance, { title: string; onPress: () => void; disabled?: boolean; busy?: boolean; primary?: boolean; danger?: boolean; titleWidth?: "auto" | "tight"; toolTip?: string; /** The host's own glyph, drawn where that host draws a menu chevron. */ symbol?: "chevron-up-down"; symbolTrailing?: boolean; accessibilityLabel?: string; style?: StyleProp<ViewStyle> }>(function ActionButton({ title, onPress, disabled, busy, primary, danger, titleWidth, toolTip, symbol, symbolTrailing, accessibilityLabel, style }, ref): React.JSX.Element {
-  return <NativeButton ref={ref} title={title} disabled={disabled} busy={busy} primary={primary} destructive={danger} titleWidth={titleWidth} toolTip={toolTip} symbol={symbol} symbolTrailing={symbolTrailing} accessibilityLabel={accessibilityLabel} onPress={onPress} style={style} />;
+const ActionButton = React.forwardRef<HostInstance, { title: string; onPress: () => void; disabled?: boolean; busy?: boolean; primary?: boolean; danger?: boolean; titleWidth?: "auto" | "tight"; toolTip?: string; /** The host's own glyph, drawn where that host draws a menu chevron. */ symbol?: "chevron-up" | "chevron-down" | "chevron-up-down"; symbolWithTitle?: boolean; symbolTrailing?: boolean; accessibilityLabel?: string; style?: StyleProp<ViewStyle> }>(function ActionButton({ title, onPress, disabled, busy, primary, danger, titleWidth, toolTip, symbol, symbolWithTitle, symbolTrailing, accessibilityLabel, style }, ref): React.JSX.Element {
+  return <NativeButton ref={ref} title={title} disabled={disabled} busy={busy} primary={primary} destructive={danger} titleWidth={titleWidth} toolTip={toolTip} symbol={symbol} symbolWithTitle={symbolWithTitle} symbolTrailing={symbolTrailing} accessibilityLabel={accessibilityLabel} onPress={onPress} style={style} />;
 });
 
 function TextField({ label, value, onCommit, onDraftChange, hint, hintStyle, placeholder, secret, multiline, compactMultiline, keyboardType, stacked, labelWidth, labelAlign, controlWidth, labelVisible = true, suffix, disabled, validate, accessory, style }: { label: string; value: string; onCommit: (value: string) => void | Promise<void>; onDraftChange?: (value: string) => void; hint?: string; hintStyle?: StyleProp<TextStyle>; placeholder?: string; secret?: boolean; multiline?: boolean; compactMultiline?: boolean; keyboardType?: "default" | "numeric"; stacked?: boolean; labelWidth?: number; labelAlign?: "left" | "right"; controlWidth?: number; /** The caller renders the label itself (a stacked keys-editor row). */ labelVisible?: boolean; suffix?: string; disabled?: boolean; /** Commit-time validation: an invalid draft stays in the field with its message instead of reaching Core. */ validate?: (next: string) => string | undefined; /** A control that belongs to this row beside the field, such as its help mark. It rides the same grid level as PickerField's, so a field with an accessory and a picker with one draw the same column. */ accessory?: React.ReactNode; style?: StyleProp<ViewStyle> }): React.JSX.Element {
@@ -16391,7 +16418,7 @@ function RawEditor({ label, domain, document, language, ipc, translate, showLabe
   </View>;
 }
 
-function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"] | null | undefined, translate: Translate): { compact: string; compactSentence: string; tooltip: string; full: string; speedRate: string } {
+function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"] | null | undefined, translate: Translate): { compact: string; compactSentence: string; tooltip: string; full: string; speedRate: string; kind?: ProbeKind } {
   // `null` is the pane saying it has no finding for this route — it was just
   // asked again, or edited since — so Core's own copy of it is not shown
   // either.  `undefined` is a pane that has not measured the route: it paints
@@ -16399,15 +16426,15 @@ function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"
   const resultRecord = result === null ? undefined : result as UnknownRecord | undefined;
   const probe = result === null ? ({} as UnknownRecord) : resultRecord ?? asRecord(model.probe);
   if (Object.keys(probe).length === 0) {
-    return { compact: "", compactSentence: "", tooltip: "", full: "", speedRate: "" };
+    return { compact: "", compactSentence: "", tooltip: "", full: "", speedRate: "", kind: undefined };
   }
   // A flash route is measured for its speed, and that reading is the answer
   // the button was pressed for - not a footnote under the availability count.
   // It is built first, from the copy this press measured (which carries the
   // rate) or from the one Core stored with the finding, so a window that
   // reopens reads the number the last press produced.
-  const speedTest = asRecord((result as UnknownRecord | undefined)?.speed_test ?? probe.speed_test);
-  const speed = probeSpeedTestPresentation(speedTest, translate);
+  const speedTest = asRecord(result?.speed_test ?? probe.speed_test);
+  const speedReading = probeSpeedTestPresentation(speedTest, translate);
   const surfaces: Array<{ surface: string; available?: boolean; status?: string; original_request?: unknown }> = result?.surfaces
     ?? Object.entries(asRecord(probe.surfaces)).map(([surface, value]) => ({
       surface,
@@ -16473,12 +16500,12 @@ function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"
   const degradation = asRecord(result?.degradation ?? probe.degradation);
   // Each layer is its own measurement with its own line, so a route can report
   // a rate without carrying a fingerprint it was never asked for.
-  const speed = asRecord(result?.speed ?? probe.speed);
-  const speedLine = probeSpeedLine(speed, translate);
-  const speedSentence = probeSpeedLine(speed, translate, true);
   const precise = asRecord(result?.precise ?? probe.precise);
   const preciseLine = probePreciseLine(precise, translate);
   const preciseSentence = probePreciseLine(precise, translate, true);
+  // The speed reading leads with time to first token, which is the wait a user
+  // actually feels; the rate follows it and says how it was counted.
+
   // A route that answered nowhere was never measured, so its finding is never a
   // verdict about what answers behind the name: dilution needs a response to
   // judge (or a run that produced one), and the availability sentence already
@@ -16504,16 +16531,15 @@ function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"
   const compactFinding = [
     deepTestIncluded ? degradationLine : "",
     preciseLine,
-    speedLine,
+    speedReading.rate,
   ].filter(Boolean).join("; ")
     || (surfaces.length > 0 && availableCount === surfaces.length ? "" : availabilityInline);
   const compact = [availabilityCount, compactFinding].filter(Boolean).join("; ");
   const full = [
-    speed.detail,
-    speed.protocolLine,
-    speed.sampleLine,
+    speedReading.detail,
+    speedReading.protocolLine,
+    speedReading.sampleLine,
     summary,
-    speedSentence,
     preciseSentence,
     probeDegradationDetails(degradation, translate),
     result?.detail ?? "",
@@ -16523,8 +16549,17 @@ function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"
   // ellipsizes instead of wrapping, and the hover hint repeats that line in full
   // before it spells the same finding out.
   const compactSentence = `${translate("providers.probeResultPrefix")} ${compact}`;
-  const tooltip = joinProbeSummary([compactSentence, availabilitySentence, degradationSentence, preciseSentence, speedSentence]);
-  return { compact, compactSentence, tooltip, full };
+  const tooltip = joinProbeSummary([compactSentence, availabilitySentence, degradationSentence, preciseSentence, speedReading.detail]);
+  return {
+    compact,
+    compactSentence,
+    tooltip,
+    full,
+    speedRate: speedReading.rate,
+    // Which check produced what the pane is showing, so the menu can mark it
+    // and a press that already ran is not offered as if it had not.
+    kind: isProbeKind(stringValue(result?.kind)) ? stringValue(result?.kind) as ProbeKind : undefined,
+  };
 }
 
 /**
@@ -16576,44 +16611,68 @@ function joinProbeSummary(parts: string[]): string {
  * checkbox: the pane reports the finding and leaves the routing decision to
  * the user.
  */
-/** One line for the speed probe, and nothing at all when it did not run.
+
+/** The speed reading, in the shapes the pane draws it.
  *
- * A rate with no basis is a number about nothing, and so is a rate derived from
- * a stream that arrived in one burst.  Both are reported for what they are: the
- * time to first token is still sound, so it is what the line leads with.
+ * `rate` is the compact phrase the result row carries; the other three are the
+ * lines the hover hint and the details block add.  Time to first token leads
+ * because it is the wait a user feels before the answer starts, and the rate is
+ * absent rather than zero when the route emitted nothing: a silence has no
+ * rate, and printing one would turn "said nothing" into "was slow".
  */
-function probeSpeedLine(speed: UnknownRecord, translate: Translate, detailed = false): string {
-  if (Object.keys(speed).length === 0) return "";
+function probeSpeedTestPresentation(speed: UnknownRecord, translate: Translate): {
+  rate: string;
+  detail: string;
+  protocolLine: string;
+  sampleLine: string;
+} {
+  const blank = { rate: "", detail: "", protocolLine: "", sampleLine: "" };
+  if (Object.keys(speed).length === 0) return blank;
   const status = stringValue(speed.status);
-  if (!status) return "";
-  if (status === "ok") {
-    const ttft = speed.first_token_ms;
-    const ttftText = typeof ttft === "number" ? ttft.toFixed(0) : "?";
-    const rate = speed.tokens_per_second;
-    const hasRate = typeof rate === "number";
-    if (!detailed) {
-      // The compact row leads with the reading that is always sound.  A burst
-      // stream contributes no rate, and saying nothing about it beats printing
-      // a placeholder for a number that does not exist.
-      return hasRate
-        ? translate("providers.speedLineRate", { ttft: ttftText, rate: (rate as number).toFixed(1) })
-        : translate("providers.speedLine", { ttft: ttftText });
-    }
-    if (!hasRate) return translate("providers.speedLineBurst", { ttft: ttftText });
-    const total = speed.total_ms;
-    return translate("providers.speedLineDetail", {
-      ttft: ttftText,
-      rate: (rate as number).toFixed(1),
-      basis: translate(
-        stringValue(speed.basis) === "usage" ? "providers.speedBasisUsage" : "providers.speedBasisText",
-      ),
-      tokens: String(speed.output_tokens ?? "?"),
-      total: typeof total === "number" ? (total / 1000).toFixed(1) : "?",
-    });
+  if (!status) return blank;
+  if (status === "unsupported") return blank;
+  if (status !== "ok") {
+    return { ...blank, rate: translate("providers.speedUnavailable") };
   }
-  if (status === "no_output") return translate("providers.speedNoOutput");
-  if (status === "unsupported") return "";
-  return translate("providers.speedUnavailable");
+  const ttft = speed.first_token_seconds;
+  const perSecond = speed.output_token_count_per_second;
+  const ttftText = typeof ttft === "number" ? (ttft * 1000).toFixed(0) : "";
+  const rateText = typeof perSecond === "number" ? perSecond.toFixed(1) : "";
+  const phrase = [
+    ttftText ? translate("providers.speedLine", { ttft: ttftText }) : "",
+    rateText ? translate("providers.speedTestTokensPerSecond", { rate: rateText }) : "",
+  ].filter(Boolean).join(" \u00b7 ");
+  const counted = stringValue(speed.counted_by) === "upstream"
+    ? translate("providers.speedBasisUsage")
+    : translate("providers.speedBasisText");
+  const tokens = speed.output_token_count;
+  const seconds = speed.seconds;
+  const detail = ttftText || rateText
+    ? translate("providers.speedLineDetail", {
+      ttft: ttftText || "?",
+      rate: rateText || "?",
+      basis: counted,
+      tokens: String(tokens ?? "?"),
+      total: typeof seconds === "number" ? seconds.toFixed(1) : "?",
+    })
+    : stringValue(speed.detail);
+  const protocol = stringValue(speed.protocol) || stringValue(speed.surface);
+  const window = speed.window_seconds;
+  const rounds = speed.rounds;
+  const protocolLine = protocol
+    ? translate("providers.speedTestWindow", {
+      protocol,
+      window: typeof window === "number" ? String(window) : "?",
+      rounds: typeof rounds === "number" ? String(rounds) : "?",
+    })
+    : "";
+  const sample = stringValue(speed.sample);
+  return {
+    rate: phrase ? `${translate("providers.speedTestPrefix")} ${phrase}` : "",
+    detail,
+    protocolLine,
+    sampleLine: sample ? translate("providers.speedTestSample", { sample }) : "",
+  };
 }
 
 /** One line for the precision check, and nothing when it did not run.

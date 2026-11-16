@@ -662,6 +662,7 @@ export const en: Record<TranslationKey, string> = {
   // running both would make one press pay twice.  The window is stated so the
   // press is not a mystery: it is why the button takes seconds rather than
   // returning at once, and why the number is comparable across routes.
+  "providers.speedTestWindow": "{protocol} · {window}s window · {rounds} rounds",
   "providers.speedTestHint": "Measures output tokens per second over 6 seconds on this route's own protocol",
   "providers.speedTestMeasuring": "Measuring speed...",
   "providers.speedTestPrefix": "Speed:",

@@ -608,6 +608,8 @@ export interface IpcResults {
     speed?: ProbeSpeedResult;
     /** The precision (quantization) check, present only when that layer ran. */
     precise?: ProbePreciseResult;
+    /** The speed reading this press produced, present only when it ran. */
+    speed_test?: ProbeSpeedTest;
     surfaces?: { surface: string; available: boolean; status?: string; original_request?: { method: string; url: string; headers: Record<string, string>; body: Record<string, unknown> } }[];
   };
   export: { revision: number; section_count: number; sections?: ConfigDomain[] };
@@ -1232,6 +1234,33 @@ export interface NativeLeafAdapter {
  * An absent rate means the stream arrived in one burst, where no generation
  * window exists to divide by.
  */
+/**
+ * One token-rate measurement, as the speed check reports it.
+ *
+ * `first_token_seconds` is the wait before the route said anything at all.
+ * `output_token_count_per_second` is measured over the time the rounds spent
+ * emitting, not the wall clock, so the prefill between rounds does not enter
+ * the denominator.  `counted_by` says whether the count is the upstream's own
+ * statement or this side's tally, because those are different claims.
+ */
+export interface ProbeSpeedTest {
+  status: string;
+  target?: string | null;
+  protocol?: string;
+  surface?: string;
+  output_token_count_per_second?: number | null;
+  output_token_count?: number;
+  first_token_seconds?: number | null;
+  counted_by?: "upstream" | "estimate" | "";
+  seconds?: number;
+  window_seconds?: number;
+  rounds?: number;
+  sample?: string;
+  detail?: string;
+  checked_at?: string;
+  original_request?: { method: string; url: string; headers: Record<string, string>; body: Record<string, unknown> };
+}
+
 export interface ProbeSpeedResult {
   available: boolean;
   status: string;
