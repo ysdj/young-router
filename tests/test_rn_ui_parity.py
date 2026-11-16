@@ -5071,7 +5071,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("const cacheWriteTokens = compactLogValue(value.cache_write_tokens);", renderer)
         self.assertIn('[translate("logs.cacheRead"), cacheReadTokens],', renderer)
         self.assertIn('[translate("logs.cacheWrite"), cacheWriteTokens],', renderer)
-        self.assertIn("cacheHit: formatLogCacheHit(cacheReadTokens, compactLogValue(value.prompt_tokens)),", renderer)
+        self.assertIn("cacheHit: formatLogCacheHit(cacheReadTokens, compactLogValue(value.prompt_tokens), cacheWriteTokens),", renderer)
         self.assertNotIn('value.source_label) || compactLogValue(value.source)', renderer)
         self.assertIn('if (tab === "online-usage") return renderOnlineUsageRecord(record, value, translate);', self.ui)
         columns = self.ui.split('if (tab === "online-usage") return [', 1)[1].split("];", 1)[0]
@@ -7165,12 +7165,37 @@ class ReactNativeUiParityTests(unittest.TestCase):
         states nothing rather than a count that looks like a rate.
         """
 
-        self.assert_ui_has("function formatLogCacheHit(cached: string, input: string): string {")
+        self.assert_ui_has("function formatLogCacheHit(cached: string, input: string, written = \"\"): string {")
         self.assert_ui_has("return `${Math.round(share * 100)}%`;")
         self.assert_ui_has("if (!input || !Number.isFinite(inputTokens) || inputTokens <= 0) {")
         self.assert_ui_not_has("`${rate} · ${count}`")
         # With the count gone the header is the widest thing the column holds.
         self.assert_ui_has("const LOG_CACHE_COLUMN_WIDTH = 68;")
+
+    def test_a_written_prefix_with_no_read_is_a_measured_zero(self) -> None:
+        """The most expensive turn in the table is not drawn as an empty cell.
+
+        Measured 2026-11-16 on `claude-fable-5-2`: a turn sent 552,705 prompt
+        tokens and its upstream reported `cache_creation_input_tokens: 552,658`
+        with no read at all -- the write rate on the whole prefix and nothing
+        reused.  The column left that cell blank, exactly like a row whose route
+        never mentioned its cache, so the operator read "no cache" for the turn
+        that paid 1.25x for a fresh 553k prefix.  A reported write is an answer,
+        and the answer is `0%`; only a row that reported neither stays empty.
+        """
+
+        self.assert_ui_has("const wroteWholePrefix = Boolean(written) && Number.isFinite(writtenTokens) && writtenTokens > 0;")
+        self.assert_ui_has('return wroteWholePrefix ? "0%" : "";')
+        # The requests tab reads the write beside the read, from the row's own
+        # spelling, and hands both to the cell.
+        self.assert_ui_has("const cacheWriteTokens = compactLogValue(usage.cache_write_tokens ?? value.cache_write_tokens);")
+        self.assert_ui_has("const cacheHit = formatLogCacheHit(cacheReadTokens, sentTokens, cacheWriteTokens);")
+        # The rate is the cell and nothing else: the two counts stay out of the
+        # row's text, so the detail column keeps stating what it stated before
+        # (the record itself still carries `usage` for whoever opens it).
+        self.assert_ui_not_has('details.push(`${translate("logs.cacheRead")}')
+        self.assert_ui_not_has('details.push(`${translate("logs.cacheWrite")}')
+        self.assert_ui_has("The counts stay out of the row's text: the cell is a rate")
 
     def test_the_relay_log_states_what_a_request_cost(self) -> None:
         """A relay bills a request in fractions of a cent.

@@ -13496,10 +13496,27 @@ function formatLogTokens(value: string): string {
  * write, prompt) are what the row's double-click states.  A row that reported
  * no cache at all leaves the cell empty: "0%" would claim a measured miss for
  * a turn whose upstream never answered.
+ *
+ * A reported cache **write** is an answer, and the worst one a prompt can get:
+ * an upstream that writes the whole prefix and reads none of it billed this
+ * turn at the write rate and reused nothing.  That row states `0%`.  Without it
+ * the most expensive turn in the table — measured 2026-11-16 on
+ * `claude-fable-5-2`, 552,658 written of 552,705 sent — drew the same empty
+ * cell as a route that never mentioned its cache, so "no cache" and "paid for
+ * a whole new one" read alike.
+ *
+ * The counts stay out of the row's text: the cell is a rate, and a row that
+ * restates the two token counts under it spends the detail column on a number
+ * the rate already decided.  The record itself is unchanged, so opening the
+ * row still states `usage` exactly as the runtime wrote it.
  */
-function formatLogCacheHit(cached: string, input: string): string {
+function formatLogCacheHit(cached: string, input: string, written = ""): string {
   const cachedTokens = Number(cached);
-  if (!cached || !Number.isFinite(cachedTokens)) return "";
+  if (!cached || !Number.isFinite(cachedTokens)) {
+    const writtenTokens = Number(written);
+    const wroteWholePrefix = Boolean(written) && Number.isFinite(writtenTokens) && writtenTokens > 0;
+    return wroteWholePrefix ? "0%" : "";
+  }
   // The count is a subset of the input it is drawn against: every usage this
   // proxy logs is OpenAI-shaped, where ``prompt_tokens`` already includes the
   // tokens the upstream served from cache.  An Anthropic-shaped block that
@@ -14231,7 +14248,7 @@ function renderOnlineUsageRecord(record: unknown, value: UnknownRecord, translat
     tokens,
     // The relay states the cached count beside the prompt it was cached from,
     // so this tab reads the same rate cell the requests tab does.
-    cacheHit: formatLogCacheHit(cacheReadTokens, compactLogValue(value.prompt_tokens)),
+    cacheHit: formatLogCacheHit(cacheReadTokens, compactLogValue(value.prompt_tokens), cacheWriteTokens),
     cost,
     detail: details.join(" | "),
     // The double-click detail is the same labelled fields, one per line, so
@@ -14319,7 +14336,11 @@ function renderLogRecord(record: unknown, tab: LogTab, index: number, translate:
       ?? value.cache_read_tokens
       ?? value.cached_tokens,
   );
-  const cacheHit = formatLogCacheHit(cacheReadTokens, sentTokens);
+  // A turn that wrote the whole prefix and read none of it is a measured miss,
+  // and the row's own spellings say so; the projection already carries the
+  // write beside the read it did not answer.
+  const cacheWriteTokens = compactLogValue(usage.cache_write_tokens ?? value.cache_write_tokens);
+  const cacheHit = formatLogCacheHit(cacheReadTokens, sentTokens, cacheWriteTokens);
   const details: string[] = [];
   const abortedDetail = tab === "requests" ? requestAbortedDetail(value.aborted, translate) : "";
   if (abortedDetail) details.push(abortedDetail);
