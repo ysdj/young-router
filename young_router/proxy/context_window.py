@@ -22,6 +22,25 @@ What it elides, oldest first:
 
 Each elided part is replaced in place, so the transcript keeps its shape: an
 elided tool result is still the result of the call that produced it.
+
+Two rules this pass has to keep, both learned from a live Claude Code thread
+that re-read the same paper fifty times instead of once:
+
+* **A picture is priced as a picture on both wires, and only priced.**  The
+  image-context pass is Codex's: it reads the Responses shape
+  (``input_image`` / ``image_url``), and its rewrite writes placeholders a
+  Codex ``view_image`` call answers.  A Messages replay spells the same picture
+  ``{"type": "image", "source": {"type": "base64", …}}`` and has no such
+  tool, so on that wire this module prices the pixels and leaves the body
+  alone -- see ``_strings_joined``, ``_image_token_estimate`` and
+  ``_messages_wire_image_tokens``.  Counting their base64 as prose declared a
+  300k-token replay to be 1.47M and elided history on every single step.
+* **What the model just read stays readable.**  The turn being answered is
+  protected, but on the Messages wire that turn is a *tool result*, and the
+  result the step was actually made from sits one item before it -- so the read
+  the model was mid-way through became a marker on the next request.  ``_marker``
+  therefore never tells the model to re-read a file: that sentence was the
+  instruction the thread followed.
 """
 
 from __future__ import annotations
@@ -267,15 +286,120 @@ def wire_tokens(items: Any) -> Optional[int]:
     # 10-15% below the same JSON, so a replay the pass believed it had fitted
     # to 918,680 tokens reached the upstream at 1,169,888 and was refused
     # again on every resend.
+    #
+    # The image bodies leave the counted text for the reason in
+    # ``_strings_joined``: they are priced per picture below, not per byte.
     try:
-        serialized = json.dumps(items)
+        serialized = json.dumps(_without_inline_image_bytes(items))
     except Exception:
         serialized = text
     return len(_ENCODER.encode(serialized, disallowed_special=()))
 
 
+def _without_inline_image_bytes(node: Any) -> Any:
+    """``node`` with every inline image body emptied, its shape kept.
+
+    Only the bytes go: the part stays an image with its mime type, so the
+    serialized size of the replay is what the wire pays for everything that is
+    not a picture.  ``_image_token_estimate`` adds the pictures back.
+    """
+
+    if isinstance(node, list):
+        return [_without_inline_image_bytes(part) for part in node]
+    if isinstance(node, Mapping):
+        if _is_inline_image(node):
+            updated = dict(node)
+            source = updated.get("source")
+            if isinstance(source, Mapping) and isinstance(source.get("data"), str):
+                source = dict(source)
+                source["data"] = ""
+                updated["source"] = source
+                return updated
+            value = updated.get("image_url")
+            if isinstance(value, Mapping):
+                value = dict(value)
+                value["url"] = "data:image/;base64,"
+                updated["image_url"] = value
+                return updated
+            if isinstance(value, str):
+                updated["image_url"] = "data:image/;base64,"
+                return updated
+            return updated
+        return {key: _without_inline_image_bytes(value) for key, value in node.items()}
+    return node
+
+
+def _is_inline_image(node: Mapping[str, Any]) -> bool:
+    """An image part of either wire, with its bytes inline.
+
+    Responses says ``{"type": "input_image", "image_url": "data:…"}``;
+    Messages says ``{"type": "image", "source": {"type": "base64", "data":
+    …}}``.
+
+    This predicate exists for *measuring*, and that is the boundary: replacing a
+    picture with a placeholder that names a file is the image-context pass, and
+    that pass is Codex's -- it keys on a Codex replay's own evidence and writes
+    placeholders a Codex ``view_image`` call can answer.  A Claude Code replay
+    is a different client with no such tool, so the fix on this wire is to price
+    the pictures correctly and nothing else.  Widening
+    ``image_context._part_data_url`` to read ``source.data`` would be a rewrite
+    this client never asked for; the bug was arithmetic.
+    """
+
+    kind = node.get("type")
+    if not isinstance(kind, str) or "image" not in kind:
+        return False
+    source = node.get("source")
+    if isinstance(source, Mapping):
+        data = source.get("data")
+        if isinstance(data, str) and data:
+            return True
+        return isinstance(source.get("url"), str)
+    value = node.get("image_url")
+    if isinstance(value, Mapping):
+        value = value.get("url")
+    return isinstance(value, str) and bool(value)
+
+
+def _inline_image_b64(node: Any, out: Optional[List[str]] = None) -> List[str]:
+    """The base64 bodies of every inline image *the scanner cannot see*.
+
+    ``image_context.scan`` is the Codex pass and reads the Responses spelling
+    (``input_image`` / ``image_url``); its pictures are already priced from
+    their headers there.  This walker reads the other spelling -- Messages'
+    ``{"type": "image", "source": {"type": "base64", "data": …}}`` -- so the
+    two prices never add up to the same picture twice.
+    """
+
+    found = out if out is not None else []
+    stack = [node]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, Mapping):
+            source = item.get("source")
+            if isinstance(source, Mapping):
+                data = source.get("data")
+                if isinstance(data, str) and data:
+                    found.append(data)
+                    continue
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return found
+
+
 def _strings_joined(node: Any, out: Optional[List[str]] = None) -> str:
-    """Every string inside ``node``, in order, as one blob."""
+    """Every string inside ``node``, in order, as one blob.
+
+    Inline image bytes are the one exception, and they are left out here.  A
+    token counter prices a picture from its pixels; ``wire_tokens`` counts the
+    serialized replay, where a 473 KB base64 of a 1999x1589 screenshot is
+    322,000 tokens of prose.  Five ``Read`` results of one paper were enough to
+    declare a 300k-token thread 1.47M and have this pass elide its history on
+    every step -- the model then re-read what had just been taken away.  The
+    pictures are priced by ``_image_token_estimate`` instead, in the window's
+    own unit, and they are the image pass's to replace.
+    """
 
     parts = out if out is not None else []
     stack = [node]
@@ -284,6 +408,8 @@ def _strings_joined(node: Any, out: Optional[List[str]] = None) -> str:
         if isinstance(item, str):
             parts.append(item)
         elif isinstance(item, Mapping):
+            if _is_inline_image(item):
+                continue
             stack.extend(item.values())
         elif isinstance(item, list):
             stack.extend(item)
@@ -377,9 +503,14 @@ def _marker(item: Mapping[str, Any], chars: int, kind: Optional[str] = None) -> 
     label = kind or (
         "tool output" if item.get("type") == "function_call_output" else "message"
     )
+    # No instruction to re-read.  The sentence this replaces ended "re-read the
+    # file or ask the user if you need it", and a live Claude Code thread obeyed
+    # it: every elided `sed -n 'A,Bp'` was answered by the same `sed` again, 100
+    # offset reads for 24.9 KB of unique text.  The marker states what is gone;
+    # what to do about it is the model's call, not this string's.
     return (
         f"[{chars} characters of earlier {label} elided to fit this model's "
-        "context window; re-read the file or ask the user if you need it.]"
+        "context window.]"
     )
 
 
@@ -687,7 +818,13 @@ def _elided_message_turn(item: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def _elidable(items: List[Any]) -> List[int]:
-    """Indices worth shortening, largest first, never the last message."""
+    """Indices worth shortening, largest first, never the step being answered.
+
+    A picture is not in this ranking and must not be: ``_item_text`` measures
+    bodies, and an image's body is the image pass's to replace with a
+    placeholder that names the file the model can open.  A text marker in its
+    place names nothing to view.
+    """
 
     protected = _protected_index(items)
     ranked: List[Tuple[int, int]] = []
@@ -709,6 +846,22 @@ def _protected_index(items: List[Any]) -> int:
     with a single user message puts every ``view_image`` result of that turn
     here, and shortening one of them hands the model a placeholder for the
     picture it just asked to see.
+
+    On the Messages wire the last ``user`` turn is *always* a ``tool_result``,
+    so anchoring there protected one item out of hundreds: a Claude Code thread
+    of one user request followed by 300 tool round trips had 341 of its 860
+    items replaced by markers, and the answer it was composing had just lost
+    the reads that answer was made from.  The step being answered is that
+    ``tool_result`` *and the call that asked for it*, so the anchor is the last
+    assistant turn -- the pair leaves or stays together, which is also the only
+    shape the upstream accepts.
+
+    This is a boundary, not the cure.  What made that thread unreadable was the
+    count itself: base64 priced as prose (see ``_strings_joined``) put every
+    request 500k tokens over a window it actually filled to 30%.  A pass that
+    does not need to elide cannot lose what the model just read, and it stays a
+    *group* rather than the whole history so a thread whose first message is its
+    only user request is still shorten-able (see ``OneTurnThreadTests``).
     """
 
     for index in range(len(items) - 1, -1, -1):
@@ -723,8 +876,35 @@ def _protected_index(items: List[Any]) -> int:
         item = items[index]
         if isinstance(item, Mapping) and item.get("type") == "message":
             return index
+    return _messages_step_anchor(items)
+
+
+def _messages_step_anchor(items: List[Any]) -> int:
+    """``_protected_index`` for a Messages replay (``{"role", "content"}``).
+
+    The step being answered is the last ``tool_use`` turn *and* the
+    ``tool_result`` that answers it and anything the assistant has begun to say
+    since -- a call whose answer was elided is a step the model cannot take, and
+    an answer elided this side of its own question is what the live thread kept
+    re-deriving.  Anchoring on the last ``user`` turn instead protected the
+    result alone and left its call elidable.
+    """
+
     for index in range(len(items) - 1, -1, -1):
-        if _is_message_turn(items[index]) and items[index].get("role") == "user":
+        item = items[index]
+        if not _is_message_turn(item) or item.get("role") != "assistant":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        if any(
+            isinstance(block, Mapping) and block.get("type") == "tool_use"
+            for block in content
+        ):
+            return index
+    for index in range(len(items) - 1, -1, -1):
+        item = items[index]
+        if _is_message_turn(item) and item.get("role") == "user":
             return index
     return len(items)
 
@@ -1187,15 +1367,25 @@ def _image_token_estimate(items: Any) -> int:
     Dimensions come from the image headers the scanner already reads, so this
     costs no decode.  An image whose size cannot be read keeps the byte rate,
     where the only thing known about it is how many bytes it occupies.
+
+    Two wires carry pictures and only one of them is the scanner's: the image
+    pass is Codex's, so ``image_context.scan`` reads ``input_image`` /
+    ``image_url`` and answers zero for a Claude Code replay that spells the
+    same picture ``{"type": "image", "source": {"type": "base64", …}}``.
+    Those are priced here directly and *only* priced -- this wire has no
+    ``view_image`` for a placeholder to point at, so replacing them is not this
+    pass's job (see ``_is_inline_image``).  Measuring is: a replay left
+    unpriced is a replay whose size the pass gets wrong in the expensive
+    direction.
     """
 
     from . import image_context as _image_context_module
 
+    total = 0
     try:
         images = _image_context_module.scan(items)
     except Exception:
-        return 0
-    total = 0
+        images = []
     for image in images:
         width = getattr(image, "width", None)
         height = getattr(image, "height", None)
@@ -1207,6 +1397,39 @@ def _image_token_estimate(items: Any) -> int:
             )
         elif isinstance(raw, (bytes, bytearray)) and raw:
             total += int(len(raw) * _BASE64_OVERHEAD / _IMAGE_BYTES_PER_TOKEN)
+    total += _messages_wire_image_tokens(items)
+    return total
+
+
+def _messages_wire_image_tokens(items: Any) -> int:
+    """The pictures ``image_context.scan`` cannot see, priced per picture.
+
+    Only the head of each body is decoded -- an image header sits in the first
+    few kilobytes of a JPEG, PNG, GIF and WEBP -- because this runs on every
+    request and a replay can carry a hundred pictures.  A body whose header
+    still is not in that window keeps the byte rate, which is the only thing
+    known about it without decoding the whole thing.
+    """
+
+    import base64
+
+    from . import image_context as _image_context_module
+
+    total = 0
+    for body in _inline_image_b64(items):
+        head = b""
+        if body:
+            try:
+                head = base64.b64decode(body[: 64 * 1024], validate=False)
+            except (ValueError, TypeError):
+                head = b""
+        width, height = _image_context_module._image_size(head)
+        if isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0:
+            total += -(-(width * height) // _IMAGE_PIXELS_PER_TOKEN) + (
+                _IMAGE_TILE_OVERHEAD_TOKENS
+            )
+        elif body:
+            total += int(len(body) * 3 / 4 * _BASE64_OVERHEAD / _IMAGE_BYTES_PER_TOKEN)
     return total
 
 

@@ -959,6 +959,176 @@ class RefusalRewriteBeliefTests(unittest.TestCase):
         )
 
 
+class MessagesWireImageTests(unittest.TestCase):
+    """A picture costs its pixels on the Messages wire too.
+
+    Regression ground: one Claude Code thread (``/v1/messages``, single user
+    request, 300 tool round trips) read one paper in 100 small ``sed`` windows
+    and never once had the whole thing in front of it.  Five ``Read`` results of
+    figures carried 1.72 MB of base64; ``wire_tokens`` priced that as prose and
+    reported the replay at 1,467,779 tokens of a 1,000,000-token window, so
+    ``apply`` elided history on every single step -- 341 of 860 items became
+    ``[N characters of earlier tool output elided…]`` -- and the model answered
+    by reading the same lines again, 5.5x the unique text it needed.
+
+    ``image_context.scan`` could never have priced those pictures: it is the
+    Codex pass and reads ``input_image``/``image_url`` only.
+    """
+
+    @staticmethod
+    def _jpeg(width: int, height: int) -> str:
+        """A JPEG header of the requested size, base64 -- the Read result's shape.
+
+        Only the SOF0 segment matters to ``_image_size``; the body is filler, so
+        this builds a real header without needing an encoder.
+        """
+
+        import base64
+        import struct
+
+        sof = b"\xff\xc0" + struct.pack(">H", 17) + b"\x08" + struct.pack(">HH", height, width) + b"\x03" + b"\x01\x11\x00\x02\x11\x01\x03\x11\x01"
+        body = b"\xff\xd8" + b"\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00" + sof + b"\x00" * 200_000 + b"\xff\xd9"
+        return base64.b64encode(body).decode("ascii")
+
+    def _thread(self, images: int) -> list:
+        turns: list = [
+            {"role": "user", "content": [{"type": "text", "text": "check this paper"}]},
+        ]
+        for index in range(images):
+            turns.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": f"toolu_{index}",
+                            "name": "Read",
+                            "input": {"file_path": f"/tmp/fig{index}.jpg"},
+                        }
+                    ],
+                }
+            )
+            turns.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": f"toolu_{index}",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/jpeg",
+                                        "data": self._jpeg(1999, 1589),
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
+            turns.append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": f"toolu_sed_{index}",
+                            "name": "Bash",
+                            "input": {"command": "sed -n '1,60p' read.txt"},
+                        }
+                    ],
+                }
+            )
+            turns.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": f"toolu_sed_{index}",
+                            "content": "line of the paper\n" * 400,
+                        }
+                    ],
+                }
+            )
+        return turns
+
+    def test_a_messages_image_is_priced_from_its_pixels_not_its_base64(self) -> None:
+        items = self._thread(1)
+        image_body = [
+            block["source"]["data"]
+            for turn in items
+            for block in (turn.get("content") or [])
+            if isinstance(block, dict) and block.get("type") == "tool_result"
+            for block in (block.get("content") or [])
+            if isinstance(block, dict) and block.get("type") == "image"
+        ]
+        self.assertEqual(len(image_body), 1)
+        priced = cw._messages_wire_image_tokens(items)
+        # 1999x1589 / 750 px per token, plus the tiles' overhead.
+        self.assertGreater(priced, 4_000)
+        self.assertLess(priced, 5_000)
+        # What the same body costs priced as the prose its base64 resembles:
+        # the ratio this test exists for is the one that tripped the window.
+        as_prose = len(image_body[0]) / 1.47
+        self.assertGreater(as_prose / priced, 30)
+
+    def test_a_messages_image_no_longer_inflates_the_wire_count(self) -> None:
+        with_image = self._thread(5)
+        without_image = json.loads(json.dumps(with_image))
+        for turn in without_image:
+            for block in turn.get("content") or []:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                for part in block.get("content") or []:
+                    if isinstance(part, dict) and part.get("type") == "image":
+                        part["source"]["data"] = ""
+        self.assertLess(
+            cw.wire_tokens(with_image),
+            cw.wire_tokens(without_image) * 1.5,
+            "an inline image must not be counted as the prose its base64 resembles",
+        )
+
+    def test_a_replay_of_five_figures_does_not_trip_the_window(self) -> None:
+        # The live thread's arithmetic: 5 figure reads, 300 tool round trips,
+        # ~350k tokens of text against a 1M window.
+        items = self._thread(5)
+        router = _Router(1_000_000)
+        with mock.patch.object(cw, "_router", return_value=router):
+            self.assertIsNone(
+                cw.apply({"model": "m", "messages": json.loads(json.dumps(items))}),
+                "this replay fits; eliding it takes away what the model just read",
+            )
+
+    def test_the_step_being_answered_keeps_its_own_tool_result(self) -> None:
+        # ``_protected_index`` anchored on the last ``user`` turn, which on this
+        # wire is the ``tool_result`` itself -- so the call one item earlier was
+        # elidable, and the step lost the read it was made from.
+        items = self._thread(6)
+        anchor = cw._protected_index(items)
+        last_call = next(
+            index
+            for index in range(len(items) - 1, -1, -1)
+            if any(
+                isinstance(block, dict) and block.get("type") == "tool_use"
+                for block in (items[index].get("content") or [])
+            )
+        )
+        self.assertEqual(anchor, last_call)
+        self.assertNotIn(last_call, cw._elidable(items))
+
+    def test_a_marker_does_not_tell_the_model_to_read_it_again(self) -> None:
+        # The old sentence ended "re-read the file or ask the user if you need
+        # it", and the thread obeyed it: the same ``sed`` came back, on 100
+        # offset reads for 24.9 KB of unique text.
+        marker = cw._marker({"type": "function_call_output"}, 1234)
+        self.assertIn("elided", marker)
+        self.assertNotIn("re-read", marker)
+        self.assertNotIn("ask the user", marker)
+
 
 if __name__ == "__main__":
     unittest.main()
