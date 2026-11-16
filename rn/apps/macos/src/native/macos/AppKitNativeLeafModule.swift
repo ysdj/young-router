@@ -4,6 +4,26 @@ import AppKit
 #if canImport(React)
 import React
 
+/// One surface's path inside a station, as Core states it.
+///
+/// The page passes the value the relay domain publishes
+/// (``station_surfaces``), and this is the only place it is trusted: no scheme,
+/// no leading slash, no dot segments, no query — a relative path that can only
+/// land inside the origin this window already validated.  Anything else
+/// answers nil, which leaves the window on the station's origin instead of
+/// somewhere the page chose.
+private func relaySurfacePath(_ value: Any?) -> String? {
+    guard let value else { return nil }
+    guard let path = value as? String else { return nil }
+    let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._~/-")
+    guard !path.isEmpty, path.utf8.count <= 200,
+          !path.hasPrefix("/"), !path.hasSuffix("/"), !path.contains("//"), !path.contains(".."),
+          path.rangeOfCharacter(from: allowed.inverted) == nil else {
+        return nil
+    }
+    return path
+}
+
 @objc(LiteLLMNativeLeaf)
 final class AppKitNativeLeafModule: RCTEventEmitter {
     private let leaf = AppKitNativeLeaf.shared
@@ -579,7 +599,7 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         resolver resolve: @escaping RCTPromiseResolveBlock,
         rejecter reject: @escaping RCTPromiseRejectBlock
     ) {
-        guard Set(options.keys).isSubset(of: ["accountId", "type", "label", "origin", "language", "username", "embedded", "pendingAccount", "stationId", "stationName", "stationType", "stationOrigin", "rememberPassword", "autoGrouping"]),
+        guard Set(options.keys).isSubset(of: ["accountId", "type", "label", "origin", "language", "username", "embedded", "pendingAccount", "stationId", "stationName", "stationType", "stationOrigin", "rememberPassword", "autoGrouping", "signInPath"]),
               let accountID = options["accountId"] as? String,
               let type = options["type"] as? String,
               let label = options["label"] as? String,
@@ -669,7 +689,8 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
                 stationType: stationType,
                 stationOrigin: options["stationOrigin"] as? String,
                 rememberPassword: rememberPassword,
-                autoGrouping: autoGrouping
+                autoGrouping: autoGrouping,
+                signInPath: relaySurfacePath(options["signInPath"])
             ) { result in
                 DispatchQueue.main.async {
                     guard let result else {
@@ -688,7 +709,7 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         resolver resolve: @escaping RCTPromiseResolveBlock,
         rejecter reject: @escaping RCTPromiseRejectBlock
     ) {
-        guard Set(options.keys).isSubset(of: ["accountId", "type", "label", "origin", "language"]),
+        guard Set(options.keys).isSubset(of: ["accountId", "type", "label", "origin", "language", "usageLogsPath"]),
               let accountID = options["accountId"] as? String,
               let type = options["type"] as? String,
               let label = options["label"] as? String,
@@ -707,7 +728,8 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
                 type: type,
                 label: label,
                 origin: origin,
-                language: language
+                language: language,
+                usageLogsPath: relaySurfacePath(options["usageLogsPath"])
             ) {
                 DispatchQueue.main.async { resolve(nil) }
             }
@@ -725,7 +747,7 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         resolver resolve: @escaping RCTPromiseResolveBlock,
         rejecter reject: @escaping RCTPromiseRejectBlock
     ) {
-        guard Set(options.keys).isSubset(of: ["accountId", "type", "label", "origin", "language"]),
+        guard Set(options.keys).isSubset(of: ["accountId", "type", "label", "origin", "language", "dashboardPath"]),
               let accountID = options["accountId"] as? String,
               let type = options["type"] as? String,
               let label = options["label"] as? String,
@@ -744,7 +766,8 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
                 type: type,
                 label: label,
                 origin: origin,
-                language: language
+                language: language,
+                dashboardPath: relaySurfacePath(options["dashboardPath"])
             ) {
                 DispatchQueue.main.async { resolve(nil) }
             }

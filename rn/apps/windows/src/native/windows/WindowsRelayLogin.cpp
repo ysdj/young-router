@@ -1468,9 +1468,13 @@ winrt::fire_and_forget InitializeBrowser(std::shared_ptr<LoginState> state) {
       // way in and filling it is the sign-in the user asked for.
       state->login_submit_authorized = state->restored_password && !state->restored_password->empty();
     }
-    // Deployments do not share a stable login path. Start at the configured
-    // origin and let the site's own navigation expose its sign-in control.
-    state->webview.Source(winrt::Windows::Foundation::Uri(Utf8ToWide(state->options.origin)));
+    // The page inside the station, as the relay domain states it: a family's
+    // paths are one table for every host that opens a station page, and a copy
+    // printed in each host is how the web host drew a station's marketing home
+    // in its sign-in dialog.  No path means the origin, never a guessed leaf.
+    auto sign_in_url = state->options.origin;
+    if (!state->options.sign_in_path.empty()) sign_in_url += "/" + state->options.sign_in_path;
+    state->webview.Source(winrt::Windows::Foundation::Uri(Utf8ToWide(sign_in_url)));
   } catch (...) {
     if (!state->canceled.load() && !state->finished.load()) {
       state->status.Text(Text(state->options, L"The embedded sign-in browser is unavailable.", L"内置登录浏览器不可用。"));

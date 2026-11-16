@@ -35,6 +35,7 @@ import {
   takeRelayGroupApply,
   updateRelayGroupSheet,
 } from "./relayGroupSheet";
+import { stationSurfaceAddress } from "../ui/relayOrigin";
 
 /** One JSON-over-HTTP exchange with the local Core. */
 export type BrowserCoreTransport = {
@@ -1292,7 +1293,13 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
       }
     },
     openRelayLogs: async () => undefined,
-    openRelayDashboard: async (options) => { window.open(options.origin, "_blank", "noopener"); },
+    // The console's own page, not the station's front door: a sub2api station
+    // answers `/` with a marketing home, which reads as signed out even for a
+    // session the person holds.  The path comes from Core's table, exactly as
+    // the native hosts read it.
+    openRelayDashboard: async (options) => {
+      window.open(stationSurfaceAddress(options.origin, options.dashboardPath ?? ""), "_blank", "noopener");
+    },
     clearRelayPassword: async () => undefined,
     clearRelayCredentials: async () => undefined,
     // 开机自启动 on this host.  The desktop apps register their own login item

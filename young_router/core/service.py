@@ -4265,7 +4265,9 @@ class CoreStore:
         machine, same person — to open that page in a real browser.  The
         address is the station's sign-in form, not its origin: a sub2api
         station answers `GET /` with a marketing home whose own 登录 link is a
-        second click (`relay_browser.sign_in_url`).  The
+        second click, so the path comes from the station family's own table
+        (`relay_accounts.STATION_SURFACES`), the same one the native hosts read
+        from the snapshot.  The
         window is the station's own, so a captcha, a code, or a redirect works
         exactly as it does in any browser; Core then reads the session that
         browser holds and finishes the same verified-login boundary the native
@@ -4277,6 +4279,7 @@ class CoreStore:
         """
 
         from . import relay_browser
+        from .domains.relay_accounts import station_surface_address
 
         # A published page is open in somebody else's browser -- a gateway, a
         # server, a machine on the LAN.  A window this Core opened would appear
@@ -4308,7 +4311,7 @@ class CoreStore:
                 pass
         try:
             browser = relay_browser.launch(
-                relay_browser.sign_in_url(origin.strip()),
+                station_surface_address(origin.strip(), "sign_in", account_type),
                 profile_root=profile_root,
                 account_id=str(account_id),
                 embedded=embedded,

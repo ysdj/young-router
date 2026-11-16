@@ -26,6 +26,11 @@ struct WindowsRelayLoginOptions {
   // question; only a session-only row (and a pending account) is asked again.
   std::optional<bool> remember_password_preference;
   std::optional<bool> auto_grouping_preference;
+  // The page inside the station this window opens (its sign-in form), as the
+  // relay domain states it.  A station's `/` is its front door, not its form:
+  // sub2api answers `/` with a marketing home.  Empty means the origin — never
+  // a leaf this host guessed.
+  std::string sign_in_path;
   // The host's own decision surface: the sign-in surface asks its post-login
   // question (keep the typed password? remember it and auto-group?) through the
   // one decision window the app uses for every question, instead of a

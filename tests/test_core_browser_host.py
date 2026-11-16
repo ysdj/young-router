@@ -1382,10 +1382,9 @@ class BrowserRelaySignInTests(unittest.TestCase):
 
         The window opened on the origin drew "SISCT2API — Subscription to API
         Conversion Platform" with a 立即开始 button and no field to sign in
-        with, while the form is one route further at `/login`.  Both relay
-        families this app signs in to serve it there and the macOS host has
-        opened that path since 36ae051; Core opened the origin, so the page
-        host showed a sign-in dialog nobody could sign in through.
+        with, while the form is one route further at `/login`.  Core opened the
+        origin, so the page host showed a sign-in dialog nobody could sign in
+        through; the address now comes from the station family's own table.
         """
 
         browser = mock.Mock()
@@ -1410,33 +1409,45 @@ class BrowserRelaySignInTests(unittest.TestCase):
         # there would turn every one of them into `/login/api/...`.
         self.assertEqual("https://relay.example.test", self.core._browser_logins[answered["login_id"]]["origin"])
 
-    def test_the_two_hosts_that_draw_the_stations_form_read_the_same_leaf(self) -> None:
-        """The dialog is shared; the page inside it is not.
+    def test_the_station_family_owns_where_its_pages_are(self) -> None:
+        """One table, published to every host that opens a station page.
 
         `native.relayLogin` is a host leaf: macOS draws the station in a
-        WKWebView it owns (`NativeRelayLoginController.loginURL`), Windows in
-        its WebView2, and a page asks Core to open a real browser
-        (`start_relay_browser_login`).  So "which page of the station" is three
-        implementations of one rule, and when 36ae051 taught the macOS leaf
-        `/login` nothing told the Core one — the sign-in dialog then drew the
-        station's marketing home on the web host alone.  This is that seam,
-        pinned so an edit to one side is a failing test instead of a form
-        nobody can type into.
+        WKWebView it owns, Windows in its WebView2, and a page asks Core to
+        open a real browser.  "Which page of the station" therefore used to be
+        three copies of one rule, and 36ae051 taught only the macOS copy
+        `/login` — the sign-in dialog then drew the station's marketing home on
+        the web host alone, with every other test green.  The paths live in
+        the relay domain now, the snapshot publishes them, and Core's own
+        sign-in resolves the same table.
         """
 
-        self.assertEqual("https://relay.example.test/login", relay_browser.sign_in_url("https://relay.example.test"))
-        native = Path(__file__).resolve().parents[1] / "rn/apps/macos/src/native/macos/AppKitNativeLeaf.swift"
-        mac = native.read_text(encoding="utf-8")
-        login_surface = mac.split("private var loginURL: URL {", 1)[1].split("private var localizedChinese", 1)[0]
-        self.assertIn('return originURL.appendingPathComponent("login")', login_surface)
-        # Recorded, not endorsed: the Windows leaf starts at the origin and
-        # lets the site's own navigation expose the form, because its WebView2
-        # fills a remembered password there.  A change to that answer belongs
-        # beside this test, not in a quiet comment on one side.
-        windows = (Path(__file__).resolve().parents[1] / "rn/apps/windows/src/native/windows/WindowsRelayLogin.cpp").read_text(encoding="utf-8")
-        self.assertIn("Deployments do not share a stable login path", windows)
+        from young_router.core.domains.relay_accounts import (
+            STATION_SURFACES,
+            station_surface_address,
+            station_surface_path,
+        )
 
-    def test_the_sign_in_address_keeps_a_base_path_and_never_doubles_the_leaf(self) -> None:
+        self.assertEqual(
+            {
+                "newapi": {"sign_in": "login", "dashboard": "console", "usage_logs": "usage-logs"},
+                "sub2api": {"sign_in": "login", "dashboard": "dashboard", "usage_logs": "usage"},
+            },
+            STATION_SURFACES,
+        )
+        # A surface both families state the same way needs no family: a pending
+        # account ("") is asking exactly that, and its sign-in window must not
+        # wait for a type it does not have yet.
+        self.assertEqual("login", station_surface_path("", "sign_in"))
+        self.assertEqual("login", station_surface_path("auto", "sign_in"))
+        # The dashboard is not one of those: two families answer two paths, so
+        # guessing one is how a console link lands on a marketing home.
+        self.assertEqual("", station_surface_path("", "dashboard"))
+        self.assertEqual("console", station_surface_path("newapi", "dashboard"))
+        self.assertEqual("dashboard", station_surface_path("sub2api", "dashboard"))
+        # The published projection is the one the hosts read.
+        surfaces = self.core.snapshot()["domains"]["relay_accounts"]["station_surfaces"]
+        self.assertEqual(STATION_SURFACES, surfaces)
         for origin, expected in (
             ("https://relay.example.test", "https://relay.example.test/login"),
             ("https://relay.example.test/", "https://relay.example.test/login"),
@@ -1447,7 +1458,9 @@ class BrowserRelaySignInTests(unittest.TestCase):
             ("", ""),
         ):
             with self.subTest(origin=origin):
-                self.assertEqual(expected, relay_browser.sign_in_url(origin))
+                self.assertEqual(expected, station_surface_address(origin, "sign_in", "sub2api"))
+        # A surface the family answers nothing for is the origin, never a guess.
+        self.assertEqual("https://relay.example.test", station_surface_address("https://relay.example.test", "dashboard", ""))
 
     def test_a_host_with_no_browser_answers_which_capability_is_missing(self) -> None:
         with mock.patch.object(relay_browser, "unavailable_reason", return_value="no_browser"):

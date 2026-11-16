@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <thread>
 #include <cmath>
 #include <set>
@@ -1087,7 +1088,24 @@ void WinUI3NativeLeafModule::RelayLogin(
   auto auto_grouping = boolean("autoGrouping");
   // "embedded" is a macOS sheet hint; Windows always opens its own login
   // window, so the flag is accepted and ignored here.
-  static std::set<std::string> const allowed{"accountId", "type", "label", "origin", "language", "username", "embedded", "pendingAccount", "stationId", "stationName", "stationType", "stationOrigin", "rememberPassword", "autoGrouping"};
+  static std::set<std::string> const allowed{"accountId", "type", "label", "origin", "language", "username", "embedded", "pendingAccount", "stationId", "stationName", "stationType", "stationOrigin", "rememberPassword", "autoGrouping", "signInPath"};
+  // One surface's path inside the station, as Core's relay domain states it.
+  // This is the only place the value is trusted: no scheme, no leading slash,
+  // no dot segments, no query — a relative path that stays inside the origin
+  // this window already validated.  Anything else is answered as absent, which
+  // leaves the window on the origin instead of somewhere the page chose.
+  auto surface_path = [](std::optional<std::string> const& value) -> std::string {
+    if (!value) return {};
+    auto const& path = *value;
+    if (path.empty() || path.size() > 200 || path.front() == '/' || path.back() == '/' ||
+        path.find("//") != std::string::npos || path.find("..") != std::string::npos) return {};
+    for (char c : path) {
+      auto const byte = static_cast<unsigned char>(c);
+      if (!(std::isalnum(byte) || c == '.' || c == '_' || c == '~' || c == '/' || c == '-')) return {};
+    }
+    return path;
+  };
+  auto sign_in_path = surface_path(field("signInPath"));
   auto station_id = field("stationId");
   auto station_name = field("stationName");
   auto station_type = field("stationType");
@@ -1129,6 +1147,7 @@ void WinUI3NativeLeafModule::RelayLogin(
   if (station_origin) native_options.station_origin = station_origin;
   native_options.remember_password_preference = remember_password;
   native_options.auto_grouping_preference = auto_grouping;
+  native_options.sign_in_path = std::move(sign_in_path);
   // One decision surface for the whole app: the sign-in browser asks its
   // post-login question through the host's own window instead of a dialog of
   // its own.

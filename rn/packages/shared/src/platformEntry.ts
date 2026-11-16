@@ -83,6 +83,8 @@ type NativeModule = {
     username?: string;
     /** The account's own remember-password preference, so a re-sign-in does not silently clear it. */
     rememberPassword?: boolean;
+    /** The station's sign-in form, from Core's own table. */
+    signInPath?: string;
   }) => Promise<{ revision: number; loginStatus: "signed_in"; username: string } | undefined>;
   cancelRelayLogin?: () => void;
   openRelayLogs?: (options: {
@@ -91,6 +93,8 @@ type NativeModule = {
     label: string;
     origin: string;
     language: LanguagePreference;
+    /** The usage log's page, from Core's table. */
+    usageLogsPath?: string;
   }) => Promise<void>;
   /** Optional: a host with an authenticated station browser for the dashboard. */
   openRelayDashboard?: (options: {
@@ -99,6 +103,8 @@ type NativeModule = {
     label: string;
     origin: string;
     language: LanguagePreference;
+    /** The console's page, from Core's table: `/` is a marketing home. */
+    dashboardPath?: string;
   }) => Promise<void>;
   restoreRelaySession?: (options: {
     accountId: string;

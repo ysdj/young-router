@@ -1791,6 +1791,7 @@ private enum NativeRelayOriginPolicy {
         stationOrigin: String? = nil,
         rememberPassword: Bool? = nil,
         autoGrouping: Bool? = nil,
+        signInPath: String? = nil,
         completion: @escaping (CoreIPCBridge.RelayLoginResult?) -> Void
     ) {
         guard Thread.isMainThread else {
@@ -1810,6 +1811,7 @@ private enum NativeRelayOriginPolicy {
                     stationOrigin: stationOrigin,
                     rememberPassword: rememberPassword,
                     autoGrouping: autoGrouping,
+                    signInPath: signInPath,
                     completion: completion
                 )
             }
@@ -1875,7 +1877,8 @@ private enum NativeRelayOriginPolicy {
             stationType: stationType,
             stationOrigin: stationOrigin,
             rememberPasswordPreference: rememberPassword,
-            autoGroupingPreference: autoGrouping
+            autoGroupingPreference: autoGrouping,
+            surfacePath: signInPath
         )
         activeRelayLoginController = controller
         controller.start { [weak self] result in
@@ -1898,6 +1901,7 @@ private enum NativeRelayOriginPolicy {
         label: String,
         origin: String,
         language: String,
+        usageLogsPath: String? = nil,
         completion: @escaping () -> Void
     ) {
         guard Thread.isMainThread else {
@@ -1908,6 +1912,7 @@ private enum NativeRelayOriginPolicy {
                     label: label,
                     origin: origin,
                     language: language,
+                    usageLogsPath: usageLogsPath,
                     completion: completion
                 )
             }
@@ -1943,6 +1948,7 @@ private enum NativeRelayOriginPolicy {
             language: language,
             username: nil,
             presentationParent: settingsWindow(),
+            surfacePath: usageLogsPath,
             mode: .logs
         )
         activeRelayLoginController = controller
@@ -1968,6 +1974,7 @@ private enum NativeRelayOriginPolicy {
         label: String,
         origin: String,
         language: String,
+        dashboardPath: String? = nil,
         completion: @escaping () -> Void
     ) {
         guard Thread.isMainThread else {
@@ -1978,6 +1985,7 @@ private enum NativeRelayOriginPolicy {
                     label: label,
                     origin: origin,
                     language: language,
+                    dashboardPath: dashboardPath,
                     completion: completion
                 )
             }
@@ -2039,6 +2047,7 @@ private enum NativeRelayOriginPolicy {
                     language: language,
                     username: nil,
                     presentationParent: self.settingsWindow(),
+                    surfacePath: dashboardPath,
                     mode: .dashboard
                 )
                 self.activeRelayLoginController = controller
@@ -6189,6 +6198,17 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     /// so the question is still the one that sets its preference.
     private let rememberPasswordPreference: Bool?
     private let autoGroupingPreference: Bool?
+    /// The path of the page this surface lives on, relative to ``originURL``.
+    ///
+    /// It comes from Core, which owns the station-family table
+    /// (``relay_accounts.STATION_SURFACES``) because three hosts open station
+    /// pages: macOS draws one in this webview, Windows in its own, and a page
+    /// host asks Core to open a real browser.  A copy of the table in each host
+    /// is how the sign-in dialog drew a station's marketing home on the web
+    /// host alone — the macOS leaf had been taught ``/login``, Core never was.
+    /// A host that is handed no path stays on the origin rather than printing
+    /// its own guess.
+    private let surfacePath: String?
     private var embeddedContent: NSView?
     private var embeddedCloseObserver: NSObjectProtocol?
     private let webView: WKWebView
@@ -6275,6 +6295,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         stationOrigin: String? = nil,
         rememberPasswordPreference: Bool? = nil,
         autoGroupingPreference: Bool? = nil,
+        surfacePath: String? = nil,
         mode: NativeRelayBrowserMode = .login,
         handoff: NativeHandoffSignIn? = nil
     ) {
@@ -6299,6 +6320,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         self.stationOrigin = stationOrigin
         self.rememberPasswordPreference = rememberPasswordPreference
         self.autoGroupingPreference = autoGroupingPreference
+        self.surfacePath = surfacePath
 
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
@@ -6500,18 +6522,14 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     }
 
     private var loginURL: URL {
-        if mode == .logs {
-            return relayURL(path: (resolvedType ?? type) == "newapi" ? "usage-logs" : "usage") ?? originURL
+        // The root is not a substitute for any of these: a sub2api station
+        // answers ``/`` with its marketing home, so a sign-in window opened
+        // there shows no field to type into and a dashboard opened there
+        // renders signed-out even for a live session.
+        if let surfacePath, let url = relayURL(path: surfacePath) {
+            return url
         }
-        if mode == .dashboard {
-            // The console path each family serves its own dashboard at.  The
-            // root is not a substitute: a sub2api station answers ``/`` with the
-            // marketing home, which renders signed-out even for a live session.
-            return relayURL(path: (resolvedType ?? type) == "newapi" ? "console" : "dashboard") ?? originURL
-        }
-        // Both relay families expose the sign-in form at /login; landing
-        // there skips the marketing home page and its separate 登录 link.
-        return originURL.appendingPathComponent("login")
+        return originURL
     }
 
     private var localizedChinese: Bool {

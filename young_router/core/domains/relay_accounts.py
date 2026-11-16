@@ -35,6 +35,20 @@ from ..security import safe_exception_message
 
 DOMAIN_NAME = "relay_accounts"
 ACCOUNT_TYPES = ("newapi", "sub2api")
+# The page each station family serves one surface at, relative to the station's
+# own origin.  This is a property of the family, so it lives here and nowhere
+# else: every host that shows a station page reads the table from this domain
+# (the snapshot publishes it, and Core's own browser sign-in resolves it here).
+# A copy printed in each host is how the sign-in window drew a marketing home
+# on the web host alone -- the macOS leaf had been taught `/login`, Core never
+# was -- and a station's `/` is its front door, not its form: measured on
+# api.sisct2.xyz (2026-11-16), sub2api answers `/` with "立即开始" and puts the
+# form one route further at `/login`.
+STATION_SURFACES: dict[str, dict[str, str]] = {
+    "newapi": {"sign_in": "login", "dashboard": "console", "usage_logs": "usage-logs"},
+    "sub2api": {"sign_in": "login", "dashboard": "dashboard", "usage_logs": "usage"},
+}
+STATION_SURFACE_KINDS = ("sign_in", "dashboard", "usage_logs")
 LOGIN_STATUSES = ("signed_out", "signed_in", "expired", "unknown")
 RESOURCE_STATUSES = ("idle", "ready", "unavailable")
 RESOURCE_ERRORS = ("none", "login_expired", "no_api_keys", "no_models", "unavailable")
@@ -325,6 +339,45 @@ def _origin_key(value: str) -> tuple[str, str, int | None] | None:
         return (scheme, parsed.hostname.rstrip(".").lower(), port)
     except ValueError:
         return None
+
+
+def station_surface_path(account_type: object, surface: object) -> str:
+    """The path one station family serves a surface at, or "".
+
+    A pending account has no family yet ("" and "auto" both mean "settle it
+    from the station's own answer"), so an unknown type is answered by the
+    path every family agrees on -- which is exactly the case for the sign-in
+    form, where both families say `login`.  A surface they disagree on
+    (the dashboard) has no family-free answer and returns nothing rather than
+    picking one of them.
+    """
+
+    family = account_type if isinstance(account_type, str) else ""
+    stated = STATION_SURFACES.get(family, {}).get(surface if isinstance(surface, str) else "", "")
+    if stated:
+        return stated
+    agreed = {
+        above[surface]
+        for above in STATION_SURFACES.values()
+        if isinstance(surface, str) and above.get(surface)
+    }
+    return agreed.pop() if len(agreed) == 1 else ""
+
+
+def station_surface_address(origin: str, surface: object, account_type: object) -> str:
+    """One surface's address for a station origin, never a bare origin.
+
+    A station whose origin already carries the leaf (a pasted dashboard URL
+    that kept its base path) is not given it twice.
+    """
+
+    base = str(origin).strip().rstrip("/")
+    path = station_surface_path(account_type, surface).strip("/")
+    if not base or not path:
+        return base
+    if base.rstrip("/").endswith("/" + path):
+        return base
+    return f"{base}/{path}"
 
 
 def _relay_endpoint(origin: str, path: str) -> str:
@@ -1890,6 +1943,13 @@ class RelayAccountsDomain:
             # to decide whether entering the pane needs a station round trip at
             # all, so both sides apply one number.
             "session_recheck_seconds": self._session_recheck_seconds(),
+            # Where each station family serves its sign-in form, its console and
+            # its usage log.  Published because every host that opens a station
+            # page needs the same answer, and a host that keeps its own copy is
+            # a host that can disagree: the macOS leaf had been taught `/login`
+            # while Core still opened the origin, so the sign-in window drew the
+            # station's marketing home on the web host alone.
+            "station_surfaces": {family: dict(paths) for family, paths in STATION_SURFACES.items()},
             "last_action": copy.deepcopy(self._last_action),
         }
 

@@ -6,7 +6,7 @@ import { NativeButton, NativeCheckbox, NativePicker, NativeTextField, nativeCont
 import { pushPresentation, trapWithin } from "../platform/presentationStack";
 import { usePendingAction } from "./pendingAction";
 import { setGroupManagerOpen } from "./providerWizardGate";
-import { normalizeRelayOrigin, stationOriginKey } from "./relayOrigin";
+import { normalizeRelayOrigin, stationOriginKey, stationSurfaceAddress, stationSurfacePath, type StationSurfaces } from "./relayOrigin";
 import { multiplierSpelling } from "./rateSpelling";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
@@ -365,6 +365,31 @@ export function relaySessionRecheckSeconds(snapshot?: CoreSnapshot): number | un
 }
 
 /**
+ * Where each station family serves its sign-in form, its console and its usage
+ * log, exactly as Core publishes them.
+ *
+ * Every host that opens a station page reads this one table: the native leaves
+ * resolve the path and hand it down with the surface they are opening, and the
+ * page host's browser sign-in has Core resolve the same table on its own side.
+ * A host that kept its own copy is a host that could disagree — the macOS leaf
+ * had been taught `/login` while Core still opened the origin, so the sign-in
+ * dialog drew a station's marketing home on the web host alone.
+ */
+export function relayStationSurfaces(snapshot?: CoreSnapshot): StationSurfaces {
+  const domain = record(snapshot?.domains.relay_accounts);
+  const state = Object.keys(record(domain.state)).length > 0 ? record(domain.state) : domain;
+  const surfaces: StationSurfaces = {};
+  for (const [family, value] of Object.entries(record(state.station_surfaces))) {
+    const paths: Record<string, string> = {};
+    for (const [surface, path] of Object.entries(record(value))) {
+      if (typeof path === "string" && path) paths[surface] = path;
+    }
+    if (Object.keys(paths).length > 0) surfaces[family] = paths;
+  }
+  return surfaces;
+}
+
+/**
  * How long Core's service-account observation answers a later read for, in
  * seconds.
  *
@@ -582,6 +607,7 @@ export function StationAccountsPanel({
   language,
   cleanups,
   sessionRecheckSeconds,
+  stationSurfaces,
   stationDraft: stationDraftProp,
   onStationDraftChange,
   onStageStationUpdate,
@@ -600,6 +626,13 @@ export function StationAccountsPanel({
    * window costs no station round trip.
    */
   sessionRecheckSeconds?: number;
+  /**
+   * Where each station family serves its pages, as Core publishes them.  The
+   * sign-in window and the console link both read it here instead of printing
+   * a path in this pane: the table belongs to the station family, and every
+   * host that opens a station page reads the same one.
+   */
+  stationSurfaces?: StationSurfaces;
   busy: boolean;
   translate: Translate;
   commit: RelayCommit;
@@ -898,11 +931,16 @@ export function StationAccountsPanel({
     setFormBusy(true);
     startSigningIn(account.id);
     try {
+      // The page inside the station, from Core's own table: the origin is the
+      // station's front door, and a sign-in window opened on it shows a
+      // marketing home for a family whose form is one route further in.
+      const signInPath = stationSurfacePath(stationSurfaces, account.type, "sign_in");
       const result = await native.relayLogin({
         accountId: account.id,
         type: account.type,
         label: account.label,
         origin: account.origin,
+        ...(signInPath ? { signInPath } : {}),
         language,
         username: account.username || undefined,
         // The page's form opens on this answer; the native hosts use the two
@@ -1022,12 +1060,16 @@ export function StationAccountsPanel({
       publish(translate("relay.typeNotDetected"));
       return;
     }
+    // A station whose family is already known states its own path; a bare
+    // address resolves to the one every family agrees on (the form).
+    const signInPath = stationSurfacePath(stationSurfaces, stationType, "sign_in");
     try {
       const result = await native.relayLogin({
         accountId: pendingID,
         type: stationType,
         label: stationDisplayName(station, translate),
         origin: station.origin,
+        ...(signInPath ? { signInPath } : {}),
         language,
         pendingAccount: true,
         ...(station.persisted ? { stationId: station.id } : {}),
@@ -1087,6 +1129,11 @@ export function StationAccountsPanel({
   const openDashboard = (): void => {
     if (!selected) return;
     const account = selected;
+    // The console's own path, from Core's table: `/` is a marketing home for a
+    // sub2api station, which reads as signed out even for a live session.  It
+    // travels beside the account so every host — the app's own browser or the
+    // default one a host falls back to — lands on the console.
+    const dashboardPath = stationSurfacePath(stationSurfaces, account.type, "dashboard");
     // No pending lane: this surface's promise resolves when the dashboard
     // window closes, and a spinner that lasted exactly that long would read as
     // a stalled action and grey out the row's session controls meanwhile.
@@ -1097,11 +1144,12 @@ export function StationAccountsPanel({
           type: account.type,
           label: account.label,
           origin: account.origin,
+          ...(dashboardPath ? { dashboardPath } : {}),
           language,
         }).catch(() => { publish(translate("relay.operationFailed")); });
         return;
       }
-      native.openExternalURL?.(account.origin);
+      native.openExternalURL?.(stationSurfaceAddress(account.origin, dashboardPath));
     } catch {
       publish(translate("relay.operationFailed"));
     }

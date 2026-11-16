@@ -2145,8 +2145,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("set(user, \\(safeUser))", mac_leaf)
         self.assertIn("input[type=email], input[type=text]", mac_leaf)
         self.assertIn("const words = new Set(['login', 'log in', 'sign in', '登录']);", mac_leaf)
-        # Both relay families land directly on the login form.
-        self.assertIn('return originURL.appendingPathComponent("login")', mac_leaf)
+        # The sign-in window lands on the form, at the path Core states for
+        # this station family; a host with no path stays on the origin rather
+        # than printing a family table of its own.
+        self.assertIn("signInPath: String? = nil,", mac_leaf)
+        self.assertIn("surfacePath: signInPath", mac_leaf)
+        self.assertIn("signInPath: relaySurfacePath(options[\"signInPath\"])", mac_module)
         self.assertIn("private let loadingOverlay = NSVisualEffectView()", mac_leaf)
         self.assertNotIn("NSProgressIndicator", mac_leaf)
         self.assertNotIn("startAnimation", mac_leaf)
@@ -2348,7 +2352,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn('options.language == "zh-Hans"', windows_relay)
         self.assertIn('auto prior_password = ReadChunkedCredential(state->options.account_id, L"password");', windows_relay)
         self.assertIn('host == L"localhost"', windows_relay)
-        self.assertIn('state->webview.Source(winrt::Windows::Foundation::Uri(Utf8ToWide(state->options.origin)));', windows_relay)
+        # The sign-in window lands on the form Core names for this family, not
+        # on the origin: a sub2api station answers `/` with a marketing home.
+        self.assertIn('state->webview.Source(winrt::Windows::Foundation::Uri(Utf8ToWide(sign_in_url)));', windows_relay)
+        self.assertIn('sign_in_url += "/" + state->options.sign_in_path;', windows_relay)
+        self.assertIn('auto sign_in_path = surface_path(field("signInPath"));', windows_module)
+        self.assertIn('native_options.sign_in_path = std::move(sign_in_path);', windows_module)
         probe_login = windows_relay.split("winrt::fire_and_forget ProbeLogin", 1)[1].split("winrt::fire_and_forget InitializeBrowser", 1)[0]
         self.assertNotIn("state->captured_password.reset();", probe_login)
         self.assertIn("if (!password) password = state->captured_password;", windows_relay)
@@ -2410,7 +2419,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("const openDashboard = (): void => {", relay_ui)
         self.assertIn("if (native.openRelayDashboard) {", relay_ui)
         self.assertIn("if (native.openRelayDashboard) {", relay_ui)
-        self.assertIn("native.openExternalURL?.(account.origin);", relay_ui)
+        self.assertIn("native.openExternalURL?.(stationSurfaceAddress(account.origin, dashboardPath));", relay_ui)
         self.assertIn('translate("relay.openDashboard")', relay_ui)
         self.assertIn("title={accountDisplayName(selected, translate)}", relay_ui)
         # The macOS host renders that page in the browser that already holds the
@@ -2423,10 +2432,19 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("let initialContentSize = mode == .dashboard", mac_leaf)
         self.assertIn("NSSize(width: 1140, height: 780)", mac_leaf)
         self.assertIn("NSSize(width: 1000, height: 620)", mac_leaf)
-        dashboard_url = mac_leaf.split("if mode == .dashboard {", 1)[1].split("private var localizedChinese", 1)[0]
         # The console path, not the site root: a sub2api station renders its
-        # marketing home at ``/`` even for a live session.
-        self.assertIn('(resolvedType ?? type) == "newapi" ? "console" : "dashboard"', dashboard_url)
+        # marketing home at ``/`` even for a live session.  The path is Core's
+        # (`relay_accounts.STATION_SURFACES`, published in the relay snapshot)
+        # and arrives with the surface the host is opening, so no host prints a
+        # family table of its own — that copy is how the web host's sign-in
+        # dialog drew a marketing home while every other test was green.
+        login_surface = mac_leaf.split("private var loginURL: URL {", 1)[1].split("private var localizedChinese", 1)[0]
+        self.assertIn("surfacePath", login_surface)
+        self.assertNotIn("console", login_surface)
+        self.assertNotIn("usage-logs", login_surface)
+        self.assertIn('"dashboardPath"', mac_module)
+        self.assertIn("dashboardPath: relaySurfacePath(options[\"dashboardPath\"])", mac_module)
+        self.assertIn("surfacePath: dashboardPath", mac_leaf)
         self.assertIn("RCT_EXTERN_METHOD(openRelayDashboard:(NSDictionary *)options", mac_bridge)
         # A New API console sends `New-Api-User` on every read and takes its value
         # from `localStorage.user.id` (its own `ar()` answers -1 without one), so

@@ -83,6 +83,47 @@ export function stationOriginKey(value: string): string {
   }
 }
 
+/**
+ * Where each station family serves a surface, and the address built from it.
+ *
+ * Core owns the table (`relay_accounts.STATION_SURFACES`) and publishes it in
+ * the relay snapshot, because every host that opens a station page needs the
+ * same answer: macOS draws the station in its own webview, Windows in its own,
+ * and a page asks Core to open a real browser.  A copy printed in each host is
+ * how the sign-in dialog drew a station's marketing home on the web host alone
+ * — the macOS leaf had been taught `/login`, Core never was.
+ */
+export type StationSurface = "sign_in" | "dashboard" | "usage_logs";
+export type StationSurfaces = Record<string, Record<string, string>>;
+
+export function stationSurfacePath(
+  surfaces: StationSurfaces | undefined,
+  type: string,
+  surface: StationSurface,
+): string {
+  const exact = surfaces?.[type]?.[surface];
+  if (typeof exact === "string" && exact) return exact;
+  // A pending account has no family yet ("" and "auto" both mean "settle it
+  // from the station's own answer").  A surface every family states the same
+  // way — the sign-in form — needs none; one they disagree on (the dashboard)
+  // has no family-free answer, and guessing one is how a console link lands on
+  // a marketing home.
+  const stated = new Set<string>();
+  for (const paths of Object.values(surfaces ?? {})) {
+    const path = paths?.[surface];
+    if (typeof path === "string" && path) stated.add(path);
+  }
+  return stated.size === 1 ? Array.from(stated)[0] ?? "" : "";
+}
+
+/** `<origin>` plus one surface's path, never doubling a leaf the base already has. */
+export function stationSurfaceAddress(origin: string, path: string): string {
+  const base = origin.trim().replace(/\/+$/u, "");
+  const leaf = path.trim().replace(/^\/+|\/+$/gu, "");
+  if (!base || !leaf) return base;
+  return base.endsWith(`/${leaf}`) ? base : `${base}/${leaf}`;
+}
+
 /** The account one sign-in actually landed on, or the pending shell itself. */
 export type RelayLoginIdentity = {
   id: string;

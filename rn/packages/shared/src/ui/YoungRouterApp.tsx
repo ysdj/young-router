@@ -23,6 +23,7 @@ import {
   type ProvidedKeyRow,
   pendingCredentialCleanups,
   relaySessionRecheckSeconds,
+  relayStationSurfaces,
   serviceAccountRecheckSeconds,
   StationAccountsPanel,
   stationDisplayName,
@@ -36,7 +37,7 @@ import {
   type RelayWorkspaceBridge,
   type StationDraft,
 } from "./RelayAccountManager";
-import { relayLoginLandedAccount, suggestedProviderName, suggestedRelayStationName } from "./relayOrigin";
+import { relayLoginLandedAccount, stationSurfacePath, suggestedProviderName, suggestedRelayStationName } from "./relayOrigin";
 import { multiplierSpelling, rateNumber, rateSpelling } from "./rateSpelling";
 import { applyPatch, mergeSnapshot, snapshotProjectionRevision } from "../applyPatch";
 import { postActionRefreshNeeded, publishSnapshot, useDomainRecord, type EventChannelState } from "./snapshotStore";
@@ -5904,11 +5905,16 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       setSignedInAccountID(pendingID);
       setLoginPhase("sign-in");
       loginInFlight.current = true;
+      // The form's own page, from the station family table Core publishes: the
+      // address typed into the wizard is the station's front door, which a
+      // sub2api station answers with its marketing home.
+      const signInPath = stationSurfacePath(relayStationSurfaces(snapshot), accountType, "sign_in");
       const result = await native.relayLogin({
         accountId: pendingID,
         type: accountType,
         label: (stationForProvider?.name ?? suggestedRelayStationName(candidate)) || candidate,
         origin: candidate,
+        ...(signInPath ? { signInPath } : {}),
         language: snapshot?.language ?? "system",
         pendingAccount: true,
         ...(stationForProvider ? { stationId: stationForProvider.id } : {}),
@@ -10611,11 +10617,15 @@ function ProviderEditor({ provider, relayStations, native, busy, translate, disp
       // The station binding is created when the login lands, from the family
       // the flow resolved, so a cancelled sign-in still reserves nothing.
       const relayType = station?.type ?? "";
+      // The station's surfaces come from the snapshot this pane already holds
+      // for its cleanups; there is no bare `snapshot` in this scope.
+      const signInPath = stationSurfacePath(relayStationSurfaces(snapshotForCleanups), relayType, "sign_in");
       const result = await native.relayLogin({
         accountId: pendingID,
         type: relayType,
         label: origin,
         origin,
+        ...(signInPath ? { signInPath } : {}),
         language,
         pendingAccount: true,
         stationName,
@@ -10765,6 +10775,7 @@ function ProviderEditor({ provider, relayStations, native, busy, translate, disp
       language={language}
       cleanups={pendingCredentialCleanups(snapshotForCleanups)}
       sessionRecheckSeconds={relaySessionRecheckSeconds(snapshotForCleanups)}
+      stationSurfaces={relayStationSurfaces(snapshotForCleanups)}
       busy={busy}
       translate={translate}
       commit={relay.commit}

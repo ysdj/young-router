@@ -133,6 +133,8 @@ export interface NativeLeafBridge {
     stationName?: string;
     stationType?: "newapi" | "sub2api";
     stationOrigin?: string;
+    /** The station's sign-in form, from Core's own table. */
+    signInPath?: string;
   }): Promise<{ revision: number; loginStatus: "signed_in"; username: string } | undefined>;
   cancelRelayLogin?: () => void;
   restoreRelaySession(options: {
@@ -148,6 +150,8 @@ export interface NativeLeafBridge {
     label: string;
     origin: string;
     language: LanguagePreference;
+    /** The usage log's page, from Core's table. */
+    usageLogsPath?: string;
   }): Promise<void>;
   /** Optional: the host's authenticated station browser, for the dashboard. */
   openRelayDashboard?(options: {
@@ -156,6 +160,8 @@ export interface NativeLeafBridge {
     label: string;
     origin: string;
     language: LanguagePreference;
+    /** The console's page, from Core's table: `/` is a marketing home. */
+    dashboardPath?: string;
   }): Promise<void>;
   clearRelayPassword(accountId: string): Promise<void>;
   clearRelayCredentials(accountId: string): Promise<void>;

@@ -580,31 +580,6 @@ def _target_id(target: Mapping[str, Any]) -> str:
     return ""
 
 
-def sign_in_url(origin: str) -> str:
-    """The station's own sign-in form, which is not the station's front door.
-
-    Measured on a sub2api station (api.sisct2.xyz, 2026-11-16): `GET /` answers
-    the marketing home — "SISCT2API — Subscription to API Conversion Platform",
-    a 立即开始 button — and the form is one route further at `/login`, so a
-    window opened on the origin drew a page with no field to type a password
-    into.  Both relay families this app signs in to (New API, sub2api) serve
-    the form at `/login`, which is also where the macOS host has opened since
-    36ae051; a station that already holds the session forwards that path to
-    its dashboard, which is where the person belonged anyway.
-
-    A base path pasted with the origin ("https://host/relay") keeps it, and an
-    address that already ends in the leaf is left alone.
-    """
-
-    trimmed = origin.strip().rstrip("/")
-    if not trimmed:
-        return ""
-    leaf = (urlsplit(trimmed).path.rsplit("/", 1)[-1] or "").lower()
-    if leaf in {"login", "signin", "sign-in"}:
-        return trimmed
-    return f"{trimmed}/login"
-
-
 def active_page_target(port: int, origin: str) -> Mapping[str, Any] | None:
     """The page whose screen is the one to show: the station, or where it went.
 

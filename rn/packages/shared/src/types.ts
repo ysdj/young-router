@@ -1141,6 +1141,10 @@ export interface NativeLeafAdapter {
     stationName?: string;
     stationType?: "newapi" | "sub2api";
     stationOrigin?: string;
+    /** The station's sign-in form, from Core's own table: the origin is the
+     * station's front door, which a sub2api station answers with a marketing
+     * home.  Absent leaves the window on the origin rather than a guess. */
+    signInPath?: string;
   }): Promise<{ revision: number; loginStatus: "signed_in"; username: string } | undefined>;
   cancelRelayLogin(): void;
   restoreRelaySession(options: {
@@ -1156,6 +1160,8 @@ export interface NativeLeafAdapter {
     label: string;
     origin: string;
     language: LanguagePreference;
+    /** The usage log's page, from Core's table. */
+    usageLogsPath?: string;
   }): Promise<void>;
   /**
    * Show a signed-in station's dashboard in the app's own authenticated
@@ -1171,6 +1177,8 @@ export interface NativeLeafAdapter {
     label: string;
     origin: string;
     language: LanguagePreference;
+    /** The console's page, from Core's table: `/` is a marketing home. */
+    dashboardPath?: string;
   }): Promise<void>;
   clearRelayPassword(accountId: string): Promise<void>;
   clearRelayCredentials(accountId: string): Promise<void>;
