@@ -13,6 +13,7 @@ from . import codex_fast_tier as _codex_fast_tier_module
 from . import responses_execution as _responses_execution_module
 from . import responses_surfaces as _responses_surfaces_module
 from . import tool_history as _tool_history_module
+from . import tool_result_images as _tool_result_images_module
 from . import web_search_native as _web_search_native_module
 from . import reasoning as _reasoning_module
 from . import routing as _routing_module
@@ -78,6 +79,17 @@ class YoungRouterHook(CustomLogger):
         paired = _tool_history_module.paired_request(data)
         if paired is not None:
             data = paired
+        # A picture inside a tool result is a shape the client's wire allows and
+        # an OpenAI-compatible upstream cannot read: the bridge serialises it as
+        # a data URL and the upstream tokenizes the base64 as prose.  Measured
+        # on the live relay, the same 473 KB image cost 327,716 prompt tokens
+        # inside a result and 1,053 as an ordinary image part -- and only in the
+        # second shape could the model see it.  Lifting the pictures out is what
+        # makes a figure cost a figure, so it runs before the size passes below
+        # price the body (see ``tool_result_images``).
+        promoted = _tool_result_images_module.promoted_tool_result_images(data)
+        if promoted is not None:
+            data = promoted
         if not _responses_request_module._request_is_responses_api(data):
             # Messages replays the same history and meets the same cap.  The
             # route refuses an oversized prompt with a plain 400, and on its

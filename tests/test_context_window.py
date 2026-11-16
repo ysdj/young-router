@@ -960,19 +960,24 @@ class RefusalRewriteBeliefTests(unittest.TestCase):
 
 
 class MessagesWireImageTests(unittest.TestCase):
-    """A picture costs its pixels on the Messages wire too.
+    """A picture inside a tool result is not a picture to this upstream.
 
     Regression ground: one Claude Code thread (``/v1/messages``, single user
     request, 300 tool round trips) read one paper in 100 small ``sed`` windows
     and never once had the whole thing in front of it.  Five ``Read`` results of
-    figures carried 1.72 MB of base64; ``wire_tokens`` priced that as prose and
-    reported the replay at 1,467,779 tokens of a 1,000,000-token window, so
-    ``apply`` elided history on every single step -- 341 of 860 items became
-    ``[N characters of earlier tool output elided…]`` -- and the model answered
-    by reading the same lines again, 5.5x the unique text it needed.
+    figures carried 1.72 MB of base64; the replay measured 1,467,779 tokens of
+    a 1,000,000-token window, so ``apply`` elided history on every step -- 341
+    of 860 items became ``[N characters of earlier tool output elided…]`` -- and
+    the model answered by reading the same lines again, 5.5x the unique text it
+    needed.
 
-    ``image_context.scan`` could never have priced those pictures: it is the
-    Codex pass and reads ``input_image``/``image_url`` only.
+    The measurement was right.  The bytes really are that expensive: the Chat
+    bridge serialises a picture inside a ``tool_result`` as a data URL, and the
+    upstream tokenizes that string -- 327,716 prompt tokens for one 473 KB
+    JPEG, against 1,053 for the same bytes as an ordinary ``image`` part, where
+    the model could also actually see it.  ``tool_result_images`` is what makes
+    the replay cost what a replay of pictures should cost; these tests pin both
+    prices so neither can drift into the other.
     """
 
     @staticmethod
@@ -1056,7 +1061,18 @@ class MessagesWireImageTests(unittest.TestCase):
             )
         return turns
 
-    def test_a_messages_image_is_priced_from_its_pixels_not_its_base64(self) -> None:
+    def test_a_messages_image_is_priced_at_what_the_upstream_reads(self) -> None:
+        """A picture *inside a tool result* is prose to this upstream.
+
+        The Messages wire allows an ``image`` part inside a ``tool_result`` --
+        what ``Read`` of a JPEG answers.  The Chat bridge serialises it as a
+        data URL in a Chat ``tool`` message, and the upstream tokenizes that
+        string: measured on the live relay, one 473 KB JPEG cost 327,716 prompt
+        tokens there, against 1,053 as an ordinary ``image`` part.  So the
+        honest price for this shape is its bytes, and ``tool_result_images``
+        is what turns it into the shape that costs a picture's price.
+        """
+
         items = self._thread(1)
         image_body = [
             block["source"]["data"]
@@ -1068,13 +1084,25 @@ class MessagesWireImageTests(unittest.TestCase):
         ]
         self.assertEqual(len(image_body), 1)
         priced = cw._messages_wire_image_tokens(items)
-        # 1999x1589 / 750 px per token, plus the tiles' overhead.
-        self.assertGreater(priced, 4_000)
-        self.assertLess(priced, 5_000)
-        # What the same body costs priced as the prose its base64 resembles:
-        # the ratio this test exists for is the one that tripped the window.
-        as_prose = len(image_body[0]) / 1.47
-        self.assertGreater(as_prose / priced, 30)
+        self.assertGreaterEqual(priced, len(image_body[0]))
+
+        # The same picture beside the result -- the shape the lift produces --
+        # is priced from its pixels instead.
+        beside = [
+            items[0],
+            items[1],
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_0", "content": "ok"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_body[0]}},
+                ],
+            },
+        ]
+        beside_price = cw._messages_wire_image_tokens(beside)
+        self.assertGreater(beside_price, 4_000)
+        self.assertLess(beside_price, 5_000)
+        self.assertGreater(priced / beside_price, 30)
 
     def test_a_messages_image_no_longer_inflates_the_wire_count(self) -> None:
         with_image = self._thread(5)

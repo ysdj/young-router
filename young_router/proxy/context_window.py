@@ -369,6 +369,13 @@ def _inline_image_b64(node: Any, out: Optional[List[str]] = None) -> List[str]:
     their headers there.  This walker reads the other spelling -- Messages'
     ``{"type": "image", "source": {"type": "base64", "data": …}}`` -- so the
     two prices never add up to the same picture twice.
+
+    A picture inside a ``tool_result`` is collected too, but it is priced by
+    ``_tool_result_image_tokens`` instead: the upstream cannot read that shape
+    and tokenizes its data URL as prose, so the honest price is its bytes and
+    not its pixels.  ``tool_result_images`` lifts those pictures out before
+    this pass runs; when one is still here the lift did not happen, and a
+    pixel price would understate the body by two orders of magnitude.
     """
 
     found = out if out is not None else []
@@ -1409,14 +1416,27 @@ def _messages_wire_image_tokens(items: Any) -> int:
     request and a replay can carry a hundred pictures.  A body whose header
     still is not in that window keeps the byte rate, which is the only thing
     known about it without decoding the whole thing.
+
+    Pictures still inside a ``tool_result`` are the exception, and the reason
+    this function is not simply a sum of pixel prices: the upstream cannot read
+    that shape, so it tokenizes the data URL as prose.  Measured on the live
+    relay, one 473 KB JPEG cost 327,716 prompt tokens there and 1,053 as an
+    ordinary ``image`` part.  ``tool_result_images`` moves them out before this
+    pass runs; a body that still has one is priced at what the upstream will
+    actually charge for it.
     """
 
     import base64
 
     from . import image_context as _image_context_module
 
-    total = 0
+    nested = set()
+    for body in _tool_result_image_b64(items):
+        nested.add(body)
+    total = _tool_result_image_tokens(items)
     for body in _inline_image_b64(items):
+        if body in nested:
+            continue
         head = b""
         if body:
             try:
@@ -1430,6 +1450,52 @@ def _messages_wire_image_tokens(items: Any) -> int:
             )
         elif body:
             total += int(len(body) * 3 / 4 * _BASE64_OVERHEAD / _IMAGE_BYTES_PER_TOKEN)
+    return total
+
+
+def _tool_result_image_b64(node: Any, out: Optional[List[str]] = None) -> List[str]:
+    """The base64 bodies of pictures sitting inside a ``tool_result``."""
+
+    found = out if out is not None else []
+    stack = [node]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, Mapping):
+            if item.get("type") == "tool_result":
+                content = item.get("content")
+                if isinstance(content, list):
+                    for part in content:
+                        if not isinstance(part, Mapping):
+                            continue
+                        source = part.get("source")
+                        if not isinstance(source, Mapping):
+                            continue
+                        data = source.get("data")
+                        if isinstance(data, str) and data:
+                            found.append(data)
+                continue
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return found
+
+
+def _tool_result_image_tokens(node: Any) -> int:
+    """What a picture inside a ``tool_result`` costs on this wire.
+
+    Not its pixels.  The bridge serialises the part as a data URL inside a Chat
+    ``tool`` message, and the upstream tokenizes that string -- one 473 KB JPEG
+    was billed at 327,716 prompt tokens against 1,053 for the same bytes as an
+    ordinary image part.  Priced at the byte rate the upstream applies, this
+    number is what makes the window guard see the body that will be refused.
+    """
+
+    total = 0
+    for body in _tool_result_image_b64(node):
+        # The data URL prefix (``data:image/jpeg;base64,``) is prose the
+        # upstream also reads, and base64 costs roughly a token per character
+        # on this relay: measured 327,716 tokens for 473,448 characters.
+        total += len(body)
     return total
 
 
