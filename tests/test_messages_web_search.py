@@ -299,6 +299,88 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], rows)
 
 
+class PageReadTests(unittest.IsolatedAsyncioTestCase):
+    """The top results are read the way Codex's ``open`` reads a page."""
+
+    def _patched(self, endpoint, fetch):
+        return (
+            mock.patch.object(endpoint, "_router_entries", lambda model: []),
+            mock.patch.object(endpoint, "page_fetcher", lambda client, params=None: fetch),
+        )
+
+    async def test_only_the_top_results_are_read(self) -> None:
+        endpoint = search._search_endpoint_module
+        asked: list[str] = []
+
+        async def fetch(url):
+            asked.append(url)
+            return (url, "page text for " + url)
+
+        rows = [
+            {"title": "a", "url": "https://a.test/1"},
+            {"title": "b", "url": "https://a.test/2"},
+            {"title": "c", "url": "https://a.test/3"},
+        ]
+        route_patch, fetch_patch = self._patched(endpoint, fetch)
+        with route_patch, fetch_patch:
+            enriched = await endpoint.read_result_pages("some-model", rows)
+
+        self.assertEqual(["https://a.test/1", "https://a.test/2"], asked)
+        self.assertEqual("page text for https://a.test/1", enriched[0]["content"])
+        self.assertNotIn("content", enriched[2])
+        # The rows the caller handed in are not mutated.
+        self.assertNotIn("content", rows[0])
+
+    async def test_a_page_that_could_not_be_read_keeps_its_row(self) -> None:
+        endpoint = search._search_endpoint_module
+
+        async def fetch(url):
+            if url.endswith("/2"):
+                raise RuntimeError("blocked")
+            return None
+
+        route_patch, fetch_patch = self._patched(endpoint, fetch)
+        with route_patch, fetch_patch:
+            enriched = await endpoint.read_result_pages(
+                "some-model",
+                [{"url": "https://a.test/1"}, {"url": "https://a.test/2"}],
+            )
+
+        self.assertEqual(
+            [{"url": "https://a.test/1"}, {"url": "https://a.test/2"}], enriched
+        )
+
+    async def test_a_script_rendered_page_is_not_evidence(self) -> None:
+        endpoint = search._search_endpoint_module
+
+        async def fetch(url):
+            return ("t", "（这个页面用脚本渲染正文，纯文本读取拿不到内容。）")
+
+        route_patch, fetch_patch = self._patched(endpoint, fetch)
+        with route_patch, fetch_patch:
+            enriched = await endpoint.read_result_pages(
+                "some-model", [{"url": "https://a.test/1"}]
+            )
+
+        self.assertNotIn("content", enriched[0])
+
+    async def test_the_page_text_is_bounded(self) -> None:
+        endpoint = search._search_endpoint_module
+
+        async def fetch(url):
+            return ("t", "长" * 4000)
+
+        route_patch, fetch_patch = self._patched(endpoint, fetch)
+        with route_patch, fetch_patch:
+            enriched = await endpoint.read_result_pages(
+                "some-model", [{"url": "https://a.test/1"}]
+            )
+
+        self.assertEqual(
+            endpoint.MESSAGES_PAGE_TEXT_CHARS, len(enriched[0]["content"])
+        )
+
+
 class PrepareTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_search_that_ran_rewrites_the_request(self) -> None:
         request = side_query_request()
@@ -309,7 +391,12 @@ class PrepareTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Perform a web search", question or "")
             return list(ROWS)
 
+        async def pages(model, result_rows, limit=2):
+            return [dict(row, content="Ruby 3.4.0 shipped.") for row in result_rows]
+
         with mock.patch.object(search._search_endpoint_module, "search_pages", rows), mock.patch.object(
+            search._search_endpoint_module, "read_result_pages", pages
+        ), mock.patch.object(
             search, "_served_by_a_claude_route", lambda model: False
         ):
             rewritten = await search.prepare(request)
@@ -317,6 +404,30 @@ class PrepareTests(unittest.IsolatedAsyncioTestCase):
         assert rewritten is not None
         self.assertNotIn("tools", rewritten)
         self.assertEqual(2, len(search.marked_blocks(rewritten)))
+        self.assertIn(
+            "Page text (excerpt):", rewritten["messages"][0]["content"][0]["text"]
+        )
+
+    async def test_a_page_read_failure_does_not_lose_the_search(self) -> None:
+        request = side_query_request()
+
+        async def rows(model, queries, question=None):
+            return list(ROWS)
+
+        async def pages(model, result_rows, limit=2):
+            raise RuntimeError("reader down")
+
+        with mock.patch.object(search._search_endpoint_module, "search_pages", rows), mock.patch.object(
+            search._search_endpoint_module, "read_result_pages", pages
+        ), mock.patch.object(
+            search, "_served_by_a_claude_route", lambda model: False
+        ):
+            rewritten = await search.prepare(request)
+
+        assert rewritten is not None
+        self.assertIn(
+            "Ruby 3.4 Released", rewritten["messages"][0]["content"][0]["text"]
+        )
 
     async def test_a_backend_that_answered_nothing_leaves_the_request_alone(self) -> None:
         async def rows(model, queries, question=None):

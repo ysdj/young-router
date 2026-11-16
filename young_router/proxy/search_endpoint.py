@@ -1730,6 +1730,88 @@ async def search_pages(
     return [dict(row) for row in rows if isinstance(row, Mapping)]
 
 
+#: How many result pages a Messages search reads before the model answers.
+#: Claude Code's search side request is a summary, not a browsing session: two
+#: pages are what that summary can use, and each one is a request against the
+#: route's own ``/tools/fetch`` when this host cannot read it.
+MESSAGES_PAGE_READS = 2
+#: How much of one page is handed to the model.  A side request is one turn on
+#: top of the search itself; a whole documentation page inside it would spend
+#: the answer's budget on a menu it may never need.
+MESSAGES_PAGE_TEXT_CHARS = 1500
+#: ``local_page`` answers with this text when a page draws its body in scripts.
+#: It is a note to the reader, not page content, so it never becomes evidence.
+_SCRIPT_RENDERED_PAGE_MARKER = "用脚本渲染正文"
+
+
+async def read_result_pages(
+    model: str,
+    rows: list[dict[str, Any]],
+    limit: int = MESSAGES_PAGE_READS,
+) -> list[dict[str, Any]]:
+    """Give the top results the text that ``open`` would have read.
+
+    A DeepSeek route reads pages through its own ``/tools/fetch`` when this
+    host cannot, exactly as ``open`` and ``find`` do (``page_fetcher``), so the
+    search answer is written from what a page says and not only from the
+    search engine's 100-200 character display snippet.  Best-effort: a page
+    that cannot be read is left without text rather than failing the turn, and
+    the script-rendered placeholder ``local_page`` returns is not text.
+    """
+
+    if not rows or limit <= 0:
+        return rows
+    wanted = [
+        str(row.get("url") or "").strip()
+        for row in rows[:limit]
+        if str(row.get("url") or "").strip()
+    ]
+    if not wanted:
+        return rows
+    entry = next(
+        (
+            _deployment_params(candidate)
+            for candidate in _router_entries(model)
+            if is_deepseek_deployment(_deployment_params(candidate))
+        ),
+        None,
+    )
+    import httpx
+
+    texts: dict[str, str] = {}
+    async with httpx.AsyncClient(
+        timeout=REQUEST_TIMEOUT_SECONDS, trust_env=False
+    ) as client:
+        fetch = page_fetcher(client, entry)
+        reads = await asyncio.gather(
+            *(fetch(url) for url in wanted), return_exceptions=True
+        )
+    for url, read in zip(wanted, reads):
+        if isinstance(read, Exception) or read is None:
+            continue
+        _title, content = read
+        text = str(content or "")
+        if not text.strip() or _SCRIPT_RENDERED_PAGE_MARKER in text:
+            continue
+        texts[url] = text[:MESSAGES_PAGE_TEXT_CHARS]
+    _trace(
+        "messages_web_search_pages",
+        model=model,
+        requested=len(wanted),
+        read=len(texts),
+    )
+    if not texts:
+        return rows
+    enriched: list[dict[str, Any]] = []
+    for row in rows:
+        updated = dict(row)
+        text = texts.get(str(row.get("url") or "").strip())
+        if text is not None:
+            updated["content"] = text
+        enriched.append(updated)
+    return enriched
+
+
 async def _search(body: Mapping[str, Any], model: str) -> dict[str, Any]:
     import httpx
 

@@ -16,9 +16,11 @@ Codex reaches a search through ``POST {base}/alpha/search``, which
 ``search_endpoint`` answers from the same backends (a DeepSeek route's own
 ``/v1/tools/search`` first, then a Claude route's server-side search, then the
 gateway's own route).  This module is the Messages half of that route: it takes
-the query the client already stated, asks those backends for the pages, hands
-them to the model as evidence so the answer is written from something real,
-and publishes the two blocks the client's own parser reads.
+the query the client already stated, asks those backends for the pages, reads
+the top ones the way Codex's ``open`` does (this host first, a DeepSeek route's
+``/v1/tools/fetch`` when plain HTTP cannot), hands them to the model as
+evidence so the answer is written from something real, and publishes the two
+blocks the client's own parser reads.
 
 Three boundaries:
 
@@ -207,10 +209,11 @@ def evidence_text(
 ) -> str:
     """What the model is told before it answers the search side request.
 
-    The pages are listed whole (title, URL, the backend's own snippet) instead
-    of being summarised here: the model that reads them is the one that writes
-    the answer, and a summary produced by this proxy would be a second model's
-    account of pages it never opened.
+    Each page is listed as the backend returned it (title, URL, snippet), with
+    the text of the pages the reader could open.  Nothing is summarised here:
+    the model that reads them is the one that writes the answer, and a summary
+    produced by this proxy would be a second model's account of pages it never
+    opened.
     """
 
     lines = [f'The web search for "{query}" already ran before this turn.']
@@ -236,6 +239,13 @@ def evidence_text(
         snippet = " ".join(str(row.get("snippet") or "").split())
         if snippet:
             lines.append(f"   {snippet}")
+        content = row.get("content")
+        if isinstance(content, str) and content.strip():
+            # The reader's own text, when it could be read.  A search engine's
+            # display snippet is one sentence about a page; the page is what
+            # the answer cites.
+            lines.append("   Page text (excerpt):")
+            lines.extend(f"   {line}" for line in content.strip().splitlines())
     lines.append("")
     lines.append(
         "Answer the request above from these pages. Cite a page as a markdown "
@@ -477,6 +487,17 @@ async def prepare(request_data: dict[str, Any]) -> Optional[dict[str, Any]]:
         # search that ran and found the web silent.
         return None
     allowed = filtered_rows(rows, declarations[0])
+    try:
+        # The declaration's domain filter runs before a page is read: paying a
+        # fetch for a result this call is not allowed to use is both a cost and
+        # a request the client did not ask for.
+        allowed = await _search_endpoint_module.read_result_pages(model, allowed)
+    except Exception as exc:
+        _search_endpoint_module._trace(
+            "messages_web_search_page_read_failed",
+            model=model,
+            error=type(exc).__name__,
+        )
     _search_endpoint_module._trace(
         "messages_web_search_served",
         model=model,

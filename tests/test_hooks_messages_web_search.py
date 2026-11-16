@@ -42,12 +42,14 @@ class HookMessagesWebSearchTests(HookTestCase):
     """The pre-call hook is what turns a search declaration into a search."""
 
     def _patch_search(self, hooks, rows):
+        endpoint = hooks._messages_web_search_module._search_endpoint_module
+
+        async def pages(model, result_rows, limit=2):
+            return list(result_rows)
+
         return (
-            mock.patch.object(
-                hooks._messages_web_search_module._search_endpoint_module,
-                "search_pages",
-                rows,
-            ),
+            mock.patch.object(endpoint, "search_pages", rows),
+            mock.patch.object(endpoint, "read_result_pages", pages),
             mock.patch.object(
                 hooks._messages_web_search_module,
                 "_served_by_a_claude_route",
@@ -56,8 +58,8 @@ class HookMessagesWebSearchTests(HookTestCase):
         )
 
     async def _prepared(self, hooks, request, rows):
-        search_patch, route_patch = self._patch_search(hooks, rows)
-        with search_patch, route_patch:
+        search_patch, pages_patch, route_patch = self._patch_search(hooks, rows)
+        with search_patch, pages_patch, route_patch:
             return await hooks.YoungRouterHook().async_pre_call_hook(
                 {}, None, request, "anthropic_messages"
             )
@@ -94,8 +96,8 @@ class HookMessagesWebSearchTests(HookTestCase):
         async def rows(model, queries, question=None):
             raise AssertionError("a body with no declaration must not search")
 
-        search_patch, route_patch = self._patch_search(hooks, rows)
-        with search_patch, route_patch:
+        search_patch, pages_patch, route_patch = self._patch_search(hooks, rows)
+        with search_patch, pages_patch, route_patch:
             modified = await hooks.YoungRouterHook().async_pre_call_hook(
                 {}, None, request, "anthropic_messages"
             )
@@ -114,8 +116,8 @@ class HookMessagesWebSearchTests(HookTestCase):
         async def rows(model, queries, question=None):
             raise AssertionError("the Messages pass must not run on a Responses body")
 
-        search_patch, route_patch = self._patch_search(hooks, rows)
-        with search_patch, route_patch:
+        search_patch, pages_patch, route_patch = self._patch_search(hooks, rows)
+        with search_patch, pages_patch, route_patch:
             await hooks.YoungRouterHook().async_pre_call_hook(
                 {}, None, request, "aresponses"
             )
