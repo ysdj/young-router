@@ -2118,11 +2118,14 @@ class HookStreamingTimeoutTests(HookTestCase):
         )
 
     def test_the_dispatch_budget_widens_for_the_bytes_a_request_carries(self) -> None:
-        """A heavy replay has to travel before a header can come back.
+        """A heavy replay has to be read before a header can come back.
 
-        The allowance is one megabyte per second, far below any link this proxy
-        runs on, so it only ever rescues an upload: an absent host accepts no
-        bytes and pays the bare connect budget.
+        The clock this budget covers ends at the response head, and no upstream
+        writes one before it has prefilled the prompt.  The allowance is
+        therefore measured in prefill throughput, which is far slower than the
+        link: a one-megabyte-per-second floor cut a 2.7 MB replay at 12.6 s
+        when the live relay needed 26 s, and every attempt on every deployment
+        failed for the same reason.
         """
 
         hooks, _ = load_hook_module()
@@ -2137,19 +2140,71 @@ class HookStreamingTimeoutTests(HookTestCase):
         )
 
         self.assertAlmostEqual(10.0, small, places=2)
-        self.assertGreater(heavy, 12.0)
-        self.assertLess(heavy, 20.0)
+        # 3 MB at the 16 KB/s floor is 192 s, and the first-event budget for a
+        # heavy Responses replay is the wider one, so the floor is what binds.
+        self.assertGreater(heavy, 150.0)
+        self.assertLessEqual(heavy, hooks._stream_start_timeout_seconds_for_request(
+            {"input": [{"role": "user", "content": "x" * 3_000_000}]}
+        ))
 
         self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "0")
         self.assertEqual(
             0.0, hooks._upstream_dispatch_budget_seconds({"input": "hi"})
         )
 
+    def test_the_dispatch_budget_never_outlasts_the_first_event_budget(self) -> None:
+        """Both clocks end at the same event, so the shorter one is the answer.
+
+        Widening the dispatch budget for prefill must not turn into a licence to
+        wait longer for a response head than this proxy already waits for the
+        first frame of a response it did receive.
+        """
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "10")
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "30")
+        self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "0")
+        # Without this the heavy-replay widening would raise the first-event
+        # budget to its own 300 s, and the cap being tested would not bind.
+        self.set_env(hooks._HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV, "0")
+        self.addCleanup(
+            self.set_env, hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, None
+        )
+        self.addCleanup(self.set_env, hooks._STREAM_START_TIMEOUT_SECONDS_ENV, None)
+        self.addCleanup(self.set_env, hooks._REQUEST_TIMEOUT_SECONDS_ENV, None)
+        self.addCleanup(
+            self.set_env,
+            hooks._HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV,
+            None,
+        )
+
+        body = {"input": [{"role": "user", "content": "x" * 3_000_000}]}
+        self.assertAlmostEqual(
+            30.0, hooks._upstream_dispatch_budget_seconds(body), places=2
+        )
+
+    def test_a_claude_sized_replay_gets_time_to_be_prefilled(self) -> None:
+        """The measured case: 2.7 MB of Claude Code history needed 26 s.
+
+        The budget used to give that body 12.6 s and the thread failed on every
+        deployment with ``stream_start_timeout`` while the upstream was in fact
+        reading the prompt.
+        """
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "10")
+        self.addCleanup(
+            self.set_env, hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, None
+        )
+
+        body = {"messages": [{"role": "user", "content": "x" * 2_760_000}]}
+        self.assertGreater(hooks._upstream_dispatch_budget_seconds(body), 26.0)
+
     def test_a_chat_body_earns_the_same_upload_allowance(self) -> None:
         """A Claude-sized ``messages`` history is an upload like any other.
 
-        The dispatch budget is the connect budget plus one megabyte per second
-        of body, and it used to be computed from ``input`` alone -- so every
+        The dispatch budget is the connect budget plus an allowance for the
+        body, and it used to be computed from ``input`` alone -- so every
         Chat-shaped request paid the bare budget no matter how much history it
         carried.  The bridge sends Chat shapes, and so does a plain
         ``/v1/chat/completions`` client of this gateway.
@@ -2165,12 +2220,26 @@ class HookStreamingTimeoutTests(HookTestCase):
             {"messages": [{"role": "user", "content": "hi"}]}
         )
         heavy = hooks._upstream_dispatch_budget_seconds(
-            {"messages": [{"role": "user", "content": "x" * 3_000_000}]}
+            {"messages": [{"role": "user", "content": "x" * 1_000_000}]}
         )
         responses_heavy = hooks._upstream_dispatch_budget_seconds(
-            {"input": "x" * 3_000_000}
+            {"input": "x" * 1_000_000}
         )
 
         self.assertAlmostEqual(10.0, small, places=2)
-        self.assertGreater(heavy, 12.0)
+        self.assertGreater(heavy, 60.0)
         self.assertAlmostEqual(heavy, responses_heavy, places=1)
+
+        # A Chat body has no heavy-replay widening of its own: past the ordinary
+        # first-event budget the cap binds, and the two shapes part ways.  That
+        # is a statement about the first-event budget, not about the allowance.
+        chat_three_mb = hooks._upstream_dispatch_budget_seconds(
+            {"messages": [{"role": "user", "content": "x" * 3_000_000}]}
+        )
+        self.assertAlmostEqual(
+            hooks._stream_start_timeout_seconds_for_request(
+                {"messages": [{"role": "user", "content": "x" * 3_000_000}]}
+            ),
+            chat_three_mb,
+            places=2,
+        )

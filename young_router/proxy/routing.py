@@ -147,7 +147,7 @@ from .base import (
     _STREAM_START_TIMEOUT_SECONDS_ENV,
     _UPSTREAM_CONNECT_TIMEOUT_DEFAULT_SECONDS,
     _UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV,
-    _UPSTREAM_UPLOAD_FLOOR_BYTES_PER_SECOND,
+    _UPSTREAM_DISPATCH_FLOOR_BYTES_PER_SECOND,
     _HEAVY_REPLAY_STREAM_START_TIMEOUT_DEFAULT_SECONDS,
     _HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS_ENV,
     _HEAVY_REPLAY_STREAM_START_DEFAULT_THRESHOLD_BYTES,
@@ -948,14 +948,28 @@ def _upstream_connect_timeout_seconds() -> float:
 
 
 def _upstream_dispatch_budget_seconds(request_data: Optional[dict]) -> float:
-    """The connect budget, widened by the time this body needs to be uploaded.
+    """The connect budget, widened for the body this request has to send.
 
     A handshake budget alone would cut a legitimate heavy replay: a signed
     history of a few megabytes has to travel before the upstream can write even
-    its first header, and the budget is spent waiting on the same socket.  The
-    allowance is one megabyte per second -- far below any link this proxy is
-    meant to run on, so it only ever rescues uploads, never hides a dead host:
-    an unreachable route sends nothing at all and pays the bare budget.
+    its first header, and the budget is spent waiting on the same socket.
+
+    That wait is not only the upload.  The clock this budget covers ends when
+    the upstream writes the response head, and no upstream writes one before it
+    has prefilled the prompt -- so the allowance is measured in prefill
+    throughput, not link throughput.  It used to be one megabyte per second,
+    which is a link figure: a 2.7 MB replay then received 12.6 s while the live
+    relay needed 26 s, and every attempt failed with ``stream_start_timeout``
+    on every deployment for the same reason.  The floor now sits below the
+    slowest measured prefill rate (see ``_UPSTREAM_DISPATCH_FLOOR_BYTES_PER_SECOND``).
+
+    Widening is safe because an unreachable host still pays only the bare
+    budget: it accepts no bytes, so it cannot make the proxy wait for a body
+    that never travels.  The widening is also capped by the first-event budget
+    for the same request, because both clocks end at the same event -- the
+    response head.  Waiting longer for that head than this proxy already waits
+    for the first frame of a response it did receive would be two answers to
+    one question.
     """
 
     connect_seconds = _upstream_connect_timeout_seconds()
@@ -969,8 +983,11 @@ def _upstream_dispatch_budget_seconds(request_data: Optional[dict]) -> float:
         )
     except Exception:
         weight = 0
-    upload_seconds = float(max(0, weight)) / _UPSTREAM_UPLOAD_FLOOR_BYTES_PER_SECOND
+    upload_seconds = float(max(0, weight)) / _UPSTREAM_DISPATCH_FLOOR_BYTES_PER_SECOND
     budget = connect_seconds + upload_seconds
+    first_event = _stream_start_timeout_seconds_for_request(request_data)
+    if first_event > 0:
+        budget = min(budget, first_event)
     request_timeout = _request_timeout_seconds()
     if request_timeout > 0:
         budget = min(budget, request_timeout)

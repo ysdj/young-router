@@ -102,12 +102,16 @@ _STREAM_START_TIMEOUT_DEFAULT_SECONDS = 120.0
 # 2026-11-15 while every other budget in this list was still unspent.
 _UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV = "YOUNG_ROUTER_UPSTREAM_CONNECT_TIMEOUT_SECONDS"
 _UPSTREAM_CONNECT_TIMEOUT_DEFAULT_SECONDS = 10.0
-#: Floor throughput used to widen the connect budget for a body that has to be
-#: uploaded before the upstream can answer.  One megabyte per second is far
-#: below any link this proxy runs on, so the allowance only rescues a heavy
-#: replay; a host that is simply absent still pays the bare budget, because it
-#: accepts no bytes at all.
-_UPSTREAM_UPLOAD_FLOOR_BYTES_PER_SECOND = 1024.0 * 1024.0
+#: Floor throughput for the dispatch phase, which ends when the upstream writes
+#: the response head -- after the body has been uploaded *and prefilled*.
+#: Prefill, not the link, dominates that wait: measured against the live relay
+#: on 2026-11-16, a megabyte of English prose cost 8.8 s (about 110 KB/s) and a
+#: megabyte of Chinese 32 s (about 31 KB/s).  The previous figure here was one
+#: megabyte per second, a property of the link rather than of this phase, so
+#: every replay over about 1.5 MB was cut before its head arrived: 2.7 MB of
+#: Claude Code history needed 26 s and was given 12.6 s.  This floor sits below
+#: the slowest measurement, and the first-event budget still caps the total.
+_UPSTREAM_DISPATCH_FLOOR_BYTES_PER_SECOND = 16.0 * 1024.0
 _HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS_ENV = (
     "YOUNG_ROUTER_HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS"
 )
