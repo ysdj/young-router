@@ -4517,3 +4517,62 @@ class HookNativeFallbackDispatchTests(HookTestCase):
 
         self.assertNotIn("DSML", visible)
         self.assertIn("<thinking> </thinking>", visible)
+
+    async def test_two_calls_in_one_block_get_two_tool_use_blocks(self) -> None:
+        """Parallel calls arrive in one block and must stay separate calls."""
+
+        _, _proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        markup = (
+            "<｜｜DSML｜｜ calls>\n"
+            '<｜｜DSML｜｜ invoke name="Bash">\n'
+            '<｜｜DSML｜｜ parameter name="command" string="true">ls -la</｜｜DSML｜｜ parameter>\n'
+            "</｜｜DSML｜｜ invoke>\n"
+            '<｜｜DSML｜｜ invoke name="Read">\n'
+            '<｜｜DSML｜｜ parameter name="path" string="true">/tmp/a.png</｜｜DSML｜｜ parameter>\n'
+            '<｜｜DSML｜｜ parameter name="offset" string="false">12</｜｜DSML｜｜ parameter>\n'
+            "</｜｜DSML｜｜ invoke>\n"
+            "</｜｜DSML｜｜ calls>"
+        )
+        read = (
+            'event: content_block_delta\ndata: '
+            + json.dumps(
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": markup},
+                }
+            )
+            + "\n\n"
+            + 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+        ).encode()
+
+        async def upstream():
+            yield read
+
+        delivered = [
+            chunk
+            async for chunk in streaming._yield_native_stream_with_output_limit_continuation(
+                [],
+                upstream(),
+                self._dsml_messages_request(),
+                stream_started_at=0.0,
+            )
+        ]
+        frames = self._anthropic_messages_frames(delivered)
+        starts = [
+            frame
+            for frame in frames
+            if frame.get("type") == "content_block_start"
+            and (frame.get("content_block") or {}).get("type") == "tool_use"
+        ]
+        inputs = {}
+        for frame in frames:
+            delta = frame.get("delta") or {}
+            if frame.get("type") == "content_block_delta" and delta.get("type") == "input_json_delta":
+                inputs[frame["index"]] = inputs.get(frame["index"], "") + delta["partial_json"]
+
+        self.assertEqual(["Bash", "Read"], [frame["content_block"]["name"] for frame in starts])
+        self.assertEqual([900, 901], [frame["index"] for frame in starts])
+        self.assertEqual({"command": "ls -la"}, json.loads(inputs[900]))
+        self.assertEqual({"path": "/tmp/a.png", "offset": 12}, json.loads(inputs[901]))
