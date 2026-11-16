@@ -1410,6 +1410,32 @@ class BrowserRelaySignInTests(unittest.TestCase):
         # there would turn every one of them into `/login/api/...`.
         self.assertEqual("https://relay.example.test", self.core._browser_logins[answered["login_id"]]["origin"])
 
+    def test_the_two_hosts_that_draw_the_stations_form_read_the_same_leaf(self) -> None:
+        """The dialog is shared; the page inside it is not.
+
+        `native.relayLogin` is a host leaf: macOS draws the station in a
+        WKWebView it owns (`NativeRelayLoginController.loginURL`), Windows in
+        its WebView2, and a page asks Core to open a real browser
+        (`start_relay_browser_login`).  So "which page of the station" is three
+        implementations of one rule, and when 36ae051 taught the macOS leaf
+        `/login` nothing told the Core one — the sign-in dialog then drew the
+        station's marketing home on the web host alone.  This is that seam,
+        pinned so an edit to one side is a failing test instead of a form
+        nobody can type into.
+        """
+
+        self.assertEqual("https://relay.example.test/login", relay_browser.sign_in_url("https://relay.example.test"))
+        native = Path(__file__).resolve().parents[1] / "rn/apps/macos/src/native/macos/AppKitNativeLeaf.swift"
+        mac = native.read_text(encoding="utf-8")
+        login_surface = mac.split("private var loginURL: URL {", 1)[1].split("private var localizedChinese", 1)[0]
+        self.assertIn('return originURL.appendingPathComponent("login")', login_surface)
+        # Recorded, not endorsed: the Windows leaf starts at the origin and
+        # lets the site's own navigation expose the form, because its WebView2
+        # fills a remembered password there.  A change to that answer belongs
+        # beside this test, not in a quiet comment on one side.
+        windows = (Path(__file__).resolve().parents[1] / "rn/apps/windows/src/native/windows/WindowsRelayLogin.cpp").read_text(encoding="utf-8")
+        self.assertIn("Deployments do not share a stable login path", windows)
+
     def test_the_sign_in_address_keeps_a_base_path_and_never_doubles_the_leaf(self) -> None:
         for origin, expected in (
             ("https://relay.example.test", "https://relay.example.test/login"),
