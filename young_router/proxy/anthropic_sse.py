@@ -65,10 +65,33 @@ def _sse_block(payload: Dict[str, Any]) -> bytes:
 
 
 class MessagesSseRewriter:
-    """Turn DeepSeek's call markup into ``tool_use`` blocks on the wire."""
+    """Turn DeepSeek's call markup into ``tool_use`` blocks on the wire.
 
-    def __init__(self) -> None:
+    ``lead_blocks`` are published before the upstream's own blocks: they are
+    the search exchange a request already ran (``messages_web_search``), which
+    the client reads back by block type.  Every upstream ``index`` is shifted
+    past them, because one content block index names one block on the wire --
+    leaving the first upstream block at 0 would overwrite the search call with
+    the answer text.
+    """
+
+    def __init__(self, lead_blocks: Optional[List[Dict[str, Any]]] = None) -> None:
         self._filter = _anthropic_dsml_module.MessageStreamFilter()
+        #: Blocks to publish right after ``message_start``, in order.
+        self._lead_blocks: List[Dict[str, Any]] = [
+            dict(block) for block in (lead_blocks or []) if isinstance(block, dict)
+        ]
+        #: Searches these blocks report.  The provider states them in
+        #: ``usage.server_tool_use`` on the final ``message_delta``, and a
+        #: client that reads that counter (Claude Code does) otherwise shows a
+        #: search that answered as a turn that searched zero times.
+        self._search_requests = sum(
+            1
+            for block in self._lead_blocks
+            if block.get("type") == "web_search_tool_result"
+        )
+        #: How far every upstream block index moves to make room for them.
+        self._index_offset = 0
         #: Content blocks the answer has open, in the order they opened.
         self._open_blocks: List[int] = []
         self._pending = ""
@@ -117,6 +140,12 @@ class MessagesSseRewriter:
             # a keep-alive comment, a comment line, a body in another shape.
             return original
         event_type = payload.get("type")
+        if event_type == "message_start":
+            return original + self._lead_events(payload)
+        shifted = self._with_index_offset(payload)
+        if shifted is not None:
+            payload = shifted
+            original = [_sse_block(shifted)]
         if event_type == "content_block_start":
             index = payload.get("index")
             if isinstance(index, int) and index not in self._open_blocks:
@@ -137,9 +166,11 @@ class MessagesSseRewriter:
             # ended on its own.
             calls = self._filter.calls_parsed()
             out = self._closing_events()
-            if not calls:
-                return original
-            return out + [_sse_block(self._with_tool_use_stop_reason(payload))]
+            final = self._with_tool_use_stop_reason(payload) if calls else payload
+            final = self._with_search_usage(final)
+            if final is payload:
+                return out + original
+            return out + [_sse_block(final)]
         return original
 
     def _handle_delta(
@@ -164,6 +195,56 @@ class MessagesSseRewriter:
         return [_sse_block(rewritten)]
 
     # -- synthesized frames ---------------------------------------------------
+
+    def _lead_events(self, payload: Dict[str, Any]) -> List[bytes]:
+        """Publish the search exchange before the answer's own blocks.
+
+        A ``message_start`` that already carries content opened its blocks at
+        index 0, so there is no room in front of them; the lead is dropped
+        rather than written into an index the client already holds.  That shape
+        is not what a streaming provider sends, and dropping it leaves the
+        answer exactly as the route wrote it.
+        """
+
+        if not self._lead_blocks or self._index_offset:
+            return []
+        message = payload.get("message")
+        initial = message.get("content") if isinstance(message, dict) else None
+        if isinstance(initial, list) and initial:
+            self._lead_blocks = []
+            return []
+        out: List[bytes] = []
+        for index, block in enumerate(self._lead_blocks):
+            out.extend(_lead_block_events(index, block))
+        self._index_offset = len(self._lead_blocks)
+        return out
+
+    def _with_index_offset(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Move one upstream block's index past the lead blocks."""
+
+        if not self._index_offset:
+            return None
+        index = payload.get("index")
+        if not isinstance(index, int) or isinstance(index, bool):
+            return None
+        shifted = dict(payload)
+        shifted["index"] = index + self._index_offset
+        return shifted
+
+    def _with_search_usage(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Report the searches these blocks stand for on the turn's usage."""
+
+        if not self._search_requests:
+            return payload
+        usage = payload.get("usage")
+        if not isinstance(usage, dict) or "server_tool_use" in usage:
+            return payload
+        updated = dict(payload)
+        updated["usage"] = {
+            **usage,
+            "server_tool_use": {"web_search_requests": self._search_requests},
+        }
+        return updated
 
     def _with_tool_use_stop_reason(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         delta = payload.get("delta")
@@ -229,10 +310,63 @@ def _decoded(chunk: Any) -> str:
     return str(chunk)
 
 
-async def rewrite_messages_sse(body: AsyncIterator[Any]) -> AsyncIterator[bytes]:
+def _lead_block_events(index: int, block: Dict[str, Any]) -> List[bytes]:
+    """One whole content block, as the frames that publish it.
+
+    A ``server_tool_use`` block states its input through ``input_json_delta``
+    like any other tool call: the start frame carries an empty ``input`` and the
+    call's fields follow, which is the shape Claude Code accumulates before it
+    groups results by the id it saw there.
+    """
+
+    block_type = str(block.get("type") or "")
+    if block_type == "server_tool_use":
+        return [
+            _sse_block(
+                {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": block_type,
+                        "id": block.get("id"),
+                        "name": block.get("name"),
+                        "input": {},
+                    },
+                }
+            ),
+            _sse_block(
+                {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(
+                            block.get("input") or {}, ensure_ascii=False
+                        ),
+                    },
+                }
+            ),
+            _sse_block({"type": "content_block_stop", "index": index}),
+        ]
+    return [
+        _sse_block(
+            {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": block,
+            }
+        ),
+        _sse_block({"type": "content_block_stop", "index": index}),
+    ]
+
+
+async def rewrite_messages_sse(
+    body: AsyncIterator[Any],
+    lead_blocks: Optional[List[Dict[str, Any]]] = None,
+) -> AsyncIterator[bytes]:
     """Wrap a Messages body so its text never carries the route's markup."""
 
-    rewriter = MessagesSseRewriter()
+    rewriter = MessagesSseRewriter(lead_blocks=lead_blocks)
     async for chunk in body:
         for frame in rewriter.feed(_decoded(chunk)):
             yield frame

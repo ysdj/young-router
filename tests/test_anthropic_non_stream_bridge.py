@@ -248,6 +248,60 @@ class AnthropicNonStreamBridgeTests(HookTestCase):
         self.assertIs(True, calls[0]["stream"])
         self.assertEqual("message", message["type"])
 
+    async def test_a_searched_turn_publishes_its_source_blocks(self) -> None:
+        """A search this proxy ran opens the answer, not the answer's tail.
+
+        Claude Code groups its sources by the ``server_tool_use`` id and reads
+        the pages from the ``web_search_tool_result`` that names it, so a block
+        appended after the answer would be read as commentary on it.
+        """
+
+        bridge = _bridge_module()
+        hooks, _ = load_hook_module()
+        search = hooks._messages_web_search_module
+        blocks = search.result_blocks(
+            "ruby 3.4",
+            [
+                {
+                    "title": "Ruby 3.4 Released",
+                    "url": "https://www.ruby-lang.org/en/news/2024/12/25/ruby-3-4-0-released/",
+                    "snippet": "Ruby 3.4.0 has been released.",
+                }
+            ],
+        )
+
+        async def original(**kwargs):
+            return _ChunkStream([_sse(_a_full_turn())])
+
+        wrapped = bridge.wrap_deployment_function(
+            original,
+            method_name="anthropic_messages",
+            client_streaming=False,
+        )
+        message = await wrapped(
+            stream=False,
+            custom_llm_provider="anthropic",
+            messages=[{"role": "user", "content": "hi"}],
+            **{
+                search.MARKER_KEY: {
+                    "query": "ruby 3.4",
+                    "blocks": blocks,
+                }
+            },
+        )
+
+        self.assertEqual(
+            [
+                "server_tool_use",
+                "web_search_tool_result",
+                "thinking",
+                "text",
+                "tool_use",
+            ],
+            [block["type"] for block in message["content"]],
+        )
+        self.assertEqual(blocks[0]["id"], blocks[1]["tool_use_id"])
+
     async def test_a_chat_surface_is_never_bridged_for_a_custom_provider(self) -> None:
         """The same provider name over the Chat surface answers OpenAI chunks."""
 

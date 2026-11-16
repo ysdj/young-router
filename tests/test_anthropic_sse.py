@@ -52,6 +52,13 @@ def run(body: bytes, chunk_size: int | None = None) -> bytes:
     return out
 
 
+def run_with_lead(body: bytes, blocks: list[dict]) -> bytes:
+    rewriter = sse.MessagesSseRewriter(lead_blocks=blocks)
+    out = b"".join(rewriter.feed(body.decode()))
+    out += b"".join(rewriter.finish())
+    return out
+
+
 def _without_ids(body: bytes) -> bytes:
     return re.sub(rb"toolu_dsml_[0-9]+_[0-9]+", b"toolu_dsml_ID", body)
 
@@ -152,6 +159,148 @@ class RewriteTests(unittest.TestCase):
         body = b"".join(frames(text="plain")) + thinking + ping
 
         self.assertEqual(body, run(body))
+
+
+class LeadBlockTests(unittest.TestCase):
+    """A search this proxy already ran is published before the answer."""
+
+    LEAD = [
+        {
+            "type": "server_tool_use",
+            "id": "srvtoolu_abc",
+            "name": "web_search",
+            "input": {"query": "ruby 3.4"},
+        },
+        {
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_abc",
+            "content": [
+                {
+                    "type": "web_search_result",
+                    "title": "Ruby 3.4 Released",
+                    "url": "https://www.ruby-lang.org/en/news/2024/12/25/ruby-3-4-0-released/",
+                    "encrypted_content": "",
+                }
+            ],
+        },
+    ]
+
+    def test_the_search_blocks_open_before_the_answer_and_move_its_index(self) -> None:
+        events = parsed(run_with_lead(b"".join(frames(text="plain prose")), self.LEAD))
+
+        starts = [e for e in events if e.get("type") == "content_block_start"]
+        self.assertEqual([0, 1, 2], [e["index"] for e in starts])
+        self.assertEqual("server_tool_use", starts[0]["content_block"]["type"])
+        self.assertEqual("web_search_tool_result", starts[1]["content_block"]["type"])
+        self.assertEqual("text", starts[2]["content_block"]["type"])
+        # Every frame the route wrote names the shifted index, not only its
+        # opening one: a delta left at 0 would append the answer to the search
+        # call the client is already holding there.
+        deltas = [e for e in events if e.get("type") == "content_block_delta"]
+        self.assertEqual([0, 2], [e["index"] for e in deltas])
+        self.assertEqual("plain prose", deltas[1]["delta"]["text"])
+        stops = [e["index"] for e in events if e.get("type") == "content_block_stop"]
+        self.assertEqual([0, 1, 2], stops)
+
+    def test_the_search_input_is_streamed_as_tool_json(self) -> None:
+        events = parsed(run_with_lead(b"".join(frames(text="x")), self.LEAD))
+
+        partials = [
+            e["delta"]["partial_json"]
+            for e in events
+            if e.get("type") == "content_block_delta"
+            and (e.get("delta") or {}).get("type") == "input_json_delta"
+            and e.get("index") == 0
+        ]
+        self.assertEqual([{"query": "ruby 3.4"}], [json.loads(part) for part in partials])
+
+    def test_a_message_that_already_opened_blocks_keeps_them(self) -> None:
+        body = b"".join(
+            [
+                event(
+                    {
+                        "type": "message_start",
+                        "message": {
+                            "id": "m",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "hi"}],
+                        },
+                    }
+                ),
+                event({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+                event({"type": "message_stop"}),
+            ]
+        )
+
+        # The client already holds index 0, so a lead written there would
+        # replace it; the answer is forwarded instead.
+        self.assertEqual(body, run_with_lead(body, self.LEAD))
+
+    def test_the_search_count_is_stated_on_the_final_usage(self) -> None:
+        # Claude Code reads ``usage.server_tool_use`` from the last
+        # ``message_delta``; without it a search that answered reports zero.
+        body = b"".join(
+            [
+                event(
+                    {
+                        "type": "message_start",
+                        "message": {"id": "m", "role": "assistant", "content": []},
+                    }
+                ),
+                event(
+                    {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn"},
+                        "usage": {"input_tokens": 3, "output_tokens": 4},
+                    }
+                ),
+                event({"type": "message_stop"}),
+            ]
+        )
+
+        events = parsed(run_with_lead(body, self.LEAD))
+
+        delta = [e for e in events if e.get("type") == "message_delta"][-1]
+        self.assertEqual({"web_search_requests": 1}, delta["usage"]["server_tool_use"])
+        self.assertEqual(3, delta["usage"]["input_tokens"])
+
+    def test_an_upstream_usage_is_not_restated(self) -> None:
+        body = b"".join(
+            [
+                event(
+                    {
+                        "type": "message_start",
+                        "message": {"id": "m", "role": "assistant", "content": []},
+                    }
+                ),
+                event(
+                    {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn"},
+                        "usage": {
+                            "input_tokens": 3,
+                            "server_tool_use": {"web_search_requests": 2},
+                        },
+                    }
+                ),
+                event({"type": "message_stop"}),
+            ]
+        )
+
+        delta = [
+            e
+            for e in parsed(run_with_lead(body, self.LEAD))
+            if e.get("type") == "message_delta"
+        ][-1]
+
+        self.assertEqual({"web_search_requests": 2}, delta["usage"]["server_tool_use"])
+
+    def test_markup_is_still_lifted_after_a_lead(self) -> None:
+        out = run_with_lead(b"".join(frames()), self.LEAD).decode()
+
+        self.assertNotIn("DSML", out)
+        self.assertIn("srvtoolu_abc", out)
+        self.assertIn("Bash", out)
 
 
 if __name__ == "__main__":

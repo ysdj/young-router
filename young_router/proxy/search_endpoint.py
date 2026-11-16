@@ -1699,6 +1699,37 @@ async def _alpha_search_forward(
     return f"failed:{status}", None
 
 
+async def search_pages(
+    model: str, queries: list[str], question: Optional[str] = None
+) -> list[dict[str, Any]]:
+    """Run one client turn's queries through the backends this route owns.
+
+    Codex reaches these backends through ``/alpha/search``; a Messages client
+    whose search the route cannot run (``messages_web_search``) reaches the
+    same ones here, so a single decision table says which deployment answers a
+    search.  Only the structured rows come back: the text this endpoint renders
+    for Codex names ``turnNsearchM`` references, which mean nothing to another
+    client.
+
+    A backend that answered nothing returns an empty list.  The caller must not
+    read that as "the web has no page about this" -- it means no route in this
+    group runs a search, and the request has to keep its own declaration.
+    """
+
+    commands = {"search_query": [{"q": query} for query in queries]}
+    body: dict[str, Any] = {
+        "id": "messages-web-search",
+        "commands": commands,
+    }
+    if question:
+        body["input"] = question
+    payload = await _search(body, model)
+    rows = payload.get("results")
+    if not isinstance(rows, list):
+        return []
+    return [dict(row) for row in rows if isinstance(row, Mapping)]
+
+
 async def _search(body: Mapping[str, Any], model: str) -> dict[str, Any]:
     import httpx
 

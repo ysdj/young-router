@@ -24,6 +24,7 @@ import re
 from typing import Any, AsyncIterator, Optional
 
 from . import anthropic_dsml as _anthropic_dsml_module
+from . import messages_web_search as _messages_web_search_module
 
 _BRIDGE_ATTR = "_young_router_anthropic_non_stream_bridge"
 _EVENT_BOUNDARY = re.compile(r"\r\n\r\n|\n\n|\r\r")
@@ -60,7 +61,15 @@ def wrap_deployment_function(
             # station that ignores ``stream``, a short-circuit for a tool it
             # serves itself).  There is nothing to assemble.
             return stream
-        return await assemble_anthropic_message(stream)
+        message = await assemble_anthropic_message(stream)
+        # A search this proxy already ran (``messages_web_search``) is
+        # published as the pair the client reads its sources from.  It goes in
+        # front of the answer's own blocks, which is the order a provider that
+        # ran the search itself would have streamed.
+        return _messages_web_search_module.with_result_blocks(
+            message,
+            _messages_web_search_module.marked_blocks(call_kwargs),
+        )
 
     # Keep the deployment wrapper's own attributes (its failover marker is how
     # the router knows the function it received is already wrapped).

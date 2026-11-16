@@ -14,6 +14,7 @@ from . import anthropic_non_stream as _anthropic_non_stream_module
 from . import anthropic_sse as _anthropic_sse_module
 from . import codex_fast_tier as _codex_fast_tier_module
 from . import context_window as _context_window_module
+from . import messages_web_search as _messages_web_search_module
 from . import responses_request as _responses_request_module
 from . import request_context as _request_context_module
 from . import responses_execution as _responses_execution_module
@@ -474,12 +475,20 @@ def _install_messages_sse_markup_patch() -> None:
     if not callable(original) or getattr(original, _MESSAGES_SSE_PATCH_ATTR, False):
         return
 
-    def wrap_streaming_response(result: Any) -> Any:
+    def wrap_streaming_response(result: Any, data: Any) -> Any:
         body = getattr(result, "body_iterator", None)
         if body is None or not hasattr(body, "__aiter__"):
             return result
+        # A request whose search already ran (``messages_web_search``) carries
+        # the exchange its client reads back by block type.  The blocks are
+        # published before the route's own, and the rewriter moves every
+        # upstream index past them.
+        lead_blocks = _messages_web_search_module.marked_blocks(data)
         try:
-            result.body_iterator = _anthropic_sse_module.rewrite_messages_sse(body)
+            result.body_iterator = _anthropic_sse_module.rewrite_messages_sse(
+                body,
+                lead_blocks=lead_blocks or None,
+            )
         except Exception:
             return result
         return result
@@ -497,7 +506,7 @@ def _install_messages_sse_markup_patch() -> None:
         data = getattr(self, "data", None)
         if not isinstance(data, dict) or data.get("stream") is not True:
             return result
-        return wrap_streaming_response(result)
+        return wrap_streaming_response(result, data)
 
     setattr(patched_base_process_llm_request, _MESSAGES_SSE_PATCH_ATTR, True)
     setattr(

@@ -5,6 +5,7 @@ from . import anthropic_non_stream as _anthropic_non_stream_module
 from . import image_generation as _image_generation_module
 from . import image_context as _image_context_module
 from . import image_inputs as _image_inputs_module
+from . import messages_web_search as _messages_web_search_module
 from . import codex_contract as _codex_contract_module
 from . import context_window as _context_window_module
 from . import responses_output as _responses_output_module
@@ -100,6 +101,15 @@ class YoungRouterHook(CustomLogger):
             data = promoted
             rewritten = promoted
         if not _responses_request_module._request_is_responses_api(data):
+            # Claude Code's ``WebSearch`` is a second Messages request whose
+            # only job is one stated query (see ``messages_web_search``).  The
+            # search has to run before the deployment is chosen: the body that
+            # reaches the model is the one this pass rewrites, and the marker
+            # it leaves is how the answer gets the blocks the client reads.
+            searched = await _messages_web_search_module.prepare(data)
+            if searched is not None:
+                data = searched
+                rewritten = searched
             # Messages replays the same history and meets the same cap.  The
             # route refuses an oversized prompt with a plain 400, and on its
             # streaming path the same refusal arrives as an
