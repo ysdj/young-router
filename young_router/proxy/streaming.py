@@ -9,6 +9,7 @@ from typing import Callable
 
 from . import codex_fast_tier as _codex_fast_tier_module
 from . import codex_contract as _codex_contract_module
+from . import anthropic_dsml as _anthropic_dsml_module
 from . import image_generation as _image_generation_module
 from . import image_inputs as _image_inputs_module
 from . import responses_request as _responses_request_module
@@ -5614,13 +5615,90 @@ async def _yield_native_stream_with_output_limit_continuation(
             success_recorded = True
         return True
 
+    # DeepSeek-V4 answers a tool request with its own markup instead of
+    # ``tool_calls``.  On the Responses wire this proxy already parses that
+    # markup; a Chat/Anthropic stream had no such path, so the call arrived as
+    # answer text and the client rendered XML it could not execute (measured on
+    # the live gateway 2026-11-16, replaying the PIK3CA thread: the answer began
+    # ``\n\n<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name="Bash">``).  The
+    # filter holds the markup back while it streams and hands it over as real
+    # tool calls once the block closes -- see ``anthropic_dsml``.
+    dsml_filter = _anthropic_dsml_module.MessageStreamFilter()
+    is_anthropic_stream = _request_is_anthropic_messages_stream(request_data)
+
+    def dsml_clean(chunk: Any) -> Optional[Any]:
+        """The visible half of one frame, or ``None`` when it held only markup."""
+
+        if not is_anthropic_stream:
+            return chunk
+        dumped = _stream_chunk_dump(chunk)
+        if not isinstance(dumped, dict):
+            return chunk
+        if dumped.get("type") != "content_block_delta":
+            return chunk
+        delta = dumped.get("delta")
+        if not isinstance(delta, dict) or delta.get("type") != "text_delta":
+            return chunk
+        text = delta.get("text")
+        if not isinstance(text, str) or not text:
+            return chunk
+        visible = dsml_filter.feed(text)
+        if visible == text:
+            return chunk
+        if not visible:
+            return None
+        clean = dict(dumped)
+        clean_delta = dict(delta)
+        clean_delta["text"] = visible
+        clean["delta"] = clean_delta
+        return _json_stream_event(clean)
+
+    def dsml_tool_use_events() -> List[Any]:
+        """The calls the filter collected, as Messages ``tool_use`` frames."""
+
+        events: List[Any] = []
+        for call in dsml_filter.take_calls():
+            index = 900 + len(events)
+            events.append(
+                _json_stream_event(
+                    {
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": call["id"],
+                            "name": call["name"],
+                            "input": {},
+                        },
+                    }
+                )
+            )
+            events.append(
+                _json_stream_event(
+                    {
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": json.dumps(call["input"], ensure_ascii=False),
+                        },
+                    }
+                )
+            )
+            events.append(
+                _json_stream_event({"type": "content_block_stop", "index": index})
+            )
+        return events
+
     async def deliver_route() -> AsyncIterator[Any]:
         nonlocal withheld_ceiling_terminal
         nonlocal native_chunk_count
         for chunk in buffer:
             if not inspect_native_chunk(chunk):
                 return
-            yield remember_delivered_text(chunk)
+            cleaned = dsml_clean(chunk)
+            if cleaned is not None:
+                yield remember_delivered_text(cleaned)
         # Whether the ceiling frame has been withheld.  Once it has, the
         # frames that close the same answer belong to it: ``message_stop``
         # and the ``finish_reason`` terminal state the same completion the
@@ -5664,7 +5742,24 @@ async def _yield_native_stream_with_output_limit_continuation(
                 continue
             if not inspect_native_chunk(chunk):
                 return
-            yield remember_delivered_text(chunk)
+            cleaned = dsml_clean(chunk)
+            if cleaned is not None:
+                yield remember_delivered_text(cleaned)
+        # The answer is over: whatever markup is still held is all there will
+        # be.  Its visible tail is delivered first (an unterminated block still
+        # ends the answer the route wrote), then the calls it parsed to.  They
+        # go before the terminal frames, which the caller emits afterwards.
+        tail = dsml_filter.drain()
+        if tail:
+            yield _json_stream_event(
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": tail},
+                }
+            )
+        for event in dsml_tool_use_events():
+            yield event
 
     try:
         async for chunk in deliver_route():
