@@ -287,24 +287,31 @@ function RelaySignInSurface({ request }: { request: Extract<HostChromeRequest, {
  * captcha, a code, or a redirect finished in the real window is what this host
  * cannot draw, and drawing an empty box where a login page should be is the
  * failure it replaces.
+ *
+ * The surface is on screen before Core was asked for a browser — 去登录 draws
+ * it, then the work starts behind it — so its name and its screen are read
+ * from the request's own store.  A host that shows a window on this machine's
+ * screen keeps the waiting state it opened with; a host with no screen to put
+ * one on swaps in the frames.
  */
 function RelayBrowserSurface({ request }: { request: Extract<HostChromeRequest, { kind: "relayBrowser" }> }): React.JSX.Element {
+  const live = React.useSyncExternalStore(request.live.subscribe, request.live.snapshot, request.live.snapshot);
   return <DialogFrame
     title={request.title}
     footer={<>
       <View style={styles.footerSpacer} />
-      {request.mirror ? null : <NativeButton title={request.showLabel} compact onPress={request.show} />}
+      {live.mirror || !live.browser ? null : <NativeButton title={request.showLabel} compact onPress={request.show} />}
       <NativeButton title={request.cancelLabel} compact onPress={() => settleHostChrome(request, undefined)} />
     </>}
   >
-    {request.mirror
-      ? <MirrorScreen mirror={request.mirror} title={request.title} />
+    {live.mirror
+      ? <MirrorScreen mirror={live.mirror} title={request.title} />
       : <View style={styles.cardBodyContent}>
           <View style={styles.browserWaitRow}>
             <NativeBusySpinner label={request.title} />
             <Text style={styles.bodyText}>{request.body}</Text>
           </View>
-          <Text style={styles.signInHint}>{request.browser}</Text>
+          <Text style={styles.signInHint}>{live.browser}</Text>
         </View>}
   </DialogFrame>;
 }

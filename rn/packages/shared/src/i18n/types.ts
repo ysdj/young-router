@@ -541,6 +541,7 @@ export type TranslationKey =
   | "dataManagement.lastSyncFailed"
   | "webdav.syncEveryHint"
   | "logs.loading"
+  | "logs.loadOlder"
   | "logs.empty"
   | "logs.clearConfirmTitle"
   | "logs.clearConfirmBody"

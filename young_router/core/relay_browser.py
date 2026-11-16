@@ -39,6 +39,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -64,6 +65,14 @@ SESSION_TIMEOUT_SECONDS = 600.0
 # left to cancel it.  Ninety seconds is far longer than any real gap between two
 # polls and short enough that a forgotten session stops costing a browser.
 IDLE_TIMEOUT_SECONDS = 90.0
+
+# How long the station's form is looked for before the app stops filling it, and
+# how often.  A station renders its shell first and its form after a client-side
+# route, so one pass at the document commit can look at a page with no fields on
+# it yet.  Twenty seconds is longer than any of those routes takes and short
+# enough that a person who starts typing is left alone soon after.
+PREFILL_SECONDS = 20.0
+PREFILL_INTERVAL_SECONDS = 0.5
 
 
 class BrowserUnavailable(RuntimeError):
@@ -417,6 +426,146 @@ def read_local_storage(port: int, origin: str, *, timeout: float = 5.0) -> dict[
             return {}
         return {str(key): str(value) for key, value in payload.items() if isinstance(value, str)}
     return {}
+
+
+def _evaluate_page(port: int, origin: str, expression: str, *, timeout: float = 5.0) -> Any:
+    """Evaluate one expression in the station's own page and return its value.
+
+    `Runtime.evaluate` with `returnByValue`: the answer has to travel back
+    through this process, and a handle into another process cannot.  A page
+    that is not there yet answers `None`, which every caller here reads as
+    "ask again".
+    """
+
+    target = _page_target(port, origin)
+    if target is None:
+        return None
+    ws_url = target.get("webSocketDebuggerUrl")
+    if not isinstance(ws_url, str) or not ws_url:
+        return None
+    answers = _run(
+        _cdp_messages(
+            ws_url,
+            [
+                {
+                    "id": 1,
+                    "method": "Runtime.evaluate",
+                    "params": {"expression": expression, "returnByValue": True, "awaitPromise": False},
+                }
+            ],
+            timeout=timeout,
+        )
+    )
+    for answer in answers:
+        result = answer.get("result")
+        if not isinstance(result, Mapping):
+            continue
+        inner = result.get("result")
+        if isinstance(inner, Mapping):
+            return inner.get("value")
+    return None
+
+
+# The station's own form, as the page draws it.  These are the selectors the two
+# native hosts fill with the identical script; they match the field shapes both
+# station families render.  The value has to be set through the prototype's own
+# setter and announced with `input`/`change`, because a framework's value
+# tracker ignores a plain assignment -- the form then submits empty fields while
+# looking filled on screen.
+_PREFILL_SCRIPT = """
+(() => {
+  const user = document.querySelector('input[type=email], input[type=text], input:not([type]), input[name=email], input[name=username], input[autocomplete=username], input[placeholder*="用户名"], input[placeholder*="email" i]');
+  const password = document.querySelector('input[type=password], input[autocomplete=current-password]');
+  if (!user && !password) return 'none';
+  const set = (node, value) => {
+    if (!node || !value || node.value) return;
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+    setter?.call(node, value);
+    node.dispatchEvent(new Event('input', { bubbles: true }));
+    node.dispatchEvent(new Event('change', { bubbles: true }));
+  };
+  set(user, __USERNAME__);
+  set(password, __PASSWORD__);
+  if (!user?.value || !password?.value) return 'partial';
+  if (!__SUBMIT__) return 'filled';
+  const form = password.form;
+  const button = form?.querySelector('button[type=submit],input[type=submit],button:not([type])')
+    ?? Array.from(document.querySelectorAll('button')).find((node) => /sign in|log in|登录/i.test((node.textContent || node.getAttribute('aria-label') || '').trim()));
+  if (button instanceof HTMLElement) { button.click(); return 'submitted'; }
+  if (form instanceof HTMLFormElement && typeof form.requestSubmit === 'function') { form.requestSubmit(); return 'submitted'; }
+  return 'filled';
+})();
+"""
+
+
+def prefill_login_form(
+    port: int,
+    origin: str,
+    *,
+    username: str,
+    password: str,
+    submit: bool,
+) -> str:
+    """Fill the station's sign-in form, and post it once when authorized.
+
+    Answers in one word: ``none`` (no form on the page yet), ``partial`` (a
+    field the person is still typing into is what the other one lacks),
+    ``filled`` (the form now carries the app's own account), ``submitted``
+    (the form was posted), or ``""`` when the page could not be asked at all.
+
+    A field that already holds a value is left exactly as it is: the app's copy
+    is a convenience, never an overwrite of what somebody typed.
+    """
+
+    expression = (
+        _PREFILL_SCRIPT
+        .replace("__USERNAME__", json.dumps(username))
+        .replace("__PASSWORD__", json.dumps(password))
+        .replace("__SUBMIT__", "true" if submit else "false")
+    )
+    try:
+        outcome = _evaluate_page(port, origin, expression)
+    except Exception:
+        return ""
+    return outcome if isinstance(outcome, str) else ""
+
+
+def _prefill_loop(browser: "LoginBrowser", username: str, password: str, submit: bool) -> None:
+    deadline = time.monotonic() + PREFILL_SECONDS
+    while not browser.closed and time.monotonic() < deadline:
+        outcome = prefill_login_form(
+            browser.port,
+            browser.origin,
+            username=username,
+            password=password,
+            submit=submit,
+        )
+        # Nothing left to do here: the form carries the account and this window
+        # may not post it, or it was posted.  A page with no form yet is asked
+        # again -- a station that renders its login route after its shell is
+        # the normal shape, not an error.
+        if outcome == "submitted" or (outcome == "filled" and not submit):
+            return
+        time.sleep(PREFILL_INTERVAL_SECONDS)
+
+
+def start_prefill(browser: "LoginBrowser", *, username: str, password: str, submit: bool) -> None:
+    """Fill the station's form behind the sign-in window, and post it once.
+
+    On its own thread: the window's own answer (its name, its frames, its
+    polling) must not wait for the station's page to finish rendering, and the
+    form is a convenience for the person rather than a step this host blocks on.
+    """
+
+    if not username and not password:
+        return
+    thread = threading.Thread(
+        target=_prefill_loop,
+        args=(browser, username, password, submit),
+        name="yr-prefill",
+        daemon=True,
+    )
+    thread.start()
 
 
 def cookie_header(cookies: list[Mapping[str, Any]], origin: str) -> str:

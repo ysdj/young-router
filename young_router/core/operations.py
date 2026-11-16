@@ -105,6 +105,7 @@ _RUNTIME_SETTINGS_PROCESS_AUTHORITATIVE_KEYS = frozenset(
         # as the schema default (off) instead of as "the host environment
         # forgot to unset an old one".
         "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_ENABLED",
+        "YOUNG_ROUTER_CLAUDE_IMAGE_CONTEXT_ENABLED",
         "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MODE",
         "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_INSIDE_TURN",
         "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_KEEP_RECENT",

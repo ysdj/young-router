@@ -233,6 +233,12 @@ class ModelCatalogTests(unittest.TestCase):
             str(image_context_module.IMAGE_CONTEXT_MIN_BYTES_DEFAULT),
             defaults_by_key["YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MIN_BYTES"],
         )
+        # The two clients are two switches, both off unless the operator asks:
+        # enabling Codex must not rewrite a Claude replay by itself.
+        self.assertEqual(
+            "0", defaults_by_key["YOUNG_ROUTER_CLAUDE_IMAGE_CONTEXT_ENABLED"]
+        )
+        self.assertFalse(image_context_module.claude_enabled({}))
 
     def test_catalog_names_are_the_exposed_list_following_the_pickers_order(self) -> None:
         # Every picker this app writes is read top-down and picked by number, so

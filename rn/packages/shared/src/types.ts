@@ -471,10 +471,15 @@ export interface LogView extends LogSummary {
   page?: number;
   /** The number of pages available from rows already fetched. */
   page_count?: number;
-  /** How many rows one page of the online-usage view holds. */
+  /**
+   * How many rows one page holds: how many the online-usage view shows per
+   * station page, and how many the 请求 view holds until "load older" is used.
+   */
   page_rows?: number;
   /** Whether this answer carried every row the current page requested. */
   complete?: boolean;
+  /** Whether the store holds a 请求 row older than the window this view holds. */
+  has_older?: boolean;
 }
 
 export interface CoreSnapshot {

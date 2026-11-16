@@ -386,6 +386,15 @@ type TableProps = {
   selectableSpanningRowKeys?: string[];
   onSelectionChange?: (key: string, index: number) => void;
   onRowDoublePress?: (key: string, index: number) => void;
+  /**
+   * The list was scrolled to its end (oldest row).  A log tab that holds one
+   * page of history asks for the next one here, so the reader keeps scrolling
+   * instead of finding a table that simply stops.  Only the React table
+   * (Windows and the browser) reports it; the AppKit table is a native view
+   * whose scroll position this shared layer cannot read, so its hosts offer
+   * the same request as a button.
+   */
+  onEndReached?: () => void;
   style?: StyleProp<ViewStyle>;
 };
 
@@ -1345,7 +1354,7 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   </Pressable>;
 }, sameTableRow);
 
-function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, followBottom, scrollToRow, framed, sourceList, rowSymbols, rowSymbolColors, rowImageNames, disabledRowKeys, secondaryRowKeys, secondaryCellKeys, rowDetails, selectableSpanningKeys, cellHorizontalPadding, firstColumnHorizontalPadding, onSelectionChange, onRowDoublePress, style, alertRowKeys }: {
+function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, followBottom, scrollToRow, framed, sourceList, rowSymbols, rowSymbolColors, rowImageNames, disabledRowKeys, secondaryRowKeys, secondaryCellKeys, rowDetails, selectableSpanningKeys, cellHorizontalPadding, firstColumnHorizontalPadding, onSelectionChange, onRowDoublePress, onEndReached, style, alertRowKeys }: {
   columns: TableProps["columns"];
   rows: TableProps["rows"];
   selectedKey: string;
@@ -1367,6 +1376,7 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   firstColumnHorizontalPadding: number;
   onSelectionChange?: (key: string, index: number) => void;
   onRowDoublePress?: (key: string, index: number) => void;
+  onEndReached?: () => void;
   style?: StyleProp<ViewStyle>;
   alertRowKeys: string[];
 }): React.JSX.Element {
@@ -1546,6 +1556,11 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
       getItemLayout={(_data, index) => ({ length: rowHeight, offset: rowHeight * index, index })}
       scrollEventThrottle={16}
       onScroll={readScrollMetrics}
+      // The end of the list is the oldest row of a log tab: ask for the next
+      // page once the reader gets there.  The threshold is in screens, so it
+      // fires before the last row is the only thing left to draw.
+      onEndReached={onEndReached}
+      onEndReachedThreshold={0.6}
       // A target that scrolls out of range while the list is still laying
       // out is dropped instead of thrown: `scrollToIndex` fails loudly by
       // design, and a thrown error here escapes into the host process.
@@ -1717,7 +1732,7 @@ const windowsTableStyles = StyleSheet.create({
 // with them every mounted row) even when no prop changed.
 const EMPTY_STRINGS: string[] = [];
 
-export function NativeTable({ columns, rows, selectedKey = "", striped = true, compact = true, followBottom = false, scrollToRow = -1, scrollRequest, framed = true, sourceList = false, rowSymbols = EMPTY_STRINGS, rowSymbolColors = EMPTY_STRINGS, rowImageNames = EMPTY_STRINGS, cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = EMPTY_STRINGS, secondaryRowKeys = EMPTY_STRINGS, secondaryCellKeys = EMPTY_STRINGS, rowDetails = EMPTY_STRINGS, selectableSpanningRowKeys = EMPTY_STRINGS, onSelectionChange, onRowDoublePress, style, alertRowKeys = EMPTY_STRINGS }: TableProps): React.JSX.Element {
+export function NativeTable({ columns, rows, selectedKey = "", striped = true, compact = true, followBottom = false, scrollToRow = -1, scrollRequest, framed = true, sourceList = false, rowSymbols = EMPTY_STRINGS, rowSymbolColors = EMPTY_STRINGS, rowImageNames = EMPTY_STRINGS, cellHorizontalPadding = 8, firstColumnHorizontalPadding = 8, preserveColumnWidths = false, scrollTrailingColumnOverflow = false, disabledRowKeys = EMPTY_STRINGS, secondaryRowKeys = EMPTY_STRINGS, secondaryCellKeys = EMPTY_STRINGS, rowDetails = EMPTY_STRINGS, selectableSpanningRowKeys = EMPTY_STRINGS, onSelectionChange, onRowDoublePress, onEndReached, style, alertRowKeys = EMPTY_STRINGS }: TableProps): React.JSX.Element {
   // Striped rows belong to the list surface, not to its contents: the native
   // table paints its alternating bands across the whole viewport, so an empty
   // list shows the same stripes and reads as a list that happens to have no
@@ -1770,7 +1785,7 @@ export function NativeTable({ columns, rows, selectedKey = "", striped = true, c
       // at this table's fixed 8 and its header 16 — the pane's own alignment
       // was a value the browser silently ignored.
       cellHorizontalPadding={cellHorizontalPadding} firstColumnHorizontalPadding={firstColumnHorizontalPadding}
-      onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} alertRowKeys={alertRowKeys} style={[styles.table, style]} />;
+      onSelectionChange={onSelectionChange} onRowDoublePress={onRowDoublePress} onEndReached={onEndReached} alertRowKeys={alertRowKeys} style={[styles.table, style]} />;
   }
   // The macOS bridge props are built per render, and the list above them can be
   // thousands of rows: building them before the platform branch made a Windows

@@ -4275,6 +4275,14 @@ class CoreStore:
         Nothing is created here: a pending account still exists only after the
         station accepted a session.  The window and the throwaway profile are
         this Core's, closed with it (see ``_close_browser_logins``).
+
+        The account's own copy of its sign-in — the username, and the password
+        it chose to remember — is typed into that window's form by Core (see
+        :func:`relay_browser.start_prefill`): the page never receives the
+        secret, and the form is posted once only when the station's own last
+        answer says this account holds no usable session.  A browser page has
+        no WebKit credential store to restore, so this is the same convenience
+        the two native hosts get from filling their own view.
         """
 
         from . import relay_browser
@@ -4291,6 +4299,17 @@ class CoreStore:
             return {"status": "unsupported", "reason": reason}
         if not isinstance(origin, str) or not origin.strip():
             raise CoreError("relay_login_failed", "Relay origin is invalid")
+        # Read before the lock: the window is a quiet re-check of the runtime
+        # settings file, and a pending account has no row to read at all.
+        prefill: Mapping[str, Any] = {}
+        if pending_account is not True:
+            relay_for_prefill = self._domains.get("relay_accounts")
+            reader = getattr(relay_for_prefill, "login_prefill", None)
+            if callable(reader):
+                try:
+                    prefill = reader(str(account_id))
+                except Exception:
+                    prefill = {}
         with self._lock:
             relay = self._domains.get("relay_accounts")
             if relay is None or not callable(getattr(relay, "verify_browser_session", None)):
@@ -4323,6 +4342,20 @@ class CoreStore:
             # The page says so and offers the credential form instead.
             return {"status": "unsupported", "reason": "launch_failed"}
         self._start_browser_login_reaper()
+        # The form is filled behind the window, not before it: the start answer
+        # is the surface's first frame and must not wait for the station's page
+        # to render.  A pending account has nothing to fill.
+        stored_username = prefill.get("username")
+        stored_password = prefill.get("password")
+        sign_in_username = stored_username if isinstance(stored_username, str) and stored_username else (
+            str(username) if isinstance(username, str) else ""
+        )
+        relay_browser.start_prefill(
+            browser,
+            username=sign_in_username,
+            password=stored_password if isinstance(stored_password, str) else "",
+            submit=prefill.get("submit") is True,
+        )
         with self._lock:
             self._browser_logins[login_id] = {
                 "browser": browser,
@@ -4330,7 +4363,7 @@ class CoreStore:
                 "type": str(account_type),
                 "label": str(label),
                 "origin": origin.strip(),
-                "username": str(username) if isinstance(username, str) else "",
+                "username": sign_in_username,
                 "pending_account": pending_account is True,
                 "station_id": station_id,
                 "station_name": station_name,

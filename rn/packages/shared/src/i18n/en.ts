@@ -524,6 +524,7 @@ export const en: Record<TranslationKey, string> = {
   "dataManagement.lastSync": "Last sync: {time}",
   "dataManagement.lastSyncFailed": "Last sync failed ({time}); it retries at the next interval",
   "logs.loading": "Loading log summary...",
+  "logs.loadOlder": "Load older",
   "logs.empty": "No log entries match the current view.",
   "logs.clearConfirmTitle": "Clear this log?",
   "logs.clearConfirmBody": "The entries in this tab are deleted from Core and cannot be restored.",

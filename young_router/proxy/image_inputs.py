@@ -231,6 +231,31 @@ def _image_input_stats(value: Any) -> dict[str, int]:
                         size,
                     )
                 return
+            if item_type == "image" and isinstance(current.get("source"), dict):
+                # The Messages wire's spelling: the bytes are bare base64 behind
+                # ``source``, not a ``data:`` URL.  Only the budget trace reads
+                # this, and a picture the budget cannot see is a picture its
+                # before/after pair cannot show being removed.
+                source = current["source"]
+                if str(source.get("type") or "").strip().lower() == "base64":
+                    data = source.get("data")
+                    if isinstance(data, str) and data:
+                        stats["image_count"] += 1
+                        padding = (
+                            2
+                            if data.endswith("==")
+                            else 1
+                            if data.endswith("=")
+                            else 0
+                        )
+                        size = max(0, (len(data) * 3) // 4 - padding)
+                        stats["inline_image_count"] += 1
+                        stats["inline_image_bytes"] += size
+                        stats["largest_inline_image_bytes"] = max(
+                            stats["largest_inline_image_bytes"],
+                            size,
+                        )
+                        return
             for child in current.values():
                 visit(child)
             return

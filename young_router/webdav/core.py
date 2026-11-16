@@ -980,6 +980,7 @@ RELAY_OBSERVATION_FIELDS = frozenset(
         "login_observed_at",
         "login_status",
         "resource_error",
+        "resource_keys",
         "resource_status",
         "resources",
         "session",

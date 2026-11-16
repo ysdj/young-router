@@ -456,6 +456,62 @@ def _ensure_records_imported(path: Path | str, keep: int = DEFAULT_RECORD_RETENT
             raise
 
 
+def read_record_rows(path: Path | str, *, limit: int) -> list[tuple[int, str]]:
+    """The newest ``limit`` records as ``(seq, body)``, oldest first.
+
+    A reader that shows the newest rows in pages needs the number a row was
+    written under: "the records before this one" is a sequence, and a log
+    shared by one name per file has no offset that stands for it.
+    """
+
+    _ensure_records_imported(path)
+    name = _name(path)
+    connection = _handle(path).connection()
+    rows = connection.execute(
+        "SELECT seq, body FROM records WHERE name=? ORDER BY seq DESC LIMIT ?",
+        (name, max(0, int(limit))),
+    ).fetchall()
+    return [(int(row[0]), row[1]) for row in reversed(rows)]
+
+
+def record_rows_after(path: Path | str, seq: int, *, limit: int) -> list[tuple[int, str]]:
+    """Records appended after ``seq`` as ``(seq, body)``, oldest first."""
+
+    _ensure_records_imported(path)
+    name = _name(path)
+    connection = _handle(path).connection()
+    rows = connection.execute(
+        "SELECT seq, body FROM records WHERE name=? AND seq>? ORDER BY seq ASC LIMIT ?",
+        (name, int(seq), max(0, int(limit))),
+    ).fetchall()
+    return [(int(row[0]), row[1]) for row in rows]
+
+
+def record_rows_before(path: Path | str, seq: int, *, limit: int) -> list[tuple[int, str]]:
+    """The newest records older than ``seq`` as ``(seq, body)``, oldest first."""
+
+    _ensure_records_imported(path)
+    name = _name(path)
+    connection = _handle(path).connection()
+    rows = connection.execute(
+        "SELECT seq, body FROM records WHERE name=? AND seq<? ORDER BY seq DESC LIMIT ?",
+        (name, int(seq), max(0, int(limit))),
+    ).fetchall()
+    return [(int(row[0]), row[1]) for row in reversed(rows)]
+
+
+def has_records_before(path: Path | str, seq: int) -> bool:
+    """Whether this log holds a record written before ``seq``."""
+
+    _ensure_records_imported(path)
+    name = _name(path)
+    connection = _handle(path).connection()
+    row = connection.execute(
+        "SELECT 1 FROM records WHERE name=? AND seq<? LIMIT 1", (name, int(seq))
+    ).fetchone()
+    return row is not None
+
+
 def read_records(path: Path | str, *, limit: int) -> list[str]:
     """The newest ``limit`` records, oldest first."""
 
@@ -514,9 +570,13 @@ __all__ = [
     "append_record",
     "database_path",
     "has_records",
+    "has_records_before",
     "latest_record_seq",
+    "read_record_rows",
     "read_records",
     "record_count",
+    "record_rows_after",
+    "record_rows_before",
     "records_after",
     "delete_document",
     "document_version",

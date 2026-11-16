@@ -50,7 +50,18 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 # Runtime settings that own this pass.  Read through the same environment the
 # rest of the data plane reads, so a settings change reaches a running worker
 # without a republish of this module.
+#
+# Two clients, two switches, one pass: Codex replays the Responses wire and
+# Claude Code / Claude Desktop replay the Messages wire.  The sub-settings
+# below are shared because the question they answer is the same on both wires
+# (which turn is being answered, how many recent turns stay inline, how small a
+# picture is worth keeping), and the heading, ids and ask sentence are one set
+# of words the model was tuned against.
+# ``IMAGE_CONTEXT_ENABLED_ENV`` is the Codex switch; the shared sub-settings
+# below kept its historical prefix rather than renaming every stored value in
+# an operator's settings file.  The Claude switch is its own key.
 IMAGE_CONTEXT_ENABLED_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_ENABLED"
+CLAUDE_IMAGE_CONTEXT_ENABLED_ENV = "YOUNG_ROUTER_CLAUDE_IMAGE_CONTEXT_ENABLED"
 IMAGE_CONTEXT_MODE_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_MODE"
 IMAGE_CONTEXT_KEEP_RECENT_ENV = "YOUNG_ROUTER_CODEX_IMAGE_CONTEXT_KEEP_RECENT"
 # How much of the turn being answered this pass may take: ``turn`` (the default)
@@ -352,10 +363,23 @@ def _as_int(value: Any, default: int, minimum: int = 0) -> int:
 
 
 def enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
-    """Whether the pass runs at all.  Off unless the operator turns it on."""
+    """Whether the pass runs at all for a Codex replay."""
 
     env = os.environ if environ is None else environ
     return _as_bool(env.get(IMAGE_CONTEXT_ENABLED_ENV), False)
+
+
+def claude_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether the same pass runs for a Messages replay (Claude Code/Desktop).
+
+    A separate switch, not a second meaning for the Codex one: an installation
+    that already turned this on for Codex did not thereby agree to rewrite the
+    history of a Claude conversation, and the two clients keep their own
+    defaults (off).
+    """
+
+    env = os.environ if environ is None else environ
+    return _as_bool(env.get(CLAUDE_IMAGE_CONTEXT_ENABLED_ENV), False)
 
 
 def mode(environ: Optional[Mapping[str, str]] = None) -> str:
@@ -1100,6 +1124,175 @@ def _numbered(index: int) -> str:
     return f"{_ID_PREFIX}{index:0{_ID_DIGITS}d}"
 
 
+# --------------------------------------------------------------------------
+# The Messages wire (Claude Code / Claude Desktop)
+# --------------------------------------------------------------------------
+#
+# The same question arrives in a different shape.  A Messages replay is a list
+# of ``role`` turns whose content is blocks, and a picture is
+# ``{"type": "image", "source": {"type": "base64", …}}``.  Two things are
+# specific to this wire and decide the numbering below:
+#
+# * A tool result is a *user* message.  Counting every user message as a new
+#   turn would make a Claude Code task -- one prompt followed by hundreds of
+#   tool calls -- look like hundreds of turns, and the pass would then protect
+#   the wrong picture and retire nothing inside the task that needs it.  A turn
+#   starts at a user message that is not only tool results.
+# * Images inside ``tool_result`` are lifted into sibling blocks before this
+#   pass runs (``tool_result_images``), so they are already ordinary images in
+#   the turn that carried their result.  A nested one that reaches here anyway
+#   is left alone rather than guessed at; the lift is the shape repair for it.
+
+
+def _request_is_messages_wire(request_kwargs: Any) -> bool:
+    """Whether this request replays the Anthropic Messages wire.
+
+    A Chat Completions body also spells its replay ``messages``, so the field
+    alone is not evidence.  The block vocabulary is: ``tool_use``,
+    ``tool_result``, thinking blocks, and an ``image`` whose bytes sit behind
+    ``source`` are Messages shapes, while a Chat picture is ``image_url``.  A
+    text-only body of either wire is declined by its own scan (no pictures), so
+    this predicate only has to be right about the bodies that carry one.
+    """
+
+    if not isinstance(request_kwargs, Mapping):
+        return False
+    messages = request_kwargs.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return False
+    call_type = str(request_kwargs.get("call_type") or "").strip().lower()
+    if call_type in {"anthropic_messages", "amessages", "anthropic"}:
+        return True
+    for message in messages:
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, Mapping):
+                continue
+            kind = block.get("type")
+            if kind in {"tool_use", "tool_result", "thinking", "redacted_thinking"}:
+                return True
+            if kind == "image" and isinstance(block.get("source"), Mapping):
+                return True
+    return False
+
+
+def _message_starts_turn(message: Any) -> bool:
+    """Whether one Messages turn opens a new user request.
+
+    Tool results arrive as user messages too.  A message that carries one is a
+    continuation of the turn its call belongs to, even when the lift has put a
+    caption and a picture beside it.
+    """
+
+    if not isinstance(message, Mapping) or message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return True
+    if not isinstance(content, list):
+        return True
+    return not any(
+        isinstance(block, Mapping) and block.get("type") == "tool_result"
+        for block in content
+    )
+
+
+def _messages_turn_count(messages: Any) -> int:
+    """How many user turns a Messages replay contains."""
+
+    if not isinstance(messages, list):
+        return 0
+    return sum(1 for message in messages if _message_starts_turn(message))
+
+
+def _messages_image_data(block: Any) -> Optional[Tuple[str, bytes]]:
+    """The bytes of one Messages ``image`` block, if it carries any.
+
+    A ``url`` source is a reference, not the picture: this pass cannot store or
+    restore a URL, so such a block is left exactly as the client sent it.
+    """
+
+    if not isinstance(block, Mapping) or block.get("type") != "image":
+        return None
+    source = block.get("source")
+    if not isinstance(source, Mapping):
+        return None
+    if str(source.get("type") or "").strip().lower() != "base64":
+        return None
+    data = source.get("data")
+    if not isinstance(data, str) or not data.strip():
+        return None
+    try:
+        raw = base64.b64decode(data, validate=False)
+    except (ValueError, TypeError):
+        return None
+    if not raw:
+        return None
+    return str(source.get("media_type") or "image/png"), raw
+
+
+def scan_messages(messages: Any) -> List[_Found]:
+    """Every picture a Messages replay carries, in wire order, with its turn.
+
+    The numbering is the same sequence the Codex scan writes, because the ids a
+    placeholder names have to mean one picture across a task: the wire changes
+    which client is reading, not what ``IMG-001`` names.
+    """
+
+    if not isinstance(messages, list):
+        return []
+    last_answer = -1
+    for index, message in enumerate(messages):
+        if isinstance(message, Mapping) and message.get("role") == "assistant":
+            last_answer = index
+    found: List[_Found] = []
+    next_id = 1
+    turn = 0
+    for index, message in enumerate(messages):
+        if not isinstance(message, Mapping):
+            continue
+        starts_turn = _message_starts_turn(message)
+        if starts_turn:
+            turn += 1
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        # A text block ahead of a ``tool_result`` is read as the user speaking
+        # before answering, which this wire refuses.  The lift puts every
+        # picture behind the run of results; a body that still has one in front
+        # of a result is left alone rather than "labelled" into an ordering the
+        # wire rejects.
+        last_result = -1
+        for part_index, block in enumerate(content):
+            if isinstance(block, Mapping) and block.get("type") == "tool_result":
+                last_result = part_index
+        kind = "upload" if starts_turn else "tool"
+        for part_index, block in enumerate(content):
+            if part_index <= last_result:
+                continue
+            data = _messages_image_data(block)
+            if data is None:
+                continue
+            found.append(
+                _found_image(
+                    image_id=_numbered(next_id),
+                    key=f"{index}:{part_index}",
+                    item=index,
+                    part=part_index,
+                    open_tag=None,
+                    close_tag=None,
+                    data=data,
+                    turn=turn,
+                    kind=kind,
+                    unseen=index > last_answer,
+                )
+            )
+            next_id += 1
+    return found
+
+
 def _heading(image: _Found, state: str, lang: str) -> str:
     """One placeholder heading, in the reference implementation's own shape.
 
@@ -1321,6 +1514,45 @@ def _has_codex_client_evidence(request_kwargs: Mapping[str, Any]) -> bool:
     )
 
 
+def _request_has_claude_client_evidence(request_kwargs: Mapping[str, Any]) -> bool:
+    """Whether this Messages request came from Claude Code or Claude Desktop.
+
+    The setting is one switch for the whole installation, not one per client,
+    so an Anthropic-shaped body from some other integration must not be
+    rewritten just because Claude was enabled here.  Both Claude clients name
+    themselves in the user agent (``claude-cli/…``, ``claude-code/…``, and
+    ``Claude/…`` from the desktop app), and the desktop app also sends the
+    stable ``x-young-router-client: claude-desktop`` header this app documents.
+    """
+
+    from . import responses_request as _responses_request_module
+
+    for headers in _responses_request_module._incoming_request_headers(
+        dict(request_kwargs)
+    ):
+        if not isinstance(headers, Mapping):
+            continue
+        normalized = {
+            str(name).strip().lower(): value
+            for name, value in headers.items()
+            if isinstance(name, str) and isinstance(value, str)
+        }
+        if normalized.get("x-young-router-client", "").strip().lower() == "claude-desktop":
+            return True
+        for name in ("x-claude-code-session-id", "x-claude-code-cwd"):
+            if normalized.get(name, "").strip():
+                return True
+        agent = normalized.get("user-agent", "").strip().lower()
+        if agent and re.search(r"\bclaude(?:-code|-cli)?/", agent):
+            return True
+    # A reverse proxy in front of a gateway can normalize the user agent away
+    # while leaving the body alone, and Claude Code writes its own identity into
+    # the system prompt ("You are Claude Code, Anthropic's official CLI...").
+    # The body is the one part every hop forwards; read it as the fallback.
+    system_text = " ".join(_language_text(request_kwargs.get("system"))).lower()
+    return "claude code" in system_text or "claude-code" in system_text
+
+
 def _language_text(value: Any) -> List[str]:
     """The strings one request value carries, with image payloads left out.
 
@@ -1333,11 +1565,18 @@ def _language_text(value: Any) -> List[str]:
         return [value]
     if isinstance(value, Mapping):
         generated = value.get("type") == "image_generation_call"
+        picture = value.get("type") == "image"
         found: List[str] = []
         for key, part in value.items():
             if isinstance(key, str):
                 found.append(key)
             if key == "image_url" or (generated and key == "result"):
+                continue
+            if picture and key == "source":
+                # The Messages spelling keeps the bytes behind ``source``.  A
+                # base64 body has no character outside ASCII, so no byte of an
+                # image can decide the language -- reading it again would just
+                # copy the largest field of the request.
                 continue
             found.extend(_language_text(part))
         return found
@@ -1448,9 +1687,15 @@ def rewrite_for_size(
     answered, all but the oldest tool result's, because a task with one user
     message keeps every picture it ever viewed in that one turn (see
     ``keep_picture_item`` and its ``newest_picture_item`` fallback in
-    ``_rewrite``).
+    ``_retire_images``).
+
+    Both wires are repaired here: a Codex replay spells its pictures as
+    ``input_image`` and a Claude replay as an ``image`` block, and either one
+    can be the reason the route refuses the prompt.
     """
 
+    if _request_is_messages_wire(request_kwargs):
+        return _rewrite_messages(request_kwargs, forced=True, keep=keep)
     return _rewrite(request_kwargs, forced=True, keep=keep)
 
 
@@ -1467,7 +1712,11 @@ def _with_codex_image_context(request_kwargs: dict) -> Optional[dict]:
 
 
 def _declined(
-    request_kwargs: Any, reason: str, images: Optional[int] = None
+    request_kwargs: Any,
+    reason: str,
+    images: Optional[int] = None,
+    *,
+    client: str = "codex",
 ) -> None:
     """Say why this request was left alone, once per decision.
 
@@ -1481,18 +1730,250 @@ def _declined(
         return
     from . import trace as _trace_module
 
+    claude = client == "claude"
     try:
         _trace_module._route_trace(
-            "codex_image_context_declined",
+            "claude_image_context_declined" if claude else "codex_image_context_declined",
+            client=client,
             reason=reason,
             images=images,
-            enabled=enabled(),
+            enabled=claude_enabled() if claude else enabled(),
             mode=mode(),
             keep_recent=keep_recent(),
             min_bytes=min_bytes(),
         )
     except Exception:
         return
+
+
+def _retire_images(
+    images: List[_Found],
+    input_items: Any,
+    *,
+    current_turn: int,
+    keep: int,
+    minimum: int,
+    inside: bool,
+    forced: bool,
+    automatic: bool,
+    unchecked: set,
+    pinned: set,
+) -> Tuple[List[_Found], Dict[str, _Found], Optional[int]]:
+    """Which pictures this request may send, and which become placeholders.
+
+    One decision for both wires.  What differs between Codex and Claude is in
+    the scan (where a user turn starts, and which block carries the bytes), not
+    in this question: an older turn ages out, the turn being answered keeps its
+    upload and a visible window of its tool results, an id the model just asked
+    for is never retired, and one copy of byte-identical content stays so the
+    others can point at it.
+
+    The comments below are the measured reasons for the two non-obvious rules
+    (the stable anchor and the visible window); they live beside the decision
+    rather than being repeated in each caller.
+    """
+
+    # An agent task *is* one turn: a single user message followed by hundreds
+    # of steps, and every tool result of it stays inside that one turn for
+    # ever.  A pass that only reached earlier turns was therefore inert on
+    # exactly the thread that needed it -- one real task replayed 74 pictures
+    # (50.4 MB of base64) on every step until the upstream refused the prompt
+    # as too long.  The setting now reaches that far too, so a turn that keeps
+    # reading pictures stops paying for the same ones on the request that
+    # follows; size mode always did.
+    #
+    # What the turn's own upload is exempt from, and why: it is the picture the
+    # user just attached and the one the task is about, the note promises it is
+    # provided as usual, and a model shown a placeholder for it on the very
+    # first request would answer about an image it never saw.
+    #
+    # Which tool result stays is decided by the *cache*, not by recency.
+    # Keeping "the newest picture" moves the kept picture forward on every
+    # step, so the step that adds a result rewrites an item that was already on
+    # the wire and the upstream re-reads everything after it: measured on a real
+    # 20-image replay, a request shared only 85.8% of its bytes with the one
+    # before it.  Keeping the *oldest* result that is still inside the turn
+    # instead means an item is written once and never touched again, so every
+    # later step shares a prefix back to that item.  What the model still needs
+    # is never more than one fetch away: a placeholder names its id and the
+    # fetch answers it, and the newest picture is delivered as the result of the
+    # call that just returned it, which no later request can take away.
+    in_turn_tool_pictures = [
+        image.item
+        for image in images
+        if image.copy_of is None
+        and image.kind != "upload"
+        and image.turn >= current_turn
+    ]
+    keep_picture_item = min(in_turn_tool_pictures) if in_turn_tool_pictures else None
+    # Pictures of the turn being answered stay visible for a while, not for a
+    # single step.  Retiring one as soon as the next request carries it makes
+    # the model work from placeholders: a design task that had just looked at a
+    # dozen pages found "many images as placeholders", started stitching contact
+    # sheets of its own and asked for one page per step.  The window keeps the
+    # newest ``_VISIBLE_PICTURES`` of the turn visible and retires the rest,
+    # which still bounds the request: what a step adds is one picture, what it
+    # drops is the one that fell out of the window.
+    # A count is the wrong unit: ten thumbnails and ten 2240x3040 scans differ
+    # by an order of magnitude in bytes and in the tokens the route charges for
+    # them.  The window is therefore a budget of estimated picture tokens, taken
+    # newest first, capped by a count so a step that renders fifty tiny icons
+    # cannot fill the request either.
+    visible_window = set()
+    if in_turn_tool_pictures:
+        by_item = {
+            image.item: image
+            for image in images
+            if image.copy_of is None
+            and image.kind != "upload"
+            and image.turn >= current_turn
+        }
+        budget = _visible_tokens()
+        spent = 0
+        # A budget of zero is the setting with no window at all: every picture
+        # of the turn but its first is retired, which is what the size repair
+        # wants.
+        candidates = sorted(in_turn_tool_pictures, reverse=True) if budget > 0 else []
+        for item in candidates:
+            picture = by_item.get(item)
+            cost = _picture_tokens(picture)
+            if visible_window and spent + cost > budget:
+                break
+            visible_window.add(item)
+            spent += cost
+            if len(visible_window) >= _visible_pictures():
+                break
+    if not forced and keep_picture_item is not None and len(in_turn_tool_pictures) < 2:
+        # Leaving the only picture of the turn alone is the setting's rule; size
+        # mode has no such choice to make.
+        keep_picture_item = None
+    newest_picture_item = (
+        max(image.item for image in images)
+        if forced and images and keep_picture_item is None
+        else None
+    )
+    # What the model asked for by id in its own newest message.  Honoured here,
+    # before any retirement: the picture comes back at full size for this one
+    # request, then becomes a placeholder again.
+    asked = _asked_ids_by_image(images, input_items)
+
+    omitted: List[_Found] = []
+    sent_content: Dict[str, _Found] = {}
+    for image in images:
+        image_id = image.image_id or ""
+        aged = image.turn < current_turn and (current_turn - image.turn) > keep
+        if (
+            forced
+            and newest_picture_item is not None
+            and image.item < newest_picture_item
+            # Size mode has the same duty as the setting: a picture no request
+            # has carried yet must reach the model at least once, or "fetch by
+            # id" becomes the only way to see the page it just rendered.
+            and not image.unseen
+        ):
+            aged = True
+        # The turn being answered: its tool results are omitted inside it, its
+        # upload is not.
+        in_current_turn = image.turn >= current_turn and current_turn > 0
+        # A picture the model has not been shown yet is never replaced by a
+        # placeholder -- unless a byte-identical copy earlier in this same
+        # request already carries the same content, in which case the model is
+        # looking straight at it.
+        twin_already_sent = (image.content_id or "") in sent_content
+        blindable = not image.unseen or twin_already_sent
+        if (
+            image.copy_of is None
+            and image.kind != "upload"
+            and keep_picture_item is not None
+            and image.item != keep_picture_item
+            # Size mode is the repair for a route that already refused, so it
+            # retires freely; the window belongs to the setting's own pass,
+            # whose job is to keep the model looking at what it just worked on.
+            and (forced or image.item not in visible_window)
+            and (forced or (inside and in_current_turn))
+            and blindable
+        ):
+            aged = True
+        big = len(image.raw) >= minimum
+        if image_id in pinned:
+            sent_content[image.content_id or ""] = image
+            continue
+        if image.copy_of is not None:
+            # A copy the fetch tool returned belongs to the turn that fetched
+            # it; every later turn leaves it out again, in either mode.  Its
+            # original keeps its own place and its own state.
+            if image.turn < current_turn:
+                omitted.append(image)
+            else:
+                sent_content[image.content_id or ""] = image
+            continue
+        if image.key in asked:
+            # An id the model asked for is not a candidate for retirement: the
+            # original is the answer to its question.
+            sent_content[image.content_id or ""] = image
+            continue
+        # A generated picture has no part to swap for a placeholder, so it is
+        # never retired: its bytes would stay in the request while the note
+        # claimed they had been omitted.
+        drop = image.part is not None and (
+            image_id in unchecked or (automatic and aged and big)
+        )
+        if not drop:
+            sent_content[image.content_id or ""] = image
+            continue
+        omitted.append(image)
+
+    # Byte-identical images are one content: when a content would be omitted
+    # everywhere, one copy stays sent and the others point at it.  Which copy is
+    # ``min`` and not ``max`` for the same reason the turn keeps its first
+    # picture: the newest copy moves forward on every step, so its placeholder
+    # elsewhere in the replay has to be rewritten to name it, and each rewrite
+    # is a prefix the upstream re-reads.  The *oldest* copy never moves.
+    for content_id in {image.content_id for image in omitted if image.copy_of is None}:
+        if content_id in sent_content:
+            continue
+        copies = [
+            image
+            for image in omitted
+            if image.content_id == content_id and image.copy_of is None
+        ]
+        if len(copies) < 2:
+            continue
+        anchor = min(copies, key=lambda image: image.item)
+        omitted = [image for image in omitted if image is not anchor]
+        sent_content[content_id or ""] = anchor
+    return omitted, sent_content, keep_picture_item
+
+
+def _retirement_decline_reason(
+    images: List[_Found],
+    *,
+    current_turn: int,
+    keep_picture_item: Optional[int],
+    minimum: int,
+) -> str:
+    """Why nothing was omitted, in the two shapes a reader can act on.
+
+    ``no_image_old_enough`` means the replay's own shape never produced a
+    candidate (every picture is in the turn being answered, pinned, or below
+    the byte floor); ``nothing_omitted`` means candidates existed but the
+    selection kept them.  One sentence for both would send the reader to the
+    wrong knob.
+    """
+
+    if any(
+        (image.turn < current_turn and len(image.raw) >= minimum)
+        or (
+            image.turn >= current_turn
+            and image.kind != "upload"
+            and keep_picture_item is not None
+            and image.item != keep_picture_item
+            and len(image.raw) >= minimum
+        )
+        for image in images
+    ):
+        return "nothing_omitted"
+    return "no_image_old_enough"
 
 
 def _rewrite(
@@ -1549,181 +2030,23 @@ def _rewrite(
     current_turn = _turn_count(input_items)
     keep = keep_recent() if keep is None else keep
     minimum = min_bytes()
-    # A Codex task *is* one turn: a single user message followed by hundreds of
-    # steps, and every ``view_image`` result of it stays inside that one turn for
-    # ever.  A pass that only reached earlier turns was therefore inert on
-    # exactly the thread that needed it -- one real task replayed 74 pictures
-    # (50.4 MB of base64) on every step until the upstream refused the prompt as
-    # too long.  Size mode always reached that far; the setting now does too, so
-    # a turn that keeps calling ``view_image`` stops paying for the same
-    # pictures on the request that follows.
-    #
-    # What the turn's own upload is exempt from, and why: it is the picture the
-    # user just attached and the one the task is about, the note below promises
-    # it is provided as usual, and a model shown a placeholder for it on the very
-    # first request would answer about an image it never saw.
-    #
-    # Which tool result stays is decided by the *cache*, not by recency.  Keeping
-    # "the newest picture" moves the kept picture forward on every step, so the
-    # step that adds a result rewrites an item that was already on the wire and
-    # the upstream re-reads everything after it: measured on a real 20-image
-    # replay, a request shared only 85.8% of its bytes with the one before it.
-    # Keeping the *oldest* result that is still inside the turn instead means an
-    # item is written once and never touched again, so every later step shares a
-    # prefix back to that item.  What the model still needs is never more than
-    # one fetch away: a placeholder names its id and the fetch tool answers it,
-    # and the newest picture is delivered as the result of the call that just
-    # returned it, which no later request can take away.
-    inside = inside_turn() == "turn"
-    # Which picture inside the turn being answered survives.  It is the *oldest*
-    # tool result of that turn, deliberately, and both passes use it:
-    #
-    # * The setting's own pass needs it because a kept picture that moves forward
-    #   with every step rewrites an item already on the wire, and the upstream
-    #   then re-reads every byte after it.  Measured on a real 20-image replay, a
-    #   request shared only 85.8% of its prefix with the one before it.
-    # * Size mode needs the same anchor for a sharper reason: the two passes run
-    #   on the same request (this one fixes what it can, ``context_window`` then
-    #   shrinks again if the route still refuses), and an anchor chosen
-    #   differently by each means the second pass rewrites what the first just
-    #   stabilised.  Measured on a live thread, that kept the hit rate at 89-96%
-    #   when the image pass alone held it at 100%.
-    #
-    # ``None`` means every tool result of the turn is still sent (nothing to
-    # anchor on); size mode then falls back to the newest picture overall, which
-    # is what it did before and is still the best single survivor there.
-    in_turn_tool_pictures = [
-        image.item
-        for image in images
-        if image.copy_of is None
-        and image.kind != "upload"
-        and image.turn >= current_turn
-    ]
-    keep_picture_item = min(in_turn_tool_pictures) if in_turn_tool_pictures else None
-    # Pictures of the turn being answered stay visible for a while, not for a
-    # single step.  Retiring one as soon as the next request carries it makes the
-    # model work from placeholders: a design task that had just looked at a dozen
-    # pages found "many images as placeholders", started stitching contact sheets
-    # of its own and asked for one page per step.  The window keeps the newest
-    # ``_VISIBLE_PICTURES`` of the turn visible and retires the rest, which still
-    # bounds the request: what a step adds is one picture, what it drops is the
-    # one that fell out of the window.
-    # A count is the wrong unit: ten thumbnails and ten 2240x3040 scans differ by
-    # an order of magnitude in bytes and in the tokens the route charges for
-    # them.  The window is therefore a budget of estimated picture tokens, taken
-    # newest first, capped by a count so a step that renders fifty tiny icons
-    # cannot fill the request either.
-    visible_window = set()
-    if in_turn_tool_pictures:
-        by_item = {
-            image.item: image
-            for image in images
-            if image.copy_of is None
-            and image.kind != "upload"
-            and image.turn >= current_turn
-        }
-        budget = _visible_tokens()
-        spent = 0
-        # A budget of zero is the setting with no window at all: every picture of
-        # the turn but its first is retired, which is what the size repair wants.
-        candidates = sorted(in_turn_tool_pictures, reverse=True) if budget > 0 else []
-        for item in candidates:
-            picture = by_item.get(item)
-            cost = _picture_tokens(picture)
-            if visible_window and spent + cost > budget:
-                break
-            visible_window.add(item)
-            spent += cost
-            if len(visible_window) >= _visible_pictures():
-                break
-    if not forced and keep_picture_item is not None and len(in_turn_tool_pictures) < 2:
-        # Leaving the only picture of the turn alone is the setting's rule; size
-        # mode has no such choice to make.
-        keep_picture_item = None
-    newest_picture_item = (
-        max(image.item for image in images)
-        if forced and images and keep_picture_item is None
-        else None
-    )
-    # What the model asked for by id in its own newest message.  Honoured here,
-    # before any retirement: the picture comes back at full size for this one
-    # request, then becomes a placeholder again.
-    asked = _asked_ids_by_image(images, input_items)
     selection = read_selection(thread_id)
     auto = selection.get("auto")
     automatic = True if forced else (auto if isinstance(auto, bool) else mode() == "auto")
     unchecked = set(selection.get("unchecked") or set())
     pinned = set(selection.get("pinned") or set())
-
-    replacements: Dict[int, Dict[int, str]] = {}
-    omitted: List[_Found] = []
-    sent_content: Dict[str, _Found] = {}
-    omitted_keys: set = set()
-    for image in images:
-        image_id = image.image_id or ""
-        aged = image.turn < current_turn and (current_turn - image.turn) > keep
-        if (
-            forced
-            and newest_picture_item is not None
-            and image.item < newest_picture_item
-            # Size mode has the same duty as the setting: a picture no request
-            # has carried yet must reach the model at least once, or "fetch by
-            # id" becomes the only way to see the page it just rendered.
-            and not image.unseen
-        ):
-            aged = True
-        # The turn being answered: its tool results are omitted inside it, its
-        # upload is not.
-        in_current_turn = image.turn >= current_turn and current_turn > 0
-        # A picture the model has not been shown yet is never replaced by a
-        # placeholder -- unless a byte-identical copy earlier in this same
-        # request already carries the same content, in which case the model is
-        # looking straight at it.
-        twin_already_sent = (image.content_id or "") in sent_content
-        blindable = not image.unseen or twin_already_sent
-        if (
-            image.copy_of is None
-            and image.kind != "upload"
-            and keep_picture_item is not None
-            and image.item != keep_picture_item
-            # Size mode is the repair for a route that already refused, so it
-            # retires freely; the window belongs to the setting's own pass, whose
-            # job is to keep the model looking at what it just worked on.
-            and (forced or image.item not in visible_window)
-            and (forced or (inside and in_current_turn))
-            and blindable
-        ):
-            aged = True
-        big = len(image.raw) >= minimum
-        if image_id in pinned:
-            sent_content[image.content_id or ""] = image
-            continue
-        if image.copy_of is not None:
-            # A copy the fetch tool returned belongs to the turn that fetched
-            # it; every later turn leaves it out again, in either mode.  Its
-            # original keeps its own place and its own state.
-            if image.turn < current_turn:
-                omitted_keys.add(image.key)
-                omitted.append(image)
-            else:
-                sent_content[image.content_id or ""] = image
-            continue
-        if image.key in asked:
-            # An id the model asked for is not a candidate for retirement: the
-            # original is the answer to its question.
-            sent_content[image.content_id or ""] = image
-            continue
-        # A generated picture has no part to swap for a placeholder, so it is
-        # never retired: its bytes would stay in the request while the note
-        # below claimed they had been omitted.
-        drop = image.part is not None and (
-            image_id in unchecked or (automatic and aged and big)
-        )
-        if not drop:
-            sent_content[image.content_id or ""] = image
-            continue
-        omitted_keys.add(image.key)
-        omitted.append(image)
+    omitted, sent_content, keep_picture_item = _retire_images(
+        images,
+        input_items,
+        current_turn=current_turn,
+        keep=keep,
+        minimum=minimum,
+        inside=inside_turn() == "turn",
+        forced=forced,
+        automatic=automatic,
+        unchecked=unchecked,
+        pinned=pinned,
+    )
 
     # The replay is kept even when nothing is omitted -- the fetch tool has to
     # know every image the task carried, including one the client compacts
@@ -1735,45 +2058,18 @@ def _rewrite(
         from . import image_context_store as _store_module
 
         _FILE_PATHS.update(_store_module.paths(thread_id))
-
-    # Byte-identical images are one content: when a content would be omitted
-    # everywhere, one copy stays sent and the others point at it.  Which copy is
-    # ``min`` and not ``max`` for the same reason the turn keeps its first
-    # picture: the newest copy moves forward on every step, so its placeholder
-    # elsewhere in the replay has to be rewritten to name it, and each rewrite
-    # is a prefix the upstream re-reads.  The *oldest* copy never moves.
-    for content_id in {image.content_id for image in omitted if image.copy_of is None}:
-        if content_id in sent_content:
-            continue
-        copies = [
-            image
-            for image in omitted
-            if image.content_id == content_id and image.copy_of is None
-        ]
-        if len(copies) < 2:
-            continue
-        anchor = min(copies, key=lambda image: image.item)
-        omitted = [image for image in omitted if image is not anchor]
-        sent_content[content_id or ""] = anchor
     if not omitted:
         # Every image was either in the turn being answered, pinned, or below
         # the byte floor.  This is the one decline that depends on the replay's
         # own shape, so it states what it saw.
         _declined(
             request_kwargs,
-            "no_image_old_enough"
-            if not any(
-                (image.turn < current_turn and len(image.raw) >= minimum)
-                or (
-                    image.turn >= current_turn
-                    and image.kind != "upload"
-                    and keep_picture_item is not None
-                    and image.item != keep_picture_item
-                    and len(image.raw) >= minimum
-                )
-                for image in images
-            )
-            else "nothing_omitted",
+            _retirement_decline_reason(
+                images,
+                current_turn=current_turn,
+                keep_picture_item=keep_picture_item,
+                minimum=minimum,
+            ),
             len(images),
         )
         return None
@@ -1800,6 +2096,7 @@ def _rewrite(
     # no placeholder, so it is read after that decision rather than before it.
     lang = _language(request_kwargs)
     _PLACEHOLDER_KIND[lang] = kind
+    replacements: Dict[int, Dict[int, str]] = {}
     # Text parts inserted *before* a part of their item: the label of an image
     # that is still sent.
     labels: Dict[int, Dict[int, str]] = {}
@@ -1904,6 +2201,222 @@ def _rewrite(
     return result
 
 
+def _promoted_messages(request_kwargs: Mapping[str, Any]) -> Optional[dict]:
+    """This replay with tool-result pictures lifted, when they still are nested.
+
+    The pre-call hook lifts them before any deployment is chosen, so on the
+    real path this returns ``None``.  A direct caller (a test, or the size
+    repair reading a body the hook did not see) can still hand over the
+    unprepped shape, and a pass that could not see a picture inside the result
+    would leave the largest block of a Claude Code replay untouched.
+    """
+
+    from . import tool_result_images as _tool_result_images_module
+
+    try:
+        return _tool_result_images_module.promoted_tool_result_images(dict(request_kwargs))
+    except Exception:
+        return None
+
+
+def _with_claude_image_context(request_kwargs: dict) -> Optional[dict]:
+    """Leave the current turn's pictures in place and omit the earlier ones.
+
+    The Messages-wire half of the same pass.  Returns ``None`` for every
+    request this pass does not own: a disabled setting, a non-Messages route, a
+    replay without Claude client evidence, a route that refuses images, and a
+    replay whose pictures all belong to the turn being answered.
+    """
+
+    return _rewrite_messages(request_kwargs)
+
+
+def _rewrite_messages(
+    request_kwargs: dict,
+    *,
+    forced: bool = False,
+    keep: Optional[int] = None,
+) -> Optional[dict]:
+    """The Messages-wire rewrite: placeholders, labels, and the ask note.
+
+    Three boundaries this wire adds to the shared retirement rules:
+
+    * **Tool results stay paired.**  Only ``image`` blocks move; a
+      ``tool_result`` block keeps its position and its ``tool_use_id``, so the
+      call it answers is still answered.
+    * **A cache breakpoint survives its block.**  When the client marked the
+      image ``cache_control``, the placeholder text carries the same marker --
+      otherwise the rewrite would silently remove a boundary the client chose.
+    * **The ask is the only promise.**  Claude has no ``view_image_by_id`` MCP
+      server in this app and its file layout is not this app's to edit, so a
+      placeholder always says "need IMG-xxx".  The next request carries the
+      original when the proxy sees that line, exactly as it does for Codex.
+    """
+
+    if not forced and not claude_enabled():
+        _declined(request_kwargs, "setting_disabled", client="claude")
+        return None
+    request_kwargs = request_kwargs if isinstance(request_kwargs, dict) else {}
+    if not _deployment_allows_images(request_kwargs):
+        _declined(request_kwargs, "route_refuses_images", client="claude")
+        return None
+    if not _request_is_messages_wire(request_kwargs):
+        _declined(request_kwargs, "not_a_messages_request", client="claude")
+        return None
+    if not _request_has_claude_client_evidence(request_kwargs):
+        _declined(request_kwargs, "no_claude_client_evidence", client="claude")
+        return None
+
+    promoted = _promoted_messages(request_kwargs)
+    base = promoted if promoted is not None else request_kwargs
+    messages = base.get("messages")
+    if not isinstance(messages, list) or not messages:
+        _declined(request_kwargs, "empty_messages", client="claude")
+        return None
+    images = scan_messages(messages)
+    if not images:
+        _declined(request_kwargs, "no_images", 0, client="claude")
+        return None
+    current_turn = _messages_turn_count(messages)
+    keep = keep_recent() if keep is None else keep
+    minimum = min_bytes()
+    # No attachment-manager selection on this wire: that panel is a Codex
+    # plugin's, and a Claude task has no checkboxes to read.  The pass therefore
+    # always selects automatically; the mode setting is that panel's switch, not
+    # a second meaning for it here.
+    omitted, sent_content, keep_picture_item = _retire_images(
+        images,
+        messages,
+        current_turn=current_turn,
+        keep=keep,
+        minimum=minimum,
+        inside=inside_turn() == "turn",
+        forced=forced,
+        automatic=True,
+        unchecked=set(),
+        pinned=set(),
+    )
+    if not omitted:
+        _declined(
+            request_kwargs,
+            _retirement_decline_reason(
+                images,
+                current_turn=current_turn,
+                keep_picture_item=keep_picture_item,
+                minimum=minimum,
+            ),
+            len(images),
+            client="claude",
+        )
+        return None
+
+    lang = _language(base)
+    # This wire has no file path and no tool this app can promise; the proxy
+    # answers the ask itself on the next request.
+    _PLACEHOLDER_KIND[lang] = "ask"
+    _FILE_PATHS.clear()
+    omitted_keys = {image.key for image in omitted}
+    replacements: Dict[int, Dict[int, str]] = {}
+    labels: Dict[int, Dict[int, str]] = {}
+    for image in omitted:
+        twin = sent_content.get(image.content_id or "")
+        text = _placeholder(image, lang)
+        if twin is not None and twin.key != image.key:
+            text = _duplicate_placeholder(image, twin, lang)
+        original = None
+        message = messages[image.item] if image.item < len(messages) else None
+        if isinstance(message, Mapping):
+            content = message.get("content")
+            if isinstance(content, list) and image.part is not None:
+                if image.part < len(content):
+                    original = content[image.part]
+        replacement: Dict[str, Any] = {"type": "text", "text": text}
+        if isinstance(original, Mapping) and isinstance(
+            original.get("cache_control"), Mapping
+        ):
+            # The block that carried this task's cache boundary is the one being
+            # replaced; the text takes the marker so the boundary stays where
+            # the client put it.
+            replacement["cache_control"] = dict(original["cache_control"])
+        replacements.setdefault(image.item, {})[image.part] = replacement
+
+    # A picture still sent states its id, so a placeholder that names one can be
+    # matched to the picture in front of the model.  It is an insertion before
+    # the image, never a replacement of it.
+    for image in images:
+        if image.key in omitted_keys or image.part is None:
+            continue
+        labels.setdefault(image.item, {})[image.part] = _included_label(image, lang)
+
+    rewritten: List[Any] = []
+    for index, message in enumerate(messages):
+        bucket = replacements.get(index)
+        inserts = labels.get(index)
+        if not isinstance(message, Mapping) or (not bucket and not inserts):
+            rewritten.append(message)
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            rewritten.append(message)
+            continue
+        next_blocks: List[Any] = []
+        for position, block in enumerate(content):
+            label = (inserts or {}).get(position)
+            if label is not None:
+                next_blocks.append({"type": "text", "text": label})
+            if position in (bucket or {}):
+                next_blocks.append((bucket or {})[position])
+                continue
+            next_blocks.append(block)
+        updated = dict(message)
+        updated["content"] = next_blocks
+        rewritten.append(updated)
+
+    # The note goes at the end of the user message that opens the first
+    # affected turn.  The Messages wire has no developer role, and inserting a
+    # separate user message would add a turn the client never wrote (and can
+    # break the alternation a Messages replay is checked against).  Appending a
+    # text block inside the opener keeps the turn count and the roles intact;
+    # for a tool-result turn the opener is still the prompt before its first
+    # call, so the note never splits a call from its result.
+    first_omitted = min(image.item for image in omitted)
+    note_at = first_omitted
+    while note_at > 0 and not _message_starts_turn(rewritten[note_at]):
+        note_at -= 1
+    if not _message_starts_turn(rewritten[note_at]):
+        note_at = first_omitted
+    note = _WORDS[lang]["auto_ask_note"]
+    target = rewritten[note_at]
+    if isinstance(target, Mapping) and target.get("role") == "user":
+        content = target.get("content")
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}] if content else []
+        elif isinstance(content, list):
+            content = list(content)
+        else:
+            content = []
+        # A hop can run this pass twice on the same body (one deployment
+        # attempt after another).  The note is the one part a second pass would
+        # duplicate, because the placeholders it wrote are text the scan no
+        # longer counts; state it once per opener.
+        already = any(
+            isinstance(block, Mapping)
+            and block.get("type") == "text"
+            and block.get("text") == note
+            for block in content
+        )
+        if not already:
+            content.append({"type": "text", "text": note})
+        updated = dict(target)
+        updated["content"] = content
+        rewritten[note_at] = updated
+
+    result = dict(base)
+    result["messages"] = rewritten
+    _trace(request_kwargs, omitted, True, len(images), client="claude")
+    return result
+
+
 def _stored_file_paths(thread_id: Optional[str]) -> Dict[str, str]:
     """This task's ``{id: path}`` map from the replay it already has.
 
@@ -1943,13 +2456,16 @@ def _trace(
     omitted: List[_Found],
     automatic: bool,
     total: int,
+    *,
+    client: str = "codex",
 ) -> None:
     from . import routing as _routing_module
     from . import trace as _trace_module
 
     try:
         _trace_module._route_trace(
-            "codex_image_context",
+            "claude_image_context" if client == "claude" else "codex_image_context",
+            client=client,
             request_id=_routing_module._trace_request_id(dict(request_kwargs)),
             session=_routing_module._trace_session_context(dict(request_kwargs)),
             automatic=automatic,
@@ -1964,3 +2480,4 @@ def _trace(
 
 
 CODEX_IMAGE_CONTEXT_REQUEST_STEPS = (_with_codex_image_context,)
+CLAUDE_IMAGE_CONTEXT_REQUEST_STEPS = (_with_claude_image_context,)

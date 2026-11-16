@@ -647,6 +647,81 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )
             self.assertEqual(before + 1, len(list_reads()))
 
+    def test_a_key_read_survives_the_session_it_was_read_with(self) -> None:
+        """未登录 must not turn a key this app already holds into a refusal.
+
+        Measured against the reported flow: an account whose dashboard session
+        had lapsed could no longer be asked for its key values, so 获取模型 and
+        every route that already carried that key turned into an upstream
+        rejection -- while the value had been read and used a minute earlier.
+        The value now stays with the account (private storage, never a
+        snapshot) and answers while the station cannot be asked.  The station
+        *saying* the key is gone is the one answer that must not be papered
+        over with it.
+        """
+
+        key_path = "/api/v1/keys?page=1&page_size=100"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = FakeRelayHTTPClient(
+                {
+                    "/api/v1/user/profile": {"data": {"balance": 8.75}},
+                    key_path: {
+                        "data": {
+                            "items": [
+                                {"id": "11", "name": "alpha", "status": "active", "key": "sk-replace-alpha"},
+                            ]
+                        }
+                    },
+                    "/api/v1/channels/available": {
+                        "data": [{"platforms": [{"supported_models": ["model-test"]}]}]
+                    },
+                }
+            )
+            domain = RelayAccountsDomain(root, http_client=fake)
+            account_id = domain.dispatch(
+                "account.add",
+                {"type": "sub2api", "label": "Sub2API", "origin": "https://relay.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="account-a@example.test",
+                access_token="replace-token",
+                remember_password=True,
+            )
+            domain.refresh_resources(account_id)
+            domain.apply()
+
+            class Unreachable:
+                def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                    raise RelayTransportError()
+
+            # A Core that just restarted has no in-process key cache, and this
+            # station answers nothing at all: the value it read before is the
+            # credential the account has.
+            reloaded = RelayAccountsDomain(root, http_client=Unreachable())
+            self.assertEqual(
+                "sk-replace-alpha",
+                reloaded.trusted_secret_value("api_key", f"{account_id}:sub2api-11"),
+            )
+
+            class Dropped:
+                def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                    if path == key_path:
+                        return {"data": {"items": []}}
+                    return {"data": {"balance": 8.75}}
+
+            # The station answered, and this key is not on it: a value this app
+            # still held is the residue of a credential nobody can revoke, so
+            # it must not answer for a slot the station no longer serves.
+            dropped = RelayAccountsDomain(root, http_client=Dropped())
+            with self.assertRaises(RelayAccountsError):
+                dropped.trusted_secret_value("api_key", f"{account_id}:sub2api-11")
+            # And it is gone from the document, not only from this answer.
+            after = RelayAccountsDomain(root, http_client=Unreachable())
+            with self.assertRaises(RelayAccountsError):
+                after.trusted_secret_value("api_key", f"{account_id}:sub2api-11")
+
     def test_a_label_stored_without_a_key_id_is_only_repaired_when_it_is_unique(self) -> None:
         """Two same-named station keys never answer for one another.
 
@@ -2832,6 +2907,112 @@ class RelayAccountsDomainTests(unittest.TestCase):
             with self.assertRaises(RelaySessionLimitError):
                 domain.restore_saved_password(account_id)
             self.assertEqual(2, station.logins)
+
+    def test_the_sign_in_form_is_filled_and_posted_only_for_a_station_answer(self) -> None:
+        """The page host's browser form starts where the native view does.
+
+        The two native hosts type the account's own username and remembered
+        password into the station's form, and post it once only after the
+        station answered that no session is on hand.  The page host had
+        neither: it opened an empty form and waited for the person to type a
+        password this app already kept.  What authorizes the post is the
+        station's own determined answer inside the re-check window -- never a
+        transport failure, never a row no check has covered, and never an
+        account the station is holding at its session cap (that wait exists so
+        a capped account is not asked once per window).
+        """
+
+        class Station:
+
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                raise RelayAccountsError("Relay login has expired")
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=Station())
+            account_id = domain.dispatch(
+                "add",
+                {
+                    "type": "newapi",
+                    "label": "Relay",
+                    "origin": "https://relay.example.test",
+                    "username": "sample-user@example.test",
+                    "remember_password": True,
+                },
+            )["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="sample-user@example.test",
+                cookie="session=replace-cookie",
+                password="replace-password",
+            )
+
+            prefill = domain.login_prefill(account_id)
+            # The username always, the password because this account keeps one.
+            self.assertEqual("sample-user@example.test", prefill["username"])
+            self.assertEqual("replace-password", prefill["password"])
+            # A verified login is a session on hand, so posting would replace
+            # one the station never refused.
+            self.assertFalse(prefill["submit"])
+
+            # The station's own 未登录 is the answer that authorizes one post.
+            domain.set_login_status(account_id, "signed_out")
+            self.assertTrue(domain.login_prefill(account_id)["submit"])
+
+            # A refused password does not withdraw that answer: the refusal was
+            # this app's own HTTP form, and the station's page may be the one
+            # that can complete it (a captcha, a challenge).  The window posts
+            # once, which the person opened deliberately.
+            domain._note_login_refusal(account_id)
+            self.assertTrue(domain.login_prefill(account_id)["submit"])
+            domain.clear_login_refusal(account_id)
+
+            # A cap is the station refusing to mint *any* session, so the form
+            # must not ask again.
+            domain._note_login_refusal(account_id, capped=True)
+            self.assertFalse(domain.login_prefill(account_id)["submit"])
+            domain.clear_login_refusal(account_id)
+
+            # An expired session is the station rejecting its own login, which
+            # is exactly what the remembered password is for.
+            domain.set_login_status(account_id, "expired")
+            self.assertTrue(domain.login_prefill(account_id)["submit"])
+
+            # A row no check has covered is not a determined answer.
+            with tempfile.TemporaryDirectory() as untouched:
+                fresh = RelayAccountsDomain(untouched, http_client=Station())
+                fresh_id = fresh.dispatch(
+                    "add",
+                    {
+                        "type": "newapi",
+                        "label": "Relay",
+                        "origin": "https://relay.example.test",
+                        "username": "sample-user@example.test",
+                        "remember_password": True,
+                    },
+                )["accounts"][0]["id"]
+                self.assertIsNone(fresh.snapshot()["accounts"][0]["login_observed_seconds_ago"])
+                self.assertFalse(fresh.login_prefill(fresh_id)["submit"])
+                # An observation older than the window is a question the pane
+                # re-asks; nothing says the station still answers the same way.
+                fresh.accept_login_result(
+                    fresh_id,
+                    username="sample-user@example.test",
+                    cookie="session=replace-cookie",
+                    password="replace-password",
+                )
+                fresh.set_login_status(fresh_id, "signed_out")
+                fresh._accounts[0]["login_observed_at"] = "2000-01-01T00:00:00Z"
+                self.assertFalse(fresh.login_prefill(fresh_id)["submit"])
+
+            # The account's own preference, not this method, decides whether a
+            # password is kept: nothing remembered fills only the username.
+            domain.dispatch(
+                "update",
+                {"id": account_id, "remember_password": False},
+            )
+            forgotten = domain.login_prefill(account_id)
+            self.assertEqual("", forgotten["password"])
+            self.assertFalse(forgotten["submit"])
 
     def test_a_stored_session_is_asked_before_a_saved_password_is_posted(self) -> None:
         """No sign-in is sent while a cookie on hand still works.

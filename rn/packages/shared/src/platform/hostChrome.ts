@@ -47,6 +47,44 @@ export type MirrorSurface = {
   send: (event: Record<string, unknown>) => void;
 };
 
+/**
+ * What a sign-in surface learns after it is already on screen.
+ *
+ * 去登录 draws this surface before it asks Core for anything, so the press
+ * answers with a dialog instead of a pause — the browser's name and the
+ * screen it streams arrive later.  They arrive through this store rather than
+ * through a replacement request: replacing the open request would re-run the
+ * dialog's focus trap and Escape handling for a surface nobody re-opened.
+ */
+export type RelayBrowserLive = {
+  /** The browser Core opened, or "" while the launch is still in flight. */
+  browser: string;
+  /** The streamed screen, when Core runs the browser without a screen of its own. */
+  mirror?: MirrorSurface;
+};
+
+export type RelayBrowserLiveStore = {
+  snapshot: () => RelayBrowserLive;
+  subscribe: (listener: () => void) => () => void;
+};
+
+/** The store one sign-in window owns: empty until Core answers. */
+export function createRelayBrowserLive(): RelayBrowserLiveStore & { update: (patch: Partial<RelayBrowserLive>) => void } {
+  let state: RelayBrowserLive = { browser: "" };
+  const listeners = new Set<() => void>();
+  return {
+    snapshot: () => state,
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => { listeners.delete(listener); };
+    },
+    update: (patch) => {
+      state = { ...state, ...patch };
+      for (const listener of listeners) listener();
+    },
+  };
+}
+
 type Base = { id: number };
 
 export type HostChromeRequest =
@@ -116,7 +154,11 @@ export type HostChromeRequest =
       kind: "relayBrowser";
       title: string;
       body: string;
-      browser: string;
+      /**
+       * What the surface has learned since it was drawn: the browser Core
+       * opened, and the streamed screen when this host cannot show a window.
+       */
+      live: RelayBrowserLiveStore;
       cancelLabel: string;
       /** Raise the window again, for one that opened behind everything else. */
       showLabel: string;

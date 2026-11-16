@@ -531,6 +531,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "dataManagement.lastSync": "上次同步：{time}",
   "dataManagement.lastSyncFailed": "上次同步失败（{time}），将在下个间隔重试",
   "logs.loading": "正在加载日志摘要…",
+  "logs.loadOlder": "加载更早",
   "logs.empty": "当前视图没有匹配的日志条目。",
   "logs.clearConfirmTitle": "清空此日志？",
   "logs.clearConfirmBody": "此标签页的日志条目将从 Core 中删除，且无法恢复。",

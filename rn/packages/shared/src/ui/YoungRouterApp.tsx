@@ -1,6 +1,6 @@
 import type { TranslationKey } from "../i18n/types";
 import React, { createContext, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, useContext } from "react";
-import { AccessibilityInfo, Animated, AppState, FlatList, Image, NativeModules, Platform, PlatformColor, Pressable, ScrollView, StyleSheet, Text, View, type HostInstance, type ScrollViewProps, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
+import { AccessibilityInfo, Animated, AppState, FlatList, Image, Platform, PlatformColor, Pressable, ScrollView, StyleSheet, Text, View, type HostInstance, type ScrollViewProps, type StyleProp, type TextStyle, type ViewStyle } from "react-native";
 import { createTranslator } from "../i18n";
 import { assistantSettingOptions, type AssistantSettingOption } from "../i18n/assistantSettingsI18n";
 import { runtimeCategoryLabel, runtimeFieldHelp, runtimeFieldLabel, runtimeOptionLabel, runtimeUnitLabel } from "../i18n/runtimeSettingsI18n";
@@ -1663,6 +1663,7 @@ const NON_STAGING_ACTIONS: ReadonlySet<string> = new Set([
   "logs_set_time_range",
   "logs_set_filter",
   "logs_load_more",
+  "logs_load_older",
   "logs_previous_page",
 ]);
 
@@ -9359,7 +9360,7 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
     <View style={styles.modelBreadcrumb}><NativeButton title={providerLabel} link disabled={busy} onPress={onProviderClick} style={styles.breadcrumbProvider} /><Text style={styles.breadcrumbSeparator}>&gt;</Text><Text numberOfLines={1} style={styles.inspectorHeading}>{displayLabel(upstreamName, translate("common.notAvailable"))}</Text></View>
     <View style={styles.inspectorDivider} />
     <View style={styles.inspectorBody}>
-      <View style={styles.inspectorEnabledRow}><View style={styles.inspectorEnableControl}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy || !providerEnabled} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} /></View><ProbeMenuButton title={probeTitle} busy={probing} tooltip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} activeKind={probePresentation.kind} onProbe={probeKind} translate={translate} />{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding} onPress={openProbeDetails} accessibilityRole="link" accessibilityLabel={probePresentation.compactSentence}><TooltipText numberOfLines={1} ellipsizeMode="tail" tooltip={probePresentation.tooltip} style={styles.inspectorProbeFindingText}>{probePresentation.compactSentence}</TooltipText></Pressable> : null}</View>
+      <View style={styles.inspectorEnabledRow}><View style={styles.inspectorEnableControl}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy || !providerEnabled} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} /></View><ProbeMenuButton native={native} title={probeTitle} busy={probing} tooltip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} activeKind={probePresentation.kind} onProbe={probeKind} translate={translate} />{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding} onPress={openProbeDetails} accessibilityRole="link" accessibilityLabel={probePresentation.compactSentence}><TooltipText numberOfLines={1} ellipsizeMode="tail" tooltip={probePresentation.tooltip} style={styles.inspectorProbeFindingText}>{probePresentation.compactSentence}</TooltipText></Pressable> : null}</View>
       {/* The row's switch is disabled when its provider is off, so the reason
           has to be stated in words: a greyed 启用 box under a stopped provider
           otherwise reads as the app refusing the setting for no stated cause.
@@ -15277,6 +15278,31 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     }
     return () => { mounted = false; clearInterval(interval); };
   }, [ipc, selected]);
+  // "Load older" is one page of the store's history, read on demand: the tab
+  // opens on 300 rows (about 17 KB gzipped) instead of the whole 10 000-line
+  // window (3.2 MB / 257 KB on the gateway), and the reader asks for more by
+  // scrolling to the end or pressing the button.  The AppKit table is native
+  // and cannot report its scroll position to this shared layer, so the button
+  // is what every host offers; the React table (Windows and the browser) also
+  // loads on reaching the end.
+  const [olderPending, setOlderPending] = useState(false);
+  const loadOlder = (): void => {
+    const tab = "requests" as const;
+    if (olderPending) return;
+    if (selectedTabRef.current !== tab) return;
+    if (!(activeState?.tab === tab && activeState.log.has_older)) return;
+    setOlderPending(true);
+    void dispatch("logs.load_older", { tab }, "logs").then(async () => {
+      try {
+        const result = await ipc.logs(tab);
+        if (selectedTabRef.current !== tab) return;
+        viewRevisionRef.current = result.revision;
+        if (result.log) setActiveState({ tab, log: result.log });
+      } catch {
+        // The tab's own poll reconciles the confirmed view.
+      }
+    }).finally(() => setOlderPending(false));
+  };
   const clearing = clearIntent?.tab === selected;
   const rows = useMemo(
     () => renderLogRecords(clearing ? [] : (active?.records ?? []), selected, translate),
@@ -15854,7 +15880,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
           `onlineUsageLoading`, which is every case this row's narrower
           `onlineUsageLoadingSource` covered.  A wheel here as well spun two for
           one read, the second one floating above the picker. */}
-      <View style={styles.logActionsRow}>{selected === "online-usage" ? <NativePicker overlayLayer labels={onlineUsageSourceLabels} disabledIndices={onlineUsageDisabledSources} selectedValue={onlineUsagePendingLabel || (onlineUsageSourceIndex >= 0 ? onlineUsageSourceLabels[onlineUsageSourceIndex] ?? "" : "")} disabled={onlineUsageSourceLabels.length === 0} accessibilityLabel={translate("logs.onlineUsageSourceLabel")} onChange={({ nativeEvent }) => { const source = onlineUsageSourceValues[nativeEvent.index]; if (source !== undefined) refreshOnlineUsage(source, onlineUsageSourceLabels[nativeEvent.index] ?? ""); }} style={styles.onlineUsageSourcePicker} /> : null}{selected === "recovery" ? <NativeButton title={translate("logs.clearRecoveryCooldown")} accessibilityLabel={translate("logs.clearRecoveryCooldown")} compact busy={cooldownClearPending} disabled={busy && !cooldownClearPending} onPress={clearCooldowns} style={styles.clearCooldownButton} /> : null}<IconButton label="" symbol={paused ? "play" : "pause"} title={paused ? translate("common.resume") : translate("common.pause")} disabled={busy} onPress={togglePaused} /><IconButton label={Platform.OS === "web" ? translate("common.clear") : ""} symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs} /></View>
+      <View style={styles.logActionsRow}>{selected === "requests" && active?.has_older ? <NativeButton title={translate("logs.loadOlder")} accessibilityLabel={translate("logs.loadOlder")} compact busy={olderPending} disabled={busy || olderPending} onPress={loadOlder} style={styles.loadOlderButton} /> : null}{selected === "online-usage" ? <NativePicker overlayLayer labels={onlineUsageSourceLabels} disabledIndices={onlineUsageDisabledSources} selectedValue={onlineUsagePendingLabel || (onlineUsageSourceIndex >= 0 ? onlineUsageSourceLabels[onlineUsageSourceIndex] ?? "" : "")} disabled={onlineUsageSourceLabels.length === 0} accessibilityLabel={translate("logs.onlineUsageSourceLabel")} onChange={({ nativeEvent }) => { const source = onlineUsageSourceValues[nativeEvent.index]; if (source !== undefined) refreshOnlineUsage(source, onlineUsageSourceLabels[nativeEvent.index] ?? ""); }} style={styles.onlineUsageSourcePicker} /> : null}{selected === "recovery" ? <NativeButton title={translate("logs.clearRecoveryCooldown")} accessibilityLabel={translate("logs.clearRecoveryCooldown")} compact busy={cooldownClearPending} disabled={busy && !cooldownClearPending} onPress={clearCooldowns} style={styles.clearCooldownButton} /> : null}<IconButton label="" symbol={paused ? "play" : "pause"} title={paused ? translate("common.resume") : translate("common.pause")} disabled={busy} onPress={togglePaused} /><IconButton label={Platform.OS === "web" ? translate("common.clear") : ""} symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs} /></View>
     </View>
     {/* The range message is the only thing that makes this slot exist: an empty
         row of its own height sat between the toolbar and the table for every
@@ -15866,7 +15892,7 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     </View> : null}
     {rows.length > 0 && !onlineUsageWaitingForSource ? selected === "route-trace"
       ? <RouteTraceWorkspace requests={routeTraceRequests} selectedKey={selectedKey} native={native} translate={translate} onSelect={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} />
-      : <View style={styles.logTablesLayout} onLayout={({ nativeEvent }) => setTableWidth(nativeEvent.layout.width)}><View style={styles.logTableFrame} onLayout={({ nativeEvent }) => setTableWidth(nativeEvent.layout.width)}><NativeTable columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths scrollTrailingColumnOverflow onSelectionChange={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} onRowDoublePress={(_key, index) => {
+      : <View style={styles.logTablesLayout} onLayout={({ nativeEvent }) => setTableWidth(nativeEvent.layout.width)}><View style={styles.logTableFrame} onLayout={({ nativeEvent }) => setTableWidth(nativeEvent.layout.width)}><NativeTable columns={nativeTableColumns} rows={nativeTableRows} selectedKey={selectedKey} compact preserveColumnWidths scrollTrailingColumnOverflow onEndReached={selected === "requests" && active?.has_older ? loadOlder : undefined} onSelectionChange={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))} onRowDoublePress={(_key, index) => {
         if (onlineUsageWaitingForSource || onlineUsageTimePending) return;
         const row = rows[index];
         if (!row) return;
@@ -15925,8 +15951,18 @@ function EmptyState({ message }: { message: string }): React.JSX.Element { retur
  * are ordered cheapest first so the two that cost a single request sit at the
  * top.  A press never runs a probe on its own: choosing a row is what starts
  * one, so opening the menu to look costs nothing.
+ *
+ * It is asked for through the leaf adapter, which is the only way a menu exists
+ * on all three hosts.  Reaching for the native leaf out of React Native's own
+ * module registry here instead answered nothing on the page -- the browser host
+ * publishes no leaf, only `UIManager` -- so the opener returned before it asked
+ * anybody and 探测 became a button that accepted the click and did nothing.
+ * The page's menu is `platform/browserLeaf`'s `showActionMenu`, drawn by
+ * `ui/HostChrome`; the two native hosts answer the same call through the
+ * adapter.
  */
-function ProbeMenuButton({ title, tooltip, busy, disabled, activeKind, onProbe, translate }: {
+function ProbeMenuButton({ native, title, tooltip, busy, disabled, activeKind, onProbe, translate }: {
+  native: NativeLeafAdapter;
   title: string;
   tooltip?: string;
   busy: boolean;
@@ -15950,7 +15986,7 @@ function ProbeMenuButton({ title, tooltip, busy, disabled, activeKind, onProbe, 
       if (kind) onProbe(kind);
     };
     const open = (anchor: { x: number; y: number; width: number; height: number }): void => {
-      void hostChromeActionMenu(translate("providers.probeMenuTitle"), items, anchor)
+      void native.showActionMenu({ title: translate("providers.probeMenuTitle"), items, anchor })
         .then(chosen)
         .catch(() => undefined);
     };
@@ -15984,17 +16020,6 @@ function ProbeMenuButton({ title, tooltip, busy, disabled, activeKind, onProbe, 
     disabled={disabled && !busy}
     onPress={openMenu}
   />;
-}
-
-/** The host's own action menu, when this build has one. */
-async function hostChromeActionMenu(
-  title: string,
-  items: string[],
-  anchor: { x: number; y: number; width: number; height: number },
-): Promise<number | undefined> {
-  const bridge = (NativeModules as { LiteLLMNativeLeaf?: { showActionMenu?: (title: string, items: string[], anchor: { x: number; y: number; width: number; height: number }) => Promise<number | undefined> } }).LiteLLMNativeLeaf;
-  if (!bridge?.showActionMenu) return undefined;
-  return bridge.showActionMenu(title, items, anchor);
 }
 
 const ActionButton = React.forwardRef<HostInstance, { title: string; onPress: () => void; disabled?: boolean; busy?: boolean; primary?: boolean; danger?: boolean; titleWidth?: "auto" | "tight"; toolTip?: string; /** The host's own glyph, drawn where that host draws a menu chevron. */ symbol?: "chevron-up" | "chevron-down" | "chevron-up-down"; symbolWithTitle?: boolean; symbolTrailing?: boolean; accessibilityLabel?: string; style?: StyleProp<ViewStyle> }>(function ActionButton({ title, onPress, disabled, busy, primary, danger, titleWidth, toolTip, symbol, symbolWithTitle, symbolTrailing, accessibilityLabel, style }, ref): React.JSX.Element {
@@ -17338,6 +17363,8 @@ inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspec
   logRangeError: { color: systemColors.brown, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14, flexShrink: 1 },
   logRangeErrorHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 14, flexShrink: 1 },
   clearCooldownButton: { minWidth: 96, height: 22 },
+  // Sized to its own label: a fixed width would clip 加载更早 in a narrow window.
+  loadOlderButton: { minWidth: 88, height: 22 },
   toolbarLabel: { color: systemColors.label, fontSize: UI_FONT_SIZE, flexShrink: 0 },
   logFilterInput: { flex: 1, minWidth: 0, height: 24 },
   logsTabs: { width: undefined, minWidth: 389, height: 24 },

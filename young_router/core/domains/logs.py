@@ -33,6 +33,17 @@ MAX_READ_BYTES = 16 * 1024 * 1024
 # the response envelope while still returning the newest useful log rows.
 MAX_VIEW_BYTES = 3 * 1024 * 1024
 DEFAULT_LINES = 10_000
+# A page of the 请求 tab.  Its view is 300 rows, not the whole configured
+# window: the gateway's 10 000-line window was 3.2 MB of JSON (257 KB gzipped)
+# on every poll that saw one new request, and the first read projected 20 000
+# lines to keep 4 700 of them (2026-11-16).  A page is ~600 source lines and
+# 17 KB gzipped, so the pane opens and refreshes in the time a scroll takes.
+REQUEST_PAGE_ROWS = 300
+# A window that stopped polling has closed.  "Load older" widens the 请求 view
+# for the window that asked; the next window should open on the first page
+# again rather than inherit a depth somebody scrolled to an hour ago (a depth
+# the store's ceiling would let grow to the whole 10 000-row limit).
+PAGE_IDLE_RESET_SECONDS = 120.0
 # A page of online usage. The next pages reveal rows already read without
 # issuing another remote query.
 ONLINE_USAGE_PAGE_ROWS = 300
@@ -1978,6 +1989,12 @@ class LogsDomain:
         # keep the already projected window for the lines before it.
         self._request_tail_lock = threading.Lock()
         self._request_tail: dict[str, Any] = {}
+        # How many rows an "older" request asked the 请求 tab to hold.  It
+        # starts at one page and grows by a page per load; clearing the tab,
+        # setting a new limit, or reopening the pane after a pause puts it back
+        # to one page.
+        self._page_rows: dict[str, int] = {}
+        self._last_view_at: dict[str, float] = {}
         # 路由跟踪 reads the service log, which is appended to many times a
         # second while the tab polls every five seconds.  Keep the rows the
         # last poll projected and read only the bytes appended since, so a poll
@@ -2023,6 +2040,29 @@ class LogsDomain:
             configured_route_models,
         )
 
+    def _project_request_rows(
+        self,
+        rows: "list[tuple[int, str]] | list[str]",
+        configured_public_models: Mapping[str, str],
+        configured_route_models: object,
+    ) -> list[tuple[int, dict[str, Any]]]:
+        """Project (seq, line) rows, keeping each record's own sequence.
+
+        The sequence is what "older" and "newer" are named by, so the tail
+        keeps it beside the record: a record the projection drops (an
+        unreadable line) would otherwise leave the window's edge pointing at a
+        row it no longer holds, and the next page would be read from the wrong
+        place.
+        """
+
+        projected: list[tuple[int, dict[str, Any]]] = []
+        for index, row in enumerate(rows):
+            line, seq = (row[1], row[0]) if isinstance(row, tuple) else (row, index)
+            record = self._project_request_line(line, configured_public_models, configured_route_models)
+            if record is not None:
+                projected.append((seq, record))
+        return projected
+
     def _requests_records(
         self,
         path: Path,
@@ -2036,68 +2076,120 @@ class LogsDomain:
         rows after the one it last projected, keeps the projection it already
         built for the rows before them, and drops what falls out of the pane's
         window.  A row the tab cannot read is skipped, not a failure.
+
+        The window is a page, not the whole configured limit: the pane opens on
+        the newest ``REQUEST_PAGE_ROWS`` rows and asks for older ones as the
+        reader scrolls.  A page of 300 rows is about 600 source lines and 17 KB
+        gzipped, where the 10 000-line window was 3.2 MB / 257 KB on every poll
+        that saw one new request (gateway, 2026-11-16).  "Load older" moves the
+        *start* of the window back, so the rows already projected are kept and
+        only the page that was asked for is read and projected.
         """
 
         line_limit = self._line_limit("requests")
+        page_rows = self._page_rows_for("requests")
+        # Requests arrive as two-plus rows per attempt (the start and its
+        # terminal state), so a window of rows needs about twice the lines.
+        window = max(page_rows * 2, 400)
         signature = _configuration_signature(self.config_path)
         latest = runtime_store.latest_record_seq(path)
         cleared = self._clear_cursors.get("requests") if "requests" in self._cleared else None
         cleared_seq = int(cleared[1]) if isinstance(cleared, tuple) and cleared[:1] == ("records",) and isinstance(cleared[1], int) else 0
 
-        def project(lines: "list[str]") -> list[dict[str, Any]]:
-            return [
-                record
-                for record in (
-                    self._project_request_line(line, configured_public_models, configured_route_models)
-                    for line in lines
-                )
-                if record is not None
-            ]
-
         with self._request_tail_lock:
             cache = self._request_tail
             cached_seq = cache.get("seq")
+            cached_page_rows = cache.get("page_rows")
+            cached_oldest = cache.get("oldest_seq")
             usable = (
                 cache.get("signature") == signature
-                # Equality, not "at least": a window built for a smaller limit
-                # cannot answer a larger one (the rows above it were never read),
-                # and one built for a larger limit holds rows the tab no longer
-                # shows.  Either way the window is rebuilt from the store.
-                and cache.get("line_limit") == line_limit
+                # A window built for a larger page holds rows this one no
+                # longer shows, and one built for a smaller page never read the
+                # rows a larger page would; only growth is incremental.
+                and isinstance(cached_page_rows, int)
+                and cached_page_rows <= page_rows
+                and isinstance(cached_oldest, int)
                 and cache.get("cleared") == cleared_seq
                 and isinstance(cached_seq, int)
                 and cleared_seq <= cached_seq <= latest
             )
             if usable:
                 entries = list(cache.get("entries") or [])
+                oldest_seq = cached_oldest
+                if page_rows > cached_page_rows and (not cleared_seq or oldest_seq > cleared_seq):
+                    # "Load older": only the page the reader asked for is read,
+                    # and it is projected once and prepended.
+                    older = runtime_store.record_rows_before(
+                        path,
+                        oldest_seq,
+                        limit=max(window - len(entries), 1),
+                    )
+                    if older:
+                        entries[:0] = self._project_request_rows(
+                            older, configured_public_models, configured_route_models
+                        )
                 if latest > cached_seq:
-                    entries.extend(project(runtime_store.records_after(path, cached_seq, limit=max(latest - cached_seq, line_limit))))
-                entries = entries[-line_limit:]
+                    entries.extend(
+                        self._project_request_rows(
+                            runtime_store.record_rows_after(
+                                path, cached_seq, limit=max(latest - cached_seq, window)
+                            ),
+                            configured_public_models,
+                            configured_route_models,
+                        )
+                    )
+                entries = entries[-window:]
+                # The window's own edge, after the trim: a row pushed out of the
+                # window must not stay the place "older" is read from.
+                oldest_seq = entries[0][0] if entries else (cleared_seq or 0)
                 self._request_tail = {
                     "seq": latest,
                     "signature": signature,
-                    "line_limit": line_limit,
+                    "page_rows": page_rows,
                     "cleared": cleared_seq,
+                    "oldest_seq": oldest_seq,
                     "entries": entries,
                 }
-                return list(entries)
-        # No usable projection: build the window from the newest rows.
-        window = max(line_limit * 2, 400)
-        lines = (
-            runtime_store.records_after(path, cleared_seq, limit=window)
+                return [record for _seq, record in entries]
+        # No usable projection: build the newest page from the store.  Line
+        # limit is still the ceiling a reader may load up to, so a page never
+        # asks for more than the tab is configured to show.
+        page_rows = min(page_rows, line_limit)
+        window = max(page_rows * 2, 400)
+        rows = (
+            runtime_store.record_rows_after(path, cleared_seq, limit=window)
             if cleared_seq
-            else runtime_store.read_records(path, limit=window)
+            else runtime_store.read_record_rows(path, limit=window)
         )
-        entries = project(lines)[-line_limit:]
+        entries = self._project_request_rows(rows, configured_public_models, configured_route_models)[-window:]
+        oldest_seq = entries[0][0] if entries else (cleared_seq or 0)
         with self._request_tail_lock:
             self._request_tail = {
                 "seq": latest,
                 "signature": signature,
-                "line_limit": line_limit,
+                "page_rows": page_rows,
                 "cleared": cleared_seq,
+                "oldest_seq": oldest_seq,
                 "entries": entries,
             }
-        return list(entries)
+        return [record for _seq, record in entries]
+
+    def _page_rows_for(self, tab: str) -> int:
+        """How many rows this tab shows: one page until the reader asks for more."""
+
+        limit = self._line_limit(tab)
+        return max(1, min(limit, self._page_rows.get(tab, REQUEST_PAGE_ROWS)))
+
+    def _has_older_requests(self, path: Path) -> bool:
+        """Whether the store holds a request older than the loaded window."""
+
+        cleared = self._clear_cursors.get("requests") if "requests" in self._cleared else None
+        cleared_seq = int(cleared[1]) if isinstance(cleared, tuple) and cleared[:1] == ("records",) and isinstance(cleared[1], int) else 0
+        with self._request_tail_lock:
+            oldest = self._request_tail.get("oldest_seq")
+        if not isinstance(oldest, int) or oldest <= cleared_seq:
+            return False
+        return runtime_store.has_records_before(path, oldest)
 
     def _empty_tab(self, tab: str) -> dict[str, Any]:
         value: dict[str, Any] = {
@@ -2663,7 +2755,7 @@ class LogsDomain:
                     for record in records
                     if _record_matches_filter(record, needle, tab=tab)
                 ]
-            return runtime_store.has_records(path), _sort_records_by_time(records)[-self._line_limit(tab) :]
+            return runtime_store.has_records(path), _sort_records_by_time(records)[-self._page_rows_for(tab) :]
         if tab == "recovery":
             source_cursor = self._source_cursor(tab)
             clear_cursor = self._clear_cursors.get(tab)
@@ -2772,6 +2864,8 @@ class LogsDomain:
             self._online_usage_source_cursor() if tab == "online-usage" else None,
             self._filters.get(tab, ""),
             self._line_limit(tab),
+            # "Load older" widens the 请求 window: same source, another view.
+            self._page_rows_for(tab) if tab == "requests" else None,
             tab in self._cleared,
         )
 
@@ -2830,6 +2924,12 @@ class LogsDomain:
             # The pane needs to know a next page exists before it offers to
             # fetch one, so the count of rows after this page travels with it.
             value["remaining"] = max(0, total - page * rows_per_page)
+        elif tab == "requests":
+            # The pane draws its own page size and offers "load older" only
+            # while the store holds a row before the window it shows.
+            value["page_rows"] = self._page_rows_for(tab)
+            path = self._path(tab)
+            value["has_older"] = path is not None and self._has_older_requests(path)
         # Fit the records to the IPC result only after the pager describes the
         # rows held by Core: byte-cap trimming must not make an existing next
         # page look absent.
@@ -2890,6 +2990,13 @@ class LogsDomain:
     def view(self, tab: str, known_revision: int | None = None) -> dict[str, Any]:
         if tab not in LOG_TABS:
             raise LogsDomainError("Log tab is invalid")
+        now = time.monotonic()
+        last = self._last_view_at.get(tab)
+        self._last_view_at[tab] = now
+        if last is not None and now - last > PAGE_IDLE_RESET_SECONDS and self._page_rows.pop(tab, None):
+            # This window is new: it opens on the first page, not on the depth
+            # the window that closed had scrolled to.
+            self._source_signatures.pop(tab, None)
         self._refresh(tab)
         revision = self._view_revisions[tab]
         changed = known_revision != revision
@@ -3079,6 +3186,9 @@ class LogsDomain:
             # a separate, explicit destructive operation.
             self._cleared.add(str(tab))
             self._clear_cursors[str(tab)] = self._source_cursor(str(tab))
+            # A cleared tab starts at the newest page again: the rows the
+            # reader had loaded are gone, so its depth is not this view's.
+            self._page_rows.pop(str(tab), None)
         elif operation == "clear_recovery_and_cooldowns":
             if tab != "recovery":
                 raise LogsDomainError("Log tab is invalid")
@@ -3100,6 +3210,24 @@ class LogsDomain:
                 raise LogsDomainError("Log line limit is invalid")
             self._limits[str(tab)] = value
             self._discard_clear(str(tab))
+            # A new ceiling opens on one page of it, not on the depth the old
+            # limit had grown to.
+            self._page_rows.pop(str(tab), None)
+        elif operation in {"load_older", "older"}:
+            if tab != "requests":
+                raise LogsDomainError("Log tab is invalid")
+            # One more page of the store's history, and only that page: the
+            # tail keeps what it already projected and prepends the older rows
+            # the store hands back.  The pane scrolls to a page, not a shuffle:
+            # re-reading the whole window here is what the page model replaces.
+            self._page_rows[str(tab)] = min(
+                self._line_limit(str(tab)),
+                self._page_rows_for(str(tab)) + REQUEST_PAGE_ROWS,
+            )
+            self._source_signatures.pop(str(tab), None)
+            self.revision += 1
+            self._refresh(str(tab), force=True)
+            return self.snapshot()
         elif operation in {
             "load_more",
             "online_usage_more",
@@ -3196,6 +3324,8 @@ class LogsDomain:
             self._request_tail = {}
         with self._trace_tail_lock:
             self._trace_tail = {}
+        self._page_rows.clear()
+        self._last_view_at.clear()
         self._view_revisions = {
             tab: self._view_revisions.get(tab, 0) + 1 for tab in LOG_TABS
         }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+import time
 import os
 from pathlib import Path
 import tempfile
@@ -11,7 +12,7 @@ from unittest import mock
 
 from young_router import runtime_store
 from young_router.core import CoreIPCClient, CoreIPCServer, CoreStore
-from young_router.core.domains.logs import MAX_FILTER_CHARS, MAX_VIEW_BYTES, LOG_TABS, LogsDomain, LogsDomainError
+from young_router.core.domains.logs import MAX_FILTER_CHARS, MAX_VIEW_BYTES, LOG_TABS, PAGE_IDLE_RESET_SECONDS, REQUEST_PAGE_ROWS, LogsDomain, LogsDomainError
 from young_router.core.security import safe_public
 from young_router.core.service import LOG_TABS as CORE_LOG_TABS
 
@@ -2615,11 +2616,11 @@ model_list:
             self.assertEqual(2, domain.view("requests")["log"]["line_count"])
 
             with mock.patch(
-                "young_router.core.domains.logs.runtime_store.read_records",
-                wraps=runtime_store.read_records,
+                "young_router.core.domains.logs.runtime_store.read_record_rows",
+                wraps=runtime_store.read_record_rows,
             ) as rebuilt, mock.patch(
-                "young_router.core.domains.logs.runtime_store.records_after",
-                wraps=runtime_store.records_after,
+                "young_router.core.domains.logs.runtime_store.record_rows_after",
+                wraps=runtime_store.record_rows_after,
             ) as appended:
                 domain.dispatch("logs.set_filter", {"tab": "requests", "filter": "bet"})
                 # Narrowing the rows already held reads nothing back.
@@ -2724,6 +2725,93 @@ model_list:
             self.assertEqual(["live", "whole"], traced(""))
             self.assertEqual(["live"], traced("流式"))
             self.assertEqual(["whole"], traced("非流式"))
+
+    def test_request_tab_opens_on_one_page_and_loads_older_pages_on_request(self) -> None:
+        """The 请求 view is a page, and "load older" reads only the older page.
+
+        The tab used to answer with the whole 10 000-line window: 3.2 MB of
+        JSON (257 KB gzipped) on the gateway for every poll that saw one new
+        request, and a first read that projected 20 000 lines to keep 4 700 of
+        them (2026-11-16).  It now opens on ``REQUEST_PAGE_ROWS`` rows and reads
+        one more page of the store when the reader asks, so what a window
+        receives is the size of a screenful instead of the size of the log.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "recent-requests.jsonl"
+            for index in range(1200):
+                runtime_store.append_record(
+                    path,
+                    json.dumps(
+                        {
+                            "ts": f"2026-08-01T{index // 3600:02d}:{index // 60 % 60:02d}:{index % 60:02d}Z",
+                            "request_id": f"row-{index}",
+                            "status": "success",
+                        }
+                    ),
+                )
+            domain = LogsDomain(root)
+
+            first = domain.view("requests")["log"]
+            self.assertEqual(REQUEST_PAGE_ROWS, first["line_count"])
+            self.assertEqual(REQUEST_PAGE_ROWS, first["page_rows"])
+            self.assertTrue(first["has_older"])
+            self.assertEqual(f"row-{1200 - REQUEST_PAGE_ROWS}", first["records"][0]["request_id"])
+
+            with mock.patch(
+                "young_router.core.domains.logs.runtime_store.read_record_rows",
+                wraps=runtime_store.read_record_rows,
+            ) as rebuilt, mock.patch(
+                "young_router.core.domains.logs.runtime_store.record_rows_before",
+                wraps=runtime_store.record_rows_before,
+            ) as older:
+                domain.dispatch("logs.load_older", {"tab": "requests"})
+                # Loading older is one read of the rows before the window, not
+                # a rebuild of the window itself.
+                rebuilt.assert_not_called()
+                older.assert_called()
+                second = domain.view("requests")["log"]
+                self.assertEqual(REQUEST_PAGE_ROWS * 2, second["line_count"])
+                self.assertEqual(REQUEST_PAGE_ROWS * 2, second["page_rows"])
+                # The rows already on screen are the same rows, in the same
+                # order: the older page was prepended, nothing was re-sorted.
+                self.assertEqual(first["records"], second["records"][REQUEST_PAGE_ROWS:])
+                self.assertEqual(f"row-{1200 - REQUEST_PAGE_ROWS * 2}", second["records"][0]["request_id"])
+
+            # A new request still lands at the end of the window without
+            # dropping the depth the reader asked for.
+            runtime_store.append_record(
+                path,
+                json.dumps({"ts": "2026-08-01T23:59:59Z", "request_id": "newest", "status": "success"}),
+            )
+            third = domain.view("requests")["log"]
+            self.assertEqual(REQUEST_PAGE_ROWS * 2, third["line_count"])
+            self.assertEqual("newest", third["records"][-1]["request_id"])
+
+            # Every load stops at the configured ceiling, and the store's own
+            # beginning is where "older" runs out.
+            domain.dispatch("logs.set_limit", {"tab": "requests", "limit": 400})
+            limited = domain.view("requests")["log"]
+            self.assertEqual(REQUEST_PAGE_ROWS, limited["line_count"])
+            domain.dispatch("logs.load_older", {"tab": "requests"})
+            self.assertEqual(400, domain.view("requests")["log"]["line_count"])
+
+            # Clearing puts the tab back on its first page: the rows the reader
+            # had loaded are gone, so their depth is not this view's.
+            domain.dispatch("logs.clear", {"tab": "requests"})
+            cleared = domain.view("requests")["log"]
+            self.assertEqual(0, cleared["line_count"])
+            self.assertEqual(REQUEST_PAGE_ROWS, cleared["page_rows"])
+
+            # A window that stopped polling has closed: the next one opens on
+            # the first page instead of inheriting the depth it was scrolled to.
+            domain.dispatch("logs.refresh", {"tab": "requests"})
+            domain.dispatch("logs.load_older", {"tab": "requests"})
+            self.assertEqual(400, domain.view("requests")["log"]["page_rows"])
+            domain._last_view_at["requests"] = time.monotonic() - PAGE_IDLE_RESET_SECONDS - 1
+            reopened = domain.view("requests")["log"]
+            self.assertEqual(REQUEST_PAGE_ROWS, reopened["page_rows"])
 
     def test_request_tab_window_follows_a_configured_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

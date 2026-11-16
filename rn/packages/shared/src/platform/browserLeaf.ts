@@ -28,7 +28,7 @@ import type { AppRoute, LanguagePreference, NativeLocalization, NativeMenuAction
 import type { NativeIpcBridge, NativeLeafBridge } from "./nativeBridge";
 import { isSettingsShellRoute } from "../routes";
 import { resolveLanguage } from "../i18n";
-import { cancelHostChrome, requestHostChrome, type MirrorSurface, type RelaySignInAnswer } from "./hostChrome";
+import { cancelHostChrome, createRelayBrowserLive, requestHostChrome, type MirrorSurface, type RelaySignInAnswer } from "./hostChrome";
 import {
   finishRelayGroupApply,
   openRelayGroupSheet,
@@ -665,18 +665,67 @@ function startMirrorSurface(
 }
 
 /**
+ * The silent half of 去登录: the account's own saved session, or the password
+ * Core remembers for it.
+ *
+ * `undefined` is the answer both the station's refusal and an unreachable
+ * station give: the window this sign-in opens is where either becomes visible,
+ * so there is nothing to state here.  A pending account (the add flow) has no
+ * session yet and never asks.
+ */
+async function restoreSavedRelayLogin(
+  core: BrowserCoreBridge,
+  options: { accountId: string; type: string; label: string; origin: string; username?: string },
+): Promise<{ revision: number; loginStatus: "signed_in"; username: string } | undefined> {
+  try {
+    const body = {
+      account_id: options.accountId,
+      type: options.type || "",
+      label: options.label,
+      origin: options.origin,
+      username: options.username ?? "",
+      login_status: "signed_out",
+    };
+    const result = await core.hostRoute("/ipc/host/relay/restore", body);
+    if (result.login_status === "signed_in") {
+      return {
+        revision: Number(result.revision ?? 0),
+        loginStatus: "signed_in",
+        username: String(result.username ?? options.username ?? ""),
+      };
+    }
+  } catch {
+    // No saved session Core can use. The sign-in window that follows is the
+    // next answer, not a second failure: an unreachable station or a refused
+    // password is stated inside it, where the person can act on it.
+  }
+  return undefined;
+}
+
+/**
  * Sign in by letting Core open the station in a real browser.
+ *
+ * The surface is drawn first and the work happens behind it.  去登录 used to
+ * await the silent restore and then the browser launch before drawing
+ * anything, so the click answered with a pause that lasted as long as the
+ * station and a cold browser took — measured on the live page as several
+ * seconds of 登录中 over a pane with no window on it.  The press now draws the
+ * surface, which states what it is waiting for, and the browser's name and
+ * frames arrive through its own store (`createRelayBrowserLive`).
+ *
+ * The silent sign-in still runs first, inside that surface: the account's
+ * remembered session or password may still work, and that answer needs no
+ * browser at all.  A saved password is filled into the station's form by Core
+ * (and posted once when the station's own last answer says there is no session
+ * to preserve), because the page never receives the secret.
  *
  * `"unavailable"` is the answer that means "this host has no browser to open,
  * use the credential form instead" — a capability answer, not a failed
  * sign-in.  Every other answer is what the pane already reads from a native
  * sign-in: the account's state, or `undefined` when the person cancelled.
  *
- * The wait is a surface of its own: the person is working in another window,
- * so this document says what is being waited for and offers 取消, instead of
- * leaving a dead button on screen.  Cancel, a closed window, and the ten
- * minutes Core allows all end the same way, and Core is told to close the
- * window in every one of them.
+ * Cancel, a closed window, and the ten minutes Core allows all end the same
+ * way, and Core is told to close the window in every one of them.
  */
 async function browserWindowLogin(
   core: BrowserCoreBridge,
@@ -706,64 +755,75 @@ async function browserWindowLogin(
   if (options.stationName) body.station_name = options.stationName;
   if (options.stationType) body.station_type = options.stationType;
   if (options.stationOrigin) body.station_origin = options.stationOrigin;
-  let started: Record<string, unknown>;
-  try {
-    started = await core.hostRoute("/ipc/host/relay/browser/start", body);
-  } catch (error) {
-    // A refused start is answered, not thrown: `unsupported` below is the one
-    // answer that means "this host cannot show you the station", and it falls
-    // back to the form.  Anything else is a failed sign-in and stays one.
-    return hostErrorCode(error) === "relay_browser_unavailable" ? "unavailable" : undefined;
-  }
-  if (String(started.status ?? "") === "unsupported") {
-    // `reason` names which side is missing, so the form can say it: a page
-    // opened on another machine than Core (`remote`), a host with no browser
-    // (`no_browser`), no screen (`no_display`), or a launch that never
-    // reached its window (`launch_failed`).
-    lastBrowserLoginReason = String(started.reason ?? "");
-    return "unavailable";
-  }
-  lastBrowserLoginReason = "";
-  const loginId = typeof started.login_id === "string" ? started.login_id : "";
-  if (!loginId) return undefined;
-  const browserName = typeof started.browser === "string" ? started.browser : "";
-  // Declared before the stream, not after it: the stream's loop asks this on its
-  // first tick, and a `let` that has not been initialized yet throws rather than
-  // reading as `false` — measured on the live page as
-  // `ReferenceError: Cannot access 's' before initialization`, with the dialog
-  // drawn black and no frame ever requested.
+  // Declared before the surface, not after it: the surface's own answer (`wait`)
+  // and the frame stream both read this, and a `let` that has not been
+  // initialized yet throws rather than reading as `false` — measured on the live
+  // page as `ReferenceError: Cannot access 's' before initialization`, with the
+  // dialog drawn black and no frame ever requested.
   let cancelled = false;
-  // A page that is closed or reloaded mid sign-in cannot await anything, and
-  // the browser Core started for it would go on running until the ten-minute
-  // limit.  One beacon on the way out ends it now: `beforeunload` is the reload
-  // a person asked for, `pagehide` a tab closed or discarded in the background.
-  // Measured before this existed: reloading the page left three Chrome
-  // processes and three profiles behind on the host.
+  // The login Core mints for this window, or "" until it answers.  The page
+  // that is closed or reloaded mid sign-in cannot await anything, and the
+  // browser Core started for it would go on running until the ten-minute
+  // limit; one beacon on the way out ends it now.  Measured before this
+  // existed: reloading the page left three Chrome processes and three profiles
+  // behind on the host.
+  let loginId = "";
   const abandon = () => {
-    core.hostBeacon("/ipc/host/relay/browser/cancel", { login_id: loginId });
+    if (loginId) core.hostBeacon("/ipc/host/relay/browser/cancel", { login_id: loginId });
   };
   window.addEventListener("beforeunload", abandon);
   window.addEventListener("pagehide", abandon);
-  // A Core with no screen of its own, or a page opened through a proxy, cannot
-  // show a window anybody is looking at.  It answers with the frames of a
-  // headless browser instead, and this surface draws them.
-  const mirror = startMirrorSurface(core, loginId, started.mirror, () => cancelled);
+  const live = createRelayBrowserLive();
   cancelHostChrome("relayBrowser");
   const wait = requestHostChrome<"form" | undefined>({
     kind: "relayBrowser",
     title: fillLabel(strings?.relaySignInTitle ?? "Sign in", options.label),
     body: strings?.relayBrowserWaiting ?? "",
-    browser: browserName,
+    live,
     cancelLabel: strings?.cancel ?? "Cancel",
     showLabel: strings?.relayBrowserShow ?? "",
     // A window can open behind the person's own browser — or onto a Space they
     // are not looking at — and then "nothing happened" is exactly what they
     // see.  One press raises it again; Core recreates it if it was dismissed.
-    show: () => { void core.hostRoute("/ipc/host/relay/browser/focus", { login_id: loginId }).catch(() => undefined); },
-    mirror,
+    show: () => {
+      if (loginId) void core.hostRoute("/ipc/host/relay/browser/focus", { login_id: loginId }).catch(() => undefined);
+    },
   });
   void wait.then(() => { cancelled = true; });
   try {
+    // The account may already be signed in through the session or the password
+    // Core remembers; that answer closes this surface again without a browser.
+    if (options.pendingAccount !== true) {
+      const restored = await restoreSavedRelayLogin(core, options);
+      if (restored) return restored;
+      if (cancelled) return undefined;
+    }
+    let started: Record<string, unknown>;
+    try {
+      started = await core.hostRoute("/ipc/host/relay/browser/start", body);
+    } catch (error) {
+      // A refused start is answered, not thrown: `unsupported` below is the one
+      // answer that means "this host cannot show you the station", and it falls
+      // back to the form.  Anything else is a failed sign-in and stays one.
+      return hostErrorCode(error) === "relay_browser_unavailable" ? "unavailable" : undefined;
+    }
+    if (String(started.status ?? "") === "unsupported") {
+      // `reason` names which side is missing, so the form can say it: a page
+      // opened on another machine than Core (`remote`), a host with no browser
+      // (`no_browser`), no screen (`no_display`), or a launch that never
+      // reached its window (`launch_failed`).
+      lastBrowserLoginReason = String(started.reason ?? "");
+      return "unavailable";
+    }
+    lastBrowserLoginReason = "";
+    loginId = typeof started.login_id === "string" ? started.login_id : "";
+    if (!loginId || cancelled) return undefined;
+    live.update({ browser: typeof started.browser === "string" ? started.browser : "" });
+    // A Core with no screen of its own, or a page opened through a proxy, cannot
+    // show a window anybody is looking at.  It answers with the frames of a
+    // headless browser instead, and this surface draws them.
+    const mirror = startMirrorSurface(core, loginId, started.mirror, () => cancelled);
+    if (mirror) live.update({ mirror });
     while (!cancelled) {
       let answer: Record<string, unknown>;
       try {
@@ -787,7 +847,7 @@ async function browserWindowLogin(
     window.removeEventListener("beforeunload", abandon);
     window.removeEventListener("pagehide", abandon);
     cancelHostChrome("relayBrowser");
-    void core.hostRoute("/ipc/host/relay/browser/cancel", { login_id: loginId }).catch(() => undefined);
+    if (loginId) void core.hostRoute("/ipc/host/relay/browser/cancel", { login_id: loginId }).catch(() => undefined);
   }
 }
 
@@ -1163,30 +1223,6 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
     finishGroupManagerApply: async (options) => { finishRelayGroupApply(options); },
     updateGroupManager: async (snapshot) => updateRelayGroupSheet(snapshot),
     relayLogin: async (options) => {
-      // Ask Core first, for every account that might already have a session.
-      // That is the silent sign-in: the saved cookie, or the password this
-      // account already remembers, is used without a form.  A pending account
-      // (the add flow) has no such session and does not ask.
-      if (options.pendingAccount !== true) {
-        try {
-          const body = {
-            account_id: options.accountId,
-            type: options.type || "",
-            label: options.label,
-            origin: options.origin,
-            username: options.username ?? "",
-            login_status: "signed_out",
-          };
-          const result = await core.hostRoute("/ipc/host/relay/restore", body);
-          if (result.login_status === "signed_in") {
-            return { revision: Number(result.revision ?? 0), loginStatus: "signed_in", username: String(result.username ?? options.username ?? "") };
-          }
-        } catch {
-          // No saved session Core can use. The form below is the next answer,
-          // not a second failure: an unreachable station or a refused password
-          // is stated inside it, where the person can act on it.
-        }
-      }
       // The station's own login page, in a real browser: Core opens the
       // window on this machine (the one the page is served from) at the
       // station's address, so a captcha, a verification code, or an OAuth
@@ -1197,6 +1233,10 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
       // use.  A machine with no Chromium-family browser answers
       // `relay_browser_unavailable` and the credential form below is the
       // fallback, not a second feature.
+      //
+      // That window's surface is drawn before anything is asked — including
+      // the silent sign-in from the saved session or password, which runs
+      // behind it.  A machine with no browser answers before any of it.
       const browserLogin = await browserWindowLogin(core, options, strings);
       if (browserLogin !== "unavailable") return browserLogin;
       // No browser to open: the form says so first, because a station page

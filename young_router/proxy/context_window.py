@@ -26,15 +26,15 @@ elided tool result is still the result of the call that produced it.
 Two rules this pass has to keep, both learned from a live Claude Code thread
 that re-read the same paper fifty times instead of once:
 
-* **A picture is priced as a picture on both wires, and only priced.**  The
-  image-context pass is Codex's: it reads the Responses shape
-  (``input_image`` / ``image_url``), and its rewrite writes placeholders a
-  Codex ``view_image`` call answers.  A Messages replay spells the same picture
-  ``{"type": "image", "source": {"type": "base64", …}}`` and has no such
-  tool, so on that wire this module prices the pixels and leaves the body
-  alone -- see ``_strings_joined``, ``_image_token_estimate`` and
-  ``_messages_wire_image_tokens``.  Counting their base64 as prose declared a
-  300k-token replay to be 1.47M and elided history on every single step.
+* **A picture is priced as a picture on both wires.**  The image-context pass
+  reads both spellings now (``input_image`` / ``image_url``, and Messages'
+  ``{"type": "image", "source": {"type": "base64", …}}``); what this module
+  still prices itself are the shapes that pass does not rewrite -- a picture
+  still nested in a ``tool_result`` before the lift, and a Messages body from a
+  client that is not Claude.  See ``_strings_joined``,
+  ``_image_token_estimate`` and ``_messages_wire_image_tokens``.  Counting
+  their base64 as prose declared a 300k-token replay to be 1.47M and elided
+  history on every single step.
 * **What the model just read stays readable.**  The turn being answered is
   protected, but on the Messages wire that turn is a *tool result*, and the
   result the step was actually made from sits one item before it -- so the read
@@ -336,14 +336,12 @@ def _is_inline_image(node: Mapping[str, Any]) -> bool:
     Messages says ``{"type": "image", "source": {"type": "base64", "data":
     …}}``.
 
-    This predicate exists for *measuring*, and that is the boundary: replacing a
-    picture with a placeholder that names a file is the image-context pass, and
-    that pass is Codex's -- it keys on a Codex replay's own evidence and writes
-    placeholders a Codex ``view_image`` call can answer.  A Claude Code replay
-    is a different client with no such tool, so the fix on this wire is to price
-    the pictures correctly and nothing else.  Widening
-    ``image_context._part_data_url`` to read ``source.data`` would be a rewrite
-    this client never asked for; the bug was arithmetic.
+    This predicate exists for *measuring* the shapes the image-context scan
+    does not own: an ordinary Messages picture is now rewritten by that pass,
+    but one still nested in a ``tool_result`` before the lift, or in a body from
+    a client that is not Claude, stays here.  Replacing those is the image
+    pass's job when it applies; pricing them is always this module's, and the
+    bug this walker fixed was arithmetic -- base64 counted as prose.
     """
 
     kind = node.get("type")
@@ -364,11 +362,13 @@ def _is_inline_image(node: Mapping[str, Any]) -> bool:
 def _inline_image_b64(node: Any, out: Optional[List[str]] = None) -> List[str]:
     """The base64 bodies of every inline image *the scanner cannot see*.
 
-    ``image_context.scan`` is the Codex pass and reads the Responses spelling
-    (``input_image`` / ``image_url``); its pictures are already priced from
-    their headers there.  This walker reads the other spelling -- Messages'
+    ``image_context.scan`` is the Responses scanner and reads
+    ``input_image`` / ``image_url``; its pictures are already priced from their
+    headers there.  This walker reads the other spelling -- Messages'
     ``{"type": "image", "source": {"type": "base64", "data": …}}`` -- so the
-    two prices never add up to the same picture twice.
+    two prices never add up to the same picture twice.  The Messages pass may
+    have already replaced some of these with text; only the ones still here are
+    charged.
 
     A picture inside a ``tool_result`` is collected too, but it is priced by
     ``_tool_result_image_tokens`` instead: the upstream cannot read that shape
@@ -1375,15 +1375,14 @@ def _image_token_estimate(items: Any) -> int:
     costs no decode.  An image whose size cannot be read keeps the byte rate,
     where the only thing known about it is how many bytes it occupies.
 
-    Two wires carry pictures and only one of them is the scanner's: the image
-    pass is Codex's, so ``image_context.scan`` reads ``input_image`` /
-    ``image_url`` and answers zero for a Claude Code replay that spells the
-    same picture ``{"type": "image", "source": {"type": "base64", …}}``.
-    Those are priced here directly and *only* priced -- this wire has no
-    ``view_image`` for a placeholder to point at, so replacing them is not this
-    pass's job (see ``_is_inline_image``).  Measuring is: a replay left
-    unpriced is a replay whose size the pass gets wrong in the expensive
-    direction.
+    ``image_context.scan`` is the Responses scanner, so it answers zero for a
+    Claude Code replay that spells the same picture
+    ``{"type": "image", "source": {"type": "base64", …}}``.  Those are priced
+    here directly: the Messages pass rewrites the ordinary ones (an ask
+    placeholder needs no tool), and this arithmetic is what prices the rest --
+    a picture still nested in a ``tool_result``, or one in a body the pass
+    declined.  A replay left unpriced is a replay whose size the pass gets
+    wrong in the expensive direction.
     """
 
     from . import image_context as _image_context_module
@@ -1409,7 +1408,7 @@ def _image_token_estimate(items: Any) -> int:
 
 
 def _messages_wire_image_tokens(items: Any) -> int:
-    """The pictures ``image_context.scan`` cannot see, priced per picture.
+    """The pictures ``image_context.scan`` (the Responses scanner) cannot see.
 
     Only the head of each body is decoded -- an image header sits in the first
     few kilobytes of a JPEG, PNG, GIF and WEBP -- because this runs on every
@@ -1682,18 +1681,29 @@ def apply(data: Any) -> Optional[Dict[str, Any]]:
     return dict(final)
 
 
-def _turn_facts(items: Any) -> Dict[str, Any]:
-    """What the pass judged: which turns the images sit in, and what it protects."""
+def _turn_facts(items: Any, key: Optional[str] = None) -> Dict[str, Any]:
+    """What the pass judged: which turns the images sit in, and what it protects.
+
+    ``key`` is the field the replay lives in.  The two wires count a turn
+    differently -- a Messages tool result is a user message, not a new request
+    -- so a trace that always used the Responses counter would say ``turn 0``
+    over the very replay the Messages image pass had just shortened.
+    """
 
     from . import image_context as _image_context_module
 
+    list_items = items if isinstance(items, list) else []
     try:
-        images = _image_context_module.scan(items)
+        if key == "messages":
+            images = _image_context_module.scan_messages(list_items)
+            current_turn = _image_context_module._messages_turn_count(list_items)
+        else:
+            images = _image_context_module.scan(list_items)
+            current_turn = _image_context_module._turn_count(list_items)
     except Exception:
         return {}
-    list_items = items if isinstance(items, list) else []
     return {
-        "current_turn": _image_context_module._turn_count(list_items),
+        "current_turn": current_turn,
         "protected_index": _protected_index(list_items),
         "image_turns": sorted({image.turn for image in images})[:16],
         "image_count": len(images),
@@ -1717,8 +1727,8 @@ def _trace(
     try:
         if after_count is None:
             after_count = count_tokens(after, router)
-        _before_key, before_items = payload_items(before)
-        _after_key, after_items = payload_items(after)
+        before_key, before_items = payload_items(before)
+        after_key, after_items = payload_items(after)
         trace_fields = {
             "model": before.get("model"),
             "window": window,
@@ -1729,8 +1739,8 @@ def _trace(
             "image_bytes_before": _inline_image_bytes(before_items),
             "image_bytes_after": _inline_image_bytes(after_items),
             "image_pass": image_pass,
-            "before_facts": _turn_facts(before_items),
-            "after_facts": _turn_facts(after_items),
+            "before_facts": _turn_facts(before_items, before_key),
+            "after_facts": _turn_facts(after_items, after_key),
             "items_before": len(before_items or []),
             "items_after": len(after_items or []),
         }

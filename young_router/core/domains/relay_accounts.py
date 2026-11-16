@@ -718,6 +718,23 @@ def _private_account(raw: Mapping[str, Any]) -> dict[str, Any]:
         "resource_status": resource_status,
         "resource_error": resource_error,
         "resources": _safe_resources(raw.get("resources", [])),
+        # The last value this app read for each of the station's keys.  A key
+        # value is what a provider slot and a route materialize; an account
+        # whose dashboard session has lapsed can no longer be asked for it, and
+        # refusing then turns routes that already worked into upstream
+        # rejections.  Private storage only: it never crosses a snapshot.
+        "resource_keys": {
+            str(key): str(value)
+            for key, value in (raw.get("resource_keys") or {}).items()
+            if isinstance(key, str)
+            and key.strip()
+            and isinstance(value, str)
+            and value.strip()
+            and len(value.encode("utf-8")) <= 4096
+            and not any(char in value for char in "\x00\r\n")
+        }
+        if isinstance(raw.get("resource_keys"), Mapping)
+        else {},
         # The names the station's own last answer stated per key, kept apart
         # from ``resources`` because that list also carries the work staged onto
         # it.  Only Core holds it: a pane reads the row, and a provider slot
@@ -790,6 +807,10 @@ def _stored_account(account: Mapping[str, Any]) -> dict[str, Any]:
     stored.pop("login_observed_seconds_ago", None)
     stored["password"] = str(account.get("password", ""))
     stored["session"] = copy.deepcopy(account.get("session", {}))
+    # The keys this app has already read survive a restart for the same reason
+    # the password and the session do: they are the only way to answer for a
+    # station that is not signed in.
+    stored["resource_keys"] = copy.deepcopy(account.get("resource_keys", {}))
     # The station's own account id belongs to the session it was captured with,
     # so it is durable session material exactly like the cookie: a Core restart
     # that dropped it would send dashboard reads that no New API fork answers.
@@ -3186,7 +3207,7 @@ class RelayAccountsDomain:
             else:
                 path = f"/api/v1/keys/{quote(remote_id, safe='')}"
             self._api_key_request(account, method="delete", path=path)
-            self._resource_secret_cache.pop(self._resource_cache_key(account["id"], resource_id), None)
+            self._forget_resource_key(account["id"], resource_id)
         else:
             raise RelayAccountsError("The requested relay operation is unavailable")
         self._update_pending_operation(operation, state="remote_applied")
@@ -4311,6 +4332,64 @@ class RelayAccountsDomain:
             preserve_resources=True,
         )
 
+    def login_prefill(self, account_id: str) -> dict[str, Any]:
+        """What a station's sign-in form may be filled with, and whether it may
+        be posted.
+
+        Both native hosts fill the station's own form from this app's copy of
+        the account, and the page host's browser login does the same: the
+        username always, the remembered password when the account chose to keep
+        one.  The secret never crosses to the page — Core types it into the
+        browser it opened, through the same DevTools channel it reads the
+        session with.
+
+        Posting that form is a different question, and gets a different answer.
+        A sign-in is one more session against the account's cap, so the form is
+        submitted only for an account the station *answered* about inside the
+        re-check window and left without a usable session: ``signed_out`` (which
+        this domain records only while nothing usable is held) or ``expired``
+        (the station rejecting its own session).  Everything else answers False
+        and leaves the button to the person: a station that was never reached, a
+        row no check has covered, and an account the station is holding at its
+        concurrent-session cap (the one wait that is about sessions rather than
+        about the password, so a form post would ask the same refused question).
+
+        A refused password is deliberately *not* a reason to withhold the post.
+        That refusal is this app's own HTTP form; the station's page may need a
+        captcha, a challenge, or a field Core's client does not send, and the
+        person opening the window is asking for that one attempt.  It is one
+        attempt per window, not per check -- the loop in
+        :func:`relay_browser.start_prefill` posts at most once.
+        """
+
+        index = self._index(account_id)
+        account = self._accounts[index]
+        username = account.get("username", "")
+        password = account.get("password", "")
+        if not isinstance(username, str):
+            username = ""
+        if account.get("remember_password") is not True or not isinstance(password, str):
+            password = ""
+        return {
+            "username": username,
+            "password": password,
+            "submit": bool(password) and self._saved_password_may_be_replayed(account_id, account),
+        }
+
+    def _saved_password_may_be_replayed(self, account_id: str, account: Mapping[str, Any]) -> bool:
+        """Whether the station's own last answer authorizes a sign-in now."""
+
+        # A cap is the station saying it will not mint *any* session for this
+        # account right now.  The password was never the question; a form post
+        # would ask the same refused question once more.
+        if self._capped_refusals.get(str(account_id)):
+            return False
+        if account.get("login_status") not in {"signed_out", "expired"}:
+            return False
+        window = self._session_recheck_seconds()
+        observed = _observed_seconds_ago(account.get("login_observed_at"))
+        return observed is not None and window > 0 and observed < window
+
     def sign_in_with_password(
         self,
         account_id: str,
@@ -4877,9 +4956,7 @@ class RelayAccountsDomain:
                 # or Apply resolves it from here instead of paying for the read
                 # again.
                 for token_id, value in values.items():
-                    self._resource_secret_cache[
-                        self._resource_cache_key(account["id"], f"newapi-{token_id}")
-                    ] = value
+                    self._remember_resource_key(account, f"newapi-{token_id}", value)
         # What each key reported last time, so a group read that learned nothing
         # keeps that key's own catalog instead of widening it to the union.
         previous_models: dict[str, list[str]] = {}
@@ -5013,8 +5090,7 @@ class RelayAccountsDomain:
             group_id = _group_id(item.get("group_id"))
             group = item.get("group")
             group_name = _resource_name(group.get("name"), group_id) if isinstance(group, Mapping) and group_id else group_id
-            normalized_key = key.strip()
-            self._resource_secret_cache[self._resource_cache_key(account["id"], resource_id)] = normalized_key
+            normalized_key = self._remember_resource_key(account, resource_id, key)
             key_items.append((index, normalized_key, enabled, resource_id, name, group_id, group_name))
 
         gateway_models: dict[int, list[str]] = {}
@@ -6551,13 +6627,104 @@ class RelayAccountsDomain:
         (sub2api) or of the token itself (New API) is that fact, and it is the
         only one this caller needs — never the account-wide refresh that also
         lists every other key's catalog.
+
+        A station that cannot be asked — a session that lapsed and a password
+        the station has stopped accepting, a timeout, a connection this host
+        cannot make — is not an answer about the key.  The value this app read
+        the last time is then the credential the account has, and it is
+        returned instead of refusing: the alternative is every route that was
+        working turning into an upstream rejection because a cookie aged out.
+        The one exception is the station *answering* that the key is gone
+        (``RelayResourceRemoved``), which is a statement about the key and must
+        never be papered over with the value it used to have.
         """
 
         account_id = str(account.get("id", ""))
-        return self._with_renewed_session(
-            account_id,
-            lambda: self._read_key_once(account, resource, fresh=fresh),
-        )
+        try:
+            return self._with_renewed_session(
+                account_id,
+                lambda: self._read_key_once(account, resource, fresh=fresh),
+            )
+        except RelayResourceRemoved:
+            # The station answered about the key itself, so the value this app
+            # still holds is the residue of a credential nobody can revoke.
+            # Forget it: no later read may answer with it.
+            self._forget_resource_key(account_id, resource.get("id"))
+            raise
+        except Exception:
+            stored = self._stored_resource_key(account, resource)
+            if stored:
+                return stored
+            raise
+
+    @staticmethod
+    def _stored_resource_key(account: Mapping[str, Any], resource: Mapping[str, Any]) -> str:
+        """The value this app last read for one key, or ""."""
+
+        stored = account.get("resource_keys")
+        if isinstance(stored, Mapping):
+            value = stored.get(_resource_id(resource.get("id")))
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _forget_resource_key(self, account_id: object, resource_id: object) -> None:
+        """Drop one key this app held, from memory and from the document."""
+
+        resolved = str(account_id)
+        self._resource_secret_cache.pop(self._resource_cache_key(resolved, resource_id), None)
+        try:
+            index = self._index(resolved)
+        except Exception:
+            return
+        current = copy.deepcopy(self._accounts[index])
+        stored = dict(current.get("resource_keys") or {})
+        if stored.pop(_resource_id(resource_id), None) is None:
+            return
+        current["resource_keys"] = stored
+        self._accounts[index] = _private_account(current)
+        self._persist()
+
+    def _remember_resource_key(self, account: Mapping[str, Any], resource_id: object, value: str) -> str:
+        """Keep one station key in this process and in the durable document.
+
+        The account's key values are the credentials a provider slot and its
+        routes materialize.  Keeping them beside the account is what lets a
+        later read be answered while the station is signed out or unreachable,
+        and what makes that answer survive a Core restart.
+        """
+
+        normalized = value.strip()
+        if not normalized:
+            return ""
+        account_id = str(account.get("id", ""))
+        resolved = _resource_id(resource_id)
+        self._resource_secret_cache[self._resource_cache_key(account_id, resolved)] = normalized
+        stored = account.get("resource_keys")
+        keys = dict(stored) if isinstance(stored, Mapping) else {}
+        if keys.get(resolved) == normalized:
+            return normalized
+        keys[resolved] = normalized
+        # The mapping this read was given is written back by a refresh that is
+        # still building the account, so it has to carry the value too: setting
+        # only `self._accounts[index]` let the refresh's own copy of the
+        # account -- built before this write -- replace it a moment later.
+        if isinstance(account, dict):
+            account["resource_keys"] = keys
+        try:
+            index = self._index(account_id)
+        except RelayAccountsError:
+            # An account this document does not carry yet (a login being built):
+            # the mapping the caller holds is the only place it can live.
+            return normalized
+        if self._accounts[index] is not account:
+            current = copy.deepcopy(self._accounts[index])
+            merged = dict(current.get("resource_keys") or {})
+            merged[resolved] = normalized
+            current["resource_keys"] = merged
+            self._accounts[index] = _private_account(current)
+        self._persist()
+        return normalized
 
     def _read_key_once(
         self,
@@ -6580,7 +6747,7 @@ class RelayAccountsDomain:
             # The list arrives whole, so the whole account is kept: the next
             # key the sheet reveals is a cache hit instead of a second round
             # trip to the station.
-            self._cache_station_keys(account["id"], candidates)
+            self._cache_station_keys(account, candidates)
             # Resource IDs are derived from the upstream key ID. Prefer that
             # stable identifier over a display name: duplicate key names are
             # legal and must not reveal or import the wrong credential.  The
@@ -6618,9 +6785,7 @@ class RelayAccountsDomain:
             key = candidate.get("key") if isinstance(candidate, Mapping) else None
             if not isinstance(key, str) or not key.strip():
                 raise RelayResourceRemoved()
-            value = key.strip()
-            self._resource_secret_cache[cache_key] = value
-            return value
+            return self._remember_resource_key(account, resource["id"], key)
         token_id_text = resource["id"].removeprefix("newapi-")
         try:
             token_id = int(token_id_text)
@@ -6632,10 +6797,9 @@ class RelayAccountsDomain:
             raise RelayAccountsError("Relay API key is unavailable")
         value = key.strip()
         value = value if value.startswith("sk-") else f"sk-{value}"
-        self._resource_secret_cache[cache_key] = value
-        return value
+        return self._remember_resource_key(account, resource["id"], value)
 
-    def _cache_station_keys(self, account_id: object, candidates: Sequence[Mapping[str, Any]]) -> None:
+    def _cache_station_keys(self, account: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]]) -> None:
         """Keep every key one station answer carried, not only the requested one.
 
         A sub2api key list arrives whole while the group manager reveals one
@@ -6649,7 +6813,7 @@ class RelayAccountsDomain:
             if not isinstance(value, str) or not value.strip():
                 continue
             resource_id, _ = self._resource_label(item, index, prefix="sub2api")
-            self._resource_secret_cache[self._resource_cache_key(account_id, resource_id)] = value.strip()
+            self._remember_resource_key(account, resource_id, value)
 
     @staticmethod
     def _resource_multiplier(account: Mapping[str, Any], resource: Mapping[str, Any]) -> float | None:

@@ -1592,6 +1592,75 @@ class BrowserRelaySignInTests(unittest.TestCase):
         page = (self.shared / "ui/code-editor/codeEditorPage.ts").read_text(encoding="utf-8")
         self.assertIn('pasteHint: translate("editor.pasteHint")', page)
 
+    def test_the_window_is_filled_from_the_account_the_app_already_keeps(self) -> None:
+        """The form opens with the account's own sign-in, not empty.
+
+        The two native hosts type the remembered username and password into
+        the station's form.  A page host cannot hand its browser a WebKit
+        credential store, so Core types into the browser it opened instead:
+        the page never receives the secret.  The post is one attempt, made only
+        when the station's own last answer says this account holds no usable
+        session -- the same authorization the native flows apply.
+        """
+
+        status, answer = self._post(self._body())
+        self.assertEqual(200, status, answer)
+        account = self.core.snapshot()["domains"]["relay_accounts"]["accounts"][0]
+        account_id = account["id"]
+        self.assertEqual("person@example.test", account["username"])
+        # The station's own determined 未登录: no session on hand.
+        self.relay.set_login_status(account_id, "signed_out")
+
+        browser = mock.Mock()
+        browser.browser.name = "Chromium"
+        browser.mirror = None
+        browser.expired = False
+        with mock.patch.object(relay_browser, "unavailable_reason", return_value=""), \
+             mock.patch.object(relay_browser, "launch", return_value=browser), \
+             mock.patch.object(relay_browser, "start_prefill") as prefill:
+            answered = self.core.start_relay_browser_login(
+                account_id=account_id,
+                account_type="newapi",
+                label="Page Station",
+                origin="https://relay.example.test",
+                username="",
+                page_is_local=False,
+            )
+
+        self.assertEqual("waiting", answered["status"])
+        prefill.assert_called_once()
+        args, kwargs = prefill.call_args
+        self.assertIs(browser, args[0])
+        # The account's own username wins over the empty one the caller sent.
+        self.assertEqual("person@example.test", kwargs["username"])
+        self.assertEqual("replace-page-password", kwargs["password"])
+        self.assertTrue(kwargs["submit"])
+        self.assertEqual("person@example.test", self.core._browser_logins[answered["login_id"]]["username"])
+
+    def test_a_pending_account_has_nothing_to_fill(self) -> None:
+        """The add flow creates its row only after the station accepts it."""
+
+        browser = mock.Mock()
+        browser.browser.name = "Chromium"
+        browser.mirror = None
+        browser.expired = False
+        with mock.patch.object(relay_browser, "unavailable_reason", return_value=""), \
+             mock.patch.object(relay_browser, "launch", return_value=browser), \
+             mock.patch.object(relay_browser, "start_prefill") as prefill:
+            self.core.start_relay_browser_login(
+                account_id="login-page-0123456789abcdef0123",
+                account_type="newapi",
+                label="Page Station",
+                origin="https://relay.example.test",
+                pending_account=True,
+                page_is_local=True,
+            )
+        _args, kwargs = prefill.call_args
+        self.assertEqual("", kwargs["username"])
+        self.assertEqual("", kwargs["password"])
+        self.assertFalse(kwargs["submit"])
+
+
 
 class MirrorTests(unittest.TestCase):
     """A server's sign-in screen is the browser it already has, streamed.
@@ -1842,9 +1911,84 @@ class MirrorTests(unittest.TestCase):
         self.assertNotIn("--app=", launch)
 
 
+class RelayBrowserPrefillTests(unittest.TestCase):
+    """The station's form, filled by Core instead of by the person.
+
+    The page host's sign-in window is a real browser on a throwaway profile,
+    so it starts with no saved credential in it.  Core holds the account's own
+    copy, and types it into the page over the same DevTools channel it reads
+    the session with — the secret never crosses to the page, and the form is
+    posted once only when RelayAccountsDomain.login_prefill authorized it.
+    """
+
+    def test_the_values_are_json_encoded_into_the_page(self) -> None:
+        seen: list[str] = []
+
+        def evaluate(port: int, origin: str, expression: str, *, timeout: float = 5.0) -> str:
+            seen.append(expression)
+            return "submitted"
+
+        with mock.patch.object(relay_browser, "_evaluate_page", side_effect=evaluate):
+            outcome = relay_browser.prefill_login_form(
+                1,
+                "https://relay.example.test",
+                username='a"b@example.test',
+                password="p\\w'd",
+                submit=True,
+            )
+
+        self.assertEqual("submitted", outcome)
+        expression = seen[0]
+        # A quote or a backslash in the password must not end the literal, so
+        # both are JSON-encoded rather than concatenated.
+        self.assertIn('set(user, "a\\"b@example.test")', expression)
+        self.assertIn('set(password, "p\\\\w\u0027d")', expression)
+        self.assertIn("if (!true)", expression)
+        # A field the person already typed into is never overwritten.
+        self.assertIn("if (!node || !value || node.value) return;", expression)
+
+    def test_nothing_is_posted_without_authorization(self) -> None:
+        seen: list[str] = []
+        with mock.patch.object(relay_browser, "_evaluate_page", side_effect=lambda *args, **kwargs: seen.append(args[2]) or "filled"):
+            self.assertEqual(
+                "filled",
+                relay_browser.prefill_login_form(1, "https://relay.example.test", username="u", password="p", submit=False),
+            )
+        self.assertIn("if (!false)", seen[0])
+
+    def test_a_page_that_cannot_be_asked_answers_nothing(self) -> None:
+        with mock.patch.object(relay_browser, "_evaluate_page", side_effect=RuntimeError("no page")):
+            self.assertEqual(
+                "",
+                relay_browser.prefill_login_form(1, "https://relay.example.test", username="u", password="p", submit=True),
+            )
+
+    def test_the_form_is_posted_once_and_then_left_alone(self) -> None:
+        browser = mock.Mock(closed=False, port=1, origin="https://relay.example.test")
+        outcomes = iter(["none", "partial", "filled", "submitted", "submitted"])
+        with mock.patch.object(relay_browser, "prefill_login_form", side_effect=lambda *a, **k: next(outcomes)) as form, \
+             mock.patch.object(relay_browser.time, "sleep", return_value=None):
+            relay_browser._prefill_loop(browser, "u", "p", True)
+        # The page had no form, then a form nobody had typed into, then it was
+        # posted: one submission, and nothing after it.
+        self.assertEqual(4, form.call_count)
+
+    def test_a_filled_form_is_final_when_this_window_may_not_post_it(self) -> None:
+        browser = mock.Mock(closed=False, port=1, origin="https://relay.example.test")
+        with mock.patch.object(relay_browser, "prefill_login_form", return_value="filled") as form, \
+             mock.patch.object(relay_browser.time, "sleep", return_value=None):
+            relay_browser._prefill_loop(browser, "u", "p", False)
+        self.assertEqual(1, form.call_count)
+
+    def test_nothing_is_typed_when_nothing_is_kept(self) -> None:
+        browser = mock.Mock()
+        with mock.patch.object(relay_browser.threading, "Thread") as thread:
+            relay_browser.start_prefill(browser, username="", password="", submit=False)
+        thread.assert_not_called()
+
+
 class MirrorFrameTests(unittest.TestCase):
     """The stream and the input path, through Core's own listener."""
-
     def _frame_call(self, server: CoreIPCServer, session: str, since: int) -> dict[str, object]:
         """One answer from `/ipc/host/relay/browser/frames`."""
 
@@ -1904,20 +2048,29 @@ class MirrorFrameTests(unittest.TestCase):
         # The poll is long: Core holds it until something changed.
         self.assertIn("data:image/jpeg;base64,", leaf)
 
-    def test_the_stream_never_reads_a_binding_that_is_not_initialized(self) -> None:
-        """`let cancelled` has to exist before the stream asks about it.
+    def test_the_surface_is_drawn_before_anything_is_asked(self) -> None:
+        """The click draws a window first; the sign-in loads behind it.
 
-        Measured on the live page: the dialog rendered black and no frame was
-        ever requested, because the stream's first tick read `cancelled` before
-        its `let` had been initialized -- `Cannot access 's' before
-        initialization` in the bundle.  The pump is deferred too, so a caller
-        cannot be handed a closure over a half-built function.
+        Measured on the live page: 去登录 awaited the silent restore and then a
+        cold browser launch before drawing anything, so the press answered with
+        several seconds of nothing on screen.  The order is now the surface,
+        then the restore, then the browser — and `let cancelled` has to exist
+        before either of them reads it, because the surface's own answer sets
+        it and the stream's first tick asks it.  (Missing that ordering is the
+        `Cannot access 's' before initialization` that once drew the dialog
+        black and never requested a frame.)
         """
 
         leaf = (Path(__file__).resolve().parents[1] / "rn/packages/shared/src/platform/browserLeaf.ts").read_text(encoding="utf-8")
-        body = leaf.split("const browserName = typeof started.browser", 1)[1].split("cancelHostChrome(", 1)[0]
+        body = leaf.split("async function browserWindowLogin(", 1)[1].split("function relaySignInFailure", 1)[0]
+        request = body.index('kind: "relayBrowser"')
+        restore = body.index('await restoreSavedRelayLogin(core, options)')
+        start = body.index('"/ipc/host/relay/browser/start"')
         self.assertIn("let cancelled = false;", body)
-        self.assertLess(body.index("let cancelled = false;"), body.index("startMirrorSurface("))
+        self.assertLess(body.index("let cancelled = false;"), request)
+        self.assertLess(request, restore)
+        self.assertLess(restore, start)
+        self.assertLess(body.index("startMirrorSurface("), body.index("/ipc/host/relay/browser/poll"))
         self.assertIn("void Promise.resolve().then(pump);", leaf)
 
     def test_a_click_is_mapped_onto_the_drawn_picture_not_the_box(self) -> None:
@@ -1951,7 +2104,10 @@ class MirrorFrameTests(unittest.TestCase):
         chrome = Path(__file__).resolve().parents[1] / "rn/packages/shared/src/ui/HostChrome.tsx"
         text = chrome.read_text(encoding="utf-8")
         surface = text.split("function RelayBrowserSurface", 1)[1].split("function MirrorScreen", 1)[0]
-        self.assertIn("{request.mirror ? null : <NativeButton title={request.showLabel}", surface)
+        # The name and the screen arrive after the surface is already drawn, so
+        # they are read from the request's own store instead of its fixed body.
+        self.assertIn("React.useSyncExternalStore(request.live.subscribe, request.live.snapshot, request.live.snapshot)", surface)
+        self.assertIn("{live.mirror || !live.browser ? null : <NativeButton title={request.showLabel}", surface)
         self.assertIn("request.cancelLabel", surface)
 
 

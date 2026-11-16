@@ -931,7 +931,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const probeTitle = degradationIncluded',
             '? translate("providers.deepTest")',
             ': translate("providers.probe");',
-            '<ProbeMenuButton title={probeTitle} busy={probing} tooltip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} activeKind={probePresentation.kind} onProbe={probeKind} translate={translate} />',
+            '<ProbeMenuButton native={native} title={probeTitle} busy={probing} tooltip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} activeKind={probePresentation.kind} onProbe={probeKind} translate={translate} />',
             'function probeDegradationLine(degradation: UnknownRecord, translate: Translate, detailed = false): string {',
             'function probeDegradationDetails(degradation: UnknownRecord, translate: Translate): string {',
             'const degradation = asRecord(result?.degradation ?? probe.degradation);',
@@ -1278,7 +1278,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The probe button is this app's own menu button: the title with the
         # host's trailing chevron, one control, one hit target.
         self.assert_ui_has(
-            '<ProbeMenuButton title={probeTitle} busy={probing} tooltip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} activeKind={probePresentation.kind} onProbe={probeKind} translate={translate} />'
+            '<ProbeMenuButton native={native} title={probeTitle} busy={probing} tooltip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} activeKind={probePresentation.kind} onProbe={probeKind} translate={translate} />'
         )
         # The probe keeps its own name while it runs: the button carries the
         # progress as a leading spinner instead of a swapped title.
@@ -1292,6 +1292,20 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # what makes it the menu button this app draws.
         self.assert_ui_has("symbolWithTitle")
         self.assert_ui_has("onPress={openMenu}")
+        # The menu is asked for through the leaf adapter, which is the one path
+        # every host implements: macOS and Windows open theirs, and the page
+        # draws `platform/browserLeaf`'s (a `HostChrome` layer).  Reading
+        # `NativeModules.LiteLLMNativeLeaf` here instead answered nothing on the
+        # page -- react-native-web publishes `UIManager` and no leaf -- so the
+        # press opened no menu and started no probe: 探测 was a button that
+        # accepted the click and did nothing.
+        self.assertIn(
+            'void native.showActionMenu({ title: translate("providers.probeMenuTitle"), items, anchor })',
+            self.ui,
+        )
+        self.assert_ui_not_has("hostChromeActionMenu")
+        self.assertNotIn("NativeModules", self.ui)
+        self.assertIn("showActionMenu: async (title, items, anchor) => requestHostChrome<number | undefined>({", (ROOT / "rn/packages/shared/src/platform/browserLeaf.ts").read_text(encoding="utf-8"))
         self.assert_ui_not_has('onPress={() => onProbe(\"identity\")}')
         self.assert_ui_has('{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding}')
         self.assert_ui_not_has("probeSummaryTrigger")
@@ -3653,7 +3667,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('setLogTabRequest(tab && LOG_TABS.includes(tab) ? tab : "requests");', bootstrap)
         self.assert_ui_has('useState<typeof LOG_TABS[number]>(() => requestedTab ?? "requests")')
         self.assert_ui_has('return rightTime - leftTime || right.index - left.index;')
-        self.assert_ui_has('compact preserveColumnWidths scrollTrailingColumnOverflow onSelectionChange=')
+        self.assert_ui_has('compact preserveColumnWidths scrollTrailingColumnOverflow onEndReached=')
+        self.assert_ui_has('onSelectionChange={(key) => setSelectedKeys((current) => ({ ...current, [selected]: key }))}')
         self.assertNotIn('compact followBottom onSelectionChange=', self.ui)
         self.assert_ui_has('requestedTabKey={nativeAction?.sequence ?? 0}')
         self.assert_ui_has('const clearTabRef = useRef<typeof LOG_TABS[number] | undefined>(undefined);')
@@ -3673,6 +3688,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('const lineCount = clearing ? 0 : active?.line_count ?? rows.length;')
         self.assert_ui_has('void dispatch("logs.clear_recovery_and_cooldowns", { tab }, "logs").then(async () => {')
         self.assert_ui_has('NativeButton title={translate("logs.clearRecoveryCooldown")}')
+        self.assert_ui_has('NativeButton title={translate("logs.loadOlder")}')
+        self.assert_ui_has('void dispatch("logs.load_older", { tab }, "logs").then(async () => {')
+        self.assert_ui_has('active?.has_older ? loadOlder : undefined')
         self.assert_ui_has('IconButton label="" symbol={paused ? "play" : "pause"}')
         self.assert_ui_has('IconButton label={Platform.OS === "web" ? translate("common.clear") : ""} symbol="trash" title={translate("common.clearView")} disabled={busy} onPress={clearLogs}')
         self.assertNotIn('dispatch("logs.refresh", { tab: selected }, "logs")', self.ui)
@@ -4700,7 +4718,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn(f"\n  {unit}: \"", localized)
         # The Relay and Computer Facade categories disappeared with their only
         # settings; retired dead controls must not stay translated in the pane.
-        for category in ("Timeouts", "Recovery", "Web Search", "Vision Router", "Model Context", "Fallback", "MCP", "Logs", "Network", "Service", "Our Free Model"):
+        for category in ("Timeouts", "Recovery", "Web Search", "Vision Router", "Model Context", "Image Context", "Fallback", "MCP", "Logs", "Network", "Service", "Our Free Model"):
             self.assertIn(f'  "{category}":', localized)
         self.assertNotIn('  "Relay":', localized)
         self.assertNotIn('  "Computer Facade":', localized)

@@ -1131,6 +1131,35 @@ class MessagesWireImageTests(unittest.TestCase):
                 "this replay fits; eliding it takes away what the model just read",
             )
 
+    def test_an_oversized_messages_replay_omits_its_older_figures(self) -> None:
+        """The size repair reaches the Messages wire with the ask placeholder."""
+
+        items = self._thread(3)
+        before = cw._messages_wire_image_tokens(items)
+        request = {
+            "model": "m",
+            "messages": json.loads(json.dumps(items)),
+            "headers": {"user-agent": "claude-cli/2.1.309 (external, cli)"},
+            "call_type": "anthropic_messages",
+        }
+        router = _Router(5_000)
+        with mock.patch.object(cw, "_router", return_value=router):
+            fitted = cw.apply(request)
+
+        assert fitted is not None
+        self.assertLess(cw._messages_wire_image_tokens(fitted["messages"]), before)
+        pictures = [
+            block
+            for message in fitted["messages"]
+            for block in (message.get("content") or [])
+            if isinstance(block, dict) and block.get("type") == "image"
+        ]
+        self.assertEqual(1, len(pictures))
+        self.assertIn(
+            "need IMG-",
+            json.dumps(fitted["messages"], ensure_ascii=False),
+        )
+
     def test_the_step_being_answered_keeps_its_own_tool_result(self) -> None:
         # ``_protected_index`` anchored on the last ``user`` turn, which on this
         # wire is the ``tool_result`` itself -- so the call one item earlier was

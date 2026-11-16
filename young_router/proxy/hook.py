@@ -308,6 +308,7 @@ class YoungRouterHook(CustomLogger):
             _responses_request_module._with_codex_function_call_arguments_repaired,
             _responses_request_module._with_codex_function_call_output_text,
             *(_image_context_module.CODEX_IMAGE_CONTEXT_REQUEST_STEPS),
+            *(_image_context_module.CLAUDE_IMAGE_CONTEXT_REQUEST_STEPS),
             _responses_request_module._with_internal_litellm_metadata,
             _responses_request_module._with_mcp_auto_approval,
             _responses_request_module._with_codex_openrouter_native_web_search_tool,
@@ -324,9 +325,16 @@ class YoungRouterHook(CustomLogger):
         ):
             image_budget_before = None
             image_budget_event = None
-            if update_request is _image_context_module._with_codex_image_context:
+            if update_request in (
+                _image_context_module._with_codex_image_context,
+                _image_context_module._with_claude_image_context,
+            ):
                 image_budget_before = _image_inputs_module._image_input_budget(modified_kwargs)
-                image_budget_event = "codex_image_context"
+                image_budget_event = (
+                    "claude_image_context"
+                    if update_request is _image_context_module._with_claude_image_context
+                    else "codex_image_context"
+                )
             updated_kwargs = update_request(modified_kwargs)
             if image_budget_before is not None:
                 _trace_module._route_trace(
