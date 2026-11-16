@@ -12,6 +12,7 @@ import time
 import unittest
 import urllib.request
 import uuid
+import zlib
 from unittest import mock
 
 from young_router.core import (
@@ -107,6 +108,62 @@ class SnapshotPollCacheTests(unittest.TestCase):
                 )
                 server.handle_request(request, session_token=token)
             self.assertEqual(1, len(calls))
+
+    def test_a_cached_gzip_poll_is_one_member_chrome_can_decode(self) -> None:
+        """The cached answer's compression is one gzip member, not a splice.
+
+        The result bytes are cached, but the request id in front of them is
+        not: two polls of one revision carry different envelopes.  Splicing
+        separately compressed pieces is legal gzip, and ``gzip.decompress``
+        reads them all -- Chrome does not.  It stopped after the first member
+        and handed the page the 58-byte envelope prefix as the whole snapshot,
+        so every post-action refresh failed to parse ("Native IPC response
+        payload is invalid") and the control that started it fell back to its
+        old value.  A single member is the contract the browser implements.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            core = CoreStore(domains=[MemoryDomain("probe", {"blob": "x" * 4096})])
+            server = CoreIPCServer(core)
+            server.start()
+            self.addCleanup(server.stop)
+            token = server._mint_web_session()
+            endpoint = server.endpoint
+
+            def poll(request_id: str) -> dict:
+                payload = encode_message(
+                    {"protocol_version": 1, "request_id": request_id, "method": "snapshot", "params": {}}
+                )
+                connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=10)
+                try:
+                    connection.request(
+                        "POST",
+                        "/ipc",
+                        body=payload,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Accept-Encoding": "gzip",
+                            "Authorization": f"Bearer {token}",
+                        },
+                    )
+                    response = connection.getresponse()
+                    encoded = response.read()
+                    self.assertEqual(200, response.status)
+                    self.assertEqual("gzip", response.getheader("Content-Encoding"))
+                finally:
+                    connection.close()
+                decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                decoded = decoder.decompress(encoded) + decoder.flush()
+                self.assertEqual(b"", decoder.unused_data, "the answer carried a second gzip member")
+                answer = json.loads(decoded)
+                self.assertEqual(request_id, answer["request_id"])
+                return answer
+
+            first = poll("poll-one")
+            # The second poll is the cached path: same revision, new request id.
+            second = poll("poll-two")
+            self.assertEqual(first["result"], second["result"])
+            self.assertGreater(len(json.dumps(second["result"])), 1024)
 
     def test_a_mid_write_snapshot_body_is_not_cached_for_the_catching_up_head(self) -> None:
         """The cached bytes belong to a projection, not just to a head.

@@ -566,10 +566,6 @@ class _PreparedResponse:
 
     status: int
     body: bytes
-    #: The same body already gzip-coded, when the server holds those bytes.
-    #: A cached snapshot carries the compressed result from the revision it
-    #: belongs to; only its small request-id envelope is compressed per poll.
-    gzip_body: bytes | None = None
 
 
 @dataclass
@@ -786,7 +782,6 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         session_token: str | None = None,
         clear_session: bool = False,
         browser_session: bool = False,
-        gzip_body: bytes | None = None,
     ) -> None:
         """Answer with bytes that are already the body this route sends."""
         # A body this handler never read would otherwise become the next
@@ -801,7 +796,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
         encoding = ""
         accept_encoding = self.headers.get("Accept-Encoding", "")
         if len(encoded) >= COMPRESSIBLE_BODY_BYTES and _accepts_encoding(accept_encoding, "gzip"):
-            compressed = gzip_body if gzip_body is not None else gzip.compress(encoded, 6)
+            compressed = gzip.compress(encoded, 6)
             if len(compressed) < len(encoded):
                 encoded, encoding = compressed, "gzip"
         # An error also leaves the peer free to reuse the connection: the
@@ -1273,13 +1268,9 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                 request_id = data["request_id"][:256]
             self._send_error(400, request_id=request_id, code=exc.code, message=exc.message)
             return
-        response = self._owner.handle_request(
-            request,
-            session_token=token,
-            accepts_gzip=_accepts_encoding(self.headers.get("Accept-Encoding", ""), "gzip"),
-        )
+        response = self._owner.handle_request(request, session_token=token)
         if isinstance(response, _PreparedResponse):
-            self._send_encoded(response.status, response.body, gzip_body=response.gzip_body)
+            self._send_encoded(response.status, response.body)
             return
         self._send(200 if response.ok else 400, response.to_mapping())
 
@@ -1345,13 +1336,12 @@ class CoreIPCServer:
         self._bootstrap_consumed = False
         self._sessions: dict[str, _Session] = {}
         self._subscriptions: dict[str, _Subscription] = {}
-        #: ``(revision, projected_revision, result bytes, gzip bytes)`` of the
-        #: last snapshot answered to a poll; the compressed form is filled in
-        #: when a client first accepts gzip.  Both revisions are part of the
-        #: key: a body answered while a write lane was held carries the last
-        #: committed projection under the current head, and serving it after
-        #: the lane freed would hand a window state Core had already left.
-        self._snapshot_body: tuple[int, int, bytes, bytes | None] | None = None
+        #: ``(revision, projected_revision, result bytes)`` of the last
+        #: snapshot answered to a poll.  Both revisions are part of the key: a
+        #: body answered while a write lane was held carries the last committed
+        #: projection under the current head, and serving it after the lane
+        #: freed would hand a window state Core had already left.
+        self._snapshot_body: tuple[int, int, bytes] | None = None
         self._editor_capabilities: dict[str, _EditorCapability] = {}
         self._secret_capabilities: dict[str, _SecretCapability] = {}
         self._secret_read_capabilities: dict[str, _SecretReadCapability] = {}
@@ -2619,7 +2609,7 @@ class CoreIPCServer:
                 session.subscriptions.add(subscription_id)
         return subscription_id
 
-    def _prepared_snapshot(self, request_id: str, *, accepts_gzip: bool = False) -> "_PreparedResponse | None":
+    def _prepared_snapshot(self, request_id: str) -> "_PreparedResponse | None":
         """The cached answer for this state, or ``None`` to build one.
 
         The cache is keyed by the pair the store states about a snapshot: the
@@ -2629,6 +2619,14 @@ class CoreIPCServer:
         outlive the write that held the lane — the head stayed put when the
         projection caught up.  A miss leaves the caller to build and validate
         one, and the next call to ``remember_snapshot_result`` stores it.
+
+        Only the result bytes are cached.  The request id sits before them in
+        the envelope and differs on every poll, so a compressed answer cannot
+        be reused: ``gzip`` permits concatenated members, but a browser
+        decodes the first member and stops, which handed Chrome a 58-byte
+        prefix of every cached snapshot and no parseable answer at all.  The
+        caller compresses the assembled body as one member (``_send_encoded``
+        is the one place that decides whether a body is coded).
         """
 
         cached = self._snapshot_body
@@ -2638,19 +2636,7 @@ class CoreIPCServer:
             or cached[1] != self.core.projected_revision
         ):
             return None
-        compressed = cached[3]
-        if accepts_gzip and compressed is None:
-            compressed = gzip.compress(cached[2], 6)
-            if self._snapshot_body is cached:
-                self._snapshot_body = (cached[0], cached[1], cached[2], compressed)
-        prefix = self._snapshot_prefix(request_id)
-        gzip_body = None
-        if compressed is not None:
-            # ``gzip`` permits concatenated members, so the cached result
-            # keeps its compression while only the small request-id envelope
-            # is compressed for this poll.
-            gzip_body = gzip.compress(prefix, 6) + compressed + gzip.compress(b"}", 6)
-        return _PreparedResponse(200, prefix + cached[2] + b"}", gzip_body)
+        return _PreparedResponse(200, self._snapshot_prefix(request_id) + cached[2] + b"}")
 
     def _snapshot_prefix(self, request_id: str) -> bytes:
         return (
@@ -2670,7 +2656,6 @@ class CoreIPCServer:
             self.core.revision,
             projected_revision if type(projected_revision) is int else self.core.projected_revision,
             _encode_json(result),
-            None,
         )
 
     def next_event(self, subscription_id: str, *, session_token: str, timeout: float) -> dict[str, Any] | None:
@@ -2708,7 +2693,6 @@ class CoreIPCServer:
         request: RequestEnvelope,
         *,
         session_token: str,
-        accepts_gzip: bool = False,
     ) -> "ResponseEnvelope | _PreparedResponse":
         if not self._valid_session(session_token):
             return ResponseEnvelope.failure(request.request_id, "unauthorized", "Core IPC authentication failed")
@@ -2716,7 +2700,7 @@ class CoreIPCServer:
         try:
             params = request.params
             if request.method == "snapshot":
-                prepared = self._prepared_snapshot(request.request_id, accepts_gzip=accepts_gzip)
+                prepared = self._prepared_snapshot(request.request_id)
                 if prepared is not None:
                     return prepared
                 result: Any = {"snapshot": self.core.snapshot()}
