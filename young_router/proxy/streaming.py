@@ -5625,6 +5625,12 @@ async def _yield_native_stream_with_output_limit_continuation(
     # tool calls once the block closes -- see ``anthropic_dsml``.
     dsml_filter = _anthropic_dsml_module.MessageStreamFilter()
     is_anthropic_stream = _request_is_anthropic_messages_stream(request_data)
+    # Which content blocks this answer has open.  The frames a DSML block turns
+    # into are appended at the end of the answer, and a client that receives a
+    # ``content_block_start`` while an earlier block is still open reads the
+    # earlier block as never finished -- so the text block has to be closed
+    # before the call's block opens.
+    dsml_open_blocks: List[int] = []
 
     def dsml_clean(chunk: Any) -> Optional[Any]:
         """The visible half of one frame, or ``None`` when it held only markup."""
@@ -5633,6 +5639,16 @@ async def _yield_native_stream_with_output_limit_continuation(
             return chunk
         dumped = _stream_chunk_dump(chunk)
         if not isinstance(dumped, dict):
+            return chunk
+        if dumped.get("type") == "content_block_start":
+            index = dumped.get("index")
+            if isinstance(index, int) and index not in dsml_open_blocks:
+                dsml_open_blocks.append(index)
+            return chunk
+        if dumped.get("type") == "content_block_stop":
+            index = dumped.get("index")
+            if index in dsml_open_blocks:
+                dsml_open_blocks.remove(index)
             return chunk
         if dumped.get("type") != "content_block_delta":
             return chunk
@@ -5657,8 +5673,22 @@ async def _yield_native_stream_with_output_limit_continuation(
         """The calls the filter collected, as Messages ``tool_use`` frames."""
 
         events: List[Any] = []
-        for call in dsml_filter.take_calls():
-            index = 900 + len(events)
+        calls = dsml_filter.take_calls()
+        if calls:
+            # Close what the answer left open (the text block) before the
+            # synthesized blocks begin; a client that never saw this stop keeps
+            # the text block dangling while the tool call is already running.
+            for open_index in list(dsml_open_blocks):
+                events.append(
+                    _json_stream_event(
+                        {"type": "content_block_stop", "index": open_index}
+                    )
+                )
+            dsml_open_blocks.clear()
+        for call_index, call in enumerate(calls):
+            # Indices the answer never used, so a client cannot confuse a
+            # synthesized block with one the route wrote itself.
+            index = 900 + call_index
             events.append(
                 _json_stream_event(
                     {

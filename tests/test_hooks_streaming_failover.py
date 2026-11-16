@@ -4357,3 +4357,163 @@ class HookNativeFallbackDispatchTests(HookTestCase):
         self.assertNotIn("call_type", calls[0])
         self.assertEqual(calls[0]["_excluded_deployment_ids"], ["msgs-original"])
         self.assertEqual(chunks, recovered)
+
+    def _dsml_messages_request(self) -> dict:
+        return {
+            "model": "default-claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1024,
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/messages"},
+            "model_info": {"id": "msgs-dsml", "order": 1},
+        }
+
+    def _anthropic_messages_frames(self, delivered):
+        """Every Messages frame in a delivered stream, in order."""
+
+        frames = []
+        for chunk in delivered:
+            frames.extend(sys.modules["young_router.proxy.streaming"]._stream_chunk_dumps(chunk))
+        return frames
+
+    async def test_dsml_markup_becomes_a_tool_use_block_on_a_messages_stream(self) -> None:
+        """A Messages client must receive the call as a call, not as XML.
+
+        Measured on the live gateway 2026-11-16: the answer for the PIK3CA
+        thread began ``\\n\\n<｜｜DSML｜｜ calls>\\n<｜｜DSML｜｜ invoke
+        name="Bash">`` and the client rendered it as text it could not
+        execute.  The same markup is a real call here.
+        """
+        _, _proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        markup = (
+            '\n\n<｜｜DSML｜｜ calls>\n'
+            '<｜｜DSML｜｜ invoke name="Bash">\n'
+            '<｜｜DSML｜｜ parameter name="command" string="true">sed -n 1,80p /tmp/x'
+            "</｜｜DSML｜｜ parameter>\n"
+            "</｜｜DSML｜｜ invoke>\n"
+            "</｜｜DSML｜｜ calls>"
+        )
+
+        def text_delta(text):
+            return (
+                'event: content_block_delta\ndata: '
+                + json.dumps(
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": text},
+                    }
+                )
+                + "\n\n"
+            ).encode()
+
+        open_text = (
+            b'event: content_block_start\ndata: {"type":"content_block_start","index":0,'
+            b'"content_block":{"type":"text","text":""}}\n\n'
+        )
+        # Split mid-tag, the way a stream arrives.
+        reads = [open_text]
+        for index in range(0, len(markup), 7):
+            reads.append(text_delta(markup[index : index + 7]))
+        reads.append(b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
+
+        async def upstream():
+            for read in reads:
+                yield read
+
+        delivered = [
+            chunk
+            async for chunk in streaming._yield_native_stream_with_output_limit_continuation(
+                [],
+                upstream(),
+                self._dsml_messages_request(),
+                stream_started_at=0.0,
+            )
+        ]
+        frames = self._anthropic_messages_frames(delivered)
+        types = [frame.get("type") for frame in frames]
+        visible = "".join(
+            frame["delta"]["text"]
+            for frame in frames
+            if frame.get("type") == "content_block_delta"
+            and (frame.get("delta") or {}).get("type") == "text_delta"
+        )
+        calls = [
+            frame
+            for frame in frames
+            if frame.get("type") == "content_block_start"
+            and (frame.get("content_block") or {}).get("type") == "tool_use"
+        ]
+
+        self.assertNotIn("DSML", visible)
+        self.assertEqual(1, len(calls))
+        self.assertEqual("Bash", calls[0]["content_block"]["name"])
+        command = "".join(
+            frame["delta"]["partial_json"]
+            for frame in frames
+            if frame.get("type") == "content_block_delta"
+            and (frame.get("delta") or {}).get("type") == "input_json_delta"
+        )
+        self.assertIn("sed -n 1,80p /tmp/x", command)
+
+        # The text block is closed before the call's block opens: a client that
+        # never sees its stop keeps block 0 dangling while the tool runs.
+        start_positions = [
+            position for position, frame in enumerate(frames)
+            if frame.get("type") == "content_block_start"
+            and (frame.get("content_block") or {}).get("type") == "tool_use"
+        ]
+        stop_positions = [
+            position for position, frame in enumerate(frames)
+            if frame.get("type") == "content_block_stop" and frame.get("index") == 0
+        ]
+        self.assertEqual(1, len(stop_positions))
+        self.assertLess(stop_positions[0], start_positions[0])
+
+    async def test_a_dangling_dsml_closer_never_reaches_the_client(self) -> None:
+        """The shape that leaked on this build: a closer with no block."""
+
+        _, _proxy_server = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        text = "<thinking> </thinking>\n\n</｜｜DSML｜｜ calls>"
+
+        def text_delta(piece):
+            return (
+                'event: content_block_delta\ndata: '
+                + json.dumps(
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": piece},
+                    }
+                )
+                + "\n\n"
+            ).encode()
+
+        reads = [text_delta(text[index : index + 3]) for index in range(0, len(text), 3)]
+        reads.append(b'event: message_stop\ndata: {"type":"message_stop"}\n\n')
+
+        async def upstream():
+            for read in reads:
+                yield read
+
+        delivered = [
+            chunk
+            async for chunk in streaming._yield_native_stream_with_output_limit_continuation(
+                [],
+                upstream(),
+                self._dsml_messages_request(),
+                stream_started_at=0.0,
+            )
+        ]
+        frames = self._anthropic_messages_frames(delivered)
+        visible = "".join(
+            frame["delta"]["text"]
+            for frame in frames
+            if frame.get("type") == "content_block_delta"
+            and (frame.get("delta") or {}).get("type") == "text_delta"
+        )
+
+        self.assertNotIn("DSML", visible)
+        self.assertIn("<thinking> </thinking>", visible)
