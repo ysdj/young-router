@@ -23,6 +23,8 @@ import json
 import re
 from typing import Any, AsyncIterator, Optional
 
+from . import anthropic_dsml as _anthropic_dsml_module
+
 _BRIDGE_ATTR = "_young_router_anthropic_non_stream_bridge"
 _EVENT_BOUNDARY = re.compile(r"\r\n\r\n|\n\n|\r\r")
 _MESSAGE_TAIL_KEYS = ("stop_reason", "stop_sequence", "stop_details")
@@ -174,6 +176,50 @@ def _call_provider(call_kwargs: dict) -> str:
     return model.split("/", 1)[0].strip().lower() if "/" in model else ""
 
 
+def _lift_dsml_calls(content: list[dict], tail: dict) -> list[dict]:
+    """Replace DeepSeek's own call markup with the blocks a client executes.
+
+    A non-streaming Messages turn is assembled from the route's frames, so the
+    markup a route writes instead of ``tool_calls`` lands here as answer text.
+    Measured on this gateway 2026-11-16: ``stop_reason: end_turn`` and one text
+    block reading ``<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name="Bash">``.
+    Stripping it without lifting the call would answer a question the client
+    asked as a request to act.
+    """
+
+    lifted: list[dict] = []
+    calls: list[dict] = []
+    for block in content:
+        if block.get("type") != "text":
+            lifted.append(block)
+            continue
+        text = block.get("text")
+        if not isinstance(text, str) or not _anthropic_dsml_module.has_tool_calls(text):
+            lifted.append(block)
+            continue
+        calls.extend(_anthropic_dsml_module.parse_tool_calls(text))
+        cleaned = _anthropic_dsml_module.strip_tool_calls(text)
+        if not cleaned.strip():
+            # An answer that was nothing but the call has no text to keep; an
+            # empty text block is not something a client renders.
+            continue
+        lifted.append(dict(block, text=cleaned))
+    if not calls:
+        return lifted
+    for call in calls:
+        lifted.append(
+            {
+                "type": "tool_use",
+                "id": call["id"],
+                "name": call["name"],
+                "input": call["input"],
+            }
+        )
+    if tail.get("stop_reason") in (None, "", "end_turn"):
+        tail["stop_reason"] = "tool_use"
+    return lifted
+
+
 async def assemble_anthropic_message(stream: AsyncIterator[Any]) -> dict:
     """Rebuild the whole ``/v1/messages`` answer from its SSE frames.
 
@@ -248,7 +294,7 @@ async def assemble_anthropic_message(stream: AsyncIterator[Any]) -> dict:
         raise _incomplete("no message_start frame")
     if not saw_stop:
         raise _incomplete("the stream ended before message_stop")
-    message["content"] = [blocks[index] for index in order]
+    message["content"] = _lift_dsml_calls([blocks[index] for index in order], tail)
     message.update(tail)
     if usage:
         message["usage"] = usage

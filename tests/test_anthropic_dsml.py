@@ -268,3 +268,62 @@ class OrphanTagTests(unittest.TestCase):
         self.assertEqual(text, dsml.strip_tool_calls(text))
         stream = dsml.MessageStreamFilter()
         self.assertEqual(text, stream.feed(text) + stream.drain())
+
+
+class AssembledMessageTests(unittest.IsolatedAsyncioTestCase):
+    """A non-streaming Messages turn is rebuilt from frames, then lifted."""
+
+    async def test_a_markup_answer_becomes_a_tool_use_block(self) -> None:
+        import json as _json
+
+        from young_router.proxy import anthropic_non_stream as non_stream
+
+        frames = [
+            {"type": "message_start", "message": {"id": "m", "role": "assistant", "content": []}},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": CALL},
+            },
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+            {"type": "message_stop"},
+        ]
+
+        async def stream():
+            for frame in frames:
+                yield frame
+
+        message = await non_stream.assemble_anthropic_message(stream())
+        self.assertEqual(["tool_use"], [block["type"] for block in message["content"]])
+        self.assertEqual("Bash", message["content"][0]["name"])
+        self.assertIn("sed", message["content"][0]["input"]["command"])
+        self.assertEqual("tool_use", message["stop_reason"])
+        self.assertNotIn("DSML", _json.dumps(message))
+
+    async def test_prose_around_the_call_survives(self) -> None:
+        from young_router.proxy import anthropic_non_stream as non_stream
+
+        frames = [
+            {"type": "message_start", "message": {"id": "m", "role": "assistant", "content": []}},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "Checking that." + CALL},
+            },
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+            {"type": "message_stop"},
+        ]
+
+        async def stream():
+            for frame in frames:
+                yield frame
+
+        message = await non_stream.assemble_anthropic_message(stream())
+        types = [block["type"] for block in message["content"]]
+        self.assertEqual(["text", "tool_use"], types)
+        self.assertIn("Checking that.", message["content"][0]["text"])
+        self.assertEqual("tool_use", message["stop_reason"])
