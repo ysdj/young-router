@@ -5645,10 +5645,21 @@ async def _yield_native_stream_with_output_limit_continuation(
     # tool calls once the block closes -- see ``anthropic_dsml``.
     dsml_filter = _anthropic_dsml_module.MessageStreamFilter()
     is_anthropic_stream = _request_is_anthropic_messages_stream(request_data)
+    if not _request_is_responses_stream(request_data):
+        _dsml_trace(
+            request_data,
+            stage="open",
+            anthropic=is_anthropic_stream,
+            surface=_routing_module._request_client_surface(request_data),
+            stream=_stream_chunk_type(buffer[0]) if buffer else None,
+            choices=bool(isinstance(_stream_chunk_dump(buffer[0]), dict)
+                        and (_stream_chunk_dump(buffer[0]) or {}).get("choices")) if buffer else None,
+        )
     # Whether the filter is looking at this answer at all is the difference
     # between "the route wrote no markup" and "nothing rewrote it", and the two
     # are indistinguishable from the client's side.  One trace per answer.
     dsml_text_frames = [0]
+    dsml_yielded: dict = {}
     # Which content blocks this answer has open.  The frames a DSML block turns
     # into are appended at the end of the answer, and a client that receives a
     # ``content_block_start`` while an earlier block is still open reads the
@@ -5753,7 +5764,10 @@ async def _yield_native_stream_with_output_limit_continuation(
                 return
             cleaned = dsml_clean(chunk)
             if cleaned is not None:
-                yield remember_delivered_text(cleaned)
+                yielded = remember_delivered_text(cleaned)
+                kind = str(_stream_chunk_type(yielded))
+                dsml_yielded[kind] = dsml_yielded.get(kind, 0) + 1
+                yield yielded
         # Whether the ceiling frame has been withheld.  Once it has, the
         # frames that close the same answer belong to it: ``message_stop``
         # and the ``finish_reason`` terminal state the same completion the
@@ -5799,7 +5813,10 @@ async def _yield_native_stream_with_output_limit_continuation(
                 return
             cleaned = dsml_clean(chunk)
             if cleaned is not None:
-                yield remember_delivered_text(cleaned)
+                yielded = remember_delivered_text(cleaned)
+                kind = str(_stream_chunk_type(yielded))
+                dsml_yielded[kind] = dsml_yielded.get(kind, 0) + 1
+                yield yielded
         # The answer is over: whatever markup is still held is all there will
         # be.  Its visible tail is delivered first (an unterminated block still
         # ends the answer the route wrote), then the calls it parsed to.  They
@@ -5822,6 +5839,7 @@ async def _yield_native_stream_with_output_limit_continuation(
                 calls=len(dsml_filter.calls_parsed()),
                 marker=dsml_filter.saw_marker,
                 tail=len(tail),
+                yielded=dsml_yielded,
             )
 
     try:

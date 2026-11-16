@@ -793,6 +793,16 @@ async def _yield_native_stream_after_terminal(
                 selected_box=selected_deployment_box,
             )
             _routing_module._record_deployment_success_for_cooldown(success_request)
+            _trace_module._request_route_trace(
+                "native_stream_replayed_after_terminal",
+                request_data,
+                chunks=len(buffered_chunks),
+                surface=_routing_module._request_client_surface(request_data),
+                first=[
+                    _streaming_module._stream_chunk_type(chunk)
+                    for chunk in buffered_chunks[:4]
+                ],
+            )
             for buffered_chunk in buffered_chunks:
                 yield buffered_chunk
             return

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .. import api_base as _api_base_module
 from . import anthropic_non_stream as _anthropic_non_stream_module
+from . import anthropic_sse as _anthropic_sse_module
 from . import codex_fast_tier as _codex_fast_tier_module
 from . import context_window as _context_window_module
 from . import responses_request as _responses_request_module
@@ -335,6 +336,7 @@ def _install_latin1_response_headers_patch() -> None:
     )
 
 
+_MESSAGES_SSE_PATCH_ATTR = "_young_router_messages_sse_markup_patch"
 _NON_STREAM_DISCONNECT_PATCH_ATTR = "_young_router_non_stream_disconnect_patch"
 
 
@@ -436,6 +438,71 @@ def _install_non_stream_client_disconnect_patch() -> None:
     setattr(
         patched_base_process_llm_request,
         "_original_base_process_llm_request",
+        original,
+    )
+    ProxyBaseLLMRequestProcessing.base_process_llm_request = (
+        patched_base_process_llm_request
+    )
+
+
+def _install_messages_sse_markup_patch() -> None:
+    """Rewrite a Messages body where it is actually sent.
+
+    The post-call streaming hook is not the Messages wire: measured on the
+    gateway 2026-11-16, one probe's hook yielded 45 frames while the client
+    received 208, so a filter there hides markup only from itself.  The body
+    the endpoint returns is the last place the bytes can be changed, and
+    ``streaming._yield_native_stream_with_output_limit_continuation`` keeps its
+    own filter for the surfaces where the hook *is* the wire.
+
+    Only ``/v1/messages`` bodies with ``stream`` set are wrapped, and only when
+    the answer is streamed: a whole-body answer is assembled by
+    ``anthropic_non_stream``, which lifts the same markup itself.
+    """
+
+    try:
+        from litellm.proxy.common_request_processing import (
+            ProxyBaseLLMRequestProcessing,
+        )
+    except Exception:
+        return
+    original = getattr(
+        ProxyBaseLLMRequestProcessing,
+        "base_process_llm_request",
+        None,
+    )
+    if not callable(original) or getattr(original, _MESSAGES_SSE_PATCH_ATTR, False):
+        return
+
+    def wrap_streaming_response(result: Any) -> Any:
+        body = getattr(result, "body_iterator", None)
+        if body is None or not hasattr(body, "__aiter__"):
+            return result
+        try:
+            result.body_iterator = _anthropic_sse_module.rewrite_messages_sse(body)
+        except Exception:
+            return result
+        return result
+
+    async def patched_base_process_llm_request(
+        self: Any,
+        request: Any,
+        fastapi_response: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        result = await original(self, request, fastapi_response, *args, **kwargs)
+        if kwargs.get("route_type") != "anthropic_messages":
+            return result
+        data = getattr(self, "data", None)
+        if not isinstance(data, dict) or data.get("stream") is not True:
+            return result
+        return wrap_streaming_response(result)
+
+    setattr(patched_base_process_llm_request, _MESSAGES_SSE_PATCH_ATTR, True)
+    setattr(
+        patched_base_process_llm_request,
+        "_young_router_original_base_process_llm_request",
         original,
     )
     ProxyBaseLLMRequestProcessing.base_process_llm_request = (
@@ -3785,6 +3852,10 @@ def install_all() -> None:
     _install_latin1_response_headers_patch()
     _install_anthropic_unversioned_endpoint_patch()
     _install_non_stream_client_disconnect_patch()
+    # DeepSeek answers a tool request with its own markup; on ``/v1/messages``
+    # the client's bytes are written after the post-call hook has had its say,
+    # so the rewrite has to sit on the body the endpoint returns.
+    _install_messages_sse_markup_patch()
     # Anthropic caches only what the request marks, and a Responses turn has no
     # place to mark it: without this every Codex thread pays full input price.
     _enable_anthropic_prompt_caching()

@@ -15835,57 +15835,68 @@ function EmptyState({ message }: { message: string }): React.JSX.Element { retur
 
 /** The probe button, and the menu that says which question it asks.
  *
- * The button itself keeps its one-press meaning, and the chevron beside it
- * opens the menu of the other questions.  A press on the chevron never runs a
- * probe on its own: choosing a menu row is what starts one, so opening the menu
- * to look costs nothing.
+ * Drawn as this app's own menu button - the title with the host's trailing
+ * chevron - rather than as a button with a hand-drawn triangle beside it.  The
+ * two hosts already draw a menu button that way (`symbolTrailing`), and a bare
+ * Pressable next to a native button is two hit targets, a second visual
+ * language, and a control whose affordance depends on a font glyph.
+ *
+ * The menu is the host's own action menu, anchored to the button, and its rows
+ * are ordered cheapest first so the two that cost a single request sit at the
+ * top.  A press never runs a probe on its own: choosing a row is what starts
+ * one, so opening the menu to look costs nothing.
  */
-function ProbeMenuButton({ title, tooltip, busy, disabled, onProbe, translate }: {
+function ProbeMenuButton({ title, tooltip, busy, disabled, activeKind, onProbe, translate }: {
   title: string;
   tooltip?: string;
   busy: boolean;
   disabled: boolean;
+  /** The kind whose finding the pane is currently showing, if any. */
+  activeKind?: ProbeKind;
   onProbe: (kind: ProbeKind) => void;
   translate: Translate;
 }): React.JSX.Element {
-  const chevronRef = React.useRef<View>(null);
+  const buttonRef = React.useRef<View>(null);
   const openMenu = (): void => {
     if (disabled) return;
-    const items = PROBE_KIND_ORDER.map((kind) => translate(`providers.probeKind.${kind}` as TranslationKey));
+    // A check mark names the check that produced what the pane is showing now,
+    // so a press that already ran is not offered as if it had not.
+    const items = PROBE_KIND_ORDER.map((kind) => {
+      const label = translate(`providers.probeKind.${kind}` as TranslationKey);
+      return kind === activeKind ? `\u2713 ${label}` : label;
+    });
     const chosen = (index: number | undefined): void => {
       const kind = index === undefined ? undefined : PROBE_KIND_ORDER[index];
       if (kind) onProbe(kind);
     };
-    const node = chevronRef.current;
+    const open = (anchor: { x: number; y: number; width: number; height: number }): void => {
+      void hostChromeActionMenu(translate("providers.probeMenuTitle"), items, anchor)
+        .then(chosen)
+        .catch(() => undefined);
+    };
+    const node = buttonRef.current;
     if (node && typeof node.measureInWindow === "function") {
-      node.measureInWindow((x, y, width, height) => {
-        void hostChromeActionMenu(translate("providers.probeMenuTitle"), items, { x, y, width, height })
-          .then(chosen)
-          .catch(() => undefined);
-      });
+      node.measureInWindow(open);
       return;
     }
-    // A host that cannot measure the chevron still offers the menu, anchored at
-    // the corner: an unanchorable menu is better than a dead control.
-    void hostChromeActionMenu(translate("providers.probeMenuTitle"), items, { x: 0, y: 0, width: 0, height: 0 })
-      .then(chosen)
-      .catch(() => undefined);
+    // A host that cannot measure the button still offers the menu.  The anchor
+    // must have a real size - both hosts reject a zero-width rectangle - so it
+    // is one point at the corner rather than the empty rectangle that silently
+    // returned nothing.
+    open({ x: 0, y: 0, width: 1, height: 1 });
   };
-  return <View style={styles.probeMenuGroup}>
-    <ActionButton title={title} titleWidth="tight" busy={busy} toolTip={tooltip} disabled={disabled && !busy} onPress={() => onProbe("identity")} />
-    <Pressable
-      ref={chevronRef}
-      disabled={disabled}
-      onPress={openMenu}
-      onAccessibilityTap={openMenu}
-      accessibilityRole="button"
-      accessibilityLabel={translate("providers.probeMenuTitle")}
-      accessibilityState={{ disabled, expanded: false }}
-      style={[styles.probeMenuChevron, disabled && styles.probeMenuChevronDisabled]}
-    >
-      <Text style={styles.probeMenuChevronText}>{"\u25BE"}</Text>
-    </Pressable>
-  </View>;
+  return <ActionButton
+    ref={buttonRef}
+    title={title}
+    titleWidth="tight"
+    busy={busy}
+    toolTip={tooltip}
+    symbol="chevron-up-down"
+    symbolTrailing
+    accessibilityLabel={translate("providers.probeMenuTitle")}
+    disabled={disabled && !busy}
+    onPress={openMenu}
+  />;
 }
 
 /** The host's own action menu, when this build has one. */
@@ -15899,8 +15910,8 @@ async function hostChromeActionMenu(
   return bridge.showActionMenu(title, items, anchor);
 }
 
-const ActionButton = React.forwardRef<HostInstance, { title: string; onPress: () => void; disabled?: boolean; busy?: boolean; primary?: boolean; danger?: boolean; titleWidth?: "auto" | "tight"; toolTip?: string; style?: StyleProp<ViewStyle> }>(function ActionButton({ title, onPress, disabled, busy, primary, danger, titleWidth, toolTip, style }, ref): React.JSX.Element {
-  return <NativeButton ref={ref} title={title} disabled={disabled} busy={busy} primary={primary} destructive={danger} titleWidth={titleWidth} toolTip={toolTip} onPress={onPress} style={style} />;
+const ActionButton = React.forwardRef<HostInstance, { title: string; onPress: () => void; disabled?: boolean; busy?: boolean; primary?: boolean; danger?: boolean; titleWidth?: "auto" | "tight"; toolTip?: string; /** The host's own glyph, drawn where that host draws a menu chevron. */ symbol?: "chevron-up-down"; symbolTrailing?: boolean; accessibilityLabel?: string; style?: StyleProp<ViewStyle> }>(function ActionButton({ title, onPress, disabled, busy, primary, danger, titleWidth, toolTip, symbol, symbolTrailing, accessibilityLabel, style }, ref): React.JSX.Element {
+  return <NativeButton ref={ref} title={title} disabled={disabled} busy={busy} primary={primary} destructive={danger} titleWidth={titleWidth} toolTip={toolTip} symbol={symbol} symbolTrailing={symbolTrailing} accessibilityLabel={accessibilityLabel} onPress={onPress} style={style} />;
 });
 
 function TextField({ label, value, onCommit, onDraftChange, hint, hintStyle, placeholder, secret, multiline, compactMultiline, keyboardType, stacked, labelWidth, labelAlign, controlWidth, labelVisible = true, suffix, disabled, validate, accessory, style }: { label: string; value: string; onCommit: (value: string) => void | Promise<void>; onDraftChange?: (value: string) => void; hint?: string; hintStyle?: StyleProp<TextStyle>; placeholder?: string; secret?: boolean; multiline?: boolean; compactMultiline?: boolean; keyboardType?: "default" | "numeric"; stacked?: boolean; labelWidth?: number; labelAlign?: "left" | "right"; controlWidth?: number; /** The caller renders the label itself (a stacked keys-editor row). */ labelVisible?: boolean; suffix?: string; disabled?: boolean; /** Commit-time validation: an invalid draft stays in the field with its message instead of reaching Core. */ validate?: (next: string) => string | undefined; /** A control that belongs to this row beside the field, such as its help mark. It rides the same grid level as PickerField's, so a field with an accessory and a picker with one draw the same column. */ accessory?: React.ReactNode; style?: StyleProp<ViewStyle> }): React.JSX.Element {
