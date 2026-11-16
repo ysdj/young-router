@@ -58,14 +58,12 @@ struct DispatcherQueueAwaiter {
   void await_resume() const noexcept {}
 };
 
-// The window's own chrome is what this removes: scrollbars (the panel is
-// frameless and a bar would carve pixels out of the station's layout),
-// entrance animation, smooth scrolling, view transitions.  What the station
-// painted is left alone: a primary button in these forks is a gradient with
-// white text and no background-color, so flattening gradients deleted the
-// sign-in button and left a form that answered only to a keyboard Enter.
-constexpr wchar_t kImmediateWebPresentationScript[] = LR"JS((() => {
-  const styleID = '__young_router_immediate_presentation';
+// The window keeps the station's scrollbar out of the layout: the panel is
+// frameless and a bar would carve pixels out of the station's own page.
+// Everything else the station paints — colours, motion, transitions — is the
+// station's.
+constexpr wchar_t kRelayPageScrollbarScript[] = LR"JS((() => {
+  const styleID = '__young_router_relay_no_scrollbars';
   const install = () => {
     if (document.getElementById(styleID)) return;
     // A document-start script can run before there is an element to append to;
@@ -75,15 +73,8 @@ constexpr wchar_t kImmediateWebPresentationScript[] = LR"JS((() => {
     const style = document.createElement('style');
     style.id = styleID;
     style.textContent = `
-      html { scroll-behavior: auto !important; }
       html, body, * { scrollbar-width: none !important; }
       *::-webkit-scrollbar { width: 0 !important; height: 0 !important; display: none !important; }
-      *, *::before, *::after {
-        animation: none !important;
-        transition: none !important;
-        scroll-behavior: auto !important;
-        view-transition-name: none !important;
-      }
     `;
     target.appendChild(style);
   };
@@ -1426,7 +1417,7 @@ winrt::fire_and_forget InitializeBrowser(std::shared_ptr<LoginState> state) {
     core.Settings().IsPasswordAutosaveEnabled(false);
     core.Settings().UserAgent(kRelayBrowserUserAgent);
     core.NewWindowRequested([](auto const&, web::CoreWebView2NewWindowRequestedEventArgs const& args) { args.Handled(true); });
-    co_await core.AddScriptToExecuteOnDocumentCreatedAsync(kImmediateWebPresentationScript);
+    co_await core.AddScriptToExecuteOnDocumentCreatedAsync(kRelayPageScrollbarScript);
     co_await core.AddScriptToExecuteOnDocumentCreatedAsync(kRelayLoginBlockingOverlayScript);
     // The capture always runs so the post-login prompt can offer to keep the
     // typed password; whether it is persisted is decided after sign-in.

@@ -6117,20 +6117,13 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     })();
     """
 
-    /// The window's own chrome is what this removes: scrollbars (the panel is
-    /// frameless and a bar would carve pixels out of the station's layout),
-    /// entrance animation, smooth scrolling, view transitions.  What the
-    /// station *painted* is left alone.
-    ///
-    /// Flattening gradients used to live here, as "present the page before it
-    /// finishes painting".  It read as a faster first paint and it deleted the
-    /// sign-in button: these forks draw a primary button as a gradient with
-    /// white text and no `background-color` at all, so dropping the gradient
-    /// left white text on a white card — a form whose only visible action was
-    /// a keyboard Enter, on the one page the person is there to answer.
-    private static let immediateWebPresentationScript = """
+    /// The window keeps the station's scrollbar out of the layout: the panel is
+    /// frameless and a bar would carve pixels out of the station's own page.
+    /// Everything else the station paints — colours, motion, transitions — is
+    /// the station's.
+    private static let relayPageScrollbarScript = """
     (() => {
-      const styleID = '__young_router_immediate_presentation';
+      const styleID = '__young_router_relay_no_scrollbars';
       const install = () => {
         if (document.getElementById(styleID)) return;
         // A document-start script can run before there is an element to append
@@ -6140,15 +6133,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         const style = document.createElement('style');
         style.id = styleID;
         style.textContent = `
-          html { scroll-behavior: auto !important; }
           html, body, * { scrollbar-width: none !important; }
           *::-webkit-scrollbar { width: 0 !important; height: 0 !important; display: none !important; }
-          *, *::before, *::after {
-            animation: none !important;
-            transition: none !important;
-            scroll-behavior: auto !important;
-            view-transition-name: none !important;
-          }
         `;
         target.appendChild(style);
       };
@@ -6334,7 +6320,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         if handoff == nil {
             configuration.userContentController.addUserScript(
                 WKUserScript(
-                    source: Self.immediateWebPresentationScript,
+                    source: Self.relayPageScrollbarScript,
                     injectionTime: .atDocumentStart,
                     forMainFrameOnly: false
                 )
@@ -6547,6 +6533,30 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         text("Waiting for sign-in...", "等待完成登录...")
     }
 
+    /// What the status line says while the page is on its way.  The page area
+    /// is never covered: a web view paints progressively, and the opaque cover
+    /// this window used to raise made a slow station look like a dead window.
+    private var loadingStatusText: String {
+        mode == .handoff
+            ? text("Loading the provider's sign-in page...", "正在加载官方登录页面...")
+            : mode == .dashboard
+                ? text("Loading the dashboard...", "正在加载仪表盘...")
+                : mode == .logs
+                    ? text("Loading usage logs...", "正在加载用量日志...")
+                    : text("Loading sign-in page...", "正在加载登录页面...")
+    }
+
+    /// What the status line says when the page is neither loading nor failed.
+    private var idleStatusText: String {
+        if isEmbeddedPresentation { return waitingForSignInStatus }
+        if let handoff { return handoff.instruction }
+        return mode == .dashboard
+            ? text("Showing the relay site's dashboard.", "正在显示中转站仪表盘。")
+            : mode == .logs
+                ? text("Showing the relay site's usage logs.", "正在显示中转站用量日志。")
+                : text("Complete sign-in in the page; success is detected automatically.", "请在页面中完成登录，成功后将自动检测。")
+    }
+
     private func setStatus(_ value: String) {
         guard statusLabel.stringValue != value else { return }
         statusLabel.stringValue = value
@@ -6646,14 +6656,7 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             : (handoff.map { $0.url.host ?? $0.url.absoluteString } ?? originURL.host ?? originURL.absoluteString)
         accountLabel.isHidden = !showsHostSubtitle || mode == .handoff
         accountLabel.textColor = .secondaryLabelColor
-        statusLabel.stringValue = isEmbeddedPresentation
-            ? waitingForSignInStatus
-            : handoff.map { $0.instruction }
-                ?? (mode == .dashboard
-                    ? text("Showing the relay site's dashboard.", "正在显示中转站仪表盘。")
-                    : mode == .logs
-                        ? text("Showing the relay site's usage logs.", "正在显示中转站用量日志。")
-                        : text("Complete sign-in in the page; success is detected automatically.", "请在页面中完成登录，成功后将自动检测。"))
+        statusLabel.stringValue = idleStatusText
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
         signInButton.isHidden = !showsReloadAction
@@ -6741,13 +6744,10 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         loadingOverlay.blendingMode = .withinWindow
         loadingOverlay.state = .active
         loadingOverlay.translatesAutoresizingMaskIntoConstraints = false
-        loadingLabel.stringValue = mode == .handoff
-            ? text("Loading the provider's sign-in page...", "正在加载官方登录页面...")
-            : mode == .dashboard
-                ? text("Loading the dashboard...", "正在加载仪表盘...")
-                : mode == .logs
-                    ? text("Loading usage logs...", "正在加载用量日志...")
-                    : text("Loading sign-in page...", "正在加载登录页面...")
+        // The cover is the failure surface, not the loading surface: the
+        // station's own page is what the pane shows while it loads.
+        loadingOverlay.isHidden = true
+        loadingLabel.stringValue = loadingStatusText
         loadingLabel.textColor = .secondaryLabelColor
         loadingLabel.alignment = .center
         loadingLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -8125,10 +8125,10 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard isBrowserFlowLive else { return }
+        setStatus(idleStatusText)
         if mode == .handoff {
             // The provider's page is the whole flow: nothing to restore, no
             // session to capture, no form to fill. Core follows the device code.
-            revealBrowserPage()
             return
         }
         scheduleEmbeddedBrowserResize()
@@ -8156,6 +8156,10 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         guard isBrowserFlowLive else { return }
+        // The document has committed: its own first paint is what the pane
+        // shows from here, so the status line can go back to the instruction
+        // even while the page keeps loading subresources.
+        setStatus(idleStatusText)
         scheduleEmbeddedBrowserResize()
         schedulePageReadinessProbe()
     }
@@ -8172,18 +8176,15 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         showBrowserFailure()
     }
 
-    /// Reveal the page as soon as it has painted something, and let it fill in.
+    /// Start the per-step work as soon as the page has painted something.
     ///
-    /// The overlay used to wait for `document.body.innerText` to be non-empty,
-    /// which is not "the page arrived" but "the page finished its own data
-    /// fetch".  A station whose shell renders immediately and then streams, or
-    /// polls, or waits on an API leaves that text empty while the page is
-    /// perfectly usable — so the probe re-armed itself and the user stared at
-    /// 正在加载登录页面 while the sign-in form was already in the view behind it.
-    /// A web view paints progressively, so the overlay only needs to cover the
-    /// blank first frame: it lifts on committed content and every later step
-    /// (form reveal, agreement dismissal, resize, session restore) keeps running
-    /// against the live page exactly as before.
+    /// The page is already on screen while it loads — the window no longer
+    /// covers it — so this probe is what decides when the form reveal,
+    /// agreement dismissal, resize, and session work begin against a document
+    /// that exists.  A station whose shell renders immediately and then streams,
+    /// polls, or waits on an API is usable long before its data fetch finishes,
+    /// and the bounded wait is only the fallback for a document that never
+    /// paints at all.
     private func schedulePageReadinessProbe() {
         pageReadinessProbe?.cancel()
         let work = DispatchWorkItem { [weak self] in
@@ -8192,10 +8193,10 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
             self.webView.evaluateJavaScript(Self.pagePaintedScript) { [weak self] value, _ in
                 guard let self, self.isBrowserFlowLive else { return }
                 // A document that painted, or one that has had long enough to
-                // paint and did not: either way the page belongs on screen, and
-                // the form/session work below runs against it as usual.
+                // paint and did not: either way the page belongs on screen and
+                // its form/session work runs against it as usual.
                 if value as? Bool == true || self.pageReadinessAttempts >= Self.pageReadinessMaxAttempts {
-                    self.revealBrowserPage()
+                    self.startBrowserPageWork()
                 } else {
                     self.schedulePageReadinessProbe()
                 }
@@ -8209,9 +8210,9 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     ///
     /// Any committed element or any laid-out text counts: a station's shell, a
     /// spinner it draws itself, or the finished form are all "something is on
-    /// screen", and the app must never keep its own cover over a page that is
-    /// already drawing.  An empty document (no elements at all) is the blank
-    /// first frame the overlay actually exists for.
+    /// screen", and the follow-up work starts against it.  An empty document
+    /// (no elements at all) is the blank first frame the probe waits out before
+    /// running that work anyway.
     private static let pagePaintedScript = """
     (() => {
       const body = document.body;
@@ -8221,9 +8222,8 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
     })();
     """
 
-    /// Lift the overlay and start the per-step work on the live page.
-    private func revealBrowserPage() {
-        withoutAnimations { loadingOverlay.isHidden = true }
+    /// Start the per-step work on the live page.
+    private func startBrowserPageWork() {
         guard mode != .handoff else { return }
         scheduleEmbeddedBrowserResize()
         scheduleAgreementReveal()
@@ -8362,14 +8362,9 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         agreementRevealAttempts = 0
         automaticCheckProbe?.cancel()
         automaticCheckProbe = nil
-        loadingLabel.stringValue = mode == .handoff
-            ? text("Loading the provider's sign-in page...", "正在加载官方登录页面...")
-            : mode == .dashboard
-                ? text("Loading the dashboard...", "正在加载仪表盘...")
-                : mode == .logs
-                    ? text("Loading usage logs...", "正在加载用量日志...")
-                    : text("Loading sign-in page...", "正在加载登录页面...")
-        withoutAnimations { loadingOverlay.isHidden = false }
+        loadingLabel.stringValue = loadingStatusText
+        setStatus(loadingStatusText)
+        withoutAnimations { loadingOverlay.isHidden = true }
     }
 
     private func showBrowserFailure() {
@@ -8378,13 +8373,15 @@ private final class NativeRelayLoginController: NSObject, NSWindowDelegate, WKNa
         loginFormRevealProbe = nil
         automaticCheckProbe?.cancel()
         automaticCheckProbe = nil
-        loadingLabel.stringValue = mode == .handoff
+        let message = mode == .handoff
             ? text("The provider's sign-in page could not be loaded. Open it in your browser.", "官方登录页面加载失败，可改在浏览器中打开。")
             : mode == .dashboard
                 ? text("The dashboard could not be loaded.", "仪表盘页面加载失败。")
                 : mode == .logs
                     ? text("The usage log page could not be loaded.", "用量日志页面加载失败。")
                     : text("The sign-in page could not be loaded.", "登录页面加载失败。")
+        loadingLabel.stringValue = message
+        setStatus(message)
         withoutAnimations { loadingOverlay.isHidden = false }
     }
 

@@ -737,20 +737,39 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("auth_kind", identity)
         self.assertNotIn("auth_kind", editor)
 
-    def test_relay_login_reveals_the_page_as_soon_as_it_paints(self) -> None:
-        # A web view paints progressively.  The overlay exists for the blank
-        # first frame, not for "the page finished its own data fetch": waiting on
-        # body.innerText covered a station whose shell renders immediately and
-        # then streams, leaving 正在加载登录页面 over a usable sign-in form.
+    def test_relay_login_loads_like_a_browser_instead_of_under_a_cover(self) -> None:
+        # A web view paints progressively.  The station's own page fills the pane
+        # while it loads; an opaque 正在加载登录页面 cover made a slow station look
+        # like a dead window, and it stayed up until the document had parsed
+        # enough to answer a paint probe.  The cover is now the failure surface
+        # only.
         leaf = (MAC_NATIVE / "AppKitNativeLeaf.swift").read_text(encoding="utf-8")
+        self.assertIn("private let loadingOverlay = NSVisualEffectView()", leaf)
+        build = leaf.split("private func buildPanel() {", 1)[1]
+        self.assertIn("loadingOverlay.isHidden = true", build.split("private func", 1)[0])
+        loading = leaf.split("private func showBrowserLoading() {", 1)[1].split("\n    }", 1)[0]
+        self.assertIn("loadingOverlay.isHidden = true", loading)
+        # The status line says the page is loading; the mode's instruction comes
+        # back when the page finishes.
+        self.assertIn("private var loadingStatusText: String", leaf)
+        self.assertIn("private var idleStatusText: String", leaf)
+        self.assertIn("setStatus(loadingStatusText)", loading)
+        self.assertIn("setStatus(idleStatusText)", leaf)
+        commit = leaf.split("didCommit navigation:", 1)[1].split("\n    }", 1)[0]
+        self.assertIn("setStatus(idleStatusText)", commit)
+        # A failure still says so instead of leaving an unexplained blank pane.
+        failure = leaf.split("private func showBrowserFailure() {", 1)[1].split("\n    }", 1)[0]
+        self.assertIn("loadingOverlay.isHidden = false", failure)
+        self.assertIn("loadingLabel.stringValue = message", failure)
+        self.assertIn("setStatus(message)", failure)
+        # The paint probe still starts the per-step work; it no longer owns a
+        # cover, so a late answer cannot hide a failure message.
         self.assertIn("private static let pagePaintedScript = \"\"\"", leaf)
         painted = leaf.split("private static let pagePaintedScript = \"\"\"", 1)[1].split('"""', 1)[0]
-        # Any committed element counts as painted.
         self.assertIn("if (body.children.length > 0) return true;", painted)
-        # The overlay is lifted on that answer.
-        self.assertIn("private func revealBrowserPage() {", leaf)
-        reveal = leaf.split("private func revealBrowserPage() {", 1)[1].split("\n    }", 1)[0]
-        self.assertIn("loadingOverlay.isHidden = true", reveal)
+        self.assertIn("private func startBrowserPageWork() {", leaf)
+        reveal = leaf.split("private func startBrowserPageWork() {", 1)[1].split("\n    }", 1)[0]
+        self.assertNotIn("loadingOverlay", reveal)
         # The per-step work still runs once the page is on screen.
         for step in (
             "scheduleEmbeddedBrowserResize()",
@@ -759,7 +778,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             "scheduleLoginWatch(delay: 1)",
         ):
             self.assertIn(step, reveal)
-        # The cover can never outlive a page that is drawing.
+        # The bounded wait still exists for a document that never paints.
         self.assertIn("private var pageReadinessAttempts = 0", leaf)
         self.assertIn("private static let pageReadinessMaxAttempts = 60", leaf)
         probe = leaf.split("private func schedulePageReadinessProbe() {", 1)[1].split("\n    }", 1)[0]
@@ -2166,18 +2185,21 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("private let loadingOverlay = NSVisualEffectView()", mac_leaf)
         self.assertNotIn("NSProgressIndicator", mac_leaf)
         self.assertNotIn("startAnimation", mac_leaf)
-        self.assertIn("private static let immediateWebPresentationScript", mac_leaf)
-        self.assertIn("animation: none !important;", mac_leaf)
-        self.assertIn("transition: none !important;", mac_leaf)
+        self.assertIn("private static let relayPageScrollbarScript", mac_leaf)
         # The station's own paints stay.  A fork draws its primary button as a
         # gradient with white text and no background-color, so rewriting
         # gradients to flatten the page deleted the one visible way to sign in
-        # (the form then answered only to a keyboard Enter).  Scrollbars and
-        # motion are the window's business; colours are the station's.
+        # (the form then answered only to a keyboard Enter).  Only the
+        # scrollbar is the window's business; colours and motion are the
+        # station's, so neither host cancels the page's own animations.
         for host in (mac_leaf, windows_relay):
             self.assertNotIn("stripGradients", host)
             self.assertNotIn("gradientPattern", host)
             self.assertNotIn("mask-image']", host)
+            self.assertNotIn("animation: none !important;", host)
+            self.assertNotIn("transition: none !important;", host)
+            self.assertNotIn("view-transition-name", host)
+            self.assertIn("scrollbar-width: none !important;", host)
             self.assertIn("new MutationObserver(install).observe(document,", host)
         self.assertIn(': text("Loading sign-in page...", "正在加载登录页面...")', mac_leaf)
         self.assertIn("func webView(_ webView: WKWebView, didStartProvisionalNavigation", mac_leaf)
@@ -2245,7 +2267,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         # literals carry must not contain any (a stray escape silently broke
         # the announcement dismissal script once).
         js_scripts = {}
-        for name in ("relayLoginSurfaceScript", "loginStateScript", "embeddedContentHeightScript", "immediateWebPresentationScript"):
+        for name in ("relayLoginSurfaceScript", "loginStateScript", "embeddedContentHeightScript", "relayPageScrollbarScript"):
             match = re.search(rf'private static let {name} = """\n(.*?)\n    """', mac_leaf, re.S)
             self.assertIsNotNone(match, name)
             js_scripts[name] = match.group(1)
