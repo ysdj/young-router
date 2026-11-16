@@ -4031,6 +4031,26 @@ def _request_supports_streaming_error_fallback(request_data: Optional[dict]) -> 
         return False
     return request_data.get("input") is not None or request_data.get("messages") is not None
 
+def _dsml_trace(request_data: Optional[dict], **fields: Any) -> None:
+    """Record that this answer carried markup the filter rewrote.
+
+    A Messages answer whose ``text_delta`` frames were rewritten is otherwise
+    invisible: the client sees the visible half either way, so a filter that
+    never ran looks exactly like a route that wrote no markup.
+    """
+
+    from . import trace as _trace_module
+
+    try:
+        _trace_module._route_trace(
+            _anthropic_dsml_module.TRACE_EVENT,
+            model=(request_data or {}).get("model"),
+            **fields,
+        )
+    except Exception:
+        return
+
+
 def _request_is_anthropic_messages_stream(request_data: Optional[dict]) -> bool:
     if not _request_supports_streaming_error_fallback(request_data):
         return False
@@ -5625,6 +5645,10 @@ async def _yield_native_stream_with_output_limit_continuation(
     # tool calls once the block closes -- see ``anthropic_dsml``.
     dsml_filter = _anthropic_dsml_module.MessageStreamFilter()
     is_anthropic_stream = _request_is_anthropic_messages_stream(request_data)
+    # Whether the filter is looking at this answer at all is the difference
+    # between "the route wrote no markup" and "nothing rewrote it", and the two
+    # are indistinguishable from the client's side.  One trace per answer.
+    dsml_text_frames = [0]
     # Which content blocks this answer has open.  The frames a DSML block turns
     # into are appended at the end of the answer, and a client that receives a
     # ``content_block_start`` while an earlier block is still open reads the
@@ -5659,6 +5683,7 @@ async def _yield_native_stream_with_output_limit_continuation(
         if not isinstance(text, str) or not text:
             return chunk
         visible = dsml_filter.feed(text)
+        dsml_text_frames[0] += 1
         if visible == text:
             return chunk
         if not visible:
@@ -5790,6 +5815,14 @@ async def _yield_native_stream_with_output_limit_continuation(
             )
         for event in dsml_tool_use_events():
             yield event
+        if is_anthropic_stream:
+            _dsml_trace(
+                request_data,
+                frames=dsml_text_frames[0],
+                calls=len(dsml_filter.calls_parsed()),
+                marker=dsml_filter.saw_marker,
+                tail=len(tail),
+            )
 
     try:
         async for chunk in deliver_route():

@@ -47,6 +47,10 @@ from typing import Any, Dict, List, Optional
 
 #: The delimiters.  ``\uff5c`` is the fullwidth vertical bar DeepSeek uses.
 _DSML = "\uff5c\uff5cDSML\uff5c\uff5c"
+#: The trace a rewritten answer reports, so "no markup" and "nothing ran" are
+#: distinguishable from the host's log.
+TRACE_EVENT = "anthropic_dsml_rewritten"
+
 CALLS_START = f"<{_DSML} calls>"
 CALLS_END = f"</{_DSML} calls>"
 INVOKE_START = f"<{_DSML} invoke"
@@ -229,6 +233,10 @@ class MessageStreamFilter:
         #: exactly this: ``</｜｜DSML｜｜ calls>`` with no block around it, so a
         #: filter keyed only on the opener passed it straight through.
         self._in_orphan = False
+        #: Whether a block opener was ever seen, and how many calls were
+        #: parsed.  Both are what tells a route that wrote no markup apart
+        #: from a filter that never looked at the answer.
+        self.saw_marker = False
 
     def feed(self, text: str) -> str:
         if not isinstance(text, str) or not text:
@@ -288,6 +296,7 @@ class MessageStreamFilter:
                 self._fences.append(fence.group(1))
                 continue
             if start >= 0:
+                self.saw_marker = True
                 visible.append(self._buffer[:start])
                 self._buffer = self._buffer[start:]
                 self._inside = True
@@ -364,6 +373,11 @@ class MessageStreamFilter:
         text = self._buffer
         self._buffer = ""
         return text
+
+    def calls_parsed(self) -> List[Dict[str, Any]]:
+        """The calls parsed so far, without consuming them."""
+
+        return list(self._calls)
 
     def take_calls(self) -> List[Dict[str, Any]]:
         calls = self._calls
