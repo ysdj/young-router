@@ -233,3 +233,55 @@ class PromotionShapeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PreCallHookTests(unittest.IsolatedAsyncioTestCase):
+    """The hook must hand back the body it lifted the pictures into.
+
+    The first draft lifted them, logged ``pictures: 5``, and then returned
+    ``paired`` -- the variable holding what the *previous* pass produced, which
+    is ``None`` when that pass changed nothing.  The lift was therefore invisible
+    to the caller: the upstream still received the original body, still priced
+    the five figures at 327k tokens each, and still refused it at 1,444,919.
+    A trace saying the pass ran is not evidence that its result was used.
+    """
+
+    async def test_the_lifted_body_is_what_the_hook_returns(self) -> None:
+        from young_router.proxy import hook as hook_module
+
+        request = {
+            "model": "default-chat",
+            "messages": [
+                _call(),
+                _result(),
+            ],
+        }
+
+        returned = await hook_module.YoungRouterHook().async_pre_call_hook(
+            {}, None, request, None
+        )
+
+        self.assertIsNotNone(returned, "the lift changed the body; the hook must say so")
+        kinds = [block["type"] for block in returned["messages"][1]["content"]]
+        self.assertEqual(["tool_result", "text", "image"], kinds)
+
+    async def test_the_lift_does_not_edit_the_messages_it_was_given(self) -> None:
+        """The pass builds a new list; the client's own blocks stay untouched.
+
+        The hook writes routing metadata onto the request it is handed -- that
+        is older behaviour and not this pass's business.  What this pass must
+        not do is rewrite the messages in place: a retry that replays the same
+        object would then lift an already-lifted body.
+        """
+
+        from young_router.proxy import hook as hook_module
+
+        request = {
+            "model": "default-chat",
+            "messages": [_call(), _result()],
+        }
+        before = json.dumps(request["messages"], sort_keys=True)
+
+        await hook_module.YoungRouterHook().async_pre_call_hook({}, None, request, None)
+
+        self.assertEqual(before, json.dumps(request["messages"], sort_keys=True))

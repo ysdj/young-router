@@ -47,10 +47,12 @@ class YoungRouterHook(CustomLogger):
     ) -> Optional[dict]:
         """Record what the replay carries before LiteLLM counts it.
 
-        Nothing is rewritten here: the replay reaches the upstream exactly as
-        the client sent it, and the image-context pass that decides which
-        images go out runs in ``async_pre_call_deployment_hook`` together with
-        every other request adaptation.
+        The replay reaches the upstream as the client sent it, except for the
+        repairs below -- pairing a cut tool history and lifting a picture out of
+        a ``tool_result``.  Both are shape repairs the client's own data already
+        supports, and both have to happen before a deployment is chosen.  The
+        image-context pass that decides which images go out runs later, in
+        ``async_pre_call_deployment_hook``, with every other adaptation.
         """
 
         if not isinstance(data, dict):
@@ -76,9 +78,15 @@ class YoungRouterHook(CustomLogger):
         # ends on "start a new task".  Pairing happens here, before a deployment
         # is chosen, so every wire, bridge and hop sees the same replay.  It is
         # not a reason to stop: the passes below still apply to the paired body.
-        paired = _tool_history_module.paired_request(data)
-        if paired is not None:
-            data = paired
+        #: What this hook hands back when nothing below shortens the body.  It
+        #: starts as "the client's own replay" and is replaced by whichever
+        #: earlier pass rewrote it, so a later pass never returns the body an
+        #: earlier one replaced.  ``return paired`` did exactly that: the
+        #: picture lift ran, logged its five pictures, and the hook then handed
+        #: the original body back.
+        rewritten = _tool_history_module.paired_request(data)
+        if rewritten is not None:
+            data = rewritten
         # A picture inside a tool result is a shape the client's wire allows and
         # an OpenAI-compatible upstream cannot read: the bridge serialises it as
         # a data URL and the upstream tokenizes the base64 as prose.  Measured
@@ -90,6 +98,7 @@ class YoungRouterHook(CustomLogger):
         promoted = _tool_result_images_module.promoted_tool_result_images(data)
         if promoted is not None:
             data = promoted
+            rewritten = promoted
         if not _responses_request_module._request_is_responses_api(data):
             # Messages replays the same history and meets the same cap.  The
             # route refuses an oversized prompt with a plain 400, and on its
@@ -111,7 +120,7 @@ class YoungRouterHook(CustomLogger):
                 # result and the call that is left.
                 repaired = _tool_history_module.paired_request(fitted_messages)
                 return repaired if repaired is not None else fitted_messages
-            return paired
+            return rewritten
         # Record this before any bridge or surface adapter rewrites the input:
         # a Chat-shaped route replays this history as messages and the answer it
         # returns covers the whole restored context.
@@ -130,7 +139,7 @@ class YoungRouterHook(CustomLogger):
             # result whose call it dropped, and pairing has already run.
             repaired = _tool_history_module.paired_request(fitted)
             return repaired if repaired is not None else fitted
-        return paired
+        return rewritten
 
     def _record_recent_request_started(self, kwargs: Dict[str, Any]) -> None:
         """Publish a bounded progress row before the upstream call begins."""
