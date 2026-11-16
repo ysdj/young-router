@@ -50,6 +50,12 @@ from ._shared_api import (
 
 DOMAIN_NAME = "claude"
 _CLAUDE_NONSTREAM_FALLBACK_ENV = "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK"
+#: Auto-memory is on unless the document says otherwise: the client's default
+#: is on, so ``false`` is the only value that turns it off.  The env spelling
+#: is the same gate on another wire; the switch reads both and writes one, so
+#: the pane cannot show "on" for a session the env var has already silenced.
+_CLAUDE_AUTO_MEMORY_SETTING = "autoMemoryEnabled"
+_CLAUDE_DISABLE_AUTO_MEMORY_ENV = "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
 #: Claude Preview and Claude Browser tools are resolved back to ``auto`` even
 #: in a bypass-permissions session, so with auto mode offered they wait for a
 #: verdict this gateway cannot carry and are denied as unanswered; with auto
@@ -2332,6 +2338,71 @@ class ClaudeSettingsDomain:
         self._exists = True
         self._baseline_bytes = text.encode("utf-8")
 
+    def code_auto_memory_enabled(self, document: Mapping[str, Any] | None = None) -> bool:
+        """Whether Claude Code reads and writes its project memory directory.
+
+        Absent means on: the client's own default is on, so only an explicit
+        ``false`` (or the env spelling of the same gate) turns it off.  A
+        document that still carries the env gate reads as off even when the
+        boolean is missing, because the session the client starts honours the
+        env var.
+        """
+
+        source = self._draft if document is None else document
+        if source.get(_CLAUDE_AUTO_MEMORY_SETTING) is False:
+            return False
+        env = source.get("env")
+        if isinstance(env, Mapping):
+            gate = str(env.get(_CLAUDE_DISABLE_AUTO_MEMORY_ENV) or "").strip().lower()
+            if gate in {"1", "true", "yes", "on"}:
+                return False
+        return True
+
+    def set_code_auto_memory(self, enabled: bool) -> None:
+        """Write Claude Code's auto-memory switch and persist it.
+
+        One gate, one spelling: off writes ``autoMemoryEnabled: false`` and
+        on removes the key, which is the client's default.  The env spelling
+        is cleared in both directions so a document that carried both gates
+        cannot keep the session silent while the pane shows it on.  The disk
+        document is ``_raw`` so toggling saves no unrelated draft edit; the
+        draft receives the same change so the pane and the next Apply agree.
+        """
+
+        if not isinstance(self._raw, dict):
+            self._raw = {}
+        # Stage the change in copies: validation and the on-disk check below
+        # can still refuse it, and a refused toggle must not leave either
+        # document claiming a value that was never written.
+        raw = dict(self._raw)
+        draft = dict(self._draft) if isinstance(self._draft, dict) else None
+        for document in (raw, draft):
+            if not isinstance(document, dict):
+                continue
+            if enabled:
+                document.pop(_CLAUDE_AUTO_MEMORY_SETTING, None)
+            else:
+                document[_CLAUDE_AUTO_MEMORY_SETTING] = False
+            env = document.get("env")
+            if isinstance(env, Mapping) and _CLAUDE_DISABLE_AUTO_MEMORY_ENV in env:
+                env = dict(env)
+                env.pop(_CLAUDE_DISABLE_AUTO_MEMORY_ENV, None)
+                document["env"] = env
+        errors = validate_settings(raw)
+        if errors:
+            raise ClaudeSettingsError(errors[0])
+        if _current_bytes(self.settings_path) != self._baseline_bytes:
+            raise ClaudeSettingsError(
+                "Claude Settings changed on disk; reload and try again"
+            )
+        self._raw = raw
+        if draft is not None:
+            self._draft = draft
+        text = json.dumps(self._raw, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        _atomic_write(self.settings_path, text)
+        self._exists = True
+        self._baseline_bytes = text.encode("utf-8")
+
     def _code_auto_mode_disabled(
         self, document: Mapping[str, Any] | None = None
     ) -> bool:
@@ -2595,6 +2666,7 @@ class ClaudeSettingsDomain:
                     "model_list_enabled": self.code_model_list_enabled(),
                     "nonstream_fallback_enabled": self.code_nonstream_fallback_enabled(),
                     "auto_mode_enabled": self.code_auto_mode_enabled(),
+                    "auto_memory_enabled": self.code_auto_memory_enabled(),
                 },
                 "claudeDesktop": {
                     "uses_local_api": self.desktop_uses_local_api(),
@@ -2879,6 +2951,18 @@ class ClaudeSettingsDomain:
             if not isinstance(enabled, bool):
                 raise DomainError("The Claude auto-mode switch is invalid")
             self.set_code_auto_mode(enabled)
+            self._revision += 1
+            return self.snapshot()
+        if name in {
+            "claude_auto_memory_set",
+            "claudeautomemoryset",
+            "auto_memory_set",
+            "automemoryset",
+        }:
+            enabled = data.get("enabled")
+            if not isinstance(enabled, bool):
+                raise DomainError("The Claude auto-memory switch is invalid")
+            self.set_code_auto_memory(enabled)
             self._revision += 1
             return self.snapshot()
         candidate = copy.deepcopy(self._draft)

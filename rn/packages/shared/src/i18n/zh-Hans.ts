@@ -30,6 +30,8 @@ export const zhHans: Record<TranslationKey, string> = {
   "claude.nonstreamFallbackHint": "流式回答中途失败时，用流式重试，而不是把整轮改成一个非流式请求。",
   "claude.autoMode": "自动权限模式",
   "claude.autoModeHint": "关掉后，预览与浏览器工具不再被自动判断拦住，改为逐条确认。",
+  "claude.autoMemory": "自动记忆",
+  "claude.autoMemoryHint": "关掉后，Claude Code 不再读写项目的记忆目录；已经在跑的会话保留它启动时读到的内容。",
   "claude.model": "模型",
   "claude.gateway": "漾路由网关",
   "claude.permissions": "权限",

@@ -30,6 +30,8 @@ export const en: Record<TranslationKey, string> = {
   "claude.nonstreamFallbackHint": "When a stream fails mid-answer, retry it as a stream instead of re-sending the whole turn as one body.",
   "claude.autoMode": "Auto permission mode",
   "claude.autoModeHint": "Off: preview and browser tools stop being blocked by auto review and ask you one by one instead.",
+  "claude.autoMemory": "Auto memory",
+  "claude.autoMemoryHint": "Off: Claude Code stops reading and writing the project's memory directory. Sessions already running keep what they loaded.",
   "claude.model": "Model",
   "claude.gateway": "Young Router gateway",
   "claude.permissions": "Permissions",

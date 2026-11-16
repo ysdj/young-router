@@ -33,6 +33,8 @@ export type TranslationKey =
   | "claude.nonstreamFallbackHint"
   | "claude.autoMode"
   | "claude.autoModeHint"
+  | "claude.autoMemory"
+  | "claude.autoMemoryHint"
   | "claude.model"
   | "claude.gateway"
   | "claude.permissions"
