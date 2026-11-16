@@ -2317,7 +2317,7 @@ model_list:
                 [record["request_id"] for record in domain.view("requests")["log"]["records"]],
             )
 
-    def test_request_tab_view_actions_rebuild_the_window(self) -> None:
+    def test_request_tab_view_actions_apply_to_the_window(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = root / "recent-requests.jsonl"
@@ -2338,6 +2338,55 @@ model_list:
                 ["beta"],
                 [record["request_id"] for record in domain.view("requests")["log"]["records"]],
             )
+
+    def test_a_filter_change_does_not_reproject_the_whole_window(self) -> None:
+        """A keystroke in 筛选 narrows rows already projected; it never re-reads them.
+
+        The projection is keyed by what the window is built from -- the
+        configuration revision, the limit, the cleared cursor and the newest
+        sequence -- while the filter is applied to the records afterwards.
+        Dropping the projection on every filter change (which this used to do)
+        made each keystroke re-read and re-project up to twenty thousand rows:
+        4-7 s of Core time per character on the gateway (2026-11-16), so the
+        filtered table arrived long after it had been typed.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "recent-requests.jsonl"
+            for index, name in enumerate(("alpha", "beta")):
+                runtime_store.append_record(
+                    path,
+                    json.dumps({"ts": f"2026-08-01T04:10:0{index}Z", "request_id": name, "status": "success"}),
+                )
+            domain = LogsDomain(root)
+            self.assertEqual(2, domain.view("requests")["log"]["line_count"])
+
+            with mock.patch(
+                "young_router.core.domains.logs.runtime_store.read_records",
+                wraps=runtime_store.read_records,
+            ) as rebuilt, mock.patch(
+                "young_router.core.domains.logs.runtime_store.records_after",
+                wraps=runtime_store.records_after,
+            ) as appended:
+                domain.dispatch("logs.set_filter", {"tab": "requests", "filter": "bet"})
+                # Narrowing the rows already held reads nothing back.
+                rebuilt.assert_not_called()
+                self.assertEqual(
+                    ["beta"],
+                    [record["request_id"] for record in domain.view("requests")["log"]["records"]],
+                )
+                # The append that follows is the only thing projected.
+                runtime_store.append_record(
+                    path,
+                    json.dumps({"ts": "2026-08-01T04:10:09Z", "request_id": "beta-two", "status": "success"}),
+                )
+                self.assertEqual(
+                    ["beta", "beta-two"],
+                    [record["request_id"] for record in domain.view("requests")["log"]["records"]],
+                )
+                rebuilt.assert_not_called()
+                appended.assert_called()
 
     def test_request_filter_reads_the_mode_column_the_row_states_as_a_boolean(self) -> None:
         """The mode column's words find their own rows, and only their own.

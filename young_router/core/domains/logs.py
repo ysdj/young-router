@@ -2023,7 +2023,11 @@ class LogsDomain:
             cached_seq = cache.get("seq")
             usable = (
                 cache.get("signature") == signature
-                and cache.get("line_limit", 0) >= line_limit
+                # Equality, not "at least": a window built for a smaller limit
+                # cannot answer a larger one (the rows above it were never read),
+                # and one built for a larger limit holds rows the tab no longer
+                # shows.  Either way the window is rebuilt from the store.
+                and cache.get("line_limit") == line_limit
                 and cache.get("cleared") == cleared_seq
                 and isinstance(cached_seq, int)
                 and cleared_seq <= cached_seq <= latest
@@ -2940,12 +2944,14 @@ class LogsDomain:
             self.revision += 1
             self._refresh(tab, force=True)
             return self.snapshot()
-        if tab == "requests":
-            # A view action can change what the tab shows (filter, limit,
-            # pause, clear) — never serve it from a window parsed under the
-            # previous intent.
-            with self._request_tail_lock:
-                self._request_tail = {}
+        # A view action changes what the tab *shows*, not which rows it is built
+        # from: the filter, the pause state and the clear cursor are applied
+        # after the window is projected, and the window's own key already names
+        # the limit, the cleared cursor and the configuration revision.  This
+        # used to drop the projection on every action aimed at the requests tab,
+        # so each keystroke in the 筛选 field re-read and re-projected up to
+        # twenty thousand rows -- 4-7 s of Core time on the gateway
+        # (2026-11-16), i.e. the filtered table arrived long after it was typed.
         if operation == "record_menu_action":
             if tab != "actions":
                 raise LogsDomainError("Log tab is invalid")
