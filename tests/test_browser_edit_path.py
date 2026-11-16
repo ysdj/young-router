@@ -11,8 +11,13 @@ and only a running page can answer that.
 So this drives the real bundle in a real browser against a real Core: the
 assertions are the request shapes a settled edit may cost (a plan read, a
 dispatch, an apply -- never the whole projection), the bytes those answers may
-carry, and the time the pressed control takes to show the new value.  The
-measurement is repeated in `tests/test_browser_edit_path.mjs`, which is also
+carry, the time the pressed control takes to show the new value, and -- on a
+link slower than a control's own patience -- whether the press stays put.  A
+control that fell back to the old value on a fixed two-second budget and then
+painted the new one when the state arrived was the second half of the same
+report: the box showed the press, took it back, and showed it again.
+
+The measurement is repeated in `tests/test_browser_edit_path.mjs`, which is also
 runnable by hand:
 
     node tests/test_browser_edit_path.mjs http://127.0.0.1:PORT/ui/ --latency 250 --downstream 125000
@@ -171,6 +176,17 @@ class BrowserEditCostTests(unittest.TestCase):
         self.assertIsNotNone(edit["paintedMs"])
         self.assertLessEqual(edit["paintedMs"], 400)
         self.assertIn("已保存", edit["strip"])
+        # The press is the control's until its write answers.  Falling back to
+        # the old value while the request is still open makes one press read as
+        # two, which is what the slow-link half of the report described.
+        self.assertFalse(edit["returned"], "the press went back to its old value before any answer arrived")
+        slow = edit["slowLink"]
+        self.assertIsNotNone(slow["paintedMs"], f"the press on a slow link never showed the chosen value: {slow}")
+        self.assertFalse(
+            slow["returned"],
+            f"the press on a slow link went back to its old value after {slow['paintedMs']} ms: {slow}",
+        )
+        self.assertIn("已保存", slow["strip"], f"the slow link's edit never stated the save: {slow}")
 
 
 if __name__ == "__main__":

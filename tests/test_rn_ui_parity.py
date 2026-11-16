@@ -4401,8 +4401,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for marker in (
             'accessibilityLabel={labelled("settings.useRouterModelList")}',
             'translate("codex.modelCatalogHint")',
-            "const toggleCatalog = (enabled: boolean): void => {",
-            "void onToggleCodexModelCatalog(enabled).finally(() => setCatalogBusy(false));",
+            # The switch's own answer travels back to the control: a switch
+            # holds the value it was given until the write settles, so the
+            # request's promise is returned instead of dropped.
+            "const toggleCatalog = (enabled: boolean): Promise<unknown> | void => {",
+            "return onToggleCodexModelCatalog(enabled).finally(() => setCatalogBusy(false));",
             # This app's model list names models only its proxy serves, so the
             # row is one of the pane's proxy-scoped switches: it is disabled,
             # and says why, while the client points somewhere else.
@@ -4443,7 +4446,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "SETTINGS_FIELD_HELP_SLOT",
             # One on/off setting is a switch, never a checkbox.
             "<NativeToggle",
-            "void onUseLocalApi(designatedSelection ?? {}).finally(() => setClientActionBusy(false));",
+            "return onUseLocalApi(designatedSelection ?? {}).finally(() => setClientActionBusy(false));",
             # On the proxy the model is only a public name, so the route the
             # user last chose decides where "off" goes instead of the first
             # matching row; Core remembers it because the client's own file no
@@ -4468,7 +4471,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # nobody can answer re-mounts the box onto the configured value.
             "disabled={(busy && !(clientActionBusy || designateBusy)) || clientActionBusy || designateBusy}",
             "onValueChange={toggleLocalApi}",
-            "const toggleLocalApi = (enabled: boolean): void => {",
+            # On is one write this switch owns, so its answer goes back to the
+            # control; off with no remembered route asks the user instead.
+            "const toggleLocalApi = (enabled: boolean): void | Promise<unknown> => {",
+            "return onUseLocalApi(designatedSelection ?? {}).finally(() => setClientActionBusy(false));",
             "const [switchGeneration, setSwitchGeneration] = useState(0);",
             "const assembleSwitch = (): void => setSwitchGeneration((current) => current + 1);",
             "const menuGroups = useMemo(() => savedRouteMenuGroups(models, translate), [models, translate]);",
@@ -9320,6 +9326,50 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('<ProviderKeysPanel')
         self.assertNotIn('providerKeyGrid:', self.ui)
 
+    def test_a_switch_holds_its_press_until_its_write_answers(self) -> None:
+        """A press is the control's while the write is open, not for two seconds.
+
+        The defect this pins: the echo on a switch had a fixed two-second
+        budget, so a link slower than that took the press back and then painted
+        it again when the state arrived -- one press read as two, and the box
+        looked like it would not stay where it was put.  What replaces the clock
+        is the write's own answer: no timer runs while the request is open, a
+        refusal withdraws the echo at once, and an accepted write holds it until
+        the projection agrees (or a bounded grace, so a value the domain then
+        refuses does not stay painted).  The running-page detector is
+        ``tests/test_browser_edit_path.mjs``; this states the contract.
+        """
+
+        for marker in (
+            "type ChoiceAnswer = void | boolean | Promise<unknown>;",
+            "type ChoiceHandler = (value: boolean) => ChoiceAnswer;",
+            "const CONTROL_ECHO_TIMEOUT_MS = 2000;",
+            "const CONTROL_CONFIRM_GRACE_MS = 6000;",
+            'type ChoicePhase = "waiting" | "accepted" | "unanswerable";',
+            # No clock while the write is unanswered: this line is the fix.
+            'if (chosen.phase === "waiting") return;',
+            'chosen.phase === "accepted" ? CONTROL_CONFIRM_GRACE_MS : CONTROL_ECHO_TIMEOUT_MS',
+            # The answer itself: refused means withdrawn now, accepted means
+            # held until the state agrees.
+            "answer.then((result) => settled(result !== false), () => settled(false));",
+            "const settled = (accepted: boolean): void => {",
+            # One press at a time, so a slow first answer cannot clear the echo
+            # of the press that replaced it.
+            "const press = useRef(0);",
+        ):
+            self.assertIn(marker, self.native_controls)
+        # Core's answer travels back to the control: `dispatch` states what
+        # became of the action, and every switch hands that promise over.
+        self.assert_ui_has("type Dispatch = (type: string, payload?: UnknownRecord, domain?: ConfigDomain) => Promise<boolean>;")
+        self.assert_ui_has("}, null, true).then((staged) => staged !== undefined);")
+        self.assert_ui_has('onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })}')
+        self.assert_ui_has('onValueChange={(enabled) => dispatch(isLogin ? "service_provider.patch" : "provider.patch"')
+        # A pane's own two-sided switch answers its own outcome instead of
+        # resolving while it is still deciding.
+        self.assert_ui_has("const setAutoStart = async (enabled: boolean): Promise<boolean> => {")
+        self.assert_ui_has("const setRunInBackground = async (enabled: boolean): Promise<boolean> => {")
+        self.assert_ui_has("onValueChange={setRunInBackground}")
+
     def test_shared_native_controls_default_to_compact_density(self) -> None:
         native_controls = (ROOT / "rn/packages/shared/src/ui/NativeControls.tsx").read_text(encoding="utf-8")
         appkit_controls = (ROOT / "rn/packages/shared/src/ui/AppKitControls.tsx").read_text(encoding="utf-8")
@@ -9607,7 +9657,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "state.status === \"saved\" || state.status === \"ready\" || state.status === \"error\"",
             "refreshAfter = true",
             "if (refreshAfter && !cancelled && postActionRefreshNeeded({ channel: eventChannel.current, revisionBefore, revisionAfter, localRevision: revision.current })) await refresh();",
-            "}, null, true);",
+            "}, null, true).then((staged) => staged !== undefined);",
             # Leaving a pane with nothing to write is not an Apply: the flush
             # used to cancel after a `staged` read and then read the whole
             # projection back for it, so every sidebar press paid two round trips

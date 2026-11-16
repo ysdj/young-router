@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   FlatList,
@@ -90,7 +90,9 @@ type SegmentedProps = {
 type ToggleProps = {
   value: boolean;
   disabled?: boolean;
-  onValueChange?: (value: boolean) => void;
+  /** Answers the write it started: a promise settles when the write does, and
+   *  ``false`` states that it was refused (see ``useChosenValue``). */
+  onValueChange?: ChoiceHandler;
   style?: StyleProp<ViewStyle>;
   accessibilityLabel?: string;
 };
@@ -110,7 +112,8 @@ type CheckboxProps = {
   disabled?: boolean;
   compact?: boolean;
   labelVisible?: boolean;
-  onValueChange?: (value: boolean) => void;
+  /** Answers the write it started (see ``ToggleProps.onValueChange``). */
+  onValueChange?: ChoiceHandler;
   style?: StyleProp<ViewStyle>;
 };
 
@@ -562,7 +565,7 @@ const WindowsSegmentedControl = React.forwardRef<any, SegmentedProps>(function W
 });
 
 function WindowsToggle({ value, disabled, onValueChange, style, accessibilityLabel }: ToggleProps): React.JSX.Element {
-  const toggle = (): void => onValueChange?.(!value);
+  const toggle = (): void => { void onValueChange?.(!value); };
   return <Pressable
     style={[styles.windowsToggle, disabled && styles.windowsDisabled, style]}
     disabled={disabled}
@@ -585,7 +588,7 @@ function WindowsToggle({ value, disabled, onValueChange, style, accessibilityLab
 
 function WindowsCheckbox({ label, value, disabled, compact = true, labelVisible = true, onValueChange, style }: CheckboxProps): React.JSX.Element {
   const sizedStyle = [{ minWidth: labelVisible ? nativeCheckboxMinimumWidth(label) : 24 }, style];
-  const toggle = (): void => onValueChange?.(!value);
+  const toggle = (): void => { void onValueChange?.(!value); };
   return <Pressable
     style={[styles.checkboxFallback, compact && styles.windowsCheckboxCompact, sizedStyle]}
     disabled={disabled}
@@ -857,45 +860,106 @@ export function NativeSelectableRow({ title, detail, selected, disabled, onPress
 }
 
 /**
- * How long a control shows the value a person just chose before the state has
- * caught up.
+ * What a switch's handler may answer about the write it started.
  *
- * One round trip on a published page, a frame in the native window.  The wait
- * is what a control must not be frozen on: pressing 启用 and watching the box
- * stay empty until the write has round-tripped is what made the page feel
- * broken while the same control in the app was instant.  Two seconds is longer
- * than any link on which the echo helps, and short enough that a write Core
- * refused does not leave a control claiming it happened.
+ * A promise is the answer: it settles when the write does, and ``false`` (or a
+ * rejection) states that the write was refused.  A handler that answers nothing
+ * states nothing, and the control falls back to a frame budget instead of
+ * waiting for a confirmation that will never come.
+ */
+type ChoiceAnswer = void | boolean | Promise<unknown>;
+type ChoiceHandler = (value: boolean) => ChoiceAnswer;
+
+/**
+ * How long a control shows a press whose handler answers nothing.
+ *
+ * One round trip on a published page, a frame in the native window.  A control
+ * that never shows its own press reads as a dead control, so the press is
+ * echoed either way; this budget is the only thing an unanswerable handler can
+ * be held to.
  */
 const CONTROL_ECHO_TIMEOUT_MS = 2000;
+
+/**
+ * How long a control keeps showing a press whose write was accepted, while the
+ * row it belongs to catches up.
+ *
+ * The write answering ``true`` is Core taking the edit, not the projection
+ * already carrying it: an Apply sits behind its own debounce and one more round
+ * trip, and on a published page that is seconds.  So the clock does not start
+ * at the press.  It starts when the write answers, and it is long enough for the
+ * commit behind it -- while still handing the control back to the state when an
+ * edit was accepted and then refused by the domain's own validation, which is
+ * the case where the box must not keep claiming the value.
+ */
+const CONTROL_CONFIRM_GRACE_MS = 6000;
+
+/**
+ * Where a press stands: the write has not answered, it answered and was taken,
+ * or the handler cannot be waited on at all.
+ */
+type ChoicePhase = "waiting" | "accepted" | "unanswerable";
+type Choice = { value: boolean; phase: ChoicePhase };
+
+function thenable(answer: void | boolean | Promise<unknown>): answer is Promise<unknown> {
+  return typeof answer === "object" && answer !== null && typeof answer.then === "function";
+}
 
 /**
  * The value a person just chose, until the state agrees with it.
  *
  * This is not a claim that the write happened: the status strip still says
- * 正在保存, the row the edit belongs to still draws the projection, and the
- * echo is withdrawn the moment the state agrees -- or after
- * ``CONTROL_ECHO_TIMEOUT_MS``, which is the rollback a refusal deserves.  A
- * control that never shows its own press reads as a dead control, and one that
- * keeps showing it after a refusal reads as a lie; this is the interval
- * between the two.
+ * 正在保存 and the row the edit belongs to still draws the projection.  What
+ * the echo follows is the write's own answer, not a clock -- a link that takes
+ * three seconds to carry an edit used to have the box flip back at two, and
+ * then flip again when the state finally arrived, which read as a switch that
+ * would not stay where it was put.  So:
+ *
+ * - while the write is in flight the echo holds, however long that takes;
+ * - a refusal (a rejected promise, or ``false``) withdraws it at once;
+ * - an accepted write holds it until the state agrees, or for
+ *   ``CONTROL_CONFIRM_GRACE_MS`` after the answer, whichever comes first -- a
+ *   projection that never adopts an accepted value is a refusal Core stated
+ *   later, and the box stops arguing with it;
+ * - a handler that answers nothing is held to ``CONTROL_ECHO_TIMEOUT_MS``.
  */
-function useChosenValue(value: boolean, onValueChange?: (next: boolean) => void): [boolean, (next: boolean) => void] {
-  const [chosen, setChosen] = useState<boolean | undefined>(undefined);
+function useChosenValue(value: boolean, onValueChange?: ChoiceHandler): [boolean, (next: boolean) => void] {
+  const [chosen, setChosen] = useState<Choice | undefined>(undefined);
+  // One press at a time: a second press while the first write is in flight
+  // owns the echo, and the first write's late answer must not clear it.
+  const press = useRef(0);
   useEffect(() => {
     if (chosen === undefined) return;
-    if (chosen === value) {
+    if (chosen.value === value) {
       setChosen(undefined);
       return;
     }
-    const timer = setTimeout(() => setChosen(undefined), CONTROL_ECHO_TIMEOUT_MS);
+    if (chosen.phase === "waiting") return;
+    const timer = setTimeout(() => setChosen(undefined), chosen.phase === "accepted" ? CONTROL_CONFIRM_GRACE_MS : CONTROL_ECHO_TIMEOUT_MS);
     return () => clearTimeout(timer);
   }, [chosen, value]);
   const choose = useCallback((next: boolean) => {
-    setChosen(next);
-    onValueChange?.(next);
+    const token = press.current + 1;
+    press.current = token;
+    setChosen({ value: next, phase: "waiting" });
+    let answer: ChoiceAnswer;
+    try {
+      answer = onValueChange?.(next);
+    } catch {
+      if (press.current === token) setChosen(undefined);
+      return;
+    }
+    if (!thenable(answer)) {
+      setChosen((current) => (current !== undefined && press.current === token ? { value: next, phase: "unanswerable" } : current));
+      return;
+    }
+    const settled = (accepted: boolean): void => {
+      if (press.current !== token) return;
+      setChosen((current) => (current === undefined || current.value !== next ? current : accepted ? { value: next, phase: "accepted" } : undefined));
+    };
+    answer.then((result) => settled(result !== false), () => settled(false));
   }, [onValueChange]);
-  return [chosen ?? value, choose];
+  return [chosen === undefined ? value : chosen.value, choose];
 }
 
 export function NativeCheckbox({ label, value, disabled, compact = true, labelVisible = true, onValueChange, style }: CheckboxProps): React.JSX.Element {

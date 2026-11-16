@@ -134,7 +134,15 @@ async function clickAt(cdp, x, y) {
 
 /**
  * Clicks the provider's enable box and reports what the page asked Core for,
- * what it downloaded, and how long the box took to show the new value.
+ * what it downloaded, how long the box took to show the new value, and whether
+ * the box ever went back to the value it started from.
+ *
+ * That last fact is the one a link slower than a control's own patience
+ * produced: the press painted, then the control's fixed two-second budget ran
+ * out and it fell back to the old value, and the state only arrived after.  A
+ * person reads that as a switch that will not stay where it was put, so the
+ * driver samples the box for the whole window instead of only looking for the
+ * first paint.
  */
 async function editOnce(cdp, label, settleMs) {
   const before = await evaluate(cdp, ENABLE_STATE);
@@ -170,26 +178,54 @@ async function editOnce(cdp, label, settleMs) {
   const started = Date.now();
   await clickAt(cdp, before.x, before.y);
   let painted;
+  let returned = false;
+  let settled = false;
   let strip = "";
   while (Date.now() - started < settleMs) {
     await sleep(40);
     const state = await evaluate(cdp, ENABLE_STATE);
-    if (painted === undefined && state && state.checked !== before.checked) painted = Date.now() - started;
+    // The strip as the previous sample read it: a press that goes back to its
+    // old value while no outcome has been stated is the control arguing with a
+    // write nobody has lost yet.  After 失败/错误 the old value is the honest
+    // answer and is not counted.
+    const stated = /已保存|失败|错误/.test(strip);
     strip = await evaluate(cdp, STRIP);
+    if (!state) continue;
+    if (painted === undefined && state.checked !== before.checked) painted = Date.now() - started;
+    if (painted !== undefined && state.checked === before.checked && !stated) returned = true;
+    if (stated && state.checked !== before.checked) settled = true;
     // The strip still reads 已保存 from the edit before this one for a moment,
     // so the answer this measurement is about is the one whose Apply landed.
-    if (applied && painted !== undefined && /已保存|失败|错误/.test(strip)) break;
+    if (applied && painted !== undefined && settled && stated) break;
   }
   await sleep(400);
   return {
     label,
     from: before.checked,
     paintedMs: painted ?? null,
+    // True when the box went back to the value it started from after showing
+    // the press: the one thing a control must not do while a write is open.
+    returned,
     strip,
     calls: traffic.map((entry) => ({ method: entry.method, bytes: entry.bytes, failed: entry.failed })),
     bytes: traffic.reduce((total, entry) => total + (entry.bytes || 0), 0),
     methods: traffic.map((entry) => entry.method),
   };
+}
+
+/**
+ * Waits for the route inspector's enable box to be on screen.
+ *
+ * The shell reads its first state before it can draw a table, so a page opened
+ * on a shaped link answers this in seconds rather than a frame.
+ */
+async function waitForEnableBox(cdp) {
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    const state = await evaluate(cdp, ENABLE_STATE);
+    if (state) return state;
+    await sleep(100);
+  }
+  throw new Error("the page never drew an enable checkbox");
 }
 
 async function main() {
@@ -222,14 +258,17 @@ async function main() {
     }
     if (!ready) throw new Error("the browser did not open its debugging port");
 
+    // The slow-link press first, and alone: two windows on one Core share its
+    // drafts, so a second page sitting open would have its own auto-apply
+    // consume this page's staged edit and report a write this measurement
+    // never saw.  One page at a time, then.
+    const slowCdp = await openTarget(port, pageUrl, { latency: 2500, downstream: 250000 });
+    await waitForEnableBox(slowCdp);
+    const slow = await editOnce(slowCdp, "slow link", 45000);
+    await slowCdp.send("Page.close").catch(() => undefined);
+
     cdp = await openTarget(port, pageUrl, latencyMs === undefined ? undefined : { latency: latencyMs, downstream: downstream ?? -1 });
-    // The shell reads its first state before it can draw a table.
-    for (let attempt = 0; attempt < 200; attempt += 1) {
-      const state = await evaluate(cdp, ENABLE_STATE);
-      if (state) break;
-      await sleep(100);
-    }
-    if (!(await evaluate(cdp, ENABLE_STATE))) throw new Error("the page never drew an enable checkbox");
+    await waitForEnableBox(cdp);
 
     // One warm-up edit each way: the first action of a document is the one
     // allowed to read a projection, because the channel has not spoken yet.
@@ -239,7 +278,7 @@ async function main() {
     await sleep(1200);
 
     const measured = await editOnce(cdp, "measured", 8000);
-    result.measured = measured;
+    result.measured = { ...measured, slowLink: slow };
 
     if (measured.methods.includes("snapshot")) {
       result.reasons.push(`a settled edit read the whole projection (snapshot among ${measured.methods.join(", ")})`);
@@ -254,6 +293,18 @@ async function main() {
     }
     if (!/已保存/.test(measured.strip)) {
       result.reasons.push(`the status strip never stated the save (last: ${measured.strip})`);
+    }
+    if (measured.returned) {
+      result.reasons.push("the press went back to its old value before any answer arrived");
+    }
+    if (slow.paintedMs === null) {
+      result.reasons.push("the press on a slow link never showed the chosen value");
+    }
+    if (slow.returned) {
+      result.reasons.push(`the press on a slow link went back to its old value after ${slow.paintedMs} ms, before its write answered`);
+    }
+    if (!/已保存/.test(slow.strip)) {
+      result.reasons.push(`the slow link's edit never stated the save (last: ${slow.strip}, calls: ${slow.methods.join(", ")})`);
     }
     result.ok = result.reasons.length === 0;
   } finally {

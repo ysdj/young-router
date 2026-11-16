@@ -70,7 +70,16 @@ import type {
 
 type Translate = (key: string, values?: Record<string, string | number>) => string;
 type UnknownRecord = Record<string, unknown>;
-type Dispatch = (type: string, payload?: UnknownRecord, domain?: ConfigDomain) => Promise<void>;
+/**
+ * One settings action, answering what became of it.
+ *
+ * ``true`` is Core taking the write; ``false`` is the strip stating why it did
+ * not.  A switch hands this answer to its control, which is what lets the box
+ * keep the value it was given for as long as the write is in flight and hand
+ * itself back to the state when the write is refused -- instead of guessing at
+ * a clock (see ``useChosenValue``).
+ */
+type Dispatch = (type: string, payload?: UnknownRecord, domain?: ConfigDomain) => Promise<boolean>;
 type ApplyProbedSurface = (providerId: string, modelId: string, surface: ProbeSurfaceName, options?: { confirmRecommendation?: boolean }) => Promise<boolean>;
 type NativeSecretClear = (options: {
   domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav";
@@ -3263,7 +3272,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   // revision, and that one rebase, so they never fail because another surface
   // advanced the shared revision first.
   const enqueueServiceDispatch = (type: string, payload: UnknownRecord = {}): Promise<IpcResults["dispatch"]> => enqueueDispatch(type, payload, null);
-  const dispatch: Dispatch = (type, payload = {}, targetDomain = domain) => run(async () => {
+  const dispatch: Dispatch = (type, payload = {}, targetDomain = domain) => runOutcome(async () => {
     const staged = await enqueueDispatch(type, payload, targetDomain);
     if (targetDomain === "codex" || targetDomain === "claude") {
       setSettingsRawReloadToken((current) => current + 1);
@@ -3274,7 +3283,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   // shell's auto-apply flush.
   // Refresh each committed action so toggles and pickers also project their
   // new Core state immediately instead of waiting for the disk watcher.
-  }, null, true);
+  }, null, true).then((staged) => staged !== undefined);
   const dispatchWithOutcome = async (type: string, payload: UnknownRecord = {}, targetDomain = domain, keepControlsEnabled = false): Promise<CoreSnapshot | undefined> => {
     // Keep a stable, narrowed domain for the asynchronous outcome projection.
     // `targetDomain` is optional on the public helper because most callers use
@@ -10124,7 +10133,7 @@ function ProviderIdentityFields({ provider, providerID, relayStations, station, 
   const providerAddressIsReference = providerBaseURL.trim().startsWith("os.environ/");
   const showBaseURL = Boolean(providerBaseURL.trim()) && !providerAddressIsReference;
   const providerTypeText = providerKindLabel(kind, translate);
-  const commitBaseURL = (endpoint: string): void | Promise<void> => {
+  const commitBaseURL = (endpoint: string): void | Promise<unknown> => {
     if (station) return undefined;
     const nextStation = relayStationForBaseUrl(endpoint, relayStations);
     if (nextStation) {
@@ -10158,7 +10167,7 @@ function ProviderIdentityFields({ provider, providerID, relayStations, station, 
     }
     return dispatch("provider.patch", { provider_id: providerID, changes });
   };
-  const commitName = (name: string): void | Promise<void> => {
+  const commitName = (name: string): void | Promise<unknown> => {
     const next = name.trim();
     if (!next || next === committedName.trim()) return undefined;
     return isLogin
@@ -11233,13 +11242,13 @@ function ClientBackendFields({ accessibilityPrefix, models, native, localApiActi
   /** What the off direction returns to; absent when nothing is remembered. */
   designatedSelection?: UnknownRecord;
   /** Absent for a client that keeps no model list of its own. */
-  modelList?: { enabled: boolean; onToggle: (enabled: boolean) => Promise<void> };
+  modelList?: { enabled: boolean; onToggle: (enabled: boolean) => void | Promise<unknown> };
   modelListHint?: string;
   busy: boolean;
   /** States a result the row could not perform where the window's strip reads it. */
   onStatus?: (message?: string) => void;
-  onUseLocalApi: (selection: UnknownRecord) => Promise<void>;
-  onUseSavedModel: (selection: UnknownRecord) => Promise<void>;
+  onUseLocalApi: (selection: UnknownRecord) => Promise<unknown>;
+  onUseSavedModel: (selection: UnknownRecord) => Promise<unknown>;
   translate: Translate;
 }): React.JSX.Element {
   const menuGroups = useMemo(() => savedRouteMenuGroups(models, translate), [models, translate]);
@@ -11277,14 +11286,13 @@ function ClientBackendFields({ accessibilityPrefix, models, native, localApiActi
   // A real two-way switch: on adopts this app's proxy through the row this app
   // owns, off puts the client back on the saved route the control names — the
   // remembered route, so unchecking opens no menu.
-  const toggleLocalApi = (enabled: boolean): void => {
+  const toggleLocalApi = (enabled: boolean): void | Promise<unknown> => {
     if (clientActionBusy || designateBusy) { assembleSwitch(); return; }
     if (enabled) {
       setClientActionBusy(true);
       // The proxy serves public model names, so adopting it also states the
       // route the client is leaving; that is what "off" returns to later.
-      void onUseLocalApi(designatedSelection ?? {}).finally(() => setClientActionBusy(false));
-      return;
+      return onUseLocalApi(designatedSelection ?? {}).finally(() => setClientActionBusy(false));
     }
     if (designatedSelection) { designateSavedModel(designatedSelection); return; }
     // Off with no destination remembered — a client this app adopted before it
@@ -11348,7 +11356,7 @@ function ClientBackendFields({ accessibilityPrefix, models, native, localApiActi
       onValueChange={(enabled) => {
         if (listBusy) return;
         setListBusy(true);
-        void modelList.onToggle(enabled).finally(() => setListBusy(false));
+        return Promise.resolve(modelList.onToggle(enabled)).finally(() => setListBusy(false));
       }}
       hint={modelListHint}
       translate={translate}
@@ -11375,7 +11383,8 @@ function ProxyScopedToggleField({ label, accessibilityLabel, value, proxyOnly, b
   /** True while the client points at this app's proxy. */
   proxyOnly: boolean;
   busy: boolean;
-  onValueChange: (enabled: boolean) => void;
+  /** Answers the write this switch started, so the knob holds until it settles. */
+  onValueChange: (enabled: boolean) => void | Promise<unknown>;
   hint?: string;
   translate: Translate;
 }): React.JSX.Element {
@@ -11402,7 +11411,8 @@ function ClientToggleField({ label, hint, accessibilityLabel, value, busy, onVal
   accessibilityLabel: string;
   value: boolean;
   busy: boolean;
-  onValueChange: (enabled: boolean) => void;
+  /** Answers the write this switch started (see ``ProxyScopedToggleField``). */
+  onValueChange: (enabled: boolean) => void | Promise<unknown>;
 }): React.JSX.Element {
   return <View style={SETTINGS_FIELD}>
     <View style={SETTINGS_FIELD_ROW_INDENTED}>
@@ -11472,25 +11482,25 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
   /** The saved route Codex is on, or the one it last left for this app. */
   codexRoute?: ClientRoute;
   standaloneSearch: boolean;
-  onToggleStandaloneSearch: (enabled: boolean) => Promise<void>;
+  onToggleStandaloneSearch: (enabled: boolean) => Promise<unknown>;
   codexFeatures?: UnknownRecord;
   clientProvider: string;
   clientModel: string;
   localApiActive: boolean;
-  onToggleCodexModelCatalog: (enabled: boolean) => Promise<void>;
-  onToggleCodexFeature: (feature: string, enabled: boolean) => Promise<void>;
-  onUseLocalApi: (selection: UnknownRecord) => Promise<void>;
-  onUseSavedModel: (selection: UnknownRecord) => Promise<void>;
+  onToggleCodexModelCatalog: (enabled: boolean) => Promise<unknown>;
+  onToggleCodexFeature: (feature: string, enabled: boolean) => Promise<unknown>;
+  onUseLocalApi: (selection: UnknownRecord) => Promise<unknown>;
+  onUseSavedModel: (selection: UnknownRecord) => Promise<unknown>;
   /** One entry per Claude app: its own switch, route, and model list. */
   claudeClients: Record<ClaudeClientApp, UnknownRecord>;
   claudeDesktopAvailable: boolean;
   claudeModels: UnknownRecord[];
-  onClaudeUseLocalApi: (app: ClaudeClientApp, selection: UnknownRecord) => Promise<void>;
-  onClaudeUseSavedModel: (app: ClaudeClientApp, selection: UnknownRecord) => Promise<void>;
-  onToggleClaudeModelList: (app: ClaudeClientApp, enabled: boolean) => Promise<void>;
-  onToggleClaudeNonstreamFallback: (enabled: boolean) => Promise<void>;
-  onToggleClaudeAutoMode: (enabled: boolean) => Promise<void>;
-  onToggleClaudeAutoMemory: (enabled: boolean) => Promise<void>;
+  onClaudeUseLocalApi: (app: ClaudeClientApp, selection: UnknownRecord) => Promise<unknown>;
+  onClaudeUseSavedModel: (app: ClaudeClientApp, selection: UnknownRecord) => Promise<unknown>;
+  onToggleClaudeModelList: (app: ClaudeClientApp, enabled: boolean) => Promise<unknown>;
+  onToggleClaudeNonstreamFallback: (enabled: boolean) => Promise<unknown>;
+  onToggleClaudeAutoMode: (enabled: boolean) => Promise<unknown>;
+  onToggleClaudeAutoMemory: (enabled: boolean) => Promise<unknown>;
   translate: Translate;
   ipc: IpcClient;
   filesToken: number;
@@ -11545,10 +11555,12 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
   // Core owns the value and the switch only guards the request while it is in
   // flight.
   const [catalogBusy, setCatalogBusy] = useState(false);
-  const toggleCatalog = (enabled: boolean): void => {
+  // The answer is the switch's own: a control holds the value it was given
+  // until the write answers, so the request's promise travels back to it.
+  const toggleCatalog = (enabled: boolean): Promise<unknown> | void => {
     if (catalogBusy) return;
     setCatalogBusy(true);
-    void onToggleCodexModelCatalog(enabled).finally(() => setCatalogBusy(false));
+    return onToggleCodexModelCatalog(enabled).finally(() => setCatalogBusy(false));
   };
   const claudeCode = asRecord(claudeClients.claudeCode);
   const claudeDesktop = asRecord(claudeClients.claudeDesktop);
@@ -11566,7 +11578,7 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
   // fan-out is stated once: a switch that reads "on" only when every app is on
   // must write to every app when it moves.
   const forEveryClaudeApp = async (
-    action: (app: ClaudeClientApp, selection: UnknownRecord) => Promise<void>,
+    action: (app: ClaudeClientApp, selection: UnknownRecord) => Promise<unknown>,
     selection: UnknownRecord,
   ): Promise<void> => {
     for (const { app } of claudeApps) await action(app, selection);
@@ -11638,7 +11650,7 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
             localApiActive={localApiActive}
             designatedRoute={localApiActive ? "" : codexRouteLabel}
             designatedSelection={codexRoute}
-            modelList={{ enabled: codexModelCatalogEnabled, onToggle: async (enabled) => toggleCatalog(enabled) }}
+            modelList={{ enabled: codexModelCatalogEnabled, onToggle: toggleCatalog }}
             modelListHint={translate("codex.modelCatalogHint")}
             busy={busy}
             onStatus={onStatus}
@@ -11676,7 +11688,7 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
                     accessibilityLabel={fullLabel}
                     value={codexFeatures?.[feature] === true}
                     disabled={busy}
-                    onValueChange={(enabled) => void onToggleCodexFeature(feature, enabled)}
+                    onValueChange={(enabled) => onToggleCodexFeature(feature, enabled)}
                     style={SETTINGS_FIELD_SWITCH_SLOT}
                   />
                 </View>
@@ -12001,10 +12013,13 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
       setServiceBusy(false);
     }
   };
-  const setAutoStart = async (enabled: boolean): Promise<void> => {
+  // Both switches answer for themselves: `setRequestedAutoStart` is this pane's
+  // own optimism, and the answered boolean hands the control back to the
+  // preference Core actually kept the moment the write is refused.
+  const setAutoStart = async (enabled: boolean): Promise<boolean> => {
     // A host with no login item (the browser page) has no switch to flip: its
     // toggle is drawn disabled and states the reason.
-    if (!snapshot || autoStartBusy || !native.setLaunchAtLogin) return;
+    if (!snapshot || autoStartBusy || !native.setLaunchAtLogin) return false;
     setAutoStartBusy(true);
     setRequestedAutoStart(enabled);
     // Pane results belong to the window's one permanent status strip, exactly
@@ -12033,16 +12048,18 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
       }
       onSnapshot(await ipc.snapshot());
       onStatus(translate("common.saved"));
+      return true;
     } catch (reason: unknown) {
       // Hand the switch back to the preference Core actually kept.
       setRequestedAutoStart(undefined);
       onStatus(errorMessage(reason, translate));
+      return false;
     } finally {
       setAutoStartBusy(false);
     }
   };
-  const setRunInBackground = async (enabled: boolean): Promise<void> => {
-    if (!snapshot || backgroundBusy) return;
+  const setRunInBackground = async (enabled: boolean): Promise<boolean> => {
+    if (!snapshot || backgroundBusy) return false;
     setBackgroundBusy(true);
     setRequestedBackground(enabled);
     // Pane results belong to the window's one permanent status strip, exactly
@@ -12064,10 +12081,12 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
         native.window.focus("home");
       }
       onStatus(translate("common.saved"));
+      return true;
     } catch (reason: unknown) {
       // Hand the switch back to the preference Core actually kept.
       setRequestedBackground(undefined);
       onStatus(errorMessage(reason, translate));
+      return false;
     } finally {
       setBackgroundBusy(false);
     }
@@ -12093,7 +12112,7 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
           <View style={SETTINGS_FIELD_ROW_INDENTED}>
             <Text style={SETTINGS_FIELD_LABEL}>{translate("general.autoStart")}</Text>
             <View style={SETTINGS_FIELD_CELL}>
-              <NativeToggle value={autoStartValue} disabled={autoStartBusy || busy || snapshot === undefined || !native.setLaunchAtLogin} accessibilityLabel={translate("general.autoStart")} onValueChange={(next) => { void setAutoStart(next); }} style={SETTINGS_FIELD_SWITCH_SLOT} />
+              <NativeToggle value={autoStartValue} disabled={autoStartBusy || busy || snapshot === undefined || !native.setLaunchAtLogin} accessibilityLabel={translate("general.autoStart")} onValueChange={setAutoStart} style={SETTINGS_FIELD_SWITCH_SLOT} />
             </View>
           </View>
           {/* A page has no login item to register. Saying so is the difference
@@ -12104,7 +12123,7 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
           <View style={SETTINGS_FIELD_ROW_INDENTED}>
             <Text style={SETTINGS_FIELD_LABEL}>{translate("general.runInBackground")}</Text>
             <View style={SETTINGS_FIELD_CELL}>
-              <NativeToggle value={backgroundValue} disabled={backgroundBusy || busy || snapshot === undefined} accessibilityLabel={translate("general.runInBackground")} onValueChange={(next) => { void setRunInBackground(next); }} style={SETTINGS_FIELD_SWITCH_SLOT} />
+              <NativeToggle value={backgroundValue} disabled={backgroundBusy || busy || snapshot === undefined} accessibilityLabel={translate("general.runInBackground")} onValueChange={setRunInBackground} style={SETTINGS_FIELD_SWITCH_SLOT} />
             </View>
           </View>
         </View>
@@ -12658,7 +12677,7 @@ type PendingTextFieldState = {
 // Ordinary text keeps its draft local for the short autosave quiet period,
 // then commits without requiring a blur or an explicit Apply. Blur, submit and
 // the shell's close/navigation flush remain immediate fallback commit points.
-function usePendingTextField(value: string, onCommit: (next: string) => void | Promise<void>, label: string, onDraftChange?: (next: string) => void, validate?: (next: string) => string | undefined): PendingTextFieldState {
+function usePendingTextField(value: string, onCommit: (next: string) => void | Promise<unknown>, label: string, onDraftChange?: (next: string) => void, validate?: (next: string) => string | undefined): PendingTextFieldState {
   const [draft, setDraft] = useState(value);
   const [error, setError] = useState<string>();
   const registry = useContext(PendingFieldContext);
@@ -12799,7 +12818,7 @@ function usePendingTextField(value: string, onCommit: (next: string) => void | P
   return { draft, error, onChangeText, commit, reset, resetTo, isDirty: () => dirtyRef.current, hasError: () => errorRef.current !== undefined };
 }
 
-function RuntimeValueField({ label, value, width, keyboardType, editable = true, validate, resetToken = 0, resetValue = "", onCommit, onErrorChange }: { label: string; value: string; width: "number" | "text"; keyboardType?: "default" | "numeric"; editable?: boolean; validate?: (next: string) => string | undefined; resetToken?: number; resetValue?: string; onCommit: (value: string) => void | Promise<void>; onErrorChange?: (message?: string) => void }): React.JSX.Element {
+function RuntimeValueField({ label, value, width, keyboardType, editable = true, validate, resetToken = 0, resetValue = "", onCommit, onErrorChange }: { label: string; value: string; width: "number" | "text"; keyboardType?: "default" | "numeric"; editable?: boolean; validate?: (next: string) => string | undefined; resetToken?: number; resetValue?: string; onCommit: (value: string) => void | Promise<unknown>; onErrorChange?: (message?: string) => void }): React.JSX.Element {
   const field = usePendingTextField(value, onCommit, label, undefined, validate);
   useEffect(() => { onErrorChange?.(field.error); }, [field.error, onErrorChange]);
   // A reset click replaces any uncommitted draft with the default value.
@@ -15982,7 +16001,7 @@ const ActionButton = React.forwardRef<HostInstance, { title: string; onPress: ()
   return <NativeButton ref={ref} title={title} disabled={disabled} busy={busy} primary={primary} destructive={danger} titleWidth={titleWidth} toolTip={toolTip} symbol={symbol} symbolWithTitle={symbolWithTitle} symbolTrailing={symbolTrailing} accessibilityLabel={accessibilityLabel} onPress={onPress} style={style} />;
 });
 
-function TextField({ label, value, onCommit, onDraftChange, hint, hintStyle, placeholder, secret, multiline, compactMultiline, keyboardType, stacked, labelWidth, labelAlign, controlWidth, labelVisible = true, suffix, disabled, validate, accessory, style }: { label: string; value: string; onCommit: (value: string) => void | Promise<void>; onDraftChange?: (value: string) => void; hint?: string; hintStyle?: StyleProp<TextStyle>; placeholder?: string; secret?: boolean; multiline?: boolean; compactMultiline?: boolean; keyboardType?: "default" | "numeric"; stacked?: boolean; labelWidth?: number; labelAlign?: "left" | "right"; controlWidth?: number; /** The caller renders the label itself (a stacked keys-editor row). */ labelVisible?: boolean; suffix?: string; disabled?: boolean; /** Commit-time validation: an invalid draft stays in the field with its message instead of reaching Core. */ validate?: (next: string) => string | undefined; /** A control that belongs to this row beside the field, such as its help mark. It rides the same grid level as PickerField's, so a field with an accessory and a picker with one draw the same column. */ accessory?: React.ReactNode; style?: StyleProp<ViewStyle> }): React.JSX.Element {
+function TextField({ label, value, onCommit, onDraftChange, hint, hintStyle, placeholder, secret, multiline, compactMultiline, keyboardType, stacked, labelWidth, labelAlign, controlWidth, labelVisible = true, suffix, disabled, validate, accessory, style }: { label: string; value: string; onCommit: (value: string) => void | Promise<unknown>; onDraftChange?: (value: string) => void; hint?: string; hintStyle?: StyleProp<TextStyle>; placeholder?: string; secret?: boolean; multiline?: boolean; compactMultiline?: boolean; keyboardType?: "default" | "numeric"; stacked?: boolean; labelWidth?: number; labelAlign?: "left" | "right"; controlWidth?: number; /** The caller renders the label itself (a stacked keys-editor row). */ labelVisible?: boolean; suffix?: string; disabled?: boolean; /** Commit-time validation: an invalid draft stays in the field with its message instead of reaching Core. */ validate?: (next: string) => string | undefined; /** A control that belongs to this row beside the field, such as its help mark. It rides the same grid level as PickerField's, so a field with an accessory and a picker with one draw the same column. */ accessory?: React.ReactNode; style?: StyleProp<ViewStyle> }): React.JSX.Element {
   const field = usePendingTextField(value, onCommit, label, onDraftChange, validate);
   return <View style={[styles.formRow, compactStyles.formRow, (stacked || multiline) && styles.formRowStacked, style]}>{labelVisible ? <Text style={[styles.formRowLabel, labelWidth === undefined ? null : { width: labelWidth }, labelAlign === undefined ? null : { textAlign: labelAlign }, (stacked || multiline) && styles.formRowLabelStacked]}>{label}</Text> : null}<View style={[controlWidth === undefined ? styles.formRowControl : styles.formRowControlFixed, compactStyles.formRowControl, controlWidth === undefined ? null : { width: controlWidth }]}><NativeTextField style={[styles.input, compactStyles.input, multiline && styles.textArea, compactMultiline && styles.compactTextArea, field.error !== undefined && styles.inputInvalid]} value={field.draft} placeholder={placeholder} editable={!disabled} onChangeText={field.onChangeText} onBlur={() => { if (!disabled) void field.commit().catch(() => undefined); }} onSubmitEditing={multiline ? undefined : () => { if (!disabled) void field.commit().catch(() => undefined); }} multiline={multiline} secureTextEntry={secret} autoCapitalize="none" autoCorrect={false} keyboardType={keyboardType} accessibilityLabel={label} />{hint ? <Text style={[styles.fieldHint, hintStyle]}>{hint}</Text> : null}{field.error !== undefined ? <Text style={[styles.fieldError, hintStyle]} accessibilityLiveRegion="polite">{field.error}</Text> : null}</View>{accessory ?? null}{suffix ? <Text style={[styles.fieldHint, hintStyle]}>{suffix}</Text> : null}</View>;
 }
