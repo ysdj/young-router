@@ -13,12 +13,12 @@ import threading
 import time
 from datetime import datetime, timezone
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 from ..log_tabs import LOG_TABS
 from ... import runtime_store
 from ..persistence import PersistenceError
-from ..security import REDACT_TEXT
+from ..security import REDACT_TEXT, safe_public
 from ...log_rotation import (
     LOG_BACKUP_SEGMENTS_ENV,
     LOG_MAX_BYTES_ENV,
@@ -93,6 +93,18 @@ LEADING_TIMESTAMP = re.compile(
     r"^\[(?P<bracket>[^\]]+)\]\s*|^(?:Updated\s+)?(?P<iso>\d{4}-\d{2}-\d{2}[T ][^\s]+)\s*"
 )
 TRACEBACK_START = re.compile(r"Traceback \(most recent call last\):", re.IGNORECASE)
+# The fields a trace row states its own moment in.  A row that carries none of
+# them takes the moment from the line's leading marker instead.
+TRACE_TIMESTAMP_FIELDS = (
+    "ts",
+    "timestamp",
+    "time",
+    "created_at",
+    "updated_at",
+    "checked_at",
+    "heartbeat_at",
+    "started_at",
+)
 TRACEBACK_TERMINAL = re.compile(
     r"^(?:[A-Za-z_][\w.]*(?:Error|Exception|Interrupt|Exit)|Error|Exception):\s*",
     re.IGNORECASE,
@@ -1966,6 +1978,30 @@ class LogsDomain:
         # keep the already projected window for the lines before it.
         self._request_tail_lock = threading.Lock()
         self._request_tail: dict[str, Any] = {}
+        # 路由跟踪 reads the service log, which is appended to many times a
+        # second while the tab polls every five seconds.  Keep the rows the
+        # last poll projected and read only the bytes appended since, so a poll
+        # is the size of what arrived instead of the size of the log.
+        self._trace_tail_lock = threading.Lock()
+        self._trace_tail: dict[str, Any] = {}
+
+    def _public_station_record(self, record: dict[str, Any] | None) -> dict[str, Any] | None:
+        """One station row, sanitized as ``log_view`` publishes a view.
+
+        The built-in tabs build every row they store from their own fields,
+        and every string in it has already been through ``REDACT_TEXT`` (the
+        request/route-trace/recovery projectors run each value through
+        ``_safe_scalar``, the text tabs redact each line), so those rows are
+        already what a window may see.  A relay's usage row is the one record
+        this domain copies from a remote answer: its key names and values are
+        the station's, so it takes the full envelope rule here, once per read,
+        instead of leaving that walk to every poll.
+        """
+
+        if record is None:
+            return None
+        sanitized = safe_public(record)
+        return sanitized if isinstance(sanitized, dict) else None
 
     def _project_request_line(
         self,
@@ -2434,6 +2470,157 @@ class LogsDomain:
             records = [record for record in records if needle in str(record).casefold()]
         return _sort_records_by_time(records)
 
+    def _route_trace_records(
+        self,
+        lines: list[str],
+        configured_deployments: Mapping[str, Mapping[str, str]],
+    ) -> list[dict[str, Any]]:
+        """Project the trace rows among ``lines`` (other service output ignored)."""
+
+        configured_public_models = _configured_public_models_from(configured_deployments)
+        configured_route_models = _configured_route_public_models_from(configured_deployments)
+        records: list[dict[str, Any]] = []
+        for line in lines:
+            if "litellm_route_trace" not in line:
+                continue
+            try:
+                parsed: object = json.loads(line.split("litellm_route_trace ", 1)[-1])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(parsed, Mapping):
+                continue
+            if not any(parsed.get(key) not in (None, "") for key in TRACE_TIMESTAMP_FIELDS):
+                timestamp = _leading_timestamp(line)
+                if timestamp:
+                    parsed = {**parsed, "timestamp": timestamp}
+            # Every string in the row has passed ``REDACT_TEXT`` here (via
+            # ``_safe_scalar``), so the tab stores what a window may see and
+            # ``log_view`` does not walk the rows again.
+            record = _safe_route_trace_record(
+                parsed,
+                configured_public_models,
+                configured_route_models,
+            )
+            if record:
+                records.append(record)
+        return records
+
+    def _read_appended_lines(self, path: Path, offset: int) -> tuple[list[str], int]:
+        """The complete lines written after ``offset``, and the offset past them.
+
+        A writer can be halfway through a row when this runs, so only the bytes
+        up to the last newline are returned and claimed; the rest is read by the
+        next poll as part of the row it belongs to.  Reading the fragment now
+        would drop that row: the line would never be complete on any later
+        read.
+        """
+
+        try:
+            with path.open("rb") as handle:
+                handle.seek(offset)
+                data = handle.read(self.maximum_read_bytes)
+        except FileNotFoundError:
+            return [], offset
+        except OSError:
+            raise LogsDomainError("Log source is unavailable") from None
+        end = data.rfind(b"\n") + 1
+        if end == 0:
+            # One line longer than the whole read budget could never be parsed
+            # as a row here; step past it so the next poll is not stuck on it.
+            return [], offset + (len(data) if len(data) >= self.maximum_read_bytes else 0)
+        return data[:end].decode("utf-8", errors="replace").splitlines(), offset + end
+
+    def _route_trace_view(self, path: Path) -> tuple[bool, list[object]]:
+        """The 路由跟踪 tab, reading only what the service log appended.
+
+        ``server.log`` takes many appends a second while this tab polls every
+        five, and every trace row is projected from a whole-document read in
+        the older shape: 16 MB of bytes, split, filtered, parsed and redacted
+        again for rows that had not moved.  The rows a previous poll already
+        projected are kept here, and a poll reads the bytes written since the
+        last complete line it saw.  A rotation (another inode) or a clear is a
+        rebuild, because that is when the segments the tab shows change.
+        """
+
+        tab = "route-trace"
+        line_limit = self._line_limit(tab)
+        configured_deployments = _configured_deployments(self.config_path)
+        cursor = self._file_cursor(path)
+        cleared = tab in self._cleared
+        # The rows depend on the configuration (it names the public model), on
+        # the limit the pane asks for, and on where a clear started; a tail
+        # built under another of those is not this view's window.
+        key = (
+            str(path),
+            line_limit,
+            _configuration_signature(self.config_path),
+            self._clear_cursors.get(tab) if cleared else None,
+        )
+        if cleared:
+            with self._trace_tail_lock:
+                self._trace_tail = {}
+        else:
+            with self._trace_tail_lock:
+                tail = self._trace_tail
+                reusable = (
+                    tail.get("key") == key
+                    and cursor[1] is not None
+                    and tail.get("inode") == cursor[:2]
+                    and isinstance(tail.get("offset"), int)
+                    and isinstance(cursor[3], int)
+                    and tail["offset"] <= cursor[3]
+                )
+                if reusable:
+                    offset = cast(int, tail["offset"])
+                    records = list(tail["records"])
+                    if cursor[3] > offset:
+                        lines, offset = self._read_appended_lines(path, offset)
+                        records.extend(self._route_trace_records(lines, configured_deployments))
+                        records = records[-line_limit:]
+                        self._trace_tail = {
+                            "key": key,
+                            "inode": cursor[:2],
+                            "offset": offset,
+                            "records": records,
+                        }
+                    return self._finish_route_trace(records, path, line_limit)
+        # A first read, a read after rotation, or a cleared tab: project the
+        # retained segments.  Filtering across both of them keeps an old trace
+        # from disappearing as soon as enough ordinary service output is
+        # written.
+        lines = (
+            self._lines_for_cleared_file(tab, path, all_lines=True)
+            if cleared
+            else self._read_current_and_previous_lines(path)
+        )
+        records = self._route_trace_records(lines, configured_deployments)[-line_limit:]
+        with self._trace_tail_lock:
+            self._trace_tail = {
+                "key": key,
+                "inode": cursor[:2],
+                "offset": cursor[3] if isinstance(cursor[3], int) else 0,
+                "records": records,
+            }
+        return self._finish_route_trace(records, path, line_limit)
+
+    def _finish_route_trace(
+        self,
+        records: list[object],
+        path: Path,
+        line_limit: int,
+    ) -> tuple[bool, list[object]]:
+        """Apply this view's filter and window to the rows the tail holds."""
+
+        needle = self._filters.get("route-trace", "").casefold()
+        if needle:
+            records = [
+                record
+                for record in records
+                if _record_matches_filter(record, needle, tab="route-trace")
+            ]
+        available = path.exists() or path.with_name(f"{path.name}.1").exists()
+        return available, _sort_records_by_time(records)[-line_limit:]
+
     def _records(self, tab: str) -> tuple[bool, list[object]]:
         if tab == "online-usage":
             # The rows held here are exactly one page, read from the station at
@@ -2515,109 +2702,35 @@ class LogsDomain:
                 _sort_records_by_time(records)[-self._line_limit(tab) :],
             )
         if tab == "route-trace":
-            # Route traces are sparse relative to the ordinary proxy output.
-            # Filter across both retained rotation segments before applying the
-            # view limit, otherwise an old trace disappears as soon as enough
-            # non-trace service output is written.
-            lines = (
-                self._lines_for_cleared_file(tab, path, all_lines=True)
-                if tab in self._cleared
-                else self._read_current_and_previous_lines(path)
-            )
-            lines = [line for line in lines if "litellm_route_trace" in line]
-        else:
-            line_limit = (
-                min(MAX_LINES, self._line_limit(tab) * 4)
-                if tab == "service"
-                else self._line_limit(tab)
-            )
-            lines = (
-                self._lines_for_cleared_file(tab, path, line_limit=line_limit)
-                if tab in self._cleared
-                else self._read_lines(path, line_limit=line_limit)
-            )
+            return self._route_trace_view(path)
+        line_limit = (
+            min(MAX_LINES, self._line_limit(tab) * 4)
+            if tab == "service"
+            else self._line_limit(tab)
+        )
+        lines = (
+            self._lines_for_cleared_file(tab, path, line_limit=line_limit)
+            if tab in self._cleared
+            else self._read_lines(path, line_limit=line_limit)
+        )
         if tab == "service":
             # ``_group_service_lines`` already drops the route trace, the
             # startup banner, and the console noise; the repeats left behind
             # are the per-worker copies of one event.
             lines = _collapse_service_repeats(_group_service_lines(lines))
-        configured_deployments = (
-            _configured_deployments(self.config_path)
-            if tab in {"requests", "route-trace"}
-            else {}
-        )
-        configured_public_models = _configured_public_models_from(configured_deployments)
-        configured_route_models = _configured_route_public_models_from(
-            configured_deployments
-        )
         records: list[object] = []
         for line in lines:
             if not line.strip():
                 continue
-            parsed: object | None = None
-            if tab in {"requests", "route-trace"}:
-                try:
-                    source = line
-                    if tab == "route-trace":
-                        source = line.split("litellm_route_trace ", 1)[-1]
-                    parsed = json.loads(source)
-                except (TypeError, json.JSONDecodeError):
-                    parsed = None
-            if isinstance(parsed, Mapping):
-                if tab == "route-trace" and not any(
-                    parsed.get(key) not in (None, "")
-                    for key in (
-                        "ts",
-                        "timestamp",
-                        "time",
-                        "created_at",
-                        "updated_at",
-                        "checked_at",
-                        "heartbeat_at",
-                        "started_at",
-                    )
-                ):
-                    timestamp = _leading_timestamp(line)
-                    if timestamp:
-                        parsed = {**parsed, "timestamp": timestamp}
-                record = (
-                    _safe_request_record(
-                        parsed,
-                        configured_public_models,
-                        configured_route_models,
-                    )
-                    if tab == "requests"
-                    else _safe_route_trace_record(
-                        parsed,
-                        configured_public_models,
-                        configured_route_models,
-                    )
-                )
-                if record:
-                    records.append(record)
-            elif tab == "service":
+            if tab == "service":
                 # ``_group_service_lines`` already stripped the ANSI sequences
                 # and redacted each row, so the same regex work is not spent a
                 # second time across up to four line limits of rows.
                 records.append(line[:MAX_TEXT_LOG_CHARS])
-            elif tab not in {"requests", "route-trace"}:
+            else:
                 records.append(
                     REDACT_TEXT(ANSI_CONTROL_SEQUENCE.sub("", line))[:MAX_TEXT_LOG_CHARS]
                 )
-        if tab == "requests":
-            records = _collapse_request_records(records)
-            self._refresh_runtime_settings()
-            stale_seconds = self._request_stale_seconds
-            if stale_seconds > 0:
-                now = time.time()
-                records = [
-                    _close_stale_request_record(
-                        record,
-                        stale_seconds=stale_seconds,
-                        now=now,
-                    )
-                    for record in records
-                ]
         needle = self._filters.get(tab, "").casefold()
         if needle:
             records = [
@@ -2625,12 +2738,7 @@ class LogsDomain:
                 for record in records
                 if _record_matches_filter(record, needle, tab=tab)
             ]
-        available = (
-            runtime_store.has_records(path)
-            if tab == "requests"
-            else path.exists() or (tab == "route-trace" and path.with_name(f"{path.name}.1").exists())
-        )
-        return available, _sort_records_by_time(records)[-self._line_limit(tab) :]
+        return path.exists(), _sort_records_by_time(records)[-self._line_limit(tab) :]
 
     def _source_signature(self, tab: str) -> tuple[object, ...]:
         if tab == "recovery":
@@ -2867,14 +2975,19 @@ class LogsDomain:
                     # what it really returns: a 38 890-row account whose feed
                     # answers 100 rows a page has 389 pages, not 130.
                     self._online_usage_applied_rows[source_id] = applied_rows
+            # A station's row is the one record this domain does not build from
+            # its own fields, so it is sanitized here, once per read: the same
+            # rule ``log_view`` applies to an envelope, which is why the view it
+            # answers does not have to walk these rows again.
             answered_rows = [
-                dict(value)
+                self._public_station_record(dict(value))
                 if isinstance(value, Mapping)
                 else {"detail": REDACT_TEXT(str(value))[:512]}
                 for value in values
                 if (isinstance(value, Mapping) and value)
                 or (isinstance(value, str) and value.strip())
-            ][-self._line_limit(tab) :]
+            ]
+            answered_rows = [row for row in answered_rows if row][-self._line_limit(tab) :]
             # A station that could not be read is not a station with no history:
             # keeping the last good page is what stops one failed poll from
             # blanking a table that was already on screen.  Only that relay's
@@ -3081,6 +3194,8 @@ class LogsDomain:
         self._source_signatures.clear()
         with self._request_tail_lock:
             self._request_tail = {}
+        with self._trace_tail_lock:
+            self._trace_tail = {}
         self._view_revisions = {
             tab: self._view_revisions.get(tab, 0) + 1 for tab in LOG_TABS
         }

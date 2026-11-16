@@ -12,6 +12,7 @@ from unittest import mock
 from young_router import runtime_store
 from young_router.core import CoreIPCClient, CoreIPCServer, CoreStore
 from young_router.core.domains.logs import MAX_FILTER_CHARS, MAX_VIEW_BYTES, LOG_TABS, LogsDomain, LogsDomainError
+from young_router.core.security import safe_public
 from young_router.core.service import LOG_TABS as CORE_LOG_TABS
 
 
@@ -182,6 +183,170 @@ class LogsDomainTests(unittest.TestCase):
             self.assertNotIn(secret, snapshot_text)
             self.assertNotIn(str(root), snapshot_text)
             self.assertNotIn("private request", snapshot_text)
+
+    def test_every_row_a_log_tab_holds_is_already_a_public_projection(self) -> None:
+        """A tab's rows are fixed points of the rule ``log_view`` publishes.
+
+        ``log_view`` used to walk the finished view through ``safe_public`` on
+        every poll: 1.6 s of Core time for a 4 700-row 请求 view on the gateway
+        (2026-11-16), spent re-redacting strings the projector had already
+        redacted and returning the same bytes.  The rows are sanitized where
+        they are built instead, so this pins the invariant that lets the IPC
+        boundary sanitize the envelope only.  A new record field that skips the
+        rule fails here rather than in a window.
+        """
+
+        secret = "sk-synthetic-view-secret"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            route_key = f"model=public-chat / provider=p / upstream=openai/public-chat / key={secret}"
+            (root / "recent-requests.jsonl").write_text(
+                json.dumps(
+                    {
+                        "ts": "2026-08-01T04:10:00Z",
+                        "request_id": "view-secret",
+                        "status": "success",
+                        "public_model": "public-chat",
+                        "provider": f"p {secret}",
+                        "api_key_name": secret,
+                        "upstream_model": "openai/public-chat",
+                        "route_key": route_key,
+                        "duration_ms": 12,
+                        "usage": {"prompt_tokens": 3, "cache_write_tokens": 7},
+                        "error": {"reason": f"failed at {root} {secret}"},
+                        "aborted": {"reason": f"closed {secret}"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "server.log").write_text(
+                "[2026-08-01T04:10:01Z] litellm_route_trace "
+                + json.dumps(
+                    {
+                        "timestamp": "2026-08-01T04:10:01Z",
+                        "event": "probe",
+                        "public_model": f"public-chat {secret}",
+                        "route_key": route_key,
+                        "detail": f"failed at {root} token={secret}",
+                        "request_id": "trace-secret",
+                        "deployment_id": "public-chat",
+                        "candidates": [{"id": "a", "route_key": route_key}],
+                    }
+                )
+                + "\n"
+                + f"[2026-08-01T04:10:02Z] INFO: using {root}/config.yaml token={secret}\n",
+                encoding="utf-8",
+            )
+            (root / "actions.log").write_text(
+                f"[2026-08-01T04:10:03Z] [INFO] opened file {root}/config.yaml key={secret}\n",
+                encoding="utf-8",
+            )
+            runtime = root / ".litellm-runtime"
+            runtime.mkdir()
+            (runtime / "route-recovery-state.json").write_text(
+                json.dumps(
+                    {
+                        "recoveries": {
+                            route_key: {
+                                "last_failure_at": "2026-08-01T04:10:04Z",
+                                "failure": f"{root} {secret}",
+                                "status": "recovering",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            domain = LogsDomain(root)
+
+            for tab in ("requests", "route-trace", "service", "actions", "recovery"):
+                log = domain.view(tab)["log"]
+                rendered = json.dumps(log, ensure_ascii=False)
+                self.assertNotIn(secret, rendered, tab)
+                self.assertNotIn(str(root), rendered, tab)
+                self.assertEqual(safe_public(log), log, tab)
+
+            # The cache counters are quantities the row states, not credentials:
+            # the envelope rule used to rewrite this one as the presence marker.
+            self.assertEqual(
+                7,
+                domain.view("requests")["log"]["records"][0]["usage"]["cache_write_tokens"],
+            )
+
+    def test_a_relays_usage_row_is_sanitized_before_the_view_holds_it(self) -> None:
+        """The one record a tab copies from a remote answer takes the rule too.
+
+        Built-in rows are projected field by field, but a station's usage row
+        arrives with its own key names.  It is sanitized once, when the page is
+        read, instead of leaving that walk to every poll.
+        """
+
+        class Reader:
+            def refresh(self, source_id: str | None = None) -> list[dict[str, str]]:
+                return [
+                    {
+                        "timestamp": "2026-08-01T04:10:00Z",
+                        "model": "public-chat",
+                        "api_key": "sk-synthetic-station-secret",
+                        "access_token": "synthetic-station-token",
+                        "document": "whole document",
+                        "file_path": "/Users/somebody/private.log",
+                        "local_path": "/Users/somebody/other.log",
+                        "notes": "failed at /Users/somebody/private.log",
+                    }
+                ]
+
+            def sources(self) -> list[dict[str, str]]:
+                return [{"id": "one", "label": "relay-one"}]
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = LogsDomain(directory, online_usage_reader=Reader())
+            domain.dispatch("logs.refresh_online_usage", {"tab": "online-usage", "source": "one"})
+            row = domain.view("online-usage")["log"]["records"][0]
+
+            self.assertEqual("configured", row["api_key"])
+            self.assertEqual("configured", row["access_token"])
+            self.assertEqual("configured", row["document"])
+            # A path-named field states presence; a path written inside a text
+            # value is masked where it appears.
+            self.assertEqual("configured", row["file_path"])
+            self.assertEqual("configured", row["local_path"])
+            self.assertIn("<private-path>", row["notes"])
+            self.assertEqual("public-chat", row["model"])
+            self.assertEqual(safe_public(row), row)
+
+    def test_a_log_view_sanitizes_the_envelope_not_every_row_again(self) -> None:
+        """A poll is the size of the envelope, not the size of the table.
+
+        The full-view second pass was measured at 1.6 s of Core time per read
+        of a 4 700-row 请求 tab on the gateway (2026-11-16).  The rows are
+        sanitized where they are built and copied here, so the envelope rule
+        runs a handful of times per view instead of once per cell.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "recent-requests.jsonl").write_text(
+                "".join(
+                    json.dumps({"ts": f"2026-08-01T04:10:{index:02d}Z", "request_id": f"r{index}", "status": "success"})
+                    + "\n"
+                    for index in range(200)
+                ),
+                encoding="utf-8",
+            )
+            core = CoreStore(domains=[LogsDomain(root)])
+
+            with mock.patch(
+                "young_router.core.service._safe_public",
+                wraps=safe_public,
+            ) as envelope:
+                tab = core.log_view("requests")["log"]
+
+            self.assertEqual(200, tab["line_count"])
+            # One call per envelope field, never one per row (200 rows of
+            # seven fields would be more than a thousand).
+            self.assertLess(envelope.call_count, 40)
 
     def test_redacts_generic_sensitive_key_value_log_forms(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1184,6 +1349,93 @@ model_list:
             self.assertEqual(
                 ["[2026-08-01T04:10:11Z] INFO: Started server process [101] (×3)"],
                 records,
+            )
+
+    def test_a_route_trace_poll_reads_only_the_bytes_the_log_appended(self) -> None:
+        """An append is a new trace; a poll never re-reads the segment.
+
+        server.log takes many appends a second while 路由跟踪 polls every five
+        seconds, and the tab re-read 16 MB, split, filtered, parsed and
+        re-projected every trace on every poll (1.9 s of Core time per window
+        on the gateway, 2026-11-16).  What a previous poll projected is kept,
+        and the read is the bytes written since the last complete line.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / "server.log"
+            log.write_text(
+                "".join(
+                    f"[2026-08-01T04:10:1{index}Z] litellm_route_trace "
+                    + json.dumps({"timestamp": f"2026-08-01T04:10:1{index}Z", "event": "probe"})
+                    + "\n"
+                    for index in range(2)
+                )
+                + "ordinary service output\n",
+                encoding="utf-8",
+            )
+            domain = LogsDomain(root)
+            self.assertEqual(2, domain.view("route-trace")["log"]["line_count"])
+
+            with open(log, "a", encoding="utf-8") as handle:
+                handle.write(
+                    "[2026-08-01T04:10:13Z] litellm_route_trace "
+                    + json.dumps({"timestamp": "2026-08-01T04:10:13Z", "event": "probe"})
+                    + "\n"
+                )
+            with mock.patch.object(
+                domain,
+                "_read_current_and_previous_lines",
+                wraps=domain._read_current_and_previous_lines,
+            ) as rebuilt:
+                tab = domain.view("route-trace")["log"]
+                rebuilt.assert_not_called()
+            self.assertEqual(
+                ["2026-08-01T04:10:10Z", "2026-08-01T04:10:11Z", "2026-08-01T04:10:13Z"],
+                [record["timestamp"] for record in tab["records"]],
+            )
+
+            # A writer halfway through a row leaves it for the poll that sees
+            # its newline: reading the fragment here would drop the record.
+            complete = (
+                "[2026-08-01T04:10:14Z] litellm_route_trace "
+                + json.dumps({"timestamp": "2026-08-01T04:10:14Z", "event": "probe"})
+            )
+            with open(log, "a", encoding="utf-8") as handle:
+                handle.write(complete[:30])
+            self.assertEqual(3, domain.view("route-trace")["log"]["line_count"])
+            with open(log, "a", encoding="utf-8") as handle:
+                handle.write(complete[30:] + "\n")
+            tab = domain.view("route-trace")["log"]
+            self.assertEqual(4, tab["line_count"])
+            self.assertEqual("2026-08-01T04:10:14Z", tab["records"][-1]["timestamp"])
+
+            # A filter narrows the rows already held; it is not a reason to
+            # read the log again (the same rule the 请求 tab follows).
+            domain.dispatch("logs.set_filter", {"tab": "route-trace", "filter": "2026-08-01T04:10:11"})
+            with mock.patch.object(
+                domain,
+                "_read_current_and_previous_lines",
+                side_effect=AssertionError("unexpected rebuild"),
+            ):
+                self.assertEqual(
+                    ["2026-08-01T04:10:11Z"],
+                    [record["timestamp"] for record in domain.view("route-trace")["log"]["records"]],
+                )
+
+            # Rotation is a rebuild: the rows of the new segment are not
+            # appended to an offset that now belongs to another file.
+            log.rename(root / "server.log.1")
+            log.write_text(
+                "[2026-08-01T04:10:15Z] litellm_route_trace "
+                + json.dumps({"timestamp": "2026-08-01T04:10:15Z", "event": "probe"})
+                + "\n",
+                encoding="utf-8",
+            )
+            domain.dispatch("logs.set_filter", {"tab": "route-trace", "filter": ""})
+            self.assertEqual(
+                ["2026-08-01T04:10:10Z", "2026-08-01T04:10:11Z", "2026-08-01T04:10:13Z", "2026-08-01T04:10:14Z", "2026-08-01T04:10:15Z"],
+                [record["timestamp"] for record in domain.view("route-trace")["log"]["records"]],
             )
 
     def test_a_route_trace_record_is_never_split_by_a_quoted_timestamp(self) -> None:

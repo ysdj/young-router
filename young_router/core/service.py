@@ -50,7 +50,7 @@ from .protocol import (
     make_patch_event,
     make_resync_event,
 )
-from .security import REDACTED, _key_text, redact, safe_exception_message, safe_error_message
+from .security import REDACTED, copy_public_rows, safe_exception_message, safe_error_message, safe_public as _safe_public
 from ..public_names import display_upstream_model
 
 
@@ -375,53 +375,42 @@ class FileCapabilityRegistry:
         return item.path
 
 
+def _safe_log_envelope(result: object) -> object:
+    """Sanitize a log view's envelope; its rows are already what a window sees.
+
+    A log tab builds its rows from its own fields, and every string in one has
+    been through ``REDACT_TEXT`` by the time the tab stores it (the projectors
+    redact each value, the text tabs redact each line).  The one row that comes
+    from a relay's own answer -- 在线用量 -- takes this same envelope rule when
+    that page is read, because its key names are the station's.  What is left
+    for this boundary is the envelope: the tab's flags, its filter, its relay
+    choices.  The rows are copied so a window can never mutate Core's stored
+    view, but they are not re-redacted: that second walk was 1.6 s per poll of
+    a 4 700-row view on the gateway (2026-11-16) and returned the same bytes.
+    """
+
+    if not isinstance(result, Mapping):
+        return _safe_public(result)
+    safe: dict[str, Any] = {}
+    for key, value in result.items():
+        if key != "log" or not isinstance(value, Mapping):
+            safe[str(key)] = _safe_public(value)
+            continue
+        log: dict[str, Any] = {}
+        for name, item in value.items():
+            if name == "records" and isinstance(item, list):
+                log[str(name)] = copy_public_rows(item)
+                continue
+            log[str(name)] = _safe_public(item)
+        safe[str(key)] = log
+    return safe
+
+
 def _canonical_domain(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise CoreError("invalid_domain", "A settings domain is required")
     clean = value.strip()
     return _DOMAIN_ALIASES.get(clean, clean)
-
-
-def _safe_public(value: object) -> object:
-    """Redact secrets, paths, and raw config-like fields in a snapshot."""
-
-    if isinstance(value, Mapping):
-        result: dict[str, Any] = {}
-        for key, item in value.items():
-            key_text = _key_text(key)
-            # Raw editor text and complete documents are available only through
-            # an explicit trusted editor operation, never in ``snapshot``.
-            if key_text in {
-                "raw",
-                "raw_text",
-                "raw_json",
-                "config_text",
-                "auth_text",
-                "settings_text",
-                "source_text",
-                "document",
-                "config_document",
-                "private_path",
-                "file_path",
-            }:
-                if item in (None, "", False, [], {}):
-                    result[str(key)] = item
-                else:
-                    result[str(key)] = REDACTED
-                continue
-            result[str(key)] = _safe_public(redact(item, _key=key))
-        return result
-    if isinstance(value, list):
-        return [_safe_public(item) for item in value]
-    if isinstance(value, tuple):
-        return [_safe_public(item) for item in value]
-    # Every mapping and sequence above was rebuilt, and ``redact`` returned a
-    # scalar leaf verbatim in this projection.  An immutable scalar therefore
-    # needs no copy; anything else (a set, an arbitrary object) still does, so
-    # the snapshot can never hand a caller Core's own mutable state.
-    if value is None or value is True or value is False or type(value) is int or type(value) is float or type(value) is str:
-        return value
-    return copy.deepcopy(value)
 
 
 # What each domain's action answer may leave in the snapshot's
@@ -3348,7 +3337,13 @@ class CoreStore:
                 raise
             except Exception as exc:
                 raise CoreError("logs_unavailable", safe_exception_message(exc)) from None
-            safe_result = _safe_public(result)
+            # A tab stores rows that already passed the redaction rule when
+            # they were built (see ``LogsDomain``), so the envelope is what this
+            # boundary still sanitizes.  Walking every row again cost 1.6 s per
+            # poll of a 4 700-row 请求 tab on the gateway (2026-11-16) and
+            # produced the same bytes; the rows are copied, not re-redacted, so
+            # a window still cannot mutate Core's own state.
+            safe_result = _safe_log_envelope(result)
             if not isinstance(safe_result, Mapping):
                 raise CoreError("logs_unavailable", "Logs are unavailable")
             return dict(safe_result)
