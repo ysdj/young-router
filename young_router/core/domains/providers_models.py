@@ -1398,7 +1398,7 @@ class ProvidersModelsDomain:
 
         value = runtime_setting_text(MODEL_CONCURRENCY_SETTING_KEY)
         parsed = _int_or_none(value)
-        return parsed if parsed is not None and 0 <= parsed <= MODEL_CONCURRENCY_MAX else 16
+        return parsed if parsed is not None and 0 <= parsed <= MODEL_CONCURRENCY_MAX else 128
 
     def _context_registry(self):
         """The read-only registry that resolves public-model metadata.

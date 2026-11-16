@@ -1937,6 +1937,10 @@ class HookRoutingTests(HookTestCase):
             ),
             (hooks._RECOVERY_MAX_SECONDS_ENV, hooks._RECOVERY_MAX_DEFAULT_SECONDS),
             (hooks._RECOVERY_INTERVAL_SECONDS_ENV, hooks._RECOVERY_INTERVAL_DEFAULT_SECONDS),
+            (
+                hooks.MODEL_CONCURRENCY_LIMIT_ENV,
+                hooks.MODEL_CONCURRENCY_LIMIT_DEFAULT,
+            ),
         )
         for key, actual in pairs:
             with self.subTest(key=key):
