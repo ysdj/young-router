@@ -4263,6 +4263,9 @@ class CoreStore:
         unreadable there, and the station's page cannot be served under this
         app's origin).  What it can do is ask the Core beside it — same
         machine, same person — to open that page in a real browser.  The
+        address is the station's sign-in form, not its origin: a sub2api
+        station answers `GET /` with a marketing home whose own 登录 link is a
+        second click (`relay_browser.sign_in_url`).  The
         window is the station's own, so a captcha, a code, or a redirect works
         exactly as it does in any browser; Core then reads the session that
         browser holds and finishes the same verified-login boundary the native
@@ -4305,7 +4308,7 @@ class CoreStore:
                 pass
         try:
             browser = relay_browser.launch(
-                origin.strip(),
+                relay_browser.sign_in_url(origin.strip()),
                 profile_root=profile_root,
                 account_id=str(account_id),
                 embedded=embedded,

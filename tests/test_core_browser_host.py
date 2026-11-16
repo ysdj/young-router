@@ -1377,6 +1377,52 @@ class BrowserRelaySignInTests(unittest.TestCase):
         # A login id this Core never minted answers nothing.
         self.assertIsNone(self.core.relay_browser_mirror("not-a-login"))
 
+    def test_a_sign_in_window_opens_the_form_and_not_the_stations_home(self) -> None:
+        """Measured 2026-11-16 on api.sisct2.xyz: `/` is the marketing home.
+
+        The window opened on the origin drew "SISCT2API — Subscription to API
+        Conversion Platform" with a 立即开始 button and no field to sign in
+        with, while the form is one route further at `/login`.  Both relay
+        families this app signs in to serve it there and the macOS host has
+        opened that path since 36ae051; Core opened the origin, so the page
+        host showed a sign-in dialog nobody could sign in through.
+        """
+
+        browser = mock.Mock()
+        browser.browser.name = "Chromium"
+        browser.mirror = None
+        browser.expired = False
+        opened: list[str] = []
+        with mock.patch.object(relay_browser, "unavailable_reason", return_value=""), \
+             mock.patch.object(relay_browser, "launch", side_effect=lambda url, **_: (opened.append(url), browser)[1]):
+            answered = self.core.start_relay_browser_login(
+                account_id="login-browser-0123456789abcdef",
+                account_type="sub2api",
+                label="Page Station",
+                origin="https://relay.example.test",
+                pending_account=True,
+                page_is_local=True,
+            )
+        self.assertEqual("waiting", answered["status"])
+        self.assertEqual(["https://relay.example.test/login"], opened)
+        # The stored origin stays the origin: it is the base every read is
+        # built from (`/api/user/self`, the key page), and a login address kept
+        # there would turn every one of them into `/login/api/...`.
+        self.assertEqual("https://relay.example.test", self.core._browser_logins[answered["login_id"]]["origin"])
+
+    def test_the_sign_in_address_keeps_a_base_path_and_never_doubles_the_leaf(self) -> None:
+        for origin, expected in (
+            ("https://relay.example.test", "https://relay.example.test/login"),
+            ("https://relay.example.test/", "https://relay.example.test/login"),
+            ("https://example.test/relay", "https://example.test/relay/login"),
+            ("https://example.test/relay/", "https://example.test/relay/login"),
+            ("https://example.test/relay/login", "https://example.test/relay/login"),
+            ("http://127.0.0.1:8642", "http://127.0.0.1:8642/login"),
+            ("", ""),
+        ):
+            with self.subTest(origin=origin):
+                self.assertEqual(expected, relay_browser.sign_in_url(origin))
+
     def test_a_host_with_no_browser_answers_which_capability_is_missing(self) -> None:
         with mock.patch.object(relay_browser, "unavailable_reason", return_value="no_browser"):
             answered = self.core.start_relay_browser_login(
