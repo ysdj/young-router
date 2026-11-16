@@ -1730,13 +1730,24 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("anchor: { x, y, width, height }", ui)
         self.assertNotIn("tabs.measureInWindow", ui)
         self.assertIn("func showActionMenu(title: String, items: [String], anchor: [String: NSNumber])", mac)
-        self.assertIn("menu.popUp(positioning: nil, at: point, in: contentView)", mac)
-        self.assertIn("let pointY = contentView.isFlipped ? y + height : y", mac)
+        # Both menus open at the measured rectangle: the flat one used to hand
+        # the raw Y to popUp while the grouped one converted it, so the two
+        # halves of the same control disagreed about where a menu belongs.
+        self.assertEqual(
+            mac.count("at: menuAnchorPoint(contentView: contentView, anchor: anchor)"),
+            2,
+        )
+        self.assertNotIn("at: point, in: contentView", mac)
+        # The measured rectangle is the only anchor; a pointer reading put the
+        # menu under the mouse and broke keyboard and accessibility presses.
         self.assertNotIn("NSEvent.mouseLocation", mac)
+        self.assertNotIn("pointer.y", mac)
+        self.assertIn("let belowButton = contentView.isFlipped", mac)
+        self.assertIn("bounds.maxY - (anchorY + anchorHeight)", mac)
         self.assertIn("anchor:(NSDictionary *)anchor", mac_bridge)
         self.assertIn("showActionMenu:items:anchor:resolver:rejecter:", mac_module)
         self.assertIn("NativeMenuAnchor anchor", windows_header)
-        # The grouped menu adds one submenu per provider; the pointer decides
+        # The grouped menu groups by provider; the measured anchor decides
         # where it opens so it stays under the button that asked for it.
         self.assertIn("showGroupedActionMenu?(title: string, groups:", bridge)
         self.assertIn("showGroupedActionMenu: async (title, groups, anchor)", platform)
@@ -1757,9 +1768,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn(".sectionHeader(title: entry.0)", mac)
         self.assertIn("header.isEnabled = false", mac)
         # "Below" is +y only in a flipped view: the settings shell's backdrop
-        # is unflipped, so the same sum moved the menu up over its button.
+        # is unflipped, so the same sum has to be mirrored to land below the
+        # button instead of above it.
         self.assertIn(
-            "let below = contentView.isFlipped ? pointer.y + anchorHeight : pointer.y",
+            "let belowButton = contentView.isFlipped",
             mac,
         )
         self.assertIn('symbolName = @"chevron.up.chevron.down";', mac_controls)
