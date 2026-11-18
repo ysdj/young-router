@@ -1988,6 +1988,54 @@ class LinkedEditResolvesFromTheKeyItAlreadyHolds(unittest.TestCase):
                 {item["code"] for item in providers.snapshot()["binding_issues"]},
             )
 
+    def test_a_validation_refusal_survives_the_rollback_that_erased_it(self) -> None:
+        """The strip can name the row that refused a rolled-back Apply.
+
+        Core records the refusal on the draft it is about to roll back, and the
+        rollback restores the draft the user started from -- which validates
+        again.  Asking the restored draft why the write failed answered "valid",
+        so the window could only say 校验未通过 with no row marked and nothing
+        the user could act on.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            http = RelayCoordinatorHTTP()
+            relay = RelayAccountsDomain(root, http_client=http)
+            providers = ProvidersModelsDomain(root / "config.yaml")
+            core = CoreStore(domains=[relay, providers])
+            self._linked_provider_core(core, relay)
+            self._add_linked_model(core, providers, "public-chat", "model-a")
+            core.apply("providers_models", revision=core.revision)
+            # A name can be cleared in the field before Apply: the row is
+            # staged, the preflight refuses to render it, and the rollback
+            # restores the name that was there.
+            provider = providers.snapshot()["providers"][0]
+            core.dispatch(
+                {
+                    "domain": "providers_models",
+                    "type": "model.patch",
+                    "payload": {
+                        "provider_id": provider["name"],
+                        "model_id": provider["models"][-1]["editor_id"],
+                        "patch": {"model_name": ""},
+                    },
+                },
+                expected_revision=core.revision,
+            )
+
+            with self.assertRaises(CoreError) as raised:
+                core.apply("providers_models", revision=core.revision)
+
+            self.assertEqual("provider_model_invalid", raised.exception.code)
+            validation = core.snapshot()["drafts"]["providers_models"]["validation"]
+            self.assertFalse(validation["valid"])
+            self.assertEqual(
+                {"model_name_required"},
+                {item["code"] for item in validation["issues"]},
+            )
+            self.assertIn(".models[", validation["issues"][0]["path"])
+
     def test_a_station_rename_renames_the_provider_slot_that_binds_the_key(self) -> None:
         """A key the station renamed is the same key, under the station's name.
 

@@ -51,6 +51,7 @@ export type TranslationKey =
   | "validation.modelUpstreamRequired"
   | "validation.modelProviderKeyMissing"
   | "validation.modelMultiplierMissing"
+  | "validation.modelCredentialRequired"
   | "validation.invalidSyntax"
   | "validation.issueAt"
   | "validation.moreIssues"

@@ -48,6 +48,7 @@ export const en: Record<TranslationKey, string> = {
   "validation.modelUpstreamRequired": "This model needs an upstream model.",
   "validation.modelProviderKeyMissing": "The key \"{key}\" this model selects is unavailable.",
   "validation.modelMultiplierMissing": "The linked relay group has no usable multiplier.",
+  "validation.modelCredentialRequired": "Select a provider key or sign in to an account for this model.",
   "validation.invalidSyntax": "The configuration syntax is invalid.",
   "validation.issueAt": "{path}: {message}",
   "validation.moreIssues": "(and {count} more)",

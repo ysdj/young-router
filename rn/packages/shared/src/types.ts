@@ -493,6 +493,13 @@ export interface CoreSnapshot {
    * predates the field, where the two are always the same.
    */
   projected_revision?: number;
+  /**
+   * Which Core process answered.  A revision orders writes inside one process
+   * only: a replacement Core starts again at zero, and a window that kept the
+   * old number would have every write refused as a conflict.  The shared
+   * client adopts the new head when this changes.  Absent from an older Core.
+   */
+  core_instance_id?: string;
   service: ServiceStatus;
   providers_models: ProvidersModelsSummary;
   drafts: Partial<Record<ConfigDomain, DraftState>>;

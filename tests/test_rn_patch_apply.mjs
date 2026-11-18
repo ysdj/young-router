@@ -281,6 +281,19 @@ assert.equal(kept.projected_revision, 8, "the newer projection gave up its revis
 assert.equal(kept.revision, applied.revision, "the head moved without a newer read");
 assert.equal(mergeSnapshot(applied, applied), applied, "an unchanged state was rebuilt");
 
+// A window left open across a Core replacement holds a revision the new
+// process will never reach: revisions only order writes inside one process.
+// The instance id is the only thing that tells that restart apart from a late
+// answer, and the new process's state has to be adopted whole -- otherwise
+// every write made on the old number is refused as a conflict forever.
+const restartedCore = {
+  ...snapshotAt(1, [{ ...provider, id: "provider-after-restart", editor_id: "provider-after-restart" }]),
+  core_instance_id: "core-two",
+};
+const adopted = mergeSnapshot({ ...applied, core_instance_id: "core-one" }, restartedCore);
+assert.equal(adopted.revision, 1, "the restarted Core's head was refused as an older read");
+assert.equal(adopted.domains.providers_models.providers[0].id, "provider-after-restart", "the restarted Core's projection was not adopted");
+
 // ---------------------------------------------------------------------------
 // The per-domain store: one reference per domain, one notify per moved domain.
 // ---------------------------------------------------------------------------

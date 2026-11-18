@@ -87,9 +87,20 @@ export function snapshotProjectionRevision(snapshot: CoreSnapshot | undefined): 
  *
  * ``held`` is returned unchanged when ``next`` advances neither half; that is
  * the common keep-alive case and it keeps every domain subscriber quiet.
+ *
+ * A revision only orders writes inside one Core process.  A replacement Core
+ * starts at zero again, so a window left open across a restart holds a number
+ * the new process will never reach; comparing the two halves would then keep
+ * the dead process's state forever, and every write made on it is refused as
+ * a conflict for a change that never happened.  The instance id on the
+ * snapshot is what tells the two apart, and a changed id adopts ``next``
+ * whole.
  */
 export function mergeSnapshot(held: CoreSnapshot | undefined, next: CoreSnapshot): CoreSnapshot {
   if (!held) return next;
+  const heldInstance = held.core_instance_id;
+  const nextInstance = next.core_instance_id;
+  if (heldInstance && nextInstance && heldInstance !== nextInstance) return next;
   const heldProjection = snapshotProjectionRevision(held) ?? held.revision;
   const nextProjection = snapshotProjectionRevision(next) ?? next.revision;
   const heldHasNewerProjection = heldProjection > nextProjection;

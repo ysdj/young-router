@@ -1612,6 +1612,7 @@ function validationIssueMessageKey(code: string): string | undefined {
     case ["model", "upstream", "required"].join("_"): return "validation.modelUpstreamRequired";
     case ["model", "provider", "key", "missing"].join("_"): return "validation.modelProviderKeyMissing";
     case ["model", "multiplier", "missing"].join("_"): return "validation.modelMultiplierMissing";
+    case ["model", "credential", "required"].join("_"): return "validation.modelCredentialRequired";
     case ["invalid", "syntax"].join("_"): return "validation.invalidSyntax";
     default: return undefined;
   }
@@ -3186,8 +3187,8 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       } catch (reason: unknown) {
         const code = stringValue(asRecord(reason).code);
         if (code !== "unsupported_method" && code !== "invalid_domain" && code !== "domain_unavailable") throw reason;
-        const whole = await ipc.snapshot();
-        revision.current = Math.max(revision.current ?? -1, whole.revision);
+        const whole = mergeSnapshot(latestSnapshot.current, await ipc.snapshot());
+        revision.current = whole.revision;
         latestSnapshot.current = whole;
         onSnapshot(whole);
         return {
@@ -3255,7 +3256,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
 
   const refresh = async (): Promise<CoreSnapshot> => {
     const next = mergeSnapshot(latestSnapshot.current, await ipc.snapshot());
-    revision.current = Math.max(revision.current ?? -1, next.revision);
+    revision.current = next.revision;
     latestSnapshot.current = next;
     onSnapshot(next);
     return latestSnapshot.current ?? next;
@@ -3275,9 +3276,22 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       const preferred: ConfigDomain[] = code === "provider_model_invalid" || code === "apply_failed"
         ? [domain ?? "providers_models"]
         : domain ? [domain] : ["providers_models", "relay_accounts", "codex", "claude", "clients", "runtime", "webdav"];
-      // Some coordinated relay failures happen during preflight, before the
-      // ordinary domain validator is called. Ask Core for that summary here so
-      // the failed draft still carries a precise issue for the UI to render.
+      // Core keeps the validation that refused the Apply across its rollback,
+      // and that summary is the only one describing the draft the user still
+      // holds.  Read it first: asking for a fresh `validate` would re-check the
+      // restored draft, overwrite that answer with "valid", and the strip would
+      // show 校验未通过 with no row and no reason.
+      const next = mergeSnapshot(latestSnapshot.current, await ipc.snapshot());
+      revision.current = next.revision;
+      latestSnapshot.current = next;
+      onSnapshot(next);
+      for (const name of preferred) {
+        const message = validationSummaryMessage(next.drafts[name]?.validation, translate);
+        if (message) return message;
+      }
+      // A coordinated relay failure can happen during preflight, before the
+      // ordinary domain validator ran on the draft the window holds. Ask Core
+      // for that summary as the fallback.
       let validatedMessage: string | undefined;
       for (const name of preferred) {
         try {
@@ -3292,16 +3306,6 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
           // A domain that is not part of this transaction must not hide the
           // validation detail from the domain that is.
         }
-      }
-      // Apply records the issue before returning its error. Read that same
-      // snapshot so the strip and alertRowKeys describe the failed draft.
-      const next = await ipc.snapshot();
-      revision.current = Math.max(revision.current ?? -1, next.revision);
-      latestSnapshot.current = next;
-      onSnapshot(next);
-      for (const name of preferred) {
-        const message = validationSummaryMessage(next.drafts[name]?.validation, translate);
-        if (message) return message;
       }
       return validatedMessage;
     } catch {
@@ -3660,7 +3664,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
         const next = await ipc.diskState(monitoredDiskDomains);
         if (!active) return;
         const previous = latestSnapshot.current;
-        revision.current = Math.max(revision.current ?? -1, next.revision);
+        revision.current = next.revision;
         const diskStateChanged = monitoredDiskDomains.some((diskDomain) =>
           !sameDiskState(previous?.disk[diskDomain], next.disk[diskDomain]),
         );
@@ -3669,9 +3673,9 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
           // Only materialize the full snapshot when the cheap disk probe found
           // a change that the editor actually needs to render.
           try {
-            const refreshed = await ipc.snapshot();
+            const refreshed = mergeSnapshot(latestSnapshot.current, await ipc.snapshot());
             if (!active) return;
-            revision.current = Math.max(revision.current ?? -1, refreshed.revision);
+            revision.current = refreshed.revision;
             latestSnapshot.current = refreshed;
             currentDisk = refreshed.disk;
             onSnapshot(refreshed);
@@ -3740,8 +3744,8 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     }, "common.reloaded");
   };
   const resolveRawEditorConflict = useCallback<RawEditorConflictHandler>(async (editorDomain, _document) => {
-    const refreshed = await ipc.snapshot();
-    revision.current = Math.max(revision.current ?? -1, refreshed.revision);
+    const refreshed = mergeSnapshot(latestSnapshot.current, await ipc.snapshot());
+    revision.current = refreshed.revision;
     latestSnapshot.current = refreshed;
     onSnapshot(refreshed);
     const diskState = refreshed.disk[editorDomain];
@@ -3755,8 +3759,8 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       if (diskChanged) {
         const reloaded = await ipc.reload(editorDomain, refreshed.revision);
         revision.current = reloaded.revision;
-        const after = await ipc.snapshot();
-        revision.current = Math.max(revision.current ?? -1, after.revision);
+        const after = mergeSnapshot(latestSnapshot.current, await ipc.snapshot());
+        revision.current = after.revision;
         latestSnapshot.current = after;
         onSnapshot(after);
         setKeptDiskGeneration((current) => ({ ...current, [editorDomain]: undefined }));
@@ -8633,8 +8637,16 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // route, not the pane, is what refused the write.
   const bindingIssueFor = useCallback((model: UnknownRecord): UnknownRecord | undefined => bindingIssueRow(bindingIssues, model), [bindingIssues]);
   const alertModelKeys = useMemo(
-    () => modelRowKeys(models.filter((item) => modelNeedsAttention(item, translate) || Boolean(bindingIssueFor(item))).map(editorIdentifier)),
-    [bindingIssueFor, modelRowKeys, models, translate],
+    () => modelRowKeys(models.filter((item, index) => (
+      modelNeedsAttention(item, translate)
+      || Boolean(bindingIssueFor(item))
+      // Core's refusal names the route by its position in this provider, so
+      // the row that refused the write is marked here, not only in 路由.  A
+      // validation failure used to leave this table unmarked: the strip said
+      // 校验未通过 and the row the user had just touched looked fine.
+      || validationIssues.some((issue) => validationIssueMatchesModel(issue, provider ?? {}, index))
+    )).map(editorIdentifier)),
+    [bindingIssueFor, modelRowKeys, models, provider, translate, validationIssues],
   );
   // Where a model is listed more than once, the copy that was pressed is the
   // one that reads as selected — the group's own listing when the user picked

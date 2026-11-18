@@ -5424,14 +5424,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('selected === "requests" ? REQUEST_LOG_POLL_MS', self.ui)
         self.assertIn('selected === "online-usage" ? ONLINE_USAGE_POLL_MS : LOG_VIEW_POLL_MS', self.ui)
         self.assertIn("const next = await ipc.diskState(monitoredDiskDomains);", self.ui)
-        self.assertIn("const refreshed = await ipc.snapshot();", self.ui)
+        self.assertIn("const refreshed = mergeSnapshot(latestSnapshot.current, await ipc.snapshot());", self.ui)
         disk_watcher = self.ui.split("const monitoredDiskDomains = useMemo", 1)[1].split("const discardPendingFields", 1)[0]
         self.assertNotIn("const next = await ipc.snapshot();", disk_watcher)
         self.assertIn("const diskStateChanged = monitoredDiskDomains.some", self.ui)
         self.assertIn("function sameDiskState(left: DiskState | undefined, right: DiskState | undefined)", self.ui)
         self.assertIn("if (!previous || diskStateChanged)", self.ui)
         self.assertIn("if (hasPendingFieldEdits()) return;", self.ui)
-        self.assertIn("revision.current = Math.max(revision.current ?? -1, next.revision);", self.ui)
+        self.assertIn("revision.current = next.revision;", self.ui)
         self.assertIn("This timer exists to observe external file changes", self.ui)
 
     def test_raw_editors_surface_loading_staging_and_failures_without_replacing_the_editor(self) -> None:
@@ -9171,7 +9171,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("function bindingIssueRow(bindingIssues: UnknownRecord[], model: UnknownRecord): UnknownRecord | undefined {", self.ui)
         self.assertIn("if (issueModel && issueModel === modelID) return true;", self.ui)
         self.assertIn("return Boolean(issueKey) && issueKey === keyID;", self.ui)
-        self.assertIn("() => modelRowKeys(models.filter((item) => modelNeedsAttention(item, translate) || Boolean(bindingIssueFor(item))).map(editorIdentifier)),", self.ui)
+        self.assertIn("() => modelRowKeys(models.filter((item, index) => (", self.ui)
+        self.assertIn("|| validationIssues.some((issue) => validationIssueMatchesModel(issue, provider ?? {}, index))", self.ui)
         self.assertIn("alertRowKeys={alertRouteKeys}", self.ui)
         self.assertIn('<Text style={styles.fieldHint}>{bindingIssueText}</Text>', self.ui)
         # A relay key is a row in the provider's key table too, and the reason
@@ -9824,7 +9825,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('model: { name, upstream_model: name, enabled: true, order: 0,', workspace)
         self.assertNotIn('enabled: false, order: 0', workspace)
         self.assertIn("if (isDraftModel(model, translate)) return true;", self.ui)
-        self.assertIn("(item) => modelNeedsAttention(item, translate) || Boolean(bindingIssueFor(item))", self.ui)
+        self.assertIn("modelNeedsAttention(item, translate)", self.ui)
+        self.assertIn("Boolean(bindingIssueFor(item))", self.ui)
+        self.assertIn("validationIssues.some((issue) => validationIssueMatchesModel(issue, provider ?? {}, index))", self.ui)
         self.assertIn("asRecords(item.models).some((model) => modelNeedsAttention(model, translate) || bindingIssueRow(bindingIssues, model) !== undefined)", self.ui)
         for locale in (self.zh, self.en):
             self.assertIn('"providers.draftModelHint"', locale)
@@ -10392,7 +10395,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # the entry instead of asking the user to hunt for it.
         self.assertIn("function modelNeedsAttention(model: UnknownRecord, translate: Translate): boolean {", self.ui)
         self.assertIn(
-            "() => modelRowKeys(models.filter((item) => modelNeedsAttention(item, translate) || Boolean(bindingIssueFor(item))).map(editorIdentifier)),",
+            "() => modelRowKeys(models.filter((item, index) => (",
+            self.ui,
+        )
+        self.assertIn(
+            "|| validationIssues.some((issue) => validationIssueMatchesModel(issue, provider ?? {}, index))",
             self.ui,
         )
         # A freshly created row is enabled and still carries the placeholder

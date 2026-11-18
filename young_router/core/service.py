@@ -1463,6 +1463,13 @@ class CoreStore:
         # makes it the one a test replaced by the time the window expires.
         self._emitter = CoalescingEmitter(lambda: self._emit())
         self._revision = 0
+        # Which Core process answered this snapshot.  A revision only orders
+        # writes inside one process: a replacement Core starts again at zero,
+        # so a window left open across a restart holds a number this Core will
+        # never reach.  Sending it back conflicts every write forever, and the
+        # client cannot tell that from a real concurrent edit.  This identity
+        # lets the client adopt the new head instead; see ``mergeSnapshot``.
+        self._core_instance_id = uuid.uuid4().hex
         # The newest revision a change to a settings document produced.  A
         # staged write is stale only against this one: see ``_check_revision``.
         self._settings_advanced_at = 0
@@ -3238,6 +3245,7 @@ class CoreStore:
             # revision and chains patches on the second.
             "revision": self._revision,
             "projected_revision": self._revision,
+            "core_instance_id": self._core_instance_id,
             "service": copy.deepcopy(_safe_public(self._service)),
             "providers_models": copy.deepcopy(domains["providers_models"]),
             "drafts": copy.deepcopy(self._drafts),
@@ -7973,6 +7981,12 @@ class CoreStore:
         relay_locally_applied = False
         applied: list[str] = []
         operation_total = 0
+        # The validation that refuses this Apply, kept across the rollback.
+        # ``restore_local_state`` restores the drafts too, so a refusal recorded
+        # on the failed draft would disappear before the window can read it --
+        # every validation failure then reached the strip as a bare 校验未通过
+        # with no row marked.  Publish these after the restore instead.
+        captured_validation: dict[str, Any] = {}
 
         def restore_local_state() -> None:
             _restore_files(file_checkpoints)
@@ -8008,7 +8022,10 @@ class CoreStore:
                     # contract, then run the strict validator after private
                     # material is injected and before any local write.
                     preflight = getattr(adapters[name], "validate_relay_preflight", None)
-                    if not callable(preflight) or preflight().get("valid") is not True:
+                    summary = preflight() if callable(preflight) else None
+                    if not isinstance(summary, Mapping) or summary.get("valid") is not True:
+                        if isinstance(summary, Mapping):
+                            captured_validation[name] = summary
                         raise CoreError("provider_model_invalid", "Fix the provider/model issues")
                     continue
                 if relay_dependency_only and name == "relay_accounts":
@@ -8016,7 +8033,9 @@ class CoreStore:
                     # work, so the station's session state and its outstanding
                     # operations are not this edit's validation.
                     continue
-                if not self.validate(name)["valid"]:
+                summary = self.validate(name)
+                if not summary["valid"]:
+                    captured_validation[name] = summary
                     if name == "relay_accounts" and "providers_models" in adapters:
                         # The relay's preflight is the journal: pending key
                         # creates, a session that needs a sign-in, a target
@@ -8243,6 +8262,11 @@ class CoreStore:
                         )
                 validation = self.validate("providers_models")
                 if not validation["valid"]:
+                    # The strict validator runs on the *materialized* draft.
+                    # That refusal is the one the station's own answer caused,
+                    # and the rollback is about to restore a draft that
+                    # validates again, so keep the summary for the strip.
+                    captured_validation["providers_models"] = validation
                     # Name the cause: this message is all the pane can show, and
                     # "Fix the linked model issues" over an empty table told
                     # nobody which row refused the write.
@@ -8388,9 +8412,10 @@ class CoreStore:
                     rollback_failed = True
                 if rollback_failed:
                     raise CoreError("apply_failed", "Settings could not be rolled back") from None
+                self._mark_refused_draft(transaction_adapters)
+                self._overlay_captured_validation(captured_validation)
                 if isinstance(exc, CoreError):
                     raise
-                self._mark_refused_draft(transaction_adapters)
                 raise CoreError("apply_failed", safe_exception_message(exc)) from None
 
             # Remote work may have succeeded even if the network connection
@@ -8428,6 +8453,23 @@ class CoreStore:
             "pending_operations": 0,
             "issues": [],
         }
+
+    def _overlay_captured_validation(self, captured: Mapping[str, Any]) -> None:
+        """Publish the validation that refused an Apply after its rollback.
+
+        The rollback restores the drafts the user was holding before the
+        attempt, and with them the *previous* validation answer -- which is
+        usually valid.  A window asking why the write failed then read a clean
+        draft and could only say 校验未通过 with nothing marked.  These summaries
+        describe the draft that actually refused, so they are the answer the
+        strip and ``alertRowKeys`` need.
+        """
+
+        for name, summary in captured.items():
+            record = self._drafts.get(name)
+            if record is None:
+                continue
+            record["validation"] = _validation_summary(summary)
 
     def _mark_refused_draft(self, adapters: Mapping[str, DomainAdapter]) -> None:
         """Record why a rolled-back draft could not be written, on its own rows.
@@ -8662,6 +8704,10 @@ class CoreStore:
                 persistence_paths.append(self._metadata_store.path)
             file_checkpoints = _checkpoint_files(persistence_paths)
             applied: list[str] = []
+            # See the relay coordinator: a validation refusal is recorded on the
+            # draft that is about to be rolled back, so keep its summary here
+            # and publish it after the restore.
+            captured_validation: dict[str, Any] = {}
             try:
                 for name in names:
                     if f"overwrite_external_{name}" not in overwrite_codes:
@@ -8684,7 +8730,9 @@ class CoreStore:
                 for name in names:
                     if name in _VALIDATES_ON_APPLY:
                         continue
-                    if not self.validate(name)["valid"]:
+                    summary = self.validate(name)
+                    if not summary["valid"]:
+                        captured_validation[name] = summary
                         raise CoreError("validation_failed", "Fix the validation errors")
                 for name in names:
                     adapter = adapters[name]
@@ -8742,18 +8790,16 @@ class CoreStore:
                 self._disk_identities = core_checkpoint["disk_identities"]
                 if rollback_failed:
                     raise CoreError("apply_failed", "Settings could not be rolled back") from None
+                self._mark_refused_draft(transaction_adapters)
+                self._overlay_captured_validation(captured_validation)
                 codes = getattr(exc, "codes", None)
                 if isinstance(codes, Sequence) and not isinstance(codes, (str, bytes, bytearray)):
                     raise ConfirmationNeeded(str(item) for item in codes) from None
                 if isinstance(exc, CoreError):
                     raise
-                # A domain that refuses its own draft says so with rows, not
-                # with a sentence: the pane marks the route or key that refuses
-                # (``alertRowKeys``) and the strip states the outcome once.  A
-                # bare rollback reported 更改未生效 with nothing marked, so the
-                # row the user had just touched — the ＋ that started this
-                # write — looked like the one that failed.
-                self._mark_refused_draft(transaction_adapters)
+                # A refusal that was not a validation or domain error is a
+                # rolled-back write; the rows it named were already published
+                # above.
                 raise CoreError("apply_failed", safe_exception_message(exc)) from None
             should_emit = True
             response = {

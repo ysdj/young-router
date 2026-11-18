@@ -853,6 +853,23 @@ class CoreProtocolTests(unittest.TestCase):
 
 
 class CorePersistenceAndStoreTests(unittest.TestCase):
+    def test_each_core_process_states_which_instance_answered(self) -> None:
+        """A revision orders writes inside one process, and nothing more.
+
+        A window left open across a Core replacement holds a number the new
+        process will never reach.  The instance id is what lets the shared
+        client adopt the new head instead of sending that dead number back and
+        having every write refused as a conflict forever.
+        """
+
+        first = CoreStore(domains=[MemoryDomain("probe")])
+        identity = first.snapshot()["core_instance_id"]
+        self.assertIsInstance(identity, str)
+        self.assertTrue(identity)
+        self.assertEqual(identity, first.snapshot()["core_instance_id"])
+        second = CoreStore(domains=[MemoryDomain("probe")])
+        self.assertNotEqual(identity, second.snapshot()["core_instance_id"])
+
     def test_multidomain_apply_rolls_back_files_state_metadata_and_events(self) -> None:
         class FileDomain(MemoryDomain):
             def __init__(self, name: str, path: Path, *, fail: bool = False):
