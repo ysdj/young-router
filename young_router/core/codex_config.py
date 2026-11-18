@@ -484,37 +484,37 @@ def local_api_key(config: dict[str, Any]) -> str:
 #: A listing entry's own modality, as LiteLLM resolves it from the upstream
 #: model name (``create_model_info_response`` reads ``mode`` off the model
 #: metadata).  It is the one statement in the listing that says a route answers
-#: images rather than text, so it is what keeps an image generator out of a
-#: client's model picker without touching ``/v1/models`` itself -- the router
-#: keeps publishing the route, and only the pickers this app writes skip it.
-_IMAGE_LISTING_MODE_MARKER = "image"
-
-
-def _listing_entry_is_image_model(item: Any) -> bool:
-    """Whether one ``/v1/models`` entry states that it generates images."""
+#: images or video rather than text, so it is what keeps a generator out of a
+#: client's model picker without touching ``/v1/models`` itself for every other
+#: client -- the router keeps publishing the route, and only the pickers this
+#: app writes skip it.
+def _listing_entry_is_generation_model(item: Any) -> bool:
+    """Whether one ``/v1/models`` entry states that it generates media."""
 
     if not isinstance(item, dict):
         return False
-    mode = item.get("mode")
-    return isinstance(mode, str) and _IMAGE_LISTING_MODE_MARKER in mode.strip().lower()
+    from .model_catalog import listing_mode_serves_generation
+
+    return listing_mode_serves_generation(item.get("mode"))
 
 
-def _public_catalog_is_image_model(name: str) -> bool:
-    """Whether the public catalogs say this route serves only images.
+def _public_catalog_is_generation_model(name: str) -> bool:
+    """Whether the public catalogs say this route serves only media generation.
 
     The listing's own ``mode`` is LiteLLM's inference, and it is absent for a
     route whose upstream name no installed cost map knows.  The public catalogs
-    (pi.dev, models.dev) state the modality independently, and
-    ``model_catalog._route_is_image_model`` already reads them for the Codex
-    catalog entry, so the same answer narrows this list too.  A registry that
-    cannot be built is not evidence of a text model: the answer is ``False`` and
-    the listing's own ``mode`` remains the only filter on this path.
+    (pi.dev, models.dev) and LiteLLM's cost map state the modality
+    independently, and ``model_catalog.route_serves_only_generation`` already
+    reads them for the Codex catalog entry, so the same answer narrows this list
+    too.  A registry that cannot be built is not evidence of a text model: the
+    answer is ``False`` and the listing's own ``mode`` remains the only filter
+    on this path.
     """
 
     try:
         from . import model_catalog as _model_catalog
 
-        return _model_catalog.route_serves_only_images(name)
+        return _model_catalog.route_serves_only_generation(name)
     except Exception:
         return False
 
@@ -602,13 +602,14 @@ def _local_model_listing(
 def _usable_listing_name(item: object) -> str | None:
     """One listing row's public name, or ``None`` for a row a picker must skip.
 
-    Image generators are dropped here, and only here: ``/v1/models`` keeps
-    publishing them, while every picker this app writes is built from what these
-    functions answer.  A generator cannot be selected into a conversation (it is
-    reached through the client's own image tool, not by naming it as the model),
-    so listing it offered a choice that could only fail; the request log for
-    ``gpt-image-2.5-sunburst`` showed the client sending a full coding-agent tool
-    set to a route that answers ``{"size":"1024x1024"...}`` instead.
+    Image and video generators are dropped here, and only here: ``/v1/models``
+    keeps publishing them to clients outside Claude, while every picker this app
+    writes is built from what these functions answer.  A generator cannot be
+    selected into a conversation (it is reached through the client's own media
+    tool, not by naming it as the model), so listing it offered a choice that
+    could only fail; the request log for ``gpt-image-2.5-sunburst`` showed the
+    client sending a full coding-agent tool set to a route that answers
+    ``{"size":"1024x1024"...}`` instead.
     """
 
     value = item.get("id") if isinstance(item, dict) else item
@@ -617,7 +618,7 @@ def _usable_listing_name(item: object) -> str | None:
     name = value.strip()
     if not name or len(name) > 256 or any(ord(char) < 32 for char in name):
         return None
-    if _listing_entry_is_image_model(item) or _public_catalog_is_image_model(name):
+    if _listing_entry_is_generation_model(item) or _public_catalog_is_generation_model(name):
         return None
     return name
 
@@ -633,14 +634,15 @@ def local_exposed_models(
     authentication, response-shape, or size failure therefore produces no
     exposed models.
 
-    An image generation route is dropped here, and only here: ``/v1/models``
-    keeps publishing it, while every picker this app writes -- the managed Codex
-    catalog and both Claude lists -- is built from what this function answers.
-    A generator cannot be selected into a conversation (it is reached through
-    the client's own image tool, not by naming it as the model), so listing it
-    offered a choice that could only fail; the request log for
-    ``gpt-image-2.5-sunburst`` showed the client sending a full coding-agent tool
-    set to a route that answers ``{"size":"1024x1024"...}`` instead.
+    A media generation route is dropped here, and only here: ``/v1/models``
+    keeps publishing it for clients outside Claude, while every picker this app
+    writes -- the managed Codex catalog and both Claude lists -- is built from
+    what this function answers.  A generator cannot be selected into a
+    conversation (it is reached through the client's own image or video tool,
+    not by naming it as the model), so listing it offered a choice that could
+    only fail; the request log for ``gpt-image-2.5-sunburst`` showed the client
+    sending a full coding-agent tool set to a route that answers
+    ``{"size":"1024x1024"...}`` instead.
 
     The answer is ordered by public name, case-insensitively, and that is the
     only order in it: every picker this app writes -- the managed Codex catalog
@@ -677,9 +679,9 @@ def configured_exposed_models(config: object) -> list[str]:
     read as "no models" and the list would be left stale or erased.
 
     The filters are the same ones: an enabled route, one row per public name,
-    image generators out (a generator is reached through the client's own image
-    tool, never by naming it as the model), ordered by name so every picker puts
-    a route in the same place.
+    image and video generators out (a generator is reached through the client's
+    own media tool, never by naming it as the model), ordered by name so every
+    picker puts a route in the same place.
     """
 
     providers = _get_mapping(config.get("providers")) if isinstance(config, dict) else {}

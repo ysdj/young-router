@@ -2073,7 +2073,7 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
       field.Text(winrt::hstring(name));
       field.TextWrapping(xaml::TextWrapping::Wrap);
       field.Foreground(theme_brush(L"TextFillColorPrimaryBrush", winrt::Windows::UI::Color{255, 30, 30, 30}));
-      controls::ToolTipService::SetToolTip(field, winrt::box_value(winrt::hstring(name)));
+      // The name wraps, so it is never cut: there is nothing a hover could add.
       models_stack.Children().Append(field);
     }
   };
@@ -2115,14 +2115,13 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   copy_button.Width(22);
   copy_button.Margin(xaml::Thickness{6, 0, 0, 0});
   // The copy is an icon button beside the value, the way every icon action in
-  // the app reads: the words ride it as its tooltip and its automation name
-  // instead of taking a text button's width.
+  // the app reads: its words ride its automation name instead of taking a text
+  // button's width, because a button states no hover tip.
   auto copy_glyph = controls::FontIcon{};
   copy_glyph.FontFamily(winrt::Microsoft::UI::Xaml::Media::FontFamily(L"Segoe MDL2 Assets"));
   copy_glyph.FontSize(kUIFontSize);
   copy_glyph.Glyph(L"\xE8C8");
   copy_button.Content(copy_glyph);
-  controls::ToolTipService::SetToolTip(copy_button, winrt::box_value(winrt::hstring(labels.copy_label)));
   winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(copy_button, winrt::hstring(labels.copy_label));
   controls::Grid::SetColumn(copy_button, 1);
   value_field.Children().Append(copy_button);
@@ -2156,8 +2155,8 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   footer.Children().Append(toggle);
   // The switch owns the station's whole key layout, so the question mark beside
   // it states what it does before it is turned on.  It takes the info glyph the
-  // rest of the app uses, and the words ride it as its tooltip and automation
-  // name instead of taking a text button's width.
+  // rest of the app uses, and its words ride its automation name — the mark
+  // opens the explanation itself, so there is no hover to spend on it.
   controls::Button toggle_help;
   toggle_help.FontSize(kUIFontSize);
   auto help_glyph = controls::FontIcon{};
@@ -2171,7 +2170,6 @@ std::optional<GroupManagerResult> WinUI3NativeLeaf::ShowGroupManager(
   toggle_help.VerticalAlignment(xaml::VerticalAlignment::Center);
   toggle_help.Width(16);
   toggle_help.Height(16);
-  controls::ToolTipService::SetToolTip(toggle_help, winrt::box_value(winrt::hstring(labels.auto_grouping_help)));
   winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(toggle_help, winrt::hstring(labels.auto_grouping_label));
   // The mark opens a hint, never a question: a flyout beside the switch reads
   // as the explanation the shared UI's help tip draws, while a dialog would ask

@@ -28,7 +28,7 @@ import type { AppRoute, LanguagePreference, NativeLocalization, NativeMenuAction
 import type { NativeIpcBridge, NativeLeafBridge } from "./nativeBridge";
 import { isSettingsShellRoute } from "../routes";
 import { resolveLanguage } from "../i18n";
-import { cancelHostChrome, createRelayBrowserLive, requestHostChrome, type MirrorSurface, type RelaySignInAnswer } from "./hostChrome";
+import { cancelHostChrome, createRelayBrowserLive, finishModelPick, requestHostChrome, requestModelPick, type MirrorSurface, type RelaySignInAnswer } from "./hostChrome";
 import {
   finishRelayGroupApply,
   openRelayGroupSheet,
@@ -138,11 +138,12 @@ const SERVICE_OPERATIONS: ReadonlySet<string> = new Set(["start", "stop", "resta
  *
  * A probe reads the upstream, so it is a network call in Core's hands and not
  * an edit: the native hosts grant it fifteen minutes for exactly that reason.
- * The page gave it the twenty-second edit budget, and a flash route's press now
- * *measures* its speed -- six seconds of streaming output on top of the surface
- * probes -- so the page aborted a measurement that was running normally and
- * reported "Core did not answer" over a route that was answering.  The same
- * operation gets the same budget on every host.
+ * The page gave it the twenty-second edit budget, and a speed press now
+ * *measures* the route -- six seconds of streaming output, plus however long
+ * the first token takes to arrive, on top of the surface probes -- so the page
+ * aborted a measurement that was running normally and reported "Core did not
+ * answer" over a route that was answering.  The same operation gets the same
+ * budget on every host.
  */
 const PROBE_TIMEOUT_MS = 900_000;
 
@@ -684,7 +685,7 @@ async function restoreSavedRelayLogin(
       label: options.label,
       origin: options.origin,
       username: options.username ?? "",
-      login_status: "signed_out",
+      login_status: "unknown",
     };
     const result = await core.hostRoute("/ipc/host/relay/restore", body);
     if (result.login_status === "signed_in") {
@@ -700,6 +701,52 @@ async function restoreSavedRelayLogin(
     // password is stated inside it, where the person can act on it.
   }
   return undefined;
+}
+
+/**
+ * What a verified sign-in may keep: the password, or only the login.
+ *
+ * The two answers the native hosts offer in their own post-login prompt, and
+ * asked for the same reason: an account that keeps no password is exactly the
+ * account whose next visit would ask again, and the station's own session cap is
+ * what repeated sign-ins exhaust.  It is asked only when there is a choice to
+ * make: an account that already remembers its password answered this question
+ * when it was turned on, and one with no password to offer has nothing to keep
+ * ("记住密码" would promise a password Core never saw).
+ *
+ * Dismissing the question is 仅记住登录态, which is also the floor both native
+ * hosts apply: the login arrives either way, the password is the optional half.
+ */
+async function askRememberPassword(
+  core: BrowserCoreBridge,
+  options: { accountId: string; label: string },
+  answer: Record<string, unknown>,
+  strings: NativeLocalization | undefined,
+): Promise<void> {
+  if (answer.remember_password === true) return;
+  if (answer.can_remember_password !== true) return;
+  // The sign-in surface has done its job; the question is put over the pane,
+  // not over a station page the person has finished with.
+  cancelHostChrome("relayBrowser");
+  let keep = false;
+  try {
+    keep = await requestHostChrome<boolean>({
+      kind: "confirm",
+      title: strings?.relayRememberPasswordTitle ?? "Keep the password?",
+      message: fillLabel(strings?.relayRememberPasswordBody ?? "", options.label),
+      confirmLabel: strings?.relayRememberPasswordKeep ?? "Keep Password",
+      cancelLabel: strings?.relayRememberSessionOnly ?? "Keep Session Only",
+      destructive: false,
+    });
+  } catch {
+    // A question nobody answered keeps only the login, like a dismissed one.
+    keep = false;
+  }
+  try {
+    await core.hostRoute("/ipc/host/relay/remember", { account_id: options.accountId, remember: keep === true });
+  } catch {
+    // The login already stands; this answer is a preference, not a step.
+  }
 }
 
 /**
@@ -833,6 +880,14 @@ async function browserWindowLogin(
       }
       const status = String(answer.status ?? "");
       if (status === "signed_in") {
+        // Pending sign-ins can merge into an existing account. Only Core
+        // knows which row owns the session and captured password.
+        if (typeof answer.account_id !== "string" || !answer.account_id) return undefined;
+        // The post-login question, asked after the window has served its
+        // purpose: the session is verified, and the password the person typed
+        // into the station's own page is the one thing still worth keeping.
+        // Both native hosts ask it in the same place, for the same reason.
+        void askRememberPassword(core, { accountId: answer.account_id, label: options.label }, answer, strings);
         return {
           revision: Number(answer.revision ?? 0),
           loginStatus: "signed_in",
@@ -1148,19 +1203,13 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
     // and defining a no-op here would tell the shared UI the device-code
     // challenge was shown while nothing appeared. Leaving it undefined is what
     // selects the read-only viewer fallback, which states the URL and code.
-    chooseModelsToAdd: async (models, providerName, keyName) => requestHostChrome<string[] | undefined>({
-      kind: "picker",
+    chooseModelsToAdd: async (models, providerName, keyName) => requestModelPick({
       title: strings?.modelChooserTitle ?? providerName,
       models,
       providerName,
       keyName,
       confirmLabel: strings?.modelChooserAddSelected ?? "",
       cancelLabel: strings?.cancel ?? "",
-      // The chooser is a surface, not a sentence: the native hosts build it with
-      // a heading, a provider/key line, a search field, 全选/反选 and a count,
-      // and this host drew only the checkboxes and the two buttons.  Every word
-      // below is the same string the native leaves read from their table, so the
-      // three hosts offer the same chooser.
       labels: {
         providerLabel: strings?.modelChooserProvider ?? "",
         keyLabel: strings?.modelChooserKey ?? "",
@@ -1175,7 +1224,8 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
         empty: strings?.modelChooserEmpty ?? "",
         noMatches: strings?.modelChooserNoMatches ?? "",
       },
-    }),
+    }, strings?.childSaving ?? ""),
+    finishModelsToAdd: (status, close) => finishModelPick(status, close),
     editSecret: async () => undefined,
     clearSecret: async (domain, field, target) => {
       // Clearing is the same two host-only exchanges as staging, with the
@@ -1311,24 +1361,38 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
           label: options.label,
           origin: options.origin,
           username: options.username ?? "",
-          login_status: "signed_out",
+          // This host has no station cookie of its own to offer -- the page
+          // cannot read another origin's jar -- so it states no observation and
+          // Core resolves one: the saved session first, then the remembered
+          // password.  That is the same two-step every native host runs before
+          // it hands Core an answer, and it is why this says `unknown`: a host
+          // that has not asked the station must not hand Core its own guess as
+          // the station's answer.  Measured on a fresh account with no saved
+          // password: the guess was recorded 未登录 with a fresh observation,
+          // so the pane settled on an answer nobody had taken -- and shared it
+          // with every other machine.
+          login_status: "unknown",
         };
-        // Core's answer is the whole point of the call: a `signed_out`
-        // observation still probes the password this account already
-        // remembers and answers `signed_in` when the saved session works.
-        // Dropping it made the pane's own success branch unreachable on this
-        // host — a proven session still drew as signed out — and spent a
-        // round trip per row for nothing.
         const result = await core.hostRoute("/ipc/host/relay/restore", body);
-        if (result.login_status !== "signed_in") return undefined;
+        const answered = String(result.login_status ?? "");
+        // Core's answer is the check's whole point, and every determined state
+        // is reported -- not only success.  The pane reads 未登录/已过期 off it
+        // and stamps the row, while the native hosts have always answered all
+        // three; this host used to drop the two failures, so its rows kept
+        // whatever they held and the check looked like it had not run at all.
+        if (answered !== "signed_in" && answered !== "signed_out" && answered !== "expired") return undefined;
+        const loginStatus: "signed_in" | "signed_out" | "expired" = answered;
         return {
           revision: Number(result.revision ?? 0),
-          loginStatus: "signed_in" as const,
+          loginStatus,
           username: String(result.username ?? options.username ?? ""),
         };
       } catch {
-        // An unreachable station is not a signed-out account: it says nothing
-        // about the session, so the row keeps whatever it already knew.
+        // No answer at all, for the same reason a native probe reports none: an
+        // unreachable station (``relay_restore_unavailable``) says nothing about
+        // the session, and a station that refused to mint one
+        // (``relay_login_session_limit``, ``relay_login_backoff``) answered a
+        // question this check did not ask.  The pane keeps what it knew.
         return undefined;
       }
     },

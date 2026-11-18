@@ -59,6 +59,15 @@ export interface NativeLeafBridge {
   }): Promise<void>;
   chooseModelsToAdd(models: string[], providerName: string, keyName: string): Promise<string[] | undefined>;
   /**
+   * Optional: answer the open chooser's 添加 while its window stays up.
+   *
+   * A host whose chooser cannot stay on screen while another surface writes
+   * leaves this undefined and closes on the press, which is what every host did
+   * before the hand-over existed.  Nothing waits for an answer that no host can
+   * give: the pane writes the pick after the chooser is gone, exactly as it did.
+   */
+  finishModelsToAdd?(status: string, close: boolean): Promise<string[] | undefined>;
+  /**
    * Optional: the sheet exists only on a host that can host it. A browser page
    * has no panel to put it in, so it leaves this undefined rather than
    * answering a no-op — the pane disables 分组 from the same absence.
@@ -239,6 +248,9 @@ export function createNativeLeafBridgeAdapter(bridge: NativeLeafBridge): NativeL
       ? (options) => bridge.showProviderAuth!(options)
       : undefined,
     chooseModelsToAdd: ({ models, providerName, keyName }) => bridge.chooseModelsToAdd(models, providerName, keyName),
+    finishModelsToAdd: bridge.finishModelsToAdd
+      ? ({ status, close }) => bridge.finishModelsToAdd!(status, close)
+      : undefined,
     showGroupManager: bridge.showGroupManager ? (options) => bridge.showGroupManager!(options) : undefined,
     awaitGroupManagerApply: bridge.awaitGroupManagerApply
       ? () => bridge.awaitGroupManagerApply!()

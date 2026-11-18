@@ -18,11 +18,11 @@ keep building, which is the cost this host exists to avoid.
 
 ## Signing in to a station from a server
 
-Two native hosts present a station's login page in a WebKit view they own. A
-page cannot: another origin's page cannot be framed, its cookies are unreadable,
-and a proxied copy carries this app's hostname into a captcha's site key. So
-Core opens the station itself — and *where* depends on whether this machine has
-a screen:
+The macOS host presents a station's login page in a WebKit view; Windows uses
+WebView2. A page cannot: another origin's page cannot be framed, its cookies
+are unreadable, and a proxied copy carries this app's hostname into a captcha's
+site key. So Core opens the station itself — and *where* depends on whether
+this machine has a screen:
 
 - **a machine with a screen** opens a real window on it, raises it if it landed
   behind something, and reads the session over CDP when it closes;
@@ -117,6 +117,18 @@ serving it over a link nobody sized for it.
 
 ## What is deliberately not the same
 
+- **A narrow page changes shape; it does not clip.** The two native hosts
+  refuse a window smaller than their own minimum, so no shared pane ever had to
+  answer "what if there is no second column". A phone has no minimum, so the
+  page answers it: below 760 pt the sidebar becomes a strip of route tabs, and
+  the second-level rails of 运行时, 外部 and 备份与同步 become horizontal strips of
+  chips above the detail they select. Below 1024 pt the providers pane draws one
+  column — the provider list and the model table — and a pressed row's
+  inspector replaces them, with a back bar returning to the list; three columns
+  need about 900 pt before the middle table folds to truncated cells. Both
+  breakpoints live in `useWebMediaQuery` in the shared UI (`useCompactWebShell`
+  and `useCompactProvidersPane`), so a wide page and both native hosts keep the
+  layout they had.
 - **A child surface is a layer, not a window.** `NativeWindow.open` presents
   the provider wizard, the raw editor and 分组管理 as a modal layer pinned to
   the viewport with a draggable title bar, on the same page. It is fixed to the
@@ -125,8 +137,9 @@ serving it over a link nobody sized for it.
   entries behind one settings change. Each layer mounts its own React root of
   the same component, which is exactly what a native host does when it makes a
   second window.
-- **No menu bar, no tray, no launch-at-login.** A page has none of them. The
-  address bar is the menu.
+- **No menu bar or tray.** A page uses its address bar for navigation. When
+  opened on the machine running Core, it can still change that machine's
+  launch-at-login setting; a remotely published page cannot.
 - **The station's login page opens in a real browser, on this machine.** A
   page cannot present another origin's form (its cookies are unreadable here and
   the station's page cannot be served under this origin), so Core — the process
@@ -168,9 +181,6 @@ serving it over a link nobody sized for it.
   script the page's own CSP refused to run, and one Escape listener per layer
   that closed every open surface at once. Escape and Tab now go through
   `platform/presentationStack.ts`, so only the topmost layer answers.
-- **One column when narrow.** A page has no minimum window size, so below
-  760 pt the settings sidebar becomes a route strip above the pane instead of
-  taking half a phone's width.
 - **A fixed-position tab strip.** Native segmented controls are one fixed
   width; a browser's may be wider than its row, so the web strip scrolls and
   sizes each segment to its own label.

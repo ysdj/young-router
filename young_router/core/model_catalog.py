@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 import os
 from pathlib import Path
 import threading
-from typing import Any
+from typing import Any, Final
 
 from .model_contexts import ModelContextRegistry
 from .model_contexts import (
@@ -15,6 +15,7 @@ from .model_contexts import (
     SEARCH_TOOL_CAPABILITY_UNSUPPORTED,
     ReasoningCapability,
     default_context_cache_path,
+    litellm_mode,
     published_reasoning_levels,
 )
 from .native_codex_catalog import load_native_catalog
@@ -299,22 +300,66 @@ def _route_reasoning_capability(
     return registry.reasoning_for_model_id(name)
 
 
-def _route_is_image_model(registry: ModelContextRegistry, name: str) -> bool:
-    """Whether this public route serves only image generation.
+#: The LiteLLM listing ``mode`` markers that name a generator rather than a
+#: conversation.  ``image`` covers ``image_generation``/``image_edit`` and
+#: ``video`` covers ``video_generation``; a chat, responses, embedding or
+#: audio mode carries neither.
+_GENERATION_LISTING_MODE_MARKERS: Final = ("image", "video")
+_CONVERSATIONAL_LISTING_MODES: Final = frozenset({"chat", "completion", "responses"})
+
+
+def listing_mode_serves_generation(mode: object) -> bool:
+    """Whether one listing row's ``mode`` names media generation.
+
+    This is the listing's own statement, so it needs no catalog lookup and is
+    the first filter every Claude view applies.  A missing or unreadable mode is
+    not evidence of a generator; the registry answers that case instead.
+    """
+
+    if not isinstance(mode, str):
+        return False
+    normalized = mode.strip().lower()
+    return bool(normalized) and any(
+        marker in normalized for marker in _GENERATION_LISTING_MODE_MARKERS
+    )
+
+
+def _listing_mode_serves_conversation(mode: object) -> bool:
+    """Whether LiteLLM's mode says this deployment answers text turns."""
+
+    return isinstance(mode, str) and mode.strip().casefold() in _CONVERSATIONAL_LISTING_MODES
+
+
+def _route_serves_only_generation_model(
+    registry: ModelContextRegistry,
+    name: str,
+    states_generation: Callable[[Sequence[str]], bool],
+) -> bool:
+    """Whether this route resolves a generator and no thinking conversation.
 
     The public catalogs (pi.dev, models.dev) already state the modality, so the
     prefix heuristic the provider pane uses is not needed here.  A route earns
-    the answer when one of its deployments resolves an image contract -- from a
-    catalog's modality or from LiteLLM's own ``mode``, which is the table that
-    carries a name no public catalog has listed yet -- and no deployment states
-    a thinking level above the disabled step: a group that also serves a
-    reasoning text model keeps its ladder, and a deployment the registry cannot
-    resolve (a retired alias beside two live ones) does not veto the two that
-    agree.
+    the answer when one of its deployments resolves an image or video contract
+    -- from a catalog's modality or from LiteLLM's own ``mode``, which is the
+    table that carries a name no public catalog has listed yet -- and no
+    deployment states a thinking level above the disabled step: a group that
+    also serves a reasoning text model keeps its ladder, and a deployment the
+    registry cannot resolve (a retired alias beside two live ones) does not veto
+    the two that agree.
     """
 
     model_ids = registry.route_model_ids(name) or [name]
-    if not registry.states_image_generation(model_ids):
+    if not states_generation(model_ids):
+        return False
+    # A public route may group several deployments under one name. A video
+    # backend beside an ordinary chat backend is still a conversation the
+    # picker can select, even when that chat model exposes no reasoning ladder.
+    # Ask LiteLLM's own mode for each concrete id before using the reasoning
+    # ladder as the fallback for catalogs that do not state their wire mode.
+    if any(
+        _listing_mode_serves_conversation(litellm_mode([model_id]))
+        for model_id in model_ids
+    ):
         return False
     resolved = [
         capability
@@ -326,6 +371,29 @@ def _route_is_image_model(registry: ModelContextRegistry, name: str) -> bool:
     return all(
         capability.supported_levels in (("none",), ())
         for capability in resolved
+    )
+
+
+def _route_is_image_model(registry: ModelContextRegistry, name: str) -> bool:
+    """Whether this public route serves only image generation."""
+
+    return _route_serves_only_generation_model(
+        registry, name, registry.states_image_generation
+    )
+
+
+def _route_is_generation_model(
+    registry: ModelContextRegistry, name: str
+) -> bool:
+    """Whether this public route serves only image or video generation."""
+
+    return _route_serves_only_generation_model(
+        registry,
+        name,
+        lambda model_ids: (
+            registry.states_image_generation(model_ids)
+            or registry.states_video_generation(model_ids)
+        ),
     )
 
 
@@ -410,10 +478,12 @@ def route_serves_only_images(
     failing looked like -- Codex sent ``exec_command`` and ``apply_patch`` to a
     route that answers its own request body.
 
-    ``/v1/models`` is deliberately not this question.  The router keeps
-    publishing every route it serves, because Pi and anything else speaking the
-    raw OpenAI shape may legitimately call the generator; only the Codex catalog
-    and the Claude pickers this app writes or publishes consult this answer.
+    ``/v1/models`` is deliberately not this question for clients that are not
+    Claude.  The router keeps publishing every route it serves, because Pi and
+    anything else speaking the raw OpenAI shape may legitimately call the
+    generator; the Codex catalog entry reads this answer, and the generated
+    Claude pickers plus the Claude discovery view read
+    ``route_serves_only_generation``.
 
     A registry that cannot be built answers ``False``: an unreadable cache is
     not evidence that a route is an image model, and the listing's own ``mode``
@@ -425,6 +495,32 @@ def route_serves_only_images(
     try:
         resolved = registry or _image_filter_registry()
         return _route_is_image_model(resolved, name.strip())
+    except Exception:
+        return False
+
+
+def route_serves_only_generation(
+    name: str,
+    *,
+    registry: ModelContextRegistry | None = None,
+) -> bool:
+    """Whether this public route serves only image or video generation.
+
+    Same question as ``route_serves_only_images``, with the video modality
+    included: a video generator also holds no conversation, so listing it in a
+    Claude model picker offers a choice that can only fail.  The two answers
+    share one resolution; this one asks the registry for both modalities.
+
+    A registry that cannot be built answers ``False``: an unreadable cache is
+    not evidence of a generator, and a listing's own ``mode`` remains the only
+    filter on that path.
+    """
+
+    if not isinstance(name, str) or not name.strip():
+        return False
+    try:
+        resolved = registry or _image_filter_registry()
+        return _route_is_generation_model(resolved, name.strip())
     except Exception:
         return False
 
@@ -779,6 +875,8 @@ __all__ = [
     "managed_catalog_path",
     "previous_managed_catalog_path",
     "profile_has_instructions",
+    "listing_mode_serves_generation",
+    "route_serves_only_generation",
     "route_serves_only_images",
     "select_inherited_profile",
     "write_catalog",

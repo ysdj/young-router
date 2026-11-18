@@ -12,6 +12,8 @@ from young_router.core.model_catalog import (
     catalog_model_names,
     catalog_names_from_editor,
     catalog_payload,
+    listing_mode_serves_generation,
+    route_serves_only_generation,
     route_serves_only_images,
     select_inherited_profile,
     write_catalog,
@@ -2042,7 +2044,6 @@ class SharedContextCacheTests(unittest.TestCase):
         answer is the one the catalog already resolves per route: only a route
         that serves images and states no thinking step above ``off``.
         """
-
         with tempfile.TemporaryDirectory() as directory:
             cache = Path(directory) / "contexts.json"
             cache.write_text(
@@ -2094,6 +2095,63 @@ class SharedContextCacheTests(unittest.TestCase):
             )
             self.assertFalse(route_serves_only_images("", registry=registry))
             self.assertFalse(route_serves_only_images(None, registry=registry))  # type: ignore[arg-type]
+
+    def test_the_generation_filter_covers_video_and_keeps_chat_routes(self) -> None:
+        registry = mock.Mock()
+        registry.route_model_ids.side_effect = lambda name: [name]
+        registry.states_image_generation.return_value = False
+        registry.states_video_generation.side_effect = (
+            lambda model_ids: any("sora" in str(model_id) for model_id in model_ids)
+        )
+        registry.reasoning_for_model_id.return_value = None
+
+        self.assertTrue(
+            route_serves_only_generation("sora-2", registry=registry)
+        )
+        self.assertFalse(
+            route_serves_only_generation("text-route", registry=registry)
+        )
+        # A group that also serves a reasoning conversation is not a generator
+        # picker row, exactly as in the image answer.
+        registry.states_video_generation.return_value = True
+        registry.states_video_generation.side_effect = None
+        registry.reasoning_for_model_id.return_value = mock.Mock(
+            supported_levels=("low", "high")
+        )
+        self.assertFalse(
+            route_serves_only_generation("mixed-video-group", registry=registry)
+        )
+
+    def test_a_nonreasoning_chat_deployment_keeps_a_mixed_video_group(self) -> None:
+        registry = mock.Mock()
+        registry.route_model_ids.return_value = ["openai/sora-2", "openai/plain-chat"]
+        registry.states_image_generation.return_value = False
+        registry.states_video_generation.side_effect = lambda model_ids: any(
+            "sora-2" in str(model_id) for model_id in model_ids
+        )
+        registry.reasoning_for_model_id.return_value = None
+
+        with mock.patch(
+            "young_router.core.model_catalog.litellm_mode",
+            side_effect=lambda model_ids: "chat" if "plain-chat" in model_ids[0] else "video_generation",
+        ):
+            self.assertFalse(
+                route_serves_only_generation("mixed-video-group", registry=registry)
+            )
+
+    def test_the_listing_mode_filter_names_both_media_modalities(self) -> None:
+        for mode in (
+            "image_generation",
+            "image_edit",
+            "video_generation",
+            "IMAGE",
+            "text-to-video",
+        ):
+            with self.subTest(mode=mode):
+                self.assertTrue(listing_mode_serves_generation(mode))
+        for mode in ("chat", "responses", "embedding", "audio_speech", "", None):
+            with self.subTest(mode=mode):
+                self.assertFalse(listing_mode_serves_generation(mode))
 
     def test_an_unreadable_catalog_does_not_hide_every_route(self) -> None:
         """An exception in the filter must answer "chat", never "image"."""

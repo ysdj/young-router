@@ -26,7 +26,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-from ...api_base import _NoRedirect
+from ...api_base import _NoRedirect, trust_context
 from ...browser_identity import browser_request_headers
 from ...public_names import imported_public_name
 from ..persistence import AtomicJSONStore, PersistenceError, read_bytes
@@ -674,6 +674,15 @@ def _private_account(raw: Mapping[str, Any]) -> dict[str, Any]:
     if resource_error not in RESOURCE_ERRORS:
         resource_error = "none"
     remember_password = raw.get("remember_password") is True
+    # Keeping the *login* is a separate decision from keeping the password.
+    # The two native hosts always write the session into their own credential
+    # store, so "session only" is their floor; a page host has no such store,
+    # and refusing the session here is what made a session-only account sign in
+    # again on every visit (and, after the login state became synced, what made
+    # it report 未登录 on every machine).  An account from an older document has
+    # no such field: it keeps what its own login produced, which is the floor
+    # above.
+    remember_session = raw.get("remember_session") is not False
     auto_grouping = raw.get("auto_grouping") is True
     raw_session = raw.get("session", {})
     if raw_session is None:
@@ -689,7 +698,7 @@ def _private_account(raw: Mapping[str, Any]) -> dict[str, Any]:
     }
     if not session["cookie"] and not session["access_token"]:
         session = {}
-    if not remember_password:
+    if not remember_session:
         session = {}
     return {
         "id": _account_id(raw.get("id")),
@@ -700,6 +709,7 @@ def _private_account(raw: Mapping[str, Any]) -> dict[str, Any]:
         "username": _text(raw.get("username", ""), "Relay username", limit=320, required=False),
         "login_status": status,
         "remember_password": remember_password,
+        "remember_session": remember_session,
         "auto_grouping": auto_grouping,
         "password": _text(raw.get("password", ""), "Relay password", limit=4096, required=False) if remember_password else "",
         "session": session,
@@ -756,16 +766,28 @@ def _private_account(raw: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _reloaded_account(raw: Mapping[str, Any]) -> dict[str, Any]:
-    """Drop process-local login claims after Core restarts.
+    """Read one stored account back, keeping a login a credential still backs.
 
-    The native host can restore its process session, while Core can attempt an
-    explicitly remembered password. Until either succeeds, persisted metadata
-    must not claim that the remote site is currently authenticated.
+    A determination is durable: 已登录 is the account's state, one machine's
+    answer is the other machine's (the WebDAV merge orders the two by the same
+    stamp), and dropping it here made every restart -- and every pull, which
+    reloads this store -- forget a login nothing had questioned.  The pane then
+    probed again on the next entry, and an account at the station's session cap
+    paid for that with a refusal.
+
+    What must not survive is a *claim* with nothing behind it: 已登录 beside an
+    empty session is not a state anything can act on, and the next read would
+    have to prove it anyway.  Only that pair goes back to ``unknown``.
     """
 
     account = _private_account(raw)
-    if account["login_status"] == "signed_in":
+    session = account.get("session")
+    usable = isinstance(session, Mapping) and bool(session.get("cookie") or session.get("access_token"))
+    if account["login_status"] == "signed_in" and not usable:
         account["login_status"] = "unknown"
+        # The stamp measured an observation that no longer speaks: carrying it
+        # would let a claim with nothing behind it answer the pane's window.
+        account["login_observed_at"] = ""
     return account
 
 
@@ -779,6 +801,9 @@ def _public_account(account: Mapping[str, Any]) -> dict[str, Any]:
         "username": str(account.get("username", "")),
         "login_status": str(account.get("login_status", "unknown")),
         "remember_password": account.get("remember_password") is True,
+        # Whether this account keeps its login (the session) without keeping
+        # the password: 仅记住登录态, the answer the post-login prompt offers.
+        "remember_session": account.get("remember_session") is not False,
         "auto_grouping": account.get("auto_grouping") is True,
         "password_saved": bool(account.get("password")),
         "balance": _balance(account.get("balance")),
@@ -799,14 +824,18 @@ def _public_account(account: Mapping[str, Any]) -> dict[str, Any]:
 def _stored_account(account: Mapping[str, Any]) -> dict[str, Any]:
     stored = _public_account(account)
     stored.pop("password_saved", None)
-    # ``login_observed_at`` is deliberately not written here, so the re-check
-    # window never outlives the process that observed the login: a restart reads
-    # this document back with no stamp, and every account is probed for real
-    # once.  The pane derives its own age from the same value while Core holds
-    # it, so both sides measure one observation.
     stored.pop("login_observed_seconds_ago", None)
+    # The login *observation* is durable, because it is the account's state and
+    # a state that dies with the process is one no other machine can follow:
+    # a restart -- or a WebDAV pull, which reloads this store -- used to read
+    # the document back with no stamp, so the pane's re-check window always
+    # said "ask the station again" and an entry re-authenticated a login that
+    # was never in doubt.  The stamp is the moment, and the window still bounds
+    # it: an old one asks for a real check, a recent one settles it.
+    stored["login_observed_at"] = _updated_at(account.get("login_observed_at"))
     stored["password"] = str(account.get("password", ""))
     stored["session"] = copy.deepcopy(account.get("session", {}))
+    stored["remember_session"] = account.get("remember_session") is not False
     # The keys this app has already read survive a restart for the same reason
     # the password and the session do: they are the only way to answer for a
     # station that is not signed in.
@@ -1165,7 +1194,7 @@ class RelayHTTPClient:
     ):
         self._optional_paths = optional_paths
         if opener is None:
-            context = ssl.create_default_context()
+            context = trust_context()
             opener = urllib.request.build_opener(
                 _NoRedirect(), urllib.request.HTTPSHandler(context=context)
             )
@@ -1479,6 +1508,12 @@ class RelayAccountsDomain:
         # The active copy stays process-local. An explicitly remembered login
         # also has a durable private copy beside the plaintext password.
         self._session_secrets: dict[str, dict[str, str]] = {}
+        # A password a person typed into the station's own page (the page host
+        # has no webview to read it from, so Core watches the browser it opened).
+        # It is held only between the verified sign-in and the post-login
+        # answer: keeping it is that answer, and the window closing unasked is
+        # the "session only" default.  Private memory, never a snapshot.
+        self._captured_passwords: dict[str, str] = {}
         # The last balance a station stated, per account, and the moment it stops
         # answering; see ``BALANCE_REUSE_SECONDS``.
         self._balance_observations: dict[str, tuple[float, float]] = {}
@@ -2829,7 +2864,7 @@ class RelayAccountsDomain:
         elif name in {"station_remove", "relay_station_remove", "remove_station", "station_delete"}:
             details = self._remove_station_local(
                 data.get("id", data.get("station_id")),
-                dependency_policy=data.get("dependency_policy", data.get("policy", "detach")),
+                dependency_policy=data.get("dependency_policy", data.get("policy", "delete_models")),
             )
         elif name in {"api_key_create", "relay_api_key_create", "account_api_key_create"}:
             self.create_api_key(
@@ -2931,9 +2966,15 @@ class RelayAccountsDomain:
                 ],
             }
         elif name in {"delete", "account_delete", "account_remove", "relay_delete", "relay_account_remove", "remove_account"}:
+            # Deleting an account takes the keys it owns with it.  ``detach``
+            # was the default here, and what it left behind is the state a
+            # person reports as broken: a provider key with no account name, a
+            # 中转站关联 section with no rows, and a note about a key "not on the
+            # station".  The station's own keys are untouched either way -- this
+            # is the local copy.
             details = self._remove_account_local(
                 data.get("id", data.get("account_id")),
-                dependency_policy=data.get("dependency_policy", data.get("policy", "detach")),
+                dependency_policy=data.get("dependency_policy", data.get("policy", "delete_models")),
             )
         elif name in {
             "credential_cleanup_confirm",
@@ -3996,16 +4037,22 @@ class RelayAccountsDomain:
         password: str = "",
         user_id: object = "",
         remember_password: bool | None = None,
+        remember_session: bool | None = None,
         auto_grouping: bool | None = None,
         preserve_resources: bool = False,
-        quota: object = None,
     ) -> dict[str, Any]:
         """Trusted native/browser boundary for one completed login.
 
         ``remember_password`` is a tri-state: ``None`` keeps the stored
         preference (used when no password was typed), while ``True``/``False``
         apply the post-login choice made in the host's subordinate prompt —
-        ``False`` also clears an earlier saved password and persisted session.
+        ``False`` clears the saved password, and nothing else.
+        ``remember_session`` is the same tri-state for keeping the login
+        itself, and ``False`` is the one answer that also drops the session.
+        The two are separate switches because the prompt's second answer is
+        exactly "keep the login, not the password": merging them made that
+        answer drop the session too, so a session-only account was signed out
+        again on its very next visit.
         ``auto_grouping`` is the same tri-state for the prompt's third answer:
         ``True`` turns 自动分组 on with the sign-in, so the resource read that
         follows it can stage the one-key-per-group layout.
@@ -4017,10 +4064,12 @@ class RelayAccountsDomain:
         have a guessed value sent at it.  An absent id keeps whatever this
         account already held, so a routine re-login never erases it.
 
-        ``quota`` is the New API profile the host's probe just read.  That probe
-        and this account's balance are the same answer, so taking it here is
-        what states 已登录 and the money beside it together, instead of leaving a
-        second copy of the read to the key-list refresh behind it.
+        A sign-in states the login and nothing about the money.  The hosts hand
+        over the dashboard quota their own probe read, and this used to publish
+        it as the balance -- measured live, that number and the station's profile
+        API disagreed by tens of dollars, so the row visibly changed seconds
+        after 登录.  The refresh behind the sign-in is the account's one balance
+        read, from the same reader every later refresh uses.
         """
 
         index = self._index(account_id)
@@ -4043,25 +4092,16 @@ class RelayAccountsDomain:
             secrets["refresh_token"] = _text(refresh_token, "Relay refresh token", limit=32768)
         if remember_password is not None:
             account["remember_password"] = remember_password is True
+        if remember_session is not None:
+            account["remember_session"] = remember_session is True
         if auto_grouping is not None:
             account["auto_grouping"] = auto_grouping is True
         captured_user_id = _station_user_id(user_id)
         if captured_user_id:
             account["user_id"] = captured_user_id
         observed_at = _utc_now_iso()
-        # New API's profile read is the same answer its balance comes from; a
-        # sub2api probe reads a different page, so there is no quota to take and
-        # its balance stays with the refresh below.  A station whose display
-        # unit cannot be read still signs in: the balance is a summary of the
-        # account, never the login itself.
-        if quota is not None and account["type"] == "newapi":
-            try:
-                balance = self._balance_from_quota(account, quota)
-            except RelayAccountsError:
-                balance = None
-            if balance is not None:
-                account["balance"] = balance
-                self._remember_balance(account_id, balance)
+        # The probe's ``quota`` is deliberately unused: see the docstring.  A
+        # sign-in states the login; the refresh it triggers states the money.
         account.update(
             {
                 "username": username_value,
@@ -4079,13 +4119,22 @@ class RelayAccountsDomain:
             account["groups"] = []
         if account["remember_password"] and password:
             account["password"] = _text(password, "Relay password", limit=4096)
-        if account["remember_password"]:
+        if not account["remember_password"]:
+            account["password"] = ""
+        # The session is kept when the account keeps its login, which is not
+        # the same question as keeping the password: 仅记住登录态 states exactly
+        # that pair, and a host that asks it (the page host has no credential
+        # store of its own) has no other place to put the cookie.
+        if account.get("remember_session") is not False:
             account["session"] = copy.deepcopy(secrets)
         else:
-            account["password"] = ""
             account["session"] = {}
+            # The in-memory lane is the same answer: a login this account does
+            # not keep is not one Core should keep issuing requests with.
+            self._session_secrets.pop(account_id, None)
         self._accounts[index] = _private_account(account)
-        self._session_secrets[account_id] = secrets
+        if account.get("remember_session") is not False:
+            self._session_secrets[account_id] = secrets
         # A login just proved itself, so any refusal this account was waiting
         # out is answered: the wait only ever meant "this app is not asking
         # again yet", and there is nothing left to ask.
@@ -4174,7 +4223,7 @@ class RelayAccountsDomain:
         index = self._index(account_id)
         account = copy.deepcopy(self._accounts[index])
         session = account.get("session", {})
-        if not account.get("remember_password") or not isinstance(session, Mapping):
+        if not account.get("remember_session") or not isinstance(session, Mapping):
             return None
         secrets = {
             key: value
@@ -4198,9 +4247,14 @@ class RelayAccountsDomain:
             # usable session", and the caller then records 未登录 for a login
             # that was never actually rejected.
             raise
-        except RelayAccountsError:
-            # The station answered and refused this session.  That is a real
-            # answer, and ``None`` is how it is stated.
+        except RelayAccountsError as exc:
+            # A session-only account has no password restore that can settle
+            # the refusal, so record it here instead of returning the old
+            # signed-in state on its next check. A remembered-password account
+            # leaves that transition to its sign-in attempt; other response
+            # errors say nothing about the session itself.
+            if not account["remember_password"] and "expired" in str(exc).lower():
+                self.set_login_status(account_id, "expired")
             return None
         profile = _json_data(payload)
         if not isinstance(profile, Mapping):
@@ -4273,8 +4327,12 @@ class RelayAccountsDomain:
             # the app would then hold that station-side rejection for an account
             # whose real state is simply "nothing remembered" -- at the cost of
             # one more login attempt on an account that was never going to sign
-            # in.  The login is recorded as the secret-free non-answer it is.
-            return self.settle_login_status(account_id, "signed_out")
+            # in.  Nothing is *recorded* either: an account holding no
+            # credential is not the station saying 未登录, and stamping it as one
+            # let a machine that had never signed in state (and, once a login
+            # state travels, share) an answer nobody had asked for.  The row
+            # keeps the placeholder it already carries.
+            return _public_account(account)
         remaining = self._login_refusal_remaining(account_id)
         if remaining > 0:
             raise RelayLoginBackoffError(remaining)
@@ -4374,6 +4432,9 @@ class RelayAccountsDomain:
             "username": username,
             "password": password,
             "submit": bool(password) and self._saved_password_may_be_replayed(account_id, account),
+            # Whether the account already keeps its password: the sign-in
+            # surface asks the post-login question exactly when it does not.
+            "remember_password": account.get("remember_password") is True,
         }
 
     def _saved_password_may_be_replayed(self, account_id: str, account: Mapping[str, Any]) -> bool:
@@ -4389,6 +4450,60 @@ class RelayAccountsDomain:
         window = self._session_recheck_seconds()
         observed = _observed_seconds_ago(account.get("login_observed_at"))
         return observed is not None and window > 0 and observed < window
+
+    def capture_password(self, account_id: str, value: object) -> None:
+        """Hold a password a person typed into the station's own form.
+
+        Between the verified sign-in and the post-login question: the answer is
+        what decides whether it is stored, and the value never crosses a
+        snapshot or a page.
+        """
+
+        self._index(account_id)
+        if isinstance(value, str) and value.strip():
+            self._captured_passwords[str(account_id)] = _text(value, "Relay password", limit=4096)
+
+    def login_preferences(self, account_id: str) -> dict[str, Any]:
+        """What this account keeps after a sign-in: the password, and the login.
+
+        Read by the page host right after a verified sign-in, because the
+        boundary's own answer is a fixed four-field shape both native bridges
+        check exactly -- adding a field there failed every native sign-in.  The
+        two answers the post-login question needs live on the account anyway.
+        """
+
+        index = self._index(account_id)
+        account = self._accounts[index]
+        return {
+            "remember_password": account.get("remember_password") is True,
+            "password_saved": bool(account.get("password")),
+            "remember_session": account.get("remember_session") is not False,
+        }
+
+    def settle_captured_password(self, account_id: str, *, keep: bool) -> dict[str, Any]:
+        """Apply the post-login answer about a password the person typed.
+
+        ``keep`` is 记住密码: the account remembers the password (the captured
+        one, or the one it already had when nothing was captured).  ``not keep``
+        is 仅记住登录态: the login stays, the password does not.  Either answer
+        spends the captured value, so a question answered twice cannot keep a
+        password the person declined.
+        """
+
+        index = self._index(account_id)
+        account = copy.deepcopy(self._accounts[index])
+        captured = self._captured_passwords.pop(str(account_id), "")
+        account["remember_password"] = keep is True
+        if keep is True:
+            if captured:
+                account["password"] = captured
+        else:
+            account["password"] = ""
+        account["last_updated_at"] = _utc_now_iso()
+        self._accounts[index] = _private_account(account)
+        self._persist()
+        self.revision += 1
+        return _public_account(self._accounts[index])
 
     def sign_in_with_password(
         self,
@@ -4605,9 +4720,12 @@ class RelayAccountsDomain:
         an account comes back without the user's help -- answering that check
         from the observation would freeze the account out of its own recovery.
 
-        A restart, a reload, or a window of 0 leaves no recent observation, so
-        the station is asked for real; the stamp is not durable, which is what
-        keeps a frozen 未登录 from outliving the process that determined it.
+        The stamp is durable and travels with the store, so a determination
+        outlives the process that made it -- including one another machine
+        made, which is how a login observed on one machine answers the pane on
+        the second.  What keeps a frozen 未登录 from being permanent is the
+        window itself: an observation older than ``session_recheck_seconds``
+        answers nothing and the station is asked for real.
         """
 
         window = self._session_recheck_seconds()
@@ -5709,6 +5827,11 @@ class RelayAccountsDomain:
                 # next read (and :meth:`_renew_remembered_session`) ask whether
                 # it still works, which is the only question that can retire it.
                 account["login_status"] = "expired"
+                # The station answered, and the answer was "this session is
+                # not valid": that is a login observation, so it is stamped
+                # like every other determined one.  A read that failed for
+                # another reason never reaches here and stamps nothing.
+                account["login_observed_at"] = _utc_now_iso()
                 resource_error = "login_expired"
             elif "no api keys" in message:
                 resource_error = "no_api_keys"
@@ -6886,10 +7009,50 @@ class RelayAccountsDomain:
         if account_result is None:
             raise RelayAccountsError("Relay account is unavailable")
         _, account = account_result
-        resource = self._selected_resource(account, resource_id)
+        try:
+            resource = self._selected_resource(account, resource_id)
+        except RelayAccountsError:
+            # The account's key list is empty or unread (a sign-in replaced it,
+            # or the station could not be asked).  The source being resolved
+            # already names the key -- station, account and key id -- which is
+            # what an import needs; the credential comes from the document at
+            # Apply time.  Refusing here is what made 获取模型 answer "the relay
+            # API key is unavailable" for a key this app still held.
+            resource = self._source_resource_fallback(account, resource_id, source)
         if resource.get("enabled") is not True:
             raise RelayAccountsError("Enable the relay API key before importing it")
         return self._relay_source(account, resource)
+
+    @staticmethod
+    def _source_resource_fallback(
+        account: Mapping[str, Any],
+        resource_id: str,
+        source: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """A resource descriptor for a source the account can no longer list.
+
+        Everything a binding reads from a resource -- its id, its address, the
+        name the station last answered with -- is either in the source or on
+        the account.  The station's own key list is what used to supply the
+        rest, and a key this Core already holds does not need that list to be
+        used: the address is the station the key was minted on.
+        """
+
+        name = source.get("api_key_name", source.get("name", ""))
+        models = source.get("source_models", source.get("models", []))
+        stated_base = source.get("api_base")
+        api_base = ""
+        if isinstance(stated_base, str) and stated_base.strip():
+            api_base = _api_base(stated_base)
+        elif isinstance(account.get("origin"), str) and str(account.get("origin")).strip():
+            api_base = _api_base(account.get("origin"))
+        return {
+            "id": resource_id,
+            "name": name if isinstance(name, str) else "",
+            "api_base": api_base,
+            "enabled": source.get("enabled") is not False,
+            "models": list(models) if isinstance(models, (list, tuple)) else [],
+        }
 
     def station_identities(self) -> list[dict[str, str]]:
         """Every station's id and origin, for a coordinator that resolves sites.
@@ -6903,6 +7066,29 @@ class RelayAccountsDomain:
             {"id": str(station.get("id", "")), "origin": str(station.get("origin", ""))}
             for station in self._stations
         ]
+
+    def stations_holding_a_login(self) -> list[str]:
+        """The stations whose accounts were *observed* to be signed in or out.
+
+        A sign-in -- a password typed, a station page completed -- is work a
+        person did, and it is the only thing the key list, the balance and
+        every provider slot on that station are read through.  Startup repair
+        treats such a station as content rather than as the leftover of a
+        dismissed window: the sweep cannot tell those apart, and guessing
+        "leftover" once erased a station, its 23 keys and the provider bound to
+        it.  The stamp is the evidence -- a claim with no observation behind it
+        (`login_observed_at` empty) is a row, not a sign-in, and stays
+        repairable.
+        """
+
+        return sorted(
+            {
+                str(account.get("station_id", "")).strip()
+                for account in self._accounts
+                if str(account.get("station_id", "")).strip()
+                and str(account.get("login_observed_at", "")).strip()
+            }
+        )
 
     def provider_station_source(self, source: object) -> dict[str, str]:
         """Resolve the one non-secret station identity used by a provider."""
@@ -7255,6 +7441,7 @@ class RelayAccountsDomain:
             station_id = _station_id(raw.get("station_id"))
             account_id = _account_id(raw.get("account_id"))
             resource_id = _resource_id(raw.get("resource_id"))
+            account: Mapping[str, Any] | None = None
             try:
                 _, account = self._operation_account(
                     {"station_id": station_id, "account_id": account_id}
@@ -7279,8 +7466,22 @@ class RelayAccountsDomain:
                         )
                     )
                     continue
-                issues.append(self._apply_issue("resource_unavailable", account_id=account_id, resource_id=resource_id))
-                continue
+                # The account holds no key list to select from -- a sign-in
+                # cleared it, or the station could not be read -- but this
+                # Core may still hold the key itself (a slot persisted its
+                # value, or an earlier read cached it).  That key is what
+                # 获取模型 asks with: refusing here turned a credential this app
+                # already had into "the relay API key is unavailable", so the
+                # route could not be listed while signed out even though the
+                # station's own gateway answers a key that needs no session.
+                stored_key = cached_keys.get((account_id, resource_id)) if account is not None else None
+                if account is None or not stored_key:
+                    issues.append(self._apply_issue("resource_unavailable", account_id=account_id, resource_id=resource_id))
+                    continue
+                resource = self._source_resource_fallback(account, resource_id, raw)
+                # The key this read would have fetched is the one already in
+                # hand, so the station is not asked at all.
+                held_sources.add((account_id, resource_id))
             if resource_id.startswith("pending-"):
                 issues.append(self._apply_issue("created_resource_unresolved", account_id=account_id, resource_id=resource_id))
                 continue

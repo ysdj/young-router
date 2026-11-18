@@ -155,6 +155,42 @@ class RelayStationDomainTests(unittest.TestCase):
             self.assertEqual([], result["stations"])
             self.assertEqual([], result["accounts"])
 
+    def test_deleting_an_account_deletes_the_keys_it_owned(self) -> None:
+        """The delete a pane sends is the delete that reaches the providers.
+
+        ``account.delete`` normalizes to ``account_delete``; only the
+        ``*_remove`` spellings were listed as dependency actions, so the
+        provider policy never ran and the account's key slots stayed behind --
+        drawn as a relay key with no account name beside a 中转站关联 section
+        with nothing in it.  The station keeps its own keys: this is the local
+        copy, never a station write.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory)
+            account = domain.dispatch(
+                "account.add",
+                {"type": "newapi", "label": "only", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            domain.dispatch(
+                "account.add",
+                {"type": "newapi", "label": "kept", "origin": "https://kept.example.test"},
+            )
+
+            result = domain.dispatch("account.delete", {"id": account["id"]})
+
+            self.assertEqual(["kept"], [item["label"] for item in result["accounts"]])
+            # The action names the account's own resources, which is what the
+            # provider policy turns into "delete this slot and its routes".
+            self.assertEqual("account_remove", result["last_action"]["kind"])
+            self.assertEqual("delete_models", result["last_action"]["dependency_policy"])
+            self.assertEqual(
+                [{"station_id": account["station_id"], "account_id": account["id"], "resource_id": ""}]
+                if result["last_action"].get("resources")
+                else [],
+                result["last_action"].get("resources") or [],
+            )
+
     def test_station_type_update_reclassifies_accounts_and_invalidates_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             domain = RelayAccountsDomain(directory)

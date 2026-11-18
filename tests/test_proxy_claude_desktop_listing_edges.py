@@ -61,7 +61,7 @@ class PublishedContextTests(unittest.TestCase):
 class KeptRowTests(unittest.TestCase):
     def setUp(self) -> None:
         patcher = mock.patch.object(
-            claude_desktop_listing, "_route_is_image", return_value=False
+            claude_desktop_listing, "_route_is_generation", return_value=False
         )
         self.addCleanup(patcher.stop)
         patcher.start()

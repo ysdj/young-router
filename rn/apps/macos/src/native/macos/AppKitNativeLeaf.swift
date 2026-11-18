@@ -67,6 +67,81 @@ func configureImmediatePresentation(_ window: NSWindow) {
     window.animationBehavior = .none
 }
 
+/// A label that answers the pointer only with the part it had to cut.
+///
+/// The rule is about the reader, not the label: a tip that repeats words already
+/// on screen is noise, and a tip that appears because a control exists is noise
+/// twice over.  What earns a tip is a text the frame clipped — and an
+/// abbreviation, which clips on purpose: `M→C` passes `Messages → Completions`
+/// as its `hoverText`, because the shortened cell cannot state it any other way.
+/// Every other label states its own text, and only while it does not fit.
+///
+/// The verdict is taken on every layout and every text change rather than once
+/// when the cell is built: a table column widens, a window resizes, and a tip
+/// that was true when the row was drawn would otherwise outlive its reason.
+/// The ObjC control views read this class through the generated Swift header
+/// (`AppKitControlViews.mm` builds every table cell's label with it), and that
+/// header carries public declarations only — the same reason ``AppKitBusySpinner``
+/// is public.
+@objc(LiteLLMTruncatingLabel)
+public final class LiteLLMTruncatingLabel: NSTextField {
+    /// The long form of an abbreviation, stated however wide the label is.
+    /// Empty keeps the label's own text, shown only while it is clipped.
+    @objc public var hoverText: String? {
+        didSet { refreshTruncationTip() }
+    }
+
+    override public var stringValue: String {
+        didSet { refreshTruncationTip() }
+    }
+
+    override public var attributedStringValue: NSAttributedString {
+        didSet { refreshTruncationTip() }
+    }
+
+    /// A label configured the way `NSTextField(labelWithString:)` is: no bezel,
+    /// no editing, one truncating line.  Callers that lay out with constraints
+    /// turn autoresizing off themselves, exactly as they do for a plain label.
+    @objc(truncatingLabel)
+    public static func truncatingLabel() -> LiteLLMTruncatingLabel {
+        let label = LiteLLMTruncatingLabel(frame: .zero)
+        label.isEditable = false
+        label.isSelectable = false
+        label.isBordered = false
+        label.drawsBackground = false
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        return label
+    }
+
+    override public func layout() {
+        super.layout()
+        refreshTruncationTip()
+    }
+
+    override public func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        refreshTruncationTip()
+    }
+
+    /// State the hover for what this label actually shows.
+    @objc public func refreshTruncationTip() {
+        if let hover = hoverText, !hover.isEmpty {
+            toolTip = hover
+            return
+        }
+        let text = stringValue
+        // A label with no room yet (a cell being built) has no verdict to give:
+        // the layout pass that gives it its frame asks again.
+        guard !text.isEmpty, bounds.width > 1 else {
+            toolTip = nil
+            return
+        }
+        let needed = attributedStringValue.size().width
+        toolTip = needed > bounds.width + 0.5 ? text : nil
+    }
+}
+
 
 private enum NativeRelayOriginPolicy {
     static func allows(_ url: URL) -> Bool {
@@ -257,6 +332,11 @@ private enum NativeRelayOriginPolicy {
         statusItem.length = NSStatusItem.squareLength
         statusItem.button?.title = ""
         statusItem.button?.image = Self.statusBarIcon
+        // The menu-bar extra is the one control that draws no words at all: it
+        // is a glyph, the app's background surface, and the status its only
+        // text.  The rule that no button states a tip is about controls inside
+        // a window; this is where the app states its status when no window is
+        // open, so the tooltip stays.
         statusItem.button?.toolTip = statusTitle
         statusItem.button?.setAccessibilityLabel(statusTitle)
     }
@@ -588,10 +668,29 @@ private enum NativeRelayOriginPolicy {
     /// stay answerable. One chooser at a time: a request that lands while a
     /// chooser is up settles that one as cancelled instead of stacking a second
     /// identical window over it.
-    private struct ModelChooser {
+    ///
+    /// Its 添加 is a hand-over, the way 分组管理's 保存并关闭 is: the window stays
+    /// up with the button reporting the write, the pane's answer comes back
+    /// through ``answerModelsToAdd``, and only an answer that the rows landed
+    /// ends the window.  That is why the completion is spent once (`answered`)
+    /// while a later 添加 arrives through `nextPick` — a promise settles once, and
+    /// a refused write must not leave the chooser with a button that answers
+    /// nobody.
+    private final class ModelChooser {
         let panel: NSPanel
         let controller: NativeModelChooserController
         let completion: ([String]?) -> Void
+        var answered = false
+        /// A 添加 the person pressed while the pane had no waiter yet.
+        var pendingPick: [String]?
+        /// The caller waiting for the next 添加 in this window.
+        var nextPick: (([String]?) -> Void)?
+
+        init(panel: NSPanel, controller: NativeModelChooserController, completion: @escaping ([String]?) -> Void) {
+            self.panel = panel
+            self.controller = controller
+            self.completion = completion
+        }
     }
 
     /// Present a child surface — the provider wizard, the file editor, the
@@ -1227,7 +1326,7 @@ private enum NativeRelayOriginPolicy {
             cancelAnswerID: built.cancelAnswerID,
             completion: completion
         )
-        let anchor = locksParent ? (parent ?? activeWindow()) : nil
+        let anchor = locksParent ? (parent ?? questionAnchor()) : nil
         Self.positionDecisionPanel(panel, over: anchor)
         if let anchor {
             presentChildPanel(panel, in: anchor, prepare: prepare)
@@ -2241,16 +2340,76 @@ private enum NativeRelayOriginPolicy {
         // collected the moment this method returns, and its 取消, 全选, 反选
         // and + buttons then answer nobody.
         controller.onFinish = { [weak self] selection in
-            self?.finishModelChooser(panel, selection: selection)
+            self?.handOverModelChooser(panel, selection: selection)
+        }
+        controller.onCancel = { [weak self] in
+            self?.finishModelChooser(panel, selection: nil)
         }
         openModelChooser = ModelChooser(panel: panel, controller: controller, completion: completion)
         presentChildPanel(panel, in: activeWindow(), prepare: { controller.focusSearchField() })
     }
 
+    /// Take the footer's 添加 and leave the window up while it is written.
+    ///
+    /// The rows a pick creates are the pane's to file, and it files them behind
+    /// this window: the first 添加 answers `chooseModelsToAdd`, and a 添加 that
+    /// follows a refused write answers the caller that ``answerModelsToAdd`` is
+    /// holding.  The button reports the wait in the meantime (see
+    /// `NativeModelChooserController.setSaving`), so nobody presses it into a
+    /// window that looks asleep.
+    private func handOverModelChooser(_ panel: NSPanel, selection: [String]?) {
+        guard let chooser = openModelChooser, chooser.panel === panel else { return }
+        let picked = selection ?? []
+        guard !picked.isEmpty else { return }
+        chooser.controller.setSaving(true, status: localized("childSaving", fallback: "Saving…"))
+        guard chooser.answered else {
+            chooser.answered = true
+            chooser.completion(picked)
+            return
+        }
+        if let waiter = chooser.nextPick {
+            chooser.nextPick = nil
+            waiter(picked)
+        } else {
+            chooser.pendingPick = picked
+        }
+    }
+
+    /// Answer a handed-over 添加: the chooser states `status` in its own strip, and
+    /// `close` is the answer to "did the rows land?".  Kept open, it hands the
+    /// next 添加 back to the caller — undefined when the person closed it
+    /// instead, so a refused write is never a window nobody can move.
+    func answerModelsToAdd(status: String, close: Bool, completion: @escaping ([String]?) -> Void) {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.answerModelsToAdd(status: status, close: close, completion: completion)
+            }
+            return
+        }
+        guard let chooser = openModelChooser else {
+            completion(nil)
+            return
+        }
+        guard !close else {
+            chooser.controller.setSaving(true, status: status)
+            finishModelChooser(chooser.panel, selection: nil)
+            completion(nil)
+            return
+        }
+        chooser.controller.setSaving(false, status: status)
+        if let staged = chooser.pendingPick {
+            chooser.pendingPick = nil
+            completion(staged)
+            return
+        }
+        chooser.nextPick = completion
+    }
+
     /// Settle the open chooser exactly once, whichever way its window went
-    /// away: the footer's + carries the selection, while 取消, Esc and the
-    /// title-bar close button carry nothing. Ending the child surface here is
-    /// what releases the lock over the window the chooser was opened from.
+    /// away: 取消, Esc and the title-bar close button carry nothing, and an
+    /// answer that already ended the pick is not delivered twice.  Ending the
+    /// child surface here is what releases the lock over the window the chooser
+    /// was opened from.
     private func finishModelChooser(_ panel: NSPanel, selection: [String]?) {
         guard let chooser = openModelChooser, chooser.panel === panel else { return }
         openModelChooser = nil
@@ -2259,7 +2418,14 @@ private enum NativeRelayOriginPolicy {
         panel.delegate = nil
         endChildPanel(panel)
         withoutAnimations { panel.close() }
-        chooser.completion(selection)
+        if !chooser.answered {
+            chooser.answered = true
+            chooser.completion(selection)
+        }
+        let waiter = chooser.nextPick
+        chooser.nextPick = nil
+        chooser.pendingPick = nil
+        waiter?(nil)
     }
 
     private func makeModelChooserPanel(
@@ -2293,11 +2459,11 @@ private enum NativeRelayOriginPolicy {
         panel.contentView = content
         let titleLabel = NSTextField(labelWithString: localized("modelChooserHeading", fallback: "Choose models to add"))
         titleLabel.font = nativeHeadingFont
-        let subtitleLabel = NSTextField(labelWithString: "\(localized("modelChooserProvider", fallback: "Provider")): \(providerName)    \(localized("modelChooserKey", fallback: "Key")): \(keyName)")
+        let subtitleLabel = LiteLLMTruncatingLabel.truncatingLabel()
+        subtitleLabel.stringValue = "\(localized("modelChooserProvider", fallback: "Provider")): \(providerName)    \(localized("modelChooserKey", fallback: "Key")): \(keyName)"
         subtitleLabel.textColor = .secondaryLabelColor
         subtitleLabel.lineBreakMode = .byTruncatingMiddle
         subtitleLabel.usesSingleLineMode = true
-        subtitleLabel.toolTip = subtitleLabel.stringValue
         let searchField = NativeInstantFocusSearchField()
         searchField.placeholderString = localized("modelChooserSearch", fallback: "Search models")
         searchField.sendsSearchStringImmediately = true
@@ -2311,10 +2477,10 @@ private enum NativeRelayOriginPolicy {
         selectionControls.orientation = .horizontal
         selectionControls.alignment = .centerY
         selectionControls.spacing = 8
-        let selectAllButton = modelChooserButton(title: localized("modelChooserAll", fallback: "All"), toolTip: localized("modelChooserSelectAllVisible", fallback: "Select all visible models"))
+        let selectAllButton = modelChooserButton(title: localized("modelChooserAll", fallback: "All"), name: localized("modelChooserSelectAllVisible", fallback: "Select all visible models"))
         selectAllButton.target = controller
         selectAllButton.action = #selector(NativeModelChooserController.selectAllAction(_:))
-        let invertButton = modelChooserButton(title: localized("modelChooserInvert", fallback: "Invert"), toolTip: localized("modelChooserInvertVisible", fallback: "Invert visible model selection"))
+        let invertButton = modelChooserButton(title: localized("modelChooserInvert", fallback: "Invert"), name: localized("modelChooserInvertVisible", fallback: "Invert visible model selection"))
         invertButton.target = controller
         invertButton.action = #selector(NativeModelChooserController.invertSelectionAction(_:))
         selectionControls.addArrangedSubview(selectAllButton)
@@ -2352,10 +2518,25 @@ private enum NativeRelayOriginPolicy {
         let cancelButton = NSButton(title: localized("cancel", fallback: "Cancel"), target: controller, action: #selector(NativeModelChooserController.cancelAction(_:)))
         cancelButton.bezelStyle = .rounded
         cancelButton.keyEquivalent = "\u{1b}"
-        let addButton = modelChooserButton(title: "+", toolTip: localized("modelChooserAddSelected", fallback: "Add Selected"))
+        let addButton = modelChooserButton(title: "+", name: localized("modelChooserAddSelected", fallback: "Add Selected"))
         addButton.target = controller
         addButton.action = #selector(NativeModelChooserController.addSelectedAction(_:))
         addButton.keyEquivalent = "\r"
+
+        // The write a pick starts is not instant (a station-side import, an
+        // apply), and the press that started it used to look like it had done
+        // nothing: the footer states the wait beside the button that began it.
+        // The wheel is the app's own pre-rendered frames — the same ones 分组管理
+        // turns while it loads — never a progress-indicator view.
+        let progress = NSImageView()
+        progress.imageScaling = .scaleProportionallyDown
+        progress.isHidden = true
+        let statusLabel = NSTextField(labelWithString: "")
+        statusLabel.font = NSFont.systemFont(ofSize: nativeUIFontSize)
+        statusLabel.textColor = .secondaryLabelColor
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.usesSingleLineMode = true
+        statusLabel.isHidden = true
 
         controller.configureControls(
             searchField: searchField,
@@ -2363,10 +2544,12 @@ private enum NativeRelayOriginPolicy {
             resultCountLabel: resultCountLabel,
             selectAllButton: selectAllButton,
             invertSelectionButton: invertButton,
-            addButton: addButton
+            addButton: addButton,
+            progress: progress,
+            statusLabel: statusLabel
         )
 
-        for view in [titleLabel, subtitleLabel, searchField, selectionControls, scroll, cancelButton, addButton] {
+        for view in [titleLabel, subtitleLabel, searchField, selectionControls, scroll, progress, statusLabel, cancelButton, addButton] {
             view.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(view)
         }
@@ -2393,6 +2576,15 @@ private enum NativeRelayOriginPolicy {
             addButton.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -nativePanelInset),
             cancelButton.trailingAnchor.constraint(equalTo: addButton.leadingAnchor, constant: -8),
             cancelButton.centerYAnchor.constraint(equalTo: addButton.centerYAnchor),
+            // The wait reads left of the pair that started it, so the two
+            // buttons keep the footer's own right edge.
+            progress.widthAnchor.constraint(equalToConstant: AppKitBusySpinner.size),
+            progress.heightAnchor.constraint(equalToConstant: AppKitBusySpinner.size),
+            progress.trailingAnchor.constraint(equalTo: cancelButton.leadingAnchor, constant: -10),
+            progress.centerYAnchor.constraint(equalTo: addButton.centerYAnchor),
+            statusLabel.trailingAnchor.constraint(equalTo: progress.leadingAnchor, constant: -8),
+            statusLabel.leadingAnchor.constraint(greaterThanOrEqualTo: content.leadingAnchor, constant: nativePanelInset),
+            statusLabel.centerYAnchor.constraint(equalTo: addButton.centerYAnchor),
         ])
         // Reserve the list's own height and let the chrome above and below it be
         // whatever those steps measure.  Pinning the height for the measurement
@@ -2409,13 +2601,15 @@ private enum NativeRelayOriginPolicy {
         return panel
     }
 
-    private func modelChooserButton(title: String, toolTip: String) -> NSButton {
+    /// `name` is the button's own sentence for VoiceOver only: a button states
+    /// no hover tip, so the words a glyph cannot draw live in its accessible
+    /// name (`+` reads as "Add Selected", not as a plus sign).
+    private func modelChooserButton(title: String, name: String) -> NSButton {
         // Keep Return-to-add via the default-button key equivalent, but draw
         // the ordinary (non-accent) bezel so the "+" stays a neutral action.
         let button = NeutralDefaultButton(title: title, target: nil, action: nil)
         button.bezelStyle = .rounded
-        button.toolTip = toolTip
-        button.setAccessibilityLabel(toolTip)
+        button.setAccessibilityLabel(name)
         return button
     }
 
@@ -2711,6 +2905,20 @@ private enum NativeRelayOriginPolicy {
 
     private func settingsWindow() -> NSWindow? {
         settingsWindowKey().flatMap { routeWindows[$0] }
+    }
+
+    /// Where a question goes when nobody named a window for it.
+    ///
+    /// A question asked *by* a child surface belongs over that surface: the
+    /// import's 名称大小写 question is asked while the model chooser is still up
+    /// and writing, and anchoring on the workspace drew it behind the chooser —
+    /// the chooser looked frozen, and the answer it was waiting for sat in a
+    /// window nobody could see.
+    private func questionAnchor() -> NSWindow? {
+        if let key = NSApp.keyWindow, childPanels.contains(where: { $0.window === key }) {
+            return key
+        }
+        return activeWindow()
     }
 
     func activeWindow() -> NSWindow? {
@@ -3665,7 +3873,11 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         panel.contentView = content
         let titleLabel = NSTextField(labelWithString: title)
         titleLabel.font = nativeHeadingFont
-        let accountField = NSTextField(labelWithString: accountLabel)
+        // The station account under the window's title: one line, and the
+        // middle ellipsis is the only way a long account fits.  Its hover states
+        // the whole name exactly while the line is clipped.
+        let accountField = LiteLLMTruncatingLabel.truncatingLabel()
+        accountField.stringValue = accountLabel
         self.accountField = accountField
         accountField.font = NSFont.systemFont(ofSize: nativeUIFontSize)
         accountField.textColor = .secondaryLabelColor
@@ -3695,7 +3907,6 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         removeButton.controlSize = .small
         removeButton.image = NSImage(named: NSImage.removeTemplateName)
         removeButton.imagePosition = .imageOnly
-        removeButton.toolTip = label("removeLabel")
         removeButton.setAccessibilityLabel(label("removeLabel"))
         self.removeButton = removeButton
         let addButton = NSButton(title: "", target: self, action: #selector(addDraftKey(_:)))
@@ -3703,7 +3914,6 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         addButton.controlSize = .small
         addButton.image = NSImage(named: NSImage.addTemplateName)
         addButton.imagePosition = .imageOnly
-        addButton.toolTip = label("addLabel")
         addButton.setAccessibilityLabel(label("addLabel"))
         self.addButton = addButton
 
@@ -3828,16 +4038,16 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         valueField.setAccessibilityLabel(label("valueLabel"))
         self.valueField = valueField
         // The copy is an icon button beside the value, the way every icon
-        // action in the app reads: the words ride it as its tooltip and its
-        // accessibility label instead of taking a text button's width from
-        // the key and the models beside it.
+        // action in the app reads: its words ride its accessible name instead
+        // of taking a text button's width from the key and the models beside
+        // it.  No button states a hover tip - the glyph is the button, and the
+        // row it belongs to already says what is being copied.
         let copyButton = NSButton(title: "", target: self, action: #selector(copySelectedKey(_:)))
         copyButton.bezelStyle = .rounded
         copyButton.font = detailFont
         copyButton.controlSize = .small
         copyButton.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: label("copyLabel"))
         copyButton.imagePosition = .imageOnly
-        copyButton.toolTip = label("copyLabel")
         copyButton.setAccessibilityLabel(label("copyLabel"))
         self.copyButton = copyButton
         // The copy action keeps its own icon-sized slice of the row, so the
@@ -3873,7 +4083,6 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         helpButton.image = NSImage(systemSymbolName: "questionmark.circle", accessibilityDescription: label("autoGroupingLabel"))
         helpButton.imagePosition = .imageOnly
         helpButton.contentTintColor = .secondaryLabelColor
-        helpButton.toolTip = label("autoGroupingHelp")
         helpButton.setAccessibilityLabel(label("autoGroupingLabel"))
         self.autoGroupingHelpButton = helpButton
         let closeButton = NSButton(title: label("closeLabel"), target: self, action: #selector(closePanel(_:)))
@@ -4196,12 +4405,8 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             enabledCheckbox?.state = .off
             nameField?.stringValue = ""
             multiplierField?.stringValue = empty
-            // No selection carries no rate: a tooltip left over from the
-            // previous row reports a rate nobody selected.
-            multiplierField?.toolTip = nil
             // Nothing is selected, so no read may write into the value row.
             valueField?.stringValue = empty
-            valueField?.toolTip = nil
             modelsList?.setModels([])
             copyButton?.isEnabled = false
             syncingSelection = true
@@ -4220,9 +4425,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
             // is a batch, while the controls above still act on every row.
             nameField?.stringValue = ""
             multiplierField?.stringValue = empty
-            multiplierField?.toolTip = nil
             valueField?.stringValue = empty
-            valueField?.toolTip = nil
             modelsList?.setModels([])
             copyButton?.isEnabled = false
             let groupIDs = Set(selectedRows.map { $0.groupID })
@@ -4241,7 +4444,6 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         enabledCheckbox?.allowsMixedState = false
         enabledCheckbox?.state = row.enabled ? .on : .off
         multiplierField?.stringValue = row.multiplier.isEmpty ? empty : row.multiplier
-        multiplierField?.toolTip = row.multiplier.isEmpty ? nil : row.multiplier
         revealSelectedKey(row)
         modelsList?.setModels(row.modelNames)
         copyButton?.isEnabled = canCopy(row)
@@ -4442,7 +4644,6 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
     /// draft key has no key on the station yet, and a row with no credential
     /// states that instead of a stand-in label that reads like the value.
     private func revealSelectedKey(_ row: KeyRow) {
-        valueField?.toolTip = nil
         guard canCopy(row) else {
             // 密钥值 carries the key itself: a row whose station has no key
             // says 未提供, and a row the sheet cannot read states nothing.
@@ -4843,7 +5044,7 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         } else {
             cell = NSTableCellView()
             cell.identifier = identifier
-            let label = NSTextField(labelWithString: "")
+            let label = LiteLLMTruncatingLabel.truncatingLabel()
             label.translatesAutoresizingMaskIntoConstraints = false
             label.font = NSFont.systemFont(ofSize: nativeUIFontSize)
             label.lineBreakMode = .byTruncatingTail
@@ -4861,7 +5062,6 @@ private final class NativeGroupManagerController: NSObject, NSTableViewDataSourc
         }
         let text = cell.textField
         text?.stringValue = value
-        text?.toolTip = value
         // The list reports the store as it stands: every column keeps the full
         // label color, and a row the draft will create or delete is dimmed —
         // no column carries status text.
@@ -5367,7 +5567,6 @@ private final class NativeModelChooserListView: NSView {
             checkbox.tag = rowIndex
             checkbox.title = rows[rowIndex].title
             checkbox.state = rows[rowIndex].selected ? .on : .off
-            checkbox.toolTip = rows[rowIndex].title
             checkbox.setAccessibilityLabel(rows[rowIndex].title)
             checkbox.frame = NSRect(x: 10, y: CGFloat(visibleIndex) * rowHeight + 2, width: max(0, bounds.width - 20), height: rowHeight - 4)
             checkbox.autoresizingMask = [.width]
@@ -5422,8 +5621,10 @@ private final class NativeModelChooserListView: NSView {
 }
 
 private final class NativeModelChooserController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
-    private var didFinish = false
-    var onFinish: (([String]?) -> Void)?
+    /// The footer's 添加: the pick itself, handed to the pane that files it.
+    var onFinish: (([String]) -> Void)?
+    /// 取消, Esc and the title-bar close button: no pick, no write.
+    var onCancel: (() -> Void)?
     /// The chooser's window, so its search field is focused once the window is
     /// key. The host retains both the window and this controller while the
     /// chooser is up.
@@ -5434,6 +5635,14 @@ private final class NativeModelChooserController: NSObject, NSWindowDelegate, NS
     weak var selectAllButton: NSButton?
     weak var invertSelectionButton: NSButton?
     weak var addButton: NSButton?
+    weak var progress: NSImageView?
+    weak var statusLabel: NSTextField?
+    private var wheelTimer: Timer?
+    private var wheelStep = 0
+    /// The pane is writing the pick this window handed over: every control
+    /// that could start another one, or take the window away underneath it, is
+    /// out of reach until the answer lands.
+    private var saving = false
     let listView: NativeModelChooserListView
     private let countTemplate: String
     private let filteredCountTemplate: String
@@ -5448,14 +5657,34 @@ private final class NativeModelChooserController: NSObject, NSWindowDelegate, NS
         listView.stateDidChange = { [weak self] in self?.refreshControls() }
     }
 
-    func configureControls(searchField: NativeInstantFocusSearchField, scrollView: NSScrollView, resultCountLabel: NSTextField, selectAllButton: NSButton, invertSelectionButton: NSButton, addButton: NSButton) {
+    func configureControls(searchField: NativeInstantFocusSearchField, scrollView: NSScrollView, resultCountLabel: NSTextField, selectAllButton: NSButton, invertSelectionButton: NSButton, addButton: NSButton, progress: NSImageView, statusLabel: NSTextField) {
         self.searchField = searchField
         self.scrollView = scrollView
         self.resultCountLabel = resultCountLabel
         self.selectAllButton = selectAllButton
         self.invertSelectionButton = invertSelectionButton
         self.addButton = addButton
+        self.progress = progress
+        self.statusLabel = statusLabel
         searchField.delegate = self
+        refreshControls()
+    }
+
+    /// State a waiting write: the spinner turns beside 添加, the button and every
+    /// control that could start a second pick or end the window go quiet, and
+    /// `status` names what is happening (添加中, 已保存, or a cause to fix).
+    func setSaving(_ saving: Bool, status: String) {
+        self.saving = saving
+        statusLabel?.stringValue = status
+        statusLabel?.textColor = saving ? .secondaryLabelColor : .secondaryLabelColor
+        statusLabel?.isHidden = status.isEmpty
+        progress?.isHidden = !saving
+        if saving {
+            startWheel()
+        } else {
+            stopWheel()
+        }
+        searchField?.isEnabled = !saving
         refreshControls()
     }
 
@@ -5496,27 +5725,56 @@ private final class NativeModelChooserController: NSObject, NSWindowDelegate, NS
             summary += "  |  " + selectedCountTemplate.replacingOccurrences(of: "{count}", with: String(listView.selectedCount))
         }
         resultCountLabel?.stringValue = summary
-        selectAllButton?.isEnabled = listView.visibleCount > 0
-        invertSelectionButton?.isEnabled = listView.visibleCount > 0
-        addButton?.isEnabled = listView.selectedCount > 0
+        selectAllButton?.isEnabled = !saving && listView.visibleCount > 0
+        invertSelectionButton?.isEnabled = !saving && listView.visibleCount > 0
+        addButton?.isEnabled = !saving && listView.selectedCount > 0
     }
-    @objc func selectAllAction(_ sender: Any?) { listView.selectAll() }
-    @objc func invertSelectionAction(_ sender: Any?) { listView.invertSelection() }
-    @objc func addSelectedAction(_ sender: Any?) { finish([String](listView.selectedModels)) }
-    @objc func cancelAction(_ sender: Any?) { finish(nil) }
-    func windowWillClose(_ notification: Notification) { finish(nil) }
+    /// The wheel turns by swapping pre-rendered frames, so nothing about the
+    /// footer's layout changes while it reports progress.
+    private func startWheel() {
+        guard wheelTimer == nil else { return }
+        progress?.image = AppKitBusySpinner.frames.isEmpty ? nil : AppKitBusySpinner.frames[wheelStep % max(1, AppKitBusySpinner.frames.count)]
+        let timer = Timer(timeInterval: AppKitBusySpinner.stepInterval, repeats: true) { [weak self] timer in
+            guard let self else {
+                timer.invalidate()
+                return
+            }
+            guard !AppKitBusySpinner.frames.isEmpty else { return }
+            self.wheelStep = (self.wheelStep + 1) % AppKitBusySpinner.frames.count
+            self.progress?.image = AppKitBusySpinner.frames[self.wheelStep]
+        }
+        wheelTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
 
-    /// Settle the pending chooser exactly once, whichever way its window went
-    /// away: the Add button carries the selection, Cancel and the title-bar
-    /// close button carry nothing. The host ends the child surface from this
-    /// one completion.
-    private func finish(_ selection: [String]?) {
-        guard !didFinish else { return }
-        didFinish = true
-        let completion = onFinish
-        onFinish = nil
-        completion?(selection)
+    private func stopWheel() {
+        wheelTimer?.invalidate()
+        wheelTimer = nil
     }
+
+    @objc func selectAllAction(_ sender: Any?) { guard !saving else { return }; listView.selectAll() }
+    @objc func invertSelectionAction(_ sender: Any?) { guard !saving else { return }; listView.invertSelection() }
+    /// 添加 hands the pick over; it does not end the window.  The window stays
+    /// until the pane's answer says the rows landed, because closing here was
+    /// what made a pick look like it had been discarded.
+    @objc func addSelectedAction(_ sender: Any?) {
+        guard !saving else { return }
+        let picked = [String](listView.selectedModels)
+        guard !picked.isEmpty else { return }
+        onFinish?(picked)
+    }
+    @objc func cancelAction(_ sender: Any?) {
+        guard !saving else { return }
+        onCancel?()
+    }
+    func windowWillClose(_ notification: Notification) {
+        guard !saving else { return }
+        onCancel?()
+    }
+    /// A window that is writing cannot be taken away under the write: its
+    /// answer would arrive at a chooser that no longer exists, and the person
+    /// would never learn whether the rows were saved.
+    func windowShouldClose(_ sender: NSWindow) -> Bool { !saving }
     var selectedModels: [String] { listView.selectedModels }
 }
 

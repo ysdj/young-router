@@ -558,6 +558,46 @@ def _relay_has_session(account: object) -> bool:
     return bool(session.get("cookie") or session.get("access_token"))
 
 
+#: The fields that are the account's login rather than a reading of it.  They
+#: travel together: a status is only true of the session that proved it, and
+#: the station's own account id belongs to that session.
+LOGIN_FIELDS = ("login_status", "login_observed_at", "session", "user_id")
+
+
+def _stamp(value: object) -> float | None:
+    """One login observation, as an orderable instant, or ``None``.
+
+    Two machines write these, so the string is parsed rather than compared:
+    the offsets both machines emit are UTC, but a stamp a person or an older
+    version wrote may not be, and ordering two differently-written instants as
+    text is how a newer login loses to an older one.
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.timestamp()
+
+
+def _newer_login(account: dict[str, Any], other: dict[str, Any]) -> bool:
+    """Whether this row's login observation is the later of the two."""
+
+    mine = _stamp(account.get("login_observed_at"))
+    theirs = _stamp(other.get("login_observed_at"))
+    return mine is not None and theirs is not None and mine > theirs
+
+
+def _same_login(account: dict[str, Any], other: dict[str, Any]) -> bool:
+    """Whether the two rows carry different login states (the one to adopt)."""
+
+    return any(account.get(field) != other.get(field) for field in LOGIN_FIELDS)
+
+
 def _relay_rows_by_id(document: dict[str, Any], key: str) -> dict[str, dict[str, Any]]:
     """One document's rows of ``key``, keyed by their id; unreadable rows drop."""
 
@@ -569,6 +609,64 @@ def _relay_rows_by_id(document: dict[str, Any], key: str) -> dict[str, dict[str,
         for row in rows
         if isinstance(row, dict) and isinstance(row.get("id"), str) and row["id"]
     }
+
+
+def _merge_tombstone_rows(
+    first: dict[str, dict[str, Any]],
+    second: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Keep the newest removal for each id, using the same rule per tombstone kind."""
+
+    merged = dict(first)
+    for identifier, candidate in second.items():
+        current = merged.get(identifier)
+        if current is None:
+            merged[identifier] = candidate
+            continue
+        candidate_stamp = _stamp(candidate.get("removed_at"))
+        current_stamp = _stamp(current.get("removed_at"))
+        if candidate_stamp is not None and (
+            current_stamp is None or candidate_stamp > current_stamp
+        ):
+            merged[identifier] = candidate
+    return merged
+
+
+def _tombstone_superseded(
+    row: dict[str, Any],
+    removed_stations: dict[str, dict[str, Any]],
+    removed_accounts: dict[str, dict[str, Any]],
+) -> bool:
+    """Whether a later observation outranks the removal that names this row.
+
+    A tombstone is content, and it is permanent -- which is what makes a
+    deletion land on the other machine.  But a row that was *written after* the
+    removal is not the row that was removed: restoring a store (or signing in
+    again to a station someone deleted) states the station is here, and the
+    stamp on that login is the only order the two facts have.  Treating the
+    tombstone as final made the restore unrecoverable: every pull removed the
+    account again, from whichever machine pushed last.
+    """
+
+    observed = _stamp(row.get("login_observed_at"))
+    if observed is None:
+        return False
+    removed_at: float | None = None
+    account_id = row.get("id")
+    if isinstance(account_id, str):
+        entry = removed_accounts.get(account_id)
+        if isinstance(entry, dict):
+            stamp = _stamp(entry.get("removed_at"))
+            if stamp is not None:
+                removed_at = stamp
+    station_id = row.get("station_id")
+    if isinstance(station_id, str):
+        entry = removed_stations.get(station_id)
+        if isinstance(entry, dict):
+            stamp = _stamp(entry.get("removed_at"))
+            if stamp is not None and (removed_at is None or stamp > removed_at):
+                removed_at = stamp
+    return removed_at is not None and observed > removed_at
 
 
 def _relay_row_is_removed(
@@ -641,10 +739,38 @@ def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
     local_removed_accounts = _relay_rows_by_id(local_document, "removed_accounts")
     incoming_removed_stations = _relay_rows_by_id(incoming_document, "removed_stations")
     incoming_removed_accounts = _relay_rows_by_id(incoming_document, "removed_accounts")
+    original_incoming_removed_stations = dict(incoming_removed_stations)
+    original_incoming_removed_accounts = dict(incoming_removed_accounts)
     if not local_accounts and not local_stations and not (local_removed_stations or local_removed_accounts):
         # Nothing local to preserve and nothing local to defend: the incoming
         # copy is the answer.
         return None
+
+    # A login observed after a removal supersedes it, on both sides: the row
+    # came back, and the tombstone describes a station that is here again.  The
+    # rule lives here, once, because a tombstone and the row it names can meet
+    # on either copy.
+    live_removed_stations = _merge_tombstone_rows(
+        local_removed_stations, incoming_removed_stations
+    )
+    live_removed_accounts = _merge_tombstone_rows(
+        local_removed_accounts, incoming_removed_accounts
+    )
+    for account in [*local_accounts.values(), *incoming_accounts.values()]:
+        if not _tombstone_superseded(
+            account, live_removed_stations, live_removed_accounts
+        ):
+            continue
+        account_id = account.get("id")
+        station_id = account.get("station_id")
+        if isinstance(account_id, str):
+            local_removed_accounts.pop(account_id, None)
+            incoming_removed_accounts.pop(account_id, None)
+            live_removed_accounts.pop(account_id, None)
+        if isinstance(station_id, str):
+            local_removed_stations.pop(station_id, None)
+            incoming_removed_stations.pop(station_id, None)
+            live_removed_stations.pop(station_id, None)
 
     # A removal recorded on one side suppresses that id on the other.  The two
     # directions are deliberately symmetric: the other machine's deletion is
@@ -682,15 +808,43 @@ def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
             continue
         if not _relay_has_session(local_account):
             continue
+        if _newer_login(local_account, incoming_account):
+            fresher_local.add(account_id)
+            continue
+        if _stamp(local_account.get("login_observed_at")) and not _stamp(incoming_account.get("login_observed_at")):
+            # The incoming login was never observed: a peer running an earlier
+            # version wrote no stamp, and an account nobody signed in on has
+            # none either.  That is not evidence against a session this machine
+            # holds -- and letting it win is what made a fresh sign-in vanish at
+            # the next pull, because the bundle that had been built before it
+            # replaced the store wholesale.
+            fresher_local.add(account_id)
+
+    # The login itself, taken from whichever side observed it last.  Which row
+    # survives above is decided by the *session*; the login a person just
+    # completed is a different question, and one machine's answer is the other
+    # machine's state: without this, a sign-in on the desktop left the gateway
+    # reading 未登录 (and paying a probe per pane entry) until its own next
+    # read, and a determination made on the gateway never reached the desktop
+    # at all.  Only the login travels: the local key list, balance and group
+    # catalog stay this machine's own reading, so adopting a peer's login never
+    # blanks the rows the pane is showing.
+    login_from_local: dict[str, dict[str, Any]] = {}
+    login_from_incoming: dict[str, dict[str, Any]] = {}
+    for account_id, local_account in kept_local_accounts.items():
+        incoming_account = kept_incoming_accounts.get(account_id)
+        if incoming_account is None:
+            continue
         local_observed = local_account.get("login_observed_at")
         incoming_observed = incoming_account.get("login_observed_at")
-        if not (isinstance(local_observed, str) and local_observed and isinstance(incoming_observed, str) and incoming_observed):
-            # Without two comparable observations there is no basis to prefer
-            # the local session over the incoming one.
+        if not (_stamp(local_observed) and _stamp(incoming_observed)):
             continue
-        if local_observed <= incoming_observed:
+        if not _same_login(local_account, incoming_account):
             continue
-        fresher_local.add(account_id)
+        if _newer_login(local_account, incoming_account):
+            login_from_local[account_id] = local_account
+        elif _newer_login(incoming_account, local_account):
+            login_from_incoming[account_id] = incoming_account
 
     keep_ids = locally_only | fresher_local
     kept_account_rows = [
@@ -725,6 +879,46 @@ def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
     ]
 
     merged_accounts = [*incoming_account_rows, *kept_account_rows]
+    local_readings_changed = False
+    # An incoming row keeps its own readings only where this machine has none.
+    # The observations are *this* machine's poll, taken from the same station
+    # moments later: replacing a key list the pane is showing with the peer's
+    # older one made a login arriving from the other machine look like every
+    # key had moved, and the read that replaced it was paid for nothing.
+    if kept_local_accounts:
+        preserved: list[dict[str, Any]] = []
+        for account in merged_accounts:
+            local_account = kept_local_accounts.get(account.get("id"))
+            if local_account is None:
+                preserved.append(account)
+                continue
+            row = dict(account)
+            for field in LOCAL_READINGS:
+                if field in local_account:
+                    if field not in row or row[field] != local_account[field]:
+                        local_readings_changed = True
+                    row[field] = local_account[field]
+            preserved.append(row)
+        merged_accounts = preserved
+    if login_from_local or login_from_incoming:
+        # The login group replaces the surviving row's own, so both directions
+        # read as one rule: whatever the newer observation says, whichever row
+        # was kept for its session or its keys.
+        adopted: list[dict[str, Any]] = []
+        for account in merged_accounts:
+            account_id = account.get("id")
+            source = login_from_local.get(account_id) or login_from_incoming.get(account_id)
+            if source is None:
+                adopted.append(account)
+                continue
+            row = dict(account)
+            for field in LOGIN_FIELDS:
+                if field in source:
+                    row[field] = source[field]
+                else:
+                    row.pop(field, None)
+            adopted.append(row)
+        merged_accounts = adopted
     merged_account_station_ids = {
         account.get("station_id") for account in merged_accounts if isinstance(account.get("station_id"), str)
     }
@@ -751,12 +945,19 @@ def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
     # listing the id is exactly what let a stale peer hand it back on the next
     # run, and a stale peer can appear at any time.  The list is bounded by the
     # store's own cap, so keeping it costs a row per id ever removed.
-    merged_tombstones: dict[str, list[dict[str, Any]]] = {}
-    for key, tombstones in (
-        ("removed_stations", {**incoming_removed_stations, **local_removed_stations}),
-        ("removed_accounts", {**incoming_removed_accounts, **local_removed_accounts}),
-    ):
-        merged_tombstones[key] = [tombstones[identifier] for identifier in sorted(tombstones)]
+    merged_removed_stations = _merge_tombstone_rows(
+        incoming_removed_stations, local_removed_stations
+    )
+    merged_removed_accounts = _merge_tombstone_rows(
+        incoming_removed_accounts, local_removed_accounts
+    )
+    merged_tombstones = {
+        key: [tombstones[identifier] for identifier in sorted(tombstones)]
+        for key, tombstones in (
+            ("removed_stations", merged_removed_stations),
+            ("removed_accounts", merged_removed_accounts),
+        )
+    }
 
     # A cleanup tombstone belongs to the account it names, and the two kinds
     # sit on opposite sides of it: a ``password`` tombstone is about an account
@@ -800,10 +1001,13 @@ def _merge_relay_accounts(local: bytes, incoming: bytes) -> bytes | None:
     changed = bool(
         locally_only
         or fresher_local
+        or login_from_local
+        or login_from_incoming
+        or local_readings_changed
         or {account.get("id") for account in incoming_account_rows} != set(incoming_accounts)
         or {station.get("id") for station in incoming_station_rows} != set(incoming_stations)
-        or {row["id"] for row in merged_tombstones["removed_stations"]} != set(incoming_removed_stations)
-        or {row["id"] for row in merged_tombstones["removed_accounts"]} != set(incoming_removed_accounts)
+        or merged_removed_stations != original_incoming_removed_stations
+        or merged_removed_accounts != original_incoming_removed_accounts
         or cleanup_keys != incoming_cleanup_keys
     )
     if not changed:
@@ -962,6 +1166,15 @@ def sync_targets(config_path: pathlib.Path) -> list[tuple[str, pathlib.Path, boo
 #: travels inside a bundle that a real change produced, and each machine keeps
 #: the fresher copy of what it observed (``_merge_relay_accounts``).
 #:
+#: ``login_status`` is deliberately *not* in this list.  A login is not a
+#: reading of the station, it is the account's state: signed in here is signed
+#: in on the other machine, whose pane draws the same 已登录 / 未登录 without
+#: paying a probe of its own.  The moment it was observed stays behind
+#: (``login_observed_at`` above) because a poll restamps it on every read, and
+#: carrying that would turn each refresh into an edit; the merge orders the two
+#: copies by that stamp instead, so the newer determination is the one that
+#: survives without the clock ever deciding a push.
+#:
 #: The list is deliberately short and explicit, and it lives here rather than
 #: being derived from the relay domain's own schema.  `resources` and `groups`
 #: must stay excluded even though a staged rename or group pick is written
@@ -978,7 +1191,6 @@ RELAY_OBSERVATION_FIELDS = frozenset(
         "groups",
         "last_updated_at",
         "login_observed_at",
-        "login_status",
         "resource_error",
         "resource_keys",
         "resource_status",
@@ -988,6 +1200,12 @@ RELAY_OBSERVATION_FIELDS = frozenset(
         "user_id",
     }
 )
+
+#: What a *read* of the station produced, as opposed to what a person set or
+#: what a login established.  Every machine reads its own, and the merge keeps
+#: the local copy: two machines polling one station are two answers to a
+#: question neither of them asked the other.
+LOCAL_READINGS = frozenset(RELAY_OBSERVATION_FIELDS) - frozenset(LOGIN_FIELDS) - {"user_id"}
 
 
 def _relay_rows(value: object, order: str) -> list[dict[str, Any]]:
@@ -1017,10 +1235,19 @@ def _durable_relay_bytes(data: bytes) -> bytes | None:
         return None
     if not isinstance(document, dict):
         return None
-    accounts = [
-        {key: value for key, value in account.items() if key not in RELAY_OBSERVATION_FIELDS}
-        for account in _relay_rows(document.get("accounts"), "id")
-    ]
+    accounts = []
+    for account in _relay_rows(document.get("accounts"), "id"):
+        row = {key: value for key, value in account.items() if key not in RELAY_OBSERVATION_FIELDS}
+        # A login status is content only when the station (or a host's own
+        # probe) determined it, and the stamp is what says so.  Without this a
+        # row that merely has no credential to try -- a placeholder, or an
+        # account this machine never signed in -- would read as 未登录 to the
+        # comparison and could out-vote the machine that actually holds a
+        # session.
+        observed = isinstance(account.get("login_observed_at"), str) and bool(account.get("login_observed_at"))
+        if not observed or account.get("login_status") not in {"signed_in", "signed_out", "expired"}:
+            row.pop("login_status", None)
+        accounts.append(row)
     cleanups = _relay_rows(document.get("pending_credential_cleanups"), "account_id")
     cleanups.sort(key=lambda row: json.dumps(row, ensure_ascii=False, sort_keys=True))
     # A removal tombstone is content too: two machines write the same removals

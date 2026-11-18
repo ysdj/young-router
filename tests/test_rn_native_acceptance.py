@@ -1180,7 +1180,12 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         presentation = leaf.split("private func presentBuiltDecisionPanel(", 1)[1].split(
             "/// Puts a decision panel where a question belongs", 1
         )[0]
-        self.assertIn("let anchor = locksParent ? (parent ?? activeWindow()) : nil", presentation)
+        # A question asked *by* a child surface goes over that surface: the
+        # import's 名称大小写 question is asked while the model chooser is up and
+        # writing, and anchoring it on the workspace drew it behind the chooser.
+        self.assertIn("let anchor = locksParent ? (parent ?? questionAnchor()) : nil", presentation)
+        self.assertIn("private func questionAnchor() -> NSWindow? {", leaf)
+        self.assertIn("childPanels.contains(where: { $0.window === key })", leaf)
         self.assertIn("Self.positionDecisionPanel(panel, over: anchor)", presentation)
         self.assertIn("presentChildPanel(panel, in: anchor, prepare: prepare)", presentation)
         self.assertIn("private static func positionDecisionPanel(_ panel: NSWindow, over anchor: NSWindow?)", leaf)
@@ -2580,7 +2585,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("verified->quota", windows_relay)
         self.assertIn('payload.SetNamedValue(L"quota"', windows_core)
         self.assertIn('"refresh_token", "user_id", "quota"', core_ipc)
-        self.assertIn("quota=quota,", core_ipc)
+        # Core accepts that quota at the boundary and drops it: the balance is
+        # the profile API's answer on the refresh behind the restore, because the
+        # page's number and the API's disagreed live.
+        self.assertNotIn("quota=quota,", core_ipc)
         # A braced initializer fills members in declaration order, so the family
         # a probe answered as comes before the station's own account id.  Read as
         # "id, then family" the session was stored under the id, which ReadSession
@@ -2637,7 +2645,7 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("chooseModelsToAdd(models: string[]", bridge)
         self.assertIn("chooseModelsToAdd?: (models: string[]", platform)
         self.assertIn("native.chooseModelsToAdd({ models: candidates, providerName, keyName })", ui)
-        self.assertIn("candidateSet.has(model)", ui)
+        self.assertIn("roster.has(model)", ui)
         self.assertNotIn("<Modal", ui)
         self.assertNotIn("FetchedModelsDialog", ui)
 
@@ -2645,10 +2653,10 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertIn("NSPanel(", mac_leaf)
         # The chooser is the reference child surface: its own movable window,
         # the window behind it locked by the shield, and a completion that
-        # carries the selection once that window closes.
+        # carries the first pick once the person presses 添加.
         self.assertIn("completion: @escaping ([String]?) -> Void) {", mac_leaf)
         self.assertIn("presentChildPanel(panel, in: activeWindow(), prepare: { controller.focusSearchField() })", mac_leaf)
-        self.assertIn("completion(selection)", mac_leaf)
+        self.assertIn("chooser.completion(picked)", mac_leaf)
         # The host owns the chooser while its window is up. AppKit holds a
         # window's delegate and a control's target weakly, so a chooser that
         # only exists as a local in `chooseModelsToAdd` is collected the moment
@@ -2665,10 +2673,34 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
             mac_leaf,
         )
         self.assertIn("controller.onFinish = { [weak self] selection in", mac_leaf)
-        self.assertIn("self?.finishModelChooser(panel, selection: selection)", mac_leaf)
+        self.assertIn("self?.handOverModelChooser(panel, selection: selection)", mac_leaf)
+        self.assertIn("controller.onCancel = { [weak self] in", mac_leaf)
         self.assertIn("private func finishModelChooser(_ panel: NSPanel, selection: [String]?) {", mac_leaf)
         self.assertIn("panel.delegate = nil", mac_leaf)
-        self.assertIn("chooser.completion(selection)", mac_leaf)
+        # 添加 hands the pick over instead of closing the window: the pane writes
+        # the rows behind it, the footer turns the app's own wheel, and only the
+        # answer that the rows landed takes the window down.  A refused write
+        # keeps the window, its ticks and its 添加 for another try, and the next
+        # press comes back as the answer to the same question.
+        self.assertIn("private func handOverModelChooser(_ panel: NSPanel, selection: [String]?) {", mac_leaf)
+        self.assertIn('chooser.controller.setSaving(true, status: localized("childSaving", fallback: "Saving…"))', mac_leaf)
+        self.assertIn("func answerModelsToAdd(status: String, close: Bool, completion: @escaping ([String]?) -> Void) {", mac_leaf)
+        self.assertIn("chooser.nextPick = completion", mac_leaf)
+        self.assertIn("func setSaving(_ saving: Bool, status: String) {", mac_leaf)
+        self.assertIn("addButton?.isEnabled = !saving && listView.selectedCount > 0", mac_leaf)
+        self.assertIn("func windowShouldClose(_ sender: NSWindow) -> Bool { !saving }", mac_leaf)
+        # The wheel beside the footer states the wait with the shared frames.
+        self.assertIn("private func startWheel() {", mac_leaf)
+        self.assertIn("AppKitBusySpinner.frames[wheelStep % max(1, AppKitBusySpinner.frames.count)]", mac_leaf)
+        # The shared pane answers the hand-over and selects the rows it wrote.
+        self.assertIn("native.finishModelsToAdd({ status, close })", ui)
+        self.assertIn("const importPickedModels = async (", ui)
+        self.assertIn("await answerModelPick(translate(\"common.saved\"), true);", ui)
+        self.assertIn("finishModelsToAdd?(options: { status: string; close: boolean }): Promise<string[] | undefined>;", types)
+        self.assertIn("finishModelsToAdd?(status: string, close: boolean): Promise<string[] | undefined>;", bridge)
+        self.assertIn("finishModelsToAdd?: (status: string, close: boolean) => Promise<string[] | undefined>;", platform)
+        self.assertIn("@objc(finishModelsToAdd:close:resolver:rejecter:)", mac_module)
+        self.assertIn("RCT_EXTERN_METHOD(finishModelsToAdd:(NSString *)status close:(BOOL)close", mac_bridge)
         # A request that lands on an open chooser settles it instead of stacking
         # a second identical window over the one the user is answering, and the
         # lock only brings forward a child that is still open.
@@ -3658,14 +3690,25 @@ class ReactNativeNativeAcceptanceTests(unittest.TestCase):
         self.assertNotIn("if (result.status != 200) continue;", poll)
 
 
-    def test_windows_controls_carry_their_hint_and_their_name(self) -> None:
+    def test_windows_controls_carry_their_name_and_no_hint(self) -> None:
         controls = (SHARED / "ui/NativeControls.tsx").read_text(encoding="utf-8")
         mac_button_spec = (SHARED / "ui/macos/NativeButtonNativeComponent.ts").read_text(encoding="utf-8")
-        self.assertIn("toolTip?: string;", mac_button_spec)
+        # A button states no hover tip on any host: the macOS leaf, the Windows
+        # leaf and the page all draw the title, and a glyph button is named here
+        # instead of hinted at.
+        self.assertNotIn("toolTip?: string;", mac_button_spec)
         self.assertIn("accessibilityLabel?: string;", mac_button_spec)
-        # The React button carries a hover hint and its own accessible name.
         self.assertIn("accessibilityLabel={accessibilityLabel ?? title}", controls)
-        self.assertIn("tooltip: toolTip ?? title", controls)
+        self.assertNotIn("tooltip: toolTip ?? title", controls)
+        self.assertNotIn("setAttribute?.(", controls)
+        # Neither native host has a second way to say it: the AppKit button view
+        # never assigns a tooltip, and the WinUI leaf never asks the tooltip
+        # service for one.
+        mac_controls = (MAC_NATIVE / "AppKitControlViews.mm").read_text(encoding="utf-8")
+        self.assertNotIn("_button.toolTip = [", mac_controls)
+        self.assertNotIn("newViewProps.toolTip", mac_controls)
+        windows_leaf = (WIN_NATIVE / "WinUI3NativeLeaf.cpp").read_text(encoding="utf-8")
+        self.assertNotIn("ToolTipService::SetToolTip", windows_leaf)
         # The React switch and text field name themselves from the shared label.
         self.assertIn("accessibilityLabel={accessibilityLabel}", controls)
         self.assertIn("<TextInput {...props}", controls)

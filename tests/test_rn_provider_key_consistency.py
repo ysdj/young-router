@@ -36,7 +36,7 @@ class ProviderKeyConsistencyTests(unittest.TestCase):
         # visibility rule, so every offered entry has a row above it.
         self.assertIn("selectedStationAccounts.flatMap((account) =>", workspace)
         self.assertIn("providedKeyRows([account], translate)", workspace)
-        self.assertIn("providerKeyChoices(provider, providerKeySources)", workspace)
+        self.assertIn("providerKeyChoices(provider, providerKeySources, relayAccountPrefixByID)", workspace)
         # The snapshot's whole station list is no longer what the picker reads.
         self.assertNotIn("providerKeyChoices(provider, relaySources", workspace)
         self.assertNotIn("relaySourcesForBaseUrl", UI)
@@ -47,7 +47,7 @@ class ProviderKeyConsistencyTests(unittest.TestCase):
         # picker may not drop it.
         self.assertNotIn("const fetchable = ", UI)
         workspace = section(UI, "function ProviderWorkspace(", "function ProviderKeysPanel(")
-        self.assertIn("const choices = providerKeyChoices(provider, providerKeySources);", workspace)
+        self.assertIn("const choices = providerKeyChoices(provider, providerKeySources, relayAccountPrefixByID);", workspace)
 
     def test_the_key_table_reads_the_same_derivation(self) -> None:
         panel = section(UI, "function ProviderKeysPanel(", "\nfunction ")

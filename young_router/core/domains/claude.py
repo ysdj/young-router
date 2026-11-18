@@ -1621,7 +1621,7 @@ class ClaudeSettingsDomain:
         ``None`` and an empty list are different answers.  An unreadable or
         empty document is no observation and must not rewrite a client's picker,
         while a document that lists routes is the app's own statement about what
-        it serves.  Ordering and the image-generator filter are
+        it serves.  Ordering and the image/video-generator filter are
         ``codex_config.configured_exposed_models``', so every picker this app
         writes places a route in the same spot and never offers a route that
         cannot hold a conversation.

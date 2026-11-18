@@ -438,6 +438,16 @@ _RELAY_DEPENDENCY_ACTIONS = frozenset(
         "station_remove",
         "relay_station_remove",
         "remove_station",
+        # The verbs the panes actually send.  ``account.delete`` normalizes to
+        # ``account_delete``, which was missing here while only the
+        # ``*_remove`` spellings were listed -- so a delete from the account
+        # pane never reached the provider policy at all, and the linked keys
+        # stayed behind pointing at an account that no longer existed.
+        "station_delete",
+        "relay_station_delete",
+        "account_delete",
+        "relay_account_delete",
+        "relay_delete",
         "account_remove",
         "relay_account_remove",
         "remove_account",
@@ -4012,6 +4022,7 @@ class CoreStore:
         station_type: object = None,
         station_origin: object = None,
         remember_password: object = None,
+        remember_session: object = None,
         auto_grouping: object = None,
         pending_account: object = False,
     ) -> dict[str, Any]:
@@ -4022,6 +4033,12 @@ class CoreStore:
         the choice, so a previously saved password can be retired from the
         same prompt.
 
+        ``remember_session`` is the same tri-state for the login itself.  A
+        page host states ``True``: it has no credential store of its own, so
+        the session Core keeps is the only copy there is.  The native hosts
+        leave it absent -- their keychain already holds it, and the account's
+        own preference stands.
+
         ``user_id`` is the station's own account id captured with this session;
         a New API fork requires it as the ``New-Api-User`` header on every later
         dashboard read, so the login that proves the session is where it is
@@ -4029,6 +4046,7 @@ class CoreStore:
         """
 
         remember_choice = remember_password if isinstance(remember_password, bool) else None
+        remember_session_choice = remember_session if isinstance(remember_session, bool) else None
         auto_group_choice = auto_grouping if isinstance(auto_grouping, bool) else None
         known_secrets = tuple(
             value for value in (cookie, access_token, refresh_token, password) if isinstance(value, str) and value
@@ -4143,6 +4161,7 @@ class CoreStore:
                         password=str(password) if isinstance(password, str) else "",
                         user_id=user_id,
                         remember_password=remember_choice,
+                        remember_session=remember_session_choice,
                         auto_grouping=auto_group_choice,
                     )
                 else:
@@ -4231,6 +4250,13 @@ class CoreStore:
                     safe_exception_message(exc, known_secrets=known_secrets),
                 ) from None
             should_emit = True
+            # The shape is a contract: both native bridges answer only for
+            # exactly these four keys (`Set(object.keys) == …` in
+            # CoreIPCBridge.acceptRelayLogin), and a fifth field made every
+            # native sign-in fail after the station had already accepted it --
+            # measured on the live app as 无法保存登录状态。 over a signed-in
+            # dashboard.  What the page's post-login question needs is read from
+            # the account instead (see `_accept_browser_session`).
             response = {
                 "revision": self._revision,
                 "login_status": "signed_in",
@@ -4356,6 +4382,11 @@ class CoreStore:
             password=stored_password if isinstance(stored_password, str) else "",
             submit=prefill.get("submit") is True,
         )
+        # What the person types into that page is the one thing the post-login
+        # question can offer to keep, and this host has no webview to read it
+        # from: Core watches the browser it opened.  Nothing is stored unless
+        # the answer says so.
+        relay_browser.start_capture(browser)
         with self._lock:
             self._browser_logins[login_id] = {
                 "browser": browser,
@@ -4370,6 +4401,9 @@ class CoreStore:
                 "station_type": station_type,
                 "station_origin": station_origin,
                 "last_cookie": "",
+                # The account's own answer to "keep the password", so the page
+                # asks the post-login question only when it is not already on.
+                "remember_password": prefill.get("remember_password") is True,
             }
         result: dict[str, Any] = {"login_id": login_id, "browser": browser.browser.name, "status": "waiting"}
         mirror = getattr(browser, "mirror", None)
@@ -4508,6 +4542,8 @@ class CoreStore:
     def _accept_browser_session(self, entry: Mapping[str, Any], verified: Mapping[str, Any]) -> dict[str, Any]:
         """Hand one verified browser session to the one login boundary."""
 
+        browser = entry.get("browser")
+        captured = str(getattr(browser, "captured_password", "") or "")
         try:
             result = self.accept_relay_login(
                 account_id=entry["account_id"],
@@ -4523,10 +4559,101 @@ class CoreStore:
                 station_type=entry["station_type"],
                 station_origin=entry["station_origin"],
                 pending_account=entry["pending_account"] is True,
+                # The login itself is kept: a page host has no credential store
+                # of its own, so dropping the session here is what signed a
+                # session-only account out again on its next visit.  Whether the
+                # *password* is kept is the question the page asks next.
+                remember_session=True,
             )
         except CoreError as exc:
             return {"status": "rejected", "code": exc.code}
-        return {"status": "signed_in", **{key: value for key, value in result.items() if key != "status"}}
+        except Exception:
+            # A bridge that answers the wrong shape is a failed sign-in, not a
+            # window that goes on waiting: the page polls until this answers,
+            # and a raise here left the surface waiting on a login Core had
+            # already refused to record.
+            return {"status": "rejected", "code": "relay_login_failed"}
+        relay = self._domains.get("relay_accounts")
+        account_id = str(entry["account_id"])
+        if entry.get("pending_account") is True:
+            # The login boundary may have merged this pending sign-in into an
+            # account with the same station identity. Resolve that identity
+            # through the relay domain again so the password capture and the
+            # post-login preference read address the row that was actually
+            # updated, not the temporary id carried by the browser window.
+            finder = getattr(relay, "account_for_login_identity", None) if relay is not None else None
+            if callable(finder):
+                try:
+                    resolved = finder(
+                        origin=entry["origin"],
+                        username=str(verified.get("username") or entry.get("username", "")),
+                    )
+                except Exception:
+                    resolved = ""
+                if isinstance(resolved, str) and resolved:
+                    account_id = resolved
+        capture = getattr(relay, "capture_password", None) if relay is not None else None
+        if captured and callable(capture):
+            try:
+                capture(account_id, captured)
+            except Exception:
+                captured = ""
+        keeps: dict[str, Any] = {}
+        reader = getattr(relay, "login_preferences", None) if relay is not None else None
+        if callable(reader):
+            try:
+                keeps = reader(account_id)
+            except Exception:
+                keeps = {}
+        return {
+            "status": "signed_in",
+            # A pending browser login may be merged into an existing account.
+            # The page's post-login preference must target the row that owns
+            # the captured password, not the temporary id used to start the
+            # browser window.
+            "account_id": account_id,
+            **{key: value for key, value in result.items() if key != "status"},
+            # The post-login question: asked only while the account keeps no
+            # password, and only when there is one to keep.
+            "remember_password": keeps.get("remember_password") is True,
+            "can_remember_password": bool(captured) or keeps.get("password_saved") is True,
+        }
+
+    def remember_relay_password(self, *, account_id: object, remember: object) -> dict[str, Any]:
+        """Answer the post-login question about the password a person typed.
+
+        Two answers, and neither is about the login: 记住密码 keeps the password
+        (the one just typed into the station's page), 仅记住登录态 keeps only
+        the session.  The question is asked after the sign-in is verified
+        because that is when Core knows both halves — the session it captured
+        and the password the person typed — and asking before it would make the
+        answer a condition of the login.
+        """
+
+        if not isinstance(remember, bool):
+            raise CoreError("relay_login_failed", "Relay login answer is invalid")
+        with self._domain_scope("relay_accounts"):
+            relay = self._domains.get("relay_accounts")
+            settler = getattr(relay, "settle_captured_password", None) if relay is not None else None
+            if not callable(settler):
+                raise CoreError("relay_login_failed", "Relay account is unavailable")
+            try:
+                public = settler(str(account_id), keep=remember)
+            except Exception as exc:
+                raise CoreError(
+                    "relay_login_failed",
+                    safe_exception_message(exc, known_secrets=()),
+                ) from None
+            self._advance_revision()
+            self._persist_metadata()
+            response = {
+                "revision": self._revision,
+                "account_id": str(account_id),
+                "remember_password": public.get("remember_password") is True,
+                "password_saved": bool(public.get("password_saved")),
+            }
+        self._request_emit()
+        return response
 
     def focus_relay_browser_login(self, login_id: object) -> dict[str, Any]:
         """Bring one sign-in window back to the front.
@@ -4703,7 +4830,6 @@ class CoreStore:
         access_token: object = "",
         refresh_token: object = "",
         user_id: object = "",
-        quota: object = None,
     ) -> dict[str, Any]:
         """Restore or update one locally validated native relay session.
 
@@ -4716,10 +4842,12 @@ class CoreStore:
         beside the session because a New API fork requires it as the
         ``New-Api-User`` header on every dashboard read.
 
-        ``quota`` is the New API profile the host's own probe just read.  The
-        probe that proves the session is the same answer the account's balance
-        comes from, so carrying it here settles both in one write instead of
-        paying a second read for a number the entry already had.
+        The body also carries the dashboard ``quota`` the host's probe read.
+        Nothing consumes it: the account's balance comes from the station's
+        profile API on the refresh behind this call, and publishing the page's
+        number first made the row change by tens of dollars seconds after a
+        sign-in.  The field stays accepted at the boundary -- installed hosts
+        still send it -- and nowhere else.
         """
 
         known_secrets = tuple(
@@ -4763,7 +4891,84 @@ class CoreStore:
             ):
                 raise CoreError("relay_restore_failed", "Relay account does not match the saved site")
             try:
-                if login_status == "signed_in":
+                if login_status == "unknown":
+                    # The page host has no station probe of its own -- it cannot
+                    # read another origin's cookie -- so it states *no
+                    # observation*, and Core resolves one.  Treating that
+                    # request as the host's own ``signed_out`` was the one
+                    # determination nobody made: an account with no remembered
+                    # password was recorded 未登录 without the station ever being
+                    # asked, and (since a login state now travels) that invented
+                    # answer was then synced to every other machine.
+                    # A login this Core already determined inside its re-check
+                    # window answers the check with that observation: an entry
+                    # made moments after a sign-in (or after a refusal) must not
+                    # spend a station round trip -- nor, on a refused account,
+                    # a second password attempt -- repeating the same answer.
+                    public = recent_login_answer(str(account_id))
+                    unreachable = False
+                    from .domains.relay_accounts import (
+                        RelayAccountsError,
+                        RelayLoginRefusedError,
+                        RelaySessionLimitError,
+                        RelayTransportError,
+                    )
+
+                    try:
+                        public = public if public is not None else session_restorer(str(account_id))
+                    except RelayTransportError:
+                        unreachable = True
+                    except Exception:
+                        public = None
+                    if public is None and not unreachable:
+                        # The station refused the stored session, and this
+                        # account remembers the password it was signed in with.
+                        # Signing in here -- once, bounded by the refusal
+                        # window below -- is what makes a saved login come back
+                        # on its own instead of waiting for someone to press
+                        # 去登录 on an account whose password this app holds.
+                        # The attempt only follows a *refused* session: a
+                        # station that could not be reached raises above and
+                        # signs nothing in, because an unanswerable probe is
+                        # not the station saying no.
+                        try:
+                            public = password_restorer(str(account_id))
+                        except RelayTransportError:
+                            unreachable = True
+                        except RelaySessionLimitError:
+                            # The cap, not the password: the station will not
+                            # mint another session.  Record nothing and let the
+                            # cap's own wait keep the next entry from asking.
+                            public = None
+                        except RelayLoginRefusedError:
+                            # Still inside the wait a previous refusal started.
+                            public = None
+                        except RelayAccountsError:
+                            # The station answered the sign-in and refused it
+                            # (a password it no longer accepts, a login that
+                            # needs verification).  That is a determined
+                            # answer about the login, so it is recorded as one
+                            # -- the retry window above (``_note_login_refusal``)
+                            # is what makes it the *only* attempt per window.
+                            public = status_setter(str(account_id), "signed_out")
+                        except Exception:
+                            # Anything else observed nothing about the login:
+                            # the account keeps the state it held.
+                            public = None
+                    if public is None:
+                        # Nothing was determined: answer with the state this
+                        # Core already holds rather than stamping a new one.
+                        public = next(
+                            (
+                                item
+                                for item in accounts
+                                if isinstance(item, Mapping) and item.get("id") == account_id
+                            ),
+                            None,
+                        )
+                    if public is None:
+                        raise CoreError("relay_restore_failed", "Relay account is unavailable")
+                elif login_status == "signed_in":
                     public = accepter(
                         str(account_id),
                         username=str(username),
@@ -4772,7 +4977,6 @@ class CoreStore:
                         refresh_token=str(refresh_token) if isinstance(refresh_token, str) else "",
                         user_id=user_id,
                         preserve_resources=True,
-                        quota=quota,
                     )
                 elif login_status in {"signed_out", "expired"} and matching.get("remember_password") is True:
                     # A login this Core already determined inside its re-check
@@ -6017,6 +6221,12 @@ class CoreStore:
         that actually answers the reachability question is trusted: an
         unavailable or malformed provider document must not turn into "every
         station is an orphan".
+
+        With no ids -- the startup repair -- a station an account still backs
+        with a login is content, not leftover: the two are indistinguishable
+        here, and a sweep that guessed "leftover" erased a station, its 23 keys
+        and the provider bound to it.  Only an empty station row, or one whose
+        accounts never completed a sign-in, is repair's to remove.
         """
 
         providers = self._domains.get("providers_models")
@@ -6037,8 +6247,12 @@ class CoreStore:
                 for station in identities
                 if isinstance(station, Mapping) and str(station.get("id", "")).strip()
             ]
+            logged_in: set[str] = set()
             if station_ids is None:
-                candidates = set(available)
+                reader_of_logins = getattr(relay, "stations_holding_a_login", None)
+                if callable(reader_of_logins):
+                    logged_in = set(str(item) for item in reader_of_logins())
+                candidates = set(available) - logged_in
             else:
                 candidates &= set(available)
             candidates -= reached
@@ -6064,6 +6278,50 @@ class CoreStore:
                 # failed Core start.
                 pass
         return removed
+
+    @staticmethod
+    def _relay_domain_ids(relay: object, key: str) -> list[str]:
+        """One relay list's ids, as the provider domain needs them."""
+
+        snapshot = getattr(relay, "snapshot", None)
+        if not callable(snapshot):
+            return []
+        try:
+            state = snapshot()
+        except Exception:
+            return []
+        rows = state.get(key) if isinstance(state, Mapping) else None
+        if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes, bytearray)):
+            return []
+        return [str(row.get("id", "")) for row in rows if isinstance(row, Mapping) and row.get("id")]
+
+    @staticmethod
+    def _relay_stations_with_accounts(relay: object) -> list[str]:
+        """The relay stations a provider key can still be bound to.
+
+        One station per account list: a station whose last account was deleted
+        has nothing left for a slot to point at, even while its own row is
+        still in the store (the delete removes the empty station later in the
+        same run).  A provider naming such a station fails the Apply after it.
+        """
+
+        snapshot = getattr(relay, "snapshot", None)
+        if not callable(snapshot):
+            return []
+        try:
+            state = snapshot()
+        except Exception:
+            return []
+        accounts = state.get("accounts") if isinstance(state, Mapping) else None
+        if not isinstance(accounts, Sequence) or isinstance(accounts, (str, bytes, bytearray)):
+            return []
+        return sorted(
+            {
+                str(account.get("station_id", ""))
+                for account in accounts
+                if isinstance(account, Mapping) and account.get("station_id")
+            }
+        )
 
     @staticmethod
     def _relay_reachable_stations(providers: object, relay: object) -> list[str]:
@@ -6434,7 +6692,17 @@ class CoreStore:
                         released_station_ids = [
                             station_id for station_id in reached_before if station_id not in reached_after
                         ]
+                        # A station this provider reached but the relay store no
+                        # longer has is already released: an account delete that
+                        # landed first took it (and its account) with it.  Asking
+                        # for its removal again answered "Relay station is
+                        # unavailable", which rolled back the provider delete --
+                        # measured on the live app as 校验未通过，更改未生效。 over a
+                        # row whose station had been gone for hours.
+                        present_stations = set(self._relay_domain_ids(released_relay, "stations"))
                         for station_id in released_station_ids:
+                            if station_id not in present_stations:
+                                continue
                             released_relay.dispatch(
                                 "station_remove",
                                 {"id": station_id, "dependency_policy": "detach"},
@@ -6451,6 +6719,24 @@ class CoreStore:
                                 raise CoreError("domain_error", "Linked model dependency handling is unavailable")
                             rebind = _as_mapping(payload).get("rebind") if isinstance(payload, Mapping) else None
                             dependency_result = handler(resources, normalized_policy, rebind=rebind)
+                            if normalized_action in {"account_remove", "relay_account_remove", "remove_account",
+                                                     "station_remove", "relay_station_remove", "remove_station"}:
+                                # Whatever the policy did with the linked rows,
+                                # the ones that now point at an account (or a
+                                # station) this Core no longer has are gone as
+                                # well.  That is the residue a person sees as "a
+                                # relay key with no account name" -- a slot
+                                # nothing can ever resolve.  Local only: the
+                                # station keeps its own keys.
+                                releaser = getattr(providers, "drop_unreachable_relay_sources", None)
+                                if callable(releaser):
+                                    try:
+                                        releaser(
+                                            self._relay_domain_ids(adapter, "accounts"),
+                                            self._relay_stations_with_accounts(adapter),
+                                        )
+                                    except Exception:
+                                        pass
                             if isinstance(dependency_result, Mapping):
                                 dependency_issues = dependency_result.get("issues")
                                 if (
@@ -7838,6 +8124,18 @@ class CoreStore:
                     ):
                         raise CoreError("relay_apply_unavailable", "Linked model dependency handling could not be completed")
             if providers is not None:
+                # The same release, for a store that already holds the residue:
+                # a slot pointing at an account (or a station) this Core does
+                # not have can never resolve again, whatever policy wrote it.
+                # An Apply is where the document is meant to be true, so this
+                # is where it stops carrying rows nothing can answer for.
+                releaser = getattr(providers, "drop_unreachable_relay_sources", None)
+                relay_domain = self._domains.get("relay_accounts")
+                if callable(releaser) and relay_domain is not None:
+                    releaser(
+                        self._relay_domain_ids(relay_domain, "accounts"),
+                        self._relay_stations_with_accounts(relay_domain),
+                    )
                 materialize = getattr(providers, "materialize_relay_bindings", None)
                 dependency_summary = getattr(providers, "dependency_summary", None)
                 if not callable(materialize) or not callable(dependency_summary):
@@ -7941,8 +8239,23 @@ class CoreStore:
                             "relay_binding_failed",
                             "A linked relay binding could not be resolved",
                         )
-                if not self.validate("providers_models")["valid"]:
-                    raise CoreError("provider_model_invalid", "Fix the linked model issues")
+                validation = self.validate("providers_models")
+                if not validation["valid"]:
+                    # Name the cause: this message is all the pane can show, and
+                    # "Fix the linked model issues" over an empty table told
+                    # nobody which row refused the write.
+                    first = validation.get("errors") or validation.get("issues") or []
+                    detail = ""
+                    if isinstance(first, Sequence) and not isinstance(first, (str, bytes, bytearray)) and first:
+                        entry = first[0]
+                        if isinstance(entry, Mapping):
+                            detail = str(entry.get("message") or "")
+                        elif isinstance(entry, str):
+                            detail = entry
+                    raise CoreError(
+                        "provider_model_invalid",
+                        safe_exception_message(detail) if detail else "Fix the linked model issues",
+                    )
                 providers.apply()
                 provider_locally_applied = True
                 self._mark_relay_coordinated_applied("providers_models")

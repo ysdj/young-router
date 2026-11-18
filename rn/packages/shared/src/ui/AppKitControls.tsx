@@ -26,7 +26,22 @@ export type NativeButtonProps = {
   symbolWithTitle?: boolean;
   /** Draw the symbol after the title (menu buttons read "Title ▾"). */
   symbolTrailing?: boolean;
-  toolTip?: string;
+  /**
+   * The hosts that draw their own controls turn this into their picker's
+   * shape.  AppKit already has a menu button -- the one this host's other menu
+   * triggers are -- so the flag stops here instead of reaching the view: what
+   * draws the chevron on macOS is `symbol` with `symbolTrailing`.
+   */
+  menuTrigger?: boolean;
+  /**
+   * The rows a host that paints its own list would draw, and the row it
+   * reports.  macOS opens its own menu from `onPress` -- the page turns these
+   * into a real `<select>` -- so both stop here rather than reaching a view
+   * that has no list to put them in.
+   */
+  menuItems?: string[];
+  onMenuChoose?: (index: number) => void;
+  /** The button's name for assistive technology; a button states no hover tip. */
   accessibilityLabel?: string;
   disabled?: boolean;
   /**
@@ -66,7 +81,7 @@ type NativePickerProps = {
   style?: StyleProp<ViewStyle>;
 };
 
-export const AppKitButton = React.forwardRef<any, NativeButtonProps>(function AppKitButton(props, ref): React.JSX.Element {
+export const AppKitButton = React.forwardRef<any, NativeButtonProps>(function AppKitButton({ menuTrigger: _menuTrigger, menuItems: _menuItems, onMenuChoose: _onMenuChoose, ...props }, ref): React.JSX.Element {
   return <NativeAppKitButton {...props} ref={ref as never} style={[props.link ? styles.linkButton : styles.button, props.style]} />;
 });
 

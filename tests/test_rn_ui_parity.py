@@ -13,6 +13,8 @@ MACOS_LEAF = ROOT / "rn/apps/macos/src/native/macos/AppKitNativeLeaf.swift"
 MACOS_PROJECT = ROOT / "rn/apps/macos/macos/YoungRouter.xcodeproj/project.pbxproj"
 PLATFORM_ENTRY = ROOT / "rn/packages/shared/src/platformEntry.ts"
 RELAY_MANAGER = ROOT / "rn/packages/shared/src/ui/RelayAccountManager.tsx"
+PROVIDED_KEY_NAMES = ROOT / "rn/packages/shared/src/ui/providedKeyName.ts"
+PROVIDER_KEY_LABELS = ROOT / "rn/packages/shared/src/ui/providerKeyLabels.ts"
 # The account list both a relay station and an OpenAI row draw.
 ACCOUNTS_TABLE = ROOT / "rn/packages/shared/src/ui/AccountsTable.tsx"
 RELAY_ORIGIN = ROOT / "rn/packages/shared/src/ui/relayOrigin.ts"
@@ -44,6 +46,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         cls.zh = ZH_HANS.read_text(encoding="utf-8")
         cls.en = EN.read_text(encoding="utf-8")
         cls.relay = RELAY_MANAGER.read_text(encoding="utf-8")
+        cls.provided_key_names = PROVIDED_KEY_NAMES.read_text(encoding="utf-8")
+        cls.provider_key_labels = PROVIDER_KEY_LABELS.read_text(encoding="utf-8")
 
     def assert_ui_has(self, marker: str) -> None:
         self.assertIn(marker, self.ui, marker)
@@ -181,10 +185,12 @@ class ReactNativeUiParityTests(unittest.TestCase):
         types = (ROOT / "rn/packages/shared/src/types.ts").read_text(encoding="utf-8")
         self.assertIn("  childSaving: string;", types)
         self.assert_ui_has('childSaving: translate("common.saving"),')
-        # The wizard's footer states its own line beside its buttons again.
-        # Exactly one status line, and no step body repeats it.
-        self.assert_ui_has('const wizardStatus = validation || loginFeedback.current || (loginPhase === "sign-in" ? translate("relay.loginWorking") : "");')
-        self.assert_ui_has('const wizardFooterStatus = wizardStatus || status || "";')
+        # The wizard's footer states its own failure beside its buttons, and a
+        # failure only: a success line printed there outlived its step and sat
+        # under every later one, and a wait belongs to the sign-in surface.
+        self.assert_ui_has('const wizardFooterStatus = validation || loginFailure.current;')
+        self.assert_ui_not_has('const wizardFooterStatus = wizardStatus || status || "";')
+        self.assert_ui_not_has('const wizardStatus = validation || loginFeedback.current')
         self.assert_ui_has('{wizardFooterStatus ? <Text accessibilityLiveRegion="polite" numberOfLines={2} style={styles.childSurfaceFooterStatus}>{wizardFooterStatus}</Text> : <View style={styles.childSurfaceFooterSpacer} />}')
         # The WebDAV detail form is a child window too: its write is stated in
         # its footer, beside the three buttons that own it.
@@ -293,12 +299,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('model: {')
         self.assert_ui_has('enabled: true, order: 0,')
         self.assert_ui_has('const name = uniquePlaceholderName(models.map((item) => stringValue(item.model_name ?? item.name)), base);')
-        # The list draws a group row only for a key the model actually belongs
-        # to; a keyless draft is listed without an invented 未定义密钥 group.
+        # A keyless draft is filed under the heading that states exactly that
+        # and nothing else.  It used to be listed above every heading, which
+        # read as a route whose key the pane had simply forgotten to print --
+        # an orphan row nobody could name.  The heading's credential id is the
+        # empty one, which no slot can carry, so it is not an invented key.
         self.assert_ui_has("const key = modelProviderKeyState(item, provider ?? {});")
         self.assert_ui_has("if (!key) {")
         self.assert_ui_has("ungrouped.push(item);")
-        self.assert_ui_has("for (const item of ungrouped) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });")
+        self.assert_ui_has('rows.push({ key: modelGroupRowKey(""), cells: [translate("providers.undefinedKey")], spanning: true });')
+        self.assert_ui_has('for (const item of ungrouped) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });')
         # One group row is one provider key, addressed by its slot id, so the
         # station's key and a custom key that read the same stay two groups and
         # a model is filed under the key it names.
@@ -490,7 +500,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         chrome = (ROOT / "rn/packages/shared/src/ui/HostChrome.tsx").read_text(encoding="utf-8")
         self.assertIn('const pending = draft.trim() !== "" && draft !== request.value;', chrome)
         self.assertIn('disabled={!pending}', chrome)
-        self.assertIn('compact primary disabled={selected.length === 0}', chrome)
+        # The picker's confirm is also where the write reports itself now: it is
+        # disabled at zero, disabled again while the pane files the pick, and
+        # busy for exactly that wait.
+        self.assertIn('compact primary busy={saving} disabled={saving || selected.length === 0}', chrome)
 
         for source, marker in (
             ((ROOT / "rn/apps/macos/src/native/macos/AppKitNativeLeaf.swift").read_text(encoding="utf-8"),
@@ -876,7 +889,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'isProbeSurface(nextSurface)',
             'dispatchWithOutcome("model.add_many", {',
             'const apiKeyID = stringValue(summary.slot_id);',
-            'models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, imported: true, imported_name_case: nameCase, api_key_name: apiKeyName, ...(apiKeyID ? { provider_key_id: apiKeyID } : {}), enabled: true, order: 0 }))',
+            'models: picked.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, imported: true, imported_name_case: nameCase, api_key_name: apiKeyName, ...(apiKeyID ? { provider_key_id: apiKeyID } : {}), enabled: true, order: 0 }))',
             '<ProtocolPicker providerId={providerId}',
             'function ProtocolPicker(',
             'const mode = stringValue(model.upstream_protocol_mode, "fallback");',
@@ -931,7 +944,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const probeTitle = degradationIncluded',
             '? translate("providers.deepTest")',
             ': translate("providers.probe");',
-            '<ProbeMenuButton native={native} title={probeTitle} busy={probing} tooltip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} activeKind={probePresentation.kind} onProbe={probeKind} translate={translate} />',
+            '<ProbeMenuButton native={native} title={probeTitle} busy={probing} notes={servesImages ? { reachability: translate("providers.probeImagesHint") } : degradationIncluded ? { identity: translate("providers.deepTestHint") } : undefined} disabled={busy && !probing} activeKind={probePresentation.kind} onProbe={probeKind} translate={translate} />',
             'function probeDegradationLine(degradation: UnknownRecord, translate: Translate, detailed = false): string {',
             'function probeDegradationDetails(degradation: UnknownRecord, translate: Translate): string {',
             'const degradation = asRecord(result?.degradation ?? probe.degradation);',
@@ -942,7 +955,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'titleWidth="tight"',
             'accessibilityRole="link" accessibilityLabel={probePresentation.compactSentence}',
             'const degradationSentence = degradationMeasured ? probeDegradationLine(degradation, translate, true) : "";',
-            'const tooltip = joinProbeSummary([compactSentence, availabilitySentence, degradationSentence, preciseSentence, speedReading.detail]);',
+            'const tips = joinProbeSummary([compactSentence, availabilitySentence, degradationSentence, preciseSentence, speedReading.detail]);',
             '? translate("providers.probeInlineReady")',
             '? translate("providers.probeInlinePartial")',
             '? translate("providers.probeInlineRefused")',
@@ -1026,7 +1039,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertIn(marker, self.native_controls)
         # A caller may ask for the host's own trailing chevron: the probe button
         # is a menu button, and that is how this app draws one.
-        self.assert_ui_has('titleWidth={titleWidth} toolTip={toolTip} symbol={symbol} symbolWithTitle={symbolWithTitle} symbolTrailing={symbolTrailing} accessibilityLabel={accessibilityLabel} onPress={onPress} style={style} />;')
+        self.assert_ui_has('titleWidth={titleWidth} symbol={symbol} symbolWithTitle={symbolWithTitle} symbolTrailing={symbolTrailing} menuTrigger={menuTrigger} menuItems={menuItems} onMenuChoose={onMenuChoose} accessibilityLabel={accessibilityLabel} onPress={onPress} style={style} />;')
         for marker in (
             '"providers.probe": "探测"',
             '"providers.deepTest": "探测"',
@@ -1052,6 +1065,26 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }')
         self.assert_ui_has('const compactSentence = `${translate("providers.probeResultPrefix")} ${compact}`;')
         self.assert_ui_has('ellipsizeMode="tail" tooltip={probePresentation.tooltip}')
+        # The hover hint is the whole finding in words, and the click-through
+        # opens on that same sentence: a reader who clicked the row asked what
+        # it says, so the tips come first and the records that state them follow.
+        self.assert_ui_has('const tips = joinProbeSummary([compactSentence, availabilitySentence, degradationSentence, preciseSentence, speedReading.detail]);')
+        self.assert_ui_has('tooltip: tips,')
+        self.assert_ui_has('const full = [tips, raw].filter(Boolean).join("\\n\\n");')
+        self.assert_ui_has('const raw = [')
+        self.assert_ui_has('speedReading.protocolLine,')
+        self.assert_ui_has('translate("providers.probeOriginalRequest", { request: JSON.stringify(requests, null, 2) }),')
+        # The tooltip the row carries is never the raw block: a hover hint that
+        # opened with JSON would answer a different question than the click.
+        self.assert_ui_has('tooltip={probePresentation.tooltip}')
+        # No route is refused the reading for its name: the menu offers it as
+        # its own row, and the flash check that used to gate the press is gone.
+        self.assertNotIn('isSpeedTestRoute', self.ui)
+        self.assertNotIn('speedTested', self.ui)
+        # A reading that could not be taken still says which finding it is: the
+        # one word would have reported "no chat wire", "key refused" and "said
+        # nothing" as the same sentence.
+        self.assert_ui_has('detail: stringValue(speed.detail),')
         # The whole finding - label included - is one grey underlined link: the
         # underline is what says it can be clicked, so nothing is bolded.
         self.assertNotIn('inspectorProbeResultLabel', self.ui)
@@ -1086,7 +1119,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # states which way it opens is what keeps a right-hand pane's help
             # inside that pane instead of clipped by the column beside it.
             'function HelpTip({ open, text, title, onToggle, align = "right" }: { open: boolean; text: string; title: string; onToggle: () => void; align?: "left" | "right" }): React.JSX.Element {',
-            '<NativeButton title="" symbol="help" link plainLink toolTip={title} accessibilityLabel={title} onPress={onToggle} style={styles.helpTipButton} />',
+            '<NativeButton title="" symbol="help" link plainLink accessibilityLabel={title} onPress={onToggle} style={styles.helpTipButton} />',
             # The panel is text a screen reader is told about: the mark's own
             # label names the tip, and the sentence it opens is announced when
             # it appears rather than being reachable only by reading the pane.
@@ -1259,13 +1292,21 @@ class ReactNativeUiParityTests(unittest.TestCase):
         """A generator's only honest availability test costs an image.
 
         The Images wire has no dry run, so the probe really generates one.  The
-        button says so before it is pressed, because the user pays for it, and
-        a generator carries no 真伪 line: the deep test is not one this route
-        can run, and reporting it as "not applicable" beside a working probe
-        read as one more thing that failed.
+        row that spends it says so before it is chosen, because the user pays
+        for it, and a generator carries no 真伪 line: the deep test is not one
+        this route can run, and reporting it as "not applicable" beside a
+        working probe read as one more thing that failed.
+
+        The sentence is stated on the menu row, not on the button: a control
+        states no hover tip, and a bill the reader meets after the press is a
+        bill they could not refuse.
         """
 
-        self.assert_ui_has('(servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)')
+        self.assert_ui_has('notes={servesImages ? { reachability: translate("providers.probeImagesHint") } : degradationIncluded ? { identity: translate("providers.deepTestHint") } : undefined}')
+        # The note rides the row it is about: `连通性` is the press that
+        # generates the picture, and `真伪` is the one that scans after it.
+        self.assert_ui_has('const note = notes?.[kind];')
+        self.assert_ui_has('const stated = note ? `${label} \\u00b7 ${note}` : label;')
         self.assert_ui_has('const degradationMeasured = deepTestIncluded\n    && (availableCount > 0 || Boolean(stringValue(degradation.verdict)));')
         for locale in (self.zh, self.en):
             self.assertIn('"providers.probeImagesHint":', locale)
@@ -1275,10 +1316,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )
 
     def test_provider_probe_button_reports_progress_without_graying_out(self) -> None:
-        # The probe button is this app's own menu button: the title with the
-        # host's trailing chevron, one control, one hit target.
+        # The probe button is this app's own menu trigger: the title with the
+        # trailing chevron, one control, one hit target.
         self.assert_ui_has(
-            '<ProbeMenuButton native={native} title={probeTitle} busy={probing} tooltip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} activeKind={probePresentation.kind} onProbe={probeKind} translate={translate} />'
+            '<ProbeMenuButton native={native} title={probeTitle} busy={probing} notes={servesImages ? { reachability: translate("providers.probeImagesHint") } : degradationIncluded ? { identity: translate("providers.deepTestHint") } : undefined} disabled={busy && !probing} activeKind={probePresentation.kind} onProbe={probeKind} translate={translate} />'
         )
         # The probe keeps its own name while it runs: the button carries the
         # progress as a leading spinner instead of a swapped title.
@@ -1319,6 +1360,58 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_not_has("probeReady")
         self.assert_ui_not_has("authenticationReady")
         self.assertNotIn('await flushPendingFields();\n      const before = await ipc.snapshot();', self.ui)
+
+    def test_the_probe_trigger_opens_the_browser_s_own_list(self) -> None:
+        """探测 is a `<select>` on the page, so it opens the pickers' own list.
+
+        The app's menu card (`ui/HostChrome`) is not that list: blue underlined
+        rows in a square card, beside the system's rounded menu, in a pane where
+        every picker is a `<select>`.  A `<select>` cannot be styled, and that
+        is the whole point -- it cannot be anything other than the list 协议方式
+        and its neighbours open.  What stays ours is the closed control: its
+        bezel, its name (探测), and the wheel while the check runs.
+        """
+
+        # The call site hands the rows to the host that paints its own list,
+        # and keeps the leaf menu for the two native hosts.
+        self.assert_ui_has("    menuTrigger\n    menuItems={items}\n    onMenuChoose={chosen}")
+        self.assert_ui_has('symbol="chevron-down"')
+        self.assert_ui_has("onPress={openMenu}")
+        # The check mark rides the row's own label, because the row a select
+        # marks is the one it holds -- and that one is the trigger's name.
+        self.assert_ui_has('const note = notes?.[kind];')
+        self.assert_ui_has('return kind === activeKind ? `\\u2713 ${stated}` : stated;')
+        # `ActionButton` is the only path to the leaf, so the rows ride it.
+        self.assert_ui_has("menuItems={menuItems} onMenuChoose={onMenuChoose}")
+        # The page draws a real select, in the pickers' own frame.
+        self.assertIn("const WebMenuPicker = React.forwardRef<any, {", self.native_controls)
+        self.assertIn('if (Platform.OS === "web" && menuItems !== undefined && onMenuChoose !== undefined) {', self.native_controls)
+        self.assertIn("style={[styles.webPickerFrame, style]}", self.native_controls)
+        # A picker's box is a number its caller decides, and the trigger keeps
+        # the one its own label earned instead of the widest check's name.
+        self.assertIn("? { width: reservedWidth, flexShrink: 0 }", self.native_controls)
+        self.assertIn("style={busy ? WEB_SELECT_BUSY_STYLE : WEB_SELECT_STYLE}", self.native_controls)
+        # The closed control keeps its own name: the value is a hidden row that
+        # is not one of the choices, and choosing a row puts it back.
+        self.assertIn("<option value={idle} hidden>{title}</option>", self.native_controls)
+        self.assertIn("{items.map((label, index) => <option key={`${label}:${index}`} value={index}>{label}</option>)}", self.native_controls)
+        self.assertIn("select.value = idle;", self.native_controls)
+        # Windows draws its own pickers, so its trigger is the picker's frame
+        # and the picker's own arrow -- not a glyph the font places.
+        self.assertIn("if (menuTrigger === true) {", self.native_controls)
+        self.assertIn('style={[styles.windowsPicker, compact && styles.windowsPickerCompact,', self.native_controls)
+        self.assertIn('style={[styles.windowsPickerText, { color: ink }]}', self.native_controls)
+        self.assertIn('<Text style={styles.windowsPickerChevron}>{"\\u25BE"}</Text>', self.native_controls)
+        # A typed chevron was the first attempt at this and cannot be placed
+        # where a select puts its arrow; nothing draws one any more.
+        self.assertNotIn("MenuChevron", self.native_controls)
+        # macOS keeps `AppKitButton`'s own menu button and its own menu, so the
+        # page-only props stop before the view.
+        self.assertIn("menuTrigger: _menuTrigger, menuItems: _menuItems, onMenuChoose: _onMenuChoose, ...props", self.appkit_controls)
+        # The hand-drawn split button this replaced left its styles behind; a
+        # trigger that is a picker has no seam to reserve.
+        self.assert_ui_not_has("probeMenuGroup")
+        self.assert_ui_not_has("probeMenuChevron")
 
     def test_a_changed_probe_input_clears_the_probe_result(self) -> None:
         """A finding is shown only while it describes the route on screen."""
@@ -1459,7 +1552,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # to the selected account.
         self.assert_ui_has('labels={accountPickerLabels}')
         self.assert_ui_has('source.accountID === selectedStationAccount.id')
-        self.assert_ui_has('label={`${source.resourceLabel || relaySourceName(source)}${multiplier}`}')
+        self.assert_ui_has('label={`${source.resourceLabel || relaySourceName(source)}${multiplier}${ungrouped}`}')
         # A read or the post-login grouping states its wait in the key area;
         # the empty card is not drawn until both have finished.
         self.assert_ui_has('(loginBusy || resourcesBusy || autoGroupingBusy) ? <View style={styles.providerWizardKeyEmpty}>')
@@ -1624,9 +1717,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('onChangeText={(value) => { setModelName(value); setValidation(""); }}', wizard)
         self.assertIn('onChangeText={(value) => { setUpstreamModel(value); setValidation(""); }}', wizard)
         go_back = wizard.split("const goBack = (): void => {", 1)[1].split("};", 1)[0]
-        self.assertIn("setLoginFeedbackMessage(undefined);", go_back)
-        self.assertIn("setLoginFeedbackMessage(undefined);", wizard.split("const chooseProviderType = ", 1)[1].split("};", 1)[0])
-        self.assertIn("setLoginFeedbackMessage(undefined);", wizard.split("const chooseExistingProvider = ", 1)[1].split("};", 1)[0])
+        self.assertIn("setLoginFailure(undefined);", go_back)
+        self.assertIn("setLoginFailure(undefined);", wizard.split("const chooseProviderType = ", 1)[1].split("};", 1)[0])
+        self.assertIn("setLoginFailure(undefined);", wizard.split("const chooseExistingProvider = ", 1)[1].split("};", 1)[0])
 
     def test_a_failed_wizard_finish_reports_on_the_wizard(self) -> None:
         """A dispatch that throws is still a press the person has to see fail.
@@ -1896,7 +1989,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         finish = wizard.split("const finishWithoutModels = async (): Promise<void> => {", 1)[1].split("const goBack", 1)[0]
         self.assertIn("const targetProviderID = providerID || await commitWizardProvider();", finish)
         self.assertIn("await importProvidedKey(targetProviderID, selectedProvidedChoice)", finish)
-        self.assertIn('onStatus(translate("providers.wizard.complete"));', finish)
+        # A create that works closes the window; it writes no line into the
+        # footer, which states failures only.
+        self.assertNotIn("onStatus(", finish)
+        self.assertNotIn("providers.wizard.complete", finish)
         # The lit primary that would close over no write stays unlit.
         self.assertIn("(step === \"model\" && genericModelStep && modelPicksEmpty)", wizard)
         for locale, sentence in (
@@ -2085,7 +2181,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # ＋ creates the row enabled, so the user does not have to enable what
         # they just made; the placeholder name is what the pane marks.
         self.assert_ui_has('model: { name, upstream_model: name, enabled: true, order: 0, ...(inheritedKey ?')
-        self.assert_ui_has('models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, imported: true, imported_name_case: nameCase, api_key_name: apiKeyName, ...(apiKeyID ? { provider_key_id: apiKeyID } : {}), enabled: true, order: 0 }))')
+        self.assert_ui_has('models: picked.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, imported: true, imported_name_case: nameCase, api_key_name: apiKeyName, ...(apiKeyID ? { provider_key_id: apiKeyID } : {}), enabled: true, order: 0 }))')
         self.assert_ui_has('value={String(displayedOrder)}')
         self.assert_ui_has('label={translate("providers.order")}')
         self.assert_ui_has('label={translate("providers.followMultiplier")}')
@@ -2193,6 +2289,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('modelRateText(workspaceService, stringValue(item.upstream_model).trim(), multiplier),')
         self.assert_ui_has('for (const item of ungrouped) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });')
         self.assert_ui_has('for (const item of group.models) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });')
+        # A key's group sits where the key table puts it, not where its first
+        # route happens to fall in the document: deleting the first route of a
+        # key used to move that key's whole group to the end of the list.
+        self.assert_ui_has('const keyOrder = providerKeyStates(provider ?? {}).map((key) => key.id);')
+        self.assert_ui_has('for (const keyID of orderedModelGroupIDs([...grouped.keys()], keyOrder)) {')
         self.assert_ui_has('columns={variant === "inline"')
         self.assert_ui_has('cellHorizontalPadding={6}')
         self.assert_ui_has('firstColumnHorizontalPadding={0}')
@@ -2206,15 +2307,15 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn('providerKeyList:', self.ui)
         self.assert_ui_has('modelListPane: { flex: 1, minWidth: 0 }')
         self.assert_ui_has('providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }')
-        self.assert_ui_has('return <ProviderWorkspaceDraftContext.Provider value={providerDraftProjection}><View style={styles.providersLayout}>')
-        self.assert_ui_has('<View style={styles.providerLeftColumn}>')
+        self.assert_ui_has('return <ProviderWorkspaceDraftContext.Provider value={providerDraftProjection}><View style={[styles.providersLayout, compactWeb && styles.providersLayoutCompact]}>')
+        self.assert_ui_has('{compactWeb && compactDetail ? null : <View style={styles.providerLeftColumn}>')
         self.assert_ui_has('<TablePane wide style={styles.routeTablePane}')
-        self.assert_ui_has('<View style={styles.providerInspector}>')
-        self.assertEqual(1, self.ui.count('<View style={styles.providerInspector}>'))
+        self.assert_ui_has('<View style={[styles.providerInspector, compactWeb && styles.providerInspectorCompact]}>')
+        self.assertEqual(1, self.ui.count('<View style={[styles.providerInspector, compactWeb && styles.providerInspectorCompact]}>'))
         self.assertNotIn('viewMode === "routes" ? <View style={styles.providerWorkspace}', self.ui)
         self.assertNotIn('routeWorkspaceWithInspector', self.ui)
         self.assert_ui_has('routeTablePane: { flex: 1, minWidth: 0, minHeight: 0 }')
-        self.assert_ui_has('onSelectionChange={(key) => selectRouteTableRow(key)}')
+        self.assert_ui_has('onSelectionChange={(key) => { selectRouteTableRow(key); if (compactWeb && key) setCompactDetail(true); }}')
         # The routes table leads with the upstream model — the model a route
         # actually calls — then names its provider, key, and order, and its
         # columns come from the pane's own width: the two name columns were
@@ -2242,8 +2343,8 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('key: routePublicModelRowKey(group.name)')
         self.assert_ui_has('spanning: true')
         self.assert_ui_has(r'cells: [`\t${modelUpstreamDisplay(editorIdentifier(entry.provider), entry.model)')
-        self.assert_ui_has('rows={routeRows} secondaryRowKeys={offRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact preserveColumnWidths selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => selectRouteTableRow(key)}')
-        self.assert_ui_has('<ProviderListTable translate={translate} selectedProviderId={providerId} providerNameDrafts={providerNameDrafts} validationIssues={validationIssues} onSelect={selectProviderRow} />')
+        self.assert_ui_has('rows={routeRows} secondaryRowKeys={offRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact preserveColumnWidths selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => { selectRouteTableRow(key); if (compactWeb && key) setCompactDetail(true); }}')
+        self.assert_ui_has('<ProviderListTable translate={translate} selectedProviderId={providerId} providerNameDrafts={providerNameDrafts} validationIssues={validationIssues} onSelect={(key) => { selectProviderRow(key); if (compactWeb) setCompactDetail(true); }} />')
         provider_list = self.ui.split("const ProviderListTable = React.memo(", 1)[1].split("function ProviderWorkspace(", 1)[0]
         self.assertIn('rows={rows} secondaryRowKeys={secondaryRowKeys} alertRowKeys={alertRowKeys} selectedKey={selectedProviderId} compact firstColumnHorizontalPadding={0} onSelectionChange=', provider_list)
         self.assert_ui_has('rows={modelRows} secondaryRowKeys={offModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange=')
@@ -2315,7 +2416,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('confirmLabel: translate("providers.importNameCaseLower"),')
         self.assert_ui_has('cancelLabel: translate("providers.importNameCaseOriginal"),')
         self.assert_ui_has('return lower ? "lower" : "original";')
-        self.assert_ui_has('const nameCase = await importNameCaseAnswer(native, translate, selectedModels);')
+        self.assert_ui_has('const nameCase = await importNameCaseAnswer(native, translate, picked);')
         self.assert_ui_has('const nameCase = await importNameCaseAnswer(native, translate, chosen);')
         self.assert_ui_has('const importNameCase = await importNameCaseAnswer(native, translate, selectedImportNames);')
         # The wizard's 完成 creates the account-backed entries with the picks
@@ -2327,7 +2428,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_not_has('public_name_case: createdNameCase')
         # The answer travels with the pick that asked it.
         self.assert_ui_has('imported_name_case: nameCase,')
-        self.assert_ui_has('models: chosen, public_name_case: nameCase })')
+        self.assert_ui_has('models: chosen, public_name_case: nameCase }, "providers_models");')
         self.assert_ui_has('imported_name_case: importNameCase })),')
         self.assert_ui_has('imported_name_case: importNameCase, ...modelRecordCapabilityChanges(fetchedModelCapabilities[name]) })),')
         domain = (ROOT / "young_router/core/domains/providers_models.py").read_text(encoding="utf-8")
@@ -2361,7 +2462,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         self.assert_ui_has('.map((name) => ({ name, upstream_model: name, imported: true, imported_name_case: importNameCase })),')
         self.assert_ui_has('.map(({ name, upstream_model }) => ({ name, upstream_model })),')
-        self.assert_ui_has('models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, imported: true, imported_name_case: nameCase,')
+        self.assert_ui_has('models: picked.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, imported: true, imported_name_case: nameCase,')
         domain = (ROOT / "young_router/core/domains/providers_models.py").read_text(encoding="utf-8")
         self.assertIn('if explicit_bool(model.pop("imported", None)):', domain)
         self.assertIn('name_case=model.pop("imported_name_case", "lower"),', domain)
@@ -2375,7 +2476,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('const ROUTE_PUBLIC_MODEL_PREFIX = "route-public-model:";')
         self.assert_ui_has('function routePublicModelRowKey(publicModel: string): string')
         self.assert_ui_has('selectableSpanningRowKeys={selectableRouteGroupKeys}')
-        self.assert_ui_has('onSelectionChange={(key) => selectRouteTableRow(key)}')
+        self.assert_ui_has('onSelectionChange={(key) => { selectRouteTableRow(key); if (compactWeb && key) setCompactDetail(true); }}')
         # The click maps the row key back to the public model, not to a route.
         select_public = self.ui.split("const selectRouteTableRow = useCallback", 1)[1].split("const chooseViewMode", 1)[0]
         self.assertIn('rowKey.startsWith(ROUTE_PUBLIC_MODEL_PREFIX)', select_public)
@@ -2419,11 +2520,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # gone for good — it restated the rows the table already lists and took
         # the width the title needs (the pane's own record rendered as its first
         # character) — and the link states its action in two words with the
-        # model it returns to in its tooltip, because the full sentence as a
-        # label took the same width.
+        # model it returns to as its accessible name, because the full sentence
+        # as a label took the same width and a button states no hover tip.
         self.assertIn('backLabel && onBackToModel', inspector)
         self.assertIn('title={translate("providers.backToModelShort")}', inspector)
-        self.assertIn('toolTip={translate("providers.backToModel", { model: backLabel })}', inspector)
+        self.assertIn('accessibilityLabel={translate("providers.backToModel", { model: backLabel })}', inspector)
         self.assertIn('<View style={styles.providerEditorHeader}>', inspector)
         self.assertIn('<Text numberOfLines={1} style={styles.providerEditorHeading}>{group.name}</Text>', inspector)
         self.assertLess(inspector.index('providerEditorHeading}>{group.name}'), inspector.index('providers.backToModelShort'))
@@ -2449,7 +2550,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn('const declaredWindow = customWindow !== undefined ? customWindow : recommendedWindow;', model_detail)
         self.assertNotIn('contextWindowPairText', self.ui)
         self.assertIn('title={translate("providers.publicModelSettings")}', model_detail)
-        self.assertIn('toolTip={translate("providers.publicModelSettingsHint")}', model_detail)
+        self.assertIn('accessibilityLabel={translate("providers.publicModelSettingsHint")}', model_detail)
         self.assertIn('disabled={busy || !onOpenPublicModel} onPress={() => onOpenPublicModel?.()} style={styles.modelWindowLink}', model_detail)
         # The row's own mark carries the recommendation the line no longer
         # states; the pane that always edits the number is where the help
@@ -2702,7 +2803,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # the provider's own default, which is not one of these groups: listing
         # it under every group put the same route on screen once per credential,
         # and each copy carried the same 启用 box — so flipping one read as
-        # flipping the others.
+        # flipping the others.  It is drawn under its own 未定义密钥 heading
+        # instead of above every heading, so a route with no key is stated as
+        # such rather than looking like a row the pane forgot to file.
+        self.assert_ui_has('rows.push({ key: modelGroupRowKey(""), cells: [translate("providers.undefinedKey")], spanning: true });')
         self.assert_ui_has('for (const item of ungrouped) rows.push({ key: modelRowKey("", editorIdentifier(item)), cells: modelCells(item) });')
         grouped_rows = self.ui.split("if (modelCredentials.length > 0) {", 1)[1].split("return rows;", 1)[0]
         # A route answers with exactly one credential — an account or a key —
@@ -2717,12 +2821,73 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # several credentials keeps the highlight on the copy that was pressed.
         self.assert_ui_has("const [selectedModelRow, setSelectedModelRow] = useState<string>();")
         self.assert_ui_has('if (selectedModelRow && modelRows.some((row) => !row.spanning && row.key === selectedModelRow && modelIDFromRowKey(row.key) === selectedModel)) {')
-        # The list says which row a model sits in; the pane never invents a
-        # group for it, because a route that names no credential has no group.
+        # The list says which row a model sits in.  A route that names no
+        # credential sits in the 未定义密钥 heading's group, which is a real row
+        # of the list -- so the highlight is found the same way as any other.
         self.assert_ui_has("const listed = modelRows.find((row) => !row.spanning && modelIDFromRowKey(row.key) === selectedModel);")
         model_table = self.ui.split("<NativeTable columns={modelTableColumns(", 1)[1].split("/></View>", 1)[0]
         self.assertIn("const modelID = modelIDFromRowKey(key);", model_table)
         self.assertIn("setSelectedModel(modelID); setSelectedModelRow(key);", model_table)
+
+    def test_a_key_group_sits_where_its_key_sits_not_where_its_first_route_falls(
+        self,
+    ) -> None:
+        """Deleting a route must not move its key's group.
+
+        The list used to take the groups in the order the *routes* introduced
+        them: a `Map` filled while walking the model list, iterated in insertion
+        order.  So a key's place was decided by which of its routes happened to
+        come first in the document, and deleting that one route moved the whole
+        group to the end of the pane — the user deleted a model and watched an
+        unrelated key jump to the bottom of the list.  A key's position is the
+        key table's own order, which is the list the groups are headings of.
+        """
+
+        rows = self.ui.split("const modelRows = useMemo(", 1)[1].split("}, [modelCredentials", 1)[0]
+        # The order is read off the key table, once, and the groups are drawn
+        # in it.  Sorting by the order a route was met is the bug itself.
+        self.assertIn("const keyOrder = providerKeyStates(provider ?? {}).map((key) => key.id);", rows)
+        self.assertIn("for (const keyID of orderedModelGroupIDs([...grouped.keys()], keyOrder)) {", rows)
+        self.assertNotIn("for (const [keyID, group] of grouped) {", rows)
+        # The rule itself has one producer, and its own executed test:
+        # tests/test_rn_model_group_order.mjs.
+        order = (ROOT / "rn/packages/shared/src/ui/modelGroupOrder.ts").read_text(encoding="utf-8")
+        self.assertIn("export function orderedModelGroupIDs(", order)
+        self.assertIn("const unknown = present.filter((id) => id !== \"\" && !position.has(id));", order)
+        self.assertIn("return [...ungrouped, ...known, ...unknown];", order)
+        self.assert_ui_has('import { orderedModelGroupIDs } from "./modelGroupOrder";')
+
+    def test_a_route_that_names_no_key_is_drawn_under_an_undefined_key_heading(
+        self,
+    ) -> None:
+        """A keyless route is stated, not left floating above every heading.
+
+        A model row drawn above the first group heading read as a route whose
+        key the pane had simply forgotten to print — an orphan nobody could
+        name.  It now sits under a 未定义密钥 heading, the same word the model
+        inspector's key picker already uses for its "no key" choice.  The
+        heading is not an invented credential: its id is the empty string,
+        which no slot can carry, so no route can be filed under it by mistake
+        and the pane never presents a group the document does not name.
+        """
+
+        rows = self.ui.split("const modelRows = useMemo(", 1)[1].split("}, [modelCredentials", 1)[0]
+        # The heading is drawn only when there is something under it: an empty
+        # heading claims a group the pane has no route for.
+        self.assertIn("if (ungrouped.length > 0) {", rows)
+        self.assertIn(
+            'rows.push({ key: modelGroupRowKey(""), cells: [translate("providers.undefinedKey")], spanning: true });',
+            rows,
+        )
+        # The word is the picker's own, not a second spelling of the same fact.
+        self.assertIn('"providers.undefinedKey": "未定义密钥"', self.zh)
+        self.assert_ui_has('{ value: "", label: translate("providers.undefinedKey") }')
+        # A heading is a spanning row, so clicking it cannot select anything:
+        # it is not an entry and has no model behind it.
+        self.assertIn("spanning: true", rows)
+        # Both list shapes draw it: an account-backed row's list and an
+        # ordinary provider's.
+        self.assertEqual(rows.count('rows.push({ key: modelGroupRowKey(""), cells: [translate("providers.undefinedKey")], spanning: true });'), 2)
 
     def test_provider_empty_state_keeps_the_native_table_frames(self) -> None:
         provider_list = self.ui.split("const ProviderListTable = React.memo(", 1)[1].split("function ProviderWorkspace(", 1)[0]
@@ -3547,18 +3712,19 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("signOutControl", sidebar)
         self.assertIn('<Text numberOfLines={1} style={styles.settingsSidebarTitle}>{translate("app.title")}</Text>', shell)
         # One glyph, not a glyph plus a sentence: the label the band would
-        # otherwise repeat is the button's own hover hint and accessible name.
+        # otherwise repeat is the button's accessible name, which is the only
+        # place a glyph button keeps its words - no host states a button's tip.
         sign_out = self.ui.split("function SignOutControl(", 1)[1].split("\nfunction ", 1)[0]
         self.assertIn('title=""', sign_out)
         self.assertIn('symbol="power-off"', sign_out)
         self.assertNotIn("symbolWithTitle", sign_out)
-        self.assertIn("toolTip={title}", sign_out)
+        self.assertNotIn("toolTip", sign_out)
         self.assertIn("accessibilityLabel={title}", sign_out)
-        # A browser draws a hover label from the host node's `title`, which
-        # React Native Web does not forward; an icon-only page button would
-        # otherwise have nothing to read under the pointer.
-        self.assertIn('node?.setAttribute?.("title", hoverLabel);', self.native_controls)
-        self.assertIn("props.toolTip ?? (showsTitle ? undefined : props.title)", self.native_controls)
+        # A button states no hover tip on any host: the page's `title` attribute
+        # and the Windows leaf's `tooltip` prop are gone with the rest of them.
+        self.assertNotIn('setAttribute?.("title"', self.native_controls)
+        self.assertNotIn("hoverLabel", self.native_controls)
+        self.assertNotIn("tooltip: toolTip ?? title", self.native_controls)
         # The page is the one host that answers it, and Core's own route is what
         # it answers with.
         browser_leaf = (ROOT / "rn/packages/shared/src/platform/browserLeaf.ts").read_text(encoding="utf-8")
@@ -4214,7 +4380,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.native_controls,
         )
         self.assertIn(
-            'minWidth: (props.busy === undefined ? reservation : nativeButtonBusyMinimumWidth(props.title, reservation, props.plainLink === true)) + (props.symbol ? 22 : 0),',
+            'const reservedWidth = (props.busy === undefined ? reservation : nativeButtonBusyMinimumWidth(props.title, reservation, props.plainLink === true)) + (props.symbol ? 22 : 0);',
             self.native_controls,
         )
         # A busy button keeps its title, width, and enabled color and shows a
@@ -4376,7 +4542,9 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'translate("clients.fileMissing")',
             "onOpenFile(file)",
             "disabled={busy || !file.exists}",
-            'toolTip={file.exists ? undefined : translate("clients.fileMissing")}',
+            # The missing file is a visible note on the row, not a hover hint on
+            # the button that cannot open it.
+            'note={file.exists ? null : <Text style={styles.settingsActionRowNote}>{translate("clients.fileMissing")}</Text>}',
             "<SettingsActionRow",
             "assistantFileSurfaceStyles.filePathLink",
         ):
@@ -5625,7 +5793,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # becomes the persisted API-key identifier; the selection is handed
         # to the same helper that abandons a listing for the old key.
         for marker in (
-            'function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[]): ProviderKeyChoice[] {',
+            'function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[], accountPrefixes?: Map<string, string>): ProviderKeyChoice[] {',
             'if (choices.length > 0) return choices;',
             'const slot = providerKeyStates(provider).find((key) => key.managed && managedServiceForSlot(key.managed, providerAuthKind(provider)));',
             'return slot ? [{ id: slot.id, name: slot.name, kind: "independent" as const, state: slot }] : [];',
@@ -5637,15 +5805,18 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const pendingCustomKeyName = useRef<string | undefined>(undefined);',
             'pendingCustomKeyName.current = undefined; // selection lands after the snapshot refresh' if False else 'setSelectedKey(`custom:${added.id}`);',
             'return dispatch("provider.key_delete", { provider_id: providerId, name: selectedKeyName });',
-            'function apiKeyDisplayName(value: unknown, translate: Translate): string {',
-            'if (!name) return translate("common.notAvailable");',
-            'return name === "default" ? translate("providers.defaultKey") : name;',
-            'const sourceName = relaySourceName(choice.source) || name;',
-            'return source ? [source.accountLabel, source.resourceLabel].filter(Boolean).join("/") : "";',
-            'const accountLabel = username ? username.split("@", 1)[0].trim() || username : stringValue(account.label, accountID).trim();',
-            'return `${sourceName}${multiplier}`;',
+            'const accountLabel = relayAccountLabel(account);',
         ):
             self.assert_ui_has(marker)
+        for marker in (
+            'export function apiKeyDisplayName(value: unknown, translate: Translate): string {',
+            'if (!name) return translate("common.notAvailable");',
+            'return name === "default" ? translate("providers.defaultKey") : name;',
+            'const sourceName = relaySourceName(choice.source) || ownName;',
+            'return source ? [source.accountLabel, source.resourceLabel].filter(Boolean).join("/") : "";',
+            'return `${sourceName}${multiplier}`;',
+        ):
+            self.assertIn(marker, self.provider_key_labels)
         self.assertNotIn('keys.length <= 1', self.ui)
 
     def test_provider_api_key_deletion_confirmation_explains_model_deletion(self) -> None:
@@ -5672,7 +5843,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assert_ui_has("native.chooseModelsToAdd({ models: candidates, providerName, keyName })")
-        self.assert_ui_has("candidateSet.has(model)")
+        self.assert_ui_has("roster.has(model)")
         self.assertNotIn("Modal, Platform", self.ui)
         self.assertNotIn("fetchedModalBackdrop", self.ui)
         self.assertNotIn("function FetchedModelsDialog", self.ui)
@@ -5703,6 +5874,79 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("list.MinHeight(220);", windows_leaf)
         self.assertIn("list.Height(420);", windows_leaf)
 
+    def test_a_pick_is_written_while_its_chooser_stays_up(self) -> None:
+        """添加 is a hand-over, and the rows it writes are the ones selected.
+
+        The chooser used to close on the press and the pane asked Core with
+        nobody watching: the rows appeared a moment later, when the autosave
+        applied the draft, with the selection still on whatever had been there
+        before — so a pick of two models looked like it had been discarded.  The
+        window now stays, its footer turns the app's own wheel beside 添加, the
+        pane selects the first new row behind it, and only the answer that the
+        rows landed takes the window down.  A refused write keeps the window, its
+        ticks and its 添加 for another try.
+        """
+
+        self.assert_ui_has("const importPickedModels = async (")
+        self.assert_ui_has('const answerModelPick = (status: string, close: boolean): Promise<string[]> =>')
+        self.assert_ui_has("native.finishModelsToAdd({ status, close })")
+        # The write is saved, not merely staged, before the chooser closes: the
+        # debounce could still drop the draft it was closing over.
+        self.assert_ui_has("await applyStagedQuietly();")
+        self.assert_ui_has('await answerModelPick(translate("common.saved"), true);')
+        # A refusal keeps the window and asks for the next 添加 it takes.
+        self.assert_ui_has('picked = await answerModelPick(translate("common.notApplied"), false);')
+        self.assert_ui_has('picked = await answerModelPick(message, false);')
+        # A pick Core skipped as already present is not a failed write and not a
+        # new row: the chooser states it and closes.
+        self.assert_ui_has("if (!appearedModelIDs(next, providerId, known).length) {")
+        self.assert_ui_has('await answerModelPick(translate("providers.fetchNothingNew"), true);')
+        self.assertIn('"providers.fetchNothingNew": "选中的模型已经全部存在，未新增。"', self.zh)
+        self.assertIn('"providers.fetchNothingNew": "Those models are already in this provider."', self.en)
+        # The rows the pane selects are the attempt's own: every attempt names
+        # the ids it found, so a retry never selects what an earlier try added.
+        self.assert_ui_has("pendingModelIds.current = { providerId, ids: known };")
+        self.assertIn("function appearedModelIDs(snapshot: CoreSnapshot | undefined, providerID: string, known: ReadonlySet<string>): string[] {", self.ui)
+
+        # The macOS chooser answers through the same two steps 分组管理 makes.
+        self.assertIn(
+            "func answerModelsToAdd(status: String, close: Bool, completion: @escaping ([String]?) -> Void) {",
+            self.macos_leaf,
+        )
+        self.assertIn("chooser.nextPick = completion", self.macos_leaf)
+        self.assertIn("chooser.pendingPick = picked", self.macos_leaf)
+        # A window that is writing cannot be closed under the write, and its 取消
+        # cannot abandon rows the pane is already filing.
+        self.assertIn("func windowShouldClose(_ sender: NSWindow) -> Bool { !saving }", self.macos_leaf)
+        self.assertIn("guard !saving else { return }", self.macos_leaf)
+        # The wait is stated where the press happened: the footer's own wheel,
+        # the shared pre-rendered frames, and the status beside it.
+        self.assertIn("let progress = NSImageView()", self.macos_leaf)
+        self.assertIn("progress.widthAnchor.constraint(equalToConstant: AppKitBusySpinner.size),", self.macos_leaf)
+        self.assertIn("func setSaving(_ saving: Bool, status: String) {", self.macos_leaf)
+        self.assertNotIn("NSProgressIndicator", self.macos_leaf)
+        # A host whose chooser cannot stay up says so by leaving the capability
+        # out; nothing waits for an answer that host cannot give.
+        self.assertIn(
+            "finishModelsToAdd?(options: { status: string; close: boolean }): Promise<string[] | undefined>;",
+            (ROOT / "rn/packages/shared/src/types.ts").read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "finishModelsToAdd?(status: string, close: boolean): Promise<string[] | undefined>;",
+            (ROOT / "rn/packages/shared/src/platform/nativeBridge.ts").read_text(encoding="utf-8"),
+        )
+        # The page's own chooser makes the same two steps: 添加 hands the ticks
+        # over (`request.submit`), the confirm button reports the write, and the
+        # answer either closes the layer or leaves it with its ticks for a retry.
+        page_chrome = (ROOT / "rn/packages/shared/src/ui/HostChrome.tsx").read_text(encoding="utf-8")
+        page_bridge = (ROOT / "rn/packages/shared/src/platform/browserLeaf.ts").read_text(encoding="utf-8")
+        page_store = (ROOT / "rn/packages/shared/src/platform/hostChrome.ts").read_text(encoding="utf-8")
+        self.assertIn("export function requestModelPick(", page_store)
+        self.assertIn("export function finishModelPick(status: string, close: boolean): Promise<ModelChoice> {", page_store)
+        self.assertIn("finishModelsToAdd: (status, close) => finishModelPick(status, close),", page_bridge)
+        self.assertIn("onPress={() => request.submit(selected)}", page_chrome)
+        self.assertIn("busy={saving} disabled={saving || selected.length === 0}", page_chrome)
+
     def test_fetch_models_reports_empty_or_unavailable_results_and_does_not_open_stale_chooser(self) -> None:
         for marker in (
             'const dispatchWithOutcome = async (type: string, payload: UnknownRecord = {}, targetDomain = domain, keepControlsEnabled = false): Promise<CoreSnapshot | undefined>',
@@ -5715,7 +5959,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # The roster is the credential that was asked for, not the one the
             # picker holds when the answer lands: a fetch that lost that race
             # opened the old key's models under the new key's name.
-            'const keyName = requested\n      ? providerKeyChoiceLabel({ name: requested.name, kind: requested.kind, source: requested.source }, translate)',
+            'const keyName = requested\n      ? providerKeyChoiceLabel(requested, translate)',
             'const requestedSource = requested?.kind === "relay" ? requested.source : undefined;',
             'stringValue(answeredSource.resource_id) !== requestedSource.resourceID',
             'handleFetchedModels(summary, choice);',
@@ -5764,7 +6008,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             workspace,
         )
         self.assertIn(
-            '<ProviderListTable translate={translate} selectedProviderId={providerId} providerNameDrafts={providerNameDrafts} validationIssues={validationIssues} onSelect={selectProviderRow} />',
+            '<ProviderListTable translate={translate} selectedProviderId={providerId} providerNameDrafts={providerNameDrafts} validationIssues={validationIssues} onSelect={(key) => { selectProviderRow(key); if (compactWeb) setCompactDetail(true); }} />',
             workspace,
         )
 
@@ -5944,7 +6188,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'label={translate("providers.keyName")}',
             'NativeSecretField labelVisible={false} plainText autoCommit label={translate("providers.keyValue")}',
             'title={translate("providers.backToModelShort")}',
-            'toolTip={translate("providers.backToModel", { model: sourceModelLabel })}',
+            'accessibilityLabel={translate("providers.backToModel", { model: sourceModelLabel })}',
             'providerEditorHeader:',
             'providerEditorSection:',
             'formRow: { width: "100%", minHeight: 26',
@@ -5958,12 +6202,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # return link is the same two words here as in the public-model pane —
         # as a full sentence it measured 246 pt of the row and left the title
         # rendering as its own first character, which is the whole header's
-        # reason for existing.  The model it returns to rides the tooltip.
+        # reason for existing.  The model it returns to is the link's accessible
+        # name, because a button states no hover tip.
         provider_header = self.ui.split("<View style={styles.providerEditorHeader}>", 2)
         self.assertEqual(2, len(provider_header) - 1)
         for header in (provider_header[1], provider_header[2].split("</View>", 1)[0]):
             self.assertIn('title={translate("providers.backToModelShort")}', header)
-            self.assertIn('toolTip={translate("providers.backToModel"', header)
+            self.assertIn('accessibilityLabel={translate("providers.backToModel"', header)
         self.assertNotIn('title={translate("providers.backToModel", { model: sourceModelLabel })}', self.ui)
         self.assertNotIn('title={translate("providers.backToModel", { model: backLabel })}', self.ui)
         self.assert_ui_has('label={translate("providers.publicModel")} labelWidth={MODEL_INSPECTOR_LABEL_WIDTH} value={group.name} disabled={busy}')
@@ -6142,7 +6387,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'const refreshWorkBuddyAccount = async (): Promise<void> => {',
             'if (account && stringValue(account.state) !== "signed-in") void loadWorkBuddyAccount(true);',
             # The account re-read is an icon button, like the relay block's +.
-            'symbol="refresh" compact toolTip={translate("providers.wizard.workbuddyRefresh")}',
+            'symbol="refresh" compact accessibilityLabel={translate("providers.wizard.workbuddyRefresh")}',
             # The account links in the one association block; models keep the
             # provider's own key slot and the key-driven 获取模型 path.
             'const refreshWorkBuddyAccount = async (): Promise<void> => {',
@@ -6275,6 +6520,43 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertIn(marker, domain, marker)
 
+    def test_a_provided_key_without_models_says_so_and_can_ask_again(self) -> None:
+        """选好密钥后的一步不许是空白。
+
+        wawapii reports 23 keys and seven of them declare no model.  Picking one
+        drew the step's header and nothing else: no reason, no action, and a 完成
+        that stayed unlit — a page that looked broken.  The step now names the
+        fact, asks the station once for that key on its own (a read is the only
+        thing that tells "the station has none" from "the read never landed"),
+        and 重新获取模型 is the press that asks again.
+        """
+
+        wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
+        self.assertIn("const providedModelStepIdentity = step === \"model\" && usingProvidedKeyPath(keyPath) && modelCandidates.length === 0", wizard)
+        self.assertIn("const status = await relay.refreshResources(selectedStationAccount.id, { force: true });", wizard)
+        self.assertIn("{usingProvidedKeyPath(keyPath) && modelCandidates.length === 0 ? <View style={styles.providerWizardModelGroup}>", wizard)
+        self.assertIn('translate(providedModelsFailed\n                  ? "relay.resourcesUnavailable"', wizard)
+        self.assertIn('title={translate("providers.wizard.refreshModels")} compact link disabled={wizardBusy} onPress={() => { providedModelsReadFor.current = ""; setProvidedModelsTicket((value) => value + 1); }}', wizard)
+        # A key the station put in no group serves nothing: the row says so
+        # before the step, and the empty step names that cause rather than
+        # claiming a failed read.
+        self.assertIn('const ungrouped = source.ungrouped ? translate("providers.wizard.providedKeyNoGroup") : "";', wizard)
+        self.assertIn('? "providers.wizard.providedKeyNoGroupModels"', wizard)
+        for locale, sentence in (
+            (self.zh, '"providers.wizard.providedKeyNoGroupModels": "该密钥未分配分组，站点没有为它提供模型。请在中转站为它指定分组，或选择另一把密钥。"'),
+            (self.en, '"providers.wizard.providedKeyNoGroupModels": "This key belongs to no group, so the station serves no model through it.'),
+        ):
+            self.assertIn(sentence, locale)
+        # The one read per key is remembered by key, not by array identity: the
+        # publish that follows a read rebuilds everything this step reads.
+        self.assertIn("if (providedModelsReadFor.current === providedModelStepIdentity) return;", wizard)
+        self.assertIn("}, [providedModelStepIdentity, providedModelsTicket]);", wizard)
+        for locale, sentence in (
+            (self.zh, '"providers.wizard.providedKeyNoModels": "该密钥在中转站上没有声明模型。"'),
+            (self.en, '"providers.wizard.providedKeyNoModels": "This key declares no models at the station."'),
+        ):
+            self.assertIn(sentence, locale)
+
     def test_a_fetched_roster_checks_nothing_by_default(self) -> None:
         """A listing offers its models; it does not choose them.
 
@@ -6298,10 +6580,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
 
         wizard = self.ui.split("function ProviderSetupWizard(", 1)[1].split("function ProviderWorkspace(", 1)[0]
         # One standalone wheel per branch (the official account's roster, the
-        # lane's roster, the generic listing), the sign-in wait, and the key
-        # read/grouping wait the signed-in key step states.  The buttons that
-        # start those reads draw none of their own for the same wait.
-        self.assertEqual(5, wizard.count("<NativeBusySpinner"))
+        # lane's roster, the generic listing), the sign-in wait, the key
+        # read/grouping wait the signed-in key step states, and the read a
+        # provided key's empty model step asks for.  The buttons that start
+        # those reads draw none of their own for the same wait.
+        self.assertEqual(6, wizard.count("<NativeBusySpinner"))
         self.assertNotIn('busy={modelFetchState === "loading"}', wizard)
         self.assertNotIn("providerWizardModelLoading", wizard)
         self.assertNotIn("providerWizardModelLoading", self.ui)
@@ -7018,10 +7301,14 @@ class ReactNativeUiParityTests(unittest.TestCase):
             self.assertNotIn(gone, general)
         # The address is the one thing in a pane that is meant to be pressed:
         # pressing it opens a page this window has already proved itself to, so
-        # the key never has to be copied into another browser.
+        # the key never has to be copied into another browser.  On the page
+        # itself the press opens the address the row printed -- Core's launch
+        # address is this machine's loopback, which a published page cannot open.
         for marker in (
             'accessibilityRole="link"',
             "void openWebPage()",
+            'const webPageOwnOrigin = Platform.OS === "web"',
+            'if (webPageOwnOrigin === "") {',
             "await ipc.webLaunchUrl()",
             "native.openExternalURL?.(address)",
         ):
@@ -7403,12 +7690,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
     def test_a_shortened_cell_states_its_long_form_on_hover(self) -> None:
         """A one-letter cell is only honest if hovering restores the wire names.
 
-        The native table already sets every cell's tooltip to its own text, so
-        an abbreviated cell would tooltip `M→C` -- the same riddle twice.  The
-        tooltip therefore travels as its own per-cell list, alongside `cells`
-        and by the same positional rule, and the AppKit side prefers it over
-        the cell's text.  The pathway is pinned at every hop: a prop dropped in
-        one file would still typecheck, and the cell would simply go quiet.
+        A cell states no hover for text it already draws -- the rule is that
+        only a cut label raises a hint -- so an abbreviated cell would hover as
+        `M→C`, the same riddle twice.  The long form therefore travels as its
+        own per-cell list, alongside `cells` and by the same positional rule,
+        and the AppKit label prefers it over the cell's text.  The pathway is
+        pinned at every hop: a prop dropped in one file would still typecheck,
+        and the cell would simply go quiet.
         """
 
         mac_native = MACOS_CONTROLS.read_text(encoding="utf-8")
@@ -7429,10 +7717,74 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "? StringFromStdString(viewProps.cellTooltips[cellIndex]) : @\"\";",
             native_table,
         )
-        self.assertIn("NSString *tooltip = cellTooltip.length > 0 ? cellTooltip : value;", native_table)
+        # The declared long form is the hover; every other cell's hover is the
+        # label's own rule (its text, and only while the column clipped it).
+        self.assertIn("label.hoverText = cellTooltip.length > 0 ? cellTooltip : nil;", native_table)
+        self.assertNotIn("label.toolTip =", native_table)
         # A tooltip-only change still has to re-tile the rows, or the cell keeps
         # the tooltip it was first drawn with.
         self.assertIn("oldViewProps.cellTooltips != newViewProps.cellTooltips;", native_table)
+
+    def test_a_button_states_no_hover_tip(self) -> None:
+        """No control keeps a tip: what a button says it says in its own words.
+
+        Every host used to give one.  macOS fell back to the button's own title,
+        Windows put the same words in `tooltip`, the page wrote a `title`
+        attribute, and the shared UI passed a sentence for 返回, the help mark
+        and every icon button — so pointing at 探测 or at a copy glyph opened a
+        tip that repeated a label already in view, or explained a press nobody
+        had made yet.  The rule stops at the control now: a button draws its
+        title, and a glyph button carries its accessible name.
+        """
+
+        group_sheet = (ROOT / "rn/packages/shared/src/ui/RelayGroupSheet.tsx").read_text(encoding="utf-8")
+        for source in (self.native_controls, self.appkit_controls, self.ui, self.relay, group_sheet):
+            self.assertNotIn("toolTip", source)
+        # The page's `title` and the Windows leaf's `tooltip` prop were the other
+        # two hosts of the same rule, and both are gone with the prop.
+        self.assertNotIn("setAttribute?.(", self.native_controls)
+        self.assertNotIn('"tooltip"', self.native_controls)
+        # What the sentences said instead: an accessible name.  The two that
+        # still matter are pinned, because dropping the tip without moving the
+        # sentence would have quietly deleted it.
+        self.assert_ui_has('accessibilityLabel={translate("providers.backToModel", { model: backLabel })}')
+        self.assert_ui_has('accessibilityLabel={translate("providers.backToModel", { model: sourceModelLabel })}')
+
+    def test_only_a_clipped_text_states_a_tip(self) -> None:
+        """A text states a hover only while the host had to cut it.
+
+        The old rule attached a tip to every label that could be long: a field
+        label the pane always fits said itself twice under the pointer.  What
+        earns a hint is an ellipsis, and only the host knows — the width a label
+        ends up with is the layout's business, not the pane's.  The shared text
+        reads what the host drew (`onTextLayout`) and the AppKit label compares
+        its own frame, so both attach the hint at the moment it is true and drop
+        it when a wider column makes it false.
+        """
+
+        self.assert_ui_has('const NativeTipText = Text as unknown as React.ComponentType<React.ComponentProps<typeof Text> & { tooltip?: string }>;')
+        # The label is measured against a copy laid out at its natural width,
+        # under the label's own face and with none of the label's column.
+        self.assert_ui_has('const TIP_MEASURE_STYLE: TextStyle = { position: "absolute", left: 0, top: 0, opacity: 0 };')
+        self.assert_ui_has('function textFaceStyle(style: React.ComponentProps<typeof Text>["style"]): TextStyle {')
+        self.assert_ui_has('const { fontFamily, fontSize, fontWeight, letterSpacing, lineHeight } = face;')
+        # A wrapping label is never cut, and a label with no verdict yet states
+        # nothing: the tip is attached only once both widths are known.
+        self.assert_ui_has('const single = numberOfLines === 1 && tooltip !== undefined;')
+        self.assert_ui_has('const cut = single && natural !== undefined && drawn > 0 && natural > drawn + 0.5;')
+        self.assert_ui_has('{...({ tooltip: cut ? tooltip : undefined } as { tooltip?: string })}')
+        self.assert_ui_has('onLayout={(event) => setMeasured({ text: full, width: event.nativeEvent.layout.width })}')
+        # The native labels take the same verdict on their own frame, and a
+        # table cell that abbreviates passes its long form as `hoverText` — the
+        # one case where the hover is not an ellipsis of the cell's own words.
+        mac_leaf = self.macos_leaf
+        self.assertIn("final class LiteLLMTruncatingLabel: NSTextField {", mac_leaf)
+        self.assertIn("let needed = attributedStringValue.size().width", mac_leaf)
+        self.assertIn("toolTip = needed > bounds.width + 0.5 ? text : nil", mac_leaf)
+        self.assertIn("if let hover = hoverText, !hover.isEmpty {", mac_leaf)
+        controls = MACOS_CONTROLS.read_text(encoding="utf-8")
+        self.assertIn("[LiteLLMTruncatingLabel truncatingLabel]", controls)
+        self.assertNotIn("label.toolTip =", controls)
 
     def test_the_anthropic_protocol_option_names_its_wire(self) -> None:
         """A protocol option states a wire, and its name is ``Anthropic Messages``.
@@ -7821,6 +8173,20 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # attempted suppressed the mount check for the life of the panel.
         self.assertIn("if (!fresh && active) answered = await restoreSavedSession(account);", relay)
         self.assertIn("if (!answered) attemptedAccounts.current.delete(account.id);", relay)
+        # The mount pass belongs to a change in the facts it reads, not to a
+        # render: it ends by refreshing the account, that refresh publishes a
+        # snapshot, and the rebuilt account array used to restart the pass on
+        # its own result -- probe → refresh → snapshot → probe, with the rows
+        # repainting 检测中 forever.  A station that answers nothing is asked
+        # again only after the re-check window, so the retry that a transient
+        # timeout needs cannot become a spin.
+        self.assertIn("const mountProbeKey = stationAccounts", relay)
+        self.assertIn("}, [busy, sessionRecheckSeconds, mountProbeKey]);", relay)
+        self.assertNotIn("}, [busy, sessionRecheckSeconds, stationAccounts]);", relay)
+        self.assertIn("const probeAttemptedAt = useRef(new Map<string, number>());", relay)
+        self.assertIn("probeAttemptedAt.current.set(account.id, Date.now());", relay)
+        self.assertIn("const cooling = lastAttempt !== undefined && Date.now() - lastAttempt < cooldownMs;", relay)
+        self.assertIn("const cooldownMs = Math.max(1, typeof sessionRecheckSeconds", relay)
         self.assertIn("let active = true;", relay)
         self.assertIn("return () => { active = false; };", relay)
         self.assertIn("sessionRecheckSeconds?: number;", relay)
@@ -7906,7 +8272,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # relay messages carry ("请点击刷新资源") therefore point at a button the
         # row shows once there is a session to refresh.
         self.assertIn('{selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"} disabled={controlsBusy && pendingAction !== "refresh"} onPress={() => { void refreshSelected(); }} /> : null}', relay)
-        self.assertIn('{selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.groupManager")} titleWidth="tight" compact toolTip={native.showGroupManager ? undefined : translate("relay.groupManagerUnavailable")} disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} /> : null}', relay)
+        # A disabled control states why its action is unavailable as its
+        # accessible name: a button carries no hover tip, and a greyed bezel
+        # with no reason beside it is the thing the sentence used to fix.
+        self.assertIn('{selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.groupManager")} titleWidth="tight" compact accessibilityLabel={native.showGroupManager ? translate("relay.groupManager") : translate("relay.groupManagerUnavailable")} disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} /> : null}', relay)
         self.assertIn('title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"}', relay)
         self.assertIn('const refreshSelected = async (): Promise<void> => {', relay)
         self.assertIn('await refreshAccountResources({ id: account.id }, { force: true });', relay)
@@ -8057,7 +8426,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("multiplier: groupRateLabel(resourceGroup(resource, current.groups)),", relay)
         self.assertIn("function groupRateLabel(group: RelayGroup | undefined): string {", relay)
         self.assertIn('{translate("relay.apiKeyMultiplier")}</Text><Text numberOfLines={1} style={styles.apiKeyPreviewValue}>{groupRateLabel(selectedGroup) || translate("common.none")}', relay)
-        self.assertIn('label: `${accountKeyPrefix(account, translate)}/${resourceGroupName(resource, account.groups, translate)}`', relay)
+        self.assertIn("label: providedKeyLabel(account, providedKeyName(resource, account.groups, translate), translate),", relay)
         self.assertNotIn("resourceGroupLabel", relay)
         # The detail pane reports the selected key completely: its rate and the
         # station's key in plaintext with a native copy action; the models are
@@ -8084,10 +8453,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("let valueLabel = detailCaption(label(\"valueLabel\"))", mac_leaf)
         self.assertIn("let multiplierField = detailValue()", mac_leaf)
         self.assertIn('let copyButton = NSButton(title: "", target: self, action: #selector(copySelectedKey(_:)))', mac_leaf)
-        # The copy is an icon button: the words ride it as its tooltip and its
-        # accessibility name instead of a text button's width.
+        # The copy is an icon button: the words ride its accessible name instead
+        # of a text button's width, and a button states no hover tip.
         self.assertIn('copyButton.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: label("copyLabel"))', mac_leaf)
-        self.assertIn('copyButton.toolTip = label("copyLabel")', mac_leaf)
+        self.assertNotIn('copyButton.toolTip', mac_leaf)
         self.assertIn("copyButton.widthAnchor.constraint(equalToConstant: 22),", mac_leaf)
         self.assertIn('copy_glyph.Glyph(L"\\xE8C8");', windows_leaf)
         self.assertIn("private func copySelectedKey(_ sender: NSButton) {", mac_leaf)
@@ -8479,11 +8848,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("disabled={formBusy || selectedProvided.account.autoGrouping}", provided)
         self.assertIn('hint={selectedProvided.resource.keyHint ? translate("providers.relayKeyValueHint") : translate("common.none")}', provided)
         self.assertNotIn('hint={selectedProvided.resource.keyHint ? translate("providers.apiKeySavedHint")', provided)
-        # The one input auto grouping legitimately locks says why it is locked:
-        # the switch that owns the name is in 分组管理, not on this pane.
-        self.assertIn('{selectedProvided.account.autoGrouping ? <Text style={styles.fieldHint}>{translate("providers.keyNameAutoGroupingHint")}</Text> : null}', provided)
-        self.assertIn('"providers.keyNameAutoGroupingHint": "自动分组已开启"', self.zh)
-        self.assertIn('"providers.keyNameAutoGroupingHint": "Auto grouping is on"', self.en)
+        # The name field carries no hint line: those two sentences drew a
+        # tooltip over the fields beside it, and the account row above the list
+        # already names whose key this is.
+        self.assertNotIn("providers.keyNameAutoGroupingHint", provided)
+        self.assertNotIn("providers.relayKeyFromAccount", provided)
+        self.assertNotIn("providers.keyNameAutoGroupingHint", self.zh)
+        self.assertNotIn("providers.relayKeyFromAccount", self.zh)
 
     def test_relay_add_login_asks_after_the_signin_succeeds(self) -> None:
         relay = self.relay
@@ -8502,12 +8873,20 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ):
             self.assertNotIn(marker, relay)
         for marker in (
-            'translate("relay.rememberPassword")',
-            "rememberPassword",
+            'translate("relay.addLoginPrompt")',
+            'translate("relay.savePasswordAndSession")',
+            'translate("relay.saveSessionOnly")',
             "showRelayLoginChoice",
             "providerWizardRememberRow",
         ):
             self.assertNotIn(marker, ui)
+        # The question itself does exist, and it is the *post-login* one: each
+        # host asks it after the station accepted the session, with these two
+        # answers.  A checkbox before the sign-in is what this test still
+        # forbids -- asking first makes the answer a condition of the login,
+        # which a station that needs a captcha can then never satisfy.
+        self.assertIn('relayRememberPasswordTitle: translate("relay.rememberPasswordTitle")', ui)
+        self.assertIn('relayRememberSessionOnly: translate("relay.rememberSessionOnly")', ui)
         # Adding an account goes straight to the native sign-in.
         self.assertIn("await runPendingAction(\"add\", startPendingLogin);", relay)
         # The wizard's relay family is auto-detected inside the login flow:
@@ -8556,7 +8935,10 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'labelVisible={false}',
             'keysEditorFieldHeader: { height: 22, flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 4 }',
             "rows.push({ key: `account:${account.id}`, cells: [accountDisplayName(account, translate)], spanning: true });",
-            "cells: [`\\t${providedNameDrafts[row.key] ?? row.label}`],",
+            # The list row keeps the account prefix while the station name is
+            # being edited: the draft is the key-name half only.
+            "const draft = providedNameDrafts[row.key];",
+            "cells: [`\\t${draft ? providedKeyLabel(row.account, draft, translate) : row.label}`],",
             "providedRows",
             "ApiKeyCreateDialog",
             "relay.apiKeyActions.update?.(selectedProvided.account.id, selectedProvided.resource.id, name)",
@@ -8575,6 +8957,32 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "resourceGroupUnavailable(resource, account.groups)",
         ):
             self.assertIn(marker, relay)
+
+    def test_a_fresh_provider_does_not_open_on_a_station_key_it_does_not_own(self) -> None:
+        """A station key is not this provider's key until a slot binds it.
+
+        Measured on a freshly added account: the 密钥 column opened on the
+        station's first key (`Cursor`), showed its value, and named no account —
+        so a provider with no keys at all looked like it held one.  Keys this
+        provider actually owns come first; a station key is selected only when
+        the provider already binds it, and the editor states the account either
+        way.
+        """
+
+        ui = self.ui
+        self.assertIn(
+            "const boundProvidedRows = providedRows.filter((row) => credentialKeys.some(",
+            ui,
+        )
+        self.assertIn('entry.kind === "relay" && entry.slotID !== undefined && entry.key === relayCredentialKey(row.account.id, row.resource.id)', ui)
+        open_rule = ui.split("const firstSelectable = loginCredentials[0]", 1)[1].split(";", 1)[0]
+        # Bound rows before unbound station rows, which are the last resort.
+        self.assertLess(open_rule.index("boundProvidedRows[0]"), open_rule.index("providedRows[0]"))
+        # The row keep its account prefix while a name draft is typed -- that is
+        # what stopped a station key from reading as this provider's own -- and
+        # the editor states it nowhere else, because a hint line there drew a
+        # tooltip over the neighbouring fields.
+        self.assertIn('cells: [`\\t${draft ? providedKeyLabel(row.account, draft, translate) : row.label}`]', ui)
 
     def test_no_key_editor_is_drawn_for_a_login_service(self) -> None:
         """A login service owns its key, so its literal value is nobody's to edit.
@@ -8629,6 +9037,70 @@ class ReactNativeUiParityTests(unittest.TestCase):
         )
         self.assert_ui_has('managed: booleanValue(value.managed),')
 
+    def test_a_deleted_row_selects_its_neighbour_not_the_first_row(self) -> None:
+        """Removal moves the selection one row over, never back to the top.
+
+        Every list answered a vanished selection with its first row: deleting
+        the third model selected a model the person had not touched, the
+        inspector rebuilt against it, and the table scrolled to the top -- the
+        rows they were working in slid out of view for a reason nothing on
+        screen stated.  The one obvious place to stand after a deletion is the
+        row that slid up into the gap, or the row above it when it was last;
+        the first row is what an *empty* list means.
+        """
+
+        self.assertIn('function adjacentSelectionAfterRemoval(', self.ui)
+        self.assertIn('return remainingKeys[index] ?? remainingKeys[index - 1] ?? remainingKeys[0];', self.ui)
+        # Providers, models, routes and the key table all repair through it.
+        self.assertIn('adjacentSelectionAfterRemoval(previousProviderKeys.current, keys, selectedProvider ?? "")', self.ui)
+        self.assertIn('adjacentSelectionAfterRemoval(previousModelKeys.current.ids, ids, selectedModel)', self.ui)
+        self.assertIn('adjacentSelectionAfterRemoval(previousRouteKeys.current, keys, selectedRoute ?? "")', self.ui)
+        self.assertIn('adjacentSelectionAfterRemoval(previousKeyRowKeys.current, rowKeys, selectedKey)', self.ui)
+        # And none of them still jumps to the first row on a removal.
+        self.assertNotIn('setSelectedProvider(editorIdentifier(providers[0]));\n    }\n  }, [providers, selectedProvider]);', self.ui)
+        self.assertNotIn('    if (routes.some((entry) => entry.key === selectedRoute)) return;\n    setSelectedRoute(routes[0].key);', self.ui)
+
+    def test_a_dropped_station_key_is_still_named_by_its_account(self) -> None:
+        """An orphan slot is a key of that account, and it reads like one.
+
+        A slot whose station answer no longer lists it kept its bare stored
+        name in the key table -- `station-user@example.com` beside
+        `station-user/特价 kiro` --
+        so the same account's keys appeared to come from two places.  The
+        indentation under the account header does not replace the prefix: the
+        prefix is how a key names its account everywhere else in the app.
+        """
+
+        self.assertIn("rows.push({ key: `orphan:${slot.id}`, cells: [`\\t${providedKeyLabel(account, slot.name, translate)}`] });", self.ui)
+
+    def test_a_relay_slot_keeps_its_account_prefix_without_a_successful_read(self) -> None:
+        """未登录 must not turn 账号/分组 back into a bare group name.
+
+        The prefix used to be drawn from the account's *resources*: while a key
+        list had been read, every slot found its source and the label was
+        complete.  The moment a sign-in cleared that list -- or the station could
+        not be read -- the same slot fell back to its stored name, which is the
+        group alone, and the picker listed `grok` beside `xmfwhu/grok` as though
+        the provider held two keys.  The account outlives every read, so the
+        prefix is derived from the account and travels with the slot.
+        """
+
+        self.assertIn('function relayAccountLabel(account: UnknownRecord): string {', self.ui)
+        self.assertIn('function relayAccountPrefixes(snapshot: CoreSnapshot | undefined): Map<string, string> {', self.ui)
+        # One derivation for the account's spelling: the source list and the
+        # slot fallback ask the helper instead of each splitting the address.
+        self.assertIn('const accountLabel = relayAccountLabel(account);', self.ui)
+        self.assertNotIn('username.split("@", 1)[0].trim() || username : stringValue(account.label, accountID)', self.ui)
+        # A slot whose resource is gone is completed from its account, and a
+        # name that already carries the prefix is not prefixed twice.
+        self.assertIn('const prefix = choice.accountPrefix?.trim() ? `${choice.accountPrefix.trim()}/` : "";', self.provider_key_labels)
+        self.assertIn('const ownName = prefix && !name.startsWith(prefix) ? `${prefix}${name}` : name;', self.provider_key_labels)
+        self.assertIn('const sourceName = relaySourceName(choice.source) || ownName;', self.provider_key_labels)
+        self.assertIn('accountPrefix: key.source.kind === "relay" ? relayAccountPrefixByID.get(key.source.accountID) : undefined,', self.ui)
+        # The slot the document stores is named the way the label reads, so the
+        # prefix does not depend on the snapshot at all.
+        self.assertIn('api_key_name: relaySourceName(choice),', self.ui)
+
     def test_a_relay_key_is_named_by_its_account_and_group_everywhere(self) -> None:
         """One name for one relay key: 账号/分组, never the group alone.
 
@@ -8639,20 +9111,47 @@ class ReactNativeUiParityTests(unittest.TestCase):
         label the key picker and the relay key table already use.
         """
 
-        self.assertIn('return source ? [source.accountLabel, source.resourceLabel].filter(Boolean).join("/") : "";', self.ui)
+        self.assertIn('return source ? [source.accountLabel, source.resourceLabel].filter(Boolean).join("/") : "";', self.provider_key_labels)
         self.assertIn('return relaySourceName(relaySourceForKey(key, relaySources)) || name;', self.ui)
         # An account is not a key, so the same column names it before it ever
         # reaches a key lookup: an account-backed route reads as its account.
         self.assertIn('const credential = modelCredential(model, provider, credentials);', self.ui)
         self.assertIn('grouped.set(key.id, { label: modelProviderKeyLabel(item, provider ?? {}, translate, undefined, relaySources), models: [item] });', self.ui)
         self.assertIn('modelProviderKeyLabel(entry.model, entry.provider, translate, undefined, relaySources, providerCredentials(entry.provider, translate)), order],', self.ui)
-        self.assertIn('const sourceName = relaySourceName(choice.source) || name;', self.ui)
-        self.assertIn('label={`${source.resourceLabel || relaySourceName(source)}${multiplier}`}', self.ui)
+        self.assertIn('const sourceName = relaySourceName(choice.source) || ownName;', self.provider_key_labels)
+        self.assertIn('label={`${source.resourceLabel || relaySourceName(source)}${multiplier}${ungrouped}`}', self.ui)
         # The account is the selected row, so the key list is that account's.
         self.assertIn('source.accountID === selectedStationAccount.id', self.ui)
         self.assertIn('const { account, resource, label } = selectedProvided;', self.ui)
         # The relay key table already composes the same label from the account.
-        self.assertIn('label: `${accountKeyPrefix(account, translate)}/${resourceGroupName(resource, account.groups, translate)}`', self.relay)
+        # The label is 账号前缀/分组名, and a key filed under no group carries its
+        # own name instead: five ungrouped keys used to read
+        # `riveryang6/未分组`, five identical rows for five different keys.
+        self.assertIn("label: providedKeyLabel(account, providedKeyName(resource, account.groups, translate), translate),", self.relay)
+        self.assertIn("export function providedKeyName(", self.provided_key_names)
+        self.assertIn("const hasGroup = Boolean(group || resource.groupID || resource.groupName);", self.provided_key_names)
+        self.assertNotIn('group !== translate("relay.apiKeyUngrouped")', self.provided_key_names)
+
+    def test_the_model_fetch_picker_names_a_key_by_the_same_helper_as_the_key_table(self) -> None:
+        """One key, one name: the picker asks providedKeyName, it does not re-derive.
+
+        获取模型's entries are built from providedKeyRows, and that builder once
+        carried its own copy of the naming rule while the picker used the row's
+        raw `group` field.  Fixing the table left the picker printing
+        `riveryang6/未分组` for the same six keys, because the two surfaces each
+        decided the name for themselves.  The name now comes from a single
+        exported helper, and this pins both callers to it.
+        """
+
+        self.assertIn("export function providedKeyName(resource: RelayNameResource, groups: RelayNameGroup[], translate: Translate): string {", self.provided_key_names)
+        self.assertIn("label: providedKeyLabel(account, providedKeyName(resource, account.groups, translate), translate),", self.relay)
+        # The picker's source label is that same name: no second rule, and no
+        # remaining read of the raw group field to name a key.
+        self.assertIn("resourceLabel: providedKeyName(row.resource, account.groups, translate),", self.ui)
+        self.assertNotIn("resourceLabel: row.group,", self.ui)
+        # The station-snapshot sources (wizard, account manager) name a key by
+        # the name the station reported for it, never by its group.
+        self.assertIn("resourceLabel: stringValue(resource.api_name, stringValue(resource.name, resourceID)),", self.ui)
 
     def test_a_refused_relay_binding_marks_the_row_it_belongs_to(self) -> None:
         """A binding failure names its row: the strip keeps the outcome, rows get marked.
@@ -8803,13 +9302,13 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'function relaySourcesForProvider(',
             'if (providerKind(provider) !== "relay") return [];',
             'return relaySources.filter((source) => source.stationID === stationID);',
-            'function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[]): ProviderKeyChoice[] {',
+            'function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[], accountPrefixes?: Map<string, string>): ProviderKeyChoice[] {',
             'function ProviderIdentityFields(',
             'function relayStationsFromSnapshot(',
             'const nextStation = relayStationForBaseUrl(endpoint, relayStations);',
             'dispatch("provider.select_relay_station", { provider_id: providerID, station_id: station.id })',
             'const matchingRelaySources = providerAuthKind(provider) === "api_key" ? relaySourcesForProvider(',
-            'const keyChoices = selectedProvider ? providerKeyChoices(selectedProvider, relaySourcesForProvider(selectedProvider, relaySources, activeProviderBaseURL)) : [];',
+            'const keyChoices = selectedProvider ? providerKeyChoices(selectedProvider, relaySourcesForProvider(selectedProvider, relaySources, activeProviderBaseURL), relayAccountPrefixByID) : [];',
             'const action = relaySource ? "provider.fetch_relay_resource_models" : "providers.fetch_models";',
             'dispatch("model.select_relay_resource"',
             'const providerKeyName = drafts?.providerKeyDisplayName(providerId, providerKey.id, providerKey.name) ?? providerKey.name;',
@@ -9214,6 +9713,63 @@ class ReactNativeUiParityTests(unittest.TestCase):
         for locale in (self.zh, self.en):
             self.assertIn('"runtime.fixInvalidBeforeLeaving"', locale)
         self.assertIn('const flushActivePane = useRef<((purpose?: "close" | "navigate") => Promise<boolean>) | undefined>(undefined);', self.ui)
+
+    def test_the_web_page_is_one_column_on_a_phone(self) -> None:
+        """The page's narrow layout is a layout, not a crop.
+
+        A native window refuses to shrink past its own minimum, so no shared
+        pane ever had to answer "what if there is no second column".  The
+        browser host does: at 360 pt the providers pane's three columns and the
+        settings panes' 200 pt rails left the surface they were there to open a
+        strip of clipped text.  The page therefore switches shapes, and these
+        are the shapes it switches to.
+        """
+        # One media query, declared once, and both layouts read it.
+        self.assert_ui_has("function useWebMediaQuery(query: string): boolean {")
+        self.assert_ui_has('return useWebMediaQuery("(max-width: 760px)");')
+        # The providers pane needs more room than the shell: three columns want
+        # about 900 pt, and below this the middle table folded to two truncated
+        # columns while the inspector kept 320 of the pane's width.
+        self.assert_ui_has("function useCompactProvidersPane(): boolean {")
+        self.assert_ui_has('return useWebMediaQuery("(max-width: 1024px)");')
+        self.assert_ui_has("const compactWeb = useCompactProvidersPane();")
+        self.assert_ui_has("const [compactDetail, setCompactDetail] = useState(false);")
+        self.assert_ui_has('const inspectorHasContent = viewMode === "routes"')
+        self.assert_ui_has('const showProviderInspector = inspectorHasContent && (!compactWeb || compactDetail);')
+        # A row opens its inspector in the list's place, so the pane needs the
+        # bar that takes a phone back to the list: there is no second column
+        # left to press.
+        self.assert_ui_has("function CompactDetailBar({ title, onBack, translate }: { title: string; onBack: () => void; translate: Translate }): React.JSX.Element {")
+        self.assert_ui_has('const backLabel = translate("common.back");')
+        self.assert_ui_has('compactDetailBar: { minHeight: 34, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 12, borderBottomWidth: 1, borderBottomColor: systemColors.separator, backgroundColor: systemColors.window }')
+        # The lists are one column, the provider list a fixed band above the
+        # models, and the inspector takes the whole width when opened.  The
+        # band states `flexBasis: "auto"`: a plain `height` beside the pane's
+        # `flex: 1` keeps the shorthand's basis, and the band collapsed to
+        # zero -- the two list titles drew over each other.
+        self.assert_ui_has('providersLayoutCompact: { flexDirection: "column", gap: 8 }')
+        self.assert_ui_has('providerModelColumnsCompact: { flexDirection: "column", gap: 8 }')
+        self.assert_ui_has('providerListPaneCompact: { width: "100%", minWidth: 0, maxWidth: "100%", height: 148, flexBasis: "auto", flexGrow: 0, flexShrink: 0 }')
+        self.assert_ui_has('providerInspectorCompact: { width: "100%", minWidth: 0, maxWidth: "100%"')
+        # The routes tab keeps the same drill-down: a row opens its inspector.
+        self.assert_ui_has("if (compactWeb) setCompactDetail(true);")
+        # A rail (runtime settings, external clients, backup & sync) becomes a
+        # strip of chips above the detail it selects instead of a 200 pt column
+        # beside it -- the column left the detail about 160 pt on a phone.
+        self.assert_ui_has("  if (compact) {\n    return <ScrollView horizontal showsHorizontalScrollIndicator={false}")
+        self.assert_ui_has('accessibilityRole="tab"')
+        self.assert_ui_has('compactRailBody: { flexDirection: "column", gap: 0 }')
+        self.assert_ui_has('compactRailChip: { minHeight: 28, maxWidth: 200, paddingHorizontal: 10, justifyContent: "center", borderRadius: 14')
+        for marker in (
+            "<SettingsRail rows={tocRows} selectedKey={selectedCategory} compact={compactWeb}",
+            "selectedKey={selectedClient}\n      compact={compactWeb}",
+            "selectedKey={tab}\n      compact={compactWeb}",
+        ):
+            self.assert_ui_has(marker)
+        # The one new word the page says: the way back, in both locales.
+        self.assertIn('"common.back": "返回",', self.zh)
+        self.assertIn('"common.back": "Back",', self.en)
+        self.assertIn('| "common.back"', (ROOT / "rn/packages/shared/src/i18n/types.ts").read_text(encoding="utf-8"))
 
     def test_the_log_filter_owns_its_text_until_core_confirms_it(self) -> None:
         """A poll landing mid-typing must not delete the typed character.
@@ -9915,16 +10471,16 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertNotIn("paneContentHeight", self.ui)
         self.assertIn('const vendorBaseURL = (drafts?.providerBaseURL(provider) ?? stringValue(provider.endpoint, stringValue(provider.api_base))).trim();', self.ui)
         self.assertIn(
-            '{vendorBaseURL && !providerService(provider) ? <NativeButton title="" symbol="plus" compact toolTip={translate("providers.addRelayAccount")}',
+            '{vendorBaseURL && !providerService(provider) ? <NativeButton title="" symbol="plus" compact accessibilityLabel={translate("providers.addRelayAccount")}',
             self.ui,
         )
         relay = self.relay
         self.assertIn(
-            '{stationAccounts.length < 8 ? <NativeButton title="" symbol="plus" compact toolTip={translate("relay.addAccount")}',
+            '{stationAccounts.length < 8 ? <NativeButton title="" symbol="plus" compact accessibilityLabel={translate("relay.addAccount")}',
             relay,
         )
         self.assertIn(
-            '{selected ? <NativeButton title="" symbol="minus" compact destructive toolTip={translate("relay.removeLocal")}',
+            '{selected ? <NativeButton title="" symbol="minus" compact destructive accessibilityLabel={translate("relay.removeLocal")}',
             relay,
         )
 
@@ -9987,7 +10543,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The list header's + creates a provider directly; the toolbar keeps the
         # wizard as its own action.
         self.assertIn(
-            '<TablePane style={styles.providerListPane} title={translate("providers.providers")} actions={<><IconButton label="+" title={translate("providers.newProvider")} disabled={busy} onPress={addProvider} />',
+            '<TablePane style={[styles.providerListPane, compactWeb && styles.providerListPaneCompact]} title={translate("providers.providers")} actions={<><IconButton label="+" title={translate("providers.newProvider")} disabled={busy} onPress={addProvider} />',
             self.ui,
         )
         self.assertIn('const addProvider = (): void => {', self.ui)

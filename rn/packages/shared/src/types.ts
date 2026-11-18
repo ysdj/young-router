@@ -403,7 +403,7 @@ export interface ProviderModelSummary {
     summary?: ProbeSummary;
     checked_at?: string;
     degradation?: ProbeDegradationResult;
-    /** The last token-rate measurement, present only for flash routes. */
+    /** The last token-rate measurement a speed press produced. */
     speed_test?: ProbeSpeedTest | null;
     surfaces?: Record<string, Omit<ProbeSurfaceResult, "surface">>;
   };
@@ -898,6 +898,11 @@ export interface NativeLocalization {
   relayBrowserShow?: string;
   /** What the wait says while Core holds the station's window open. */
   relayBrowserWaiting?: string;
+  /** The post-login question: keep the password, or only the login. */
+  relayRememberPasswordTitle?: string;
+  relayRememberPasswordBody?: string;
+  relayRememberPasswordKeep?: string;
+  relayRememberSessionOnly?: string;
   /** A sign-in window that could not be opened at all, named as a sentence. */
   relayBrowserUnavailable?: string;
   /** A browser was installed and the window never appeared. */
@@ -973,7 +978,7 @@ export type RelayGroupManagerLabels = {
    * capability; the value never crosses this boundary.
    */
   valueLabel: string;
-  /** The copy icon button's tooltip and accessibility name. */
+  /** The copy icon button's accessibility name, since a glyph button states no hover tip. */
   copyLabel: string;
   failedLabel: string;
   /** The selected key's model list section title (模型列表). */
@@ -1090,11 +1095,33 @@ export interface NativeLeafAdapter {
    * lands after Close changes nothing.
    */
   updateGroupManager?(options: RelayGroupManagerSnapshot): Promise<boolean>;
+  /**
+   * Ask which of `models` to add, and answer with the ticks.
+   *
+   * On a host that also offers `finishModelsToAdd`, the chooser's 添加 is a
+   * *hand-over*: the window stays up with its button reporting the write, and
+   * the pane's answer is what takes it down.  That is the same two steps 分组管理
+   * makes (``awaitGroupManagerApply``/``finishGroupManagerApply``), and for the
+   * same reason — the write is the pane's, but the person is still looking at
+   * the chooser, so a window that closed on the press left the rows they had
+   * just ticked invisible behind it.  A host without `finishModelsToAdd` closes
+   * its chooser when it answers, exactly as before.
+   */
   chooseModelsToAdd(options: {
     models: string[];
     providerName: string;
     keyName: string;
   }): Promise<string[] | undefined>;
+  /**
+   * Answer the open chooser's 添加.
+   *
+   * `status` is stated in the chooser's own strip, like 分组管理's 保存并关闭: a
+   * saved import reads 已保存, a refused one names its cause.  `close` is the
+   * answer to "did the rows land?" — true ends the window, false keeps it, its
+   * ticks and its 添加 button for another try, and resolves with the next 添加
+   * the person presses (undefined when they give up and close it).
+   */
+  finishModelsToAdd?(options: { status: string; close: boolean }): Promise<string[] | undefined>;
   editSecret(options: {
     domain: "providers_models" | "codex" | "claude" | "runtime" | "webdav";
     field: string;

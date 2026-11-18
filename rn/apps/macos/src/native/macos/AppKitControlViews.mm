@@ -1116,7 +1116,7 @@ void SyncTableHeaderScrollOffset(NSScrollView *scrollView);
 - (instancetype)initWithFrame:(NSRect)frame
 {
   if (self = [super initWithFrame:frame]) {
-    _label = [NSTextField labelWithString:@""];
+    _label = [LiteLLMTruncatingLabel truncatingLabel];
     _label.translatesAutoresizingMaskIntoConstraints = NO;
     _label.font = TableCellFont();
     _label.lineBreakMode = NSLineBreakByTruncatingTail;
@@ -1287,7 +1287,7 @@ void SyncTableHeaderScrollOffset(NSScrollView *scrollView);
     _icon.contentTintColor = NSColor.whiteColor;
     [_badge addSubview:_icon];
 
-    _label = [NSTextField labelWithString:@""];
+    _label = [LiteLLMTruncatingLabel truncatingLabel];
     _label.translatesAutoresizingMaskIntoConstraints = NO;
     _label.font = SourceListFont();
     _label.lineBreakMode = NSLineBreakByTruncatingTail;
@@ -1937,9 +1937,6 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
     _symbolTrailing = newViewProps.symbolTrailing;
     _busy = newViewProps.busy;
     [self applyButtonContent];
-    if (newViewProps.toolTip.empty()) {
-      _button.toolTip = title;
-    }
     if (newViewProps.accessibilityLabel.empty()) {
       _button.accessibilityLabel = title;
     }
@@ -1949,9 +1946,8 @@ static void InstallPersistentScrollers(NSScrollView *scrollView, BOOL horizontal
     // leading spinner is the whole feedback.
     [self updateBusyAnimation];
   }
-  if (oldViewProps.toolTip != newViewProps.toolTip) {
-    _button.toolTip = newViewProps.toolTip.empty() ? StringFromStdString(newViewProps.title) : StringFromStdString(newViewProps.toolTip);
-  }
+  // No button states a hover tip.  What a control has to say it says itself:
+  // its own title, or - for a glyph with no words - its accessible name.
   if (oldViewProps.accessibilityLabel != newViewProps.accessibilityLabel) {
     _button.accessibilityLabel = newViewProps.accessibilityLabel.empty() ? StringFromStdString(newViewProps.title) : StringFromStdString(newViewProps.accessibilityLabel);
   }
@@ -3046,6 +3042,9 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSwitchCls(void)
     _button.alignment = NSTextAlignmentLeft;
     _button.lineBreakMode = NSLineBreakByTruncatingTail;
     _button.imagePosition = NSNoImage;
+    // A row is a button, and a button states no hover tip: the title it draws
+    // is the whole answer, and a truncated one is read by widening the pane.
+    _button.toolTip = nil;
     self.contentView = _button;
   }
   return self;
@@ -3058,7 +3057,6 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSwitchCls(void)
   if (oldViewProps.title != newViewProps.title || oldViewProps.detail != newViewProps.detail) {
     NSString *title = StringFromStdString(newViewProps.title);
     _button.attributedTitle = SelectableRowTitle(title, StringFromStdString(newViewProps.detail));
-    _button.toolTip = title;
     _button.accessibilityLabel = title;
   }
   if (oldViewProps.selected != newViewProps.selected) {
@@ -3933,9 +3931,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     cell.label.stringValue = value;
     cell.label.font = TableCellFont();
     [cell applyLabelInk];
-    cell.label.toolTip = value;
     cell.label.accessibilityLabel = value;
-    cell.toolTip = value;
     cell.accessibilityLabel = value;
     return cell;
   }
@@ -3985,9 +3981,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     }
     cell.label.font = SourceListFont();
     cell.label.stringValue = value;
-    cell.label.toolTip = value;
     cell.label.accessibilityLabel = value;
-    cell.toolTip = value;
     cell.accessibilityLabel = value;
     return cell;
   }
@@ -4026,7 +4020,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
         : (railRow ? [LiteLLMSourceListTextCellView class] : [NSTableCellView class]);
     cell = [[cellClass alloc] initWithFrame:NSZeroRect];
     cell.identifier = identifier;
-    NSTextField *label = [NSTextField labelWithString:@""];
+    LiteLLMTruncatingLabel *label = [LiteLLMTruncatingLabel truncatingLabel];
     label.translatesAutoresizingMaskIntoConstraints = NO;
     label.font = TableCellFont();
     label.lineBreakMode = NSLineBreakByTruncatingTail;
@@ -4038,7 +4032,7 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
       // pair is a stack, so both lines share the leading edge and the second
       // one never claims the row's height.
       LiteLLMSourceListDetailCellView *detailCell = (LiteLLMSourceListDetailCellView *)cell;
-      NSTextField *secondary = [NSTextField labelWithString:@""];
+      LiteLLMTruncatingLabel *secondary = [LiteLLMTruncatingLabel truncatingLabel];
       secondary.translatesAutoresizingMaskIntoConstraints = NO;
       secondary.font = [NSFont systemFontOfSize:LiteLLMSourceListDetailFontSize weight:NSFontWeightRegular];
       secondary.lineBreakMode = NSLineBreakByTruncatingTail;
@@ -4083,11 +4077,10 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     if (constraint.firstAttribute == NSLayoutAttributeLeading) constraint.constant = columnPadding;
     else if (constraint.firstAttribute == NSLayoutAttributeTrailing) constraint.constant = -columnPadding;
   }
-  NSTextField *label = cell.textField;
+  LiteLLMTruncatingLabel *label = (LiteLLMTruncatingLabel *)cell.textField;
   if (detailRow) {
     LiteLLMSourceListDetailCellView *detailCell = (LiteLLMSourceListDetailCellView *)cell;
     detailCell.detailField.stringValue = detail;
-    detailCell.detailField.toolTip = detail;
     detailCell.detailField.accessibilityLabel = detail;
   }
   const std::string &rowKey = viewProps.rowKeys[static_cast<size_t>(row)];
@@ -4107,17 +4100,17 @@ Class<RCTComponentViewProtocol> LiteLLMAppKitSelectableRowCls(void)
     label.attributedStringValue = TableCellTitle(value, textColor);
   }
   // A cell that abbreviates what it holds (`M→C`) states the long form here:
-  // the tooltip and the VoiceOver label are the only places the shortened
-  // cell can still give the whole answer.  Every other cell keeps the rule that
-  // its tooltip is its own text, so an empty entry costs nothing.
+  // the hover and the VoiceOver label are the only places the shortened cell
+  // can still give the whole answer.  Every other cell states its own text, and
+  // its label raises that on hover only while the column could not hold it - a
+  // cell the table drew in full has nothing further to say under the pointer.
   NSString *cellTooltip = cellIndex < viewProps.cellTooltips.size()
       ? StringFromStdString(viewProps.cellTooltips[cellIndex])
       : @"";
-  NSString *tooltip = cellTooltip.length > 0 ? cellTooltip : value;
-  label.toolTip = tooltip;
-  label.accessibilityLabel = tooltip;
-  cell.toolTip = tooltip;
-  cell.accessibilityLabel = tooltip;
+  NSString *voiceOver = cellTooltip.length > 0 ? cellTooltip : value;
+  label.hoverText = cellTooltip.length > 0 ? cellTooltip : nil;
+  label.accessibilityLabel = voiceOver;
+  cell.accessibilityLabel = voiceOver;
   return cell;
 }
 

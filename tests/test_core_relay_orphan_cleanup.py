@@ -80,6 +80,28 @@ class RelayOrphanCleanupTests(unittest.TestCase):
                 [row["account_id"] for row in core.snapshot()["domains"]["relay_accounts"]["pending_cleanups"]],
             )
 
+    def test_the_startup_sweep_keeps_a_station_someone_signed_in_to(self) -> None:
+        """An observed sign-in outranks the sweep's guess.
+
+        wawapii's 23 keys, its balance and the provider bound to it were erased
+        because a restore put the station back before its provider row: the
+        startup repair saw "no provider reaches it" and removed the very login
+        the person had just completed.  A station whose account carries the
+        observation stamp is content; only a row nobody ever signed in to --
+        or an empty station -- is repair's to remove.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            core, relay, _providers = self._core(root)
+            station_id, account_id = self._station(core, relay)
+            relay.accept_login_result(account_id, username="sample@example.test", cookie="session=abc")
+            core.apply(domains=["relay_accounts"], revision=core.revision)
+
+            self.assertEqual([], core.prune_orphan_relay_stations())
+            self.assertEqual([station_id], [station["id"] for station in relay.snapshot()["stations"]])
+            self.assertEqual(["signed_in"], [account["login_status"] for account in relay.snapshot()["accounts"]])
+
     def test_a_station_reached_by_the_providers_address_is_kept(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

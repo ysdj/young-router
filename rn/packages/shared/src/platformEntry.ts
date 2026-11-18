@@ -36,6 +36,8 @@ type NativeModule = {
     browserLabel: string;
   }) => Promise<void>;
   chooseModelsToAdd?: (models: string[], providerName: string, keyName: string) => Promise<string[] | undefined>;
+  /** Optional: answer the open chooser's 添加 while its window stays up. */
+  finishModelsToAdd?: (status: string, close: boolean) => Promise<string[] | undefined>;
   showGroupManager?: (options: {
     title: string;
     accountLabel: string;
@@ -197,6 +199,9 @@ const nativeBridge: NativeLeafBridge = {
     ? async (options) => { await leaf.showProviderAuth!(options); }
     : undefined,
   chooseModelsToAdd: async (models, providerName, keyName) => leaf.chooseModelsToAdd?.(models, providerName, keyName),
+  finishModelsToAdd: leaf.finishModelsToAdd
+    ? async (status, close) => leaf.finishModelsToAdd!(status, close)
+    : undefined,
   showGroupManager: async (options) => leaf.showGroupManager?.(options),
   awaitGroupManagerApply: leaf.awaitGroupManagerApply ? () => leaf.awaitGroupManagerApply!() : undefined,
   finishGroupManagerApply: leaf.finishGroupManagerApply

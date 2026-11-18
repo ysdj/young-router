@@ -260,6 +260,31 @@ def _image_model_metadata_from_payload(value: Mapping[str, Any]) -> dict[str, An
     return _image_metadata_contract(value)
 
 
+def _payload_states_video_generation(value: Mapping[str, Any]) -> bool:
+    """Whether a catalog record says this model generates video.
+
+    Video has no separate contract here; the record keeps one boolean so a
+    picker filter can read the modality without re-parsing fields the cache no
+    longer holds.  Both the raw catalog shape (``architecture``/``modalities``)
+    and the normalized cache record (``generates_video``) answer it.
+    """
+
+    if value.get("generates_video") is True:
+        return True
+    if str(value.get("type") or "").strip().lower() == "video":
+        return True
+    architecture = value.get("architecture")
+    architecture = architecture if isinstance(architecture, Mapping) else {}
+    modalities = value.get("modalities")
+    modalities = modalities if isinstance(modalities, Mapping) else {}
+    outputs = architecture.get("output_modalities", modalities.get("output"))
+    if isinstance(outputs, list) and any(
+        str(item).strip().lower() == "video" for item in outputs
+    ):
+        return True
+    return "video" in str(architecture.get("modality") or "").lower().split("->")[-1]
+
+
 def _image_metadata_contract(value: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize one image-model contract, whether derived or already stored.
 
@@ -440,8 +465,9 @@ def _record_from_payload(value: object, *, source: str, priority: int) -> dict[s
     if context is None:
         context = maximum
     image_metadata = _image_model_metadata_from_payload(value)
+    video_generation = _payload_states_video_generation(value)
     context_known = context is not None
-    if context is None and not image_metadata:
+    if context is None and not (image_metadata or video_generation):
         return None
     # A generator with no stated window has no window to publish.  The public
     # catalogs state ``limit.context: 0`` for ``gpt-image-2.5-flare`` and its
@@ -451,16 +477,20 @@ def _record_from_payload(value: object, *, source: str, priority: int) -> dict[s
     # against.  ``0`` is the whole statement here, so the record keeps it and
     # every surface reads "no window" instead of a number nobody declared.
     # A text record that states nothing still falls back, exactly as before.
-    if image_metadata and not context_known:
-        return {
+    if (image_metadata or video_generation) and not context_known:
+        record: dict[str, Any] = {
             "context_window": 0,
             "max_context_window": 0,
             "effective_context_window_percent": DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT,
             "source": source,
             "priority": 0,
-            "image_model_metadata": image_metadata,
             **_reasoning_fields_from_payload(value),
         }
+        if image_metadata:
+            record["image_model_metadata"] = image_metadata
+        if video_generation:
+            record["generates_video"] = True
+        return record
     context = context or UNKNOWN_MODEL_CONTEXT_WINDOW
     maximum = max(context, maximum or context)
     percent = _positive_int(value.get("effective_context_window_percent"))
@@ -478,6 +508,8 @@ def _record_from_payload(value: object, *, source: str, priority: int) -> dict[s
         result["auto_compact_token_limit"] = auto_compact
     if image_metadata:
         result["image_model_metadata"] = image_metadata
+    if video_generation:
+        result["generates_video"] = True
     result.update(_reasoning_fields_from_payload(value))
     return result
 
@@ -591,6 +623,8 @@ def _merge_records(target: dict[str, dict[str, Any]], incoming: Mapping[str, Map
                 merged_image.setdefault(key, value)
             if merged_image:
                 merged["image_model_metadata"] = merged_image
+        if record.get("generates_video") is True:
+            merged["generates_video"] = True
         target[model_id] = merged
 
 
@@ -1177,12 +1211,14 @@ def _litellm_record(model_ids: Sequence[str]) -> dict[str, Any] | None:
     return None
 
 
-#: LiteLLM's mode for a model that generates images and answers no text turn.
+#: LiteLLM's modes for a model that generates media and answers no text turn.
 #: Its cost map is the one table that states a modality for a name no public
 #: catalog covers yet: ``gpt-image-2.6-flare`` is in it as ``image_generation``
-#: while pi.dev and models.dev have nothing under that spelling, and a route
-#: whose name is new is exactly the one a picker must not offer as a chat model.
+#: while pi.dev and models.dev have nothing under that spelling, and ``sora-2``
+#: is there as ``video_generation``.  A route whose name is new is exactly the
+#: one a picker must not offer as a chat model.
 _IMAGE_GENERATION_MODE = "image_generation"
+_VIDEO_GENERATION_MODE = "video_generation"
 
 
 def litellm_mode(model_ids: Sequence[str] | str) -> str | None:
@@ -1218,6 +1254,12 @@ def _litellm_states_image_generation(model_ids: Sequence[str] | str) -> bool:
     """Whether LiteLLM's cost map calls one of these ids an image generator."""
 
     return litellm_mode(model_ids) == _IMAGE_GENERATION_MODE
+
+
+def _litellm_states_video_generation(model_ids: Sequence[str] | str) -> bool:
+    """Whether LiteLLM's cost map calls one of these ids a video generator."""
+
+    return litellm_mode(model_ids) == _VIDEO_GENERATION_MODE
 
 
 _INSTALLED_LITELLM_VERSION: list[str | None] = []
@@ -2350,6 +2392,32 @@ class ModelContextRegistry:
         if _litellm_states_image_generation(model_ids):
             return True
         return self._remembered_image_generator(model_ids)
+
+    def states_video_generation(self, model_ids: Sequence[str]) -> bool:
+        """Whether this registry can say these ids generate video.
+
+        Two statements settle the question: the public catalogs' video modality
+        (kept as ``generates_video`` on the record) and LiteLLM's cost-map
+        ``mode``.  A name neither carries answers ``False``: an unreadable
+        table is not evidence that a route generates video.
+        """
+
+        self._sync_cache()
+        if _litellm_states_video_generation(model_ids):
+            return True
+        ids = [model_ids] if isinstance(model_ids, str) else list(model_ids)
+        candidates = [
+            candidate
+            for model_id in ids
+            for candidate in _candidate_ids(str(model_id))
+        ]
+        if not candidates:
+            return False
+        for key in _suffix_match_keys(self._records, candidates):
+            record = self._records.get(key)
+            if isinstance(record, Mapping) and record.get("generates_video") is True:
+                return True
+        return False
 
     def is_remembered_image_generator(self, model_ids: Sequence[str]) -> bool:
         """Whether a probe already established that one of these ids is a generator.

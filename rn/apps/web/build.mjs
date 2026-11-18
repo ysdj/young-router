@@ -17,7 +17,7 @@
 
 import { build } from "esbuild";
 import { createHash } from "node:crypto";
-import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { brotliCompressSync, constants, gzipSync } from "node:zlib";
@@ -195,8 +195,6 @@ try {
 } finally {
   await rm(editorPagePath, { force: true });
 }
-
-await cp(resolve(app, "shim.js"), resolve(outdir, "shim.js")).catch(() => undefined);
 
 // Precompressed siblings: the page's own script is 1.2 MB, and the wire can
 // carry it at a fifth of that. The encoding is decided here rather than in

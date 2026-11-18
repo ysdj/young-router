@@ -42,7 +42,35 @@ type ButtonProps = {
   symbolWithTitle?: boolean;
   /** Draw that symbol after the title (menu buttons read "Title ▾"). */
   symbolTrailing?: boolean;
-  toolTip?: string;
+  /**
+   * This button opens a menu, and is drawn as this app's picker: the title at
+   * the leading edge, the arrow a picker draws at the trailing edge, both in
+   * the picker's bezel.  Beside a column of pickers a button whose triangle
+   * trails its label reads as a second control family.
+   *
+   * The AppKit leaf ignores it: macOS draws its menu button from
+   * `symbol`/`symbolTrailing`, which is what the other menu triggers on that
+   * host already are.
+   */
+  menuTrigger?: boolean;
+  /**
+   * The rows of the menu this trigger opens, for a host that draws the list
+   * itself.  On the page they are a real `<select>`'s options (`WebMenuPicker`),
+   * so the list is the browser's own -- the same one every picker on the page
+   * opens -- rather than a card this app paints.
+   */
+  menuItems?: string[];
+  /** The row chosen from `menuItems`. */
+  onMenuChoose?: (index: number) => void;
+  /**
+   * The button's name for assistive technology, and the only place a glyph
+   * button keeps its words.
+   *
+   * A button states no hover tip on any host.  A tip under the pointer that
+   * repeats the title the reader can already see is noise, and one that
+   * appears because a control exists teaches nothing: on this app's buttons the
+   * words are either drawn or named here.
+   */
   accessibilityLabel?: string;
   disabled?: boolean;
   /**
@@ -312,13 +340,13 @@ type TableRow = {
   key: string;
   cells: string[];
   /**
-   * One optional tooltip per cell, for a cell that shows less than it means.
+   * One optional hover text per cell, for a cell that shows less than it means.
    *
-   * The AppKit table already sets every cell's tooltip to its own text, which
-   * is right for a column that states exactly what it holds.  A cell that
-   * abbreviates (`M→C`) passes the long form here instead, so hovering it
-   * answers the question the abbreviation raised.  An empty entry keeps the
-   * default rule, cell by cell.
+   * The AppKit table raises a cell's own text under the pointer only while the
+   * column could not hold it — a cell the table drew in full states nothing
+   * twice.  A cell that abbreviates (`M→C`) passes the long form here instead,
+   * so hovering it answers the question the abbreviation raised.  An empty
+   * entry keeps the default rule, cell by cell.
    */
   tooltips?: string[];
   spanning?: boolean;
@@ -500,7 +528,7 @@ function ButtonGlyph({ symbol, ink }: { symbol: NonNullable<ButtonProps["symbol"
   return <Text style={[styles.windowsButtonGlyph, { color: ink }]}>{(Platform.OS === "web" ? WEB_BUTTON_GLYPHS : WINDOWS_BUTTON_GLYPHS)[symbol]}</Text>;
 }
 
-function WindowsButton({ title, symbol, symbolWithTitle, symbolTrailing, toolTip, accessibilityLabel, disabled, busy, primary, destructive, compact, link, plainLink, titleWidth: _titleWidth, onPress, style, ref }: ButtonProps & { ref?: React.Ref<any> }): React.JSX.Element {
+function WindowsButton({ title, symbol, symbolWithTitle, symbolTrailing, menuTrigger, menuItems, onMenuChoose, accessibilityLabel, disabled, busy, primary, destructive, compact, link, plainLink, titleWidth: _titleWidth, onPress, style, ref }: ButtonProps & { ref?: React.Ref<any> }): React.JSX.Element {
   const showsTitle = symbolWithTitle === true || !symbol;
   // A destructive (and a primary) button fills its bezel with that colour, so
   // the label has to be the on-accent ink: reading in `danger` on a `danger`
@@ -510,6 +538,43 @@ function WindowsButton({ title, symbol, symbolWithTitle, symbolTrailing, toolTip
   // underline, so it reads as the value the row shows rather than as a
   // navigation target beside it.
   const ink = disabled ? WINDOWS_CONTROL.textDisabled : destructive ? WINDOWS_CONTROL.fill : primary ? WINDOWS_CONTROL.fill : plainLink ? WINDOWS_CONTROL.textSecondary : link ? WINDOWS_CONTROL.accent : WINDOWS_CONTROL.text;
+  // The page's menu trigger is the app's own picker (`WebMenuPicker`): it is a
+  // `<select>`, so the list it opens is the browser's own and not a card this
+  // app paints beside it.
+  if (Platform.OS === "web" && menuItems !== undefined && onMenuChoose !== undefined) {
+    return <WebMenuPicker
+      ref={ref as never}
+      title={title}
+      items={menuItems}
+      busy={busy === true}
+      disabled={disabled === true}
+      accessibilityLabel={accessibilityLabel ?? title}
+      onChoose={onMenuChoose}
+      style={style}
+    />;
+  }
+  // The host that draws its own pickers draws its own menu trigger too: the
+  // picker's bezel and its two children, with the picker's own arrow.  The
+  // title keeps the picker's `flex`, which is what puts the arrow on the
+  // trailing edge and the label on the leading one -- including while the busy
+  // wheel takes the leading slot.
+  if (menuTrigger === true) {
+    return <Pressable
+      ref={ref as never}
+      disabled={disabled}
+      onPress={onPress}
+      onAccessibilityTap={onPress}
+      accessibilityRole={link ? "link" : "button"}
+      accessibilityLabel={accessibilityLabel ?? title}
+      accessibilityState={{ disabled: disabled === true }}
+      aria-haspopup="menu"
+      style={[styles.windowsPicker, compact && styles.windowsPickerCompact, disabled && styles.windowsPickerDisabled, style]}
+    >
+      {busy === true ? <View style={styles.menuTriggerWheel}><BusyWheel ink={ink} /></View> : null}
+      <Text numberOfLines={1} style={[styles.windowsPickerText, { color: ink }]}>{title}</Text>
+      <Text style={styles.windowsPickerChevron}>{"\u25BE"}</Text>
+    </Pressable>;
+  }
   return <Pressable
     ref={ref as never}
     disabled={disabled}
@@ -518,7 +583,6 @@ function WindowsButton({ title, symbol, symbolWithTitle, symbolTrailing, toolTip
     accessibilityRole={link ? "link" : "button"}
     accessibilityLabel={accessibilityLabel ?? title}
     accessibilityState={{ disabled: disabled === true }}
-    {...({ tooltip: toolTip ?? title } as { tooltip: string })}
     style={[styles.windowsButton, compact && styles.windowsButtonCompact, link && styles.windowsButtonLink, plainLink && styles.windowsButtonPlainLink, primary && styles.windowsButtonPrimary, destructive && styles.windowsButtonDestructive, disabled && styles.windowsButtonDisabled, busy && styles.buttonBusy, style]}
   >
     {/* The wheel is the app's own on the page and the platform's ring on
@@ -540,11 +604,15 @@ const WindowsSegmentedControl = React.forwardRef<any, SegmentedProps>(function W
     if (index === selectedIndex) return;
     onChange?.({ nativeEvent: { value: label, index } } as NativeSyntheticEvent<{ value: string; index: number }>);
   };
+  const tabRefs = React.useRef<Array<any>>([]);
   const focusTab = (event: { key?: string; preventDefault?: () => void }, index: number): void => {
     if (event.key !== "ArrowLeft" && event.key !== "ArrowRight" && event.key !== "Home" && event.key !== "End") return;
     event.preventDefault?.();
     const next = event.key === "Home" ? 0 : event.key === "End" ? labels.length - 1 : (index + (event.key === "ArrowRight" ? 1 : -1) + labels.length) % labels.length;
-    if (labels[next] !== undefined) choose(labels[next], next);
+    if (labels[next] !== undefined) {
+      tabRefs.current[next]?.focus?.();
+      choose(labels[next], next);
+    }
   };
   // A native segmented control is one fixed-width strip; here the strip may be
   // wider than the row it sits in, so the caller's width reservation is dropped
@@ -555,6 +623,7 @@ const WindowsSegmentedControl = React.forwardRef<any, SegmentedProps>(function W
       const selected = index === selectedIndex;
       return <Pressable
         key={`${label}:${index}`}
+        ref={(instance: any) => { tabRefs.current[index] = instance; }}
         disabled={disabled}
         onPress={() => choose(label, index)}
         onAccessibilityTap={() => choose(label, index)}
@@ -672,31 +741,6 @@ function WindowsPicker({ labels, selectedValue, disabledIndices = [], disabled, 
   </Pressable>;
 }
 
-/**
- * A browser draws its own hover label from the host node's `title`.
- *
- * React Native Web forwards neither `tooltip` (that is a Windows leaf prop) nor
- * `title` (it is not among its forwarded props), so on the page an icon-only
- * button was a glyph with nothing to read under the pointer. The one attribute
- * a browser already understands is written onto the node, and the caller's ref
- * still reaches the leaf so anything measuring the button keeps working.
- */
-function WebHoverLabelButton({ hoverLabel, ...props }: React.ComponentProps<typeof WindowsButton> & { hoverLabel?: string }): React.JSX.Element {
-  const host = React.useRef<any>(null);
-  const forwardedRef = props.ref;
-  const setHost = React.useCallback((node: any) => {
-    host.current = node;
-    if (typeof forwardedRef === "function") forwardedRef(node);
-    else if (forwardedRef) (forwardedRef as React.MutableRefObject<any>).current = node;
-  }, [forwardedRef]);
-  React.useEffect(() => {
-    const node = host.current as { setAttribute?: (name: string, value: string) => void; removeAttribute?: (name: string) => void } | null;
-    if (hoverLabel) node?.setAttribute?.("title", hoverLabel);
-    else node?.removeAttribute?.("title");
-  }, [hoverLabel]);
-  return <WindowsButton {...props} ref={setHost} />;
-}
-
 const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeButtonWithRef({ titleWidth: titleWidthRequest, ...props }, ref): React.JSX.Element {
   const compact = props.compact ?? true;
   const buttonProps = {
@@ -710,6 +754,7 @@ const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeBu
     plainLink: props.plainLink === true,
     symbolWithTitle: props.symbolWithTitle === true,
     symbolTrailing: props.symbolTrailing === true,
+    menuTrigger: props.menuTrigger === true,
   };
   // A caller may enlarge a button, but must never reduce a translated title to
   // an ellipsis. Symbol-only and compact glyph buttons intentionally use their
@@ -719,13 +764,17 @@ const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeBu
   const reservation = titleWidthRequest === "tight"
     ? nativeButtonTightWidth(props.title, props.plainLink === true)
     : nativeButtonMinimumWidth(props.title, compact);
+  const reservedWidth = (props.busy === undefined ? reservation : nativeButtonBusyMinimumWidth(props.title, reservation, props.plainLink === true)) + (props.symbol ? 22 : 0);
   const titleWidth = showsTitle && !(compact && isCompactGlyphTitle(props.title))
     ? titleWidthRequest === "flex"
       ? { minWidth: 0, flexShrink: 1 }
-      : {
-          minWidth: (props.busy === undefined ? reservation : nativeButtonBusyMinimumWidth(props.title, reservation, props.plainLink === true)) + (props.symbol ? 22 : 0),
-          flexShrink: 0,
-        }
+      : props.menuTrigger === true
+        // A menu trigger is a picker, and a picker's box is a number its caller
+        // decides.  A floor is not enough there: a `<select>` sizes itself to
+        // its widest row, so the longest check name would set the trigger's
+        // width instead of the one its own label earned.
+        ? { width: reservedWidth, flexShrink: 0 }
+        : { minWidth: reservedWidth, flexShrink: 0 }
     : undefined;
   const style = [props.link ? styles.linkButton : styles.button, props.style, titleWidth];
   if (Platform.OS === "windows") {
@@ -735,11 +784,9 @@ const NativeButtonWithRef = React.forwardRef<any, ButtonProps>(function NativeBu
     return <AppKitButton {...buttonProps} ref={ref as never} style={[props.style, titleWidth]} />;
   }
   if (Platform.OS === "web") {
-    // The page's hover label: an explicit hint, or the name of a button that
-    // draws no words of its own.  A button that already shows its title has
-    // said everything a tooltip would repeat.
-    const hoverLabel = (props.toolTip ?? (showsTitle ? undefined : props.title)) || undefined;
-    return <WebHoverLabelButton {...buttonProps} ref={ref as never} hoverLabel={hoverLabel} style={style} />;
+    // The page draws the same button as every other host, and states no hover
+    // label for it: the browser's `title` is a tip, and a button carries none.
+    return <WindowsButton {...buttonProps} ref={ref as never} style={style} />;
   }
   return <Pressable ref={ref as never} disabled={props.disabled} onPress={props.onPress} style={[style, props.busy === true && styles.buttonBusy]} accessibilityRole={props.link ? "link" : "button"}>{props.busy === true ? <ActivityIndicator size="small" style={styles.buttonBusyIndicator} /> : null}<Text style={styles.controlText}>{props.title}</Text></Pressable>;
 });
@@ -1048,6 +1095,57 @@ function WebPicker({ labels, selectedValue, disabledIndices = [], disabled, acce
   </View>;
 }
 
+/**
+ * The page's menu trigger: a real `<select>`, whose list is the browser's own.
+ *
+ * Every picker on this page is one, and this app's own menu card was not that
+ * list: blue underlined rows in a square card, beside the system's rounded
+ * menu, read as a control from another program -- the one dropdown in the pane
+ * that looked like nothing else in it.  A `<select>` cannot be styled, but it
+ * also cannot be anything *other* than the list the pickers open, which is the
+ * whole requirement.
+ *
+ * The value stays on a hidden row: the closed control has to keep saying what
+ * the button *does* (探测), not which row was last chosen.  The row that
+ * produced the finding carries its own `✓ ` in the label, because the row a
+ * `<select>` marks is the one it holds -- and that one is never listed.
+ */
+const WebMenuPicker = React.forwardRef<any, {
+  /** What the closed control says: the button's own name. */
+  title: string;
+  /** The menu's rows, in the order the menu shows them. */
+  items: string[];
+  busy: boolean;
+  disabled: boolean;
+  accessibilityLabel?: string;
+  onChoose: (index: number) => void;
+  style?: StyleProp<ViewStyle>;
+}>(function WebMenuPicker({ title, items, busy, disabled, accessibilityLabel, onChoose, style }, ref): React.JSX.Element {
+  const idle = "\u0000menu";
+  return <View ref={ref} style={[styles.webPickerFrame, style]}>
+    <select
+      aria-label={accessibilityLabel ?? title}
+      disabled={disabled}
+      value={idle}
+      onChange={(event) => {
+        const select = event.currentTarget;
+        const index = Number(select.value);
+        // Choosing a row runs a check; it does not become this control's
+        // value, so the element is put back before the next frame.
+        select.value = idle;
+        if (Number.isInteger(index) && index >= 0 && index < items.length) onChoose(index);
+      }}
+      style={busy ? WEB_SELECT_BUSY_STYLE : WEB_SELECT_STYLE}
+    >
+      {/* `hidden` keeps the trigger's own name out of the list the browser
+          draws while it stays the value the closed control shows. */}
+      <option value={idle} hidden>{title}</option>
+      {items.map((label, index) => <option key={`${label}:${index}`} value={index}>{label}</option>)}
+    </select>
+    {busy ? <View style={styles.webMenuPickerWheel} pointerEvents="none"><BusyWheel ink={WINDOWS_CONTROL.text} /></View> : null}
+  </View>;
+});
+
 // RNW renders styles as CSS classes; a native `<select>` needs its own, and
 // it must follow the pane's palette rather than the browser's default chrome.
 //
@@ -1071,6 +1169,10 @@ const WEB_SELECT_STYLE: React.CSSProperties = {
   color: "#1b1b1b",
   font: "inherit",
 };
+
+// The same control while its action runs: the leading padding is where the
+// app's wheel sits, and the label keeps its own edge beyond it.
+const WEB_SELECT_BUSY_STYLE: React.CSSProperties = { ...WEB_SELECT_STYLE, padding: "1px 4px 1px 21px" };
 
 
 // The Windows sidebar draws the platform's own navigation glyphs, one per SF
@@ -1933,7 +2035,11 @@ function WebSecureTextInput({ domain, field, target, label, placeholder, multili
     }
     report("saving", valueRef.current.length > 0);
     void stager({ domain, field, target, value: valueRef.current }).then((staged) => {
-      report("ready", staged.present, "", staged.revision);
+      // `saved` is the completion state emitted by both native secure-input
+      // leaves.  `ready` means an idle/read state; using it here made the
+      // WebDAV child ignore a password-only stage, leaving Save disabled even
+      // after Core accepted the value.
+      report("saved", staged.present, "", staged.revision);
     }).catch((error: unknown) => report("error", valueRef.current.length > 0, error instanceof Error ? error.message : "The secret could not be saved"));
   }, [domain, field, target]);
   React.useEffect(() => {
@@ -1969,6 +2075,9 @@ function WebSecureTextInput({ domain, field, target, label, placeholder, multili
     lastCommit.current = request;
     stage();
   }, [commitRequest, stage]);
+  // There is deliberately no blur completion here.  The shared controller
+  // owns the quiet auto-commit timer, and a blur can happen before its 500 ms
+  // deadline; reporting ready there would clear dirty and cancel that write.
   return <TextInput
     accessibilityLabel={label}
     placeholder={placeholder}
@@ -1988,7 +2097,6 @@ function WebSecureTextInput({ domain, field, target, label, placeholder, multili
       // stage the same edit twice and the second answer is a revision conflict.
       report("dirty", next.length > 0);
     }}
-    onBlur={() => report("ready", valueRef.current.length > 0)}
     style={[styles.webSecretField, multiline && styles.webSecretFieldMultiline, style]}
   />;
 }
@@ -2039,6 +2147,11 @@ const styles = StyleSheet.create({
   windowsButtonRing: { width: 13, height: 13, borderRadius: 6.5, borderWidth: 1, alignItems: "center", justifyContent: "center" },
   windowsButtonRingMark: { fontSize: 9, lineHeight: 11, fontWeight: "600" },
   windowsButtonTitle: { fontSize: UI_FONT_SIZE, flexShrink: 1 },
+  // The menu trigger's wheel: it takes the leading slot while the menu's action
+  // runs, so the title does not slide.  On the page it rides over the select's
+  // own leading padding (`WEB_SELECT_BUSY_STYLE` reserves it).
+  menuTriggerWheel: { marginRight: 4 },
+  webMenuPickerWheel: { position: "absolute", left: 5, top: 0, bottom: 0, justifyContent: "center" },
   windowsButtonLinkTitle: { textDecorationLine: "underline" },
   windowsButtonPlainLinkTitle: { textDecorationLine: "underline", fontWeight: "400" },
   windowsSegmented: { flexDirection: "row", alignItems: "stretch", minHeight: WINDOWS_CONTROL.controlHeight, borderRadius: WINDOWS_CONTROL.radius, borderWidth: 1, borderColor: WINDOWS_CONTROL.stroke, overflow: "hidden", backgroundColor: WINDOWS_CONTROL.fill },

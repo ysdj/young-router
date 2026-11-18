@@ -57,6 +57,52 @@ class ImageContractRoundTripTests(unittest.TestCase):
         reloaded = _record_from_payload(stored, source="cache", priority=1)
         self.assertEqual(limits, reloaded["image_model_metadata"]["input_limits"])
 
+    def test_a_video_contract_states_no_window_and_survives_a_cache_round_trip(self) -> None:
+        stored = _record_from_payload(
+            {
+                "id": "vendor/video-cog",
+                "type": "video",
+                "modalities": {"input": ["text"], "output": ["video"]},
+            },
+            source="catalog",
+            priority=20,
+        )
+        self.assertEqual(0, stored["context_window"])
+        self.assertIs(True, stored["generates_video"])
+        reloaded = _record_from_payload(stored, source="cache", priority=1)
+        self.assertEqual(0, reloaded["context_window"])
+        self.assertIs(True, reloaded["generates_video"])
+
+    def test_a_cached_video_contract_answers_the_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "contexts.json"
+            cache.write_text(
+                json.dumps(
+                    {
+                        "records": {
+                            "vendor/video-cog": {
+                                "context_window": 0,
+                                "max_context_window": 0,
+                                "effective_context_window_percent": 95,
+                                "source": "catalog",
+                                "priority": 0,
+                                "generates_video": True,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry = ModelContextRegistry(
+                cache_path=cache, refresh_enabled=False
+            )
+            self.assertTrue(
+                registry.states_video_generation(["openai/video-cog"])
+            )
+            self.assertFalse(
+                registry.states_video_generation(["openai/chat-model"])
+            )
+
 
 class MixedGroupStatedWindowTests(unittest.TestCase):
     def test_a_reading_does_not_raise_a_route_resolved_below_it(self) -> None:

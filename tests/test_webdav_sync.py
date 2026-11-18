@@ -233,6 +233,104 @@ class WebDAVSmartSyncPlanTests(unittest.TestCase):
         # kept store survives on the peer until it merges again.
         self.assertEqual("push", webdav_core.smart_sync_plan(desktop, gateway, base))
 
+    def test_a_login_nobody_observed_is_not_content(self) -> None:
+        """An unobserved status is a placeholder, not a state to share.
+
+        An account that exists but was never asked anything carries 未登录 as a
+        default.  Sending that as content would let a machine that never signed
+        in state the account's login -- and, once a login state travels, overwrite
+        the machine that holds the session.  The stamp is what says the answer
+        was observed, so it is the stamp that decides whether the status is
+        content at all.
+        """
+
+        def digest(**changes: object) -> str:
+            document: dict[str, object] = {
+                "version": 3,
+                "stations": [],
+                "accounts": [
+                    {
+                        "id": "account-nimbus",
+                        "type": "newapi",
+                        "label": "nimbus",
+                        "origin": "https://relay.example.test",
+                        "login_status": "signed_in",
+                        "login_observed_at": "2026-11-08T03:11:37Z",
+                        "session": {"cookie": "session=desktop", "access_token": "", "refresh_token": ""},
+                    }
+                ],
+                "pending_credential_cleanups": [],
+            }
+            document["accounts"][0].update(changes)  # type: ignore[index]
+            return webdav_core.content_digest("relay-accounts.json", json.dumps(document).encode("utf-8"))
+
+        observed = digest()
+        # Every placeholder says the same thing: nothing was observed.  The
+        # words a row happens to carry must not become content just because
+        # they are spelled differently.
+        placeholder = digest(login_status="signed_out", login_observed_at="")
+        self.assertEqual(placeholder, digest(login_status="unknown", login_observed_at=""))
+        self.assertEqual(placeholder, digest(login_status="", login_observed_at=""))
+        self.assertEqual(placeholder, digest(login_status="unknown"))
+        self.assertNotEqual(observed, placeholder)
+        # An observed answer is content, whichever answer it is.
+        self.assertNotEqual(observed, digest(login_status="signed_out"))
+
+    def test_a_sign_in_alone_is_reason_enough_to_push(self) -> None:
+        """The login is content, so completing one reaches the other machine.
+
+        Everything else a station read rewrites is excluded from the digest --
+        the balance, the clock, the key list -- because none of it is an edit.
+        A login is not a reading: it is the account's state, and leaving it out
+        of the comparison meant a sign-in on one machine never produced a
+        bundle, so the other machine kept asking its station and re-declaring
+        未登录 for a login that had just happened.
+        """
+
+        document = {
+            "version": 3,
+            "stations": [],
+            "accounts": [
+                {
+                    "id": "account-nimbus",
+                    "type": "newapi",
+                    "label": "nimbus",
+                    "origin": "https://relay.example.test",
+                    "login_status": "signed_out",
+                    "login_observed_at": "2026-11-08T03:11:37Z",
+                    "session": {"cookie": "session=desktop", "access_token": "", "refresh_token": ""},
+                    "resources": [{"id": "k1", "name": "key", "enabled": True}],
+                }
+            ],
+            "pending_credential_cleanups": [],
+        }
+        signed_out = json.dumps(document).encode("utf-8")
+        document["accounts"][0]["login_status"] = "signed_in"
+        signed_in = json.dumps(document).encode("utf-8")
+        # A restamped login is the same content: the clock the poll writes is
+        # still not an edit, or every refresh would push at the peer.
+        document["accounts"][0]["login_observed_at"] = "2026-11-08T09:00:00Z"
+        restamped = json.dumps(document).encode("utf-8")
+
+        digest = {
+            "out": webdav_core.content_digest("relay-accounts.json", signed_out),
+            "in": webdav_core.content_digest("relay-accounts.json", signed_in),
+            "again": webdav_core.content_digest("relay-accounts.json", restamped),
+        }
+        self.assertNotEqual(digest["out"], digest["in"])
+        self.assertEqual(digest["in"], digest["again"])
+
+        def snapshot(relay_digest: str) -> webdav_core.SyncSnapshot:
+            base = self._two_file_snapshot(config="route-0", relay="store-0")
+            return webdav_core.SyncSnapshot(
+                dict(base.manifest or {}),
+                {**(base.digests or {}), "relay-accounts.json": relay_digest},
+            )
+
+        base = snapshot(digest["out"])
+        self.assertEqual("push", webdav_core.smart_sync_plan(snapshot(digest["in"]), base, base))
+        self.assertEqual("pull", webdav_core.smart_sync_plan(base, snapshot(digest["in"]), base))
+
     def test_two_stores_that_both_moved_are_still_a_choice(self) -> None:
         base = self._two_file_snapshot(config="route-0", relay="store-0")
         local = self._two_file_snapshot(config="route-0", relay="store-local")
@@ -919,6 +1017,107 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             merged = json.loads(local_relay.read_text(encoding="utf-8"))
             self.assertEqual(["session=other-mac"], [entry["session"]["cookie"] for entry in merged["accounts"]])
 
+    def test_a_peers_old_copy_cannot_erase_a_login_it_never_observed(self) -> None:
+        """A bundle built before the sign-in must not sign this machine out.
+
+        The relay store is replaced wholesale on a pull, and the store a peer
+        pushed may predate the login that just happened here -- including one
+        from a machine running an earlier version, which wrote no observation at
+        all.  Measured on the live app: a fresh sign-in was gone at the next
+        automatic sync, because "no stamp" was read as "nothing to prefer".
+        """
+
+        def store(cookie: str, *, stamp: str | None, status: str) -> dict[str, object]:
+            document = self._relay_store("2026-11-08T03:11:37Z", cookie)
+            account = document["accounts"][0]  # type: ignore[index]
+            account["login_status"] = status
+            if stamp is None:
+                account.pop("login_observed_at", None)
+            else:
+                account["login_observed_at"] = stamp
+            # A peer-only row keeps the merge a merge rather than a verbatim
+            # install: without it the incoming copy is simply the answer.
+            document["stations"] = [
+                *document["stations"],  # type: ignore[list-item]
+                {"id": "station-peer", "name": "peer", "origin": "https://peer.example.test", "type": "newapi"},
+            ]
+            return document
+
+        local = store("session=just-signed-in", stamp="2026-11-08T04:00:00Z", status="signed_in")
+        peer = store("", stamp=None, status="signed_out")
+        merged = webdav_core._merge_relay_accounts(json.dumps(local).encode("utf-8"), json.dumps(peer).encode("utf-8"))
+        assert merged is not None
+        account = json.loads(merged)["accounts"][0]
+        self.assertEqual("signed_in", account["login_status"])
+        self.assertEqual("session=just-signed-in", account["session"]["cookie"])
+
+        # The other way round is a real answer and still lands: a peer that
+        # observed the loss later than this machine signed in.
+        older = store("session=just-signed-in", stamp="2026-11-08T04:00:00Z", status="signed_in")
+        newer = store("", stamp="2026-11-08T05:00:00Z", status="expired")
+        merged = webdav_core._merge_relay_accounts(json.dumps(older).encode("utf-8"), json.dumps(newer).encode("utf-8"))
+        assert merged is not None
+        account = json.loads(merged)["accounts"][0]
+        self.assertEqual("expired", account["login_status"])
+        self.assertFalse((account.get("session") or {}).get("cookie"))
+
+
+        """One machine's login answer is the other machine's state.
+
+        The login used to be an observation in both senses: excluded from the
+        compared content, so a sign-in never produced a bundle, and dropped by
+        the merge, so even a bundle that carried one left the second machine
+        asking its station again.  A pane entry there then cost a probe per
+        mount, and an account at the site's session cap paid for it with a
+        refusal.
+
+        Both directions are pinned: the newer observation wins whichever side
+        it came from, and only the login group moves -- the key list the pane
+        is showing belongs to the machine that read it, and a login arriving
+        from the other side must not blank it.
+        """
+
+        def store(observed_at: str, status: str, cookie: str, *, resources: list[object], stamp: str) -> dict[str, object]:
+            document = self._relay_store(observed_at, cookie)
+            account = document["accounts"][0]  # type: ignore[index]
+            account.update({"login_status": status, "login_observed_at": observed_at, "resources": resources})
+            document["accounts"][0] = account
+            document["local_only_stamp"] = stamp
+            return document
+
+        local_keys = [{"id": "k-local", "name": "local-key", "enabled": True}]
+        peer_keys = [{"id": "k-peer", "name": "peer-key", "enabled": True}]
+
+        # The peer signed in later: its login lands here with its session, and
+        # the keys this machine already read stay exactly as they were.
+        local = store("2026-01-01T00:00:00Z", "signed_out", "", resources=local_keys, stamp="local")
+        peer = store("2026-01-02T00:00:00Z", "signed_in", "session=peer", resources=peer_keys, stamp="peer")
+        merged = webdav_core._merge_relay_accounts(json.dumps(local).encode("utf-8"), json.dumps(peer).encode("utf-8"))
+        assert merged is not None
+        account = json.loads(merged)["accounts"][0]
+        self.assertEqual("signed_in", account["login_status"])
+        self.assertEqual({"cookie": "session=peer", "access_token": "", "refresh_token": ""}, account["session"])
+        self.assertEqual("2026-01-02T00:00:00Z", account["login_observed_at"])
+        self.assertEqual(local_keys, account["resources"])
+
+        # The other direction: a login this machine determined is not undone by
+        # a bundle built before it -- including one that says 未登录.
+        local = store("2026-01-02T00:00:00Z", "signed_in", "session=here", resources=local_keys, stamp="local")
+        peer = store("2026-01-01T00:00:00Z", "signed_out", "", resources=peer_keys, stamp="peer")
+        merged = webdav_core._merge_relay_accounts(json.dumps(local).encode("utf-8"), json.dumps(peer).encode("utf-8"))
+        assert merged is not None
+        account = json.loads(merged)["accounts"][0]
+        self.assertEqual("signed_in", account["login_status"])
+        self.assertEqual("session=here", account["session"]["cookie"])
+        # An identical login on both sides is nothing to adopt: the merge
+        # answers "unchanged" and the pull installs the incoming copy verbatim.
+        self.assertIsNone(
+            webdav_core._merge_relay_accounts(
+                json.dumps(store("2026-01-02T00:00:00Z", "signed_in", "session=here", resources=peer_keys, stamp="x")).encode("utf-8"),
+                json.dumps(store("2026-01-02T00:00:00Z", "signed_in", "session=here", resources=peer_keys, stamp="x")).encode("utf-8"),
+            )
+        )
+
     def _relay_store(self, read_at: str, session: str) -> dict[str, object]:
         """One relay account whose observations differ from the other machine's."""
 
@@ -1137,6 +1336,171 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             self.assertEqual(["station-nimbus"], [station["id"] for station in installed["stations"]])
             self.assertEqual(["account-nimbus"], [account["id"] for account in installed["accounts"]])
             self.assertEqual(["station-wawapii"], [row["id"] for row in installed["removed_stations"]])
+
+    def test_a_login_observed_after_a_removal_supersedes_the_tombstone(self) -> None:
+        """A row written after the deletion is not the row that was deleted.
+
+        wawapii's station, its 23 keys and the provider bound to it were erased
+        once; restoring the store brought them back, and every pull removed them
+        again because the tombstone from the first deletion had already reached
+        the other machine -- the restore was unrecoverable.  The observation
+        stamp is the only order the two facts have: a login observed later than
+        the removal means the station is here, so the tombstone it names goes.
+        """
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            local = root / "local"
+            remote = root / "remote"
+            local.mkdir()
+            remote.mkdir()
+            local_config = self.write_config(local)
+            remote_config = self.write_config(remote)
+
+            restored = self._two_station_store(removed=False)
+            restored["removed_stations"] = [{"id": "station-wawapii", "removed_at": "2026-11-17T16:45:07Z"}]
+            restored["removed_accounts"] = [{"id": "account-wawapii", "removed_at": "2026-11-17T16:45:07Z"}]
+            for account in restored["accounts"]:  # type: ignore[index]
+                if account.get("id") == "account-wawapii":
+                    account["login_status"] = "signed_in"
+                    account["login_observed_at"] = "2026-11-17T17:15:00Z"
+                    account["session"] = {"cookie": "session=restored", "access_token": "", "refresh_token": ""}
+            local_relay = self._write_relay(local_config, restored)
+
+            peer = self._two_station_store(removed=True)
+            self._write_relay(remote_config, peer)
+
+            bundle, _manifest_snapshot = webdav_core.create_bundle(remote_config)
+            webdav_core.install_bundle(bundle, local_config)
+
+            installed = json.loads(local_relay.read_text(encoding="utf-8"))
+            self.assertIn("station-wawapii", [station["id"] for station in installed["stations"]])
+            self.assertIn("account-wawapii", [account["id"] for account in installed["accounts"]])
+            self.assertEqual([], [row["id"] for row in installed["removed_stations"] if row["id"] == "station-wawapii"])
+            self.assertEqual([], [row["id"] for row in installed["removed_accounts"] if row["id"] == "account-wawapii"])
+
+    def test_tombstone_conflicts_keep_the_newest_removal_in_both_directions(self) -> None:
+        older_time = "2026-11-17T11:00:00Z"
+        account_time = "2026-11-17T12:00:00Z"
+        newer_time = "2026-11-17T13:00:00Z"
+
+        # A stale incoming account row cannot supersede a newer local deletion.
+        local_removed = self._two_station_store(removed=True)
+        for collection in ("removed_stations", "removed_accounts"):
+            local_removed[collection][0]["removed_at"] = newer_time  # type: ignore[index]
+        stale_incoming = self._two_station_store(removed=False)
+        stale_account = next(
+            account
+            for account in stale_incoming["accounts"]  # type: ignore[union-attr]
+            if account["id"] == "account-wawapii"
+        )
+        stale_account["login_observed_at"] = account_time
+        stale_account["session"] = {"cookie": "session=old", "access_token": "", "refresh_token": ""}
+        stale_incoming["removed_stations"] = [
+            {"id": "station-wawapii", "removed_at": older_time}
+        ]
+        stale_incoming["removed_accounts"] = [
+            {"id": "account-wawapii", "removed_at": older_time}
+        ]
+
+        merged = webdav_core._merge_relay_accounts(
+            json.dumps(local_removed).encode("utf-8"),
+            json.dumps(stale_incoming).encode("utf-8"),
+        )
+        assert merged is not None
+        local_wins = json.loads(merged)
+        self.assertNotIn("account-wawapii", [row["id"] for row in local_wins["accounts"]])
+        self.assertNotIn("station-wawapii", [row["id"] for row in local_wins["stations"]])
+        self.assertEqual(newer_time, local_wins["removed_accounts"][0]["removed_at"])
+        self.assertEqual(newer_time, local_wins["removed_stations"][0]["removed_at"])
+
+        # A newer incoming deletion also beats a stale local row. Add a local-
+        # only account so this path must serialize the merged tombstone rather
+        # than taking the unchanged-bundle shortcut.
+        stale_local = self._two_station_store(removed=False)
+        local_account = next(
+            account
+            for account in stale_local["accounts"]  # type: ignore[union-attr]
+            if account["id"] == "account-wawapii"
+        )
+        local_account["login_observed_at"] = account_time
+        stale_local["removed_stations"] = [
+            {"id": "station-wawapii", "removed_at": older_time}
+        ]
+        stale_local["removed_accounts"] = [
+            {"id": "account-wawapii", "removed_at": older_time}
+        ]
+        stale_local["stations"].append(  # type: ignore[union-attr]
+            {"id": "station-local", "name": "local", "origin": "https://local.example.test", "type": "newapi"}
+        )
+        extra_account = dict(stale_local["accounts"][0])  # type: ignore[index]
+        extra_account.update(
+            {
+                "id": "account-local",
+                "station_id": "station-local",
+                "label": "local",
+                "origin": "https://local.example.test",
+            }
+        )
+        stale_local["accounts"].append(extra_account)  # type: ignore[union-attr]
+        incoming_removed = self._two_station_store(removed=True)
+        for collection in ("removed_stations", "removed_accounts"):
+            incoming_removed[collection][0]["removed_at"] = newer_time  # type: ignore[index]
+
+        merged = webdav_core._merge_relay_accounts(
+            json.dumps(stale_local).encode("utf-8"),
+            json.dumps(incoming_removed).encode("utf-8"),
+        )
+        assert merged is not None
+        incoming_wins = json.loads(merged)
+        self.assertNotIn("account-wawapii", [row["id"] for row in incoming_wins["accounts"]])
+        self.assertNotIn("station-wawapii", [row["id"] for row in incoming_wins["stations"]])
+        self.assertEqual(newer_time, incoming_wins["removed_accounts"][0]["removed_at"])
+        self.assertEqual(newer_time, incoming_wins["removed_stations"][0]["removed_at"])
+        self.assertIn("account-local", [row["id"] for row in incoming_wins["accounts"]])
+
+    def test_tombstone_time_alone_keeps_the_newest_record(self) -> None:
+        older_time = "2026-11-17T11:00:00Z"
+        newer_time = "2026-11-17T13:00:00Z"
+        for local_time, incoming_time in (
+            (older_time, newer_time),
+            (newer_time, older_time),
+        ):
+            with self.subTest(local_time=local_time):
+                local = self._two_station_store(removed=True)
+                incoming = self._two_station_store(removed=True)
+                for collection in ("removed_stations", "removed_accounts"):
+                    local[collection][0]["removed_at"] = local_time  # type: ignore[index]
+                    incoming[collection][0]["removed_at"] = incoming_time  # type: ignore[index]
+                incoming_bytes = json.dumps(incoming).encode("utf-8")
+
+                merged = webdav_core._merge_relay_accounts(
+                    json.dumps(local).encode("utf-8"), incoming_bytes
+                )
+
+                document = json.loads(merged if merged is not None else incoming_bytes)
+                self.assertEqual(newer_time, document["removed_accounts"][0]["removed_at"])
+                self.assertEqual(newer_time, document["removed_stations"][0]["removed_at"])
+
+    def test_local_readings_alone_are_returned_in_the_merged_document(self) -> None:
+        local = self._relay_store("2026-11-08T03:11:37Z", "session=shared")
+        incoming = json.loads(json.dumps(local))
+        local_account = local["accounts"][0]  # type: ignore[index]
+        incoming_account = incoming["accounts"][0]
+        local_account["resources"] = [{"id": "key-local", "name": "local key"}]
+        local_account["balance"] = 7.5
+        incoming_account["resources"] = [{"id": "key-peer", "name": "peer key"}]
+        incoming_account["balance"] = 2.0
+
+        merged = webdav_core._merge_relay_accounts(
+            json.dumps(local).encode("utf-8"),
+            json.dumps(incoming).encode("utf-8"),
+        )
+
+        assert merged is not None
+        account = json.loads(merged)["accounts"][0]
+        self.assertEqual(local_account["resources"], account["resources"])
+        self.assertEqual(local_account["balance"], account["balance"])
 
     def test_a_removal_tombstone_outlives_the_copy_that_agrees(self) -> None:
         """The tombstone is kept, not spent when the two copies agree.
@@ -1707,6 +2071,12 @@ class WebDAVSyncBundleTests(unittest.TestCase):
         and its group catalog.  Those reads are nobody's edit, so they must not
         reach the digest -- and an account's own fields must, or a rename on one
         machine would be dropped instead of carried.
+
+        A login status is the one observation that *is* content.  Signing in
+        (or losing a login the station determined) is not a reading either
+        machine happens to have taken, it is the account's state -- and the
+        clock it was observed at stays out, so a poll that merely restamps a
+        login cannot push a bundle at the other machine.
         """
 
         def digest(**changes: object) -> str:
@@ -1722,7 +2092,6 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             ("balance", 99.0),
             ("last_updated_at", "2026-11-08T09:00:00Z"),
             ("login_observed_at", "2026-11-08T09:00:00Z"),
-            ("login_status", "signed_out"),
             ("resource_status", "unavailable"),
             ("resource_error", "login_expired"),
             ("resources", [{"id": "k-renamed", "name": "renamed", "enabled": False}]),
@@ -1740,6 +2109,9 @@ class WebDAVSyncBundleTests(unittest.TestCase):
             ("remember_password", False),
             ("password", "a-new-password"),
             ("username", "someone-else@example.test"),
+            # The account's login: one machine's determination is the other
+            # machine's state, so it travels as content.
+            ("login_status", "signed_out"),
         ):
             self.assertNotEqual(baseline, digest(**{name: value}), name)
 

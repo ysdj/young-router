@@ -32,6 +32,19 @@ const LAYER_SIZE: Partial<Record<AppRoute, { width: number; height: number }>> =
 const DEFAULT_SIZE = { width: 720, height: 520 };
 const MARGIN = 24;
 
+/** Add one pointer delta to a layer's existing translation within its bounds. */
+export function nextLayerOffset(
+  current: { x: number; y: number },
+  delta: { x: number; y: number },
+  limits: { x: number; y: number },
+): { x: number; y: number } {
+  const clamp = (value: number, limit: number): number => Math.max(-limit, Math.min(limit, value));
+  return {
+    x: clamp(current.x + delta.x, limits.x),
+    y: clamp(current.y + delta.y, limits.y),
+  };
+}
+
 type Layer = {
   scrim: HTMLElement;
   close: () => void;
@@ -207,10 +220,13 @@ export function presentChildLayer(options: ChildLayerOptions): void {
   // Dragging, the gesture a native child panel accepts on its title bar. The
   // layer is centred by layout, so the drag is clamped to the room the viewport
   // actually has around it rather than to the window's own edges.
-  let drag: { pointer: number; x: number; y: number } | undefined;
+  let offset = { x: 0, y: 0 };
+  let drag: { pointer: number; x: number; y: number; offsetX: number; offsetY: number } | undefined;
   titleBar.addEventListener("pointerdown", (event) => {
     if (event.target === close) return;
-    drag = { pointer: event.pointerId, x: event.clientX, y: event.clientY };
+    // Keep the layer's existing offset so a later drag starts where the last
+    // one left it instead of replacing the accumulated translation.
+    drag = { pointer: event.pointerId, x: event.clientX, y: event.clientY, offsetX: offset.x, offsetY: offset.y };
     titleBar.setPointerCapture(event.pointerId);
     titleBar.style.cursor = "grabbing";
   });
@@ -223,11 +239,15 @@ export function presentChildLayer(options: ChildLayerOptions): void {
     const bounds = frame.getBoundingClientRect();
     const limitX = Math.max(0, (window.innerWidth - bounds.width) / 2);
     const limitY = Math.max(0, (window.innerHeight - bounds.height) / 2);
-    const clamp = (value: number, limit: number): number => Math.max(-limit, Math.min(limit, value));
-    // The frame is centred with `translate`, so a drag composes with that
-    // instead of replacing it — otherwise the first pixel of movement snapped
-    // the layer from the middle of the page to the corner.
-    frame.style.transform = `translate(calc(-50% + ${clamp(event.clientX - drag.x, limitX)}px), calc(-50% + ${clamp(event.clientY - drag.y, limitY)}px))`;
+    // The frame is centred with `translate`, so a drag composes with the
+    // existing offset instead of replacing it — otherwise the first pixel of
+    // a later movement snapped the layer back toward the centre.
+    offset = nextLayerOffset(
+      { x: drag.offsetX, y: drag.offsetY },
+      { x: event.clientX - drag.x, y: event.clientY - drag.y },
+      { x: limitX, y: limitY },
+    );
+    frame.style.transform = `translate(calc(-50% + ${offset.x}px), calc(-50% + ${offset.y}px))`;
   });
   const endDrag = (): void => { drag = undefined; titleBar.style.cursor = "grab"; };
   titleBar.addEventListener("pointerup", endDrag);

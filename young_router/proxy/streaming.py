@@ -2736,13 +2736,20 @@ def _synthesized_native_stream_error_chunk(
         }
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         return f"event: error\ndata: {encoded}\n\n".encode("utf-8")
-    return {
-        "error": {
-            "type": error_type,
-            "code": error_code,
-            "message": message,
+    # A Chat event is written by LiteLLM's SSE generator as ``f"data: {chunk}"``,
+    # so a plain dict reaches the client as its Python repr (``data: {'error':
+    # ...}``) -- not JSON, which every Chat client refuses to parse (Cherry
+    # Studio reports it as ``Invalid JSON data``).  ``_JSONStreamEvent``
+    # stringifies as JSON, the same way this repo's Responses events do.
+    return _json_stream_event(
+        {
+            "error": {
+                "type": error_type,
+                "code": error_code,
+                "message": message,
+            }
         }
-    }
+    )
 
 def _native_stream_error_code(
     exception: Exception,
@@ -5850,11 +5857,23 @@ async def _yield_native_stream_with_output_limit_continuation(
     try:
         async for chunk in deliver_route():
             yield chunk
-    except Exception as exception:
+    except (Exception, asyncio.CancelledError) as exception:
+        if (
+            isinstance(exception, asyncio.CancelledError)
+            and not _routing_module._is_local_shutdown_exception(exception)
+        ):
+            # A cancellation that is not this worker's own teardown is the
+            # runtime taking the task down for its own reasons, so it stays
+            # cooperative and is never read as a finished turn.
+            raise
         if _routing_module._is_local_shutdown_exception(exception):
             # The worker is being replaced.  A clean close would be read as a
             # finished turn by a client that waits for a terminal frame, so
             # state the restart and let the client resend onto the replacement.
+            # The shutdown patch ends a turn the drain could not finish by
+            # cancelling it (``base._retire_remaining_streams``), and the
+            # cancellation surfaces here as a ``BaseException`` the error
+            # branches below never see.
             yield _synthesized_native_stream_error_chunk(request_data, exception)
             return
         if saw_terminal:
@@ -5936,6 +5955,17 @@ async def _yield_native_stream_with_output_limit_continuation(
             if _routing_module._is_local_shutdown_exception(
                 incomplete_exception
             ):
+                # The same ending the exception branch above reports, for the
+                # same reason: this body is about to close with no terminal
+                # frame, and a Chat client that reads that close as a finished
+                # turn keeps a half-written answer it will never be told is
+                # unfinished (Cherry Studio reports it as ``Invalid response:
+                # the provider response could not be processed``).  The restart
+                # is the one stop that resends onto the replacement.
+                yield _synthesized_native_stream_error_chunk(
+                    request_data,
+                    incomplete_exception,
+                )
                 return
             raise incomplete_exception
         async for fallback_chunk in _yield_streaming_error_fallback_or_raise(

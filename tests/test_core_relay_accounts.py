@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 from pathlib import Path
 import tempfile
 import threading
@@ -10,6 +11,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
+from young_router.api_base import isolated_http_opener, trust_context
 from young_router.core.domains import relay_accounts
 from young_router.core.domains.providers_models import ProvidersModelsDomain
 from young_router.core.domains.relay_accounts import (
@@ -48,18 +50,21 @@ class FakeRelayHTTPClient:
         self.requests.append((origin, path, dict(headers)))
         if path in self.errors:
             raise self.errors[path]
-        # Group selection is optional metadata on older relay deployments.
-        # Existing resource fixtures intentionally omit it; the ones that align
-        # auto-grouping pass their catalog as a normal response instead.
-        if path == "/api/user/self/groups" and path not in self.responses:
+        # A fixture is the answer.  The defaults below are only for paths a test
+        # does not mention: reading them first handed every test an empty group
+        # catalog even when it had just stated one -- the group a key is filed
+        # under is exactly what these reads are about.
+        if path in self.responses:
+            return self.responses[path]
+        # Group selection is optional metadata on older relay deployments, so a
+        # fixture that never mentions it means "this station has none".
+        if path == "/api/user/self/groups":
             return {"data": {}}
         if path == "/api/v1/groups/available":
             return {"data": []}
         if path == "/api/v1/groups/rates":
             return {"data": {}}
-        if path not in self.responses:
-            raise AssertionError(f"unexpected relay path: {path}")
-        return self.responses[path]
+        raise AssertionError(f"unexpected relay path: {path}")
 
     def post(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
         self.post_requests.append((origin, path, dict(headers)))
@@ -1145,6 +1150,9 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 access_token="replace-dashboard-token",
             )
 
+            # Exactly the four fields both native bridges accept: a fifth one
+            # made every native sign-in answer 无法保存登录状态。 after the
+            # station had already accepted the session.
             self.assertEqual(
                 {"revision": 1, "login_status": "signed_in", "username": "sample-user"},
                 result,
@@ -1738,7 +1746,12 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertIn("replace-password", private_text)
             reloaded = RelayAccountsDomain(root)
             reloaded_account = reloaded.snapshot()["accounts"][0]
-            self.assertEqual("unknown", reloaded_account["login_status"])
+            # The login the stored session proves is durable, and the snapshot
+            # stays secret-free either way: nothing about the credentials
+            # crosses IPC because a state survived a restart.
+            self.assertEqual("signed_in", reloaded_account["login_status"])
+            self.assertNotIn("replace-cookie", json.dumps(reloaded.snapshot()))
+            self.assertNotIn("replace-password", json.dumps(reloaded.snapshot()))
             self.assertEqual("sample-user", reloaded_account["username"])
             self.assertTrue(reloaded_account["remember_password"])
             self.assertTrue(reloaded_account["password_saved"])
@@ -1784,6 +1797,145 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 ],
                 fake.requests,
             )
+
+    def test_session_only_login_is_verified_after_reload(self) -> None:
+        for account_type, path in (
+            ("newapi", "/api/user/self"),
+            ("sub2api", "/api/v1/auth/me"),
+        ):
+            with self.subTest(account_type=account_type), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                domain = RelayAccountsDomain(root)
+                account_id = domain.dispatch(
+                    "account.add",
+                    {"type": account_type, "label": "Relay", "origin": "https://relay.example.test"},
+                )["accounts"][0]["id"]
+                domain.accept_login_result(
+                    account_id,
+                    username="sample-user",
+                    cookie="session=session-only-cookie",
+                    remember_password=False,
+                    remember_session=True,
+                )
+                domain.apply()
+
+                fake = FakeRelayHTTPClient({path: {"data": {"username": "sample-user"}}})
+                reloaded = RelayAccountsDomain(root, http_client=fake)
+                self.assertFalse(reloaded.snapshot()["accounts"][0]["remember_password"])
+                self.assertTrue(reloaded.snapshot()["accounts"][0]["remember_session"])
+                self.assertEqual({}, reloaded._session_secrets)
+
+                restored = reloaded.restore_saved_session(account_id)
+
+                self.assertIsNotNone(restored)
+                self.assertEqual("signed_in", restored["login_status"])
+                self.assertEqual(
+                    [("https://relay.example.test", path, {"Cookie": "session=session-only-cookie"})],
+                    fake.requests,
+                )
+                self.assertEqual([], fake.password_logins)
+
+    def test_session_only_reload_records_a_401_probe_as_expired(self) -> None:
+        import urllib.error
+
+        class UnauthorizedOpener:
+            def __init__(self) -> None:
+                self.paths: list[str] = []
+
+            def open(self, request: object, timeout: float) -> object:
+                del timeout
+                url = request.full_url  # type: ignore[attr-defined]
+                self.paths.append(url.split(".test", 1)[-1])
+                raise urllib.error.HTTPError(url, 401, "Unauthorized", {}, None)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            domain = RelayAccountsDomain(root)
+            account_id = domain.dispatch(
+                "account.add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(
+                account_id,
+                username="sample-user",
+                cookie="session=session-only-cookie",
+                remember_password=False,
+                remember_session=True,
+            )
+            domain.apply()
+            opener = UnauthorizedOpener()
+            reloaded = RelayAccountsDomain(root, http_client=RelayHTTPClient(opener=opener))
+            self.assertEqual("signed_in", reloaded.snapshot()["accounts"][0]["login_status"])
+            core = CoreStore(domains=[reloaded])
+
+            with mock.patch.object(reloaded, "_session_recheck_seconds", return_value=0):
+                restored = core.restore_relay_session(
+                    account_id=account_id,
+                    account_type="newapi",
+                    label="Relay",
+                    origin="https://relay.example.test",
+                    login_status="unknown",
+                )
+
+            self.assertEqual(["/api/user/self"], opener.paths)
+            self.assertEqual("expired", restored["login_status"])
+            self.assertEqual("expired", core.snapshot()["domains"]["relay_accounts"]["accounts"][0]["login_status"])
+            self.assertEqual("expired", RelayAccountsDomain(root).snapshot()["accounts"][0]["login_status"])
+
+    def test_session_only_resource_renewal_verifies_the_saved_cookie(self) -> None:
+        key_path = "/api/token/?p=1&size=100"
+
+        class RecoveringStation(FakeRelayHTTPClient):
+            def __init__(self, *, expired: bool) -> None:
+                super().__init__(
+                    {
+                        "/api/user/self": {"data": {"username": "sample-user"}},
+                        key_path: {"data": {"items": [{"id": 7, "name": "known-key", "status": 1}]}},
+                    },
+                    errors={"/api/user/self": RelayAccountsError("Relay login has expired")} if expired else {},
+                )
+                self.key_reads = 0
+
+            def json(self, origin: str, path: str, *, headers: dict[str, str]) -> object:
+                if path == key_path:
+                    self.key_reads += 1
+                    if self.key_reads == 1:
+                        self.requests.append((origin, path, dict(headers)))
+                        raise RelayAccountsError("Relay login has expired")
+                return super().json(origin, path, headers=headers)
+
+        for expired in (False, True):
+            with self.subTest(expired=expired), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                domain = RelayAccountsDomain(root)
+                account_id = domain.dispatch(
+                    "account.add",
+                    {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+                )["accounts"][0]["id"]
+                domain.accept_login_result(
+                    account_id,
+                    username="sample-user",
+                    cookie="session=session-only-cookie",
+                    remember_password=False,
+                    remember_session=True,
+                )
+                domain.apply()
+                station = RecoveringStation(expired=expired)
+                reloaded = RelayAccountsDomain(root, http_client=station)
+
+                refreshed = reloaded.refresh_resources(account_id, keys_only=True)
+
+                self.assertEqual([], station.password_logins)
+                self.assertEqual(
+                    [key_path, "/api/user/self"] + ([] if expired else [key_path]),
+                    [path for _, path, _ in station.requests],
+                )
+                self.assertEqual("expired" if expired else "signed_in", refreshed["login_status"])
+                self.assertEqual("login_expired" if expired else "none", refreshed["resource_error"])
+                self.assertEqual(
+                    "expired" if expired else "signed_in",
+                    RelayAccountsDomain(root).snapshot()["accounts"][0]["login_status"],
+                )
 
     def test_account_delete_persists_secret_free_credential_cleanup_until_confirmed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2120,7 +2272,6 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 "add",
                 {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
             )["accounts"][0]
-            # A fresh Core must not trust the persisted prior sign-in claim.
             relay.accept_login_result(
                 account["id"],
                 username="previous-user",
@@ -2130,7 +2281,10 @@ class RelayAccountsDomainTests(unittest.TestCase):
             relay.refresh_resources(account["id"])
             relay.apply()
             reloaded = RelayAccountsDomain(root, http_client=fake)
-            self.assertEqual("unknown", reloaded.snapshot()["accounts"][0]["login_status"])
+            # The login the stored session backs is durable, so it survives the
+            # restart that reads it back.  What must not survive is a claim with
+            # no credential behind it, which the test below states.
+            self.assertEqual("signed_in", reloaded.snapshot()["accounts"][0]["login_status"])
             self.assertEqual(["newapi-7"], [item["id"] for item in reloaded.snapshot()["accounts"][0]["resources"]])
             providers = ProvidersModelsDomain(root / "config.yaml")
             core = CoreStore(
@@ -2156,7 +2310,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
             )
             core.refresh_relay_resources(account["id"], revision=core.revision)
             snapshot = core.snapshot()
-            self.assertEqual({"revision": 1, "login_status": "signed_in", "username": "sample-user"}, result)
+            self.assertEqual("signed_in", result["login_status"])
             self.assertEqual("signed_in", snapshot["domains"]["relay_accounts"]["accounts"][0]["login_status"])
             self.assertFalse(snapshot["drafts"]["providers_models"]["dirty"])
             self.assertEqual([], snapshot["providers_models"]["providers"])
@@ -2203,6 +2357,28 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 login_status="signed_out",
             )
 
+            # A stamp the window still covers answers the check on its own:
+            # the login was observed moments ago, so asking again would only
+            # repeat it -- and that round trip is what a pane entry used to pay
+            # per mount, per machine.
+            self.assertEqual("signed_in", result["login_status"])
+            self.assertEqual([], fake.password_logins)
+            self.assertEqual([], fake.requests)
+
+            # With the window off, the same check is a real probe, and the
+            # stored cookie is what answers it: the login Core already holds is
+            # asked whether it still works instead of the station being made to
+            # mint another session.
+            settings = root / "runtime-settings.env"
+            settings.write_text("YOUNG_ROUTER_RELAY_SESSION_RECHECK_SECONDS=0\n", encoding="utf-8")
+            with mock.patch("young_router.core.domains._shared._default_runtime_settings_path", return_value=settings):
+                result = core.restore_relay_session(
+                    account_id=account["id"],
+                    account_type="sub2api",
+                    label="Relay",
+                    origin="https://relay.example.test",
+                    login_status="signed_out",
+                )
             self.assertEqual("signed_in", result["login_status"])
             self.assertEqual([], fake.password_logins)
             self.assertEqual(
@@ -2215,6 +2391,375 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 ],
                 fake.requests,
             )
+
+    def test_a_page_host_that_has_not_asked_the_station_states_nothing(self) -> None:
+        """``unknown`` is not ``signed_out``: the check must not invent an answer.
+
+        The page host cannot read another origin's cookie, so its restore call
+        carries no observation of its own.  It used to say ``signed_out`` --
+        the value it happened to mean "please check" -- and Core recorded that
+        as a determined 未登录 with a fresh stamp: an answer the station was
+        never asked for, and (now that a login state travels) one that was then
+        synced to every other machine as if it had been observed.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = FakeRelayHTTPClient({})
+            relay = RelayAccountsDomain(root, http_client=fake)
+            account = relay.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            core = CoreStore(
+                metadata_path=root / ".litellm-runtime" / "core-state.json",
+                domains=[relay, ProvidersModelsDomain(root / "config.yaml")],
+            )
+
+            # Nothing to ask: no session, no remembered password.  The answer is
+            # the state the account already held, and it was not observed.
+            result = core.restore_relay_session(
+                account_id=account["id"],
+                account_type="newapi",
+                label="Relay",
+                origin="https://relay.example.test",
+                login_status="unknown",
+            )
+            self.assertEqual("signed_out", result["login_status"])
+            untouched = core.snapshot()["domains"]["relay_accounts"]["accounts"][0]
+            self.assertIsNone(untouched["login_observed_seconds_ago"])
+            self.assertFalse(relay.login_check_is_recent(account["id"]))
+            self.assertEqual([], fake.requests)
+            self.assertEqual([], fake.password_logins)
+
+            # With a session on hand the same call *is* a check -- but a login
+            # this Core just observed answers it: the observation is inside its
+            # window, so nothing is asked again.
+            relay.accept_login_result(
+                account["id"],
+                username="sample-user",
+                cookie="session=replace-cookie",
+                remember_password=True,
+            )
+            fake.requests.clear()
+            result = core.restore_relay_session(
+                account_id=account["id"],
+                account_type="newapi",
+                label="Relay",
+                origin="https://relay.example.test",
+                login_status="unknown",
+            )
+            self.assertEqual("signed_in", result["login_status"])
+            self.assertEqual([], fake.requests)
+
+            # Once the observation leaves its window the station is asked for
+            # real, and the credential Core holds is what answers.
+            settings = root / "runtime-settings.env"
+            settings.write_text("YOUNG_ROUTER_RELAY_SESSION_RECHECK_SECONDS=0\n", encoding="utf-8")
+            fake.responses["/api/user/self"] = {"data": {"username": "sample-user"}}
+            with mock.patch("young_router.core.domains._shared._default_runtime_settings_path", return_value=settings):
+                result = core.restore_relay_session(
+                    account_id=account["id"],
+                    account_type="newapi",
+                    label="Relay",
+                    origin="https://relay.example.test",
+                    login_status="unknown",
+                )
+            self.assertEqual("signed_in", result["login_status"])
+            self.assertGreater(len(fake.requests), 0)
+
+    def test_a_remembered_password_signs_in_once_when_the_session_is_refused(self) -> None:
+        """A saved login comes back on its own -- once, and only on a refusal.
+
+        未登录 on an account whose password this app holds is a state the app can
+        end by itself.  The check asks the stored session first (it mints
+        nothing), and only a credential the station *refused* is replaced by a
+        sign-in.  One attempt per refusal: once the station has minted a session,
+        a later check verifies that session instead of asking for another --
+        which is what makes an account at the site's concurrent-session cap
+        unable to sign in at all.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = FakeRelayHTTPClient(
+                {},
+                password_login_result={
+                    "username": "account-a@example.test",
+                    "cookie": "session=minted-cookie",
+                    "access_token": "minted-token",
+                    "refresh_token": "",
+                    "user_id": "42",
+                },
+            )
+            relay = RelayAccountsDomain(root, http_client=fake)
+            account = relay.dispatch(
+                "add",
+                {
+                    "type": "sub2api",
+                    "label": "Relay",
+                    "origin": "https://relay.example.test",
+                    "remember_password": True,
+                },
+            )["accounts"][0]
+            relay.accept_login_result(
+                account["id"],
+                username="account-a@example.test",
+                cookie="session=stale-cookie",
+                password="remembered-password",
+            )
+            core = CoreStore(
+                metadata_path=root / ".litellm-runtime" / "core-state.json",
+                domains=[relay, ProvidersModelsDomain(root / "config.yaml")],
+            )
+            # The station refuses the stored session: the probe answers 401,
+            # which is the station speaking about the credential.
+            fake.errors["/api/v1/auth/me"] = RelayAccountsError("Relay request was rejected")
+            settings = root / "runtime-settings.env"
+            settings.write_text("YOUNG_ROUTER_RELAY_SESSION_RECHECK_SECONDS=0\n", encoding="utf-8")
+            with mock.patch("young_router.core.domains._shared._default_runtime_settings_path", return_value=settings):
+                result = core.restore_relay_session(
+                    account_id=account["id"],
+                    account_type="sub2api",
+                    label="Relay",
+                    origin="https://relay.example.test",
+                    login_status="unknown",
+                )
+            self.assertEqual("signed_in", result["login_status"])
+            self.assertEqual(
+                [("https://relay.example.test", "sub2api", "account-a@example.test", "remembered-password")],
+                fake.password_logins,
+            )
+            signed_in = core.snapshot()["domains"]["relay_accounts"]["accounts"][0]
+            self.assertEqual("signed_in", signed_in["login_status"])
+            self.assertIsNotNone(signed_in["login_observed_seconds_ago"])
+
+            # The session the station minted is what the next check verifies:
+            # no second sign-in, because one was never needed.
+            fake.errors.clear()
+            fake.responses["/api/v1/auth/me"] = {"data": {"email": "account-a@example.test"}}
+            fake.requests.clear()
+            with mock.patch("young_router.core.domains._shared._default_runtime_settings_path", return_value=settings):
+                again = core.restore_relay_session(
+                    account_id=account["id"],
+                    account_type="sub2api",
+                    label="Relay",
+                    origin="https://relay.example.test",
+                    login_status="unknown",
+                )
+            self.assertEqual("signed_in", again["login_status"])
+            self.assertEqual(1, len(fake.password_logins))
+
+    def test_a_refused_password_is_answered_as_signed_out_with_one_attempt(self) -> None:
+        """A station that refuses the sign-in has stated the login.
+
+        The attempt used to end as ``unknown`` -- the state the account held --
+        so the pane could never say what the station had just said, and every
+        entry asked again.  A refusal is a determined 未登录 (stamped once), and
+        the wait it starts is what bounds the retries to one per window.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = FakeRelayHTTPClient(
+                {},
+                password_login_result=RelayAccountsError("Relay login was rejected"),
+            )
+            relay = RelayAccountsDomain(root, http_client=fake)
+            account = relay.dispatch(
+                "add",
+                {
+                    "type": "sub2api",
+                    "label": "Relay",
+                    "origin": "https://relay.example.test",
+                    "remember_password": True,
+                },
+            )["accounts"][0]
+            relay.accept_login_result(
+                account["id"],
+                username="account-a@example.test",
+                cookie="session=stale-cookie",
+                password="an-old-password",
+            )
+            core = CoreStore(
+                metadata_path=root / ".litellm-runtime" / "core-state.json",
+                domains=[relay, ProvidersModelsDomain(root / "config.yaml")],
+            )
+            fake.errors["/api/v1/auth/me"] = RelayAccountsError("Relay request was rejected")
+            settings = root / "runtime-settings.env"
+            settings.write_text("YOUNG_ROUTER_RELAY_SESSION_RECHECK_SECONDS=0\n", encoding="utf-8")
+            with mock.patch("young_router.core.domains._shared._default_runtime_settings_path", return_value=settings):
+                result = core.restore_relay_session(
+                    account_id=account["id"],
+                    account_type="sub2api",
+                    label="Relay",
+                    origin="https://relay.example.test",
+                    login_status="unknown",
+                )
+            self.assertEqual("signed_out", result["login_status"])
+            self.assertEqual(1, len(fake.password_logins))
+            stamped = core.snapshot()["domains"]["relay_accounts"]["accounts"][0]
+            self.assertEqual("signed_out", stamped["login_status"])
+            self.assertIsNotNone(stamped["login_observed_seconds_ago"])
+
+            # Inside the refusal window nothing is asked again: the wait is the
+            # station's own answer to this credential, not a cooldown this app
+            # invented.
+            fake.requests.clear()
+            with mock.patch("young_router.core.domains._shared._default_runtime_settings_path", return_value=settings):
+                again = core.restore_relay_session(
+                    account_id=account["id"],
+                    account_type="sub2api",
+                    label="Relay",
+                    origin="https://relay.example.test",
+                    login_status="unknown",
+                )
+            self.assertEqual("signed_out", again["login_status"])
+            self.assertEqual(1, len(fake.password_logins))
+
+    def test_an_unreachable_station_signs_nothing_in(self) -> None:
+        """A dropped connection is not the station saying no.
+
+        The same check that signs in after a refusal must record nothing when
+        nothing answered: a timeout is a fact about the network, and treating it
+        as 未登录 is what retired a login the user still held.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = FakeRelayHTTPClient({})
+            relay = RelayAccountsDomain(root, http_client=fake)
+            account = relay.dispatch(
+                "add",
+                {
+                    "type": "sub2api",
+                    "label": "Relay",
+                    "origin": "https://relay.example.test",
+                    "remember_password": True,
+                },
+            )["accounts"][0]
+            relay.accept_login_result(
+                account["id"],
+                username="account-a@example.test",
+                cookie="session=held-cookie",
+                password="remembered-password",
+            )
+            core = CoreStore(
+                metadata_path=root / ".litellm-runtime" / "core-state.json",
+                domains=[relay, ProvidersModelsDomain(root / "config.yaml")],
+            )
+            fake.errors["/api/v1/auth/me"] = RelayTransportError()
+            settings = root / "runtime-settings.env"
+            settings.write_text("YOUNG_ROUTER_RELAY_SESSION_RECHECK_SECONDS=0\n", encoding="utf-8")
+            before = core.snapshot()["domains"]["relay_accounts"]["accounts"][0]
+            with mock.patch("young_router.core.domains._shared._default_runtime_settings_path", return_value=settings):
+                result = core.restore_relay_session(
+                    account_id=account["id"],
+                    account_type="sub2api",
+                    label="Relay",
+                    origin="https://relay.example.test",
+                    login_status="unknown",
+                )
+            self.assertEqual("signed_in", result["login_status"])
+            self.assertEqual([], fake.password_logins)
+            after = core.snapshot()["domains"]["relay_accounts"]["accounts"][0]
+            self.assertEqual(before["login_status"], after["login_status"])
+            self.assertEqual(before["login_observed_seconds_ago"] is None, after["login_observed_seconds_ago"] is None)
+
+    def test_a_key_the_account_cannot_list_still_answers_with_the_saved_key(self) -> None:
+        """未登录 is a state of the login, not of the keys this app holds.
+
+        获取模型 for a station key asks two questions: which key is this (the
+        account's own key list), and what does it serve (one gateway read with
+        the key).  The first used to be a precondition, so an account whose key
+        list was cleared -- or never read because the station could not be asked
+        -- refused the listing even though the credential was on disk.  The key
+        is the credential; the list is one way to learn it, never the only one.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(account_id, username="sample@example.test", cookie="session=fixture-cookie")
+            account = domain.snapshot()["accounts"][0]
+            # A key the document carries: no session can list it, and none has to.
+            source = {
+                "station_id": account["station_id"],
+                "account_id": account_id,
+                "resource_id": "sub2api-404",
+            }
+            materials = domain.binding_materials(
+                [source],
+                slot_credentials={(account_id, "sub2api-404"): "sk-saved-key"},
+                catalogs=False,
+            )
+            self.assertEqual([], materials["issues"])
+            self.assertEqual("sk-saved-key", materials["resources"][0]["api_key"])
+            self.assertEqual("sub2api-404", materials["resources"][0]["resource_id"])
+            # The address is the station the key was minted on: a key that
+            # states no base URL still knows where it works.
+            self.assertEqual("https://sub.example.test", materials["resources"][0]["api_base"])
+            # And the source resolves without the key list, so an import of a
+            # key the account cannot enumerate is not refused either.
+            resolved = domain.binding_source(source)
+            self.assertEqual("sub2api-404", resolved["resource_id"])
+
+    def test_the_post_login_question_keeps_the_password_only_when_asked(self) -> None:
+        """记住密码 keeps the typed password; 仅记住登录态 keeps only the login.
+
+        The two answers the native hosts offer.  A page host has no credential
+        store of its own, so the session has to live in Core -- and it must
+        live there for *both* answers, or "session only" means "sign in again
+        next time", which is what exhausts a station's concurrent-session cap.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            relay = RelayAccountsDomain(root)
+            account = relay.dispatch(
+                "add",
+                {"type": "newapi", "label": "Relay", "origin": "https://relay.example.test"},
+            )["accounts"][0]
+            relay.accept_login_result(
+                account["id"],
+                username="sample-user",
+                cookie="session=replace-cookie",
+                remember_session=True,
+            )
+            # A session-only login still keeps the session: the login is the
+            # floor, not a reward for remembering the password.
+            self.assertTrue(relay.secret_present("session", account["id"]))
+            self.assertFalse(relay.snapshot()["accounts"][0]["remember_password"])
+            self.assertFalse(relay.snapshot()["accounts"][0]["password_saved"])
+
+            # 记住密码: the password the person typed into the station's page is
+            # kept, and the login stays.
+            relay.capture_password(account["id"], "typed-password")
+            kept = relay.settle_captured_password(account["id"], keep=True)
+            self.assertTrue(kept["remember_password"])
+            self.assertTrue(kept["password_saved"])
+            self.assertTrue(relay.secret_present("session", account["id"]))
+            self.assertEqual("typed-password", relay.trusted_secret_value("password", account["id"]))
+
+            # 仅记住登录态 on the next sign-in clears the password and keeps the
+            # login -- the captured value is spent either way.
+            relay.capture_password(account["id"], "another-password")
+            dropped = relay.settle_captured_password(account["id"], keep=False)
+            self.assertFalse(dropped["remember_password"])
+            self.assertFalse(dropped["password_saved"])
+            self.assertTrue(relay.secret_present("session", account["id"]))
+
+            # An account told not to keep its login drops the session too.
+            relay.accept_login_result(
+                account["id"],
+                username="sample-user",
+                cookie="session=replace-cookie",
+                remember_session=False,
+            )
+            self.assertFalse(relay.secret_present("session", account["id"]))
 
     def test_a_proven_session_is_not_signed_out_by_the_hosts_own_probe(self) -> None:
         """A routine session check must not rewrite a verified login.
@@ -2282,8 +2827,11 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertEqual(["newapi-7"], [item["id"] for item in account_snapshot["resources"]])
             self.assertEqual("ready", account_snapshot["resource_status"])
 
-            # A station that actually rejected its own session is still the
-            # freshest fact about it, and retires the stored session.
+            # A station that actually rejected its own session is recorded as
+            # that answer, and the credential is *kept*: it is the only thing
+            # that can be asked whether the refusal still stands, and asking is
+            # what avoids minting one more session on an account whose session
+            # count is the thing that runs out.
             result = core.restore_relay_session(
                 account_id=account["id"],
                 account_type="newapi",
@@ -2292,7 +2840,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 login_status="expired",
             )
             self.assertEqual("expired", result["login_status"])
-            self.assertFalse(relay.secret_present("session", account["id"]))
+            self.assertTrue(relay.secret_present("session", account["id"]))
 
             # Nothing is held for an account that reaches Core without a
             # session: a signed-out probe still reads as signed out.
@@ -2736,14 +3284,15 @@ class RelayAccountsDomainTests(unittest.TestCase):
             self.assertIn("/api/token/?p=1&size=100", paths)
             self.assertEqual(3.0, domain.snapshot()["accounts"][0]["balance"])
 
-    def test_a_hosts_verified_probe_states_the_balance_with_the_login_result(self) -> None:
-        """A host that proved the session already read the account's profile.
+    def test_a_hosts_verified_probe_does_not_state_the_balance(self) -> None:
+        """The probe's quota is not the number this app shows.
 
-        The macOS and Windows hosts verify a remembered session themselves and
-        hand Core the result, so Core never saw the payload the balance is in --
-        and read it again behind the login.  The quota travels with the result
-        instead, which is what lets the row read 已登录 and $3.00 in the same
-        repaint rather than a moment of one and a key list later the other.
+        The macOS and Windows hosts verify a session themselves and hand Core
+        the dashboard quota they read.  Measured live, that number and the
+        profile API's answer disagreed by tens of dollars within seconds, and the
+        row visibly changed under the user.  A sign-in therefore states the
+        login only; the refresh behind it states the money once, from the reader
+        every later refresh uses.
         """
 
         fake = FakeRelayHTTPClient(
@@ -2753,6 +3302,7 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 "/api/token/?p=1&size=100": {
                     "data": {"items": [{"id": 7, "name": "known-key", "status": 1, "key": "replace-key"}]}
                 },
+                "/api/user/self": {"data": {"quota": 1_500_000}},
             }
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -2767,24 +3317,25 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 username="sample-user",
                 cookie="session=replace-cookie",
                 remember_password=True,
-                quota=1_500_000,
             )
 
             self.assertEqual("signed_in", accepted["login_status"])
-            self.assertEqual(3.0, accepted["balance"])
+            self.assertIsNone(accepted["balance"])
             # The two facts belong to one observation: the row never states 已登录
             # with a balance from an earlier session beside it.
             self.assertIsNotNone(accepted["login_observed_seconds_ago"])
             self.assertLess(accepted["login_observed_seconds_ago"], 5.0)
-            # The quota is the profile; only the display unit had to be asked.
-            self.assertEqual(["/api/status"], [path for _, path, _ in fake.requests])
+            # Nothing was read to invent a balance: the sign-in answered with
+            # the login alone.
+            self.assertEqual([], [path for _, path, _ in fake.requests])
 
+            # The refresh behind the sign-in is the one that states the balance.
             fake.requests.clear()
             domain.refresh_resources(account_id)
-            self.assertNotIn("/api/user/self", [path for _, path, _ in fake.requests])
-            # The unit is site configuration, so the second balance did not ask
-            # for it again either.
-            self.assertNotIn("/api/status", [path for _, path, _ in fake.requests])
+            self.assertEqual(
+                3.0,
+                next(a for a in domain.snapshot()["accounts"] if a["id"] == account_id)["balance"],
+            )
 
     def test_an_authenticated_read_is_also_the_login_observation(self) -> None:
         """A station that answered an authenticated read has accepted the session.
@@ -3262,20 +3813,36 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 self.assertFalse(domain.login_check_is_recent(account_id))
                 self.assertIsNone(domain.recent_login_check_answer(account_id))
 
-            # And it does not survive a restart either: the stamp is this
-            # process's own observation, not a durable claim about the station.
+            # The observation is the account's state, so it survives the
+            # process that made it: a restart reads the stamp back and the
+            # window keeps answering.  What bounds it is its own age, not the
+            # lifetime of a Core.
             domain.apply()
             reloaded = RelayAccountsDomain(root, http_client=FakeRelayHTTPClient(responses))
-            self.assertIsNone(reloaded.snapshot()["accounts"][0]["login_observed_seconds_ago"])
-            self.assertFalse(reloaded.login_check_is_recent(account_id))
+            self.assertLess(reloaded.snapshot()["accounts"][0]["login_observed_seconds_ago"], 5.0)
+            self.assertTrue(reloaded.login_check_is_recent(account_id))
 
-    def test_a_session_window_does_not_survive_a_core_restart(self) -> None:
-        """A fresh Core never inherits the window: it holds no session then.
+            # An old observation is not a claim: the window is measured from
+            # the stamp, so a stamp that has aged out asks for a real check
+            # exactly as a fresh process did before.
+            storage = root / ".litellm-runtime" / "relay-accounts.json"
+            stored = json.loads(storage.read_text(encoding="utf-8"))
+            stored["accounts"][0]["login_observed_at"] = "2026-01-02T03:04:05Z"
+            storage.write_text(json.dumps(stored), encoding="utf-8")
+            aged = RelayAccountsDomain(root, http_client=FakeRelayHTTPClient(responses))
+            self.assertFalse(aged.login_check_is_recent(account_id))
+            self.assertIsNone(aged.recent_login_check_answer(account_id))
 
-        The re-check window is about a login *this* Core verified.  A restart
-        re-reads the document, which drops the persisted ``signed_in`` claim to
-        ``unknown``, so the first mount after a restart always probes the
-        station for real instead of answering from a stamp on disk.
+    def test_a_login_a_credential_still_backs_survives_a_restart(self) -> None:
+        """The stored login is the account's state, not this process's claim.
+
+        A restart used to drop every ``signed_in`` to ``unknown`` and every
+        stamp with it, so the first mount re-probed a station nothing had
+        questioned -- and a machine that only ever reads the store (the
+        gateway, a second desktop) had no way to learn a login the other
+        machine had just completed.  What survives is a login a credential
+        still backs; a claim with nothing behind it is not a state anything can
+        act on, and the next read would have to prove it anyway.
         """
 
         responses = {
@@ -3303,9 +3870,20 @@ class RelayAccountsDomainTests(unittest.TestCase):
 
             reloaded = RelayAccountsDomain(root, http_client=FakeRelayHTTPClient(responses))
             account = reloaded.snapshot()["accounts"][0]
-            self.assertEqual("unknown", account["login_status"])
-            self.assertIsNone(account["login_observed_seconds_ago"])
-            self.assertFalse(reloaded.login_check_is_recent(account_id))
+            self.assertEqual("signed_in", account["login_status"])
+            self.assertLess(account["login_observed_seconds_ago"], 5.0)
+            self.assertTrue(reloaded.login_check_is_recent(account_id))
+
+            # The claim the session does not back is the one that falls back:
+            # nothing can act on 已登录 beside an empty session, and Core asks
+            # the station instead of drawing a state it cannot prove.
+            storage = root / ".litellm-runtime" / "relay-accounts.json"
+            stored = json.loads(storage.read_text(encoding="utf-8"))
+            stored["accounts"][0]["session"] = {}
+            storage.write_text(json.dumps(stored), encoding="utf-8")
+            unbacked = RelayAccountsDomain(root, http_client=FakeRelayHTTPClient(responses))
+            self.assertEqual("unknown", unbacked.snapshot()["accounts"][0]["login_status"])
+            self.assertFalse(unbacked.login_check_is_recent(account_id))
 
     def test_core_records_expired_native_session_without_retaining_secrets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3476,20 +4054,30 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 domains=[reloaded, ProvidersModelsDomain(root / "config.yaml")],
             )
 
-            with self.assertRaises(CoreError) as caught:
-                core.restore_relay_session(
-                    account_id=account["id"],
-                    account_type="sub2api",
-                    label="Relay",
-                    origin="https://relay.example.test",
-                    login_status="signed_out",
-                )
+            # The window is off, so this check is a real station round trip:
+            # a fresh observation would answer it without touching the site.
+            settings = root / "runtime-settings.env"
+            settings.write_text("YOUNG_ROUTER_RELAY_SESSION_RECHECK_SECONDS=0\n", encoding="utf-8")
+            with mock.patch("young_router.core.domains._shared._default_runtime_settings_path", return_value=settings):
+                with self.assertRaises(CoreError) as caught:
+                    core.restore_relay_session(
+                        account_id=account["id"],
+                        account_type="sub2api",
+                        label="Relay",
+                        origin="https://relay.example.test",
+                        login_status="signed_out",
+                    )
 
             # The caller is told the check did not happen, and the login it
             # would have overwritten is exactly as it was — on the account and
             # in the durable document the next restart reads.
             self.assertEqual("relay_restore_unavailable", caught.exception.code)
-            self.assertEqual("unknown", core.snapshot()["domains"]["relay_accounts"]["accounts"][0]["login_status"])
+            # The login the session proves is what the account still says: a
+            # round trip that never reached the station observed nothing, so
+            # nothing about the account moved -- neither the state nor the
+            # stamp the durable document carries.
+            observed = core.snapshot()["domains"]["relay_accounts"]["accounts"][0]
+            self.assertEqual("signed_in", observed["login_status"])
             self.assertEqual(before, json.loads(stored.read_text(encoding="utf-8")))
 
             # A station that answers and refuses the credentials is the other
@@ -3509,13 +4097,14 @@ class RelayAccountsDomainTests(unittest.TestCase):
                 metadata_path=root / ".litellm-runtime" / "core-state.json",
                 domains=[refusing, ProvidersModelsDomain(root / "config.yaml")],
             )
-            refused = refusing_core.restore_relay_session(
-                account_id=account["id"],
-                account_type="sub2api",
-                label="Relay",
-                origin="https://relay.example.test",
-                login_status="signed_out",
-            )
+            with mock.patch("young_router.core.domains._shared._default_runtime_settings_path", return_value=settings):
+                refused = refusing_core.restore_relay_session(
+                    account_id=account["id"],
+                    account_type="sub2api",
+                    label="Relay",
+                    origin="https://relay.example.test",
+                    login_status="signed_out",
+                )
             self.assertEqual("signed_out", refused["login_status"])
 
     def test_local_relay_keys_stay_loadable_and_refreshable_while_signed_out(self) -> None:
@@ -4414,6 +5003,51 @@ class RelayAccountsDomainTests(unittest.TestCase):
 
             self.assertEqual([], materials["issues"])
             self.assertEqual(["model-a"], materials["resources"][0]["models"])
+
+    def test_a_key_named_after_a_group_is_still_ungrouped(self) -> None:
+        """A name is not a membership.
+
+        wawapii answers seven keys with ``group_id: null`` whose names are the
+        names of seven groups it also lists.  Reading that name as "this key is
+        in that group" invented the ratio beside it (1.3x for a key with no
+        group), and the key it invented a group for serves no model at all --
+        the station routes a key by its group, and these have none.  The key
+        stays ungrouped, and the model step says which fact that is.
+        """
+
+        fake = FakeRelayHTTPClient(
+            {
+                "/api/v1/keys?page=1&page_size=100": {
+                    "code": 0,
+                    "data": {
+                        "items": [
+                            {"id": 4, "name": "Cursor", "status": "active", "key": "sk-replace-a", "group_id": None},
+                            {"id": 5, "name": "Plus", "status": "active", "key": "sk-replace-b", "group_id": 21},
+                        ]
+                    },
+                },
+                "/api/v1/groups/available": {
+                    "code": 0,
+                    "data": [{"id": 101, "name": "Cursor"}, {"id": 21, "name": "Plus"}],
+                },
+                "/api/v1/groups/rates": {"code": 0, "data": {"101": 0.45, "21": 1.0}},
+                "/api/v1/channels/available": {"code": 0, "data": []},
+                "/v1/models": {"data": [{"id": "model-a"}]},
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            domain = RelayAccountsDomain(directory, http_client=fake)
+            account_id = domain.dispatch(
+                "add",
+                {"type": "sub2api", "label": "Sub Relay", "origin": "https://sub.example.test"},
+            )["accounts"][0]["id"]
+            domain.accept_login_result(account_id, username="sample@example.test", cookie="session=replace-cookie")
+            resources = domain.refresh_resources(account_id)["resources"]
+
+            by_name = {resource["name"]: resource for resource in resources}
+            self.assertEqual("", by_name["Cursor"]["group_id"])
+            self.assertEqual("", by_name["Cursor"]["group_name"])
+            self.assertEqual("21", by_name["Plus"]["group_id"])
 
     def test_sub2api_channel_page_supplies_each_groups_models_without_per_key_reads(self) -> None:
         """One channel read describes every group, so no key is probed.
@@ -5864,6 +6498,72 @@ class _NoRelayHTTP:
 
     def json(self, *arguments: object, **keywords: object) -> object:
         raise AssertionError("the session lease must not read the station")
+
+
+class RelayTransportTrustTests(unittest.TestCase):
+    def test_the_relay_client_verifies_against_the_current_bundle(self) -> None:
+        """A station's certificate is verified against today's roots, not the OS's.
+
+        ``ssl.create_default_context()`` with no argument trusts the bundle the
+        interpreter was compiled against.  On macOS that is LibreSSL's
+        ``/etc/ssl/cert.pem``, which predates the roots several stations now
+        chain to: measured live (2026-11-18), ``https://flux-code.cc`` -- a
+        Cloudflare site over ``SSL.com TLS ECC Root CA 2022`` -- verifies in
+        ``curl`` and in ``openssl s_client`` and failed here with "unable to get
+        local issuer certificate".  The relay client reports that as an
+        unreachable station, so for such a station the saved-session probe, the
+        remembered-password sign-in, the key list and the model listing all
+        failed at once, with no error a person could act on.
+        """
+
+        with mock.patch.object(ssl, "create_default_context", wraps=ssl.create_default_context) as spy:
+            context = trust_context()
+        self.assertEqual(ssl.CERT_REQUIRED, context.verify_mode)
+        self.assertTrue(spy.called)
+        cafile = spy.call_args.kwargs.get("cafile")
+        self.assertGreater(context.cert_store_stats()["x509_ca"], 50)
+        # certifi is the current Mozilla store and is what the shipped runtime
+        # carries; a machine without it keeps the interpreter's own bundle.
+        try:
+            import certifi
+        except Exception:
+            return
+        self.assertEqual(certifi.where(), cafile)
+
+    def test_the_credential_bearing_opener_trusts_the_same_store(self) -> None:
+        """获取模型 and the probes read through this opener, not the relay client.
+
+        An opener built without an ``HTTPSHandler`` falls back to urllib's own
+        default context -- the interpreter's stale bundle -- so a model listing
+        against a station whose chain roots in a newer CA failed while the
+        relay client (which states its context) reached the same site. That is
+        how 获取模型 answered "The provider model endpoint is unavailable" for a
+        key the station answered in ``curl``.
+        """
+
+        opener = isolated_http_opener()
+        contexts = [
+            handler._context
+            for handler in opener.handlers
+            if handler.__class__.__name__ == "HTTPSHandler"
+        ]
+        self.assertEqual(1, len(contexts))
+        self.assertEqual(ssl.CERT_REQUIRED, contexts[0].verify_mode)
+        self.assertGreaterEqual(
+            contexts[0].cert_store_stats()["x509_ca"],
+            trust_context().cert_store_stats()["x509_ca"],
+        )
+
+    def test_a_pinned_bundle_still_wins(self) -> None:
+        # An installation that pins its own roots through SSL_CERT_FILE keeps
+        # them: the app must not quietly override a trust store the machine
+        # configured.
+        pinned = "/tmp/young-router-pinned-ca.pem"
+        with mock.patch.dict("os.environ", {"SSL_CERT_FILE": pinned}):
+            with mock.patch.object(ssl, "create_default_context") as spy:
+                spy.return_value = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                trust_context()
+        self.assertEqual(pinned, spy.call_args.kwargs.get("cafile"))
 
 
 if __name__ == "__main__":

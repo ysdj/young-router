@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import ssl
 from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
 import urllib.request
@@ -55,12 +56,52 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def trust_context() -> ssl.SSLContext:
+    """The trust store every outbound HTTPS request verifies against.
+
+    ``ssl.create_default_context()`` with no argument trusts the bundle the
+    interpreter was compiled against, which on macOS is LibreSSL's
+    ``/etc/ssl/cert.pem`` -- a store that predates the roots several stations
+    now chain to.  Measured live (2026-11-18): ``https://flux-code.cc`` is
+    Cloudflare-fronted over ``SSL.com TLS ECC Root CA 2022``, verifies in
+    ``curl`` and in ``openssl s_client``, and fails here with "unable to get
+    local issuer certificate".  A station read that fails that way is reported
+    as an unreachable site, so the saved-session probe, the remembered-password
+    sign-in, the key list and 获取模型 all failed at once -- the account could
+    not come back, its slots lost the keys that give them their prefix, and a
+    route could not be listed from a key the app already held.
+
+    certifi carries the current Mozilla store and is already on Core's path
+    (LiteLLM's runtime depends on it); ``SSL_CERT_FILE`` still wins for an
+    installation that pins its own bundle, and a machine without certifi keeps
+    the interpreter's store rather than losing TLS entirely.
+    """
+
+    cafile = os.environ.get("SSL_CERT_FILE", "").strip()
+    if not cafile:
+        try:
+            import certifi  # noqa: PLC0415 - optional dependency of the runtime
+
+            cafile = certifi.where()
+        except Exception:
+            cafile = ""
+    return ssl.create_default_context(cafile=cafile or None)
+
+
 def isolated_http_opener() -> urllib.request.OpenerDirector:
-    """Build an opener that cannot redirect credential-bearing requests."""
+    """Build an opener that cannot redirect credential-bearing requests.
+
+    The TLS context is stated here as well: an opener built without an
+    ``HTTPSHandler`` falls back to urllib's own default context, which is the
+    interpreter's stale bundle -- so every credential-bearing read (获取模型,
+    probes, account catalogs) verified against yesterday's roots while the
+    relay client verified against today's.
+    """
 
     handlers: list[Any] = [_NoRedirect()]
     if os.environ.get("LITELLM_USE_SYSTEM_PROXIES") != "1":
         handlers.insert(0, urllib.request.ProxyHandler({}))
+    handlers.append(urllib.request.HTTPSHandler(context=trust_context()))
     return urllib.request.build_opener(*handlers)
 
 

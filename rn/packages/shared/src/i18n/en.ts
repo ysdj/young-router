@@ -320,6 +320,7 @@ export const en: Record<TranslationKey, string> = {
   "common.enabled": "Enabled",
   "common.disabled": "Disabled",
   "common.save": "Save",
+  "common.back": "Back",
   "common.clear": "Clear",
   "common.cleared": "Cleared",
   "common.willClear": "Will Clear",
@@ -594,6 +595,7 @@ export const en: Record<TranslationKey, string> = {
   "providers.fetchFailed": "Could not fetch models: {detail}",
   "providers.fetchKeyUnavailable": "the API key could not be resolved",
   "providers.fetchEmpty": "The provider returned no models.",
+  "providers.fetchNothingNew": "Those models are already in this provider.",
   "providers.probeMenuTitle": "Choose what to probe",
   "providers.probeKind.reachability": "Reachability (does the wire answer?)",
   "providers.probeKind.speed": "Speed (time to first token / tokens per sec)",
@@ -659,12 +661,11 @@ export const en: Record<TranslationKey, string> = {
   "providers.probeInlineInvalidResponse": "Bad reply",
   "providers.probeInlineInvalidConfig": "Incomplete config",
   "providers.probeInlineModelUnavailable": "Account does not serve it",
-  // A flash route is the one a user picks for speed, so its probe measures the
-  // token rate instead of asking the availability question again: the stream
-  // that produced the number is also the answer to whether the route works, and
-  // running both would make one press pay twice.  The window is stated so the
-  // press is not a mystery: it is why the button takes seconds rather than
-  // returning at once, and why the number is comparable across routes.
+  // 测速 is its own menu row and any route can be asked for it.  The stream
+  // that produced the number is also the answer to whether the route works, so
+  // the press does not ask that protocol again.  The window is stated so the
+  // press is not a mystery, and it is a *generation* window: it opens on the
+  // first token, while the wait before that token is reported as 首字.
   "providers.speedTestWindow": "{protocol} · {window}s window · {rounds} rounds",
   "providers.speedTestHint": "Measures output tokens per second over 6 seconds on this route's own protocol",
   "providers.speedTestMeasuring": "Measuring speed...",
@@ -713,7 +714,6 @@ export const en: Record<TranslationKey, string> = {
   "providers.keyListHint": "Names route models; saved values stay in secure storage.",
   "providers.apiKeyInput": "New API key",
   "providers.apiKeySavedHint": "Loading the saved API key...",
-  "providers.keyNameAutoGroupingHint": "Auto grouping is on",
   "providers.addKey": "Add key",
   "providers.modelRate": "Rate",
   "providers.publicModel": "Public model",
@@ -901,6 +901,9 @@ export const en: Record<TranslationKey, string> = {
   "providers.wizard.noModels": "No models discovered. Add one or more manually below.",
   "providers.wizard.fetchingModels": "Fetching available models…",
   "providers.wizard.refreshModels": "Refresh model list",
+  "providers.wizard.providedKeyNoModels": "This key declares no models at the station.",
+  "providers.wizard.providedKeyNoGroup": " (no group)",
+  "providers.wizard.providedKeyNoGroupModels": "This key belongs to no group, so the station serves no model through it. Assign it a group at the station, or pick another key.",
   "providers.wizard.selectedModels": "{count} models selected.",
   "providers.wizard.modelsToAdd": "{count} models will be added.",
   "providers.wizard.selectAtLeastOneModel": "Select at least one model to continue.",
@@ -914,7 +917,6 @@ export const en: Record<TranslationKey, string> = {
   "providers.wizard.saveProviderOnly": "Save Provider Only",
   "providers.wizard.saveProviderOnlyHint": "Keep the provider and the relay station linked to it without importing a key or any models. The station is never a row of its own; add keys or models later from the provider.",
   "providers.wizard.creating": "Preparing provider…",
-  "providers.wizard.complete": "Configuration saved.",
   "providers.wizard.required": "Complete the required fields to continue.",
   "providers.wizard.manualModelPairRequired": "A manual model needs both its name and its upstream model.",
   "providers.wizard.duplicateName": "A provider with this name already exists. Enter a different name.",
@@ -1009,7 +1011,6 @@ export const en: Record<TranslationKey, string> = {
   "relay.loginAnotherAccount": "Sign In Another Account",
   "relay.goLogin": "Sign in",
   "relay.refreshResources": "Refresh Resources",
-  "relay.loginWorking": "Complete sign-in in the station's own window.",
   "relay.signInWindowHint": "The station opened its sign-in page in its own window; finish there and this window returns by itself.",
   "relay.loginComplete": "Signed in. Matching providers now show these API keys automatically.",
   "relay.loginResourcesUnavailable": "Signed in, but API resources could not be loaded. Select Refresh Resources to retry.",
@@ -1026,6 +1027,10 @@ export const en: Record<TranslationKey, string> = {
   "relay.signInRememberHint": "Remembering it restores the sign-in the next time this page opens.",
   "relay.signInRejected": "The station refused this sign-in: the account or password is wrong, or it wants a verification code or two-factor sign-in. Finish that kind of sign-in in the desktop app.",
   "relay.signInUnreachable": "The station could not be reached. Check the address and the network, then try again.",
+  "relay.rememberPasswordTitle": "Keep this password?",
+  "relay.rememberPasswordBody": "{label} is signed in. Keeping the password restores the sign-in automatically next time; keeping only the login keeps this session without saving the password.",
+  "relay.rememberPasswordKeep": "Keep Password",
+  "relay.rememberSessionOnly": "Keep Session Only",
   "relay.browserShow": "Show Sign-In Window",
   "relay.browserWaiting": "Opening the station's sign-in page in a browser on this machine. This pane continues by itself once you are signed in.",
   "relay.browserUnavailable": "No browser this app can open was found on this machine, so the station page cannot be shown. Install Chrome, Chromium, or Edge and try again.",

@@ -1123,7 +1123,7 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 self._send_error(400, code="relay_login_failed", message="Relay login result is invalid")
             return
-        if route in {"/ipc/host/secret/capability", "/ipc/host/secret/stage", "/ipc/host/relay/login", "/ipc/host/relay/restore", "/ipc/host/relay/resources", "/ipc/host/relay/import"}:
+        if route in {"/ipc/host/secret/capability", "/ipc/host/secret/stage", "/ipc/host/relay/login", "/ipc/host/relay/remember", "/ipc/host/relay/restore", "/ipc/host/relay/resources", "/ipc/host/relay/import"}:
             token = self._session_authorization()
             if not self._owner._valid_session(token):
                 self._send_error(401, code="unauthorized", message="Core IPC authentication failed")
@@ -1155,15 +1155,29 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                         pending_account=data.get("pending_account", False),
                     )
                     self._send(200, {"protocol_version": PROTOCOL_VERSION, **result})
+                elif route.endswith("/relay/remember"):
+                    # The post-login answer: 记住密码 or 仅记住登录态.  The
+                    # password itself never travels -- Core holds what it
+                    # captured from the sign-in page, and this only states
+                    # whether to keep it.
+                    if set(data) != {"account_id", "remember"} or not isinstance(data.get("account_id"), str):
+                        raise CoreError("relay_login_failed", "Relay login answer is invalid")
+                    result = self._owner.core.remember_relay_password(
+                        account_id=data["account_id"],
+                        remember=data["remember"],
+                    )
+                    self._send(200, {"protocol_version": PROTOCOL_VERSION, **result})
                 elif route.endswith("/relay/restore"):
                     allowed = {"account_id", "type", "label", "origin", "login_status", "username", "cookie", "access_token", "refresh_token", "user_id", "quota"}
                     required = {"account_id", "type", "label", "origin", "login_status"}
                     if not required.issubset(data) or set(data).difference(allowed):
                         raise CoreError("relay_restore_failed", "Relay login result is invalid")
-                    # The profile quota the host's probe read.  It is optional -- a
-                    # host that did not read one leaves the balance to Core's own
-                    # refresh -- but a value that is not a number is refused rather
-                    # than dropped, so a broken bridge is not read as "no balance".
+                    # Installed hosts send the quota their own probe read.  It is
+                    # accepted -- and dropped: the balance comes from the station's
+                    # profile API on the refresh behind this call, because the
+                    # page's number and the API's disagreed live.  A value that is
+                    # not a number still refuses, so a broken bridge is not read as
+                    # "no quota".
                     quota = data.get("quota")
                     if quota is not None and (isinstance(quota, bool) or not isinstance(quota, (int, float))):
                         raise CoreError("relay_restore_failed", "Relay login result is invalid")
@@ -1178,7 +1192,6 @@ class _CoreRequestHandler(http.server.BaseHTTPRequestHandler):
                         access_token=data.get("access_token", ""),
                         refresh_token=data.get("refresh_token", ""),
                         user_id=data.get("user_id", ""),
-                        quota=quota,
                     )
                     self._send(200, {"protocol_version": PROTOCOL_VERSION, **result})
                 elif route.endswith("/relay/import"):
@@ -1598,14 +1611,23 @@ class CoreIPCServer:
     def _page_is_local(self, handler: "_CoreRequestHandler") -> bool:
         """Whether this request came from this machine's own browser.
 
-        A loopback page is not published anywhere: only the owner (or a process
-        running as the owner) can open it, so it is served without a key and
-        without a sign-in form.  A page reached through a reverse proxy is
-        published to whoever can reach that proxy, and stays gated.
+        A direct loopback request is not published anywhere: only the owner (or
+        a process running as the owner) can open it, so it is served without a
+        key and without a sign-in form.  Requests forwarded by the proxy carry
+        ``PUBLISHED_HOST_HEADER`` because Core sees the proxy's loopback peer for
+        both local and published pages.  That marker is the proxy boundary, not
+        the forwarded value: trusting a value such as ``localhost`` would let a
+        remote visitor choose the local, password-free path with its Host header.
         """
 
         peer = handler.client_address[0] if handler.client_address else ""
         if peer not in {"127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1"}:
+            return False
+        # A proxy-forwarded request is published even when its original Host
+        # happens to be a loopback name.  The header's presence is the only
+        # trustworthy fact this listener gets from that hop; its value is
+        # client-controlled and must never grant the local-page exemption.
+        if handler.headers.get(PUBLISHED_HOST_HEADER) is not None:
             return False
         host = self._page_published_host(handler).rsplit(":", 1)[0].strip("[]").lower()
         return host in WEB_HOSTS

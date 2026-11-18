@@ -73,6 +73,8 @@ IDLE_TIMEOUT_SECONDS = 90.0
 # enough that a person who starts typing is left alone soon after.
 PREFILL_SECONDS = 20.0
 PREFILL_INTERVAL_SECONDS = 0.5
+# How often capture retries finding a page target after a disconnect.
+CAPTURE_INTERVAL_SECONDS = 1.0
 
 
 class BrowserUnavailable(RuntimeError):
@@ -530,6 +532,153 @@ def prefill_login_form(
     return outcome if isinstance(outcome, str) else ""
 
 
+# What a *person* typed into the station's own form, sent to Core before the
+# form can navigate away. The CDP binding delivers it over the already-open
+# target socket, so an immediate cross-origin redirect cannot strand it in
+# origin-scoped browser storage.
+_CAPTURE_BINDING = "__youngRouterCapturePassword"
+
+_CAPTURE_SCRIPT = """
+(() => {
+  const read = () => {
+    const node = document.querySelector('input[type=password],input[autocomplete=current-password]');
+    if (!(node instanceof HTMLInputElement) || !node.value) return;
+    try { window.__youngRouterCapturePassword(node.value); } catch {}
+  };
+  // Send as the value is entered and again before either native form submission
+  // or an application-handled button click can navigate the page.
+  if (!window.__youngRouterCapture) {
+    window.__youngRouterCapture = true;
+    document.addEventListener('input', read, true);
+    document.addEventListener('click', read, true);
+    document.addEventListener('submit', read, true);
+    document.addEventListener('keydown', (event) => { if (event.key === 'Enter') read(); }, true);
+  }
+  read();
+  return '';
+})();
+"""
+
+
+def _record_captured_password(browser: "LoginBrowser", message: Mapping[str, Any]) -> None:
+    if message.get("method") != "Runtime.bindingCalled":
+        return
+    params = message.get("params")
+    if not isinstance(params, Mapping) or params.get("name") != _CAPTURE_BINDING:
+        return
+    value = params.get("payload")
+    if isinstance(value, str) and value:
+        browser.captured_password = value
+
+
+async def _capture_page_password(browser: "LoginBrowser", ws_url: str) -> None:
+    """Keep the latest password sent from the station page over its CDP binding.
+
+    The websocket stays attached to the page target while it navigates, unlike
+    a later lookup by the station's hostname. The page calls the binding during
+    an input or submit event, before the browser commits a cross-origin redirect.
+    Input events arrive for every character, so capture stays attached until
+    the window closes instead of mistaking the first character for the password.
+    """
+
+    import websockets
+
+    origin = urlsplit(browser.origin)
+    script = f"if (location.origin === {json.dumps(f'{origin.scheme}://{origin.netloc}')}) {{\n{_CAPTURE_SCRIPT}\n}}"
+    async with websockets.connect(
+        ws_url,
+        max_size=64 * 1024 * 1024,
+        open_timeout=5.0,
+    ) as socket_:
+        commands = (
+            (1, "Runtime.enable", {}),
+            (2, "Page.enable", {}),
+            (3, "Runtime.addBinding", {"name": _CAPTURE_BINDING}),
+            # A failed HTML form submission or a reload replaces the document
+            # without replacing its CDP target. Install listeners in each new
+            # station document as well as the one already open below.
+            (4, "Page.addScriptToEvaluateOnNewDocument", {"source": script}),
+            (
+                5,
+                "Runtime.evaluate",
+                {
+                    "expression": script,
+                    "returnByValue": True,
+                    "awaitPromise": False,
+                },
+            ),
+        )
+        for identifier, method, params in commands:
+            await socket_.send(
+                json.dumps(
+                    {"id": identifier, "method": method, "params": params}
+                )
+            )
+            deadline = time.monotonic() + 5.0
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Relay password capture setup timed out")
+                raw = await asyncio.wait_for(socket_.recv(), timeout=remaining)
+                try:
+                    message = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(message, Mapping):
+                    continue
+                _record_captured_password(browser, message)
+                if message.get("id") == identifier:
+                    if "error" in message:
+                        raise RuntimeError("Relay password capture setup failed")
+                    break
+
+        while not browser.closed:
+            try:
+                raw = await asyncio.wait_for(socket_.recv(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            try:
+                message = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(message, Mapping):
+                _record_captured_password(browser, message)
+
+
+def _capture_loop(browser: "LoginBrowser") -> None:
+    """Watch the sign-in page for a password, until the window closes.
+
+    Its own thread and target connection: the page's input event hands the value
+    over immediately, even when the ensuing login redirects to another origin.
+    """
+
+    while not browser.closed:
+        target = _page_target(browser.port, browser.origin)
+        ws_url = target.get("webSocketDebuggerUrl") if isinstance(target, Mapping) else None
+        if not isinstance(ws_url, str) or not ws_url:
+            time.sleep(CAPTURE_INTERVAL_SECONDS)
+            continue
+        try:
+            _run(_capture_page_password(browser, ws_url))
+        except Exception:
+            # A navigation can replace the page target. Reattach while this
+            # login is still open, keeping any value already received.
+            pass
+        if not browser.closed:
+            time.sleep(CAPTURE_INTERVAL_SECONDS)
+
+
+def start_capture(browser: "LoginBrowser") -> None:
+    """Remember what was typed into the station's form, for the post-login question.
+
+    Nothing is kept unless the person answers that question: the value lives on
+    the browser object, which the login's own window owns and closes.
+    """
+
+    thread = threading.Thread(target=_capture_loop, args=(browser,), name="yr-capture", daemon=True)
+    thread.start()
+
+
 def _prefill_loop(browser: "LoginBrowser", username: str, password: str, submit: bool) -> None:
     deadline = time.monotonic() + PREFILL_SECONDS
     while not browser.closed and time.monotonic() < deadline:
@@ -613,6 +762,10 @@ class LoginBrowser:
     # Set when this browser runs headless and Core streams its frames to the
     # page (see `relay_mirror`); `None` means a window on this machine's screen.
     mirror: "Any" = None
+    # What the person typed into the station's own form, once it was captured.
+    # The post-login question offers to keep it; nothing is stored until that
+    # answer, and the value dies with this window.
+    captured_password: str = ""
 
     @property
     def expired(self) -> bool:

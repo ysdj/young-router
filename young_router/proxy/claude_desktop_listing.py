@@ -20,7 +20,16 @@ explicit ``x-young-router-client: claude-desktop`` header through
 
 The view is an addition, never a replacement: the canonical ``/v1/models``
 answer keeps the public names every other client routes by.  A request that is
-not the desktop app's own gets exactly what it got before this module existed.
+not one of the Claude apps' own discovery gets exactly what it got before this
+module existed.
+
+One thing the Claude apps share is that a model picker is a list of
+conversations: an image or video generator holds none, so both Claude views
+(the desktop alias view and Claude Code's own canonical discovery) drop those
+rows.  The filter is applied before LiteLLM builds either shape, from the
+listing's own ``mode`` first and the shared catalog/registry answer second.
+It is presentation only: the router keeps the route, so a request that names a
+generator explicitly still reaches it.
 """
 
 from __future__ import annotations
@@ -38,6 +47,14 @@ from ..claude_aliases import CONTEXT_SUFFIX, claude_desktop_alias, context_suffi
 CLAUDE_DESKTOP_CLIENT_HEADER: Final = "x-young-router-client"
 CLAUDE_DESKTOP_CLIENT: Final = "claude-desktop"
 
+#: Claude Code's discovery sends these agents, and a gateway may name the view
+#: explicitly with ``x-gateway-client: claude-code`` (the spelling LiteLLM's own
+#: Claude Code view reads).  Both are the client asking for a Claude picker, not
+#: for the router's canonical OpenAI-shaped listing.
+_CLAUDE_CODE_AGENT_PREFIXES: Final = ("claude-code/", "claude-cli/")
+CLAUDE_CODE_CLIENT_HEADER: Final = "x-gateway-client"
+CLAUDE_CODE_CLIENT: Final = "claude-code"
+
 #: The ceiling every window this view states is clamped to.  A route at or above
 #: it is published as exactly 1M, because the client's ``[1m]`` spelling is how
 #: it says "the large window" and its per-model setting accepts 100k..1M; a
@@ -52,8 +69,21 @@ _LISTING_PATHS: Final = frozenset({"/v1/models", "/models"})
 _VIEW_ACTIVE: ContextVar[bool] = ContextVar(
     "young_router_claude_desktop_listing", default=False
 )
+_GENERATION_FILTER_ACTIVE: ContextVar[bool] = ContextVar(
+    "young_router_claude_generation_filter", default=False
+)
 _PATCH_ATTR: Final = "_young_router_claude_desktop_listing"
 _REGISTERED_ATTR: Final = "_young_router_claude_desktop_listing_registered"
+
+
+def _normalized_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    """The request headers keyed by their lower-case names."""
+
+    return {
+        str(name).strip().lower(): str(value)
+        for name, value in headers.items()
+        if isinstance(name, str) and isinstance(value, str)
+    }
 
 
 def is_claude_desktop_client(headers: Mapping[str, str]) -> bool:
@@ -66,11 +96,7 @@ def is_claude_desktop_client(headers: Mapping[str, str]) -> bool:
     client cannot be mistaken for the desktop app by ``Electron/`` alone.
     """
 
-    normalized = {
-        str(name).strip().lower(): str(value)
-        for name, value in headers.items()
-        if isinstance(name, str) and isinstance(value, str)
-    }
+    normalized = _normalized_headers(headers)
     if (
         normalized.get(CLAUDE_DESKTOP_CLIENT_HEADER, "").strip().lower()
         == CLAUDE_DESKTOP_CLIENT
@@ -81,24 +107,70 @@ def is_claude_desktop_client(headers: Mapping[str, str]) -> bool:
     agent = normalized.get("user-agent", "").strip().lower()
     if "electron/" not in agent:
         return False
-    return not agent.startswith(("claude-code/", "claude-cli/"))
+    return not agent.startswith(_CLAUDE_CODE_AGENT_PREFIXES)
 
 
-def _route_is_image(name: str) -> bool:
-    """Whether the public route serves image generation and nothing else.
+def is_claude_code_client(headers: Mapping[str, str]) -> bool:
+    """Whether this request is Claude Code's own model discovery.
+
+    Claude Code sends ``claude-code/<version>`` for discovery and
+    ``claude-cli/<version>`` on its model calls; either is the Claude picker.
+    The explicit gateway-client header is the stable spelling a proxy may send
+    on the client's behalf.
+    """
+
+    normalized = _normalized_headers(headers)
+    if (
+        normalized.get(CLAUDE_CODE_CLIENT_HEADER, "").strip().lower()
+        == CLAUDE_CODE_CLIENT
+    ):
+        return True
+    agent = normalized.get("user-agent", "").strip().lower()
+    return agent.startswith(_CLAUDE_CODE_AGENT_PREFIXES)
+
+
+def is_claude_listing_client(headers: Mapping[str, str]) -> bool:
+    """Whether this request is one of the Claude apps' model discovery."""
+
+    return is_claude_desktop_client(headers) or is_claude_code_client(headers)
+
+
+def _route_is_generation(name: str) -> bool:
+    """Whether the public route serves image or video generation and nothing else.
 
     The same predicate the generated pickers use: a generator is not a model to
-    have a conversation with, so it never appears in the desktop view.  An
-    unreadable catalog is not evidence of an image route, exactly as in
-    ``model_catalog.route_serves_only_images``.
+    have a conversation with, so it never appears in a Claude view.  An
+    unreadable catalog is not evidence of a generator, exactly as in
+    ``model_catalog.route_serves_only_generation``.
     """
 
     try:
-        from ..core.model_catalog import route_serves_only_images
+        from ..core.model_catalog import route_serves_only_generation
 
-        return route_serves_only_images(name)
+        return route_serves_only_generation(name)
     except Exception:
         return False
+
+
+def _listing_row_serves_generation(row: object) -> bool:
+    """Whether one canonical listing row is a generator the Claude picker drops.
+
+    The row's own ``mode`` is the listing's statement and needs no catalog read;
+    the registry is the fallback for a route whose upstream name no installed
+    table knows.
+    """
+
+    if not isinstance(row, Mapping):
+        return False
+    try:
+        from ..core.model_catalog import listing_mode_serves_generation
+
+        if listing_mode_serves_generation(row.get("mode")):
+            return True
+    except Exception:
+        pass
+    model_id = row.get("id")
+    return isinstance(model_id, str) and _route_is_generation(model_id)
 
 
 def _public_context_window(name: str) -> int | None:
@@ -223,7 +295,7 @@ def desktop_model_rows(
     ``_kept_row``).  Every other route is published under the alias
     ``claude_aliases`` derives, with the public name as ``display_name`` -- the
     app shows that name and derives the full effort ladder from the alias
-    family.  Image generators are dropped in both cases.
+    family.  Image and video generators are dropped in both cases.
 
     ``public_window`` is the one public number a route states.  It is
     injectable so the view can be checked without reading this machine's catalog
@@ -239,7 +311,7 @@ def desktop_model_rows(
         public_id = row.get("id")
         if not isinstance(public_id, str) or not public_id.strip():
             continue
-        if _route_is_image(public_id):
+        if _listing_row_serves_generation(row):
             continue
         if desktop_keeps_model_id(public_id):
             rows.append(
@@ -288,12 +360,14 @@ def desktop_model_rows(
 
 
 def install_patch() -> None:
-    """Publish the desktop view through LiteLLM's Anthropic listing builder.
+    """Publish the Claude views through LiteLLM's Anthropic listing builder.
 
     ``proxy_server.model_list`` imports the builder inside the endpoint, so
     replacing the module attribute reaches both the admin-scoped and the
     ordinary listing branches.  The patch only acts while the request
-    middleware marked this call as the desktop app's own discovery.
+    middleware marked this call as a Claude app's own discovery: every Claude
+    view drops generators before LiteLLM names the rows, and the desktop app's
+    own request additionally gets the alias view.
     """
 
     try:
@@ -309,6 +383,12 @@ def install_patch() -> None:
         display_names: Mapping[str, str] | None = None,
         listed_ids: Mapping[str, str] | None = None,
     ) -> Any:
+        if _GENERATION_FILTER_ACTIVE.get():
+            models = [
+                row
+                for row in models
+                if not _listing_row_serves_generation(row)
+            ]
         response = original(models, display_names or {}, listed_ids or {})
         if not _VIEW_ACTIVE.get() or not isinstance(response, Mapping):
             return response
@@ -320,7 +400,7 @@ def install_patch() -> None:
 
 
 class _DesktopListingMiddleware:
-    """Mark the desktop app's own listing request for the response builder."""
+    """Mark a Claude app's own listing request for the response builder."""
 
     def __init__(self, app: Any):
         self.app = app
@@ -338,11 +418,16 @@ class _DesktopListingMiddleware:
             for key, value in scope.get("headers") or []
             if isinstance(key, bytes) and isinstance(value, bytes)
         }
-        token = _VIEW_ACTIVE.set(is_claude_desktop_client(headers))
+        desktop = is_claude_desktop_client(headers)
+        view_token = _VIEW_ACTIVE.set(desktop)
+        filter_token = _GENERATION_FILTER_ACTIVE.set(
+            desktop or is_claude_code_client(headers)
+        )
         try:
             await self.app(scope, receive, send)
         finally:
-            _VIEW_ACTIVE.reset(token)
+            _GENERATION_FILTER_ACTIVE.reset(filter_token)
+            _VIEW_ACTIVE.reset(view_token)
 
 
 def register(app: Any) -> None:
@@ -355,10 +440,14 @@ def register(app: Any) -> None:
 
 
 __all__ = [
+    "CLAUDE_CODE_CLIENT",
+    "CLAUDE_CODE_CLIENT_HEADER",
     "CLAUDE_DESKTOP_CLIENT",
     "CLAUDE_DESKTOP_CLIENT_HEADER",
     "desktop_model_rows",
     "install_patch",
+    "is_claude_code_client",
     "is_claude_desktop_client",
+    "is_claude_listing_client",
     "register",
 ]

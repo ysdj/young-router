@@ -14,6 +14,7 @@ Two things are asserted here, and they are the two that can silently rot:
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import http.client
 import json
@@ -623,8 +624,11 @@ class BrowserPageTests(unittest.TestCase):
         """
 
         self.server.enable_web_host(self.root, password="s3cret-word")
-        for host in ("127.0.0.1", "localhost", "[::1]"):
-            status, headers, body = _get(self.server, "/", page_host=f"{host}:12390")
+        for host in ("127.0.0.1:12390", "localhost:12390", "[::1]:12390"):
+            # A direct request to Core carries no proxy marker.  This is the
+            # actual loopback boundary; the published proxy path is tested
+            # separately because its Host value is supplied by the client.
+            status, headers, body = self._get("/", host=host)
             self.assertEqual(200, status)
             text = body.decode("utf-8")
             self.assertIn("bundle.js", text)
@@ -635,6 +639,22 @@ class BrowserPageTests(unittest.TestCase):
             self.assertIn("yr-core-session=", cookie)
             token = cookie.split("yr-core-session=", 1)[1].split(";", 1)[0]
             self.assertTrue(self.server._valid_session(token), "the page's cookie is a live session")
+
+    def test_a_published_loopback_host_still_meets_the_password(self) -> None:
+        """A proxy marker keeps a client-supplied loopback Host published.
+
+        The proxy connects to Core over loopback for every request, so the
+        marker is the boundary between a direct local page and a published
+        page.  An external visitor must not turn the latter into the former by
+        sending ``Host: localhost``.
+        """
+
+        self.server.enable_web_host(self.root, password="s3cret-word")
+        status, _headers, body = _get(self.server, "/", page_host="localhost:12390")
+        self.assertEqual(200, status)
+        text = body.decode("utf-8")
+        self.assertIn('type="password"', text)
+        self.assertNotIn("bundle.js", text)
 
     def test_a_proxied_loopback_name_is_still_the_owner(self) -> None:
         """No forwarded name at all is a direct hit, which is loopback too."""
@@ -1245,12 +1265,15 @@ class BrowserRelaySignInTests(unittest.TestCase):
         self.cookie = _login(self.server, "page-sign-in-password")
 
     def _post(self, body: dict[str, object]) -> tuple[int, dict[str, object]]:
+        return self._post_route("/ipc/host/relay/login", body)
+
+    def _post_route(self, route: str, body: dict[str, object]) -> tuple[int, dict[str, object]]:
         endpoint = self.server.endpoint
         connection = http.client.HTTPConnection(endpoint.address, endpoint.port, timeout=5)
         try:
             connection.request(
                 "POST",
-                "/ipc/host/relay/login",
+                route,
                 body=json.dumps(body),
                 headers={"Content-Type": "application/json", "Cookie": self.cookie},
             )
@@ -1509,6 +1532,120 @@ class BrowserRelaySignInTests(unittest.TestCase):
                 return {}
 
         return {"browser": Browser(), "origin": "https://relay.example.test", "type": "newapi", "last_cookie": ""}
+
+    def test_a_verified_page_login_keeps_the_login_and_offers_the_password(self) -> None:
+        """The browser's accepted session is stored, and the question has both halves.
+
+        Measured on the live app: signing in from the page verified the session,
+        asked Core to record it, and Core answered nothing -- the accept path
+        named a switch the boundary did not have, so every page sign-in ended as
+        a session nobody stored, and the next check (a native host's probe, with
+        its own older cookie) recorded 未登录 seconds later.  What the person saw
+        was "I just signed in and it is already gone".
+        """
+
+        self._post(self._body(pending_account=True, remember_password=False))
+        account = self.core.snapshot()["domains"]["relay_accounts"]["accounts"][0]
+        class Browser:
+            captured_password = "typed-secret"
+
+            def cookies(self) -> list[object]:
+                return []
+
+            def storage(self) -> dict[str, str]:
+                return {}
+
+        entry = {
+            "browser": Browser(),
+            "account_id": account["id"],
+            "type": account["type"],
+            "label": account["label"],
+            "origin": account["origin"],
+            "username": "",
+            "pending_account": False,
+            "station_id": account.get("station_id", ""),
+            "station_name": "",
+            "station_type": account["type"],
+            "station_origin": account["origin"],
+            "last_cookie": "",
+        }
+
+        outcome = self.core._accept_browser_session(
+            entry,
+            {"username": "person@example.test", "cookie": "session=window", "access_token": "", "user_id": ""},
+        )
+        self.assertEqual("signed_in", outcome["status"])
+        # The question's two halves: nothing is kept as a password yet, and
+        # there is one to keep.
+        self.assertFalse(outcome["remember_password"])
+        self.assertTrue(outcome["can_remember_password"])
+        stored = self.core.snapshot()["domains"]["relay_accounts"]["accounts"][0]
+        self.assertEqual("signed_in", stored["login_status"])
+        self.assertTrue(self.relay.secret_present("session", account["id"]))
+
+        # 记住密码 keeps what Core captured from the station's own page, and the
+        # login stays: neither answer touches the session.
+        kept = self.core.remember_relay_password(account_id=account["id"], remember=True)
+        self.assertTrue(kept["remember_password"])
+        self.assertTrue(kept["password_saved"])
+        self.assertEqual("typed-secret", self.relay.trusted_secret_value("password", account["id"]))
+
+    def test_a_pending_browser_login_merge_captures_password_on_the_existing_account(self) -> None:
+        """The poll's resolved id also addresses the password preference route."""
+
+        assert isinstance(self.answer, dict)
+        self.answer["username"] = "window-user"
+        self._post(self._body(pending_account=True, remember_password=False))
+        account = self.core.snapshot()["domains"]["relay_accounts"]["accounts"][0]
+
+        class Browser:
+            captured_password = "typed-secret"
+            expired = False
+            last_seen_at = 0.0
+
+            def __init__(self) -> None:
+                self.process = mock.Mock()
+                self.process.poll.return_value = None
+
+            def cookies(self) -> list[dict[str, str]]:
+                return [{"name": "session", "value": "window", "domain": "relay.example.test"}]
+
+            def storage(self) -> dict[str, str]:
+                return {}
+
+            def close(self) -> None:
+                return None
+
+        entry = {
+            "browser": Browser(),
+            "account_id": "pending-browser-0123456789abcdef",
+            "type": account["type"],
+            "label": account["label"],
+            "origin": account["origin"],
+            "username": "",
+            "pending_account": True,
+            "station_id": account.get("station_id", ""),
+            "station_name": "",
+            "station_type": account["type"],
+            "station_origin": account["origin"],
+            "last_cookie": "",
+        }
+        entry_id = "pending-browser-0123456789abcdef"
+        self.core._browser_logins[entry_id] = entry
+        status, outcome = self._post_route("/ipc/host/relay/browser/poll", {"login_id": entry_id})
+
+        self.assertEqual(200, status)
+        self.assertEqual("signed_in", outcome["status"])
+        self.assertTrue(outcome["can_remember_password"])
+        self.assertEqual(account["id"], outcome["account_id"])
+        self.assertEqual([account["id"]], [row["id"] for row in self.core.snapshot()["domains"]["relay_accounts"]["accounts"]])
+        status, kept = self._post_route(
+            "/ipc/host/relay/remember",
+            {"account_id": outcome["account_id"], "remember": True},
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(kept["remember_password"])
+        self.assertEqual("typed-secret", self.relay.trusted_secret_value("password", account["id"]))
 
     def test_a_jar_the_station_never_answered_for_is_offered_again(self) -> None:
         """A request that never got an answer says nothing about the jar.
@@ -1987,6 +2124,111 @@ class RelayBrowserPrefillTests(unittest.TestCase):
         thread.assert_not_called()
 
 
+class RelayBrowserPasswordCaptureTests(unittest.TestCase):
+    def test_password_is_captured_before_a_cross_origin_redirect(self) -> None:
+        """The event reaches Core even after the station page changes origin."""
+
+        page = {"origin": "https://relay.example.test"}
+        target = {"webSocketDebuggerUrl": "ws://page"}
+        browser = mock.Mock(
+            closed=False,
+            port=1,
+            origin="https://relay.example.test",
+            captured_password="",
+        )
+
+        class Socket:
+            def __init__(self) -> None:
+                self.messages: list[dict[str, object]] = []
+                self.commands: list[dict[str, object]] = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+            async def send(self, raw: str) -> None:
+                command = json.loads(raw)
+                self.commands.append(command)
+                if command.get("method") == "Runtime.evaluate":
+                    # The page's input/click listener sends the value through
+                    # the binding before the browser commits its redirect.
+                    self.messages.append(
+                        {
+                            "method": "Runtime.bindingCalled",
+                            "params": {
+                                "name": relay_browser._CAPTURE_BINDING,
+                                "payload": "typed-password",
+                            },
+                        }
+                    )
+                    page["origin"] = "https://identity.example.test"
+                self.messages.append({"id": command["id"], "result": {}})
+
+            async def recv(self) -> str:
+                while not self.messages:
+                    await asyncio.sleep(0)
+                message = self.messages.pop(0)
+                if message.get("id") == 5:
+                    browser.closed = True
+                return json.dumps(message)
+
+        socket = Socket()
+        with mock.patch.object(relay_browser, "_page_target", return_value=target) as page_target, \
+             mock.patch("websockets.connect", return_value=socket):
+            relay_browser._capture_loop(browser)
+
+        self.assertEqual("https://identity.example.test", page["origin"])
+        self.assertEqual("typed-password", browser.captured_password)
+        page_target.assert_called_once_with(1, "https://relay.example.test")
+        self.assertEqual(
+            ["Runtime.enable", "Page.enable", "Runtime.addBinding", "Page.addScriptToEvaluateOnNewDocument", "Runtime.evaluate"],
+            [command["method"] for command in socket.commands],
+        )
+        expression = socket.commands[-1]["params"]["expression"]
+        self.assertIn("document.addEventListener('input', read, true)", expression)
+        self.assertIn("window.__youngRouterCapturePassword(node.value)", expression)
+        self.assertNotIn("sessionStorage", expression)
+        self.assertEqual(expression, socket.commands[-2]["params"]["source"])
+        self.assertIn('location.origin === "https://relay.example.test"', expression)
+
+    def test_typing_and_correcting_a_password_keeps_the_complete_value(self) -> None:
+        browser = mock.Mock(closed=False, origin="https://relay.example.test", captured_password="")
+
+        class Socket:
+            def __init__(self) -> None:
+                self.messages: list[dict[str, object]] = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+            async def send(self, raw: str) -> None:
+                command = json.loads(raw)
+                self.messages.append({"id": command["id"], "result": {}})
+                if command["method"] == "Runtime.evaluate":
+                    for value in ("t", "ty", "typo", "", "typed-password"):
+                        self.messages.append({
+                            "method": "Runtime.bindingCalled",
+                            "params": {"name": relay_browser._CAPTURE_BINDING, "payload": value},
+                        })
+
+            async def recv(self) -> str:
+                message = self.messages.pop(0)
+                if message.get("params", {}).get("payload") == "typed-password":
+                    browser.closed = True
+                return json.dumps(message)
+
+        socket = Socket()
+        with mock.patch("websockets.connect", return_value=socket):
+            asyncio.run(relay_browser._capture_page_password(browser, "ws://page"))
+
+        self.assertEqual("typed-password", browser.captured_password)
+
+
 class MirrorFrameTests(unittest.TestCase):
     """The stream and the input path, through Core's own listener."""
     def _frame_call(self, server: CoreIPCServer, session: str, since: int) -> dict[str, object]:
@@ -2151,11 +2393,34 @@ class BrowserAddressTests(unittest.TestCase):
     ui = (Path(__file__).resolve().parents[1] / "rn/packages/shared/src/ui/YoungRouterApp.tsx").read_text(encoding="utf-8")
 
     def test_the_page_states_the_origin_it_was_opened_at(self) -> None:
+        self.assertIn(
+            'const webPageOwnOrigin = Platform.OS === "web" && typeof window !== "undefined" && window.location.origin.startsWith("http")',
+            self.ui,
+        )
         panel = self.ui.split("const webPageAddress = (() => {", 1)[1].split("})();", 1)[0]
-        self.assertIn('if (Platform.OS === "web" && typeof window !== "undefined"', panel)
-        self.assertIn("return `${window.location.origin}/ui`;", panel)
+        self.assertIn('if (webPageOwnOrigin !== "") {', panel)
+        self.assertIn("return `${webPageOwnOrigin}/ui`;", panel)
         # The native hosts have no address bar: they keep the derivation.
         self.assertIn('return port ? `http://127.0.0.1:${port}/ui` : "";', panel)
+
+    def test_the_click_opens_the_address_the_row_printed(self) -> None:
+        """A published page's link went to loopback.
+
+        The row stated the address bar (`https://host/ui`) while the press asked
+        Core for the launch address, which is this machine's `127.0.0.1` plus a
+        credential -- an address the reader at a reverse-proxied page cannot
+        open, and one Core already answers for free on the owner's own page.
+        The launch credential is for a native host opening a browser beside
+        Core, so only that case may replace the printed address.
+        """
+
+        launch = self.ui.split("const openWebPage = async", 1)[1].split("const webPageAddress", 1)[0]
+        self.assertIn('let address = webPageAddress;', launch)
+        guard = launch.split('if (webPageOwnOrigin === "") {', 1)
+        self.assertEqual(2, len(guard))
+        self.assertIn("await ipc.webLaunchUrl()", guard[1])
+        # The printed address is what opens until the guard says otherwise.
+        self.assertNotIn("await ipc.webLaunchUrl()", guard[0])
 
     def test_the_proxy_states_the_name_the_browser_used(self) -> None:
         forward = (Path(__file__).resolve().parents[1] / "young_router/proxy/web_forward.py").read_text(encoding="utf-8")
@@ -2204,6 +2469,71 @@ class BrowserModelChooserTests(unittest.TestCase):
         # also flipped hidden rows would drop a selection nobody touched.
         self.assertIn('const selectAllVisible = (): void => setSelected((current) => [...current, ...visible.filter((model) => !current.includes(model))]);', chrome)
         self.assertIn('const hidden = current.filter((model) => !visible.includes(model));', chrome)
+
+    def test_the_sign_in_surface_asks_what_a_verified_sign_in_may_keep(self) -> None:
+        """A typed password is a question, not a default.
+
+        Both native hosts ask after the station accepted the session: an
+        account that keeps no password is exactly the one whose next visit asks
+        again, and repeated sign-ins are what a station's session cap runs out
+        on.  The page host had no such question at all -- and no store of its
+        own to keep the session in -- so a session-only account signed in,
+        dropped the cookie, and read 未登录 on its next visit.
+
+        The question is asked only when there is a choice: an account that
+        already remembers its password answered it when the switch was turned
+        on, and one with nothing to offer has nothing to keep.
+        """
+
+        leaf = (self.shared / "platform/browserLeaf.ts").read_text(encoding="utf-8")
+        prompt = leaf.split("async function askRememberPassword(", 1)[1].split("/**\n * Sign in by letting Core", 1)[0]
+        self.assertIn("if (answer.remember_password === true) return;", prompt)
+        self.assertIn("if (answer.can_remember_password !== true) return;", prompt)
+        self.assertIn('kind: "confirm"', prompt)
+        self.assertIn("confirmLabel: strings?.relayRememberPasswordKeep", prompt)
+        self.assertIn("cancelLabel: strings?.relayRememberSessionOnly", prompt)
+        # The answer is the only thing that travels; the password stays in
+        # Core, which captured it from the station's own page.
+        self.assertIn('core.hostRoute("/ipc/host/relay/remember", { account_id: options.accountId, remember: keep === true })', prompt)
+        self.assertNotIn("password", prompt.split("hostRoute", 1)[1].split(")", 1)[0])
+        # Asked after the sign-in is verified, and never instead of finishing it.
+        self.assertIn('if (typeof answer.account_id !== "string" || !answer.account_id) return undefined;', leaf)
+        self.assertIn("void askRememberPassword(core, { accountId: answer.account_id, label: options.label }, answer, strings);", leaf)
+
+    def test_a_session_check_reports_every_state_the_station_determined(self) -> None:
+        """The page's check answers like a native host's, not only on success.
+
+        Both native hosts hand the pane all three determined states, and the
+        pane reads them as the row's login: 已登录 for the session that works,
+        未登录/已过期 for the answer that does not.  This host dropped the two
+        failures, so its rows kept whatever they held and entering the pane
+        looked like no check had run -- the one behaviour the two hosts are
+        supposed to share.  What is still dropped is the *absence* of an
+        answer: an unreachable station, or one that refused to mint a session,
+        states nothing about the session this check is asking about.
+        """
+
+        leaf = (self.shared / "platform/browserLeaf.ts").read_text(encoding="utf-8")
+        self.assertIn(
+            'if (answered !== "signed_in" && answered !== "signed_out" && answered !== "expired") return undefined;',
+            leaf,
+        )
+        # The request states no observation of its own: a host that has not
+        # asked the station must not hand Core its guess as the answer.
+        restore = leaf.split("restoreRelaySession: async (options) => {", 1)[1].split("openRelayLogs:", 1)[0]
+        self.assertIn('login_status: "unknown"', restore)
+        self.assertNotIn('login_status: "signed_out"', restore)
+        silent_restore = leaf.split("async function restoreSavedRelayLogin(", 1)[1].split("async function askRememberPassword(", 1)[0]
+        self.assertIn('login_status: "unknown"', silent_restore)
+        self.assertNotIn('login_status: "signed_out"', silent_restore)
+        self.assertIn('const loginStatus: "signed_in" | "signed_out" | "expired" = answered;', leaf)
+        self.assertIn("loginStatus,\n          username:", leaf)
+        # The no-answer cases name the two codes they are: a station never
+        # reached, and a station that would not mint a session for this check.
+        restore = leaf.split("restoreRelaySession: async (options) => {", 1)[1].split("openRelayLogs:", 1)[0]
+        self.assertIn("relay_restore_unavailable", restore)
+        self.assertIn("relay_login_session_limit", restore)
+        self.assertIn("relay_login_backoff", restore)
 
     def test_the_words_come_from_the_apps_localization(self) -> None:
         leaf = (self.shared / "platform/browserLeaf.ts").read_text(encoding="utf-8")

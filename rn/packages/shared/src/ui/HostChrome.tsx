@@ -488,6 +488,12 @@ function PickerSurface({ request }: { request: Extract<HostChromeRequest, { kind
     return [...hidden, ...visible.filter((model) => !current.includes(model))];
   });
   const count = (template: string, values: Record<string, string>): string => Object.entries(values).reduce((text, [name, value]) => text.split(`{${name}}`).join(value), template);
+  // The pane writes the pick while this surface is still on screen: 添加 hands
+  // the ticks over, everything that could start a second pick or take the
+  // window away goes quiet, and the footer states what the write is doing.  A
+  // refused write comes back with its cause in the same strip and its ticks
+  // intact, so the same button is the retry.
+  const saving = request.saving === true;
   const summary = (needle === ""
     ? count(labels.count, { count: String(request.models.length) })
     : count(labels.countFiltered, { visible: String(visible.length), total: String(request.models.length) }))
@@ -498,11 +504,14 @@ function PickerSurface({ request }: { request: Extract<HostChromeRequest, { kind
     footer={<>
       {/* The provider and key are stated once, in the head: the footer stated
           them again in a second notation two lines below. */}
+      <Text numberOfLines={1} style={styles.pickerStatus}>{request.status}</Text>
       <View style={styles.footerSpacer} />
-      <NativeButton title={request.cancelLabel} compact onPress={() => settleHostChrome(request, undefined)} />
+      <NativeButton title={request.cancelLabel} compact disabled={saving} onPress={() => request.resolve()} />
       {/* Both native hosts disable their Add button until something is
-          selected; an enabled one here would hand back an empty list. */}
-      <NativeButton title={request.confirmLabel} compact primary disabled={selected.length === 0} onPress={() => settleHostChrome(request, selected)} />
+          selected; an enabled one here would hand back an empty list.  It is
+          also where the write reports itself, exactly as the native choosers'
+          footer does. */}
+      <NativeButton title={request.confirmLabel} compact primary busy={saving} disabled={saving || selected.length === 0} onPress={() => request.submit(selected)} />
     </>}
   >
     <View style={styles.pickerHead}>
@@ -516,11 +525,12 @@ function PickerSurface({ request }: { request: Extract<HostChromeRequest, { kind
         onChangeText={setQuery}
         placeholder={labels.search}
         accessibilityLabel={labels.search}
+        editable={!saving}
         style={styles.pickerSearch}
       />
       <View style={styles.pickerControls}>
-        <NativeButton title={labels.selectAll} compact toolTip={labels.selectAllToolTip} disabled={visible.length === 0} onPress={selectAllVisible} />
-        <NativeButton title={labels.invert} compact toolTip={labels.invertToolTip} disabled={visible.length === 0} onPress={invertVisible} />
+        <NativeButton title={labels.selectAll} compact disabled={saving || visible.length === 0} onPress={selectAllVisible} />
+        <NativeButton title={labels.invert} compact disabled={saving || visible.length === 0} onPress={invertVisible} />
         <View style={styles.footerSpacer} />
         <Text numberOfLines={1} style={styles.pickerCount}>{summary}</Text>
       </View>
@@ -532,6 +542,7 @@ function PickerSurface({ request }: { request: Extract<HostChromeRequest, { kind
           key={model}
           label={model}
           value={selected.includes(model)}
+          disabled={saving}
           onValueChange={(on) => toggle(model, on)}
         />)}
     </ScrollView>
@@ -657,6 +668,9 @@ const styles = StyleSheet.create({
   pickerSearch: { minHeight: 26 },
   pickerControls: { flexDirection: "row", alignItems: "center", gap: 8 },
   pickerCount: { color: COLOR.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16, flexShrink: 0 },
+  // The footer's statement of the write: `添加` is busy beside it, exactly as
+  // the native hosts draw the same wait.
+  pickerStatus: { color: COLOR.secondary, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16, flexShrink: 1 },
   pickerEmpty: { color: COLOR.secondary, fontSize: UI_FONT_SIZE, lineHeight: 19, paddingVertical: 6 },
   pickerBody: { paddingHorizontal: 16, paddingBottom: 10, gap: 2 },
   viewerCard: {

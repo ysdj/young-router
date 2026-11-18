@@ -679,7 +679,45 @@ class YoungRouterHook(CustomLogger):
                 ):
                     terminal_delivered = True
                 yield chunk
-        except (GeneratorExit, asyncio.CancelledError):
+        except (GeneratorExit, asyncio.CancelledError) as exc:
+            if (
+                isinstance(exc, asyncio.CancelledError)
+                and not terminal_delivered
+                and _routing_module._is_local_shutdown_exception(exc)
+            ):
+                # This worker is being replaced, so the shutdown patch cancels
+                # the turns it can no longer finish (see
+                # ``base._retire_remaining_streams``).  A cancellation is a
+                # ``BaseException``: the ``except Exception`` below never sees
+                # it, and letting it through closes the body with no terminal
+                # frame.  A Chat client reads that close as a finished turn --
+                # Cherry Studio reports the half-written body as ``Invalid
+                # response: the provider response could not be processed``, so
+                # the user is told the model answered garbage when the router's
+                # own restart cut the turn.  This is the wire boundary of the
+                # turn, so the stop every other path of this turn reports is
+                # stated here too.
+                terminal_delivered = True
+                if needs_terminal_delivery:
+                    yield _streaming_module._synthesized_failed_response_event(
+                        request_data,
+                        exc,
+                    )
+                else:
+                    yield (
+                        _streaming_module._synthesized_native_stream_error_chunk(
+                            request_data,
+                            exc,
+                        )
+                    )
+                _trace_module._request_route_trace(
+                    "stream_local_shutdown_terminal_delivered",
+                    request_data,
+                    surface=(
+                        "responses" if needs_terminal_delivery else "native"
+                    ),
+                )
+                return
             _stream_ended_by_its_reader = True
             raise
         except Exception as exc:

@@ -144,7 +144,7 @@ class CodexConfigTests(unittest.TestCase):
         ), mock.patch.object(
             codex_config.urllib.request, "build_opener", return_value=opener
         ), mock.patch.object(
-            codex_config, "_public_catalog_is_image_model", return_value=False
+            codex_config, "_public_catalog_is_generation_model", return_value=False
         ):
             rows, enabled = codex_config.local_exposed_model_rows("sk-local-test")
 
@@ -222,6 +222,8 @@ class CodexConfigTests(unittest.TestCase):
                     {"id": "chat-model", "mode": "chat"},
                     {"id": "gpt-image-2.5-sunburst", "mode": "image_generation"},
                     {"id": "gpt-image-1", "mode": "image"},
+                    {"id": "gpt-image-2-edit", "mode": "image_edit"},
+                    {"id": "sora-2", "mode": "video_generation"},
                     # A route the public catalogs resolve and LiteLLM's own cost
                     # map does not still leaves the picker.
                     {"id": "vendor-image-xl"},
@@ -236,13 +238,36 @@ class CodexConfigTests(unittest.TestCase):
             codex_config.urllib.request, "build_opener", return_value=opener
         ), mock.patch.object(
             codex_config,
-            "_public_catalog_is_image_model",
+            "_public_catalog_is_generation_model",
             side_effect=lambda name: name == "vendor-image-xl",
         ):
             models, enabled = codex_config.local_exposed_models("sk-local-test")
 
         self.assertTrue(enabled)
         self.assertEqual(["chat-model", "no-mode-chat-model"], models)
+
+    def test_local_exposed_model_rows_drops_a_video_generator(self) -> None:
+        opener = mock.Mock()
+        opener.open.return_value = self._Response(
+            {
+                "data": [
+                    {"id": "chat-model", "mode": "chat"},
+                    {"id": "sora-2", "mode": "video_generation"},
+                    {"id": "veo-3.1", "mode": "video"},
+                ]
+            }
+        )
+        with mock.patch.object(
+            codex_config, "local_base_url", return_value="http://127.0.0.1:4999/v1"
+        ), mock.patch.object(
+            codex_config.urllib.request, "build_opener", return_value=opener
+        ), mock.patch.object(
+            codex_config, "_public_catalog_is_generation_model", return_value=False
+        ):
+            rows, enabled = codex_config.local_exposed_model_rows("sk-local-test")
+
+        self.assertTrue(enabled)
+        self.assertEqual([{"id": "chat-model", "max_input_tokens": None}], rows)
 
     def test_an_unreadable_public_catalog_does_not_hide_a_chat_route(self) -> None:
         """A registry that cannot be built is not evidence of an image model."""
@@ -257,7 +282,7 @@ class CodexConfigTests(unittest.TestCase):
         ), mock.patch.object(
             codex_config.urllib.request, "build_opener", return_value=opener
         ), mock.patch(
-            "young_router.core.model_catalog.route_serves_only_images",
+            "young_router.core.model_catalog.route_serves_only_generation",
             side_effect=RuntimeError("cache unreadable"),
         ):
             models, enabled = codex_config.local_exposed_models("sk-local-test")

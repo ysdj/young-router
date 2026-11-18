@@ -143,8 +143,10 @@ def _exchange(
             "",
         )
         outbound.append(("Host", f"{address}:{port}"))
-        if page_host:
-            outbound.append((PUBLISHED_HOST_HEADER, page_host))
+        # Presence marks the proxy boundary even when the incoming request did
+        # not state Host.  Omitting it in that case would make Core mistake the
+        # proxy's own loopback Host for a direct local page and skip the gate.
+        outbound.append((PUBLISHED_HOST_HEADER, page_host))
         # Core reads a body by ``Content-Length`` and calls a request that
         # states none invalid, so a body-less POST still states its zero; a
         # body-less GET or HEAD states nothing, which is what ``http.client``

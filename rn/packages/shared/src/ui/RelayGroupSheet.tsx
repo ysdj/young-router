@@ -342,8 +342,8 @@ export function RelayGroupSheet({ translate, copyKey }: {
         <View style={styles.listHeader}>
           <Text style={styles.sectionTitle}>{labels.listLabel}</Text>
           <View style={styles.listActions}>
-            <NativeButton title="" symbol="plus" compact toolTip={labels.addLabel} accessibilityLabel={labels.addLabel} disabled={!editing || groups.length === 0} onPress={addDraft} style={styles.iconButton} />
-            <NativeButton title="" symbol="minus" compact toolTip={labels.removeLabel} accessibilityLabel={labels.removeLabel} disabled={!editing || selected === undefined} onPress={removeSelected} style={styles.iconButton} />
+            <NativeButton title="" symbol="plus" compact accessibilityLabel={labels.addLabel} disabled={!editing || groups.length === 0} onPress={addDraft} style={styles.iconButton} />
+            <NativeButton title="" symbol="minus" compact accessibilityLabel={labels.removeLabel} disabled={!editing || selected === undefined} onPress={removeSelected} style={styles.iconButton} />
           </View>
         </View>
         <NativeTable
@@ -402,7 +402,7 @@ export function RelayGroupSheet({ translate, copyKey }: {
                 through Core's lease and stops at the clipboard, exactly as the
                 native sheet's copy button does. */}
             <Text numberOfLines={1} style={styles.value}>{selected && selected.hint !== "" ? "••••••••" : labels.emptyLabel}</Text>
-            <NativeButton title="" symbol="copy" compact toolTip={labels.copyLabel} accessibilityLabel={labels.copyLabel} disabled={!selected || selected.hint === "" || selected.draft} onPress={() => { void copySelected(); }} style={styles.iconButton} />
+            <NativeButton title="" symbol="copy" compact accessibilityLabel={labels.copyLabel} disabled={!selected || selected.hint === "" || selected.draft} onPress={() => { void copySelected(); }} style={styles.iconButton} />
           </View>
         </View>
         <Text style={styles.fieldLabel}>{labels.modelsLabel}</Text>

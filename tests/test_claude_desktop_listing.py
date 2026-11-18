@@ -60,6 +60,20 @@ class ClaudeDesktopSourceTests(unittest.TestCase):
             with self.subTest(agent=agent):
                 headers = {**DESKTOP_HEADERS, "user-agent": agent}
                 self.assertFalse(claude_desktop_listing.is_claude_desktop_client(headers))
+                self.assertTrue(claude_desktop_listing.is_claude_code_client(headers))
+                self.assertTrue(claude_desktop_listing.is_claude_listing_client(headers))
+
+    def test_the_explicit_gateway_header_is_claude_code(self) -> None:
+        self.assertTrue(
+            claude_desktop_listing.is_claude_code_client(
+                {"x-gateway-client": "claude-code"}
+            )
+        )
+        self.assertTrue(
+            claude_desktop_listing.is_claude_listing_client(
+                {"x-gateway-client": "claude-code"}
+            )
+        )
 
     def test_a_non_anthropic_or_non_electron_caller_is_not_the_desktop_app(self) -> None:
         self.assertFalse(
@@ -76,11 +90,16 @@ class ClaudeDesktopSourceTests(unittest.TestCase):
 
 
 class ClaudeDesktopMiddlewareTests(unittest.TestCase):
-    def _run(self, *, path: str, headers: dict[str, str]) -> bool:
-        seen: list[bool] = []
+    def _run_flags(self, *, path: str, headers: dict[str, str]) -> tuple[bool, bool]:
+        seen: list[tuple[bool, bool]] = []
 
         async def app(scope, receive, send) -> None:  # type: ignore[no-untyped-def]
-            seen.append(claude_desktop_listing._VIEW_ACTIVE.get())
+            seen.append(
+                (
+                    claude_desktop_listing._VIEW_ACTIVE.get(),
+                    claude_desktop_listing._GENERATION_FILTER_ACTIVE.get(),
+                )
+            )
 
         middleware = claude_desktop_listing._DesktopListingMiddleware(app)
         scope = {
@@ -97,8 +116,20 @@ class ClaudeDesktopMiddlewareTests(unittest.TestCase):
         asyncio.run(middleware(scope, None, None))
         return seen[0]
 
+    def _run(self, *, path: str, headers: dict[str, str]) -> bool:
+        return self._run_flags(path=path, headers=headers)[0]
+
     def test_the_desktop_request_is_marked_for_the_builder(self) -> None:
         self.assertTrue(self._run(path="/v1/models", headers=DESKTOP_HEADERS))
+        self.assertTrue(
+            self._run_flags(path="/v1/models", headers=DESKTOP_HEADERS)[1]
+        )
+
+    def test_claude_code_is_marked_for_the_generation_filter(self) -> None:
+        headers = {**DESKTOP_HEADERS, "user-agent": "claude-code/2.1.309"}
+        view, filtered = self._run_flags(path="/v1/models", headers=headers)
+        self.assertFalse(view)
+        self.assertTrue(filtered)
 
     def test_another_path_is_not_marked(self) -> None:
         self.assertFalse(self._run(path="/v1/messages", headers=DESKTOP_HEADERS))
@@ -113,8 +144,10 @@ class ClaudeDesktopRowsTests(unittest.TestCase):
     def setUp(self) -> None:
         patcher = mock.patch.object(
             claude_desktop_listing,
-            "_route_is_image",
-            side_effect=lambda name: name.startswith("gpt-image-"),
+            "_route_is_generation",
+            side_effect=lambda name: name.startswith(
+                ("gpt-image-", "sora-", "veo-")
+            ),
         )
         self.addCleanup(patcher.stop)
         patcher.start()
@@ -278,6 +311,21 @@ class ClaudeDesktopRowsTests(unittest.TestCase):
         )["data"]
         self.assertEqual(["deepseek-v4.1-flash"], [row["display_name"] for row in rows])
 
+    def test_a_video_generator_is_never_listed(self) -> None:
+        rows = claude_desktop_listing.desktop_model_rows(
+            _response("sora-2", "veo-3.1-generate-preview", "deepseek-v4.1-flash")
+        )["data"]
+        self.assertEqual(["deepseek-v4.1-flash"], [row["display_name"] for row in rows])
+
+    def test_a_row_stating_video_mode_is_dropped_without_a_catalog_answer(self) -> None:
+        response = _response("vendor-video-cog", "deepseek-v4.1-flash")
+        response["data"][0]["mode"] = "video_generation"
+        with mock.patch.object(
+            claude_desktop_listing, "_route_is_generation", return_value=False
+        ):
+            rows = claude_desktop_listing.desktop_model_rows(response)["data"]
+        self.assertEqual(["deepseek-v4.1-flash"], [row["display_name"] for row in rows])
+
     def test_the_view_is_sorted_by_the_display_name(self) -> None:
         rows = claude_desktop_listing.desktop_model_rows(
             _response("grok-4.7", "claude-opus-5-5", "deepseek-v4.1-flash")
@@ -313,18 +361,74 @@ class ClaudeDesktopListingPatchTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         claude_desktop_listing._VIEW_ACTIVE.set(False)
+        claude_desktop_listing._GENERATION_FILTER_ACTIVE.set(False)
 
     def test_the_canonical_listing_is_unchanged_without_the_marker(self) -> None:
         rows = self.module.create_anthropic_model_list_response(
-            [{"id": "deepseek-v4.1-flash", "object": "model"}]
+            [
+                {"id": "deepseek-v4.1-flash", "object": "model"},
+                {"id": "gpt-image-2", "object": "model", "mode": "image_generation"},
+                {"id": "sora-2", "object": "model", "mode": "video_generation"},
+            ]
         )["data"]
+        self.assertEqual(
+            ["deepseek-v4.1-flash", "gpt-image-2", "sora-2"],
+            [row["id"] for row in rows],
+        )
+
+    def test_a_claude_code_listing_drops_generators_and_keeps_ids(self) -> None:
+        token = claude_desktop_listing._GENERATION_FILTER_ACTIVE.set(True)
+        try:
+            rows = self.module.create_anthropic_model_list_response(
+                [
+                    {"id": "deepseek-v4.1-flash", "object": "model"},
+                    {
+                        "id": "gpt-image-2",
+                        "object": "model",
+                        "mode": "image_generation",
+                    },
+                    {
+                        "id": "sora-2",
+                        "object": "model",
+                        "mode": "video_generation",
+                    },
+                ]
+            )["data"]
+        finally:
+            claude_desktop_listing._GENERATION_FILTER_ACTIVE.reset(token)
+        # Claude Code keeps the router's public id: the alias view belongs to
+        # Claude Desktop alone.
         self.assertEqual(["deepseek-v4.1-flash"], [row["id"] for row in rows])
+
+    def test_a_desktop_listing_drops_a_video_route(self) -> None:
+        view_token = claude_desktop_listing._VIEW_ACTIVE.set(True)
+        filter_token = claude_desktop_listing._GENERATION_FILTER_ACTIVE.set(True)
+        try:
+            with mock.patch.object(
+                claude_desktop_listing, "_route_is_generation", return_value=False
+            ):
+                rows = self.module.create_anthropic_model_list_response(
+                    [
+                        {"id": "deepseek-v4.1-flash", "object": "model"},
+                        {
+                            "id": "sora-2",
+                            "object": "model",
+                            "mode": "video_generation",
+                        },
+                    ]
+                )["data"]
+        finally:
+            claude_desktop_listing._GENERATION_FILTER_ACTIVE.reset(filter_token)
+            claude_desktop_listing._VIEW_ACTIVE.reset(view_token)
+        self.assertEqual(
+            [claude_desktop_alias("deepseek-v4.1-flash")], [row["id"] for row in rows]
+        )
 
     def test_the_marker_publishes_the_desktop_view(self) -> None:
         token = claude_desktop_listing._VIEW_ACTIVE.set(True)
         try:
             with mock.patch.object(
-                claude_desktop_listing, "_route_is_image", return_value=False
+                claude_desktop_listing, "_route_is_generation", return_value=False
             ):
                 rows = self.module.create_anthropic_model_list_response(
                     [{"id": "deepseek-v4.1-flash", "object": "model"}]

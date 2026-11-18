@@ -766,6 +766,20 @@ class CoreProtocolTests(unittest.TestCase):
         ):
             self.assertEqual({key: 7}, redact({key: 7}), key)
 
+        # A measured *wait* is a number, not a credential.  The redactor read
+        # the bare ``token`` marker in ``first_token_seconds`` and replaced the
+        # time-to-first-token a speed reading had just measured with the string
+        # ``configured``, so the pane showed no wait at all.  Duration units are
+        # what make these names measurements; the credential spellings above
+        # keep their own marker and stay redacted.
+        for key in (
+            "first_token_seconds",
+            "time_to_first_token_ms",
+            "first_token_ms",
+            "token_latency_ms",
+        ):
+            self.assertEqual({key: 12.5}, redact({key: 12.5}), key)
+
         # A name that presents a credential is still a secret, including the
         # ones spelled beside the quantity names above.
         for key in (

@@ -99,6 +99,10 @@ export type HostChromeRequest =
       keyName: string;
       confirmLabel: string;
       cancelLabel: string;
+      saving: boolean;
+      status: string;
+      submit: (models: string[]) => void;
+      finish: (status: string, close: boolean) => Promise<string[] | undefined>;
       /**
        * The chooser's own words, because it is a surface and not a message: it
        * has a heading, a provider/key line, a search field, 全选 and 反选, a
@@ -120,7 +124,7 @@ export type HostChromeRequest =
         empty: string;
         noMatches: string;
       };
-      resolve: (models: string[] | undefined) => void;
+      resolve: () => void;
     })
   | (Base & {
       kind: "relaySignIn";
@@ -197,7 +201,6 @@ export type HostChromeRequest =
 type RequestBody = Omit<Extract<HostChromeRequest, { kind: "confirm" }>, "id" | "resolve">
   | Omit<Extract<HostChromeRequest, { kind: "prompt" }>, "id" | "resolve">
   | Omit<Extract<HostChromeRequest, { kind: "viewer" }>, "id" | "resolve">
-  | Omit<Extract<HostChromeRequest, { kind: "picker" }>, "id" | "resolve">
   | Omit<Extract<HostChromeRequest, { kind: "relaySignIn" }>, "id" | "resolve">
   | Omit<Extract<HostChromeRequest, { kind: "relayBrowser" }>, "id" | "resolve">
   | Omit<Extract<HostChromeRequest, { kind: "notice" }>, "id" | "resolve">
@@ -209,6 +212,11 @@ const listeners = new Set<() => void>();
 
 function emit(): void {
   for (const listener of listeners) listener();
+}
+
+function removeRequest(id: number): void {
+  requests = requests.filter((entry) => entry.id !== id);
+  emit();
 }
 
 export function hostChromeSnapshot(): HostChromeRequest[] {
@@ -255,14 +263,68 @@ export function requestHostChrome<T>(body: RequestBody): Promise<T> {
       id,
       resolve: (answer: unknown) => {
         if (!requests.some((entry) => entry.id === id)) return;
-        requests = requests.filter((entry) => entry.id !== id);
-        emit();
+        removeRequest(id);
         resolve(answer as T);
       },
     } as HostChromeRequest;
     requests = [...requests, request];
     emit();
   });
+}
+
+type ModelPicker = Extract<HostChromeRequest, { kind: "picker" }>;
+type ModelChoice = string[] | undefined;
+
+/** Add hands the selection to the pane. The pane closes the chooser after saving or asks it for another pick. */
+export function requestModelPick(
+  body: Omit<ModelPicker, "id" | "kind" | "saving" | "status" | "submit" | "finish" | "resolve">,
+  savingLabel: string,
+): Promise<ModelChoice> {
+  const previous = requests.find((entry) => entry.kind === "picker");
+  if (previous?.saving) return Promise.resolve(undefined);
+  previous?.resolve();
+  return new Promise<ModelChoice>((firstPick) => {
+    let answer: ((models: ModelChoice) => void) | undefined = firstPick;
+    const id = ++serial;
+    const update = (saving: boolean, status: string): void => {
+      picker = { ...picker, saving, status };
+      requests = requests.map((entry) => entry.id === id ? picker : entry);
+      emit();
+    };
+    const close = (): void => {
+      removeRequest(id);
+      answer?.(undefined);
+      answer = undefined;
+    };
+    let picker: ModelPicker = {
+      ...body, id, kind: "picker", saving: false, status: "",
+      submit: (models) => {
+        if (!answer || !models.length) return;
+        const resolve = answer;
+        answer = undefined;
+        update(true, savingLabel);
+        resolve(models);
+      },
+      finish: (status, shouldClose) => {
+        if (shouldClose) {
+          close();
+          return Promise.resolve(undefined);
+        }
+        return new Promise<ModelChoice>((retry) => {
+          answer = retry;
+          update(false, status);
+        });
+      },
+      resolve: () => { if (!picker.saving) close(); },
+    };
+    requests = [...requests, picker];
+    emit();
+  });
+}
+
+export function finishModelPick(status: string, close: boolean): Promise<ModelChoice> {
+  const picker = requests.find((entry) => entry.kind === "picker");
+  return picker ? picker.finish(status, close) : Promise.resolve(undefined);
 }
 
 /** Answer one open request. Answering the same request twice is a no-op. */

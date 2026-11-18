@@ -199,6 +199,55 @@ def _keep_litellm_drain_default() -> None:
     os.environ.pop(_LITELLM_DRAIN_TIMEOUT_ENV, None)
 
 
+async def _retire_remaining_streams(server: Any) -> None:
+    """Cancel whatever is still answering, and let it write its terminal.
+
+    The drain gives every in-flight turn the whole window to finish on its own,
+    so a stream that is producing keeps producing.  When the drain gives up,
+    though, the process returns from ``serve`` and the event loop closes with
+    those turns still suspended -- the socket dies mid-body, and the client
+    reads a half-written SSE frame.  Cherry Studio reports that as ``Invalid
+    response: the provider response could not be processed``; the user is told
+    the model answered garbage when the router's own retirement cut the turn.
+
+    Cancelling is how uvicorn ends tasks when its own graceful timeout expires,
+    and a cancelled task whose turn has visible output writes the terminal that
+    closes the answer (the wire wrappers turn this worker's own teardown into
+    the retryable restart stop).  The window afterwards is the flush the client
+    needs to read that frame before the loop goes away.
+    """
+
+    try:
+        remaining = [
+            task
+            for task in list(server.server_state.tasks)
+            if not task.done()
+        ]
+    except Exception:  # pragma: no cover - uvicorn internals differ
+        return
+    if not remaining:
+        return
+    # Stated on the host's own log, like the other background failures this
+    # app writes: a retirement that had to cut a turn is exactly the event
+    # nobody is watching when a client reports a broken answer.
+    try:
+        from ..core.oplog import note as _note
+
+        _note("retiring this worker with %d turn(s) still open" % len(remaining))
+    except Exception:  # pragma: no cover - logging must not stop a shutdown
+        pass
+    for task in remaining:
+        try:
+            task.cancel()
+        except Exception:  # pragma: no cover - a task that is already gone
+            continue
+    deadline = time.monotonic() + _APP_EXIT_TERMINAL_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        if all(task.done() for task in remaining):
+            return
+        await asyncio.sleep(0.02)
+
+
 def _close_connections_without_a_request(server: Any) -> None:
     """Close every listened connection that is not mid-response.
 
@@ -335,6 +384,11 @@ def _install_uvicorn_shutdown_marker_patch() -> None:
         )
         try:
             await original_shutdown(self, sockets)
+            if shutdown_marked:
+                # The drain has given up on whatever is left: end those turns
+                # here, with the frame each wire closes a turn with, instead of
+                # letting the process exit truncate their bodies.
+                await _retire_remaining_streams(self)
         finally:
             self.config.timeout_graceful_shutdown = original_timeout
             if had_instance_wait:

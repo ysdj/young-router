@@ -86,6 +86,18 @@ NON_SECRET_TOKEN_COUNT_KINDS = frozenset(
         "write",
     }
 )
+# Units a measured *wait* is spelled in.  ``first_token_seconds`` is the time
+# the first token took to arrive, not the token itself: the redactor read the
+# bare ``token`` marker and rewrote the number Core had just measured to the
+# string ``configured``, so a speed reading reached the pane with its time to
+# first token replaced by a word and the line showed no wait at all.  A name is
+# a latency only when it also says *which* measurement it is (``first``,
+# ``latency``) *and* ends in a duration unit, so ``bootstrap_token_ttl_seconds``
+# and ``refresh_token_expires_at`` stay credentials.
+NON_SECRET_TOKEN_LATENCY_KINDS = frozenset({"first", "latency"})
+NON_SECRET_TOKEN_LATENCY_UNITS = frozenset(
+    {"ms", "milliseconds", "seconds", "secs", "s"}
+)
 # Segments that state a budget rather than a credential, wherever they sit in
 # the name: ``model_auto_compact_token_limit``, ``token_budget``,
 # ``token_count``, and the runtime setting spelled
@@ -206,13 +218,15 @@ def _key_classification(text: str) -> tuple[bool, bool]:
 
 
 def _token_quantity_key(text: str) -> bool:
-    """Whether one normalized name states how many tokens, not which token.
+    """Whether one normalized name measures tokens, not names one.
 
     Only a name that mentions ``token`` is considered, so a credential spelled
-    any other way is untouched.  Such a name is a quantity when it carries a
+    any other way is untouched.  Such a name is a measurement when it carries a
     budget segment (``max_input_tokens``, ``model_auto_compact_token_limit``,
-    ``token_budget``, ``token_count``) or when it ends in a plural count of a
-    named token kind (``input_tokens``, ``cache_read_tokens``).  Every other
+    ``token_budget``, ``token_count``), when it ends in a plural count of a
+    named token kind (``input_tokens``, ``cache_read_tokens``), or when it ends
+    in a duration unit and names the wait it is (``first_token_seconds``,
+    ``time_to_first_token_ms``, ``token_latency_ms``).  Every other
     token name — ``access_token``, ``refresh_token``, ``bootstrap_token``,
     ``id_token``, ``provider_auth_token``, ``bootstrap_token_ttl_seconds``, or
     a bare ``tokens`` — names the credential itself and stays classified as
@@ -233,6 +247,11 @@ def _token_quantity_key(text: str) -> bool:
     # from the original string before this point.
     parts = [part for part in re.split(r"[^a-z0-9]+", text.lower()) if part]
     if any(part in NON_SECRET_TOKEN_QUANTITY_SEGMENTS for part in parts):
+        return True
+    if (
+        parts[-1] in NON_SECRET_TOKEN_LATENCY_UNITS
+        and any(part in NON_SECRET_TOKEN_LATENCY_KINDS for part in parts)
+    ):
         return True
     return (
         len(parts) >= 2
@@ -543,6 +562,8 @@ def safe_exception_message(error: BaseException, *, known_secrets: Sequence[str]
 
 __all__ = [
     "NON_SECRET_TOKEN_COUNTER_KEYS",
+    "NON_SECRET_TOKEN_LATENCY_KINDS",
+    "NON_SECRET_TOKEN_LATENCY_UNITS",
     "PATH_KEY_MARKERS",
     "REDACTED",
     "SECRET_KEY_MARKERS",

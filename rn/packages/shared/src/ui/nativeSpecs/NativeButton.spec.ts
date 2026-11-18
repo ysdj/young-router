@@ -21,12 +21,11 @@ export interface NativeButtonProps extends ViewProps {
    */
   symbolTrailing?: WithDefault<boolean, false>;
   /**
-   * The control's hover hint and its accessibility name.  An icon-only button
-   * has no visible words, and a busy wheel's wording rides this hint, so an
-   * empty value falls back to the button's own title the way the macOS
-   * control already does.
+   * The button's name for assistive technology, and the only place an
+   * icon-only button keeps its words.  A button states no hover tip: the
+   * control's own title is what a pointer reads, and a glyph button is named
+   * here instead.
    */
-  toolTip?: string;
   accessibilityLabel?: string;
   disabled?: WithDefault<boolean, false>;
   /**

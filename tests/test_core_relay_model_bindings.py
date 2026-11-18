@@ -1679,6 +1679,102 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class RemovedRelayAccountTakesItsKeysTests(unittest.TestCase):
+    """Deleting an account deletes the local keys and routes it owned.
+
+    A relay key slot is a pointer at one station key.  Once the account is
+    deleted here, that pointer can never resolve again -- and the pane drew
+    exactly the residue: a key with no account name, a 中转站关联 section with no
+    rows, and a note claiming the key "does not exist on the station".  The
+    station is never told: deleting an account is a local act, and the keys on
+    the site are the site's own.
+    """
+
+    def _provider(self, domain: ProvidersModelsDomain) -> dict[str, object]:
+        domain.stage_relay_import(
+            [
+                relay_source(resource_id="resource-a", models=["chat-a"]),
+                relay_source(
+                    station_id="station-b",
+                    account_id="account-b",
+                    resource_id="resource-b",
+                    models=["chat-b"],
+                ),
+            ]
+        )
+        domain.materialize_relay_bindings(
+            {
+                "resources": [
+                    {**relay_source(resource_id="resource-a"), "api_key": "sk-replace-a"},
+                    {
+                        **relay_source(
+                            station_id="station-b",
+                            account_id="account-b",
+                            resource_id="resource-b",
+                        ),
+                        "api_key": "sk-replace-b",
+                    },
+                ]
+            }
+        )
+        return domain._draft["providers"][0]
+
+    def test_the_keys_and_routes_of_a_deleted_account_are_deleted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            domain = ProvidersModelsDomain(Path(directory) / "config.yaml")
+            provider = self._provider(domain)
+            kept_keys = [
+                {"id": "provider-slot-local", "name": "local", "value": "sk-replace-local", "source": {"kind": "independent"}}
+            ]
+            provider["api_keys"].extend(kept_keys)
+            kept_models = [
+                {
+                    "deployment_id": "local0001",
+                    "model_name": "local-chat",
+                    "provider_key_id": "provider-slot-local",
+                    "api_key_name": "local",
+                }
+            ]
+            provider["models"].extend(kept_models)
+            keys_before = [key["name"] for key in domain._provider_api_keys(provider)]
+            models_before = [model["deployment_id"] for model in provider["models"]]
+
+            # station-a is gone with its account; station-b is still here.
+            dropped = domain.drop_unreachable_relay_sources(
+                accounts=["account-b"],
+                stations=["station-b"],
+            )
+
+            self.assertEqual(1, dropped["removed_keys"])
+            provider = domain._draft["providers"][0]
+            remaining = [key["name"] for key in domain._provider_api_keys(provider)]
+            self.assertEqual(1, len(keys_before) - len(remaining))
+            self.assertIn("local", remaining)
+            # The route on the deleted slot went with it; the others stayed.
+            self.assertLess(len(provider["models"]), len(models_before))
+            self.assertIn("local0001", [model["deployment_id"] for model in provider["models"]])
+            # A key sourced from another station is not touched.
+            self.assertTrue(
+                any(
+                    key["source"].get("kind") == "relay" and key["source"].get("station_id") == "station-b"
+                    for key in domain._provider_api_keys(provider)
+                )
+            )
+
+    def test_a_station_binding_with_nothing_behind_it_is_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            domain = ProvidersModelsDomain(Path(directory) / "config.yaml")
+            provider = self._provider(domain)
+            for key in list(provider["api_keys"]):
+                if key["source"].get("kind") == "relay":
+                    key["source"] = {"kind": "independent"}
+            provider["relay_station_id"] = "station-gone"
+
+            domain.drop_unreachable_relay_sources(accounts=[], stations=[])
+
+            self.assertNotIn("relay_station_id", domain._draft["providers"][0])
+
+
 class RelayImportJoinsTheBoundProviderTests(unittest.TestCase):
     """An import joins the station's provider, even when a placeholder exists.
 

@@ -8,9 +8,11 @@ import { usePendingAction } from "./pendingAction";
 import { setGroupManagerOpen } from "./providerWizardGate";
 import { normalizeRelayOrigin, stationOriginKey, stationSurfaceAddress, stationSurfacePath, type StationSurfaces } from "./relayOrigin";
 import { multiplierSpelling } from "./rateSpelling";
+import { providedKeyName, resourceGroupName } from "./providedKeyName";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
 
 export { normalizeRelayOrigin, stationOriginKey } from "./relayOrigin";
+export { providedKeyName } from "./providedKeyName";
 
 type UnknownRecord = Record<string, unknown>;
 type Translate = (key: string, values?: Record<string, string | number>) => string;
@@ -126,11 +128,6 @@ export function groupLabel(group: RelayGroup, translate: Translate): string {
 
 function resourceGroup(resource: RelayResource, groups: RelayGroup[]): RelayGroup | undefined {
   return groups.find((group) => group.id === resource.groupID);
-}
-
-function resourceGroupName(resource: RelayResource, groups: RelayGroup[], translate: Translate): string {
-  const group = resourceGroup(resource, groups);
-  return group?.name || resource.groupName || (resource.groupID ? resource.groupID : translate("relay.apiKeyUngrouped"));
 }
 
 /** The 倍率 value: the group's rate, or nothing when it has none. */
@@ -999,6 +996,18 @@ export function StationAccountsPanel({
   // within the window costs no station round trip and never repaints the login
   // state.  Only a session the window no longer covers is probed again.
   const attemptedAccounts = useRef(new Set<string>());
+  // When each account was last probed, so a station that answers nothing is
+  // asked once per re-check window instead of once per render.  The pass below
+  // ends by refreshing the account, that refresh publishes a snapshot, and a
+  // fresh snapshot hands this panel a rebuilt `stationAccounts` array -- an
+  // array in the dependency list therefore restarted the pass on its own
+  // result: probe → refresh → snapshot → probe, with the rows repainting
+  // 检测中 and 余额 forever.  The pass belongs to a change in the facts it
+  // reads, so the dependency is that change spelled as a value.
+  const probeAttemptedAt = useRef(new Map<string, number>());
+  const mountProbeKey = stationAccounts
+    .map((account) => `${account.id}:${account.loginStatus}:${account.loginObservedSecondsAgo ?? "-"}`)
+    .join("\u001f");
   useEffect(() => {
     if (busy) return;
     // A probe that settles after this panel has been replaced must not write
@@ -1006,9 +1015,15 @@ export function StationAccountsPanel({
     // editor is keyed by station, so switching stations swaps this panel out
     // while an unbounded station round trip may still be running.
     let active = true;
-    for (const account of stationAccounts) {
-      if (attemptedAccounts.current.has(account.id) || isAccountLoading(account.id)) continue;
+    const cooldownMs = Math.max(1, typeof sessionRecheckSeconds === "number" && sessionRecheckSeconds > 0 ? sessionRecheckSeconds : 60) * 1000;
+    for (const account of accountsRef.current) {
+      const lastAttempt = probeAttemptedAt.current.get(account.id);
+      // The window is the same one Core answers from: asking again inside it
+      // cannot learn anything the answer it just gave did not say.
+      const cooling = lastAttempt !== undefined && Date.now() - lastAttempt < cooldownMs;
+      if (attemptedAccounts.current.has(account.id) || isAccountLoading(account.id) || cooling) continue;
       attemptedAccounts.current.add(account.id);
+      probeAttemptedAt.current.set(account.id, Date.now());
       const observed = account.loginObservedSecondsAgo;
       // A determined answer is settled, not a question to ask again: 已登录 and
       // 未登录 both stay put until their observation leaves the window, so
@@ -1041,10 +1056,14 @@ export function StationAccountsPanel({
         if (!active) return;
         if (!answered) attemptedAccounts.current.delete(account.id);
         await refreshAccountResources(account, { silent: true });
+        // Releasing the id lets the next pass ask again; the timestamp above is
+        // what keeps "next pass" from meaning "next render", so a transient
+        // station timeout still recovers once the window passes instead of
+        // suppressing the check for the life of the panel or spinning.
       })();
     }
     return () => { active = false; };
-  }, [busy, sessionRecheckSeconds, stationAccounts]);
+  }, [busy, sessionRecheckSeconds, mountProbeKey]);
   // The add flow never reserves an account slot. The webview login runs
   // first (its own modal window over the workspace); Core creates the account
   // shell only when sign-in actually succeeds (pending_account), so a
@@ -1330,7 +1349,8 @@ export function StationAccountsPanel({
     multiplierLabel: translate("relay.apiKeyMultiplier"),
     valueLabel: translate("providers.keyValue"),
     // The copy is an icon button beside the value; these words ride it as its
-    // tooltip and its accessibility label.
+    // accessibility label.  A button states no hover tip, so this name is the
+    // only place the glyph reads as words.
     copyLabel: translate("relay.apiKeyCopy"),
     failedLabel: translate("relay.operationFailed"),
     modelsLabel: translate("relay.apiKeyModelList"),
@@ -1347,7 +1367,8 @@ export function StationAccountsPanel({
     discardConfirm: translate("common.discard"),
     // The window's key list header carries the load: the wheel beside 密钥 turns
     // while the station round trip is in flight, and these words ride it as its
-    // tooltip, so the wait is stated on the rows it is about to replace.
+    // tooltip — a spinner draws nothing, so its hint is the only text it has —
+    // so the wait is stated on the rows it is about to replace.
     loadingLabel: translate("relay.groupManagerLoading"),
   });
   // The window's opening request: the content above plus the chrome only a
@@ -1614,8 +1635,8 @@ export function StationAccountsPanel({
     <AccountsTable
       title={translate("providers.accounts")}
       actions={<>
-        {stationAccounts.length < 8 ? <NativeButton title="" symbol="plus" compact toolTip={translate("relay.addAccount")} accessibilityLabel={translate("relay.addAccount")} busy={pendingAction === "add"} disabled={controlsBusy && pendingAction !== "add"} style={styles.panelActionButton} onPress={() => { void beginAddLogin(); }} /> : null}
-        {selected ? <NativeButton title="" symbol="minus" compact destructive toolTip={translate("relay.removeLocal")} accessibilityLabel={translate("relay.removeLocal")} busy={pendingAction === "remove"} disabled={controlsBusy && pendingAction !== "remove"} style={styles.panelActionButton} onPress={() => { void removeSelected(); }} /> : null}
+        {stationAccounts.length < 8 ? <NativeButton title="" symbol="plus" compact accessibilityLabel={translate("relay.addAccount")} busy={pendingAction === "add"} disabled={controlsBusy && pendingAction !== "add"} style={styles.panelActionButton} onPress={() => { void beginAddLogin(); }} /> : null}
+        {selected ? <NativeButton title="" symbol="minus" compact destructive accessibilityLabel={translate("relay.removeLocal")} busy={pendingAction === "remove"} disabled={controlsBusy && pendingAction !== "remove"} style={styles.panelActionButton} onPress={() => { void removeSelected(); }} /> : null}
       </>}
       columns={[{ label: translate("relay.accounts"), width: accountColumnWidth }, { label: translate("providers.authStatus"), width: statusColumnWidth }, { label: translate("relay.balance"), width: balanceColumnWidth }]}
       rows={accountRows}
@@ -1656,7 +1677,7 @@ export function StationAccountsPanel({
             collapsed to a sliver. */}
         <NativeButton
           title={accountDisplayName(selected, translate)}
-          toolTip={translate("relay.openDashboard")}
+
           accessibilityLabel={translate("relay.openDashboard")}
           compact
           link
@@ -1672,7 +1693,7 @@ export function StationAccountsPanel({
             back; a verified account never needed it. */}
         {selectedLoginState === "signed_out" ? <NativeButton title={translate("relay.goLogin")} compact busy={pendingAction === "login"} disabled={controlsBusy && pendingAction !== "login"} onPress={() => { void loginSelected(); }} /> : null}
         {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.refreshResources")} symbol="refresh" compact busy={pendingAction === "refresh"} disabled={controlsBusy && pendingAction !== "refresh"} onPress={() => { void refreshSelected(); }} /> : null}
-        {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.groupManager")} titleWidth="tight" compact toolTip={native.showGroupManager ? undefined : translate("relay.groupManagerUnavailable")} disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} /> : null}
+        {selectedLoginState === "signed_in" ? <NativeButton title={translate("relay.groupManager")} titleWidth="tight" compact accessibilityLabel={native.showGroupManager ? translate("relay.groupManager") : translate("relay.groupManagerUnavailable")} disabled={controlsBusy || !native.showGroupManager} onPress={() => { void openGroupManager(); }} /> : null}
       </View>
     </View> : null}
   </View>;
@@ -1697,6 +1718,19 @@ export function accountKeyPrefix(account: RelayAccount, translate: Translate): s
   return at > 0 ? base.slice(0, at) : base;
 }
 
+/**
+ * 账号/名字: the one spelling every key row in this app uses.
+ *
+ * The key table, a row's live rename draft, and a slot the station no longer
+ * lists all read `账号/分组`.  Each used to compose the two halves itself, so a
+ * surface could carry the account and another could drop it -- a dropped slot
+ * then read `grok` beside `xmfwhu/grok` as though the provider held two keys.
+ * The composition lives here so "who does this key belong to" has one answer.
+ */
+export function providedKeyLabel(account: RelayAccount, name: string, translate: Translate): string {
+  return `${accountKeyPrefix(account, translate)}/${name}`;
+}
+
 export function providedKeyRows(accounts: RelayAccount[], translate: Translate): ProvidedKeyRow[] {
   return accounts.flatMap((account) => (account.autoGrouping
     ? account.resources.filter((resource) => !resourceAutoGroupingUnavailable(resource, account.groups))
@@ -1706,8 +1740,9 @@ export function providedKeyRows(accounts: RelayAccount[], translate: Translate):
     account,
     resource,
     keyName: resource.apiName || resource.name,
-    // Relay keys display uniformly as 账号名（邮箱取前缀）/分组名.
-    label: `${accountKeyPrefix(account, translate)}/${resourceGroupName(resource, account.groups, translate)}`,
+    // Relay keys display uniformly as 账号名（邮箱取前缀）/分组名, with the
+    // ungrouped case settled in providedKeyName.
+    label: providedKeyLabel(account, providedKeyName(resource, account.groups, translate), translate),
     accountLabel: accountDisplayName(account, translate),
     group: resourceGroupName(resource, account.groups, translate),
     unavailable: resourceGroupUnavailable(resource, account.groups),

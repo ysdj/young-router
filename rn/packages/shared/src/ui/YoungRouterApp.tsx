@@ -8,7 +8,9 @@ import { canonicalWindowRoute, isSettingsPaneRoute, isSettingsShellRoute, LOG_TA
 import { NativeButton, NativeBusySpinner, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeRadio, NativeSecureTextInput, NativeSegmentedControl, NativeTable, NativeTextField, NativeToggle, WINDOWS_CONTROL, nativeControlTextWidth } from "./NativeControls";
 import { CodeEditorWebView, editorMenuLabels, readOnlyCodeEditorHtml, type CodeEditorLanguage } from "./code-editor/CodeEditorWebView";
 import { modelGroupRowKey, modelIDFromRowKey, modelRowKey } from "./modelRowKeys";
+import { orderedModelGroupIDs } from "./modelGroupOrder";
 import { displayUpstreamModel, groupRoutesByPublicModel, importNeedsNameCase, publicModelKey } from "./publicModelNames";
+import { apiKeyDisplayName, providerKeyChoiceLabel, relaySourceName } from "./providerKeyLabels";
 import { AccountsTable } from "./AccountsTable";
 import { usePendingAction } from "./pendingAction";
 import {
@@ -19,6 +21,8 @@ import {
   NativeFormRow,
   NativeWizardProgress,
   normalizeRelayOrigin,
+  providedKeyLabel,
+  providedKeyName,
   providedKeyRows,
   type ProvidedKeyRow,
   pendingCredentialCleanups,
@@ -803,10 +807,81 @@ function pruneStringDrafts(drafts: Record<string, string>, keep: (key: string, v
   return next;
 }
 // React Native macOS supports `tooltip` on Text, but its published TypeScript
-// declaration has not caught up with that native prop. Keep the cast narrow so
-// the probe status has a short native hover hint; the full result opens in the
-// shared read-only code viewer.
-const TooltipText = Text as unknown as React.ComponentType<React.ComponentProps<typeof Text> & { tooltip?: string }>;
+// declaration has not caught up with that native prop. Keep the cast narrow: it
+// is the one place a text is allowed to state a hover hint.
+const NativeTipText = Text as unknown as React.ComponentType<React.ComponentProps<typeof Text> & { tooltip?: string }>;
+
+/** The visible text a label holds, for comparing against what it drew. */
+function textContentOf(children: React.ReactNode): string {
+  return React.Children.toArray(children)
+    .map((child) => (typeof child === "string" || typeof child === "number" ? String(child) : ""))
+    .join("");
+}
+
+/**
+ * The offscreen copy a label measures itself against.
+ *
+ * Absolute and unpositioned on the cross axis, which is what leaves Yoga's
+ * `MaxContent` mode in charge: the copy is laid out at the width its text
+ * wants, so the difference between it and the label on screen is exactly the
+ * text the label could not fit.  Invisible, untouchable, and out of the
+ * accessibility tree — it is a measurement, not a second label.
+ */
+const TIP_MEASURE_STYLE: TextStyle = { position: "absolute", left: 0, top: 0, opacity: 0 };
+
+/** The face of a label, without the box it was given.  A copy measured with the
+ *  label's own font is the same words at their natural width; the column the
+ *  label sits in must not travel with it, or the copy would report the column
+ *  and every tip would agree the text fit. */
+function textFaceStyle(style: React.ComponentProps<typeof Text>["style"]): TextStyle {
+  const face = StyleSheet.flatten(style) as TextStyle | undefined;
+  if (!face) return {};
+  const { fontFamily, fontSize, fontWeight, letterSpacing, lineHeight } = face;
+  return { fontFamily, fontSize, fontWeight, letterSpacing, lineHeight };
+}
+
+/**
+ * A text that raises its tip only while it is being cut.
+ *
+ * The hint above a text is about the text, not about the fact that a view
+ * exists: a label the frame can hold has said everything it has, and repeating
+ * it under the pointer is noise.  What earns the tip is an ellipsis — and only
+ * the host knows, because the width a label ends up with is the layout's
+ * business, not the pane's.
+ *
+ * So the label measures itself instead of guessing: one hidden copy is laid out
+ * at its natural width, the label on screen reports the width it was given, and
+ * a natural width the label could not hold is the ellipsis.  A label that wraps
+ * is never cut — it states everything it holds across its lines — and a label
+ * the pane has not laid out yet has no verdict to give, so both keep their
+ * words away from the pointer rather than guessing.
+ */
+function TooltipText({ tooltip, children, style, numberOfLines, onLayout, ...props }: React.ComponentProps<typeof Text> & { tooltip?: string }): React.JSX.Element {
+  const full = textContentOf(children);
+  const [drawn, setDrawn] = useState(0);
+  const [measured, setMeasured] = useState<{ text: string; width: number }>();
+  // A wrapping label carries no tip at all: there is no ellipsis to explain.
+  const single = numberOfLines === 1 && tooltip !== undefined;
+  const natural = measured !== undefined && measured.text === full ? measured.width : undefined;
+  const cut = single && natural !== undefined && drawn > 0 && natural > drawn + 0.5;
+  return <>
+    <NativeTipText
+      {...props}
+      numberOfLines={numberOfLines}
+      style={style}
+      onLayout={single ? (event) => { onLayout?.(event); setDrawn(event.nativeEvent.layout.width); } : onLayout}
+      {...({ tooltip: cut ? tooltip : undefined } as { tooltip?: string })}
+    >{children}</NativeTipText>
+    {single && natural === undefined ? <NativeTipText
+      accessible={false}
+      accessibilityElementsHidden
+      importantForAccessibility="no-hide-descendants"
+      pointerEvents="none"
+      style={[textFaceStyle(style), TIP_MEASURE_STYLE]}
+      onLayout={(event) => setMeasured({ text: full, width: event.nativeEvent.layout.width })}
+    >{children}</NativeTipText> : null}
+  </>;
+}
 
 // Shared dense overrides keep forms and section chrome consistent across all
 // settings surfaces while preserving the page-specific layout styles below.
@@ -1039,6 +1114,16 @@ type RelaySourceOption = {
   resourceLabel: string;
   models: string[];
   enabled: boolean;
+  /**
+   * Whether the station filed this key under no group at all.
+   *
+   * A relay routes a key by its group, so a key with none serves nothing: the
+   * station answers its catalog with an empty list.  That is a fact about the
+   * key, not a failed read, and the model step says so instead of offering an
+   * empty page -- wawapii holds seven such keys, and their names are also the
+   * names of real groups, which is how they were mistaken for grouped ones.
+   */
+  ungrouped: boolean;
   multiplier?: number;
 };
 
@@ -1064,6 +1149,18 @@ type ProviderKeyState = {
 type ProviderKeyChoice = {
   id: string;
   name: string;
+  /**
+   * The account this slot's key belongs to, in the pane's own spelling.
+   *
+   * A relay slot is labeled ``账号/分组``.  That prefix used to come from the
+   * account's *resources* -- it was drawn only while the matching station key
+   * sat in the snapshot -- so the moment a sign-in cleared them (or a read
+   * failed) the same slot fell back to its bare name: the group alone, beside
+   * the account-prefixed copy of itself, as if the provider held two keys.
+   * The prefix is a property of the account, not of a successful read, so it
+   * travels with the slot instead.
+   */
+  accountPrefix?: string;
   /** ``account`` is a signed-in login: it is asked as that account, not by key. */
   kind: "independent" | "relay" | "account";
   /**
@@ -1142,6 +1239,43 @@ function modelCredential(
   return credentials.find((credential) => credential.accountRef === accountRef);
 }
 
+/**
+ * The name a relay account is known by inside a key label: its station
+ * username, collapsed to the local part before the `@`.
+ *
+ * One derivation for every surface that spells `账号/分组` -- the key table, the
+ * provided-key pickers, and the slot labels that outlive their station read.
+ * Two spellings of the same account is how a slot read `xmfwhu/grok` in the
+ * picker and `grok` in the table right beside it.
+ */
+function relayAccountLabel(account: UnknownRecord): string {
+  const username = stringValue(account.username).trim();
+  if (username) return username.split("@", 1)[0].trim() || username;
+  return stringValue(account.label, stringValue(account.id)).trim();
+}
+
+/**
+ * Every account's key-label prefix, whether or not its key list is readable.
+ *
+ * A relay slot is labeled ``账号/分组``, and the prefix used to be drawn from the
+ * account's *resources*: while a read had succeeded, every slot had a source to
+ * match and the label was complete; the moment a sign-in cleared the list (or a
+ * read failed) the same slot fell back to its bare name -- the group alone --
+ * so the picker listed `grok` next to `xmfwhu/grok` as if they were two keys.
+ * The account outlives every read, so the prefix is derived from the account.
+ */
+function relayAccountPrefixes(snapshot: CoreSnapshot | undefined): Map<string, string> {
+  const relay = domainState(snapshot, "relay_accounts");
+  const prefixes = new Map<string, string>();
+  for (const account of asRecords(relay.accounts)) {
+    const id = stringValue(account.id);
+    if (!id) continue;
+    const label = relayAccountLabel(account) || id;
+    prefixes.set(id, label);
+  }
+  return prefixes;
+}
+
 function relaySourcesFromSnapshot(snapshot: CoreSnapshot | undefined): RelaySourceOption[] {
   const relay = domainState(snapshot, "relay_accounts");
   const accounts = asRecords(relay.accounts);
@@ -1157,7 +1291,7 @@ function relaySourcesFromSnapshot(snapshot: CoreSnapshot | undefined): RelaySour
     const stationLabel = station?.label || stringValue(account.station_name, stringValue(account.origin, stationID));
     const stationOrigin = station?.origin || stringValue(account.origin);
     const username = stringValue(account.username).trim();
-    const accountLabel = username ? username.split("@", 1)[0].trim() || username : stringValue(account.label, accountID).trim();
+    const accountLabel = relayAccountLabel(account);
     const groups = new Map(asRecords(account.groups).map((group) => [stringValue(group.id), numberValue(group.multiplier, Number.NaN)]));
     const resources = asRecords(Array.isArray(account.resources) ? account.resources : account.api_keys);
     return resources.flatMap((resource) => {
@@ -1174,6 +1308,7 @@ function relaySourcesFromSnapshot(snapshot: CoreSnapshot | undefined): RelaySour
         resourceLabel: stringValue(resource.api_name, stringValue(resource.name, resourceID)),
         models: stringList(resource.models),
         enabled: resource.enabled !== false,
+        ungrouped: !stringValue(resource.group_id, stringValue(resource.group_name)).trim(),
         ...(Number.isFinite(multiplier) ? { multiplier } : {}),
       }];
     });
@@ -1257,7 +1392,7 @@ function relaySourcesForProvider(provider: UnknownRecord, relaySources: RelaySou
   return target ? relaySources.filter((source) => stationOriginKey(source.baseURL) === target) : [];
 }
 
-function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[]): ProviderKeyChoice[] {
+function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOption[], accountPrefixes?: Map<string, string>): ProviderKeyChoice[] {
   // Neither a relay-bound slot nor one Core owns is a credential the user may
   // pick, name, or replace, and a station resource is the same credential as
   // the slot that names it.  Both readings live in one derivation
@@ -1272,22 +1407,18 @@ function providerKeyChoices(provider: UnknownRecord, relaySources: RelaySourceOp
     accountID: source.accountID,
     resourceID: source.resourceID,
     name: source.resourceLabel,
-  }))).map((entry) => ({
-    id: entry.slotID ?? `relay:${entry.key}`,
-    name: entry.name,
-    kind: entry.kind,
-    credentialKey: entry.key,
-    state: entry.slotID === undefined ? undefined : stateByID.get(entry.slotID),
-    source: entry.resource === undefined ? undefined : sourceByKey.get(entry.key),
-  }));
-}
-
-function providerKeyChoiceLabel(choice: Pick<ProviderKeyChoice, "name" | "kind" | "source">, translate: Translate): string {
-  const name = apiKeyDisplayName(choice.name, translate);
-  if (choice.kind !== "relay") return name;
-  const sourceName = relaySourceName(choice.source) || name;
-  const multiplier = choice.source && Number.isFinite(choice.source.multiplier) ? ` (${choice.source.multiplier}x)` : "";
-  return `${sourceName}${multiplier}`;
+  }))).map((entry) => {
+    const state = entry.slotID === undefined ? undefined : stateByID.get(entry.slotID);
+    return {
+      id: entry.slotID ?? `relay:${entry.key}`,
+      name: entry.name,
+      kind: entry.kind,
+      credentialKey: entry.key,
+      state,
+      source: entry.resource === undefined ? undefined : sourceByKey.get(entry.key),
+      ...(state && state.source.kind === "relay" ? { accountPrefix: accountPrefixes?.get(state.source.accountID) } : {}),
+    };
+  });
 }
 
 function modelOrderMode(model: UnknownRecord): "manual" | "relay_multiplier" {
@@ -1314,15 +1445,6 @@ function modelProviderKeyState(model: UnknownRecord | undefined, provider: Unkno
   if (byID) return byID;
   const byName = keyStates.filter((entry) => entry.name === keyName && keyName !== "");
   return byName.length === 1 ? byName[0] : undefined;
-}
-
-function relaySourceName(source: RelaySourceOption | undefined): string {
-  // Relay keys are named by the account and the group they belong to
-  // (`account/GroupName`): the provider's own slot name is only the group
-  // name, which reads as a truncated key wherever the account is not already
-  // on screen (the model list's group rows, the routes table, the wizard's
-  // provided-key list).
-  return source ? [source.accountLabel, source.resourceLabel].filter(Boolean).join("/") : "";
 }
 
 /** The name a relay account is known by: its station username first. */
@@ -2099,6 +2221,10 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
       relaySignInLimit: translate("relay.loginRefusedElsewhere"),
       relayBrowserShow: translate("relay.browserShow"),
       relayBrowserWaiting: translate("relay.browserWaiting"),
+      relayRememberPasswordTitle: translate("relay.rememberPasswordTitle"),
+      relayRememberPasswordBody: translate("relay.rememberPasswordBody"),
+      relayRememberPasswordKeep: translate("relay.rememberPasswordKeep"),
+      relayRememberSessionOnly: translate("relay.rememberSessionOnly"),
       relayBrowserUnavailable: translate("relay.browserUnavailable"),
       relayBrowserLaunchFailed: translate("relay.browserLaunchFailed"),
       relaySignInSubmit: translate("relay.login"),
@@ -2468,19 +2594,44 @@ export function YoungRouterApp({ ipc, native, translate: hostTranslate, initialS
  * Below this width the sidebar becomes a route strip above the pane.
  */
 function useCompactWebShell(): boolean {
-  const query = "(max-width: 760px)";
-  const [compact, setCompact] = React.useState<boolean>(() => (
+  return useWebMediaQuery("(max-width: 760px)");
+}
+
+/**
+ * One media query, read once and kept current: the page's own width, as a
+ * boolean a render can branch on.
+ *
+ * A native host has no query to answer — its window has a minimum size that
+ * keeps every pane in the shape its layout was designed for — so the hook
+ * answers false there and the pane draws what it always drew.
+ */
+function useWebMediaQuery(query: string): boolean {
+  const [matches, setMatches] = React.useState<boolean>(() => (
     Platform.OS === "web" && typeof window !== "undefined" && window.matchMedia(query).matches
   ));
   React.useEffect(() => {
     if (Platform.OS !== "web" || typeof window === "undefined") return undefined;
     const media = window.matchMedia(query);
-    const update = (): void => setCompact(media.matches);
+    const update = (): void => setMatches(media.matches);
     update();
     media.addEventListener("change", update);
     return () => media.removeEventListener("change", update);
-  }, []);
-  return compact;
+  }, [query]);
+  return matches;
+}
+
+/**
+ * Whether the providers pane has room for its three columns side by side.
+ *
+ * It needs more than the shell's own breakpoint: the provider list, the model
+ * table and the 320 pt inspector together want about 900 pt.  Below this the
+ * middle table was folded to two truncated columns and the inspector's fields
+ * clipped — the width at which side-by-side stops being a layout and becomes a
+ * crop.  The pane then draws one column: the lists, and a row's inspector in
+ * their place.
+ */
+function useCompactProvidersPane(): boolean {
+  return useWebMediaQuery("(max-width: 1024px)");
 }
 
 /**
@@ -2507,7 +2658,7 @@ function SignOutControl({ native, translate, onSignOut }: {
     title=""
     symbol="power-off"
     compact
-    toolTip={title}
+
     accessibilityLabel={title}
     onPress={onSignOut}
     style={styles.iconButton}
@@ -2809,7 +2960,7 @@ const SETTINGS_FIELD_HELP_INDENT = SETTINGS_FIELD_LEAD + SETTINGS_FIELD_LABEL_WI
  */
 const SETTINGS_PANE_INSET = 24;
 
-function SettingsRail({ rows, selectedKey, onSelectionChange, details, style }: {
+function SettingsRail({ rows, selectedKey, onSelectionChange, details, style, compact }: {
   rows: { key: string; cells: string[] }[];
   selectedKey: string;
   onSelectionChange: (key: string) => void;
@@ -2821,6 +2972,17 @@ function SettingsRail({ rows, selectedKey, onSelectionChange, details, style }: 
   details?: string[];
   /** The caller's own column slot: a rail under a search field fills what is left. */
   style?: StyleProp<ViewStyle>;
+  /**
+   * Whether the pane is one column wide (a phone, a narrow browser split).
+   *
+   * A 200 pt column beside the detail leaves a phone about 160 pt for the
+   * surface it is there to open, which is the width at which every field row
+   * clipped.  The rail becomes a strip of chips above the detail instead: the
+   * same rows, one after another, scrolling sideways when there are more than
+   * the address bar's width holds.  The selection still lives in the caller,
+   * so switching between the two shapes keeps the row the user chose.
+   */
+  compact?: boolean;
 }): React.JSX.Element {
   // The rail draws its one divider and the list inside it draws no box: the
   // rail is a column of the pane, not a list floating in content, so a frame's
@@ -2828,6 +2990,25 @@ function SettingsRail({ rows, selectedKey, onSelectionChange, details, style }: 
   // divider that already states where the column ends.  A source list carries
   // its own selection capsule and row rhythm, which is what tells the rows
   // apart; the rail's single right divider is its only rule.
+  if (compact) {
+    return <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.compactRailScroll} contentContainerStyle={styles.compactRailStrip}>
+      {rows.map((row) => {
+        const selected = row.key === selectedKey;
+        const label = row.cells[0] ?? row.key;
+        return <Pressable
+          key={row.key}
+          onPress={() => onSelectionChange(row.key)}
+          accessibilityRole="tab"
+          accessibilityLabel={label}
+          accessibilityState={{ selected }}
+          aria-selected={selected}
+          style={[styles.compactRailChip, selected && styles.compactRailChipSelected]}
+        >
+          <Text numberOfLines={1} style={[styles.compactRailChipText, selected && styles.compactRailChipTextSelected]}>{label}</Text>
+        </Pressable>;
+      })}
+    </ScrollView>;
+  }
   return <View style={[styles.settingsRail, isWindowsShell && styles.settingsRailWindows, style]}>
     <NativeTable
       columns={SETTINGS_RAIL_COLUMNS}
@@ -2884,13 +3065,35 @@ function useImmediateApplyBlocked(): boolean {
 function IconButton({ label, symbol, title, disabled, onPress }: { label: string; symbol?: "chevron-up" | "chevron-down" | "copy" | "minus" | "pause" | "play" | "plus" | "trash"; title: string; disabled?: boolean; onPress: () => void }): React.JSX.Element {
   const nativeSymbol: "chevron-up" | "chevron-down" | "copy" | "minus" | "pause" | "play" | "plus" | "trash" | undefined = symbol
     ?? (label === "+" ? "plus" : label === "−" ? "minus" : label === "⧉" ? "copy" : label === "↑" ? "chevron-up" : label === "↓" ? "chevron-down" : undefined);
-  return <NativeButton title={label} symbol={nativeSymbol} toolTip={title} accessibilityLabel={title} compact disabled={disabled} onPress={onPress} style={styles.iconButton} />;
+  return <NativeButton title={label} symbol={nativeSymbol} accessibilityLabel={title} compact disabled={disabled} onPress={onPress} style={styles.iconButton} />;
 }
 
 function WindowTabs({ values, selected, disabled, onSelect, style, nativeRef }: { values: Array<{ id: string; title: string }>; selected: string; disabled?: boolean; onSelect: (id: string) => void; style?: StyleProp<ViewStyle>; nativeRef?: React.Ref<HostInstance> }): React.JSX.Element {
   const labels = values.map((item) => item.title);
   const selectedValue = values.find((item) => item.id === selected)?.title ?? labels[0] ?? "";
   return <NativeSegmentedControl ref={nativeRef} labels={labels} selectedValue={selectedValue} disabled={disabled} overlayLayer={Boolean(nativeRef)} onChange={({ nativeEvent }) => { const next = values[nativeEvent.index]; if (next) onSelect(next.id); }} style={[styles.windowTabs, style]} />;
+}
+
+/**
+ * The bar a one-column pane's detail wears instead of the column it was opened
+ * from — the way back to the list, and the name of the row it belongs to.
+ *
+ * A native window shows the list and the inspector side by side, so leaving a
+ * row is pressing another one.  A phone has no second column to put beside the
+ * list: the row opens the inspector in the list's place, and without this bar
+ * the address bar's Back would be the only way out of it.  It carries the
+ * row's own name too, because the inspector's header starts below it and the
+ * pane would otherwise read as a page the user never asked for.
+ */
+function CompactDetailBar({ title, onBack, translate }: { title: string; onBack: () => void; translate: Translate }): React.JSX.Element {
+  const backLabel = translate("common.back");
+  return <View style={styles.compactDetailBar}>
+    <Pressable accessibilityRole="button" accessibilityLabel={backLabel} onPress={onBack} hitSlop={8} style={styles.compactDetailBack}>
+      <Text style={styles.compactDetailBackText}>{"\u2039"}</Text>
+      <Text style={styles.compactDetailBackText}>{backLabel}</Text>
+    </Pressable>
+    <Text numberOfLines={1} style={styles.compactDetailTitle}>{title}</Text>
+  </View>;
 }
 
 function RouteSurface({ route, shell = false, initialClient, windowRoute, snapshot, ipc, native, translate, logTabRequest, fileIdRequest, nativeAction, eventChannel, onSnapshot, onNavigate, onClose, onRegisterFlush }: { route: AppRoute; shell?: boolean; initialClient?: ClientFile["client"]; windowRoute?: AppRoute; snapshot?: CoreSnapshot; ipc: IpcClient; native: NativeLeafAdapter; translate: Translate; logTabRequest?: LogTab; fileIdRequest?: string; nativeAction?: { id: string; sequence: number }; eventChannel: React.MutableRefObject<EventChannelState>; onSnapshot: (next: CoreSnapshot) => void; onNavigate: (route: AppRoute) => void; onClose: () => void; onRegisterFlush?: (flush?: () => Promise<boolean>) => void }): React.JSX.Element {
@@ -4391,7 +4594,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     {route === "providers-models" || route === "provider-wizard" || route === "file-editor" || route === "webdav-settings" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, (route === "provider-wizard" || route === "webdav-settings") && styles.childRouteContent, (settingsRoute || route === "runtime-settings" || route === "data-management" || route === "general-settings") && SETTINGS_PANE_ROUTE, route === "logs" && styles.logsContent]}>
     {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} applyStagedQuietly={applyStagedQuietly} onOpenWizard={() => { native.window.open("provider-wizard"); native.window.focus("provider-wizard"); }} relay={relayBridge} /> : null}
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
-    {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onStatus={setResult} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} status={result} /> : null}
+    {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
     {route === "webdav-settings" ? <WebDavSettingsPanel snapshot={snapshot} busy={busy} status={dataManagementStatuses.webdav} translate={translate} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onProbe={probeWebDavDetails} onSave={saveWebDavDetails} onSync={syncWebDavAndReadState} onCompareConflict={compareWebDavConflict} onResolveConflict={resolveWebDavConflictAndReadState} onSetContentSize={(width, height) => { void native.window.setContentSize?.("webdav-settings", width, height); }} onClose={closeRoute} /> : null}
     {settingsRoute ? <AssistantSettingsWorkspace initialClient={initialClient} busy={busy} native={native} codexModels={codexModelRows} codexModelCatalogEnabled={codexModelCatalogEnabled} codexRoute={codexDesignatedRoute ? { model: stringValue(codexDesignatedRoute.model), provider: stringValue(codexDesignatedRoute.provider), deployment_id: stringValue(codexDesignatedRoute.deployment_id), label: clientRouteLabel(stringValue(codexDesignatedRoute.provider), stringValue(codexDesignatedRoute.model)) } : undefined} standaloneSearch={codexStandaloneSearch} onToggleStandaloneSearch={(enabled) => dispatch("codex.search.set", { enabled }, "codex")} codexFeatures={(domainState(snapshot, "codex").structured as UnknownRecord | undefined)?.features as UnknownRecord | undefined} clientProvider={codexClientProvider} clientModel={codexClientModel} localApiActive={codexUsesLocalApi} onToggleCodexModelCatalog={(enabled) => dispatch("codex.model_catalog.set", { enabled }, "codex")} onToggleCodexFeature={(feature, enabled) => dispatch("codex.feature.set", { feature, enabled }, "codex")} onUseLocalApi={(selection) => dispatch("use_local_api", selection, "codex")} onUseSavedModel={(selection) => dispatch("use_saved_model", selection, "codex")} claudeClients={{ claudeCode: asRecord(claudeClients.claudeCode), claudeDesktop: asRecord(claudeClients.claudeDesktop) }} claudeDesktopAvailable={asRecord(claudeState.desktop).available !== false} claudeModels={claudeModelRows} onClaudeUseLocalApi={(app, selection) => dispatch("use_local_api", { ...selection, client: app }, "claude")} onClaudeUseSavedModel={(app, selection) => dispatch("use_saved_model", { ...selection, client: app }, "claude")} onToggleClaudeModelList={(app, enabled) => dispatch("claude.models.set", { client: app, enabled }, "claude")} onToggleClaudeNonstreamFallback={(enabled) => dispatch("claude.nonstream_fallback.set", { enabled }, "claude")} onToggleClaudeAutoMode={(enabled) => dispatch("claude.auto_mode.set", { enabled }, "claude")} onToggleClaudeAutoMemory={(enabled) => dispatch("claude.auto_memory.set", { enabled }, "claude")} translate={translate} ipc={ipc} filesToken={settingsRawBaselineToken} onOpenFile={openAssistantFile} onStatus={setResult} /> : null}
     {route === "logs" ? <LogsWorkspace snapshot={snapshot} ipc={ipc} native={native} busy={busy} translate={translate} dispatch={dispatch} onStatus={setResult} onStatusBar={setStatusBarControls} requestedTab={nativeAction?.id === "open-recovery" ? "recovery" : logTabRequest} requestedTabKey={nativeAction?.sequence ?? 0} /> : null}
@@ -4453,6 +4656,21 @@ type ServiceProviderKind = "openai_login" | "workbuddy_login" | "workbuddy_globa
  * create answered from, and a lookup that filtered by kind would report a
  * create it never saw as "nothing happened".
  */
+/**
+ * The rows a snapshot gained for one provider since `known` was read.
+ *
+ * The pane selects the first of them, and the import answers the chooser with
+ * whether there was one at all: a pick Core skipped as already present is not a
+ * failed write, and it is not a new row either.
+ */
+function appearedModelIDs(snapshot: CoreSnapshot | undefined, providerID: string, known: ReadonlySet<string>): string[] {
+  const target = snapshotProviderRecords(snapshot).find((entry) => editorIdentifier(entry) === providerID);
+  if (!target) return [];
+  return asRecords(target.models)
+    .map(modelRecord)
+    .map((entry) => editorIdentifier(entry))
+    .filter((id) => !known.has(id));
+}
 function snapshotProviderRecords(snapshot: CoreSnapshot | undefined): UnknownRecord[] {
   const state = domainState(snapshot, "providers_models");
   const details = asRecords(state.providers);
@@ -4502,7 +4720,7 @@ function nextServiceProviderName(providers: UnknownRecord[], kind: ServiceProvid
   return `${base} ${suffix}`;
 }
 
-function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayStations, busy, translate, dispatchWithOutcome, onSecretState, onStatus, onClose, onKeyToken, relay, addOfficialAccount, status }: { snapshot?: CoreSnapshot; native: NativeLeafAdapter; providers: UnknownRecord[]; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onStatus: (status?: string) => void; onClose: () => void; onKeyToken: (token: string) => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind, name?: string) => Promise<string>; /** The window's own result: a child window keeps no strip, so its footer states it. */ status?: string }): React.JSX.Element {
+function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayStations, busy, translate, dispatchWithOutcome, onSecretState, onClose, onKeyToken, relay, addOfficialAccount }: { snapshot?: CoreSnapshot; native: NativeLeafAdapter; providers: UnknownRecord[]; relaySources: RelaySourceOption[]; relayStations: RelayStationOption[]; busy: boolean; translate: Translate; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onSecretState: (state: SecretState) => void; onClose: () => void; onKeyToken: (token: string) => void; relay: RelayWorkspaceBridge; addOfficialAccount: (kind: ServiceProviderKind, name?: string) => Promise<string> }): React.JSX.Element {
   type WizardStep = "provider" | "keys" | "model";
   type WizardType = "api" | "openai" | "workbuddy" | "workbuddyGlobal" | "qoder" | "qoderGlobal" | "ourFreeModel" | "ourFreeModelKilo";
   const [step, setStep] = useState<WizardStep>("provider");
@@ -4555,7 +4773,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // group layout is another station-sized wait, and it happens after the sign-in
   // panel is gone — the key area states it instead of drawing an empty list.
   const [autoGroupingBusy, setAutoGroupingBusy] = useState(false);
-  const loginFeedback = useRef<string | undefined>(undefined);
+  const loginFailure = useRef<string | undefined>(undefined);
   const [, forceLoginFeedbackRender] = useState(0);
   const setupLoginRequest = useRef(0);
   const [signedInAccountID, setSignedInAccountID] = useState<string>();
@@ -4615,6 +4833,13 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const [manualModels, setManualModels] = useState<Array<{ id: string; name: string; upstream_model: string }>>([]);
   const [selectedManualModelIDs, setSelectedManualModelIDs] = useState<string[]>([]);
   const [modelFetchState, setModelFetchState] = useState<"idle" | "loading" | "ready" | "empty" | "unavailable">("idle");
+  // A provided key whose models the snapshot files as empty: the step asks the
+  // station for that key once when it opens, and then stops asking.  The read
+  // is the account's resource read -- the same one the key table's 刷新 pays --
+  // because a provider this wizard is still creating has no address for
+  // 获取模型 to ask through, and the station key is what the roster belongs to.
+  const [providedModelsRead, setProvidedModelsRead] = useState<{ identity: string; state: "idle" | "loading" | "failed" }>({ identity: "", state: "idle" });
+  const providedModelsReadFor = useRef("");
   const modelFetchRequest = useRef(0);
   // One listing owns the step at a time.  This is a ref rather than
   // `modelFetchState` so a caller that just set that state still reads the
@@ -4636,14 +4861,12 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // reads its state and never asks for a credential of its own.
   const [qoderAccount, setQoderAccount] = useState<UnknownRecord | undefined>(undefined);
   const [qoderBusy, setQoderBusy] = useState(false);
-  // The wizard's one status line: its own validation or feedback, and the wait
-  // while the embedded sign-in page is up.  No step body repeats it.
-  const wizardStatus = validation || loginFeedback.current || (loginPhase === "sign-in" ? translate("relay.loginWorking") : "");
-  // 完成 and every other wizard action report their outcome through the
-  // window's result.  This window renders no strip — its own footer is its one
-  // status line — so a refused create has to land here or the user sees a
-  // press that did nothing at all.
-  const wizardFooterStatus = wizardStatus || status || "";
+  // The footer states a failure and nothing else.  A success printed here
+  // ("登录成功。…", "配置已保存。") outlived the step it described and sat under
+  // every later one, reading as a message about the work on screen; a wait is
+  // drawn by the sign-in surface that owns it.  What is left is the one fact
+  // the screen cannot show by itself: this press did not work, and why.
+  const wizardFooterStatus = validation || loginFailure.current;
   const shownChallenge = useRef<Record<string, string>>({});
   // Whether this wizard itself created the official provider or changed its
   // account.  A zero-model 完成 on an already-signed-in existing provider
@@ -4651,8 +4874,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   // completed sign-in did write something.
   const officialProviderCreated = useRef(false);
   const officialLoginAttempted = useRef(false);
-  const setLoginFeedbackMessage = (message: string | undefined): void => {
-    loginFeedback.current = message;
+  const setLoginFailure = (message: string | undefined): void => {
+    loginFailure.current = message;
     forceLoginFeedbackRender((value) => value + 1);
   };
 
@@ -4798,7 +5021,8 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     if (selectedStationAccount.resourceStatus === "idle") return "relay.resourcesNotLoaded";
     return "providers.wizard.loginNoKeysHint";
   })();
-  const keyChoices = selectedProvider ? providerKeyChoices(selectedProvider, relaySourcesForProvider(selectedProvider, relaySources, activeProviderBaseURL)) : [];
+  const relayAccountPrefixByID = useMemo(() => relayAccountPrefixes(snapshot), [snapshot]);
+  const keyChoices = selectedProvider ? providerKeyChoices(selectedProvider, relaySourcesForProvider(selectedProvider, relaySources, activeProviderBaseURL), relayAccountPrefixByID) : [];
   const keyOptions = [
     { value: PROVIDER_WIZARD_NEW_KEY, label: translate("providers.wizard.addApiKey") },
     ...keyChoices.filter((choice) => choice.kind === "independent").map((choice) => ({ value: choice.id, label: providerKeyChoiceLabel(choice, translate) })),
@@ -4876,6 +5100,39 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     const values = [...(selectedProvidedChoice?.models ?? []), ...fetchedModelCandidates];
     return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
   }, [fetchedModelCandidates, selectedProvidedChoice?.models]);
+  // A provided key whose models the snapshot files as empty: the step asks the
+  // station once for that key, then stops asking.  The read is the account's
+  // resource read — the same one the key table's 刷新 pays — because a provider
+  // this wizard is still creating has no address for 获取模型 to ask through,
+  // and the station key is what the roster belongs to.  "No models" is either
+  // the station's answer or a read that never landed; one read tells them
+  // apart, and the sentence below states whichever it was.
+  const [providedModelsTicket, setProvidedModelsTicket] = useState(0);
+  const providedModelStepIdentity = step === "model" && usingProvidedKeyPath(keyPath) && modelCandidates.length === 0
+    ? `${selectedStationAccountID}\u001f${selectedProvidedChoice?.resourceID ?? ""}`
+    : "";
+  const providedModelsBusy = providedModelsRead.identity === providedModelStepIdentity && providedModelsRead.state === "loading";
+  const providedModelsFailed = providedModelsRead.identity === providedModelStepIdentity && providedModelsRead.state === "failed";
+  useEffect(() => {
+    if (!providedModelStepIdentity || !selectedStationAccount) return;
+    // Once per key per press: the publish that follows a read rebuilds every
+    // array this step reads, and keying the retry on that would be the probe
+    // loop the account pane spent a round removing.
+    if (providedModelsReadFor.current === providedModelStepIdentity) return;
+    providedModelsReadFor.current = providedModelStepIdentity;
+    let live = true;
+    setProvidedModelsRead({ identity: providedModelStepIdentity, state: "loading" });
+    void (async () => {
+      try {
+        const status = await relay.refreshResources(selectedStationAccount.id, { force: true });
+        await relay.refreshAccounts();
+        if (live) setProvidedModelsRead({ identity: providedModelStepIdentity, state: status === "ready" ? "idle" : "failed" });
+      } catch {
+        if (live) setProvidedModelsRead({ identity: providedModelStepIdentity, state: "failed" });
+      }
+    })();
+    return () => { live = false; };
+  }, [providedModelStepIdentity, providedModelsTicket]);
   /** One checkbox, one answer: every roster above toggles the same way. */
   const setModelChecked = (name: string, checked: boolean): void => {
     setSelectedModels((current) => checked
@@ -5149,7 +5406,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     setProviderSelection(PROVIDER_WIZARD_NEW_PROVIDER);
     officialProviderCreated.current = false;
     officialLoginAttempted.current = false;
-    setLoginFeedbackMessage(undefined);
+    setLoginFailure(undefined);
     setKeySelection("");
     setKeyName("");
     resetStagedKeyField();
@@ -5241,7 +5498,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   /** Switch one official service between its web login and a custom key. */
   const chooseOfficialAuthPath = (path: "login" | "manual"): void => {
     setKeyPath(path);
-    setLoginFeedbackMessage(undefined);
+    setLoginFailure(undefined);
     setKeySelection("");
     setKeyName("");
     resetStagedKeyField();
@@ -5256,7 +5513,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     setProviderSelection(value);
     officialProviderCreated.current = false;
     officialLoginAttempted.current = false;
-    setLoginFeedbackMessage(undefined);
+    setLoginFailure(undefined);
     // An existing account-backed entry keeps its own key path: a login
     // provider shows the account, a custom-key entry shows its key.  A relay
     // provider is api_key-authenticated too, but its credential is the
@@ -5284,7 +5541,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     setKeyPath(value === "new" ? (providerType === "api" ? "manual" : "login") : existingKeyPath(firstProvider));
     officialProviderCreated.current = false;
     officialLoginAttempted.current = false;
-    setLoginFeedbackMessage(undefined);
+    setLoginFailure(undefined);
     setKeySelection("");
     setKeyName("");
     resetStagedKeyField();
@@ -5300,7 +5557,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const updateProviderBaseURL = (value: string): void => {
     if (providerType !== "api") return;
     setValidation("");
-    setLoginFeedbackMessage(undefined);
+    setLoginFailure(undefined);
     setProviderBaseURL(value);
     const suggested = suggestedProviderName(value);
     const current = providerName.trim();
@@ -5658,7 +5915,12 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   const importProvidedKey = async (targetProviderID: string, choice: RelaySourceOption): Promise<{ id: string; name: string } | undefined> => {
     const next = await dispatchWithOutcome("provider.import_relay_key", {
       provider_id: targetProviderID,
-      api_key_name: choice.resourceLabel,
+      // The slot is named the way the label reads -- 账号/分组 -- so the key the
+      // document stores carries the account that owns it.  A bare group name
+      // outlives the read that produced it: the slot then read `grok` in the
+      // table while the picker beside it read `xmfwhu/grok`, and the two looked
+      // like two keys.
+      api_key_name: relaySourceName(choice),
       source: {
         kind: "relay",
         station_id: choice.stationID,
@@ -5860,7 +6122,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     if (loginBusy) return;
     const request = ++setupLoginRequest.current;
     setLoginBusy(true);
-    setLoginFeedbackMessage(translate("relay.loginWorking"));
     const candidate = normalizeRelayOrigin(activeProviderBaseURL);
     if (!candidate) {
       setLoginBusy(false);
@@ -5886,13 +6147,13 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       if (reusable) {
         setSignedInAccountID(reusable.id);
         setLoginBusy(false);
-        setLoginFeedbackMessage(undefined);
+        setLoginFailure(undefined);
         return;
       }
       const accountType = await resolveRelayType();
       if (!accountType) {
         setLoginBusy(false);
-        setLoginFeedbackMessage(translate("relay.typeNotDetected"));
+        setLoginFailure(translate("relay.typeNotDetected"));
         return;
       }
       // What this press stores is the station account — a credential of its
@@ -5945,7 +6206,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
         // spinner and one 取消) was the state a sign-in window that closed
         // itself left behind.  The keys step states the failure in its strip.
         setLoginPhase("idle");
-        setLoginFeedbackMessage(translate("relay.loginNotCompleted"));
+        setLoginFailure(translate("relay.loginNotCompleted"));
         setSignedInAccountID((current) => (current === pendingID ? undefined : current));
         return;
       }
@@ -5981,9 +6242,11 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       const refreshedSnapshot = await relay.refreshAccounts().catch(() => undefined);
       const refreshed = refreshedSnapshot ? accountsFromSnapshot(refreshedSnapshot).find((item) => item.id === landedID) : undefined;
       const resourceError = refreshed?.resourceError ?? "none";
-      if (resourceError === "login_expired") setLoginFeedbackMessage(translate("relay.loginSessionExpired"));
-      else if (status !== "ready" && resourceError === "unavailable") setLoginFeedbackMessage(translate("relay.loginResourcesUnavailable"));
-      else setLoginFeedbackMessage(translate("relay.loginComplete"));
+      if (resourceError === "login_expired") setLoginFailure(translate("relay.loginSessionExpired"));
+      else if (status !== "ready" && resourceError === "unavailable") setLoginFailure(translate("relay.loginResourcesUnavailable"));
+      // A verified sign-in states nothing here: the steps below are the answer
+      // to it, and the footer is the place failures are reported.
+      else setLoginFailure(undefined);
       // The post-login choice may have turned 自动分组 on.  The refresh above is
       // the read that layout needs, so this is the moment to stage it; the
       // pane's next Apply settles it with the station.  The staged layout is
@@ -5995,7 +6258,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           await relay.apiKeyActions?.alignAutoGrouping?.(landedID);
           await relay.refreshAccounts();
         } catch {
-          setLoginFeedbackMessage(translate("relay.autoGroupingFailed"));
+          setLoginFailure(translate("relay.autoGroupingFailed"));
         } finally {
           setAutoGroupingBusy(false);
         }
@@ -6004,7 +6267,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       // own step (`commitWizardProvider`), which creates that provider.  A bind
       // here would need a provider this wizard has not made yet.
     } catch {
-      if (request === setupLoginRequest.current) setLoginFeedbackMessage(translate("relay.operationFailed"));
+      if (request === setupLoginRequest.current) setLoginFailure(translate("relay.operationFailed"));
     } finally {
       if (request === setupLoginRequest.current) {
         loginInFlight.current = false;
@@ -6039,9 +6302,9 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     try {
       await relay.refreshResources(selectedStationAccount.id, { force: true });
       await relay.refreshAccounts();
-      setLoginFeedbackMessage(undefined);
+      setLoginFailure(undefined);
     } catch {
-      setLoginFeedbackMessage(translate("relay.resourcesUnavailable"));
+      setLoginFailure(translate("relay.resourcesUnavailable"));
     } finally {
       setResourcesBusy(false);
     }
@@ -6071,7 +6334,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
     loginInFlight.current = false;
     setLoginPhase("idle");
     setLoginBusy(false);
-    setLoginFeedbackMessage(undefined);
+    setLoginFailure(undefined);
     native.cancelRelayLogin();
   };
   const startOfficialLogin = async (): Promise<void> => {
@@ -6351,7 +6614,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           onClose();
           return;
         }
-        onStatus(translate("providers.wizard.complete"));
         onClose();
         return;
       }
@@ -6372,7 +6634,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           })),
         });
         if (!next) return;
-        onStatus(translate("providers.wizard.complete"));
         onClose();
       } finally {
         setProcessing(false);
@@ -6405,7 +6666,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           const created = await commitWizardProvider(importNameCase);
           if (!created) return;
         }
-        onStatus(translate("providers.wizard.complete"));
         onClose();
       } finally {
         setProcessing(false);
@@ -6469,7 +6729,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       }));
       const next = await dispatchWithOutcome("model.add_many", { provider_id: targetProviderID, models: modelPayload });
       if (!next) return;
-      onStatus(translate("providers.wizard.complete"));
       onClose();
     } finally {
       setProcessing(false);
@@ -6500,7 +6759,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       // The key the user signed in for is still theirs to keep: a provider
       // created without routes carries the slot those routes would name.
       if (usingProvidedKeyPath(keyPath) && selectedProvidedChoice && !await importProvidedKey(targetProviderID, selectedProvidedChoice)) return;
-      onStatus(translate("providers.wizard.complete"));
       onClose();
     } catch (reason) {
       setValidation(errorMessage(reason, translate));
@@ -6549,7 +6807,6 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
       const bound = await dispatchWithOutcome("provider.select_relay_station", { provider_id: targetProviderID, station_id: station.id });
       if (!bound) return;
       focusProviderAfterWizard(targetProviderID);
-      onStatus(translate("providers.wizard.complete"));
       onClose();
     } catch (reason) {
       // A create that fails has to say so on this window: the footer belongs
@@ -6563,7 +6820,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
   };
   const goBack = (): void => {
     setValidation("");
-    setLoginFeedbackMessage(undefined);
+    setLoginFailure(undefined);
     if (loginPhase === "sign-in") {
       cancelRelaySignIn();
       return;
@@ -6641,7 +6898,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
             </View>
           </> : <>
             {providerType === "api" ? <NativeFormRow label={translate("providers.wizard.keyPath")}>
-              <NativeSegmentedControl labels={[translate("providers.wizard.pathManual"), translate("providers.wizard.pathLogin")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathLogin") : translate("providers.wizard.pathManual")} disabled={wizardBusy} onChange={({ nativeEvent }) => { setKeyPath(nativeEvent.index === 1 ? "login" : "manual"); setValidation(""); setLoginFeedbackMessage(undefined); }} style={styles.providerWizardModeControl} />
+              <NativeSegmentedControl labels={[translate("providers.wizard.pathManual"), translate("providers.wizard.pathLogin")]} selectedValue={keyPath === "login" ? translate("providers.wizard.pathLogin") : translate("providers.wizard.pathManual")} disabled={wizardBusy} onChange={({ nativeEvent }) => { setKeyPath(nativeEvent.index === 1 ? "login" : "manual"); setValidation(""); setLoginFailure(undefined); }} style={styles.providerWizardModeControl} />
             </NativeFormRow> : null}
             {keyPath === "login" ? <View style={styles.providerWizardKeyPane}>
               <View style={styles.providerWizardKeySection}>
@@ -6682,9 +6939,13 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                     {providedChoices.map((source) => {
                       const value = `relay:${relaySourceSelectionID(source)}`;
                       const multiplier = Number.isFinite(source.multiplier) ? ` (${multiplierSpelling(source.multiplier as number)})` : "";
+                      // A key with no group serves nothing: its own name is the
+                      // label, and the row says why its model step will be empty
+                      // before the user walks into it.
+                      const ungrouped = source.ungrouped ? translate("providers.wizard.providedKeyNoGroup") : "";
                       return <NativeRadio
                         key={value}
-                        label={`${source.resourceLabel || relaySourceName(source)}${multiplier}`}
+                        label={`${source.resourceLabel || relaySourceName(source)}${multiplier}${ungrouped}`}
                         value={(selectedProvidedChoice && `relay:${relaySourceSelectionID(selectedProvidedChoice)}`) === value}
                         disabled={wizardBusy}
                         onValueChange={() => setProvidedKeySelection(value)}
@@ -6851,6 +7112,20 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
                 {modelCandidates.map((name) => <NativeCheckbox key={`discovered:${name}`} label={name} value={selectedModels.includes(name)} disabled={wizardBusy} onValueChange={(checked) => setModelChecked(name, checked)} style={styles.providerWizardModelCheckbox} />)}
               </PersistentScrollView></View>
             </View> : null}
+            {usingProvidedKeyPath(keyPath) && modelCandidates.length === 0 ? <View style={styles.providerWizardModelGroup}>
+              {/* An empty roster names the fact that made it empty: the station
+                  declared no model for this key, or the read that would have
+                  listed them did not land.  A header over nothing was what the
+                  step drew before — a selected key and a blank page. */}
+              {providedModelsBusy ? <NativeBusySpinner label={translate("providers.wizard.fetchingModels")} /> : <>
+                <Text style={styles.providerWizardHint}>{translate(providedModelsFailed
+                  ? "relay.resourcesUnavailable"
+                  : selectedProvidedChoice?.ungrouped
+                    ? "providers.wizard.providedKeyNoGroupModels"
+                    : "providers.wizard.providedKeyNoModels")}</Text>
+                <NativeButton title={translate("providers.wizard.refreshModels")} compact link disabled={wizardBusy} onPress={() => { providedModelsReadFor.current = ""; setProvidedModelsTicket((value) => value + 1); }} />
+              </>}
+            </View> : null}
             {!usingProvidedKeyPath(keyPath) ? <View style={styles.providerWizardModelGroup}>
               <Text style={styles.providerWizardPanelTitle}>{translate("providers.wizard.manualModels")}</Text>
               {manualModels.map((model) => <View key={model.id} style={styles.providerWizardManualModelRow}>
@@ -6880,7 +7155,7 @@ function ProviderSetupWizard({ snapshot, native, providers, relaySources, relayS
           : null}
         {step === "keys" && creatingProvider && !isOfficialLoginType && keyPath === "login" && loginPhase !== "sign-in"
           && (stationForProvider || selectedProvidedChoice || selectedStationAccount)
-          ? <NativeButton title={translate("providers.wizard.saveProviderOnly")} toolTip={translate("providers.wizard.saveProviderOnlyHint")} busy={processing} disabled={wizardBusy && !processing} onPress={() => { void finishProviderOnly(); }} />
+          ? <NativeButton title={translate("providers.wizard.saveProviderOnly")} busy={processing} disabled={wizardBusy && !processing} onPress={() => { void finishProviderOnly(); }} />
           : null}
         {loginPhase === "sign-in"
           ? null
@@ -7117,9 +7392,14 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         baseURL: row.resource.apiBase || account.origin,
         stationLabel: account.stationName || account.origin,
         accountLabel: accountKeyPrefix(account, translate),
-        resourceLabel: row.group,
+        // Same name the key table draws for this row (providedKeyName): the
+        // picker listing `account/未分组` while the row above it read
+        // `account/Gemini-Ultra` was this line re-deriving the label from the
+        // raw group instead of asking for the display name.
+        resourceLabel: providedKeyName(row.resource, account.groups, translate),
         models: row.resource.models,
         enabled: row.resource.enabled,
+        ungrouped: !row.resource.groupID.trim(),
         ...(multiplier === undefined ? {} : { multiplier }),
       };
     })), [selectedStationAccounts, selectedStation, translate]);
@@ -7151,6 +7431,13 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // `preferredFetchKeyID`).
   const selectedModelKeyID = model ? (modelProviderKeyState(model, provider ?? {})?.id ?? "") : "";
   const [viewMode, setViewMode] = useState<"providers" | "routes">("providers");
+  // A phone has one column.  The lists fill it, and a row opens its inspector
+  // in their place; `compactDetail` is that one bit of navigation.  No
+  // selection defaults into it: a provider is selected as soon as one exists,
+  // and opening straight on the editor would hide the models the pane is for.
+  // This pane keeps its own, wider breakpoint (see `useCompactProvidersPane`).
+  const compactWeb = useCompactProvidersPane();
+  const [compactDetail, setCompactDetail] = useState(false);
   const [selectedRoute, setSelectedRoute] = useState<string>();
   // The routes view selects either one route (its model detail) or one public
   // model's group (its own settings surface).
@@ -7210,6 +7497,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // picker with one meaningless name beside 获取模型.
   const providerHoldsNoKey = providerKindSelected === "workbuddy" || providerKindSelected === "workbuddyGlobal"
     || providerKindSelected === "ourFreeModel";
+  const relayAccountPrefixByID = useMemo(() => relayAccountPrefixes(snapshot), [snapshot]);
   const fetchKeyChoices = useMemo(() => {
     if (!provider) return [];
     // 获取模型 asks one credential for its roster, so the picker lists the
@@ -7226,11 +7514,11 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
             name: providerAuthAccount(account) || translate("providers.authAccount"),
             kind: "account" as const,
           })),
-        ...providerKeyChoices(provider, providerKeySources),
+        ...providerKeyChoices(provider, providerKeySources, relayAccountPrefixByID),
       ];
     }
     if (providerHoldsNoKey) return [];
-    const choices = providerKeyChoices(provider, providerKeySources);
+    const choices = providerKeyChoices(provider, providerKeySources, relayAccountPrefixByID);
     // A service that mints its own slot carries that slot nowhere in the
     // list above, and this row is how a lane is asked for its roster — so a
     // provider whose only key is the one Core owns has to be able to name it
@@ -7240,7 +7528,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (choices.length > 0) return choices;
     const slot = providerKeyStates(provider).find((key) => key.managed && managedServiceForSlot(key.managed, providerAuthKind(provider)));
     return slot ? [{ id: slot.id, name: slot.name, kind: "independent" as const, state: slot }] : [];
-  }, [provider, providerKeySources, providerKindSelected, providerHoldsNoKey]);
+  }, [provider, providerKeySources, relayAccountPrefixByID, providerKindSelected, providerHoldsNoKey]);
   const fetchKeyOptions = useMemo(
     () => fetchKeyChoices.map((choice) => ({
       value: choice.id,
@@ -7409,15 +7697,25 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     }, 1_000);
     return () => clearInterval(timer);
   }, [dispatchWithOutcome, native, providers, translate]);
+  // The previous list of rows, so a vanished selection can land where it was
+  // instead of jumping to the top: see `adjacentSelectionAfterRemoval`.
+  const previousProviderKeys = useRef<string[]>([]);
   useEffect(() => {
+    const keys = providers.map((item) => editorIdentifier(item));
     if (providers.length === 0) {
+      previousProviderKeys.current = keys;
       if (selectedProvider !== undefined) setSelectedProvider(undefined);
       return;
     }
-    if (!providers.some((item) => editorIdentifier(item) === selectedProvider)) {
-      setSelectedProvider(editorIdentifier(providers[0]));
-    }
+    const next = keys.includes(selectedProvider ?? "")
+      ? selectedProvider
+      : adjacentSelectionAfterRemoval(previousProviderKeys.current, keys, selectedProvider ?? "");
+    previousProviderKeys.current = keys;
+    if (next !== undefined && next !== selectedProvider) setSelectedProvider(next);
   }, [providers, selectedProvider]);
+  // The model rows of the list currently on screen, so a deleted model can be
+  // replaced by its neighbour rather than by the list's first row.
+  const previousModelKeys = useRef<{ providerId: string; ids: string[] }>({ providerId: "", ids: [] });
   useEffect(() => {
     const pending = pendingModelIds.current;
     if (pending?.providerId === providerId) {
@@ -7430,8 +7728,18 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         return;
       }
     }
-    if (selectedModel !== undefined && !models.some((item) => editorIdentifier(item) === selectedModel)) {
-      setSelectedModel(undefined);
+    const ids = models.map((item) => editorIdentifier(item));
+    // Switching providers replaces the whole list; that is a new question, not
+    // a deletion, so only a vanished row inside the *same* provider's list is
+    // repaired to its neighbour.
+    const sameList = previousModelKeys.current.providerId === providerId;
+    const next = selectedModel !== undefined && !ids.includes(selectedModel)
+      ? (sameList ? adjacentSelectionAfterRemoval(previousModelKeys.current.ids, ids, selectedModel) : undefined)
+      : selectedModel;
+    previousModelKeys.current = { providerId, ids };
+    if (next !== selectedModel) {
+      setSelectedModel(next);
+      if (next !== undefined) setProviderSourceModel(undefined);
     }
   }, [models, providerId, selectedModel]);
   useEffect(() => {
@@ -7488,6 +7796,82 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     if (key) chooseFetchKey(key.id);
     else if (selectedModel === undefined) chooseFetchKey(undefined);
   }, [selectedModel, selectedModelKeyID, fetchKeyChoices]);
+  /**
+   * Answer the open chooser's 添加: true ends its window, false keeps it.
+   *
+   * A host whose chooser cannot stay up while the pane writes has no
+   * ``finishModelsToAdd``; there the press already took the window down and this
+   * answers nobody, which is what every host did before the hand-over existed.
+   * The next 添加 the person presses comes back as the answer to the false.
+   */
+  const answerModelPick = (status: string, close: boolean): Promise<string[]> =>
+    native.finishModelsToAdd
+      ? native.finishModelsToAdd({ status, close }).then((next) => next ?? []).catch(() => [])
+      : Promise.resolve([]);
+  /**
+   * File the rows a chooser handed over, and answer that chooser.
+   *
+   * The picker is where the person just ticked models, so its window stays up
+   * while the rows are written: 添加 states the wait, the pane selects the first
+   * new row behind it, and only an answer that the rows were saved takes the
+   * window down.  The press used to close the chooser and ask Core with nobody
+   * watching — the row appeared a moment later, when the autosave applied the
+   * draft, with the selection still on whatever had been there before, which
+   * reads as "nothing was added".
+   *
+   * A refused write keeps the window, its ticks and its 添加 for another try, the
+   * same two steps 分组管理 makes.  `offered` is the roster the chooser listed: a
+   * name it never offered is not part of this pick.
+   */
+  const importPickedModels = async (
+    offered: readonly string[],
+    handedOver: readonly string[],
+    write: (models: string[]) => Promise<CoreSnapshot | undefined>,
+  ): Promise<void> => {
+    const roster = new Set(offered);
+    const accepted = (models: readonly string[]): string[] => models.filter(
+      (model, index, all) => roster.has(model) && all.indexOf(model) === index,
+    );
+    let picked = accepted(handedOver);
+    while (picked.length > 0) {
+      // Every attempt names the rows the pane already had, so the selection the
+      // effect makes is the attempt's own new row and never a row an earlier
+      // try added.
+      const known = new Set(models.map(editorIdentifier));
+      pendingModelIds.current = { providerId, ids: known };
+      const next = await write(picked).catch((reason: unknown) => {
+        onStatus(errorMessage(reason, translate));
+        return undefined;
+      });
+      if (!next) {
+        // The dispatch refused and states its own cause in the pane's strip.
+        pendingModelIds.current = undefined;
+        picked = await answerModelPick(translate("common.notApplied"), false);
+        continue;
+      }
+      if (!appearedModelIDs(next, providerId, known).length) {
+        // Core keeps one route per (public name, upstream, key) and skips the
+        // rest of a pick that names rows the provider already carries.  Nothing
+        // appeared, so there is nothing to select and nothing to retry: the
+        // chooser states it and closes.
+        pendingModelIds.current = undefined;
+        await answerModelPick(translate("providers.fetchNothingNew"), true);
+        return;
+      }
+      try {
+        // Saved before the chooser closes: 已保存 is a claim about rows in the
+        // document, not about a draft an autosave may still fail to write.
+        await applyStagedQuietly();
+      } catch (reason) {
+        const message = errorMessage(reason, translate);
+        onStatus(message);
+        picked = await answerModelPick(message, false);
+        continue;
+      }
+      await answerModelPick(translate("common.saved"), true);
+      return;
+    }
+  };
   // The model pane's own listing handler, for a provider whose models are read
   // the generic ``/v1/models`` way.
   const handleFetchedModels = (summary: UnknownRecord, requested?: ProviderKeyChoice): void => {
@@ -7542,35 +7926,24 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     // picker used to be titled with the new key while listing the old key's
     // models, which reads as "I selected this group and got another one".
     const keyName = requested
-      ? providerKeyChoiceLabel({ name: requested.name, kind: requested.kind, source: requested.source }, translate)
+      ? providerKeyChoiceLabel(requested, translate)
       : fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? apiKeyDisplayName(apiKeyName, translate);
     void native.chooseModelsToAdd({ models: candidates, providerName, keyName }).then(async (selection) => {
-      const selectedModels = (selection ?? []).filter((model, index, all) => candidateSet.has(model) && all.indexOf(model) === index);
-      if (selectedModels.length === 0) return;
-      // The spelling this import files is the user's answer, asked once for the
-      // whole pick: a catalog label with upper case in it is a name their
-      // clients would have to type that way (Core files every picked row under
-      // the same answer).
-      const nameCase = await importNameCaseAnswer(native, translate, selectedModels);
-      // The rows this pick creates are new, and the pane selects the first one
-      // the moment Core answers: 获取模型's whole point is to leave the user on
-      // the route they just added, ready to set its public name and order —
-      // previously the pane stayed on whatever row happened to be selected, so
-      // the new model looked like it had not been added at all.
-      pendingModelIds.current = { providerId, ids: new Set(models.map(editorIdentifier)) };
-      // The import's own answer is the snapshot `settlePendingModels` reads to
-      // tell the new rows from the ones the pane already had.  A fire-and-forget
-      // `dispatch` answers `undefined`, which cleared the pending selection
-      // before the rows arrived, so the pane never opened the route it had just
-      // created (the service-catalog path beside this one already asked for the
-      // snapshot).
-      void dispatchWithOutcome("model.add_many", {
-        provider_id: providerId,
-        models: selectedModels.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, imported: true, imported_name_case: nameCase, api_key_name: apiKeyName, ...(apiKeyID ? { provider_key_id: apiKeyID } : {}), enabled: true, order: 0 })).map((model) => ({
-          ...model,
-          ...modelRecordCapabilityChanges(modelCapabilities[model.upstream_model]),
-        })),
-      }, "providers_models").then((next) => { settlePendingModels(next, providerId); }).catch(() => undefined);
+      if (!selection?.length) return;
+      await importPickedModels(candidates, selection, async (picked) => {
+        // The spelling this import files is the user's answer, asked once for the
+        // whole pick: a catalog label with upper case in it is a name their
+        // clients would have to type that way (Core files every picked row under
+        // the same answer).
+        const nameCase = await importNameCaseAnswer(native, translate, picked);
+        return dispatchWithOutcome("model.add_many", {
+          provider_id: providerId,
+          models: picked.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, imported: true, imported_name_case: nameCase, api_key_name: apiKeyName, ...(apiKeyID ? { provider_key_id: apiKeyID } : {}), enabled: true, order: 0 })).map((model) => ({
+            ...model,
+            ...modelRecordCapabilityChanges(modelCapabilities[model.upstream_model]),
+          })),
+        }, "providers_models");
+      });
     }).catch(() => undefined);
   };
   /**
@@ -7616,17 +7989,13 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       providerName: provider ? providerDisplayName(provider) : providerId,
       keyName: providerKeyChoiceLabel({ name: slot?.name ?? stringValue(summary.api_key_name), kind: "independent" }, translate),
     }).then(async (selection) => {
-      const chosen = (selection ?? []).filter((model, index, all) => candidates.includes(model) && all.indexOf(model) === index);
-      if (chosen.length === 0) return;
-      // One spelling decision for the whole pick: the labels are what the user
-      // just read in the chooser, and Core files each row under this answer.
-      const nameCase = await importNameCaseAnswer(native, translate, chosen);
-      // The pick's own rows are what the pane should show afterwards; the same
-      // reason the generic 获取模型 path records them above.
-      pendingModelIds.current = { providerId, ids: new Set(models.map(editorIdentifier)) };
-      void dispatchWithOutcome("model.import_service_catalog", { provider_id: providerId, models: chosen, public_name_case: nameCase })
-        .then((next) => { settlePendingModels(next, providerId); })
-        .catch((reason: unknown) => { onStatus(errorMessage(reason, translate)); });
+      if (!selection?.length) return;
+      await importPickedModels(candidates, selection, async (chosen) => {
+        // One spelling decision for the whole pick: the labels are what the user
+        // just read in the chooser, and Core files each row under this answer.
+        const nameCase = await importNameCaseAnswer(native, translate, chosen);
+        return dispatchWithOutcome("model.import_service_catalog", { provider_id: providerId, models: chosen, public_name_case: nameCase }, "providers_models");
+      });
     }).catch(() => undefined);
   };
   const fetchModels = async (): Promise<void> => {
@@ -7906,15 +8275,26 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   const routeMoveTitleKey = activeRouteGroupUsesMultiplier ? "providers.reorderMultiplierLocked" : undefined;
   const canMoveRouteUp = !activeRouteGroupUsesMultiplier && activeRouteIndex > 0;
   const canMoveRouteDown = !activeRouteGroupUsesMultiplier && activeRouteIndex >= 0 && activeRouteIndex < activeRouteGroup.length - 1;
+  const previousRouteKeys = useRef<string[]>([]);
   useEffect(() => {
     // A public-model row is a selection of its own, so ``selectedRoute`` is
     // empty while one is highlighted.  Anything else is a list that has lost
     // the route it named (deleted, or moved to another provider): it takes the
-    // first row rather than standing with nothing highlighted and an empty
-    // inspector beside it.
-    if (viewMode !== "routes" || routes.length === 0 || selectedPublicModel !== undefined) return;
-    if (routes.some((entry) => entry.key === selectedRoute)) return;
-    setSelectedRoute(routes[0].key);
+    // row that slid into that place, or the one above it -- standing with
+    // nothing highlighted, or jumping to the top of the list, both moved the
+    // person away from the rows they were working in.
+    const keys = routes.map((entry) => entry.key);
+    if (viewMode !== "routes" || routes.length === 0 || selectedPublicModel !== undefined) {
+      previousRouteKeys.current = keys;
+      return;
+    }
+    if (selectedRoute !== undefined && keys.includes(selectedRoute)) {
+      previousRouteKeys.current = keys;
+      return;
+    }
+    const next = adjacentSelectionAfterRemoval(previousRouteKeys.current, keys, selectedRoute ?? "") ?? keys[0];
+    previousRouteKeys.current = keys;
+    setSelectedRoute(next);
   }, [routes, selectedPublicModel, selectedRoute, viewMode]);
   useEffect(() => {
     const pending = pendingRouteKey.current;
@@ -8089,10 +8469,14 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   );
   const modelRows = useMemo(() => {
     // The key name is its own column: one spanning row per key, with that
-    // key's models listed (and indented) underneath it.  A model that belongs
-    // to no key yet — the draft ＋ just created on a provider that has none —
-    // is listed first *without* a group row: filing it under an invented
-    // 未定义密钥 group would present a group the app made up as its route.
+    // key's models listed (and indented) underneath it.  A route that names no
+    // key — the draft ＋ just created on a provider that has none — is listed
+    // under a heading that says so (未定义密钥, the same word the key picker
+    // uses for its own "no key" choice), because a model row drawn above every
+    // heading reads as a route whose key the pane simply forgot to state.  The
+    // heading is not an invented credential: its id is the empty one, which no
+    // slot can carry, so nothing can be filed under it by mistake and no route
+    // is presented as answering with a key the document does not name.
     // One group is one provider key, addressed by its own slot id: a station
     // key and a custom key that read the same are two keys with two groups,
     // and a model is filed under the key it names, never under a namesake.
@@ -8118,6 +8502,10 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     const rows: Array<{ key: string; cells: string[]; spanning?: boolean }> = [];
     const ungrouped: UnknownRecord[] = [];
     const grouped = new Map<string, { label: string; models: UnknownRecord[] }>();
+    // The key table's own order, which is what the groups follow (see
+    // ``orderedModelGroupIDs``): a key's place is the key table's, never a
+    // by-product of which of its routes the document happens to list first.
+    const keyOrder = providerKeyStates(provider ?? {}).map((key) => key.id);
     for (const item of models) {
       // A route of an account-backed row is filed by the credential it answers
       // with, and an account is not a key slot: asking the key first put every
@@ -8163,7 +8551,10 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       // not an entry, and a spanning row is one the native tables refuse to
       // select, which is what keeps a click on the account or the key name
       // inert.
-      for (const item of ungrouped) rows.push({ key: modelRowKey("", editorIdentifier(item)), cells: modelCells(item) });
+      if (ungrouped.length > 0) {
+        rows.push({ key: modelGroupRowKey(""), cells: [translate("providers.undefinedKey")], spanning: true });
+        for (const item of ungrouped) rows.push({ key: modelRowKey("", editorIdentifier(item)), cells: modelCells(item) });
+      }
       for (const credential of modelCredentials) {
         const own = models.filter((item) => modelCredential(item, provider ?? {}, modelCredentials)?.id === credential.id);
         // A heading with nothing under it is not a group, it is an empty row
@@ -8174,8 +8565,13 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       }
       return rows;
     }
-    for (const item of ungrouped) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });
-    for (const [keyID, group] of grouped) {
+    if (ungrouped.length > 0) {
+      rows.push({ key: modelGroupRowKey(""), cells: [translate("providers.undefinedKey")], spanning: true });
+      for (const item of ungrouped) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });
+    }
+    for (const keyID of orderedModelGroupIDs([...grouped.keys()], keyOrder)) {
+      const group = grouped.get(keyID);
+      if (!group) continue;
       rows.push({ key: `key:${keyID}`, cells: [group.label], spanning: true });
       for (const item of group.models) rows.push({ key: editorIdentifier(item), cells: modelCells(item) });
     }
@@ -8228,16 +8624,30 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       return selectedModelRow;
     }
     // One model is one row now, so the list itself says which row that is: the
-    // first one that addresses the model, and no invented group for a route
-    // that names no credential.
+    // first one that addresses the model.  A route that names no credential
+    // sits under the 未定义密钥 heading like any other row of its group.
     const listed = modelRows.find((row) => !row.spanning && modelIDFromRowKey(row.key) === selectedModel);
     return listed ? listed.key : "";
   }, [modelRows, selectedModel, selectedModelRow]);
   // An empty column is not a pane: the inspector is drawn when there is
   // something in it to inspect, and the middle column takes the room otherwise.
-  const showProviderInspector = viewMode === "routes"
+  const inspectorHasContent = viewMode === "routes"
     ? Boolean(activePublicGroup || activeRoute)
     : Boolean(provider || model);
+  const showProviderInspector = inspectorHasContent && (!compactWeb || compactDetail);
+  // The title the one-column detail bar carries: the row this pane was opened
+  // from, named the way the list it came from names it.
+  const compactDetailTitle = viewMode === "routes"
+    ? (activePublicGroup ? activePublicGroup.name : activeRoute ? (activeRoute.publicModel || modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model)) : "")
+    : (model ? modelDisplayName(providerId, model) : provider ? providerDisplayName(provider) : "");
+  // A row that was deleted while its detail was open, or a window widened past
+  // the breakpoint, leaves the pane on the list instead of on an empty frame.
+  useEffect(() => {
+    if (!compactWeb) setCompactDetail(false);
+  }, [compactWeb]);
+  useEffect(() => {
+    if (compactDetail && !inspectorHasContent) setCompactDetail(false);
+  }, [compactDetail, inspectorHasContent]);
   // A click on the provider list is the only way back to the 启用 box a
   // disabled row exists to open, so a dimmed row stays selectable; the table
   // itself is subscribed to the domain, and this callback keeps its identity so
@@ -8345,6 +8755,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   }, [publicModelReturn, selectRoute]);
   const chooseViewMode = (value: "providers" | "routes"): void => {
     if (value === viewMode) return;
+    setCompactDetail(false);
     if (value === "routes" && selectedPublicModel === undefined) {
       const first = routes[0];
       if (first) selectRoute(first.key);
@@ -8377,8 +8788,8 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
     <Text style={styles.providerEmptyTitle}>{translate("providers.unavailableTitle")}</Text>
     <Text style={styles.providerEmptyHint}>{translate("providers.unavailableHint")}</Text>
   </View>;
-  return <ProviderWorkspaceDraftContext.Provider value={providerDraftProjection}><View style={styles.providersLayout}>
-    <View style={styles.providerLeftColumn}>
+  return <ProviderWorkspaceDraftContext.Provider value={providerDraftProjection}><View style={[styles.providersLayout, compactWeb && styles.providersLayoutCompact]}>
+    {compactWeb && compactDetail ? null : <View style={styles.providerLeftColumn}>
       <View style={styles.providerToolbar}>
         <WindowTabs values={[{ id: "providers", title: translate("providers.providers") }, { id: "routes", title: translate("providers.routes") }]} selected={viewMode} onSelect={(value) => chooseViewMode(value as "providers" | "routes")} />
         {/* The wizard is an action, not a third tab: keep it right-aligned so
@@ -8397,7 +8808,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
               first observation landed on a pane with no handler, so the width
               stayed 0 and the columns stayed at their floors.  This node only
               exists in the routes branch, so it is a new node every time. */}
-          <View style={styles.routeTableMeasure} onLayout={({ nativeEvent }) => setRouteTableWidth(nativeEvent.layout.width)}><NativeTable columns={routeTableColumns(routeTableWidth, translate)} rows={routeRows} secondaryRowKeys={offRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact preserveColumnWidths selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => selectRouteTableRow(key)} style={styles.nativeRouteTable} /></View>
+          <View style={styles.routeTableMeasure} onLayout={({ nativeEvent }) => setRouteTableWidth(nativeEvent.layout.width)}><NativeTable columns={routeTableColumns(routeTableWidth, translate)} rows={routeRows} secondaryRowKeys={offRouteKeys} alertRowKeys={alertRouteKeys} selectedKey={selectedPublicModel !== undefined ? routePublicModelRowKey(selectedPublicModel) : (selectedRoute ?? "")} compact preserveColumnWidths selectableSpanningRowKeys={selectableRouteGroupKeys} onSelectionChange={(key) => { selectRouteTableRow(key); if (compactWeb && key) setCompactDetail(true); }} style={styles.nativeRouteTable} /></View>
           {/* The routes table is grouped by public model, so an empty Core and a
               Core whose every group is collapsed both draw a blank table.  Say
               which one this is and what creates the first row, rather than
@@ -8415,23 +8826,23 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
           <ActionButton title={translate("providers.addWizard")} titleWidth="tight" primary disabled={busy} onPress={onOpenWizard} />
         </View>
       </View> : <View style={styles.providerWorkspace}>
-        <View style={styles.providerModelColumns}>
-          <TablePane style={styles.providerListPane} title={translate("providers.providers")} actions={<><IconButton label="+" title={translate("providers.newProvider")} disabled={busy} onPress={addProvider} />{provider ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteProvider} /> : null}</>}>
-            <ProviderListTable translate={translate} selectedProviderId={providerId} providerNameDrafts={providerNameDrafts} validationIssues={validationIssues} onSelect={selectProviderRow} />
+        <View style={[styles.providerModelColumns, compactWeb && styles.providerModelColumnsCompact]}>
+          <TablePane style={[styles.providerListPane, compactWeb && styles.providerListPaneCompact]} title={translate("providers.providers")} actions={<><IconButton label="+" title={translate("providers.newProvider")} disabled={busy} onPress={addProvider} />{provider ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteProvider} /> : null}</>}>
+            <ProviderListTable translate={translate} selectedProviderId={providerId} providerNameDrafts={providerNameDrafts} validationIssues={validationIssues} onSelect={(key) => { selectProviderRow(key); if (compactWeb) setCompactDetail(true); }} />
           </TablePane>
           <View style={styles.providerMiddlePane} onLayout={({ nativeEvent }) => setModelTableWidth(nativeEvent.layout.width)}>
             <TablePane style={[styles.modelListPane]} title={translate("providers.models")} actions={<>{provider ? <IconButton label="+" title={translate("providers.newModel")} disabled={busy} onPress={addModel} /> : null}{model ? <IconButton label="⧉" title={translate("common.copy")} disabled={busy} onPress={duplicateModel} /> : null}{model ? <IconButton label="−" title={translate("common.delete")} disabled={busy} onPress={confirmDeleteModel} /> : null}</>}>
-              <View style={styles.nativeModelTable}><NativeTable columns={modelTableColumns(modelTableWidth, translate)} rows={modelRows} secondaryRowKeys={offModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange={(key) => { if (!key) { /* a click that names no model row leaves the provider — the row these models belong to — as the selection, so the inspector shows it instead of emptying */ setSelectedModel(undefined); setSelectedModelRow(undefined); setProviderSourceModel(undefined); return; } const modelID = modelIDFromRowKey(key); if (modelID === undefined) return; setSelectedModel(modelID); setSelectedModelRow(key); setProviderSourceModel(undefined); }} style={styles.modelTable} /></View>
+              <View style={styles.nativeModelTable}><NativeTable columns={modelTableColumns(modelTableWidth, translate)} rows={modelRows} secondaryRowKeys={offModelKeys} alertRowKeys={alertModelKeys} selectedKey={selectedModelRowKey} compact firstColumnHorizontalPadding={0} preserveColumnWidths onSelectionChange={(key) => { if (!key) { /* a click that names no model row leaves the provider — the row these models belong to — as the selection, so the inspector shows it instead of emptying */ setSelectedModel(undefined); setSelectedModelRow(undefined); setProviderSourceModel(undefined); return; } const modelID = modelIDFromRowKey(key); if (modelID === undefined) return; setSelectedModel(modelID); setSelectedModelRow(key); setProviderSourceModel(undefined); if (compactWeb) setCompactDetail(true); }} style={styles.modelTable} /></View>
               {provider && providerHasModelCredential ? <View style={styles.tableBottomRow}>{fetchKeyChoices.length > 0 ? <NativePicker labels={fetchKeyOptions.length > 0 ? fetchKeyOptions.map((option) => option.label) : [translate("common.default")]} selectedValue={fetchKeyOptions.find((option) => option.value === selectedFetchKey)?.label ?? translate("common.default")} disabled={busy} accessibilityLabel={translate("providers.providerKey")} onChange={({ nativeEvent }) => { const option = fetchKeyOptions[nativeEvent.index]; if (option) chooseFetchKey(option.value); }} style={styles.fetchKeyPicker} /> : null}<ActionButton title={translate("providers.fetch")} busy={fetchModelsBusy} disabled={(busy && !fetchModelsBusy) || (fetchKeyChoices.length > 0 && !selectedFetchKey)} onPress={() => { void fetchModels(); }} /></View> : null}
             </TablePane>
           </View>
         </View>
       </View>}
-    </View>
-    {showProviderInspector ? <View style={styles.providerInspector}>{viewMode === "routes" ? (activePublicGroup ? <PublicModelInspector key={`public:${activePublicGroup.name}`} group={activePublicGroup} modelContexts={modelContexts} backLabel={publicModelReturn?.label} onBackToModel={returnToPublicModelOrigin} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} onRenamed={(next) => { setSelectedPublicModel(next); setSelectedRoute(""); }} /> : activeRoute ? (providerSourceModel ? <ProviderEditor key={`provider:${editorIdentifier(activeRoute.provider)}`} provider={activeRoute.provider} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(editorIdentifier(activeRoute.provider), value)} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} station={stationForProvider(activeRoute.provider)} stationAccounts={stationAccountsFor(activeRoute.provider)} relay={relay} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <ModelInspector key={`model:${editorIdentifier(activeRoute.provider)}:${editorIdentifier(activeRoute.model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(activeRoute.model)} globalConcurrencyLimit={globalConcurrencyLimit} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), probeInputFingerprint(providerBaseURL(activeRoute.provider), modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model), activeRoute.model))} onNameDraftChange={(value) => setModelNameDraft(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), value)} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onOpenPublicModel={() => { // The pane is keyed by the name the routes table groups under, which is
+    </View>}
+    {showProviderInspector ? <View style={[styles.providerInspector, compactWeb && styles.providerInspectorCompact]}>{compactWeb ? <CompactDetailBar title={compactDetailTitle} onBack={() => setCompactDetail(false)} translate={translate} /> : null}{viewMode === "routes" ? (activePublicGroup ? <PublicModelInspector key={`public:${activePublicGroup.name}`} group={activePublicGroup} modelContexts={modelContexts} backLabel={publicModelReturn?.label} onBackToModel={returnToPublicModelOrigin} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} onRenamed={(next) => { setSelectedPublicModel(next); setSelectedRoute(""); }} /> : activeRoute ? (providerSourceModel ? <ProviderEditor key={`provider:${editorIdentifier(activeRoute.provider)}`} provider={activeRoute.provider} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(editorIdentifier(activeRoute.provider), value)} sourceModel={activeRoute.model} onReturnToModel={() => { setProviderSourceModel(undefined); setSelectedModel(editorIdentifier(activeRoute.model)); }} station={stationForProvider(activeRoute.provider)} stationAccounts={stationAccountsFor(activeRoute.provider)} relay={relay} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <ModelInspector key={`model:${editorIdentifier(activeRoute.provider)}:${editorIdentifier(activeRoute.model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={activeRoute.provider} providerId={editorIdentifier(activeRoute.provider)} model={activeRoute.model} relaySources={relaySources} relayAccountPrefixByID={relayAccountPrefixByID} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(activeRoute.model)} globalConcurrencyLimit={globalConcurrencyLimit} {...modelProbeProps(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), probeInputFingerprint(providerBaseURL(activeRoute.provider), modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model), activeRoute.model))} onNameDraftChange={(value) => setModelNameDraft(editorIdentifier(activeRoute.provider), editorIdentifier(activeRoute.model), value)} onProviderClick={() => setProviderSourceModel(editorIdentifier(activeRoute.model))} onOpenPublicModel={() => { // The pane is keyed by the name the routes table groups under, which is
                   // the display name the drafts already project, so 设置 opens that
                   // group's settings even while the name field holds a draft.
-                  const publicModel = activeRoute.publicModel.trim(); if (!publicModel) return; selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: activeRoute.key, label: modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: editorIdentifier(activeRoute.provider), model_id: editorIdentifier(activeRoute.model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(activeRoute.model)); setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`); setProviderSourceModel(undefined); })} />) : <EmptyState message={translate("providers.selectToEdit")} />) : provider && model ? <ModelInspector key={`model:${providerId}:${editorIdentifier(model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={provider} providerId={providerId} model={model} relaySources={relaySources} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(model)} globalConcurrencyLimit={globalConcurrencyLimit} {...modelProbeProps(providerId, editorIdentifier(model), probeInputFingerprint(providerBaseURL(provider), modelUpstreamDisplay(providerId, model), model))} onNameDraftChange={(value) => setModelNameDraft(providerId, editorIdentifier(model), value)} onProviderClick={() => { setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onOpenPublicModel={() => { const publicModel = modelDisplayName(providerId, model).trim(); if (!publicModel) return; const originRouteKey = `${providerId}:${stringValue(model.editor_id, stringValue(model.deployment_id, identifier(model))).trim()}`; setViewMode("routes"); selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: originRouteKey, label: modelUpstreamDisplay(providerId, model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: providerId, model_id: editorIdentifier(model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(model)); setProviderSourceModel(undefined); })} /> : provider ? <ProviderEditor key={`provider:${providerId}`} provider={provider} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(providerId, value)} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} station={selectedStation} stationAccounts={selectedStationAccounts} relay={relay} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <EmptyState message={translate("providers.selectToEdit")} />}</View>
+                  const publicModel = activeRoute.publicModel.trim(); if (!publicModel) return; selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: activeRoute.key, label: modelUpstreamDisplay(editorIdentifier(activeRoute.provider), activeRoute.model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: editorIdentifier(activeRoute.provider), model_id: editorIdentifier(activeRoute.model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(activeRoute.model)); setSelectedRoute(`${destinationProviderId}:${activeRoute.deploymentID}`); setProviderSourceModel(undefined); })} />) : <EmptyState message={translate("providers.selectToEdit")} />) : provider && model ? <ModelInspector key={`model:${providerId}:${editorIdentifier(model)}`} providers={providers} providerLabels={providers.map(providerDisplayName)} provider={provider} providerId={providerId} model={model} relaySources={relaySources} relayAccountPrefixByID={relayAccountPrefixByID} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchSnapshot={dispatchWithOutcome} modelContexts={modelContexts} bindingIssue={bindingIssueFor(model)} globalConcurrencyLimit={globalConcurrencyLimit} {...modelProbeProps(providerId, editorIdentifier(model), probeInputFingerprint(providerBaseURL(provider), modelUpstreamDisplay(providerId, model), model))} onNameDraftChange={(value) => setModelNameDraft(providerId, editorIdentifier(model), value)} onProviderClick={() => { setProviderSourceModel(editorIdentifier(model)); setSelectedModel(undefined); }} onOpenPublicModel={() => { const publicModel = modelDisplayName(providerId, model).trim(); if (!publicModel) return; const originRouteKey = `${providerId}:${stringValue(model.editor_id, stringValue(model.deployment_id, identifier(model))).trim()}`; setViewMode("routes"); selectRouteTableRow(routePublicModelRowKey(publicModel)); setPublicModelReturn({ routeKey: originRouteKey, label: modelUpstreamDisplay(providerId, model) || publicModel }); }} onProviderChange={(destinationProviderId) => dispatch("model.move_provider", { provider_id: providerId, model_id: editorIdentifier(model), destination_provider_id: destinationProviderId }).then(() => { setSelectedProvider(destinationProviderId); setSelectedModel(editorIdentifier(model)); setProviderSourceModel(undefined); })} /> : provider ? <ProviderEditor key={`provider:${providerId}`} provider={provider} relayStations={relayStations} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onNameDraftChange={(value) => setProviderNameDraft(providerId, value)} sourceModel={models.find((item) => editorIdentifier(item) === providerSourceModel)} onReturnToModel={() => { if (providerSourceModel) setSelectedModel(providerSourceModel); setProviderSourceModel(undefined); }} station={selectedStation} stationAccounts={selectedStationAccounts} relay={relay} onStatus={onStatus} language={snapshot?.language ?? "system"} bindingIssues={bindingIssues} snapshotForCleanups={snapshot} /> : <EmptyState message={translate("providers.selectToEdit")} />}</View>
     : null}
     <RelayDialogHost />
   </View></ProviderWorkspaceDraftContext.Provider>;
@@ -8486,9 +8897,22 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
     return entry.kind === "relay" && entry.resource === undefined && slot ? [slot] : [];
   }), [credentialKeys, slotByID]);
   const loginCredentials = credentials ?? [];
+  // Which row the editor column opens on.  Keys this provider actually holds
+  // come first: a freshly added account has none, and the station's own key
+  // list is not this provider's — opening on `providedRows[0]` made a new
+  // provider's 密钥 section show a station key (and its value) as though the
+  // provider carried it, with no account beside it to say where it came from
+  // ("这个无账号名的 Cursor 是什么鬼").  A station key is selected only when
+  // the provider already binds it as a slot -- then it *is* the provider's key.
+  const boundProvidedRows = providedRows.filter((row) => credentialKeys.some(
+    (entry) => entry.kind === "relay" && entry.slotID !== undefined && entry.key === relayCredentialKey(row.account.id, row.resource.id),
+  ));
   const firstSelectable = loginCredentials[0]
     ? `account:${loginCredentials[0].ref}`
-    : customKeys[0] ? `custom:${customKeys[0].id}` : providedRows[0] ? `provided:${providedRows[0].key}` : orphanSlots[0] ? `orphan:${orphanSlots[0].id}` : "";
+    : customKeys[0] ? `custom:${customKeys[0].id}`
+      : boundProvidedRows[0] ? `provided:${boundProvidedRows[0].key}`
+        : orphanSlots[0] ? `orphan:${orphanSlots[0].id}`
+          : providedRows[0] ? `provided:${providedRows[0].key}` : "";
   const [selectedKey, setSelectedKey] = useState<string>(firstSelectable);
   // The key a staged edit is waiting for: a ＋ names the new key by the only
   // identity it has before it exists, while a rename names the slot it edits
@@ -8558,15 +8982,24 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
       if (accountProvidedRows.length === 0 && accountOrphans.length === 0) continue;
       rows.push({ key: `account:${account.id}`, cells: [accountDisplayName(account, translate)], spanning: true });
       for (const row of accountProvidedRows) {
+        // The draft is the key-name half only (that is what the station
+        // rename writes), so the account is still prefixed here: a row that
+        // lost its prefix as soon as somebody typed in the name field read as
+        // this provider's own key ("无账号名的 Cursor").
+        const draft = providedNameDrafts[row.key];
         rows.push({
           key: `provided:${row.key}`,
-          cells: [`\t${providedNameDrafts[row.key] ?? row.label}`],
+          cells: [`\t${draft ? providedKeyLabel(row.account, draft, translate) : row.label}`],
         });
       }
       // The account's own row still names where these keys came from: an
       // orphan is a slot of *this* account whose station answer dropped it.
+      // Its label keeps the account prefix the other rows carry: the slot's
+      // stored name is the station's key name alone, and a list that reads
+      // `xmfwhu/特价 kiro` two rows up beside a bare name here says the two
+      // rows came from different places.
       for (const slot of accountOrphans) {
-        rows.push({ key: `orphan:${slot.id}`, cells: [`\t${slot.name}`] });
+        rows.push({ key: `orphan:${slot.id}`, cells: [`\t${providedKeyLabel(account, slot.name, translate)}`] });
       }
     }
     return rows;
@@ -8637,19 +9070,31 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
       clearInterval(interval);
     };
   }, [autoGrouping, autoGroupingKey]);
+  const previousKeyRowKeys = useRef<string[]>([]);
   useEffect(() => {
     // tableRows keys already carry the custom:/provided: prefix; compare the
     // selection verbatim or every click would snap back to the first row.
-    const valid = new Set(tableRows.filter((row) => !row.spanning).map((row) => row.key));
-    if (valid.has(selectedKey)) return;
-    // An account is a row of this same list, so the repair has to fall back to
-    // one too: the sign-in it lands on is the list's first credential, and a
-    // repair that only knew about keys and station rows kept re-selecting a key
-    // the moment the panel opened on an account — the account stayed listed and
-    // never selected, and its editor column stayed empty.
-    setSelectedKey(loginCredentials[0]
-      ? `account:${loginCredentials[0].ref}`
-      : customKeys[0] ? `custom:${customKeys[0].id}` : providedRows[0] ? `provided:${providedRows[0].key}` : orphanSlots[0] ? `orphan:${orphanSlots[0].id}` : "");
+    const rowKeys = tableRows.filter((row) => !row.spanning).map((row) => row.key);
+    const valid = new Set(rowKeys);
+    if (valid.has(selectedKey)) {
+      previousKeyRowKeys.current = rowKeys;
+      return;
+    }
+    // The row that is gone takes its own place: the key that slid up into it,
+    // or the one above.  A deleted key used to reselect the list's first row,
+    // so the table scrolled back to the top and the editor filled with a
+    // credential nobody had asked for.
+    const adjacent = adjacentSelectionAfterRemoval(previousKeyRowKeys.current, rowKeys, selectedKey);
+    previousKeyRowKeys.current = rowKeys;
+    // An account is a row of this same list, so an empty repair has to fall
+    // back to one too: the sign-in it lands on is the list's first credential,
+    // and a repair that only knew about keys and station rows kept re-selecting
+    // a key the moment the panel opened on an account — the account stayed
+    // listed and never selected, and its editor column stayed empty.
+    setSelectedKey(adjacent
+      ?? (loginCredentials[0]
+        ? `account:${loginCredentials[0].ref}`
+        : customKeys[0] ? `custom:${customKeys[0].id}` : providedRows[0] ? `provided:${providedRows[0].key}` : orphanSlots[0] ? `orphan:${orphanSlots[0].id}` : ""));
   }, [customKeys, loginCredentials, orphanSlots, providedRows, selectedKey, tableRows]);
   const addKey = (): void => {
     if (selectedGroup === "provided" && isRelay) {
@@ -8836,7 +9281,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
         />)}
         {keysEditorField("key-value", translate("providers.keyValue"), <View style={styles.keysEditorValueRow}>
           <View style={styles.keysEditorValueField}><NativeSecretField labelVisible={false} plainText autoCommit label={translate("providers.keyValue")} hint={booleanValue(selectedCustom.configured) ? translate("providers.apiKeySavedHint") : translate("providers.apiKeyInput")} busy={formBusy} domain="providers_models" field="api_key" target={`${providerId}\u001f${selectedCustom.name}`} onSecretState={onSecretState} /></View>
-          <NativeButton title="" symbol="copy" compact disabled={controlsBusy || !booleanValue(selectedCustom.configured)} toolTip={translate("relay.apiKeyCopy")} accessibilityLabel={translate("relay.apiKeyCopy")} onPress={() => {
+          <NativeButton title="" symbol="copy" compact disabled={controlsBusy || !booleanValue(selectedCustom.configured)} accessibilityLabel={translate("relay.apiKeyCopy")} onPress={() => {
             void (async () => {
               try {
                 // A copy that worked says nothing: only a failure is worth a
@@ -8865,11 +9310,11 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
               void runProvidedAction(() => relay.apiKeyActions.update?.(selectedProvided.account.id, selectedProvided.resource.id, name) ?? Promise.resolve(), "relay.apiKeyUpdateStaged");
             }}
           />
-          {/* The field states why it is locked: auto grouping is the station's
-              layout owning the name, and nothing else on this pane draws that
-              switch.  A greyed name with no line beside it read as an input the
-              app had disabled for no reason. */}
-          {selectedProvided.account.autoGrouping ? <Text style={styles.fieldHint}>{translate("providers.keyNameAutoGroupingHint")}</Text> : null}
+          {/* No hint lines here.  This field is one line of a table row, and
+              the two sentences that used to sit under it (why the name is
+              locked, whose key it is) crowded the fields beside it: the account
+              row above already names the station account, so the field states
+              nothing twice. */}
         </>)}
         {keysEditorField("key-value", translate("providers.keyValue"), <NativeSecretField
           labelVisible={false}
@@ -8883,7 +9328,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
           field="api_key"
           target={`${selectedProvided.account.id}:${selectedProvided.resource.id}`}
           onSecretState={onSecretState}
-        />, <NativeButton title="" symbol="copy" compact disabled={controlsBusy || !selectedProvided.resource.keyHint} toolTip={translate("relay.apiKeyCopy")} accessibilityLabel={translate("relay.apiKeyCopy")} onPress={() => {
+        />, <NativeButton title="" symbol="copy" compact disabled={controlsBusy || !selectedProvided.resource.keyHint} accessibilityLabel={translate("relay.apiKeyCopy")} onPress={() => {
           void (async () => {
             try {
               // A copy that worked says nothing: only a failure is worth a word.
@@ -8908,7 +9353,7 @@ function ProviderKeysPanel({ provider, providerId, kind, stationAccounts, native
         />)}
         {keysEditorField("orphan-key-value", translate("providers.keyValue"), <View style={styles.keysEditorValueRow}>
           <View style={styles.keysEditorValueField}><NativeSecretField labelVisible={false} plainText autoCommit disabled label={translate("providers.keyValue")} hint={booleanValue(selectedOrphan.configured) ? translate("common.saved") : translate("common.none")} busy={controlsBusy} domain="providers_models" field="api_key" target={`${providerId}\u001f${selectedOrphan.name}`} onSecretState={onSecretState} /></View>
-          <NativeButton title="" symbol="copy" compact disabled={controlsBusy || !booleanValue(selectedOrphan.configured)} toolTip={translate("relay.apiKeyCopy")} accessibilityLabel={translate("relay.apiKeyCopy")} onPress={() => {
+          <NativeButton title="" symbol="copy" compact disabled={controlsBusy || !booleanValue(selectedOrphan.configured)} accessibilityLabel={translate("relay.apiKeyCopy")} onPress={() => {
             void (async () => {
               try {
                 const copied = await native.copySecret({ domain: "providers_models", field: "api_key", target: `${providerId}\u001f${selectedOrphan.name}` });
@@ -9102,12 +9547,13 @@ function PublicModelInspector({ group, modelContexts, backLabel, busy, translate
         route count beside the title is not part of it — the table beside the
         pane already lists those rows, and the number only squeezed the name the
         pane is editing out of it.  The return link states its action in its own
-        two words and names the model it returns to in its tooltip: the pane is
-        320 pt wide, and the full sentence as a label took the width the title
-        needs for the record it shows. */}
+        two words and names the model it returns to for assistive tech: the pane
+        is 320 pt wide, and the full sentence as a label took the width the title
+        needs for the record it shows.  A button states no hover tip, so the
+        sentence is its accessible name rather than a hint under the pointer. */}
     <View style={styles.providerEditorHeader}>
       <Text numberOfLines={1} style={styles.providerEditorHeading}>{group.name}</Text>
-      {backLabel && onBackToModel ? <NativeButton title={translate("providers.backToModelShort")} toolTip={translate("providers.backToModel", { model: backLabel })} link disabled={busy} onPress={onBackToModel} style={styles.providerReturnToModel} /> : null}
+      {backLabel && onBackToModel ? <NativeButton title={translate("providers.backToModelShort")} accessibilityLabel={translate("providers.backToModel", { model: backLabel })} link disabled={busy} onPress={onBackToModel} style={styles.providerReturnToModel} /> : null}
     </View>
     <View style={styles.inspectorDivider} />
     <View style={styles.inspectorBody}>
@@ -9121,7 +9567,7 @@ function PublicModelInspector({ group, modelContexts, backLabel, busy, translate
   </View>;
 }
 
-function ModelInspector({ providers, providerLabels, provider, providerId, model, relaySources, native, busy, translate, dispatch, probe, probeKind, probing, probeResult, modelContexts, globalConcurrencyLimit, bindingIssue, onNameDraftChange, onProviderClick, onProviderChange, onOpenPublicModel, dispatchSnapshot }: { providers: UnknownRecord[]; providerLabels: string[]; provider: UnknownRecord; providerId: string; model: UnknownRecord; relaySources: RelaySourceOption[]; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; probe: () => void; probeKind: (kind: ProbeKind) => void; probing: boolean; probeResult?: IpcResults["probe"] | null; modelContexts?: UnknownRecord; globalConcurrencyLimit?: number; bindingIssue?: UnknownRecord; onNameDraftChange?: (name: string) => void; onProviderClick: () => void; onProviderChange: (providerId: string) => void; onOpenPublicModel?: () => void; dispatchSnapshot: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined> }): React.JSX.Element {
+function ModelInspector({ providers, providerLabels, provider, providerId, model, relaySources, relayAccountPrefixByID, native, busy, translate, dispatch, probe, probeKind, probing, probeResult, modelContexts, globalConcurrencyLimit, bindingIssue, onNameDraftChange, onProviderClick, onProviderChange, onOpenPublicModel, dispatchSnapshot }: { providers: UnknownRecord[]; providerLabels: string[]; provider: UnknownRecord; providerId: string; model: UnknownRecord; relaySources: RelaySourceOption[]; relayAccountPrefixByID: Map<string, string>; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; probe: () => void; probeKind: (kind: ProbeKind) => void; probing: boolean; probeResult?: IpcResults["probe"] | null; modelContexts?: UnknownRecord; globalConcurrencyLimit?: number; bindingIssue?: UnknownRecord; onNameDraftChange?: (name: string) => void; onProviderClick: () => void; onProviderChange: (providerId: string) => void; onOpenPublicModel?: () => void; dispatchSnapshot: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined> }): React.JSX.Element {
   const id = editorIdentifier(model);
   // A service's own catalog states each model's credit rate; the rate is shown
   // beside the route it belongs to, so the picker's `x0.79` stays visible here.
@@ -9243,7 +9689,15 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   // to whether it may be chosen.
   const providerKeyOptions = [...keyStates.map((key) => ({
     value: key.id,
-    label: providerKeyChoiceLabel({ name: drafts?.providerKeyDisplayName(providerId, key.id, key.name) ?? key.name, kind: key.source.kind, source: relaySourceForKey(key, relaySources) }, translate),
+    // The slot's own account supplies the prefix, so a key whose station
+    // resource is not in this snapshot is still named 账号/分组 rather than by
+    // its bare group name.
+    label: providerKeyChoiceLabel({
+      name: drafts?.providerKeyDisplayName(providerId, key.id, key.name) ?? key.name,
+      kind: key.source.kind,
+      source: relaySourceForKey(key, relaySources),
+      accountPrefix: key.source.kind === "relay" ? relayAccountPrefixByID.get(key.source.accountID) : undefined,
+    }, translate),
   })), ...matchingRelaySources.filter((source) => !persistedRelaySourceIDs.has(relaySourceSelectionID(source))).map((source) => ({
     value: `relay:${relaySourceSelectionID(source)}`,
     label: providerKeyChoiceLabel({ name: source.resourceLabel, kind: "relay", source }, translate),
@@ -9256,10 +9710,10 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
   // staged degradation engine can attribute adds the fingerprint probe, every
   // other route keeps the plain availability probe.
   const degradationIncluded = booleanValue(asRecord(model.deep_probe).includes_degradation);
-  // A flash route's press measures speed; its hint states the window before the
-  // press instead of after it, because a button that sits for six seconds
-  // without saying why reads as a hang.
-  const speedTested = isSpeedTestRoute(model);
+  // Every route offers the speed reading: the menu row is the statement of
+  // intent, and a route's name says nothing about whether its speed may be
+  // asked for.  What the press measures is the one protocol the route
+  // recommends, which is why no check on the name appears here.
   // The probe button keeps its own name while it runs: the button carries the
   // progress as a leading spinner instead of renaming itself.
   const probeTitle = degradationIncluded
@@ -9277,7 +9731,12 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
     ? relayBindingIssueText(
       bindingIssue,
       selectedProviderKey
-        ? providerKeyChoiceLabel({ name: selectedProviderKey.name, kind: selectedProviderKey.source.kind, source: relaySourceForKey(selectedProviderKey, relaySources) }, translate)
+        ? providerKeyChoiceLabel({
+          name: selectedProviderKey.name,
+          kind: selectedProviderKey.source.kind,
+          source: relaySourceForKey(selectedProviderKey, relaySources),
+          accountPrefix: selectedProviderKey.source.kind === "relay" ? relayAccountPrefixByID.get(selectedProviderKey.source.accountID) : undefined,
+        }, translate)
         : providerLabel,
       translate,
     )
@@ -9360,7 +9819,7 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
     <View style={styles.modelBreadcrumb}><NativeButton title={providerLabel} link disabled={busy} onPress={onProviderClick} style={styles.breadcrumbProvider} /><Text style={styles.breadcrumbSeparator}>&gt;</Text><Text numberOfLines={1} style={styles.inspectorHeading}>{displayLabel(upstreamName, translate("common.notAvailable"))}</Text></View>
     <View style={styles.inspectorDivider} />
     <View style={styles.inspectorBody}>
-      <View style={styles.inspectorEnabledRow}><View style={styles.inspectorEnableControl}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy || !providerEnabled} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} /></View><ProbeMenuButton native={native} title={probeTitle} busy={probing} tooltip={(probePresentation.compact ? probePresentation.tooltip : "") || (servesImages ? translate("providers.probeImagesHint") : degradationIncluded ? translate("providers.deepTestHint") : undefined)} disabled={busy && !probing} activeKind={probePresentation.kind} onProbe={probeKind} translate={translate} />{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding} onPress={openProbeDetails} accessibilityRole="link" accessibilityLabel={probePresentation.compactSentence}><TooltipText numberOfLines={1} ellipsizeMode="tail" tooltip={probePresentation.tooltip} style={styles.inspectorProbeFindingText}>{probePresentation.compactSentence}</TooltipText></Pressable> : null}</View>
+      <View style={styles.inspectorEnabledRow}><View style={styles.inspectorEnableControl}><NativeCheckbox label={translate("common.enable")} value={booleanValue(model.model_enabled, booleanValue(model.enabled, true))} disabled={busy || !providerEnabled} onValueChange={(model_enabled) => dispatch("model.patch", { provider_id: providerId, model_id: id, changes: { model_enabled } })} /></View><ProbeMenuButton native={native} title={probeTitle} busy={probing} notes={servesImages ? { reachability: translate("providers.probeImagesHint") } : degradationIncluded ? { identity: translate("providers.deepTestHint") } : undefined} disabled={busy && !probing} activeKind={probePresentation.kind} onProbe={probeKind} translate={translate} />{probePresentation.compactSentence ? <Pressable style={styles.inspectorProbeFinding} onPress={openProbeDetails} accessibilityRole="link" accessibilityLabel={probePresentation.compactSentence}><TooltipText numberOfLines={1} ellipsizeMode="tail" tooltip={probePresentation.tooltip} style={styles.inspectorProbeFindingText}>{probePresentation.compactSentence}</TooltipText></Pressable> : null}</View>
       {/* The row's switch is disabled when its provider is off, so the reason
           has to be stated in words: a greyed 启用 box under a stopped provider
           otherwise reads as the app refusing the setting for no stated cause.
@@ -9388,7 +9847,7 @@ function ModelInspector({ providers, providerLabels, provider, providerId, model
         <Text numberOfLines={1} style={styles.modelInspectorLabel}>{translate("providers.contextWindow")}</Text>
         <View style={styles.modelWindowValue}>
           <Text numberOfLines={1} style={styles.modelWindowText}>{publicModelTokensText(declaredWindow, translate)}</Text>
-          <NativeButton title={translate("providers.publicModelSettings")} toolTip={translate("providers.publicModelSettingsHint")} accessibilityLabel={translate("providers.publicModelSettingsHint")} compact disabled={busy || !onOpenPublicModel} onPress={() => onOpenPublicModel?.()} style={styles.modelWindowLink} />
+          <NativeButton title={translate("providers.publicModelSettings")} accessibilityLabel={translate("providers.publicModelSettingsHint")} compact disabled={busy || !onOpenPublicModel} onPress={() => onOpenPublicModel?.()} style={styles.modelWindowLink} />
           <ContextWindowHelp recommended={recommendedWindow} translate={translate} />
         </View>
       </View> : null}
@@ -9505,7 +9964,7 @@ function HelpTip({ open, text, title, onToggle, align = "right" }: { open: boole
         tells this transient layer apart from the relay dialog's real scrim
         (`LiteLLMTabTransparentHitId` in `AppKitControlViews.mm`). */}
     {open ? <Pressable accessible={false} nativeID="young-router-tab-transparent" onPress={onToggle} style={styles.helpTipDismiss} /> : null}
-    <NativeButton title="" symbol="help" link plainLink toolTip={title} accessibilityLabel={title} onPress={onToggle} style={styles.helpTipButton} />
+    <NativeButton title="" symbol="help" link plainLink accessibilityLabel={title} onPress={onToggle} style={styles.helpTipButton} />
     {open ? <View accessibilityRole="text" accessibilityLiveRegion="polite" style={align === "left" ? styles.helpTipPopupLeft : styles.helpTipPopup}><Text style={styles.helpTipText}>{text}</Text></View> : null}
   </View>;
 }
@@ -9647,7 +10106,7 @@ function ProtocolPicker({ providerId, model, busy, translate, dispatch }: { prov
     return <View style={styles.protocolSettings}>
       <View style={[styles.formRow, compactStyles.formRow]}>
         <Text style={styles.modelInspectorLabel}>{translate("providers.protocolSurfaceFixed")}</Text>
-        <TooltipText numberOfLines={1} ellipsizeMode="tail" tooltip={fixedHint} accessibilityLabel={fixedHint} style={styles.providerAuthStatusValue}>{surfaceLabel}</TooltipText>
+        <TooltipText numberOfLines={1} ellipsizeMode="tail" accessibilityLabel={fixedHint} style={styles.providerAuthStatusValue}>{surfaceLabel}</TooltipText>
         <HelpTip open={tipOpen} text={fixedHint} title={translate("providers.protocolModeHelp")} onToggle={() => setTipOpen((current) => !current)} />
       </View>
     </View>;
@@ -9788,25 +10247,6 @@ function isProbeSurface(value: string): value is "openai/responses" | "openai/ch
 
 function modelProbeKey(providerId: string, modelId: string): string {
   return `${providerId}\x1f${modelId}`;
-}
-
-/**
- * Whether this route's 探测 press measures speed instead of asking again
- * whether it answers.
- *
- * The name is the evidence, read exactly as Core reads it: this app's own
- * `openai/`/`anthropic/` prefix says nothing about the model and is dropped
- * first, while any other first segment is LiteLLM's adapter and stays part of
- * the name.  The word may appear anywhere in it, which is what makes
- * `gemini-3.1-flash-lite`, `glm-5.3-flash` and `deepseek-v4.1-flash` one family.
- * The public alias is deliberately not consulted - a route may expose any
- * client-facing name while targeting a flash model - and this mirrors Core's
- * `_is_flash_route` so the hint and the press describe one test, not two.
- */
-function isSpeedTestRoute(model: UnknownRecord): boolean {
-  const wire = stringValue(model.litellm_model, stringValue(model.upstream_model)).trim().toLowerCase();
-  const name = /^(openai|anthropic)\//.test(wire) ? wire.split("/").slice(1).join("/") : wire;
-  return name.includes("flash");
 }
 
 /** The map without one entry, unchanged when it never held it: a pane that
@@ -10020,6 +10460,30 @@ function identifier(record: UnknownRecord): string {
 
 function editorIdentifier(record: UnknownRecord): string {
   return stringValue(record.editor_id, identifier(record));
+}
+
+/**
+ * The row that takes a deleted row's place: its next sibling, or the one above
+ * it when it was the last.
+ *
+ * Every list in this pane used to answer a vanished selection with its *first*
+ * row.  Deleting the third model therefore selected a row the person had not
+ * touched, the inspector rebuilt against it and the table scrolled back to the
+ * top -- so the row they were working next to jumped out of view for a reason
+ * nothing on screen stated.  A deletion leaves one obvious place to stand: the
+ * row that slid up into the gap, and failing that the row it had been under.
+ * The first row is what an *empty* selection means, not what a removed one
+ * means.
+ */
+function adjacentSelectionAfterRemoval(
+  previousKeys: readonly string[],
+  remainingKeys: readonly string[],
+  removedKey: string,
+): string | undefined {
+  if (remainingKeys.length === 0) return undefined;
+  const index = previousKeys.indexOf(removedKey);
+  if (index < 0) return remainingKeys[0];
+  return remainingKeys[index] ?? remainingKeys[index - 1] ?? remainingKeys[0];
 }
 
 function providerNameExists(providers: UnknownRecord[], name: string, excludeID = ""): boolean {
@@ -10710,9 +11174,10 @@ function ProviderEditor({ provider, relayStations, native, busy, translate, disp
     {/* The public-model pane's own header shape, for the same reason: this pane
         is 320 pt wide, the heading is a flexBasis-0 row that only takes what is
         left, and the full sentence as the link's label is 246 pt of it.  The
-        label is the action in two words and the model it returns to rides the
-        tooltip, so the provider name the header exists to show keeps its room. */}
-    <View style={styles.providerEditorHeader}><TooltipText numberOfLines={1} tooltip={providerName} accessibilityLabel={providerName} style={styles.providerEditorHeading}>{translate("providers.provider")}: {providerName}</TooltipText>{sourceModel ? <NativeButton title={translate("providers.backToModelShort")} toolTip={translate("providers.backToModel", { model: sourceModelLabel })} link disabled={busy} onPress={onReturnToModel} style={styles.providerReturnToModel} /> : null}</View>
+        label is the action in two words and the model it returns to is the
+        link's accessible name, so the provider name the header exists to show
+        keeps its room. */}
+    <View style={styles.providerEditorHeader}><TooltipText numberOfLines={1} tooltip={providerName} accessibilityLabel={providerName} style={styles.providerEditorHeading}>{translate("providers.provider")}: {providerName}</TooltipText>{sourceModel ? <NativeButton title={translate("providers.backToModelShort")} accessibilityLabel={translate("providers.backToModel", { model: sourceModelLabel })} link disabled={busy} onPress={onReturnToModel} style={styles.providerReturnToModel} /> : null}</View>
     <View style={styles.providerEditorSection}>
     <ProviderIdentityFields
       provider={provider}
@@ -10759,14 +11224,14 @@ function ProviderEditor({ provider, relayStations, native, busy, translate, disp
       <AccountsTable
         title={translate("providers.accountLinks")}
         actions={<>
-          {authAccounts.length < 8 ? <NativeButton title="" symbol="plus" compact toolTip={translate("relay.officialProviderAddLogin")} accessibilityLabel={translate("relay.officialProviderAddLogin")} busy={authPending === "sibling"} disabled={(busy || loginBusy) && authPending !== "sibling"} style={styles.iconButton} onPress={() => { void addSiblingAccount(); }} /> : null}
+          {authAccounts.length < 8 ? <NativeButton title="" symbol="plus" compact accessibilityLabel={translate("relay.officialProviderAddLogin")} busy={authPending === "sibling"} disabled={(busy || loginBusy) && authPending !== "sibling"} style={styles.iconButton} onPress={() => { void addSiblingAccount(); }} /> : null}
           {/* − ends the account the list highlights: signing it out removes it
               from this row, so the one control does both.  It reads the list's
               own selection, which falls back to the first account exactly as
               the pane below it does — the station's − behaves the same way, and
               a control that vanished until a row was clicked was a second rule
               for the same list. */}
-          {selectedAuthAccount ? <NativeButton title="" symbol="minus" compact destructive toolTip={translate("relay.officialProviderLogout")} accessibilityLabel={translate("relay.officialProviderLogout")} busy={authPending === `logout:${stringValue(selectedAuthAccount.ref)}`} disabled={(busy || loginBusy) && authPending !== `logout:${stringValue(selectedAuthAccount.ref)}`} style={styles.iconButton} onPress={() => { void logoutAccount(stringValue(selectedAuthAccount.ref)); }} /> : null}
+          {selectedAuthAccount ? <NativeButton title="" symbol="minus" compact destructive accessibilityLabel={translate("relay.officialProviderLogout")} busy={authPending === `logout:${stringValue(selectedAuthAccount.ref)}`} disabled={(busy || loginBusy) && authPending !== `logout:${stringValue(selectedAuthAccount.ref)}`} style={styles.iconButton} onPress={() => { void logoutAccount(stringValue(selectedAuthAccount.ref)); }} /> : null}
         </>}
         columns={[{ label: translate("relay.accounts"), width: authAccountColumnWidth }, { label: translate("providers.authStatus"), width: authStatusColumnWidth }]}
         rows={authAccountRows}
@@ -10824,10 +11289,10 @@ function ProviderEditor({ provider, relayStations, native, busy, translate, disp
             service's own account.  The label follows the provider. */}
         <Text style={styles.panelTitle}>{translate(providerService(provider) ? "providers.serviceLinks" : "providers.accounts")}</Text>
         <View style={styles.panelActions}>
-          {isWorkBuddyAccount && workbuddySignedIn ? <NativeButton title="" symbol="refresh" compact toolTip={translate("providers.wizard.workbuddyRefresh")} accessibilityLabel={translate("providers.wizard.workbuddyRefresh")} busy={workbuddyStatusBusy} disabled={busy && !workbuddyStatusBusy} onPress={() => { void refreshWorkBuddyAccount(); }} style={styles.iconButton} /> : null}
-          {isQoderAccount ? <NativeButton title="" symbol="refresh" compact toolTip={translate("providers.wizard.qoderRefresh")} accessibilityLabel={translate("providers.wizard.qoderRefresh")} busy={qoderStatusBusy} disabled={busy && !qoderStatusBusy} onPress={() => { void refreshQoderAccount(); }} style={styles.iconButton} /> : null}
+          {isWorkBuddyAccount && workbuddySignedIn ? <NativeButton title="" symbol="refresh" compact accessibilityLabel={translate("providers.wizard.workbuddyRefresh")} busy={workbuddyStatusBusy} disabled={busy && !workbuddyStatusBusy} onPress={() => { void refreshWorkBuddyAccount(); }} style={styles.iconButton} /> : null}
+          {isQoderAccount ? <NativeButton title="" symbol="refresh" compact accessibilityLabel={translate("providers.wizard.qoderRefresh")} busy={qoderStatusBusy} disabled={busy && !qoderStatusBusy} onPress={() => { void refreshQoderAccount(); }} style={styles.iconButton} /> : null}
           {isWorkBuddyAccount && !workbuddySignedIn && workbuddyAccount ? <NativeButton title={translate("providers.wizard.workbuddyLogin")} compact busy={workbuddyStatusBusy} disabled={busy && !workbuddyStatusBusy} onPress={() => { void openWorkBuddyApp(); }} /> : null}
-          {vendorBaseURL && !providerService(provider) ? <NativeButton title="" symbol="plus" compact toolTip={translate("providers.addRelayAccount")} accessibilityLabel={translate("providers.addRelayAccount")} busy={relayAddBusy} disabled={busy} onPress={() => { void addRelayAccountToVendor(); }} style={styles.iconButton} /> : null}
+          {vendorBaseURL && !providerService(provider) ? <NativeButton title="" symbol="plus" compact accessibilityLabel={translate("providers.addRelayAccount")} busy={relayAddBusy} disabled={busy} onPress={() => { void addRelayAccountToVendor(); }} style={styles.iconButton} /> : null}
         </View>
       </View>
       {isWorkBuddyAccount ? <>
@@ -11332,7 +11797,7 @@ function ClientBackendFields({ accessibilityPrefix, models, native, localApiActi
           <NativeButton
             ref={designateButtonRef}
             title={designatedRoute}
-            toolTip={translate(savedModelCount > 0 ? "settings.designateAsHint" : "settings.designateAsUnavailable")}
+
             accessibilityLabel={designatedRoute ? `${translate("settings.designateAs")}: ${designatedRoute}` : labelled("settings.designateAs")}
             titleWidth="flex"
             symbol="chevron-up-down"
@@ -11460,7 +11925,7 @@ function ClientFileRows({ files, revealFileLabel, revealFile, busy, translate, o
         plainLink
         titleWidth="flex"
         title={file.display_path}
-        toolTip={revealFileLabel}
+
         accessibilityLabel={`${revealFileLabel}: ${file.display_path}`}
         disabled={revealFile === undefined}
         onPress={() => revealFile?.(file.path)}
@@ -11468,7 +11933,7 @@ function ClientFileRows({ files, revealFileLabel, revealFile, busy, translate, o
       />
     }
     note={file.exists ? null : <Text style={styles.settingsActionRowNote}>{translate("clients.fileMissing")}</Text>}
-    action={<NativeButton title={translate("settings.editFile")} toolTip={file.exists ? undefined : translate("clients.fileMissing")} accessibilityLabel={`${translate("settings.editFile")}: ${file.display_path}`} disabled={busy || !file.exists} onPress={() => onOpenFile(file)} style={assistantFileSurfaceStyles.editFileButton} />}
+    action={<NativeButton title={translate("settings.editFile")} accessibilityLabel={`${translate("settings.editFile")}: ${file.display_path}`} disabled={busy || !file.exists} onPress={() => onOpenFile(file)} style={assistantFileSurfaceStyles.editFileButton} />}
   />;
   return <>{files.map(row)}</>;
 }
@@ -11512,6 +11977,9 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
 }): React.JSX.Element {
   const [files, setFiles] = useState<ClientFile[]>();
   const [error, setError] = useState<string>();
+  // A phone draws the client rail as a strip above the detail it opens; the
+  // selection it names is this component's state either way.
+  const compactWeb = useCompactWebShell();
   // The rail selects one client entry; its detail lists that client's files.
   // The starting entry is the route's own when it named one, so a deep link to
   // the Claude settings shows Claude rather than Codex.
@@ -11626,10 +12094,11 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
   const codexFeatureRows = featureKeys
     .filter((feature) => !codexHandedOverSurfaces.has(feature))
     .sort();
-  return <View style={SETTINGS_RAIL_BODY}>
+  return <View style={[SETTINGS_RAIL_BODY, compactWeb && styles.compactRailBody]}>
     <SettingsRail
       rows={railRows}
       selectedKey={selectedClient}
+      compact={compactWeb}
       onSelectionChange={(key) => { if (key) setSelectedClient(key as ClientFile["client"]); }}
     />
     <View style={[styles.settingsRailDetail, isWindowsShell && styles.settingsRailDetailWindows]}>
@@ -11683,7 +12152,7 @@ function AssistantSettingsWorkspace({ initialClient, busy, native, codexModels, 
             const fullLabel = surface ? `${label} — ${translate("codex.surfaceFeature")}` : label;
             return <View key={feature} style={SETTINGS_FIELD}>
               <View style={SETTINGS_FIELD_ROW_INDENTED}>
-                <TooltipText numberOfLines={1} tooltip={fullLabel} style={SETTINGS_FIELD_LABEL} accessibilityLabel={fullLabel}>{label}</TooltipText>
+                <TooltipText numberOfLines={1} style={SETTINGS_FIELD_LABEL} accessibilityLabel={fullLabel}>{label}</TooltipText>
                 <View style={SETTINGS_FIELD_VALUE_SLOT}>
                   <NativeToggle
                     accessibilityLabel={fullLabel}
@@ -11861,16 +12330,32 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
   // copied.  The page itself is served on this pane's own local port -- the
   // proxy answers `/ui` beside `/v1` -- so there is no second port to state and
   // none is offered; the address is derived from the port above it.
+  // The address this window is itself served from, when the window is the
+  // page.  A window reached through a reverse proxy knows the name it was
+  // published under; a native host has no address bar to read and answers "".
+  const webPageOwnOrigin = Platform.OS === "web" && typeof window !== "undefined" && window.location.origin.startsWith("http")
+    ? window.location.origin
+    : "";
   const openWebPage = async (): Promise<void> => {
-    // Ask Core for the address that carries this host's launch credential; a
-    // window that could not reach Core opens the plain address, where the key
-    // is typed like on any other browser.
     let address = webPageAddress;
-    try {
-      const launch = await ipc.webLaunchUrl();
-      if (launch) address = launch;
-    } catch {
-      // A Core that cannot answer still has an address worth opening.
+    // The page opens the address it printed.  A published page's reader may be
+    // anywhere, and Core's launch address is this machine's loopback (with a
+    // credential for a browser that has no session yet): the row said
+    // https://host/ui and the click opened 127.0.0.1:port, which is either the
+    // reader's own machine or nothing at all.  The 127.0.0.1 shape is only
+    // right for a native host opening a browser beside Core -- and the tab
+    // opened here is this same origin, so the session cookie this document
+    // already holds goes with it and no launch credential is needed.
+    if (webPageOwnOrigin === "") {
+      // Ask Core for the address that carries this host's launch credential; a
+      // window that could not reach Core opens the plain address, where the key
+      // is typed like on any other browser.
+      try {
+        const launch = await ipc.webLaunchUrl();
+        if (launch) address = launch;
+      } catch {
+        // A Core that cannot answer still has an address worth opening.
+      }
     }
     if (address) native.openExternalURL?.(address);
   };
@@ -11880,8 +12365,8 @@ function GeneralWorkspace({ snapshot, ipc, native, busy, dispatch, dispatchServi
     // under, and printing a loopback address there names an address the reader
     // cannot open.  The native hosts keep the derivation below -- they have no
     // address bar to read.
-    if (Platform.OS === "web" && typeof window !== "undefined" && window.location.origin.startsWith("http")) {
-      return `${window.location.origin}/ui`;
+    if (webPageOwnOrigin !== "") {
+      return `${webPageOwnOrigin}/ui`;
     }
     const running = serviceState === "running";
     const port = running ? stringValue(String(snapshot?.service.port ?? ""), "") : portValue;
@@ -12226,9 +12711,12 @@ function RuntimeWorkspace({ snapshot, busy, translate, dispatch, onSecretState, 
     if (!name) return;
     setActiveCategory(name);
   };
+  // A phone turns the category rail into one scrolling strip above the
+  // settings it selects; a 200 pt column left the detail about 40 pt wide.
+  const compactWeb = useCompactWebShell();
   return <View style={styles.runtimeWorkspaceFrame}>
-    <View style={SETTINGS_RAIL_BODY}>
-      <SettingsRail rows={tocRows} selectedKey={selectedCategory} onSelectionChange={selectCategory} />
+    <View style={[SETTINGS_RAIL_BODY, compactWeb && styles.compactRailBody]}>
+      <SettingsRail rows={tocRows} selectedKey={selectedCategory} compact={compactWeb} onSelectionChange={selectCategory} />
       <View style={[styles.settingsRailDetail, isWindowsShell && styles.settingsRailDetailWindows]}>
         {selectedCategory === "" ? null : <SettingsDetailHeader title={runtimeCategoryLabel(selectedCategory, translate)} />}
         {/* The surface is keyed by its category, so a switch starts at the top of
@@ -12268,6 +12756,8 @@ function DataManagementWorkspace({ snapshot, tab, onTabChange, statuses, busy, t
   const [importSections, setImportSections] = useState<ConfigDomain[]>([]);
   const [stagedSections, setStagedSections] = useState<ConfigDomain[]>([]);
   const [exportSections, setExportSections] = useState<ConfigDomain[]>([...DATA_PACKAGE_DOMAINS]);
+  // The import/export/sync rail is a strip above the tab's detail on a phone.
+  const compactWeb = useCompactWebShell();
   // A pane's command is a field like any other: the label column names the row,
   // the control column holds the button, and the result of that command stands
   // on the same line, immediately beside it.
@@ -12347,10 +12837,11 @@ function DataManagementWorkspace({ snapshot, tab, onTabChange, statuses, busy, t
     const allSelected = availableCount > 0 && selectedCount === availableCount;
     return <ActionButton title={translate(allSelected ? "dataManagement.deselectAll" : "dataManagement.selectAll")} disabled={busy || availableCount === 0} onPress={allSelected ? onDeselectAll : onSelectAll} />;
   };
-  return <View style={styles.dataManagementWorkspace}>
+  return <View style={[styles.dataManagementWorkspace, compactWeb && styles.compactRailBody]}>
     <SettingsRail
       rows={dataManagementTabRows}
       selectedKey={tab}
+      compact={compactWeb}
       onSelectionChange={(key) => { if (key) switchDataManagementTab(key as DataManagementTab); }}
     />
     <View style={[styles.settingsRailDetail, isWindowsShell && styles.settingsRailDetailWindows]}>
@@ -12500,7 +12991,7 @@ function RuntimeField({ item, busy, translate, dispatch, onSecretState, clearSec
   // Keep the reset clickable while an apply is in flight: the dispatch queue
   // serializes it, and a disabled button here reads as a dead control.
   const resetAction = modified && action === undefined
-    ? <NativeButton title="" symbol="refresh" compact toolTip={`${translate("runtime.resetToDefault")} (${rawDefaultValue || translate("common.empty")})`} accessibilityLabel={translate("runtime.resetToDefault")} onPress={resetToDefault} style={styles.runtimeResetButton} />
+    ? <NativeButton title="" symbol="refresh" compact accessibilityLabel={translate("runtime.resetToDefault")} onPress={resetToDefault} style={styles.runtimeResetButton} />
     : null;
   // Which value cell this row uses: a text value takes the wide column, and
   // every other control (a switch, a picker, a secret, a number) stays in the
@@ -13433,12 +13924,13 @@ type LogColumn = {
   floor?: number;
   value: (row: RenderedLogRecord) => string;
   /**
-   * What the cell's tooltip says, when the cell shortens what it holds.
+   * What the cell says under the pointer, when it abbreviates what it holds.
    *
-   * The native table already sets a cell's tooltip to its own text, which is
-   * the whole story for a column that states exactly what it means.  A column
-   * that abbreviates (`M→C`) is the one case where the tooltip has to say more
-   * than the cell does, so it declares the long form here.
+   * A cell states no hover tip for the text it already draws: the native table
+   * raises the cell's own words only while the column could not hold them.  A
+   * column that abbreviates (`M→C`) is the one case where the hover has to say
+   * more than the cell does — the cell is complete but shortened — so it
+   * declares the long form here.
    */
   tooltip?: (row: RenderedLogRecord) => string;
 };
@@ -15353,8 +15845,8 @@ function LogsWorkspace({ snapshot, ipc, native, busy, translate, dispatch, reque
     () => selected === "route-trace" ? [] : rows.map((row) => ({
       key: row.key,
       cells: columns.map((column) => column.value(row)),
-      // Only a column that shortens its text declares a tooltip; the rest keep
-      // the native table's own rule (tooltip = the cell's text).
+      // Only a column that abbreviates declares a hover; the rest keep the
+      // native table's own rule (the cell's text, and only while it is cut).
       tooltips: columns.map((column) => column.tooltip?.(row) ?? ""),
     })),
     [columns, rows, selected],
@@ -15941,30 +16433,46 @@ function EmptyState({ message }: { message: string }): React.JSX.Element { retur
 
 /** The probe button, and the menu that says which question it asks.
  *
- * Drawn as this app's own menu button - the title with the host's trailing
- * chevron - rather than as a button with a hand-drawn triangle beside it.  The
- * two hosts already draw a menu button that way (`symbolTrailing`), and a bare
- * Pressable next to a native button is two hit targets, a second visual
- * language, and a control whose affordance depends on a font glyph.
+ * Drawn as this app's own select -- the title at the leading edge, the arrow a
+ * picker draws at the trailing edge, one control, one hit target -- because
+ * that is the family this row sits in: 公开模型, 协议方式 and 备用协议 are
+ * pickers, and a button whose triangle trails its label read as a second
+ * control language in the same column.  The two hosts that draw their own
+ * controls take that shape from `menuTrigger`; macOS keeps drawing its menu
+ * button from the trailing chevron it is given.
  *
  * The menu is the host's own action menu, anchored to the button, and its rows
  * are ordered cheapest first so the two that cost a single request sit at the
  * top.  A press never runs a probe on its own: choosing a row is what starts
  * one, so opening the menu to look costs nothing.
  *
- * It is asked for through the leaf adapter, which is the only way a menu exists
- * on all three hosts.  Reaching for the native leaf out of React Native's own
- * module registry here instead answered nothing on the page -- the browser host
- * publishes no leaf, only `UIManager` -- so the opener returned before it asked
- * anybody and 探测 became a button that accepted the click and did nothing.
- * The page's menu is `platform/browserLeaf`'s `showActionMenu`, drawn by
- * `ui/HostChrome`; the two native hosts answer the same call through the
- * adapter.
+ * On the page the rows are a real `<select>`'s options (`menuItems`), so the
+ * list is the browser's own -- the same list every picker in this pane opens.
+ * The app's own menu card (`ui/HostChrome`) is what this control used to show,
+ * and beside those pickers its blue underlined rows in a square card read as a
+ * menu from another program: a `<select>` cannot be styled, which is exactly
+ * why it is the one thing that cannot look different from them.
+ *
+ * The two native hosts open their own menu, through the leaf adapter, which is
+ * the only way a menu exists on all three.  Reaching for the native leaf out of
+ * React Native's own module registry here instead answered nothing on the page
+ * -- the browser host publishes no leaf, only `UIManager` -- so the opener
+ * returned before it asked anybody and 探测 became a button that accepted the
+ * click and did nothing.
  */
-function ProbeMenuButton({ native, title, tooltip, busy, disabled, activeKind, onProbe, translate }: {
+function ProbeMenuButton({ native, title, busy, disabled, activeKind, notes, onProbe, translate }: {
   native: NativeLeafAdapter;
   title: string;
-  tooltip?: string;
+  /**
+   * What one row of the menu costs or does, stated on that row.
+   *
+   * These sentences used to ride the button as a hover tip, which is where a
+   * control no longer states anything: a press whose bill is not obvious - an
+   * image route answering images, a route whose fingerprint scan runs after
+   * availability - says so on the row that spends it, beside the row's own
+   * question and before it is chosen.
+   */
+  notes?: Partial<Record<ProbeKind, string>>;
   busy: boolean;
   disabled: boolean;
   /** The kind whose finding the pane is currently showing, if any. */
@@ -15973,18 +16481,22 @@ function ProbeMenuButton({ native, title, tooltip, busy, disabled, activeKind, o
   translate: Translate;
 }): React.JSX.Element {
   const buttonRef = React.useRef<View>(null);
+  // A check mark names the check that produced what the pane is showing now,
+  // so a press that already ran is not offered as if it had not.  It rides the
+  // row's own label because the page's list is the browser's: the row a
+  // `<select>` marks is the one it holds, which is the trigger's own name.
+  const items = PROBE_KIND_ORDER.map((kind) => {
+    const label = translate(`providers.probeKind.${kind}` as TranslationKey);
+    const note = notes?.[kind];
+    const stated = note ? `${label} \u00b7 ${note}` : label;
+    return kind === activeKind ? `\u2713 ${stated}` : stated;
+  });
+  const chosen = (index: number | undefined): void => {
+    const kind = index === undefined ? undefined : PROBE_KIND_ORDER[index];
+    if (kind) onProbe(kind);
+  };
   const openMenu = (): void => {
     if (disabled) return;
-    // A check mark names the check that produced what the pane is showing now,
-    // so a press that already ran is not offered as if it had not.
-    const items = PROBE_KIND_ORDER.map((kind) => {
-      const label = translate(`providers.probeKind.${kind}` as TranslationKey);
-      return kind === activeKind ? `\u2713 ${label}` : label;
-    });
-    const chosen = (index: number | undefined): void => {
-      const kind = index === undefined ? undefined : PROBE_KIND_ORDER[index];
-      if (kind) onProbe(kind);
-    };
     const open = (anchor: { x: number; y: number; width: number; height: number }): void => {
       void native.showActionMenu({ title: translate("providers.probeMenuTitle"), items, anchor })
         .then(chosen)
@@ -16008,11 +16520,15 @@ function ProbeMenuButton({ native, title, tooltip, busy, disabled, activeKind, o
     title={title}
     titleWidth="tight"
     busy={busy}
-    toolTip={tooltip}
-    // The same menu-button shape the 指定路由 control already draws: the title,
-    // a trailing downward chevron, and both symbol flags.  A symbol without
-    // `symbolWithTitle` is an icon-only button - the title is dropped and the
-    // control becomes a bare chevron, which is what a first attempt shipped.
+    // A menu trigger, drawn as this app's picker: on the page it *is* one, so
+    // the rows below are the list the browser opens for 协议方式 and its
+    // neighbours; on Windows the flag draws the same picker frame with the
+    // picker's own arrow.
+    menuTrigger
+    menuItems={items}
+    onMenuChoose={chosen}
+    // macOS draws its menu button from these three, and opens its own menu from
+    // `onPress`; the props above stop before its view.
     symbol="chevron-down"
     symbolWithTitle
     symbolTrailing
@@ -16022,8 +16538,8 @@ function ProbeMenuButton({ native, title, tooltip, busy, disabled, activeKind, o
   />;
 }
 
-const ActionButton = React.forwardRef<HostInstance, { title: string; onPress: () => void; disabled?: boolean; busy?: boolean; primary?: boolean; danger?: boolean; titleWidth?: "auto" | "tight"; toolTip?: string; /** The host's own glyph, drawn where that host draws a menu chevron. */ symbol?: "chevron-up" | "chevron-down" | "chevron-up-down"; symbolWithTitle?: boolean; symbolTrailing?: boolean; accessibilityLabel?: string; style?: StyleProp<ViewStyle> }>(function ActionButton({ title, onPress, disabled, busy, primary, danger, titleWidth, toolTip, symbol, symbolWithTitle, symbolTrailing, accessibilityLabel, style }, ref): React.JSX.Element {
-  return <NativeButton ref={ref} title={title} disabled={disabled} busy={busy} primary={primary} destructive={danger} titleWidth={titleWidth} toolTip={toolTip} symbol={symbol} symbolWithTitle={symbolWithTitle} symbolTrailing={symbolTrailing} accessibilityLabel={accessibilityLabel} onPress={onPress} style={style} />;
+const ActionButton = React.forwardRef<HostInstance, { title: string; onPress: () => void; disabled?: boolean; busy?: boolean; primary?: boolean; danger?: boolean; titleWidth?: "auto" | "tight"; /** The host's own glyph, drawn where that host draws a menu chevron. */ symbol?: "chevron-up" | "chevron-down" | "chevron-up-down"; symbolWithTitle?: boolean; symbolTrailing?: boolean; /** This button opens a menu: the hosts that draw their own controls draw it as their picker. */ menuTrigger?: boolean; /** The menu's rows, for a host that draws the list itself (the page draws them as a `<select>`). */ menuItems?: string[]; onMenuChoose?: (index: number) => void; accessibilityLabel?: string; style?: StyleProp<ViewStyle> }>(function ActionButton({ title, onPress, disabled, busy, primary, danger, titleWidth, symbol, symbolWithTitle, symbolTrailing, menuTrigger, menuItems, onMenuChoose, accessibilityLabel, style }, ref): React.JSX.Element {
+  return <NativeButton ref={ref} title={title} disabled={disabled} busy={busy} primary={primary} destructive={danger} titleWidth={titleWidth} symbol={symbol} symbolWithTitle={symbolWithTitle} symbolTrailing={symbolTrailing} menuTrigger={menuTrigger} menuItems={menuItems} onMenuChoose={onMenuChoose} accessibilityLabel={accessibilityLabel} onPress={onPress} style={style} />;
 });
 
 function TextField({ label, value, onCommit, onDraftChange, hint, hintStyle, placeholder, secret, multiline, compactMultiline, keyboardType, stacked, labelWidth, labelAlign, controlWidth, labelVisible = true, suffix, disabled, validate, accessory, style }: { label: string; value: string; onCommit: (value: string) => void | Promise<unknown>; onDraftChange?: (value: string) => void; hint?: string; hintStyle?: StyleProp<TextStyle>; placeholder?: string; secret?: boolean; multiline?: boolean; compactMultiline?: boolean; keyboardType?: "default" | "numeric"; stacked?: boolean; labelWidth?: number; labelAlign?: "left" | "right"; controlWidth?: number; /** The caller renders the label itself (a stacked keys-editor row). */ labelVisible?: boolean; suffix?: string; disabled?: boolean; /** Commit-time validation: an invalid draft stays in the field with its message instead of reaching Core. */ validate?: (next: string) => string | undefined; /** A control that belongs to this row beside the field, such as its help mark. It rides the same grid level as PickerField's, so a field with an accessory and a picker with one draw the same column. */ accessory?: React.ReactNode; style?: StyleProp<ViewStyle> }): React.JSX.Element {
@@ -16502,11 +17018,11 @@ function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"
   if (Object.keys(probe).length === 0) {
     return { compact: "", compactSentence: "", tooltip: "", full: "", speedRate: "", kind: undefined };
   }
-  // A flash route is measured for its speed, and that reading is the answer
-  // the button was pressed for - not a footnote under the availability count.
-  // It is built first, from the copy this press measured (which carries the
-  // rate) or from the one Core stored with the finding, so a window that
-  // reopens reads the number the last press produced.
+  // A speed press is measured for its rate, and that reading is the answer the
+  // button was pressed for - not a footnote under the availability count.  It
+  // is built first, from the copy this press measured (which carries the rate)
+  // or from the one Core stored with the finding, so a window that reopens
+  // reads the number the last press produced.
   const speedTest = asRecord(result?.speed_test ?? probe.speed_test);
   const speedReading = probeSpeedTestPresentation(speedTest, translate);
   const surfaces: Array<{ surface: string; available?: boolean; status?: string; original_request?: unknown }> = result?.surfaces
@@ -16609,25 +17125,32 @@ function modelProbePresentation(model: UnknownRecord, result: IpcResults["probe"
   ].filter(Boolean).join("; ")
     || (surfaces.length > 0 && availableCount === surfaces.length ? "" : availabilityInline);
   const compact = [availabilityCount, compactFinding].filter(Boolean).join("; ");
-  const full = [
-    speedReading.detail,
-    speedReading.protocolLine,
-    speedReading.sampleLine,
-    summary,
-    preciseSentence,
-    probeDegradationDetails(degradation, translate),
-    result?.detail ?? "",
-    translate("providers.probeOriginalRequest", { request: JSON.stringify(requests, null, 2) }),
-  ].filter(Boolean).join("\n\n");
   // One line: "结果: 3/3 可用 · 未注水". The row owns the width, the text
   // ellipsizes instead of wrapping, and the hover hint repeats that line in full
   // before it spells the same finding out.
   const compactSentence = `${translate("providers.probeResultPrefix")} ${compact}`;
-  const tooltip = joinProbeSummary([compactSentence, availabilitySentence, degradationSentence, preciseSentence, speedReading.detail]);
+  // The whole finding in words: the result row's sentence, then every sentence
+  // this press produced.  This is the hover hint, and it is also the first line
+  // of the details view - a reader who clicked the row asked what the finding
+  // says, so the words come before the records that state it.
+  const tips = joinProbeSummary([compactSentence, availabilitySentence, degradationSentence, preciseSentence, speedReading.detail]);
+  // What the words were read from: the measured protocol and its window, the
+  // answer sample, the per-surface matrix, the degradation battery's own
+  // fields, and the request itself.  It follows the tips in the details view,
+  // never precedes them.
+  const raw = [
+    speedReading.protocolLine,
+    speedReading.sampleLine,
+    summary,
+    probeDegradationDetails(degradation, translate),
+    result?.detail ?? "",
+    translate("providers.probeOriginalRequest", { request: JSON.stringify(requests, null, 2) }),
+  ].filter(Boolean).join("\n\n");
+  const full = [tips, raw].filter(Boolean).join("\n\n");
   return {
     compact,
     compactSentence,
-    tooltip,
+    tooltip: tips,
     full,
     speedRate: speedReading.rate,
     // Which check produced what the pane is showing, so the menu can mark it
@@ -16704,9 +17227,16 @@ function probeSpeedTestPresentation(speed: UnknownRecord, translate: Translate):
   if (Object.keys(speed).length === 0) return blank;
   const status = stringValue(speed.status);
   if (!status) return blank;
-  if (status === "unsupported") return blank;
   if (status !== "ok") {
-    return { ...blank, rate: translate("providers.speedUnavailable") };
+    // The word says the reading is missing; Core's own sentence says why.  A
+    // route with no chat wire, a refused key, and a route that generated
+    // nothing are three different findings, and "Speed unavailable" alone
+    // would report them as one.
+    return {
+      ...blank,
+      rate: translate("providers.speedUnavailable"),
+      detail: stringValue(speed.detail),
+    };
   }
   const ttft = speed.first_token_seconds;
   const perSecond = speed.output_token_count_per_second;
@@ -16865,11 +17395,6 @@ function responsesCompactionCapabilityChanges(value: unknown): UnknownRecord {
 }
 function modelRecordCapabilityChanges(value: unknown): UnknownRecord {
   return { ...webSearchCapabilityChanges(value), ...responsesCompactionCapabilityChanges(value) };
-}
-function apiKeyDisplayName(value: unknown, translate: Translate): string {
-  const name = stringValue(value);
-  if (!name) return translate("common.notAvailable");
-  return name === "default" ? translate("providers.defaultKey") : name;
 }
 /** The spelling one import files: lower case unless the user kept the roster's own. */
 type ImportNameCase = "lower" | "original";
@@ -17238,6 +17763,30 @@ const styles = StyleSheet.create({
   compactWebTitle: { flexShrink: 0, color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" },
   compactWebNav: { flexShrink: 0, paddingHorizontal: 12, paddingBottom: 8 },
   compactWebDetail: { flex: 1, minWidth: 0, minHeight: 0 },
+  // A rail on a phone: the pane's second level as a strip of chips above the
+  // detail it selects.  It scrolls sideways rather than wrapping, so the pane
+  // keeps the one height it declared and the selection stays where a thumb
+  // left it — a wrapping strip would change the detail's height as categories
+  // are added, and move the row under the thumb to another line.
+  compactRailBody: { flexDirection: "column", gap: 0 },
+  compactRailScroll: { flexGrow: 0, flexShrink: 0, maxWidth: "100%" },
+  compactRailStrip: { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 12, paddingVertical: 6 },
+  compactRailChip: { minHeight: 28, maxWidth: 200, paddingHorizontal: 10, justifyContent: "center", borderRadius: 14, borderWidth: 1, borderColor: systemColors.separator, backgroundColor: systemColors.control },
+  compactRailChipSelected: { backgroundColor: systemColors.selectedContent, borderColor: systemColors.selectedContent },
+  compactRailChipText: { color: systemColors.label, fontSize: UI_FONT_SIZE },
+  compactRailChipTextSelected: { color: systemColors.selectedControlText, fontWeight: "600" },
+  // The providers pane on one column: the lists share the height until a row
+  // is opened, then the inspector takes all of it.  A 120 pt provider column
+  // beside a model table beside a 320 pt inspector is three columns in a 360
+  // pt page, which is why every field in it read as clipped text.
+  providersLayoutCompact: { flexDirection: "column", gap: 8 },
+  providerModelColumnsCompact: { flexDirection: "column", gap: 8 },
+  providerListPaneCompact: { width: "100%", minWidth: 0, maxWidth: "100%", height: 148, flexBasis: "auto", flexGrow: 0, flexShrink: 0 },
+  providerInspectorCompact: { width: "100%", minWidth: 0, maxWidth: "100%", flexGrow: 1, flexShrink: 1 },
+  compactDetailBar: { minHeight: 34, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 12, borderBottomWidth: 1, borderBottomColor: systemColors.separator, backgroundColor: systemColors.window },
+  compactDetailBack: { flexDirection: "row", alignItems: "center", gap: 2, paddingVertical: 6, paddingRight: 8 },
+  compactDetailBackText: { color: systemColors.link, fontSize: UI_FONT_SIZE },
+  compactDetailTitle: { flex: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" },
   settingsShellHeader: { flexShrink: 0, flexDirection: "row", minWidth: 0, backgroundColor: systemColors.separator }, settingsShellHeaderWindows: { backgroundColor: systemColors.window, borderBottomWidth: 1, borderBottomColor: systemColors.separator }, settingsShell: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row" }, settingsSidebar: { width: 200, minWidth: 0, flexShrink: 0, minHeight: 0, backgroundColor: systemColors.separator }, settingsSidebarHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderIntegrated: { width: 200, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsSidebarHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsSidebarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderRightWidth: 1, borderRightColor: WINDOWS_CONTROL.strokeSubtle }, settingsSidebarAppIcon: { width: SETTINGS_HEADER_CONTENT_HEIGHT, height: SETTINGS_HEADER_CONTENT_HEIGHT, borderRadius: 4 }, settingsSidebarTitle: { color: systemColors.label, fontSize: SOURCE_LIST_FONT_SIZE, fontWeight: "600" }, settingsSidebarSpacer: { height: 8, flexShrink: 0 }, settingsSidebarList: { flex: 1, minWidth: 0, minHeight: 0 }, settingsPaneHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: SETTINGS_PANE_INSET, paddingTop: 10, paddingBottom: 8 }, settingsPaneTitleBlock: { flex: 1, minWidth: 0 }, settingsPaneHeaderIntegrated: { flex: 1, minWidth: 0, height: SETTINGS_TITLEBAR_INSET + 38, paddingTop: SETTINGS_TITLEBAR_INSET + 10, paddingBottom: 8 }, settingsDetail: { minWidth: 0, flex: 1, paddingTop: SETTINGS_TITLEBAR_INSET }, settingsDetailIntegrated: { paddingTop: 0 }, settingsDetailBody: { flex: 1, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsDetailBodyWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsDetailBodyBare: { backgroundColor: "transparent" }, settingsDetailPane: { flex: 1, minWidth: 0 }, settingsPaneTitle: { color: systemColors.label, fontSize: 15, fontWeight: "600", lineHeight: SETTINGS_HEADER_CONTENT_HEIGHT }, settingsRail: { width: SETTINGS_RAIL_WIDTH, flexShrink: 0, minHeight: 0, paddingTop: 6, overflow: "hidden" }, settingsRailWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid }, settingsRailList: { flex: 1, minHeight: 0 }, settingsRailDivider: { position: "absolute", top: 0, bottom: 0, right: 0, width: 1, backgroundColor: systemColors.separator }, settingsRailDetail: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: systemColors.textBackground }, settingsRailDetailWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailHeader: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: SETTINGS_PANE_INSET, paddingTop: SETTINGS_HEADER_LEAD, paddingBottom: SETTINGS_HEADER_GAP, backgroundColor: systemColors.window }, settingsRailDetailHeaderWindows: { backgroundColor: WINDOWS_CONTROL.fill }, settingsRailDetailTitleBlock: { flex: 1, minWidth: 0, gap: 2 }, settingsRailDetailActions: { flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 6 }, settingsRailDetailTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, settingsRailDetailHint: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE, lineHeight: 16 },
   routeStatusBar: { minHeight: 24, flexShrink: 0, flexDirection: "row", alignItems: "center", gap: 8, justifyContent: "space-between", paddingHorizontal: 16, paddingVertical: 2, borderTopWidth: 1, borderTopColor: systemColors.separator }, routeStatusBarWindows: { backgroundColor: WINDOWS_CONTROL.fillSolid, borderTopColor: WINDOWS_CONTROL.strokeSubtle }, routeStatusTextWindows: { color: WINDOWS_CONTROL.textSecondary }, routeStatusLead: { minWidth: 0, flex: 1, flexDirection: "row", alignItems: "center", gap: 6 },
   routeStatusText: { color: systemColors.secondaryLabel, fontSize: UI_TIP_FONT_SIZE },
@@ -17316,8 +17865,7 @@ const styles = StyleSheet.create({
   // so 供应商: <name> reads on one line with that button instead of sitting a few
   // points below it, and the sections under it keep the left column's row pitch.
   providersLayout: { flex: 1, minWidth: 0, minHeight: 0, flexDirection: "row", gap: 12 }, providerWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, providerLeftColumn: { flex: 1, minWidth: 0, minHeight: 0, gap: 6 }, providerModelColumns: { flex: 1, minHeight: 0, flexDirection: "row", gap: COLUMN_GAP }, routeWorkspace: { flex: 1, minWidth: 0, minHeight: 0 }, routeTableMeasure: { flex: 1, minWidth: 0, minHeight: 0 }, fetchKeyPicker: { width: 170, height: 24, marginRight: 6, flexShrink: 0 }, providerListPane: { width: 120, minWidth: 120, maxWidth: 120, flexGrow: 0, flexShrink: 0 }, modelListPane: { flex: 1, minWidth: 0 }, tablePane: { flex: 1, minWidth: 0, gap: 6 }, tablePaneWide: { flex: 1, minWidth: 0 }, tableTitleRow: { height: 24, flexDirection: "row", alignItems: "center" }, tableTitle: { color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, tableActions: { marginLeft: "auto", flexDirection: "row", gap: 6 }, iconButton: { minWidth: 24, width: 24, minHeight: 24, height: 24, alignItems: "center", justifyContent: "center" }, tableBottomRow: { minHeight: 26, flexDirection: "row", alignItems: "center" }, nativeProviderTable: { flex: 1, minHeight: 0 }, nativeModelTable: { flex: 1, minHeight: 0 }, modelTable: { flex: 1, minHeight: 0 }, nativeRouteTable: { flex: 1, minHeight: 0 }, providerInspector: { width: 320, minWidth: 260, maxWidth: 360, flexGrow: 0, flexShrink: 1 }, providerEditorContent: { flex: 1, minHeight: 0 }, providerEditorScrollContent: { paddingLeft: 0, paddingRight: 16, paddingBottom: 12, gap: 6 }, persistentScrollIndicator: { position: "absolute", width: 0, height: 0 }, persistentScrollHost: { position: "relative", flex: 1, minHeight: 0 }, persistentScrollFill: { flex: 1, minHeight: 0 }, persistentScrollThumb: { position: "absolute", top: 2, right: 2, width: 4, borderRadius: 2, backgroundColor: "rgba(96,96,96,0.55)" }, providerEditorHeader: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, providerEditorHeading: { flex: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, fontWeight: "600" }, providerReturnToModel: { flexShrink: 1 }, providerEditorSection: { borderTopWidth: 1, borderTopColor: systemColors.separator, paddingTop: 3, gap: 4 }, providerEnabledRow: { minHeight: 22, flexDirection: "row", alignItems: "center" }, providerSourceFields: { minWidth: 0, gap: 4 }, inspectorContent: { paddingLeft: 0, paddingRight: 6, paddingBottom: 12, gap: 6 }, inspectorBody: { gap: 4 }, modelBreadcrumb: { minHeight: 24, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 4 }, breadcrumbProvider: { flexShrink: 1, minWidth: 0, color: systemColors.label, fontSize: UI_FONT_SIZE, fontWeight: "600" }, breadcrumbSeparator: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorHeading: { flexShrink: 1, color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE }, inspectorDivider: { height: 1, backgroundColor: systemColors.separator }, inspectorEnabledRow: { minHeight: 24, flexDirection: "row", alignItems: "center", gap: 6 }, // The probe button and its chevron read as one control: the gap between them
-  // is the seam inside a split button, not the row's own spacing.
-  probeMenuGroup: { flexDirection: "row", alignItems: "center", flexShrink: 0 }, probeMenuChevron: { minWidth: 16, width: 16, height: 24, alignItems: "center", justifyContent: "center", marginLeft: 1, cursor: "pointer" }, probeMenuChevronDisabled: { opacity: 0.4 }, probeMenuChevronText: { color: systemColors.secondaryLabel, fontSize: 10 }, // A link is also a cursor: the row shows the pointing hand over the whole
+  // A link is also a cursor: the row shows the pointing hand over the whole
 // finding, label included, exactly like every native link in the app.
 inspectorProbeFinding: { flexShrink: 1, minWidth: 0, cursor: "pointer" }, inspectorProbeFindingText: { color: systemColors.secondaryLabel, fontSize: UI_FONT_SIZE, textDecorationLine: "underline" }, inspectorEnableControl: { flexShrink: 0 }, // A switch follows a number field, not a label: the row's own gap is the
   // label-to-control seam, and at 2 pt the bezel and the box touched.  Six

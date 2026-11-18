@@ -90,3 +90,9 @@ export function canonicalWindowRoute(route: AppRoute): AppRoute {
   if (route === "relay-add") return "provider-wizard";
   return route;
 }
+
+/** Canonical route for a page address, which can distinguish assistant panes in one window. */
+export function canonicalPageRoute(route: AppRoute): AppRoute {
+  if (route === "claude-settings") return route;
+  return canonicalWindowRoute(route);
+}

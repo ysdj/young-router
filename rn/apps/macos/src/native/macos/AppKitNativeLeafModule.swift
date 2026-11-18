@@ -417,6 +417,28 @@ final class AppKitNativeLeafModule: RCTEventEmitter {
         }
     }
 
+    /// Answer the open chooser's 添加: the window states `status` in its own
+    /// strip, and `close` is the answer to "did the rows land?".  Kept open it
+    /// resolves with the next 添加 the person presses, so a refused write can be
+    /// fixed and tried again on the same ticks.
+    @objc(finishModelsToAdd:close:resolver:rejecter:)
+    func finishModelsToAdd(
+        _ status: String,
+        close: Bool,
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        guard status.utf8.count <= 512 else {
+            reject("E_NATIVE_MODEL_CHOOSER_INPUT", "The model chooser answer is invalid.", nil)
+            return
+        }
+        DispatchQueue.main.async {
+            self.leaf.answerModelsToAdd(status: status, close: close) { selection in
+                resolve(selection)
+            }
+        }
+    }
+
     @objc func chooseModelsToAdd(_ models: [String], providerName: String, keyName: String, resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: @escaping RCTPromiseRejectBlock) {
         guard models.count <= 10_000,
               models.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 256 && !$0.unicodeScalars.contains(where: { $0.value < 32 }) }),

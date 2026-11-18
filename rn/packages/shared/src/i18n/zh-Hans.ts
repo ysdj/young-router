@@ -323,6 +323,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "common.enabled": "已启用",
   "common.disabled": "已停用",
   "common.save": "保存",
+  "common.back": "返回",
   "common.clear": "清除",
   "common.cleared": "已清除",
   "common.willClear": "将清除",
@@ -601,6 +602,7 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.fetchFailed": "获取模型失败：{detail}",
   "providers.fetchKeyUnavailable": "无法解析该 API 密钥",
   "providers.fetchEmpty": "供应商未返回模型。",
+  "providers.fetchNothingNew": "选中的模型已经全部存在，未新增。",
   "providers.probeMenuTitle": "选择探测方式",
   "providers.probeKind.reachability": "连通性（协议是否可用）",
   "providers.probeKind.speed": "测速（首字延迟 / tokens/秒）",
@@ -670,10 +672,10 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.probeInlineInvalidResponse": "返回异常",
   "providers.probeInlineInvalidConfig": "配置不完整",
   "providers.probeInlineModelUnavailable": "账号不提供此模型",
-  // flash 路由的「探测」测的是它的速度，不是再问一遍可用性：产生这个数字的那条流
-  // 本身就是「这一面答不答」的答案，两件事都做等于一次点击付两遍钱。窗口写出来，
-  // 点击才不是一件神秘的事：它解释了为什么按钮要停几秒，也解释了为什么不同路由
-  // 的数字可以比较。
+  // 「测速」是菜单里的独立一行，任何路由都能问。产生这个数字的那条流本身就是
+  // 「这一面答不答」的答案，所以这次点击不再问那一个协议一遍。窗口写出来，点击
+  // 才不是一件神秘的事；而且它是「生成」窗口：首个 token 到达时才开，之前的等待
+  // 单独报成首字延迟。
   "providers.speedTestWindow": "{protocol} · {window} 秒窗口 · {rounds} 轮",
   "providers.speedTestHint": "按这条路由自己的协议连续测量 6 秒的输出速度（token/秒）",
   "providers.speedTestMeasuring": "正在测速...",
@@ -722,7 +724,6 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.keyListHint": "名称用于模型路由；已保存的内容留在安全存储中。",
   "providers.apiKeyInput": "新 API 密钥",
   "providers.apiKeySavedHint": "正在读取已保存的 API 密钥…",
-  "providers.keyNameAutoGroupingHint": "自动分组已开启",
   "providers.addKey": "添加密钥",
   "providers.modelRate": "倍率",
   "providers.publicModel": "公开模型",
@@ -913,6 +914,9 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.wizard.noModels": "未发现模型，请在下方手动添加一个或多个。",
   "providers.wizard.fetchingModels": "正在自动获取可用模型…",
   "providers.wizard.refreshModels": "重新获取模型",
+  "providers.wizard.providedKeyNoModels": "该密钥在中转站上没有声明模型。",
+  "providers.wizard.providedKeyNoGroup": "（未分配分组）",
+  "providers.wizard.providedKeyNoGroupModels": "该密钥未分配分组，站点没有为它提供模型。请在中转站为它指定分组，或选择另一把密钥。",
   "providers.wizard.selectedModels": "已选择 {count} 个模型。",
   "providers.wizard.modelsToAdd": "将添加 {count} 个模型。",
   "providers.wizard.selectAtLeastOneModel": "请至少选择一个模型后继续。",
@@ -926,7 +930,6 @@ export const zhHans: Record<TranslationKey, string> = {
   "providers.wizard.saveProviderOnly": "仅保存供应商",
   "providers.wizard.saveProviderOnlyHint": "只保存供应商和它关联的中转站登录，不导入密钥或模型；中转站不会单独成行，之后可在供应商里继续添加。",
   "providers.wizard.creating": "正在准备供应商…",
-  "providers.wizard.complete": "配置已保存。",
   "providers.wizard.required": "请填写必填项后继续。",
   "providers.wizard.manualModelPairRequired": "手动模型需要同时填写模型名与上游模型。",
   "providers.wizard.duplicateName": "供应商名称已存在，请输入其他名称。",
@@ -1021,7 +1024,6 @@ export const zhHans: Record<TranslationKey, string> = {
   "relay.loginAnotherAccount": "登录新账号",
   "relay.goLogin": "去登录",
   "relay.refreshResources": "刷新",
-  "relay.loginWorking": "请在站点的登录窗口中完成登录。",
   "relay.signInWindowHint": "站点登录页已在单独的窗口中打开，请在那里完成登录；成功后自动返回。",
   "relay.loginComplete": "登录成功。基础 URL 匹配的供应商会自动显示这些 API 密钥。",
   "relay.loginResourcesUnavailable": "登录成功，但无法加载 API 资源。请点击“刷新”重试。",
@@ -1038,6 +1040,10 @@ export const zhHans: Record<TranslationKey, string> = {
   "relay.signInRememberHint": "记住后，本页下次进入会自动恢复登录。",
   "relay.signInRejected": "中转站拒绝了这次登录：账号或密码不正确，或站点要求验证码、两步验证。这类登录请在桌面应用里完成。",
   "relay.signInUnreachable": "连不上中转站。请检查地址和网络后重试。",
+  "relay.rememberPasswordTitle": "记住这个密码？",
+  "relay.rememberPasswordBody": "「{label}」已经登录。记住密码后，下次进入会自动恢复登录；只记住登录态则保留这次的会话，不保存密码。",
+  "relay.rememberPasswordKeep": "记住密码",
+  "relay.rememberSessionOnly": "仅记住登录态",
   "relay.browserShow": "显示登录窗口",
   "relay.browserWaiting": "正在这台机器上的浏览器里打开该中转站的登录页。完成登录后这里会自动继续。",
   "relay.browserUnavailable": "这台机器上找不到可打开的浏览器，无法显示站点登录页。请安装 Chrome、Chromium 或 Edge 后重试。",

@@ -2683,39 +2683,23 @@ class ProvidersModelsDomain:
     # ------------------------------------------------------------------
     # Token throughput
     #
-    # A flash route is the one a user picks for speed, so its 探测 button asks
-    # the question that pick is about: how fast does this route emit output.
-    # The press measures exactly one protocol - the route's own recommendation,
-    # read from the two fields the pane shows rather than invented beside them
-    # - and the availability question it used to ask on that same protocol is
-    # not asked again: the speed run *is* evidence that the surface answers, so
-    # a second round of requests would add time to the press and nothing to the
-    # answer.  A surface this app cannot write a request for keeps the ordinary
-    # probe; inventing one would measure this code instead of the route.
+    # 测速 is a question any route can be asked: how fast does this one emit
+    # output.  It is its own row in the menu, so nothing here decides by the
+    # model's name that a press means a rate - the press states it.
+    #
+    # The measurement speaks exactly one protocol - the route's own
+    # recommendation, read from the two fields the pane shows rather than
+    # invented beside them - and the availability question that protocol would
+    # otherwise be asked is not asked again: the speed run *is* evidence that
+    # the surface answers, so a second round of requests would add time to the
+    # press and nothing to the answer.  A surface this app cannot write a
+    # request for keeps the ordinary probe; inventing one would measure this
+    # code instead of the route.
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _is_flash_route(model: Mapping[str, Any]) -> bool:
-        """Whether this route is one of the family the speed reading is for.
-
-        The name is the evidence, read the way every other name decision here
-        reads it: this app's own ``openai/``/``anthropic/`` prefix says nothing
-        about the model and is dropped first, while any other first segment is
-        LiteLLM's adapter and stays part of the name.  The word may appear
-        anywhere in it - ``gemini-3.1-flash-lite``, ``glm-5.3-flash`` and
-        ``deepseek-v4.1-flash`` are one family by that word.
-
-        The public alias is deliberately not consulted: a route may expose any
-        client-facing name it likes while targeting a flash model, and the
-        button would then follow the label on screen instead of the model
-        behind it.
-        """
-
-        return "flash" in ProvidersModelsDomain._wire_model_name(model).lower()
 
     @classmethod
     def _speed_test_protocol(cls, model: Mapping[str, Any]) -> str:
-        """The one protocol a flash route's 探测 is measured on.
+        """The one protocol a speed press is measured on.
 
         The protocol the route's own mode names, read from the field the pane
         draws: 指定协议 (``fixed``) shows the interface protocol the route is
@@ -2796,10 +2780,13 @@ class ProvidersModelsDomain:
         time they spent emitting - the prefill between rounds is not generation
         and does not enter the denominator.
 
-        Both ends are bounded.  A route still streaming when the window closes
-        stops being read and reports what it had emitted by then - the window is
-        the press's promise, so the reading cannot outlast it - and a route that
-        emits nothing before it closes is silence, which is the timeout the
+        Both ends are bounded, by two different clocks.  The wait for the first
+        token is bounded by the probe's own first-event budget: a reasoning
+        route prefills for tens of seconds before it says anything, and that
+        wait is the reading's ``first_token_seconds``, not a timeout.  Once
+        output starts, the generation window opens and the reading stops at its
+        close, reporting what the route had emitted; a route that emits nothing
+        before the *wait* budget closes is silence, which is the timeout the
         availability probe also reports.
 
         The token count is the one the upstream states for its own output.  Chat
@@ -2820,6 +2807,7 @@ class ProvidersModelsDomain:
             "target": model_name or None,
             "output_token_count_per_second": None,
             "output_token_count": 0,
+            "first_token_seconds": None,
             "counted_by": "",
             "seconds": 0.0,
             "window_seconds": round(window, 1),
@@ -2840,7 +2828,11 @@ class ProvidersModelsDomain:
             # reports for an incomplete route.  It must keep that name, or the
             # pane would report the route as slow when it is not configured.
             result["status"] = "invalid_config"
-            result["detail"] = "The route names no protocol this run can measure"
+            result["detail"] = (
+                "This route has no chat wire a speed reading can measure"
+                if not protocol
+                else "The route names no protocol this run can measure"
+            )
             return result
         request = self._speed_test_request(
             protocol=protocol,
@@ -2857,15 +2849,17 @@ class ProvidersModelsDomain:
         }
         payload = json.dumps(request["body"], separators=(",", ":")).encode("utf-8")
         started = time.monotonic()
-        # The window is the generation window the copy promises - six seconds of
-        # *output* speed - so it starts when output starts.  Pinned to the
-        # request instead, a route that thinks for longer than the window could
-        # never be measured at all: measured on api.deepseek.com, the first token
-        # arrived 12-22 s after the request on a reasoning model, so every run
-        # ended as a timeout and the button never produced a number.  The wait
-        # itself is reported as the time to first token, which is the reading
-        # that wait is actually about.
-        deadline = started + window
+        # Two clocks, not one.  The *wait* for the first output is bounded by
+        # the probe's own first-event budget, because a reasoning route prefills
+        # for 15-25 s before it says anything and a window pinned to the request
+        # closed before the first token: every run on such a route read as a
+        # timeout, and the button never produced a number.  The *window* is the
+        # generation window the copy promises - six seconds of output speed - so
+        # it starts on the first content token.  Both ends stay bounded: the
+        # wait cannot outlast the same budget the availability probe gives a
+        # first event, and generation cannot outlast the window.
+        wait_budget = self._model_probe_timeout_seconds()
+        deadline: float | None = None
         window_shared = False
         # Each round contributes one count, and a round's own count is its
         # upstream state when it made one and this side's tally when it did
@@ -2879,11 +2873,19 @@ class ProvidersModelsDomain:
         rounds = 0
         retries = 0
         ended_by_itself = False
-        first_token_seconds: float | None = None
+        ttft_seconds: float | None = None
         failure_status = ""
         failure_detail = ""
         while rounds < self._SPEED_TEST_MAX_ROUNDS:
-            remaining = deadline - time.monotonic()
+            now = time.monotonic()
+            # Before the first token the press is waiting, not measuring: the
+            # budget is the probe's first-event one.  Afterwards it is the
+            # window, which is the promise the reading was asked for.
+            remaining = (
+                wait_budget - (now - started)
+                if deadline is None
+                else deadline - now
+            )
             if remaining <= 0:
                 break
             rounds += 1
@@ -2899,11 +2901,12 @@ class ProvidersModelsDomain:
             round_stated = 0
             round_ended = False
             try:
-                # The socket budget is what is left of the window, not the
-                # proxy's first-event budget: a stall must be measured as
-                # silence inside the press's own window, or a route that
-                # answers nothing would hold the button for minutes to prove
-                # what the window already proved.
+                # The socket budget is whatever clock is running: the wait
+                # budget before the first token, the generation window after
+                # it.  A stall must be measured as silence inside the clock
+                # that is running, or a route that answers nothing would hold
+                # the button for minutes to prove what the clock already
+                # proved.
                 with isolated_http_opener().open(
                     http_request, timeout=max(1.0, remaining)
                 ) as response:
@@ -2916,11 +2919,12 @@ class ProvidersModelsDomain:
                             if round_first is None:
                                 round_first = now
                                 if not window_shared:
-                                    # First output of the run: open the
-                                    # generation window here and give this route
-                                    # the full measurement it promises.
+                                    # First output of the run: the wait is
+                                    # over, so the generation window opens
+                                    # here and gives this route the full
+                                    # measurement the reading promises.
                                     window_shared = True
-                                    deadline = max(deadline, now + window)
+                                    deadline = now + window
                                 # Time to first token, taken on the first round
                                 # only: that is the wait before this route says
                                 # anything at all.  Later rounds re-prefill the
@@ -2928,12 +2932,14 @@ class ProvidersModelsDomain:
                                 # queue on the second request rather than the
                                 # route's own startup.
                                 if rounds == 1:
-                                    first_token_seconds = max(now - started, 0.0)
+                                    ttft_seconds = max(now - started, 0.0)
                             round_last = now
                         # The window is the stop condition, not the model's own
                         # end of turn: reading past it would report a rate the
-                        # press did not promise to wait for.
-                        if now >= deadline:
+                        # press did not promise to wait for.  ``deadline`` is
+                        # set by the first token, so this test only fires once
+                        # generation has actually started.
+                        if deadline is not None and now >= deadline:
                             break
                     else:
                         # The stream ended without the window cutting it: the
@@ -2996,13 +3002,13 @@ class ProvidersModelsDomain:
             ended_by_itself = ended_by_itself or round_ended
             if round_first is not None and round_last is not None:
                 seconds_emitting += max(round_last - round_first, 0.0)
-            if time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 break
         finished = time.monotonic()
         result["rounds"] = rounds
         result["sample"] = "".join(text)[:160]
         result["first_token_seconds"] = (
-            round(first_token_seconds, 3) if first_token_seconds is not None else None
+            round(ttft_seconds, 3) if ttft_seconds is not None else None
         )
         if not arrived:
             # No token arrived at all.  A failure keeps its own name; a stream
@@ -3015,7 +3021,7 @@ class ProvidersModelsDomain:
             result["detail"] = failure_detail or (
                 "The answer ended without any output to measure"
                 if ended_by_itself
-                else "No output arrived within the measurement window"
+                else "No output arrived before the first-token budget closed"
             )
             result["seconds"] = round(finished - started, 3)
             return result
@@ -3031,7 +3037,7 @@ class ProvidersModelsDomain:
             # and the count are still real, so they are what gets reported.
             result["status"] = "ok"
             result["first_token_seconds"] = (
-                round(first_token_seconds, 3) if first_token_seconds is not None else None
+                round(ttft_seconds, 3) if ttft_seconds is not None else None
             )
             result["output_token_count"] = tokens
             result["counted_by"] = "upstream" if counted_by_upstream else "estimate"
@@ -3509,23 +3515,15 @@ class ProvidersModelsDomain:
             }
         protocol = modelprint_adapter.protocol_for(wire_name, public_name)
         surface = self._degradation_requirements(protocol)
-        # A flash route's press is a speed measurement, and it is measured on
-        # the route's own recommended protocol.  When that is the same protocol
-        # the quick suite would scan, the scan is the same requests on the same
-        # wire for a different question - and the press has already answered the
-        # question the button asks.  The plan therefore excludes it, so one
-        # press never spends the window twice on one protocol.
-        if (
-            surface
-            and self._is_flash_route(model)
-            and surface == self._speed_test_protocol(model)
-        ):
-            return {
-                "includes_degradation": False,
-                "target": None,
-                "protocol": "",
-                "surface": "",
-            }
+        # The plan describes the deep test and nothing else.  It used to drop
+        # itself when the route's name said "flash", because that route's press
+        # was a speed measurement on this same wire and the scan would have been
+        # the same requests asked twice.  Speed is now its own row that any route
+        # can be asked for, and a speed press never runs the fingerprint layers,
+        # so the two measurements are never one press: a "full" press is the one
+        # that asks for both, and it means everything it says.  Reading the
+        # route's name here would also have made the deep test a property of a
+        # name instead of a property of the route's protocol.
         reachable = surfaces is None or not surface or surface in surfaces
         target = modelprint_adapter.plan_target(wire_name or public_name)
         reference = self._reference_fingerprint(model)
@@ -4145,23 +4143,25 @@ class ProvidersModelsDomain:
         surfaces = self._probe_surfaces(
             api_base, model, provider, serves_images=self._serves_images(model)
         )
-        # A flash route is pressed for its speed, not for its availability, and
-        # the two questions are answered by the same request: the measurement
-        # streams a real turn on the one protocol the route recommends, so a
-        # surface that emitted tokens answered.  Asking that protocol twice
-        # under one press would make the pane pay twice for one reading, so the
-        # speed run replaces that surface's availability probe instead of
-        # joining it.  The other surfaces keep their own probes: their answers
-        # are what a protocol recommendation compares, and only a flash route
-        # ever reaches this branch.
-        # The speed check runs when the press asked for it, and only then.  A
-        # flash route used to be measured because its name promises a rate, but
-        # the menu now offers that reading as its own row: running it under
-        # 「连通性」 would spend the press's whole window measuring something the
-        # user did not ask for, and the row beside it would say nothing.
+        # The speed check runs when the press asked for it, and only then.  It
+        # used to run for a route whose name said "flash", which made the rate a
+        # property of the name rather than a question anyone could ask; the menu
+        # offers that reading as its own row, so a press states it.  Running it
+        # under 「连通性」 would spend the press's whole window measuring
+        # something the user did not ask for, and the row beside it would say
+        # nothing.
+        #
+        # The two questions are answered by the same request when it does run:
+        # the measurement streams a real turn on the one protocol the route
+        # recommends, so a surface that emitted tokens answered.  Asking that
+        # protocol twice under one press would make the pane pay twice for one
+        # reading, so the speed run replaces that surface's availability probe
+        # instead of joining it.  The other surfaces keep their own probes:
+        # their answers are what a protocol recommendation compares.
+        speed_requested = "speed" in layers
         speed_protocol = (
             self._speed_test_protocol(model)
-            if "speed" in layers and self._IMAGE_PROBE_SURFACE not in surfaces
+            if speed_requested and self._IMAGE_PROBE_SURFACE not in surfaces
             else ""
         )
         speed_test: dict[str, Any] | None = None
@@ -4200,13 +4200,18 @@ class ProvidersModelsDomain:
                 "model_id": model_id,
                 "kind": kind,
             }
-        if speed_protocol:
+        if speed_requested:
             # The measurement speaks the recommendation's own surface, and its
             # answer joins the matrix in the same shape the availability probe
             # would have used: a route that emitted tokens is a route that
             # answered there.  It runs after the other surfaces so a press that
             # finds nothing anywhere still reports that at the same time; the
             # window it spends is the press's own, and it is bounded.
+            #
+            # A route with no chat wire to measure still gets a reading, and the
+            # reading states why it has none.  Leaving it out entirely would
+            # answer a press that asked for a rate with the availability matrix
+            # and no word about the thing that was asked for.
             speed_test = self._speed_test_run(
                 protocol=speed_protocol,
                 api_base=api_base,
@@ -4214,15 +4219,16 @@ class ProvidersModelsDomain:
                 model_name=model_name,
                 account_id=account_id,
             )
-            surface_results[speed_protocol] = {
-                "surface": speed_protocol,
-                "available": speed_test.get("status") == "ok",
-                "status": str(speed_test.get("status", "unavailable")),
-                "original_request": copy.deepcopy(
-                    speed_test.get("original_request", {})
-                ),
-            }
-            surfaces = [speed_protocol, *surfaces]
+            if speed_protocol:
+                surface_results[speed_protocol] = {
+                    "surface": speed_protocol,
+                    "available": speed_test.get("status") == "ok",
+                    "status": str(speed_test.get("status", "unavailable")),
+                    "original_request": copy.deepcopy(
+                        speed_test.get("original_request", {})
+                    ),
+                }
+                surfaces = [speed_protocol, *surfaces]
         # The modality is not always readable before the first request: LiteLLM's
         # cost map is fixed to the copy bundled with this install, and a provider
         # that ships a model ahead of it (``gpt-image-2.6-flare`` is absent from
@@ -9283,6 +9289,7 @@ class ProvidersModelsDomain:
             return result
 
         if policy_name == "delete":
+            dropped_rows: list[Mapping[str, Any]] = []
             for provider in working:
                 if not isinstance(provider, dict) or not isinstance(provider.get("models"), list):
                     continue
@@ -9293,8 +9300,14 @@ class ProvidersModelsDomain:
                     for model in provider["models"]
                     if not isinstance(model, Mapping)
                     or not self._policy_bound_key(model, keys, target_ids)
+                    or dropped_rows.append(model)
                 ]
                 result["deleted_models"] += before_count - len(provider["models"])
+            if dropped_rows:
+                # The document's own copy of these routes goes with them: it is
+                # what the config writer merges, and a route left there names a
+                # key the providers no longer carry.
+                self._forget_document_routes(dropped_rows)
         elif policy_name == "detach":
             for key_id, (provider_index, key) in key_locations.items():
                 provider = working[provider_index]
@@ -9435,18 +9448,206 @@ class ProvidersModelsDomain:
                 if key["id"] not in target_ids
             ]
             self._sync_primary_api_key(provider, keys)
-        working = [
-            provider
-            for provider in working
-            if not isinstance(provider, Mapping)
-            or self._provider_api_keys(provider)
-            or bool(provider.get("models"))
-        ]
+        # A row emptied by the policy stays.  Retiring keys and routes is what
+        # an account delete is for; the provider row is the person's own -- a
+        # name, an address, and whatever keys they added themselves -- and none
+        # of that belonged to the account.  Pruning emptied rows here deleted
+        # the whole provider on an account delete, which took with it the thing
+        # the person was going to re-sign-in.
         provider_bindings, model_bindings = self._editor_id_bindings()
         self._draft["providers"] = working
         self._restore_editor_id_bindings(provider_bindings, model_bindings)
         self._probe_overlay.clear()
         return result
+
+    @staticmethod
+    def _relay_binding_is_gone(provider: Mapping[str, Any], keys: object, known_stations: set[str]) -> bool:
+        """Whether a provider names a station nothing local can answer for.
+
+        One question, asked in two places: a row whose slot was just removed and
+        a row whose slots were already gone.  Both mean the station this row was
+        made from no longer exists here, so the binding has to go with it or the
+        next Apply refuses the document.
+        """
+
+        bound = str(provider.get("relay_station_id", "")).strip()
+        if not bound or bound in known_stations:
+            return False
+        return not any(
+            isinstance(key, Mapping) and (key.get("source") or {}).get("kind") == "relay"
+            for key in (keys or [])
+        )
+
+    def _clear_provider_relay_binding(self, provider: dict[str, Any]) -> None:
+        """Stop a provider naming a station this Core no longer has.
+
+        Two fields state one fact: ``provider_type``/``relay_station_id`` and the
+        ``extra`` source.  Dropping only the id leaves ``provider_type: relay``
+        with no station, which is not a shape the source reader accepts -- it
+        raised "Provider source is invalid" and the Apply that followed a delete
+        refused with "Relay station ID is invalid".  The pair moves through the
+        one setter that knows both halves, so the setter is the only place that
+        writes either of them: restating ``provider_type`` here read like a
+        second rule, and the next edit to one of the copies would have made a
+        station-bound row into one the source reader refuses.
+
+        The id is dropped rather than emptied: a cleared row carries no station
+        key at all, which is the shape ``config.yaml`` itself writes.  The empty
+        string spelling belongs to the legacy conversion path, not to this one.
+        """
+
+        self._set_provider_source(provider, {"kind": "custom"})
+        provider.pop("relay_station_id", None)
+
+    def _forget_document_routes(self, rows: object) -> int:
+        """Drop removed routes from the draft's own ``model_list``.
+
+        The providers' routes and the document's are two copies of one list: the
+        document is what the config writer merges, and a route left in it names
+        a key the providers no longer carry -- which the next validate reads as
+        "Model … has no api_key" and refuses the Apply that removed the key.  A
+        delete that only edited ``providers`` therefore reported 操作失败 on the
+        apply that followed it.
+        """
+
+        if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes, bytearray)):
+            return 0
+        wanted = {
+            (str(row.get("provider", "")).strip(), str(row.get("model_name", "")).strip())
+            for row in rows
+            if isinstance(row, Mapping)
+        }
+        wanted.discard(("", ""))
+        if not wanted:
+            return 0
+        document = self._draft.get("document")
+        if not isinstance(document, dict):
+            return 0
+        model_list = document.get("model_list")
+        if not isinstance(model_list, list):
+            return 0
+        kept = [
+            entry
+            for entry in model_list
+            if not isinstance(entry, Mapping)
+            or (str(entry.get("provider", "")).strip(), str(entry.get("model_name", "")).strip()) not in wanted
+        ]
+        removed = len(model_list) - len(kept)
+        if removed:
+            document["model_list"] = kept
+        return removed
+
+    def drop_unreachable_relay_sources(
+        self,
+        accounts: object = (),
+        stations: object = (),
+    ) -> dict[str, Any]:
+        """Delete the provider keys a removed relay account left behind.
+
+        A relay key slot is a *local* pointer at one station key: the station
+        owns the credential, the slot owns the copy this app materializes.  When
+        the account (or its station) is deleted here, every slot that pointed at
+        it is a row nothing can ever resolve again -- and the pane draws exactly
+        that: a key with no account name, a 中转站关联 section with no rows, and
+        a note saying the key "does not exist on the station", which is not a
+        state a person can act on.
+
+        ``stations`` is the set a relay source can still be bound to: the
+        stations that hold at least one account.  A station whose last account
+        was deleted is not one, even while its own row is still there -- an
+        account delete removes the empty station later in the same run, and a
+        provider left naming it then fails the Apply that follows.
+
+        So the slot and the routes on it go with the account.  The station is
+        never told: deleting an account is a local act, and the keys on the site
+        are the site's own (the pane's own words: 删除它不会影响中转站).  A slot
+        sourced from another account or another station -- or an imported
+        (independent) key -- is untouched.
+        """
+
+        def _ids(value: object) -> set[str]:
+            if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+                return set()
+            return {str(item).strip() for item in value if str(item).strip()}
+
+        known_accounts = _ids(accounts)
+        known_stations = _ids(stations)
+        providers = self._draft.get("providers")
+        if not isinstance(providers, list):
+            return {"removed_keys": 0, "removed_models": 0}
+        removed_keys = 0
+        removed_models = 0
+        changed = False
+        kept: list[object] = []
+        for raw_provider in providers:
+            if not isinstance(raw_provider, Mapping):
+                kept.append(raw_provider)
+                continue
+            provider = copy.deepcopy(dict(raw_provider))
+            try:
+                keys = self._provider_api_keys(provider)
+            except DomainError:
+                kept.append(raw_provider)
+                continue
+            doomed = {
+                key["id"]
+                for key in keys
+                if key["source"].get("kind") == "relay"
+                and (
+                    str(key["source"].get("account_id", "")).strip() not in known_accounts
+                    or str(key["source"].get("station_id", "")).strip() not in known_stations
+                )
+            }
+            if not doomed:
+                # A stale station binding with nothing behind it is the same
+                # finding one level up: the pane would draw the station's own
+                # section for a station that is not there.
+                if self._relay_binding_is_gone(provider, keys, known_stations):
+                    self._clear_provider_relay_binding(provider)
+                    changed = True
+                    # The row stays.  Deleting an account takes that account's
+                    # keys and models; it does not take the provider the person
+                    # made, whose name, address and custom keys are theirs.  A
+                    # row left with nothing is visible and deletable on its own.
+                    kept.append(provider)
+                else:
+                    kept.append(raw_provider)
+                continue
+            survivors = [key for key in keys if key["id"] not in doomed]
+            models = provider.get("models")
+            if isinstance(models, list):
+                remaining_models = []
+                dropped_rows: list[Mapping[str, Any]] = []
+                for model in models:
+                    if not isinstance(model, Mapping):
+                        remaining_models.append(model)
+                        continue
+                    bound_ids = {
+                        str(model.get("provider_key_id", "")).strip(),
+                    }
+                    if bound_ids & doomed:
+                        removed_models += 1
+                        dropped_rows.append(model)
+                        continue
+                    remaining_models.append(model)
+                provider["models"] = remaining_models
+                if dropped_rows:
+                    self._forget_document_routes(dropped_rows)
+            removed_keys += len(doomed)
+            self._sync_primary_api_key(provider, survivors)
+            if self._relay_binding_is_gone(provider, survivors, known_stations):
+                self._clear_provider_relay_binding(provider)
+            changed = True
+            kept.append(provider)
+        if changed:
+            self._draft["providers"] = kept
+            self.revision += 1
+            self._last_operation = {
+                "operation": "relay_sources_dropped",
+                "removed_keys": removed_keys,
+                "removed_models": removed_models,
+            }
+        return {"removed_keys": removed_keys, "removed_models": removed_models}
 
     def apply_relay_dependency_policy(
         self,

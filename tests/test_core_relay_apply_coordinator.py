@@ -2112,9 +2112,13 @@ class LinkedEditResolvesFromTheKeyItAlreadyHolds(unittest.TestCase):
             self.assertEqual("applied", result["status"])
 
             # The slot is gone with the key, and so is the route that named it:
-            # neither can outlive the credential the station revoked.  That key
-            # was this provider's only key, so the row itself is gone with them.
-            self.assertEqual([], providers.snapshot()["providers"])
+            # neither can outlive the credential the station revoked.  The row
+            # itself stays -- empty, unbilled and deletable -- because retiring
+            # a credential is not the same act as deleting the provider.
+            rows = providers.snapshot()["providers"]
+            self.assertEqual(1, len(rows))
+            self.assertEqual([], rows[0]["key_states"])
+            self.assertEqual([], rows[0]["models"])
             written = (root / "config.yaml").read_text(encoding="utf-8")
             self.assertNotIn("newapi-7", written)
 
@@ -2163,8 +2167,11 @@ class LinkedEditResolvesFromTheKeyItAlreadyHolds(unittest.TestCase):
                 [{"resource_id": row["resource_id"]} for row in details["resources"]],
             )
             # The release is staged with the retirement, so the slot and its
-            # route are gone before the Apply calls the station.
-            self.assertEqual([], providers.snapshot()["providers"])
+            # route are gone before the Apply calls the station; the row stays.
+            remaining = providers.snapshot()["providers"]
+            self.assertEqual(1, len(remaining))
+            self.assertEqual([], remaining[0]["key_states"])
+            self.assertEqual([], remaining[0]["models"])
 
             result = core.apply("relay_accounts", revision=core.revision)
             self.assertEqual("applied", result["status"])
@@ -2207,7 +2214,10 @@ class LinkedEditResolvesFromTheKeyItAlreadyHolds(unittest.TestCase):
             result = core.apply("relay_accounts", revision=core.revision)
             self.assertEqual("applied", result["status"])
             self.assertIn(("DELETE", "/api/token/7"), http.calls)
-            self.assertEqual([], providers.snapshot()["providers"])
+            rows = providers.snapshot()["providers"]
+            self.assertEqual(1, len(rows))
+            self.assertEqual([], rows[0]["key_states"])
+            self.assertEqual([], rows[0]["models"])
             self.assertNotIn("newapi-7", (root / "config.yaml").read_text(encoding="utf-8"))
 
     def _linked_provider_core(self, core: CoreStore, relay: RelayAccountsDomain) -> str:

@@ -30,7 +30,7 @@ import { askCloseRelayGroupSheet, closeRelayGroupSheet, relayGroupSheetState, se
 import { HostChromeHost } from "./ui/HostChrome";
 import { RelayGroupSheet } from "./ui/RelayGroupSheet";
 import { registerYoungRouter } from "./bootstrap";
-import { canonicalWindowRoute, DESKTOP_ROUTES, ROUTES } from "./routes";
+import { canonicalPageRoute, canonicalWindowRoute, DESKTOP_ROUTES, ROUTES } from "./routes";
 import type { AppRoute } from "./types";
 
 /**
@@ -68,7 +68,7 @@ function routeFromHash(): AppRoute {
   const fragment = window.location.hash.replace(/^#/, "");
   const route = fragment.startsWith("/") ? fragment.slice(1) : fragment;
   if (!route) return DEFAULT_ROUTE;
-  const next = canonicalWindowRoute(route as AppRoute) as AppRoute;
+  const next = canonicalPageRoute(route as AppRoute);
   // Every route is one document here, so a fragment that names no surface must
   // fall back to a pane that exists.  The launch address is the case that
   // reached users: Core prints `#launch=<token>`, the sign-in page spends it and
@@ -91,7 +91,7 @@ function routeFromHash(): AppRoute {
 function adoptRouteAddress(): void {
   const fragment = window.location.hash.replace(/^#/, "");
   const route = (fragment.startsWith("/") ? fragment.slice(1) : fragment) as AppRoute;
-  if (route && isKnownRoute(canonicalWindowRoute(route) as AppRoute)) return;
+  if (route && isKnownRoute(canonicalPageRoute(route))) return;
   const address = new URL(window.location.href);
   // Only the fragment moves: the path keeps whatever spelling served this
   // document (`/ui/` carries a trailing slash for a reason -- the script is
@@ -129,7 +129,7 @@ let currentRoute = routeFromHash();
  * navigation that has already happened.
  */
 function navigate(route: AppRoute): void {
-  const next = canonicalWindowRoute(route) as AppRoute;
+  const next = canonicalPageRoute(route);
   if (next === currentRoute) return;
   currentRoute = next;
   window.location.hash = next === "home" ? "" : `#/${next}`;

@@ -1,15 +1,14 @@
 """The 探测 button's speed reading, and the scan it replaces.
 
-The reading is its own row now — the press states it, and any route can be
-asked for it — but the streamed turn that produces the number is also the
-evidence that the surface serves it, so asking that same surface again under
-「连通性」 would make one press pay twice for one finding.  A flash name still
-matters to the deep plan: its quick suite scans the protocol the reading
-speaks, so the plan drops that duplicate scan instead of spending the window
-twice on one wire.  These tests pin what those decisions depend on — which
-routes carry the flash name, which single protocol each is measured on, what
-the measurement counts, and that a press asking for the reading does not run
-the availability probe beside it.
+The reading is its own row — the press states it, and *any* route can be asked
+for it: the menu row is the statement of intent, so no model name decides
+whether the question may be asked.  The streamed turn that produces the number
+is also the evidence that the surface serves it, so asking that same surface
+again under 「连通性」 would make one press pay twice for one finding.  These
+tests pin what those decisions depend on — which single protocol each route is
+measured on, what the measurement counts, that the wait for a reasoning route's
+first token is reported rather than timed out, and that a press asking for the
+reading does not run the availability probe beside it.
 """
 
 from __future__ import annotations
@@ -32,41 +31,39 @@ def route(name: str, **extra: object) -> dict[str, object]:
     return value
 
 
-class FlashRouteTests(unittest.TestCase):
-    def test_the_word_is_read_on_the_upstream_name(self) -> None:
-        """A flash model is one by its name, wherever that word appears.
+class RouteEligibilityTests(unittest.TestCase):
+    def test_any_route_can_be_asked_for_the_reading(self) -> None:
+        """The press states the question; a model's name does not gate it.
 
-        The name is the evidence and the public alias is not: this app's own
-        ``openai/``/``anthropic/`` prefix is a wire, not a model, so it is
-        dropped first — while ``azure/`` is LiteLLM's adapter and stays part of
-        the name, exactly as every other name decision in this domain reads it.
+        The reading used to be offered only to a route whose name carried
+        "flash": the menu row was hidden for every other model, which made a
+        measurement of the route's own speed a property of the name a provider
+        happened to give it.  What decides the reading is that the user asked
+        for it, and what it measures is the one protocol the route recommends —
+        so a route with a protocol has a reading, whatever it is called.
         """
 
         for name in (
             "openai/gemini-3.1-flash-lite",
             "openai/glm-5.3-flash",
-            "openai/deepseek-v4.1-flash",
-            "anthropic/claude-flash-something",
-            "flash",
-        ):
-            with self.subTest(name=name):
-                self.assertTrue(ProvidersModelsDomain._is_flash_route(route(name)))
-
-        for name in (
             "openai/gpt-5",
             "anthropic/claude-opus-4-8",
-            "",
-            # The public alias is deliberately not what decides this.
-            "openai/gpt-5",
+            "azure/gpt-5.2",
+            "deepseek/deepseek-v4",
         ):
             with self.subTest(name=name):
-                self.assertFalse(ProvidersModelsDomain._is_flash_route(route(name)))
+                self.assertTrue(
+                    ProvidersModelsDomain._speed_test_protocol(route(name)),
+                    name,
+                )
 
-        # A Claude-shaped public name over a flash route is still a flash route.
-        self.assertTrue(
-            ProvidersModelsDomain._is_flash_route(
-                route("openai/glm-5.3-flash", model_name="Claude Opus 5.5")
-            )
+        # A protocol this app cannot write a chat request for has no reading,
+        # and says so with the empty protocol rather than with a quiet "slow".
+        self.assertEqual(
+            "",
+            ProvidersModelsDomain._speed_test_protocol(
+                route("openai/gpt-image-2.6", upstream_url_surface="openai/images")
+            ),
         )
 
     def test_one_protocol_is_the_one_the_route_states(self) -> None:
@@ -352,6 +349,81 @@ class SpeedMeasurementTests(unittest.TestCase):
         self.assertIsNone(result["output_token_count_per_second"])
         self.assertEqual([], FakeStream.requests)
 
+    def test_the_wait_for_the_first_token_is_not_the_window(self) -> None:
+        """A reasoning route may think longer than the window before it speaks.
+
+        The window is a promise about *generation*: six seconds of output.  It
+        used to be pinned to the request, so a route that prefilled for longer
+        than the window never produced a token inside it and every press read as
+        a timeout — measured on a reasoning route, the first token arrived 15-25
+        s after the request.  The wait is bounded by the probe's own first-event
+        budget and reported as ``first_token_seconds``; the window opens when
+        output does.  This run's wait is deliberately longer than the window, so
+        a reading pinned to the request would have no token at all.
+        """
+
+        domain = ProvidersModelsDomain.__new__(ProvidersModelsDomain)
+        ticks = iter(range(0, 10_000))
+        # Two seconds per clock read, and two silent reads before the first
+        # piece: the wait is 8 s against a 5 s window.
+        clock = lambda: next(ticks) * 2.0
+
+        class Response:
+            def __enter__(self) -> "Response":
+                return self
+
+            def __exit__(self, *_args: object) -> bool:
+                return False
+
+        class Opener:
+            def open(self, *_args: object, **_kwargs: object) -> Response:
+                return Response()
+
+        events = [
+            ("", 0),
+            ("", 0),
+            ("one ", 0),
+            ("two ", 0),
+            ("three ", 0),
+        ]
+        from unittest import mock
+
+        with mock.patch(
+            "young_router.core.domains.providers_models.isolated_http_opener",
+            return_value=Opener(),
+        ), mock.patch.object(
+            ProvidersModelsDomain, "_speed_test_events", return_value=iter(events)
+        ), mock.patch.object(
+            ProvidersModelsDomain, "_count_tokens", return_value=3
+        ), mock.patch.object(
+            ProvidersModelsDomain,
+            "_speed_test_request",
+            return_value={
+                "method": "POST",
+                "url": "https://example.test/v1/chat/completions",
+                "headers": {},
+                "display_headers": {},
+                "body": {},
+            },
+        ), mock.patch(
+            "young_router.core.domains.providers_models.time.monotonic", side_effect=clock
+        ), mock.patch(
+            "young_router.core.domains.providers_models.time.sleep"
+        ):
+            reading = domain._speed_test_run(
+                protocol="openai/chat",
+                api_base="https://example.test/v1",
+                credential="replace-me-secret",
+                model_name="reasoning-route",
+            )
+
+        self.assertEqual("ok", reading["status"])
+        self.assertGreater(
+            reading["first_token_seconds"], reading["window_seconds"]
+        )
+        self.assertGreater(reading["output_token_count_per_second"], 0.0)
+        self.assertGreaterEqual(reading["rounds"], 1)
+
     def test_a_credential_is_never_part_of_the_reported_request(self) -> None:
         """The pane draws the request that was made, and a key is not that."""
 
@@ -487,12 +559,15 @@ class SpeedReplacesTheAvailabilityProbeTests(unittest.TestCase):
             stored = domain.snapshot()["providers"][0]["models"][0]["probe"]
             self.assertEqual(60.0, stored["speed_test"]["output_token_count_per_second"])
 
-    def test_the_deep_test_does_not_scan_the_measured_protocol_again(self) -> None:
-        """The plan excludes the scan when it would speak the measured surface.
+    def test_the_deep_plan_describes_the_deep_test_and_nothing_else(self) -> None:
+        """A flash name no longer shortens the plan.
 
-        The quick suite and the speed run are the same requests on the same wire
-        for different questions; one press answers one of them, so the plan
-        states there is no scan rather than spending the window twice.
+        The plan used to drop its scan when the route's name said "flash",
+        because that route's press was a speed measurement on the same wire.
+        Speed is its own row now, so the plan states what the deep test runs and
+        lets the press's own layers decide whether both are asked: a "full"
+        press asks for the scan *and* the reading, and reading the name here
+        would make the deep test a property of a name instead of a protocol.
         """
 
         model = {
@@ -509,21 +584,38 @@ class SpeedReplacesTheAvailabilityProbeTests(unittest.TestCase):
 
             # The quick suite scans the surface the degradation requirements
             # name; state which one that is instead of reaching for the
-            # adapter that computes it.
+            # adapter that computes it.  A staged baseline makes the plan
+            # reachable, so this case reads the surface rule itself.
             with mock.patch.object(
                 ProvidersModelsDomain,
                 "_degradation_requirements",
                 return_value="openai/chat",
+            ), mock.patch.object(
+                ProvidersModelsDomain,
+                "_reference_fingerprint",
+                return_value={"fingerprint": "reference"},
             ):
                 plan = domain._deep_probe_plan(model)
-            self.assertFalse(plan["includes_degradation"])
-            self.assertIsNone(plan["target"])
+            self.assertTrue(plan["includes_degradation"])
+            self.assertEqual("openai/chat", plan["surface"])
 
-            # A route whose suite protocol is a different surface keeps its scan:
-            # the measurement never spoke that wire, so nothing is duplicated.
-            # A route with no staged baseline says so instead of promising a
-            # comparison; state the reference this case is about so the plan
-            # reaches the duplicate-surface rule rather than the no-baseline one.
+            # A route the table cannot speak still says so: the reason is the
+            # protocol, not the model's name.
+            with mock.patch.object(
+                ProvidersModelsDomain,
+                "_degradation_requirements",
+                return_value="",
+            ), mock.patch.object(
+                ProvidersModelsDomain,
+                "_reference_fingerprint",
+                return_value={"fingerprint": "reference"},
+            ):
+                plan = domain._deep_probe_plan(model)
+            self.assertTrue(plan["includes_degradation"])
+
+            # A route the table speaks on another surface keeps its scan only
+            # when this press can actually ask that surface: the plan answers
+            # "will the deep test run", not "would it run for some other press".
             with mock.patch.object(
                 ProvidersModelsDomain,
                 "_degradation_requirements",
@@ -533,9 +625,113 @@ class SpeedReplacesTheAvailabilityProbeTests(unittest.TestCase):
                 "_reference_fingerprint",
                 return_value={"fingerprint": "reference"},
             ):
-                plan = domain._deep_probe_plan(model)
-            self.assertTrue(plan["includes_degradation"])
-            self.assertEqual("anthropic", plan["surface"])
+                plan = domain._deep_probe_plan(model, surfaces=["openai/chat"])
+                self.assertFalse(plan["includes_degradation"])
+                self.assertEqual("", plan["surface"])
+                plan = domain._deep_probe_plan(
+                    model, surfaces=["openai/chat", "anthropic"]
+                )
+                self.assertTrue(plan["includes_degradation"])
+                self.assertEqual("anthropic", plan["surface"])
+
+
+class AModelNameDoesNotDecideTests(unittest.TestCase):
+    def test_a_model_that_is_not_flash_still_reports_a_reading(self) -> None:
+        """The menu offers the reading for every route, so a press gets one.
+
+        A route whose name carries no "flash" used to be refused the press:
+        the pane hid the row, and a press that slipped through measured nothing.
+        The row is the user's statement of intent now, so this counts the
+        reading a non-flash route's speed press actually produces.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(
+                textwrap.dedent(PROVIDER_CONFIG)
+                .lstrip()
+                .replace("glm-5.3-flash", "gpt-5")
+                .replace("openai/chat", "openai/responses"),
+                encoding="utf-8",
+            )
+            domain = ProvidersModelsDomain(path)
+            from unittest import mock
+
+            def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
+                return {"surface": surface, "available": True, "status": "ok"}
+
+            with mock.patch.object(
+                ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe
+            ), mock.patch.object(
+                ProvidersModelsDomain,
+                "_speed_test_run",
+                return_value={
+                    "status": "ok",
+                    "protocol": "openai/responses",
+                    "output_token_count": 90,
+                    "seconds": 3.0,
+                    "output_token_count_per_second": 30.0,
+                    "first_token_seconds": 1.5,
+                    "counted_by": "upstream",
+                },
+            ) as run:
+                result = domain.probe(
+                    {
+                        "kind": "speed",
+                        "provider_id": domain.snapshot()["providers"][0]["id"],
+                        "model_id": domain.snapshot()["providers"][0]["models"][0]["editor_id"],
+                    }
+                )
+
+            run.assert_called_once()
+            self.assertEqual("openai/responses", run.call_args.kwargs["protocol"])
+            self.assertEqual("ok", result["speed_test"]["status"])
+            self.assertEqual(30.0, result["speed_test"]["output_token_count_per_second"])
+
+    def test_a_route_with_no_chat_wire_says_so_instead_of_saying_nothing(self) -> None:
+        """An image route cannot be streamed, and the press still answers.
+
+        "No chat wire" is a finding about the reading, not a reason to answer a
+        speed press with the availability matrix and leave the rate unmentioned.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(
+                textwrap.dedent(PROVIDER_CONFIG)
+                .lstrip()
+                .replace("glm-5.3-flash", "gpt-image-2.6"),
+                encoding="utf-8",
+            )
+            domain = ProvidersModelsDomain(path)
+            from unittest import mock
+
+            def surface_probe(*, surface: str, **_kwargs: object) -> dict[str, object]:
+                return {"surface": surface, "available": True, "status": "ok"}
+
+            # An Images route is one this domain must find behaviourally: the
+            # bundled cost map is what answers ``serves_images``, and this test
+            # is about the reading's wording rather than that lookup.  The empty
+            # protocol is what ``_speed_test_protocol`` returns for it.
+            with mock.patch.object(
+                ProvidersModelsDomain, "_surface_probe", side_effect=surface_probe
+            ), mock.patch.object(
+                ProvidersModelsDomain,
+                "_speed_test_protocol",
+                return_value="",
+            ):
+                result = domain.probe(
+                    {
+                        "kind": "speed",
+                        "provider_id": domain.snapshot()["providers"][0]["id"],
+                        "model_id": domain.snapshot()["providers"][0]["models"][0]["editor_id"],
+                    }
+                )
+
+            self.assertIsNotNone(result["speed_test"])
+            self.assertEqual("invalid_config", result["speed_test"]["status"])
+            self.assertEqual("", result["speed_test"]["protocol"])
+            self.assertIn("chat wire", result["speed_test"]["detail"])
 
 
 class NonFlashRouteTests(unittest.TestCase):

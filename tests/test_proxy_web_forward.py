@@ -286,6 +286,12 @@ class ForwardingTests(unittest.TestCase):
         self.assertEqual("router.example.com", recorded["page_host"])
         self.assertEqual(f"{self.address}:{self.port}", recorded["host"])
 
+    def test_a_forwarded_request_without_host_still_marks_the_proxy_boundary(self) -> None:
+        status, _headers, body = _call(self.middleware, "GET", "/ui/")
+        self.assertEqual(200, status)
+        recorded = json.loads(body)
+        self.assertEqual([""], recorded["page_host_values"])
+
     def test_a_client_cannot_state_the_page_name_itself(self) -> None:
         # The header decides whether Core gates the page, so a copy arriving
         # from the browser is dropped: only this hop says what the page is.
