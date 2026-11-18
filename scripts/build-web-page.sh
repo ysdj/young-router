@@ -83,8 +83,10 @@ ln -s "$app_modules" "$tree/rn/apps/web/node_modules"
 node "$tree/rn/apps/web/build.mjs" >/dev/null
 
 dist="$tree/rn/apps/web/dist"
-# What a page is: one shell, one content-addressed script, the editor document
-# it frames, and the shim.  `bundle.js` is refused by name -- a fixed script name
+# What a page is: one shell, one content-addressed script, and the editor
+# document it frames.  ``shim.js`` is a build-time alias for ``react-native``
+# that esbuild inlines into the bundle; it is not a file the page fetches, and
+# the build stopped writing it.  `bundle.js` is refused by name -- a fixed script name
 # under Core's `immutable` header is a browser frozen on whichever build it saw
 # first, which is why the builder names the script after its own bytes.
 bundle_name=none
@@ -112,7 +114,7 @@ for candidate in "$dist"/editor.*.js; do
   editor_name=$(basename "$candidate")
 done
 [[ "$editor_name" =~ ^editor\.[0-9a-f]{16}\.js$ ]] || { echo "build-web-page: $editor_name is not editor.<16 hex>.js" >&2; exit 1; }
-for name in index.html shim.js editor.html "$bundle_name" "$editor_name"; do
+for name in index.html editor.html "$bundle_name" "$editor_name"; do
   [[ -s "$dist/$name" ]] || { echo "build-web-page: the build has no $name" >&2; exit 1; }
 done
 # Every text asset travels with both precompressed siblings, which is what Core
