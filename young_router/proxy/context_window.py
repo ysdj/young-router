@@ -9,7 +9,7 @@ it are exactly the parts a model can ask for again.
 
 So this pass runs in ``async_pre_call_hook`` -- the only place that runs before
 deployment selection, and therefore before the refusal exists.  It shortens
-nothing unless the *exact* count LiteLLM itself computes is over the window the
+nothing unless the request's content-aware estimate is over the window the
 model group declares, and it never touches the current turn's own message or
 the instructions.
 
@@ -122,13 +122,8 @@ _DENSEST_BYTES_PER_TOKEN = 1.4
 #: is already known.
 _MIN_SHRINK_FRACTION = 0.9
 
-#: The exact size of the request this task is serving, as the router counts it.
-#: ``apply`` measures it anyway -- the count decides whether the request can be
-#: sent at all -- and the answer the client gets back should be the same number:
-#: Codex renders it as "context used" and compacts against it.  A relay that
-#: reports a smaller prompt (they all count their own way) leaves that gauge
-#: near zero while the proxy is already refusing the request, and the client
-#: then has no reason to compact until it is far too late.
+#: The input size this task's guard measured.  The value is also used for
+#: context reporting and remembering an upstream-accepted size.
 _MEASURED_INPUT_TOKENS: ContextVar[Optional[int]] = ContextVar(
     "young_router_measured_input_tokens", default=None
 )
@@ -267,7 +262,7 @@ def wire_tokens(items: Any) -> Optional[int]:
     """
 
     global _ENCODER
-    if not isinstance(items, list):
+    if not isinstance(items, (list, Mapping)):
         return None
     try:
         import tiktoken
@@ -290,7 +285,11 @@ def wire_tokens(items: Any) -> Optional[int]:
     # The image bodies leave the counted text for the reason in
     # ``_strings_joined``: they are priced per picture below, not per byte.
     try:
-        serialized = json.dumps(_without_inline_image_bytes(items))
+        # Tokenization sees decoded JSON values, not their escape spelling.
+        # Escaping CJK text here turns each character into several tokens.
+        serialized = json.dumps(
+            _without_inline_image_bytes(items), ensure_ascii=False
+        )
     except Exception:
         serialized = text
     return len(_ENCODER.encode(serialized, disallowed_special=()))
@@ -444,13 +443,20 @@ def count_tokens(data: Mapping[str, Any], router: Any = None) -> Optional[int]:
 def measure_tokens(data: Mapping[str, Any], router: Any = None) -> Optional[int]:
     """The largest honest count for this payload."""
 
-    count = count_tokens(data, router)
     key, items = payload_items(data)
     if key == "messages":
-        wire = wire_tokens(items)
-        if wire is not None and (count is None or wire > count):
+        # LiteLLM's Messages counter prices inline images as base64 text.
+        # Count decoded prompt text, system and tools; pessimistic_tokens prices
+        # images separately in the same units as the window.
+        prompt: Dict[str, Any] = {"messages": items}
+        if data.get("system") is not None:
+            prompt["system"] = data["system"]
+        if isinstance(data.get("tools"), list):
+            prompt["tools"] = data["tools"]
+        wire = wire_tokens(prompt)
+        if wire is not None:
             return wire
-    return count
+    return count_tokens(data, router)
 
 
 def schema_tokens(data: Mapping[str, Any]) -> int:
@@ -475,7 +481,11 @@ def schema_tokens(data: Mapping[str, Any]) -> int:
 
         if _ENCODER is None:
             _ENCODER = tiktoken.get_encoding("o200k_base")
-        return len(_ENCODER.encode(json.dumps(tools), disallowed_special=()))
+        return len(
+            _ENCODER.encode(
+                json.dumps(tools, ensure_ascii=False), disallowed_special=()
+            )
+        )
     except Exception:
         return 0
 
@@ -1274,7 +1284,7 @@ def _payload_bytes(data: Mapping[str, Any]) -> int:
 
     key, items = payload_items(data)
     try:
-        return len(json.dumps(items or []))
+        return len(json.dumps(items or [], ensure_ascii=False).encode("utf-8"))
     except Exception:
         return 0
 
@@ -1528,9 +1538,16 @@ def _count_is_worth_running(data: Mapping[str, Any], window: int) -> bool:
     count that the router would otherwise pay twice for a healthy replay.
     """
 
-    _key, items = payload_items(data)
+    key, items = payload_items(data)
     try:
-        serialized = len(json.dumps(items or []))
+        if key == "messages":
+            measurable: Any = {"messages": items or []}
+            for field in ("system", "tools"):
+                if data.get(field) is not None:
+                    measurable[field] = data[field]
+        else:
+            measurable = items or []
+        serialized = len(json.dumps(measurable, ensure_ascii=False).encode("utf-8"))
     except Exception:
         return True
     return serialized / _DENSEST_BYTES_PER_TOKEN >= window
@@ -1572,19 +1589,11 @@ def apply(data: Any) -> Optional[Dict[str, Any]]:
     if not _count_is_worth_running(data, limit):
         return None
     count = measure_tokens(data, router)
-    # A Messages replay is measured on the text it carries: the router's count
-    # reads the chat shape and drops the blocks (tool results, thinking) that
-    # make up most of a Claude Code history, so it under-reports by more than
-    # the margin this pass needs.
-    if payload_key == "messages":
-        measured_wire = wire_tokens(payload)
-        if measured_wire is not None and (count is None or measured_wire > count):
-            count = measured_wire
     if count is None:
         return None
-    # The tool definitions are part of the prompt and do not shrink with the
-    # history: they are added on top of whatever the messages cost.
-    schema = schema_tokens(data)
+    # Messages measurements already include system and tool definitions.
+    # Other surfaces keep LiteLLM's count and add their non-shrinking schema.
+    schema = 0 if payload_key == "messages" else schema_tokens(data)
     count += schema
     _MEASURED_INPUT_TOKENS.set(count)
     if pessimistic_tokens(data, count) <= limit:
@@ -1598,7 +1607,7 @@ def apply(data: Any) -> Optional[Dict[str, Any]]:
     if rewritten_images is not None:
         data = rewritten_images
         next_count = measure_tokens(data, router)
-        if next_count is not None:
+        if next_count is not None and payload_key != "messages":
             next_count += schema
         fitted_count = next_count
         if next_count is not None:
@@ -1631,7 +1640,7 @@ def apply(data: Any) -> Optional[Dict[str, Any]]:
             break
         result = shorter
         next_count = measure_tokens(shorter, router)
-        if next_count is not None:
+        if next_count is not None and payload_key != "messages":
             next_count += schema
         fitted_count = next_count
         # Stop at the target, not at the last count that was still under the
@@ -1660,6 +1669,8 @@ def apply(data: Any) -> Optional[Dict[str, Any]]:
                 candidate = dict(final)
                 candidate[payload_key] = new_items
                 recounted = measure_tokens(candidate, router)
+                if recounted is not None and payload_key != "messages":
+                    recounted += schema
                 if recounted is not None and recounted < fitted_count:
                     final = candidate
                     fitted_count = recounted

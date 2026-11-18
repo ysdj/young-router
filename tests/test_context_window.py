@@ -1120,6 +1120,77 @@ class MessagesWireImageTests(unittest.TestCase):
             "an inline image must not be counted as the prose its base64 resembles",
         )
 
+    def test_wire_tokens_counts_decoded_chinese_not_json_escapes(self) -> None:
+        import tiktoken
+
+        text = "走向数据已核实，下一步直接写入修改。" * 2_000
+        plain = len(
+            tiktoken.get_encoding("o200k_base").encode(
+                text, disallowed_special=()
+            )
+        )
+        measured = cw.wire_tokens(
+            [{"role": "assistant", "content": [{"type": "text", "text": text}]}]
+        )
+        self.assertIsNotNone(measured)
+        self.assertLess(measured, plain + 100)
+
+    def test_base64_image_bytes_do_not_evict_chinese_tool_history(self) -> None:
+        import base64
+
+        class _AnthropicRouter(_Router):
+            def _count_pre_call_check_tokens(
+                self, messages=None, input=None, request_kwargs=None
+            ):
+                body = {
+                    "system": request_kwargs.get("system"),
+                    "tools": request_kwargs.get("tools"),
+                    "messages": messages or [],
+                }
+                return len(json.dumps(body, ensure_ascii=False)) // 4
+
+        raw = base64.b64decode(self._jpeg(256, 256)) + b"\x00" * 4_000_000
+        image = base64.b64encode(raw).decode("ascii")
+        note = "走向数据已核实，下一步直接写入修改。" * 2_000
+        data = {
+            "model": "m",
+            "system": [{"type": "text", "text": "保留已验证的结论。"}],
+            "tools": [{"name": "Read", "description": "读取项目文件"}],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image,
+                            },
+                        }
+                    ],
+                },
+                {"role": "assistant", "content": [{"type": "text", "text": note}]},
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "继续实现。"}],
+                },
+            ],
+        }
+        router = _AnthropicRouter(1_000_000)
+        self.assertGreater(cw.count_tokens(data, router), router.window)
+
+        with (
+            mock.patch.object(cw, "_router", return_value=router),
+            mock.patch.object(cw, "_image_shrunk", return_value=None),
+        ):
+            measured = cw.measure_tokens(data, router)
+            fitted = cw.apply(data)
+
+        self.assertLess(measured, 100_000)
+        self.assertIsNone(fitted)
+        self.assertEqual(note, data["messages"][1]["content"][0]["text"])
+
     def test_a_replay_of_five_figures_does_not_trip_the_window(self) -> None:
         # The live thread's arithmetic: 5 figure reads, 300 tool round trips,
         # ~350k tokens of text against a 1M window.
