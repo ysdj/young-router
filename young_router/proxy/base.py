@@ -1151,12 +1151,25 @@ class _RouteRecoveryStreamResponse:
     def __init__(self, request_data: dict, exception: Exception) -> None:
         self.request_data = request_data
         self.exception = exception
+        self._iterator: Optional[AsyncIterator[Any]] = None
 
-    async def __aiter__(self) -> AsyncIterator[Any]:
-        from . import streaming as streaming_module
+    def __aiter__(self) -> AsyncIterator[Any]:
+        return self
 
-        async for chunk in streaming_module._stream_route_recovery_poll(self.request_data, self.exception):
-            yield chunk
+    async def __anext__(self) -> Any:
+        # Messages detects AsyncIterator before choosing its SSE response.
+        # An AsyncIterable alone falls through to FastAPI's JSON encoder.
+        if self._iterator is None:
+            from . import streaming as streaming_module
+
+            self._iterator = streaming_module._stream_route_recovery_poll(
+                self.request_data, self.exception
+            ).__aiter__()
+        return await self._iterator.__anext__()
+
+    async def aclose(self) -> None:
+        if self._iterator is not None:
+            await self._iterator.aclose()
 
 
 class _TerminalFailedResponsesStreamResponse:

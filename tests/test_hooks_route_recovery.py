@@ -10,6 +10,29 @@ from young_router import runtime_store
 
 
 class HookRouteRecoveryTests(HookTestCase):
+    async def test_messages_recovery_is_recognized_as_a_stream_by_litellm(self) -> None:
+        from collections.abc import AsyncIterator
+
+        hooks, _ = load_hook_module()
+        from young_router.proxy import streaming
+
+        request = {"model": "default-chat", "messages": [], "stream": True}
+
+        async def recovered(*_args):
+            yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+        response = hooks._route_recovery_stream_response(
+            request, TimeoutError("first event timed out")
+        )
+        # LiteLLM's Messages endpoint uses AsyncIterator, not AsyncIterable.
+        # Otherwise FastAPI tries to JSON-encode the request/socket in this object.
+        self.assertIsInstance(response, AsyncIterator)
+        with mock.patch.object(streaming, "_stream_route_recovery_poll", recovered):
+            self.assertEqual(
+                [b'event: message_stop\ndata: {"type":"message_stop"}\n\n'],
+                [chunk async for chunk in response],
+            )
+
     def test_a_server_refusal_hidden_in_a_connection_error_cools_the_route(self) -> None:
         """A refused route is cooled down; a body that was cut keeps recovering.
 

@@ -6,6 +6,32 @@ from young_router import runtime_store
 
 
 class HookStreamingTimeoutTests(HookTestCase):
+    async def test_dispatch_expiry_retains_route_after_inner_context_is_reset(self) -> None:
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "0.01")
+        self.addCleanup(self.set_env, hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, None)
+        request = {"model": "default-chat", "messages": [], "stream": True}
+
+        async def dispatch():
+            token = hooks._CURRENT_SELECTED_DEPLOYMENT.set(None)
+            try:
+                hooks._remember_selected_deployment(
+                    {
+                        "model_info": {"id": "silent-route", "order": 1},
+                        "litellm_params": {"model": "anthropic/test"},
+                    },
+                    surface="anthropic",
+                )
+                await asyncio.sleep(1)
+            finally:
+                hooks._CURRENT_SELECTED_DEPLOYMENT.reset(token)
+
+        with self.assertRaises(TimeoutError) as raised:
+            await hooks._await_upstream_dispatch(dispatch(), request)
+        self.assertEqual(
+            "silent-route", getattr(raised.exception, "failed_deployment_id", None)
+        )
+
     async def test_codex_chat_bridge_reports_restored_reasoning(self) -> None:
         """Codex must know whether the adapted upstream replay has reasoning."""
 

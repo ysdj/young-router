@@ -6066,7 +6066,14 @@ def _selected_deployment_marker_from_box(selected_box: Any = None) -> Optional[d
         if isinstance(marker, dict):
             return marker
     marker = _CURRENT_SELECTED_DEPLOYMENT.get()
-    return marker if isinstance(marker, dict) else None
+    if isinstance(marker, dict):
+        return marker
+    shared_box = _CURRENT_SELECTED_DEPLOYMENT_BOX.get()
+    if isinstance(shared_box, dict):
+        marker = shared_box.get("marker")
+        if isinstance(marker, dict):
+            return marker
+    return None
 
 
 def _apply_selected_deployment_marker_to_request(

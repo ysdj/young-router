@@ -3453,6 +3453,11 @@ async def _await_upstream_dispatch(
         budget_seconds = fallback_budget_seconds
     if budget_seconds <= 0:
         return await awaitable
+    # Cancellation unwinds the router's selected-route ContextVar before this
+    # outer budget catches its timeout. Keep the attempt's marker in the shared
+    # box so that the timeout still names (and releases) the route it contacted.
+    if not isinstance(_CURRENT_SELECTED_DEPLOYMENT_BOX.get(), dict):
+        _CURRENT_SELECTED_DEPLOYMENT_BOX.set({})
     # Two wrong tools, both rejected by measurement rather than taste:
     #
     # ``asyncio.wait_for`` and a hand-rolled ``ensure_future`` both move the
