@@ -1135,6 +1135,72 @@ class MessagesWireImageTests(unittest.TestCase):
         self.assertIsNotNone(measured)
         self.assertLess(measured, plain + 100)
 
+    def test_opaque_thinking_signatures_do_not_evict_tool_history(self) -> None:
+        import base64
+        import random
+
+        signature = base64.b64encode(random.Random(42).randbytes(180_000)).decode()
+        data = {
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "start"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "Keep the verified result.", "signature": signature},
+                        {"type": "tool_use", "id": "old", "name": "Read", "input": {"path": "a"}},
+                    ],
+                },
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "old", "content": "verified result " * 100}]},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "now", "name": "Read", "input": {"path": "b"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "now", "content": "continue"}]},
+            ],
+        }
+        with mock.patch.object(cw, "_router", return_value=_Router(100_000)):
+            self.assertIsNone(cw.apply(data))
+        self.assertEqual(signature, data["messages"][1]["content"][0]["signature"])
+        longer_summary = json.loads(json.dumps(data))
+        longer_summary["messages"][1]["content"][0]["thinking"] = "A distinct reasoning step. " * 5_000
+        self.assertGreater(
+            cw.measure_tokens(longer_summary), cw.measure_tokens(data) + 10_000
+        )
+
+    def test_opaque_signatures_do_not_change_which_oversized_history_is_elided(self) -> None:
+        import base64
+        import random
+
+        signature = base64.b64encode(random.Random(42).randbytes(180_000)).decode()
+        kept_call = {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "Keep the verified result.", "signature": signature},
+                {"type": "tool_use", "id": "kept", "name": "Read", "input": {"path": "a"}},
+            ],
+        }
+        kept_result = {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "kept", "content": "verified result " * 100}],
+        }
+        data = {
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "start"},
+                kept_call,
+                kept_result,
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "bulk", "name": "Read", "input": {"path": "b"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "bulk", "content": "large old result " * 10_000}]},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "now", "name": "Read", "input": {"path": "c"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "now", "content": "continue"}]},
+            ],
+        }
+        with mock.patch.object(cw, "_router", return_value=_Router(10_000)):
+            fitted = cw.apply(data)
+        self.assertIsNotNone(fitted)
+        self.assertTrue(any(message == kept_call for message in fitted["messages"]))
+        self.assertTrue(any(message == kept_result for message in fitted["messages"]))
+        self.assertIn("elided", fitted["messages"][4]["content"][0]["content"])
+        self.assertEqual(data["messages"][-2:], fitted["messages"][-2:])
+
     def test_base64_image_bytes_do_not_evict_chinese_tool_history(self) -> None:
         import base64
 

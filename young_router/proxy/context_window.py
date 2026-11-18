@@ -255,10 +255,10 @@ def wire_tokens(items: Any) -> Optional[int]:
     counted at over a million, so a guard comparing that number with a 1M
     window saw room that was not there and sent the request to be refused.
 
-    Everything the wire will carry is a string somewhere in this list, so every
-    string is counted.  The estimate is still not the upstream's own tokenizer,
-    but it is the right order of magnitude, which the dropped-blocks count was
-    not.
+    Readable content and the JSON structure are counted; opaque image bytes
+    and thinking signatures are normalized before estimation.  Ciphertext is
+    not prompt prose.  This remains a local estimate, not the upstream's own
+    count, especially when a signature represents hidden thinking.
     """
 
     global _ENCODER
@@ -296,16 +296,33 @@ def wire_tokens(items: Any) -> Optional[int]:
 
 
 def _without_inline_image_bytes(node: Any) -> Any:
-    """``node`` with every inline image body emptied, its shape kept.
+    """A copy with opaque payloads removed from the local text estimate.
 
-    Only the bytes go: the part stays an image with its mime type, so the
+    Inline image bytes go: the part stays an image with its mime type, so the
     serialized size of the replay is what the wire pays for everything that is
     not a picture.  ``_image_token_estimate`` adds the pictures back.
+
+    A thinking signature is an encrypted copy of the thinking, not readable
+    prompt text.  Tokenizing its base64 spelling charges roughly one token per
+    ciphertext character, which is not the cost of the thinking it represents.
+    Visible thinking text is counted in its own field.  This is still a local
+    estimate: omitted/summary thinking requires the upstream's count, not an
+    invented ciphertext-to-token conversion.  Only the estimate uses this copy;
+    the signed history itself must be sent unchanged.
     """
 
     if isinstance(node, list):
         return [_without_inline_image_bytes(part) for part in node]
     if isinstance(node, Mapping):
+        if node.get("type") == "thinking":
+            updated = dict(node)
+            signature = updated.get("signature")
+            if isinstance(signature, str) and signature:
+                updated["signature"] = ""
+            return {
+                key: _without_inline_image_bytes(value)
+                for key, value in updated.items()
+            }
         if _is_inline_image(node):
             updated = dict(node)
             source = updated.get("source")
@@ -397,8 +414,12 @@ def _inline_image_b64(node: Any, out: Optional[List[str]] = None) -> List[str]:
 def _strings_joined(node: Any, out: Optional[List[str]] = None) -> str:
     """Every string inside ``node``, in order, as one blob.
 
-    Inline image bytes are the one exception, and they are left out here.  A
-    token counter prices a picture from its pixels; ``wire_tokens`` counts the
+    Opaque payloads are normalized by the same pass ``wire_tokens`` uses.
+    Their absence from the token count also applies to the character ratio
+    used to credit elisions: keeping a signature in that ratio made dropping
+    useful tool history look too small and removed whole exchanges needlessly.
+
+    A token counter prices a picture from its pixels; ``wire_tokens`` counts the
     serialized replay, where a 473 KB base64 of a 1999x1589 screenshot is
     322,000 tokens of prose.  Five ``Read`` results of one paper were enough to
     declare a 300k-token thread 1.47M and have this pass elide its history on
@@ -408,7 +429,7 @@ def _strings_joined(node: Any, out: Optional[List[str]] = None) -> str:
     """
 
     parts = out if out is not None else []
-    stack = [node]
+    stack = [_without_inline_image_bytes(node)]
     while stack:
         item = stack.pop()
         if isinstance(item, str):
