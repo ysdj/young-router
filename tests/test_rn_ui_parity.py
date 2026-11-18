@@ -272,12 +272,11 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("export function setGroupManagerOpen(open: boolean): void {", gate)
         self.assertIn("export function isGroupManagerOpen(): boolean {", gate)
         self.assert_ui_has("return isProviderWizardOpen() || isAssistantEditorOpen() || isGroupManagerOpen() || isWebDavSettingsOpen();")
-        self.assert_ui_has("const applyStagedQuietly = (): Promise<void> => apply({ quiet: true });")
+        self.assert_ui_has("const result = await applyOutcome({ quiet: true });")
         # A host whose sheet can only save on close stages those same edits
         # after it is gone and states that host's outcome in the pane.
         self.assertIn('onStatus?.(translate("common.saved"));', self.relay)
-        self.assert_ui_has("    quiet = false,\n  ): Promise<T | undefined> => {\n    const publishResult = (next: string | undefined): void => {\n      if (quiet) return;")
-        self.assert_ui_has("true, undefined, options?.quiet === true);")
+        self.assert_ui_has("if (reportQuietFailure) return reportQuietFailure(failure);")
 
     def test_a_new_model_is_marked_until_finished_and_a_relay_block_is_not_the_edits_fault(self) -> None:
         """Standards for create-then-configure: a new row is a draft.
@@ -630,8 +629,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             # A revision is not an edit: only a domain Core still reports as
             # dirty earns the debounced Apply, so an external read that bumped
             # the revision cannot collect a second commit of the user's own.
-            'const dirty = domains.filter((name) => actionSnapshot.drafts[name]?.dirty === true);',
-            'return dirty.length === 0 ? "" : `${dirty.join(",")}@${actionSnapshot.revision}`;',
+            'stagedApplyKey(stagedDomainsForRoute(actionSnapshot), actionSnapshot.revision)',
             'if (busy || hasPendingFieldEdits()) return;',
             'const savingMessage = translate("common.saving");',
             'setResult(savingMessage);',
@@ -689,7 +687,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # The third argument of `runOutcome` is the lock; an Apply always passes
         # true (kept controls) there, and the wait text is the strip's job.
         self.assertIn(
-            'options?.silent ? null : (options?.message ?? "common.saved"), true, true, undefined, options?.quiet === true);',
+            'options?.silent ? null : (options?.message ?? "common.saved"), true, true, undefined, options?.quiet',
             apply_body,
         )
         # Every call site states no lock either.
@@ -787,7 +785,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # Two Applies for one edit move the revision under each other, and the
         # one that loses reports a save that happened as 更改未生效.  The
         # second caller joins the write already in flight instead.
-        self.assertIn("const applyInFlight = useRef<Promise<IpcResults[\"apply\"] | { cancelled: true } | undefined> | undefined>(undefined);", self.ui)
+        self.assertIn("const applyInFlight = useRef<Promise<ApplyOutcome> | undefined>(undefined);", self.ui)
         self.assertIn("if (running) return running;", apply_body)
         self.assertIn("applyInFlight.current = started;", apply_body)
         self.assertIn("if (applyInFlight.current === started) applyInFlight.current = undefined;", apply_body)
@@ -887,7 +885,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             'upstream_url_surface: nextSurface,',
             'const nextSurface = stringValue(result.recommended_surface);',
             'isProbeSurface(nextSurface)',
-            'dispatchWithOutcome("model.add_many", {',
+            'dispatchModelPick("model.add_many", {',
             'const apiKeyID = stringValue(summary.slot_id);',
             'models: picked.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, imported: true, imported_name_case: nameCase, api_key_name: apiKeyName, ...(apiKeyID ? { provider_key_id: apiKeyID } : {}), enabled: true, order: 0 }))',
             '<ProtocolPicker providerId={providerId}',
@@ -2166,7 +2164,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_has('onSelectionChange={(key) => { if (key) onSelect(key); }}')
         self.assert_ui_has('const selectProviderRow = useCallback((key: string): void => {\n    setSelectedProvider(key);\n    setSelectedModel(undefined);\n    setProviderSourceModel(undefined);\n  }, []);')
         self.assert_ui_has('selectedKey={selectedProviderId}')
-        self.assert_ui_has('const pendingModelIds = useRef<{ providerId: string; ids: Set<string> } | undefined>(undefined);')
+        self.assert_ui_has('const pendingModelIds = useRef<({ providerId: string } & ({ ids: Set<string> } | { id: string })) | undefined>(undefined);')
         self.assertNotIn('knownModelIdsByProvider', self.ui)
         self.assertNotIn('Promise.all(added.map(', self.ui)
         self.assert_ui_has('disabled={busy && !probing}')
@@ -2428,7 +2426,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assert_ui_not_has('public_name_case: createdNameCase')
         # The answer travels with the pick that asked it.
         self.assert_ui_has('imported_name_case: nameCase,')
-        self.assert_ui_has('models: chosen, public_name_case: nameCase }, "providers_models");')
+        self.assert_ui_has('dispatchModelPick("model.import_service_catalog", { provider_id: providerId, models: chosen, public_name_case: nameCase });')
         self.assert_ui_has('imported_name_case: importNameCase })),')
         self.assert_ui_has('imported_name_case: importNameCase, ...modelRecordCapabilityChanges(fetchedModelCapabilities[name]) })),')
         domain = (ROOT / "young_router/core/domains/providers_models.py").read_text(encoding="utf-8")
@@ -4178,7 +4176,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         self.assertIn("return Math.max(TABLE_MIN_HORIZONTAL_PADDING, requested);", self.native_controls)
         self.assertIn("paddingHorizontal: inset", self.native_controls)
         self.assertIn("windowsTableStyles.horizontalContent", self.native_controls)
-        self.assertIn("<ScrollView horizontal showsHorizontalScrollIndicator style={windowsTableStyles.horizontalScroll}", self.native_controls)
+        self.assertIn("style={windowsTableStyles.horizontalScroll}", self.native_controls)
         # A source list lays its rows out at the pane's own width: wrapping the
         # sidebar in this scroller let a row that was a few points too wide
         # scroll, so the column slid sideways by a per-selection amount.
@@ -5887,26 +5885,22 @@ class ReactNativeUiParityTests(unittest.TestCase):
         ticks and its 添加 for another try.
         """
 
-        self.assert_ui_has("const importPickedModels = async (")
         self.assert_ui_has('const answerModelPick = (status: string, close: boolean): Promise<string[]> =>')
         self.assert_ui_has("native.finishModelsToAdd({ status, close })")
         # The write is saved, not merely staged, before the chooser closes: the
         # debounce could still drop the draft it was closing over.
         self.assert_ui_has("await applyStagedQuietly();")
-        self.assert_ui_has('await answerModelPick(translate("common.saved"), true);')
+        self.assert_ui_has('await answerModelPick(translate(id ? "common.saved" : "providers.fetchNothingNew"), true);')
         # A refusal keeps the window and asks for the next 添加 it takes.
-        self.assert_ui_has('picked = await answerModelPick(translate("common.notApplied"), false);')
-        self.assert_ui_has('picked = await answerModelPick(message, false);')
-        # A pick Core skipped as already present is not a failed write and not a
-        # new row: the chooser states it and closes.
-        self.assert_ui_has("if (!appearedModelIDs(next, providerId, known).length) {")
-        self.assert_ui_has('await answerModelPick(translate("providers.fetchNothingNew"), true);')
+        self.assert_ui_has('picked = accepted(await answerModelPick(message, false));')
         self.assertIn('"providers.fetchNothingNew": "选中的模型已经全部存在，未新增。"', self.zh)
         self.assertIn('"providers.fetchNothingNew": "Those models are already in this provider."', self.en)
-        # The rows the pane selects are the attempt's own: every attempt names
-        # the ids it found, so a retry never selects what an earlier try added.
-        self.assert_ui_has("pendingModelIds.current = { providerId, ids: known };")
-        self.assertIn("function appearedModelIDs(snapshot: CoreSnapshot | undefined, providerID: string, known: ReadonlySet<string>): string[] {", self.ui)
+        # Core names the rows this action created, so a new pick can remove
+        # unchecked additions and Cancel can discard the remaining draft rows.
+        self.assert_ui_has("asRecords(result.action_summary?.added_rows)")
+        self.assert_ui_has("pendingModelIds.current = { providerId, id };")
+        self.assert_ui_has("await removeChooserRows(picked);")
+        self.assert_ui_has("await removeChooserRows([]);")
 
         # The macOS chooser answers through the same two steps 分组管理 makes.
         self.assertIn(
@@ -5943,7 +5937,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
         page_store = (ROOT / "rn/packages/shared/src/platform/hostChrome.ts").read_text(encoding="utf-8")
         self.assertIn("export function requestModelPick(", page_store)
         self.assertIn("export function finishModelPick(status: string, close: boolean): Promise<ModelChoice> {", page_store)
-        self.assertIn("finishModelsToAdd: (status, close) => finishModelPick(status, close),", page_bridge)
+        self.assertIn("finishModelsToAdd: finishModelPick,", page_bridge)
         self.assertIn("onPress={() => request.submit(selected)}", page_chrome)
         self.assertIn("busy={saving} disabled={saving || selected.length === 0}", page_chrome)
 
@@ -9708,7 +9702,6 @@ class ReactNativeUiParityTests(unittest.TestCase):
         # Core spends a relay-bound Apply, with the strip already cleared to
         # 就绪 by the run itself.  Edits made meanwhile queue behind the Apply.
         self.assertIn('await apply({ silent: true });', self.ui)
-        self.assertIn('const applyStagedQuietly = (): Promise<void> => apply({ quiet: true });', self.ui)
         self.assertIn('setResult(translate(purpose === "navigate" ? "runtime.fixInvalidBeforeLeaving" : "runtime.fixInvalidBeforeClose"));', self.ui)
         for locale in (self.zh, self.en):
             self.assertIn('"runtime.fixInvalidBeforeLeaving"', locale)
@@ -10230,7 +10223,7 @@ class ReactNativeUiParityTests(unittest.TestCase):
             "}, SECRET_INPUT_COMMIT_DEBOUNCE_MS);",
             "state.status === \"saved\" || state.status === \"ready\" || state.status === \"error\"",
             "refreshAfter = true",
-            "if (refreshAfter && !cancelled && postActionRefreshNeeded({ channel: eventChannel.current, revisionBefore, revisionAfter, localRevision: revision.current })) await refresh();",
+            "if (refreshAfter && !cancelled && postActionRefreshNeeded({ channel: eventChannel.current, revisionBefore, revisionAfter, localRevision: revision.current })) {",
             "}, null, true).then((staged) => staged !== undefined);",
             # Leaving a pane with nothing to write is not an Apply: the flush
             # used to cancel after a `staged` read and then read the whole

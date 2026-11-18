@@ -2286,6 +2286,41 @@ class CoreIPCTests(unittest.TestCase):
             self.assertEqual(["model-a"], staged["action_summary"]["models"])
             self.assertNotIn("synthetic-openrouter-key", json.dumps(staged))
 
+            def dispatch(action: str, **payload: object) -> dict:
+                return client.call("dispatch", {
+                    "action": {
+                        "domain": "providers_models",
+                        "type": action,
+                        "payload": {"provider_id": provider_id, **payload},
+                    },
+                    "revision": core.revision,
+                })
+
+            def model(name: str) -> dict[str, str]:
+                return {"name": name, "upstream_model": name, "api_key_name": "r"}
+
+            existing = dispatch("model.add_many", models=[model("model-a")])
+            existing_id = existing["action_summary"]["added_rows"][0]["id"]
+            client.call("apply", {"domain": "providers_models", "revision": core.revision})
+
+            first = dispatch("model.add_many", models=[model("model-a"), model("first-pick")])
+            first_rows = first["action_summary"]["added_rows"]
+            self.assertEqual([1], [row["index"] for row in first_rows])
+            elsewhere = dispatch("model.add_many", models=[model("elsewhere")])
+            elsewhere_id = elsewhere["action_summary"]["added_rows"][0]["id"]
+            dispatch("model.discard_added", model_ids=[existing_id, first_rows[0]["id"]])
+            retry = dispatch("model.add_many", models=[model("second-pick")])
+            retry_id = retry["action_summary"]["added_rows"][0]["id"]
+
+            # Cancel this chooser's second pick. The first pick was unchecked;
+            # the originally saved route and another draft writer's row stay.
+            dispatch("model.discard_added", model_ids=[retry_id])
+            models = providers.snapshot()["providers"][0]["models"]
+            self.assertEqual(
+                {("model-a", existing_id), ("elsewhere", elsewhere_id)},
+                {(row["name"], row["editor_id"]) for row in models},
+            )
+
     def test_import_preview_is_non_mutating_and_plan_is_one_use(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             package_path = Path(directory) / "configuration.json"

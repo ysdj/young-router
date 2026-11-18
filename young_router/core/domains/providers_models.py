@@ -7533,12 +7533,13 @@ class ProvidersModelsDomain:
         picked = data.get("models")
         if not isinstance(picked, Sequence) or isinstance(picked, (str, bytes, bytearray)):
             raise DomainError("Models must be a list")
-        requested = [str(item).strip() for item in picked if str(item).strip()]
-        if not requested:
+        selectors = [str(item).strip() for item in picked]
+        if not any(selectors):
             self._last_operation = {
                 "operation": "model_import_service_catalog",
                 "provider_id": self._safe_provider(provider, provider_index)["id"],
                 "imported": 0,
+                "added_rows": [],
             }
             return
         provider_id = managed_adapters.catalog_provider_id(auth_kind)
@@ -7557,18 +7558,14 @@ class ProvidersModelsDomain:
             for entry in (catalog if isinstance(catalog, Sequence) and not isinstance(catalog, (str, bytes, bytearray)) else [])
             if isinstance(entry, Mapping) and str(entry.get("id", "")).strip()
         }
-        resolved = {
-            model_id: ProvidersModelsDomain._catalog_entry_for_selector(entries, model_id)
-            for model_id in requested
-        }
-        unknown = [model_id for model_id, entry in resolved.items() if entry is None]
-        if unknown:
-            raise DomainError("The service catalog no longer lists a selected model")
-        requested = [
-            str(entry.get("id", "")).strip()
-            for entry in resolved.values()
-            if isinstance(entry, Mapping)
-        ]
+        resolved = []
+        for index, selector in enumerate(selectors):
+            if not selector:
+                continue
+            entry = self._catalog_entry_for_selector(entries, selector)
+            if entry is None:
+                raise DomainError("The service catalog no longer lists a selected model")
+            resolved.append((index, entry))
         # A route the provider already carries is not added twice: a refresh
         # that lists what is already there changes nothing and says so.  The
         # document names an upstream with its adapter prefix, so the identity a
@@ -7607,11 +7604,11 @@ class ProvidersModelsDomain:
         # labels it is about to import contain upper case, and the answer is
         # stated here rather than derived from each label.
         name_case = import_name_case(data.get("public_name_case"))
-        added = 0
-        for model_id in requested:
+        added_rows = []
+        for index, entry in resolved:
+            model_id = str(entry["id"]).strip()
             if model_id in existing:
                 continue
-            entry = entries[model_id]
             row = self._new_model(
                 edited,
                 {
@@ -7631,14 +7628,15 @@ class ProvidersModelsDomain:
             taken_names.add(public_name_key(row.get("model_name", "")))
             self._append_model_row(edited, models, row)
             existing.add(model_id)
-            added += 1
+            added_rows.append({"index": index, "id": self._editor_id(row, model=True)})
         self._apply_auth_to_models(edited, auth_kind)
         self._draft["providers"][provider_index] = edited
         self._last_operation = {
             "operation": "model_import_service_catalog",
             "provider_id": self._safe_provider(edited, provider_index)["id"],
             "auth_kind": str(self._provider_auth_state(edited).get("kind", "")),
-            "imported": added,
+            "imported": len(added_rows),
+            "added_rows": added_rows,
         }
 
     @staticmethod
@@ -9809,19 +9807,26 @@ class ProvidersModelsDomain:
             existing_identities = {
                 identity_of(item) for item in models if isinstance(item, Mapping)
             }
-            for value in values:
+            added_rows = []
+            for index, value in enumerate(values):
                 candidate = self._new_model(provider, value, used_deployment_ids)
                 identity = identity_of(candidate)
                 if identity in existing_identities:
                     continue
                 existing_identities.add(identity)
                 self._append_model_row(provider, models, candidate)
+                added_rows.append({"index": index, "id": self._editor_id(candidate, model=True)})
             auth_kind = self._provider_auth_state(provider)["kind"]
             if auth_kind != "api_key":
                 # A model added to an account-backed provider inherits the
                 # provider's surface, protocol, and credential slot; the
                 # service-provider path does the same when it adds models.
                 self._apply_auth_to_models(provider, auth_kind)
+            if action in {"model_add_many", "add_models"}:
+                self._last_operation = {
+                    "operation": "model_add_many",
+                    "added_rows": added_rows,
+                }
         elif action in {"model_patch", "patch_model"}:
             index = self._model_index(provider, data)
             model = self._copy_model_for_edit(models[index])
@@ -9983,9 +9988,32 @@ class ProvidersModelsDomain:
                 self._forget_probe_result(provider, model)
             self._normalize_model_binding(provider, model)
             models[index] = model
-        elif action in {"model_delete", "delete_model"}:
-            removed = models.pop(self._model_index(provider, data))
-            if isinstance(removed, Mapping):
+        elif action in {"model_delete", "delete_model", "model_discard_added"}:
+            if action == "model_discard_added":
+                selected = data.get("model_ids")
+                if not isinstance(selected, list) or any(not isinstance(value, str) for value in selected):
+                    raise DomainError("Models must be a list")
+                model_ids = set(selected)
+                # Another window may already have applied these rows.
+                saved = {
+                    str(model.get("deployment_id", "")).strip().lower()
+                    for entry in self._raw["providers"]
+                    if isinstance(entry, Mapping)
+                    for model in entry.get("models", [])
+                    if isinstance(model, Mapping)
+                }
+                indices = [
+                    index for index, model in enumerate(models)
+                    if isinstance(model, Mapping)
+                    and self._editor_id(model, model=True) in model_ids
+                    and str(model.get("deployment_id", "")).strip().lower() not in saved
+                ]
+            else:
+                indices = [self._model_index(provider, data)]
+            for index in reversed(indices):
+                removed = models.pop(index)
+                if not isinstance(removed, Mapping):
+                    continue
                 provider_name = str(provider.get("name", "")).strip()
                 self._probe_overlay.get(provider_name, {}).pop(self._probe_model_key(removed), None)
         elif action in {"model_move", "move_model"}:

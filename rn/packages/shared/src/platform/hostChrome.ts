@@ -115,9 +115,9 @@ export type HostChromeRequest =
         keyLabel: string;
         search: string;
         selectAll: string;
-        selectAllToolTip: string;
+        selectAllLabel: string;
         invert: string;
-        invertToolTip: string;
+        invertLabel: string;
         count: string;
         countFiltered: string;
         countSelected: string;
@@ -228,11 +228,6 @@ export function subscribeHostChrome(listener: () => void): () => void {
   return () => { listeners.delete(listener); };
 }
 
-/** The surface a key press belongs to: the newest request still open. */
-export function topHostChrome(): HostChromeRequest | undefined {
-  return requests[requests.length - 1];
-}
-
 /** The answer a dismissing action gives, per surface kind. */
 export function dismissalFor(request: HostChromeRequest): unknown {
   switch (request.kind) {
@@ -250,8 +245,7 @@ export function dismissalFor(request: HostChromeRequest): unknown {
 /**
  * Ask the page for one answer, drawn by `HostChrome`.
  *
- * The promise settles exactly once: by the surface's own answer, by Return or
- * Escape, or by `dismissHostChrome` when the layer underneath it went away.
+ * The promise settles exactly once, through the surface's answer or dismissal.
  * The request leaves the stack before its answer is delivered, so a caller that
  * opens another surface from the answer starts from a clean stack.
  */
@@ -330,11 +324,6 @@ export function finishModelPick(status: string, close: boolean): Promise<ModelCh
 /** Answer one open request. Answering the same request twice is a no-op. */
 export function settleHostChrome(request: HostChromeRequest, answer: unknown): void {
   (request.resolve as (value: unknown) => void)(answer);
-}
-
-/** Close every open request with its dismissing answer, topmost first. */
-export function dismissHostChrome(): void {
-  for (const request of [...requests].reverse()) settleHostChrome(request, dismissalFor(request));
 }
 
 /**

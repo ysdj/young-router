@@ -352,6 +352,24 @@ type TableRow = {
   spanning?: boolean;
 };
 
+/**
+ * React Native for Web filters DOM-only `title` off Text. Keep the hint on the
+ * rendered text node, showing explicit abbreviations and otherwise only text
+ * the browser actually clipped.
+ */
+export function webTextHoverProps(tooltip?: string, clippedText?: string): {
+  onMouseEnter: React.MouseEventHandler<HTMLElement>;
+  onMouseLeave: React.MouseEventHandler<HTMLElement>;
+} | undefined {
+  if (Platform.OS !== "web" || (!tooltip && !clippedText)) return undefined;
+  return {
+    onMouseEnter: ({ currentTarget }) => {
+      currentTarget.title = tooltip || (currentTarget.scrollWidth > currentTarget.clientWidth ? clippedText ?? "" : "");
+    },
+    onMouseLeave: ({ currentTarget }) => currentTarget.removeAttribute("title"),
+  };
+}
+
 type TableProps = {
   columns: TableColumn[];
   rows: TableRow[];
@@ -627,7 +645,10 @@ const WindowsSegmentedControl = React.forwardRef<any, SegmentedProps>(function W
         disabled={disabled}
         onPress={() => choose(label, index)}
         onAccessibilityTap={() => choose(label, index)}
-        {...(Platform.OS === "web" ? { onKeyDown: (event: { key?: string; preventDefault?: () => void }) => focusTab(event, index) } : {})}
+        {...(Platform.OS === "web" ? {
+          onKeyDown: (event: { key?: string; preventDefault?: () => void }) => focusTab(event, index),
+          tabIndex: !disabled && index === Math.max(0, selectedIndex) ? 0 : -1,
+        } : {})}
         accessibilityRole="tab"
         accessibilityLabel={label}
         accessibilityState={{ selected, disabled: disabled === true }}
@@ -1228,11 +1249,35 @@ function sameColumns(left: TableColumn[], right: TableColumn[]): boolean {
   return true;
 }
 
-function sameTableRow(previous: { row: TableRow; index: number; rowHeight: number; columns: TableColumn[]; compact: boolean; sourceList: boolean; stripedRows: boolean; selected: boolean; disabled: boolean; secondaryRow: boolean; alert: boolean; rowSymbol?: string; rowSymbolColor?: string; rowImageName?: string; secondaryCellKeys: Set<string>; detail?: string; selectableSpanning: boolean; cellPadding: number; firstColumnPadding: number; onSelect: (row: TableRow, index: number) => void }, next: typeof previous): boolean {
+type WindowsTableRowProps = {
+  row: TableRow;
+  index: number;
+  rowHeight: number;
+  columns: TableColumn[];
+  sourceList: boolean;
+  stripedRows: boolean;
+  selected: boolean;
+  disabled: boolean;
+  secondaryRow: boolean;
+  alert: boolean;
+  rowSymbol?: string;
+  rowSymbolColor?: string;
+  rowImageName?: string;
+  secondaryCellKeys: Set<string>;
+  detail?: string;
+  selectableSpanning: boolean;
+  cellPadding: number;
+  firstColumnPadding: number;
+  onSelect: (row: TableRow, index: number) => void;
+  onNavigate?: (event: React.KeyboardEvent<HTMLElement>, index: number) => void;
+  onRowFocus?: (node: HTMLElement) => void;
+  onRowNode?: (key: string, node: HTMLElement | null) => void;
+};
+
+function sameTableRow(previous: WindowsTableRowProps, next: WindowsTableRowProps): boolean {
   return previous.row === next.row
     && previous.index === next.index
     && previous.rowHeight === next.rowHeight
-    && previous.compact === next.compact
     && previous.sourceList === next.sourceList
     && previous.stripedRows === next.stripedRows
     && previous.selected === next.selected
@@ -1248,6 +1293,9 @@ function sameTableRow(previous: { row: TableRow; index: number; rowHeight: numbe
     && previous.cellPadding === next.cellPadding
     && previous.firstColumnPadding === next.firstColumnPadding
     && previous.onSelect === next.onSelect
+    && previous.onNavigate === next.onNavigate
+    && previous.onRowFocus === next.onRowFocus
+    && previous.onRowNode === next.onRowNode
     && sameColumns(previous.columns, next.columns);
 }
 
@@ -1312,7 +1360,6 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   index,
   rowHeight,
   columns,
-  compact,
   sourceList,
   stripedRows,
   selected,
@@ -1328,31 +1375,10 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   cellPadding,
   firstColumnPadding,
   onSelect,
-}: {
-  row: TableRow;
-  index: number;
-  rowHeight: number;
-  columns: TableColumn[];
-  compact: boolean;
-  sourceList: boolean;
-  stripedRows: boolean;
-  selected: boolean;
-  disabled: boolean;
-  secondaryRow: boolean;
-  alert: boolean;
-  rowSymbol?: string;
-  rowSymbolColor?: string;
-  rowImageName?: string;
-  secondaryCellKeys: Set<string>;
-  /** The row's own second line, printed small under its text. */
-  detail?: string;
-  selectableSpanning: boolean;
-  /** This table's own horizontal cell inset, the same number its header uses. */
-  cellPadding: number;
-  /** The first column's inset: a source list starts its rows at the pane edge. */
-  firstColumnPadding: number;
-  onSelect: (row: TableRow, index: number) => void;
-}): React.JSX.Element {
+  onNavigate,
+  onRowFocus,
+  onRowNode,
+}: WindowsTableRowProps): React.JSX.Element {
   const spanning = row.spanning === true;
   const [hovered, setHovered] = React.useState(false);
   const stripe = stripedRows && !selected && !disabled && index % 2 === 1;
@@ -1368,7 +1394,7 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
   // before drawing, and the name a screen reader reads has to drop it too —
   // otherwise every model row is announced with a tab in the middle of it.
   const rowLabel = row.cells
-    .map((cell) => cell.replace(/^\t/u, ""))
+    .map((cell, cellIndex) => (row.tooltips?.[cellIndex] || cell).replace(/^\t/u, ""))
     .filter((cell) => cell.length > 0)
     .join(", ");
   const rowStyle = [
@@ -1384,12 +1410,19 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
     !sourceList && selected && windowsTableStyles.rowSelected,
     disabled && windowsTableStyles.rowDisabled,
   ];
+  const setRowNode = React.useCallback((node: HTMLElement | null) => onRowNode?.(row.key, node), [onRowNode, row.key]);
   return <Pressable
+    ref={onRowNode ? setRowNode as never : undefined}
     disabled={disabled || (spanning && !selectableSpanning)}
     onPress={() => onSelect(row, index)}
     onHoverIn={sourceList ? () => setHovered(true) : undefined}
     onHoverOut={sourceList ? () => setHovered(false) : undefined}
-    accessibilityRole={spanning ? "header" : "button"}
+    {...(onNavigate && {
+      tabIndex: -1,
+      onFocus: (event: React.FocusEvent<HTMLElement>) => onRowFocus?.(event.currentTarget),
+      onKeyDown: (event: React.KeyboardEvent<HTMLElement>) => onNavigate(event, index),
+    } as object)}
+    accessibilityRole={spanning && !(onNavigate && selectableSpanning) ? "header" : "button"}
     accessibilityLabel={rowLabel}
     accessibilityState={spanning ? { disabled: disabled || !selectableSpanning } : { selected, disabled }}
     // React Native for Web drops `accessibilityState` and reads the aria
@@ -1402,7 +1435,7 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
     style={rowStyle}
   >
     {sourceList && selected ? <View style={[windowsTableStyles.sourceSelectionIndicator, { top: rowHeight / 2 - 8 }]} /> : null}
-    {spanning ? <Text numberOfLines={1} style={[windowsTableStyles.groupText, { color: textColor }]}>{row.cells[0] ?? ""}</Text> : <View style={windowsTableStyles.cells}>
+    {spanning ? <Text {...webTextHoverProps(row.tooltips?.[0], row.cells[0])} numberOfLines={1} style={[windowsTableStyles.groupText, { color: textColor }]}>{row.cells[0] ?? ""}</Text> : <View style={windowsTableStyles.cells}>
       {columns.map((column, columnIndex) => {
         const cell = row.cells[columnIndex] ?? "";
         const cellKey = `${row.key}\x1f${columnIndex}`;
@@ -1445,12 +1478,12 @@ const WindowsTableRow = React.memo(function WindowsTableRow({
               ? <Image source={sourceImage} style={windowsTableStyles.sourceImage} />
               : Platform.OS !== "web" && rowSymbol ? <Text style={[windowsTableStyles.symbol, { color: disabled ? WINDOWS_CONTROL.textDisabled : rowSymbolColor || (selected ? WINDOWS_CONTROL.text : WINDOWS_CONTROL.textSecondary) }]}>{windowsSourceSymbol(rowSymbol)}</Text> : null}
             <View style={windowsTableStyles.sourceCellTextColumn}>
-              <Text numberOfLines={1} style={[windowsTableStyles.cellText, { color: cellColor }]}>{visibleCell}</Text>
-              {detail ? <Text numberOfLines={1} style={windowsTableStyles.sourceCellDetail}>{detail}</Text> : null}
+              <Text {...webTextHoverProps(row.tooltips?.[columnIndex], visibleCell)} numberOfLines={1} style={[windowsTableStyles.cellText, { color: cellColor }]}>{visibleCell}</Text>
+              {detail ? <Text {...webTextHoverProps(undefined, detail)} numberOfLines={1} style={windowsTableStyles.sourceCellDetail}>{detail}</Text> : null}
             </View>
           </View>;
         }
-        return <Text key={`${row.key}:${columnIndex}`} numberOfLines={1} style={[windowsTableStyles.cell, { width: column.width, paddingHorizontal: inset, color: cellColor }]}>{visibleCell}</Text>;
+        return <Text key={`${row.key}:${columnIndex}`} {...webTextHoverProps(row.tooltips?.[columnIndex], visibleCell)} numberOfLines={1} style={[windowsTableStyles.cell, { width: column.width, paddingHorizontal: inset, color: cellColor }]}>{visibleCell}</Text>;
       })}
     </View>}
   </Pressable>;
@@ -1516,6 +1549,67 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   const secondaryRowKeysSet = React.useMemo(() => new Set(secondaryRowKeys), [secondaryRowKeys]);
   const alertKeys = React.useMemo(() => new Set(alertRowKeys), [alertRowKeys]);
   const secondaryKeys = React.useMemo(() => new Set(secondaryCellKeys), [secondaryCellKeys]);
+  const frameNode = React.useRef<HTMLElement | null>(null);
+  const rowNodes = React.useRef(new Map<string, HTMLElement>());
+  const focusedRow = React.useRef<HTMLElement | null>(null);
+  const pendingRowFocus = React.useRef<{ key: string; from: HTMLElement } | null>(null);
+  // Tab enters the frame even if the selected row is outside the rendered
+  // window. While a row has focus, it takes the frame's place in the tab order.
+  const setFocusedRow = React.useCallback((node: HTMLElement | null): void => {
+    if (focusedRow.current) focusedRow.current.tabIndex = -1;
+    focusedRow.current = node;
+    if (frameNode.current) frameNode.current.tabIndex = node ? -1 : 0;
+    if (node) node.tabIndex = 0;
+  }, []);
+  const onRowNode = React.useCallback((key: string, node: HTMLElement | null): void => {
+    if (!node) {
+      if (rowNodes.current.get(key) === focusedRow.current) setFocusedRow(null);
+      rowNodes.current.delete(key);
+      return;
+    }
+    rowNodes.current.set(key, node);
+    const pending = pendingRowFocus.current;
+    if (pending?.key !== key) return;
+    pendingRowFocus.current = null;
+    if (document.activeElement === pending.from || !pending.from.isConnected && document.activeElement === document.body) {
+      node.focus({ preventScroll: true });
+    }
+  }, [setFocusedRow]);
+  // Log refreshes replace the rows without changing their keyboard handlers.
+  const rowChoices = React.useRef({ rows, disabledKeys, selectableSpanningKeys, onSelectionChange });
+  rowChoices.current = { rows, disabledKeys, selectableSpanningKeys, onSelectionChange };
+  const navigateRow = React.useCallback((event: React.KeyboardEvent<HTMLElement>, index: number): void => {
+    const { rows, disabledKeys, selectableSpanningKeys, onSelectionChange } = rowChoices.current;
+    const home = event.key === "Home";
+    const end = event.key === "End";
+    if (!home && !end && event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    event.preventDefault();
+    const direction = home || event.key === "ArrowDown" ? 1 : -1;
+    const start = home || end || index < 0 ? (direction === 1 ? 0 : rows.length - 1) : index + direction;
+    for (let next = start; next >= 0 && next < rows.length; next += direction) {
+      const row = rows[next];
+      if (disabledKeys.has(row.key) || (row.spanning && !selectableSpanningKeys.has(row.key))) continue;
+      if (next === index) return;
+      // Group headers with a click action stay reachable for Enter. Only
+      // regular rows change the selection as you navigate, as in AppKit.
+      if (!row.spanning) onSelectionChange?.(row.key, next);
+      const node = rowNodes.current.get(row.key);
+      if (node) {
+        pendingRowFocus.current = null;
+        node.focus();
+      } else {
+        // Home and End can jump beyond the rendered window. Move focus when
+        // the newly visible target mounts, unless the reader left the table.
+        pendingRowFocus.current = { key: row.key, from: event.currentTarget };
+        verticalList.current?.scrollToIndex({
+          index: next,
+          animated: false,
+          viewPosition: home ? 0 : end ? 1 : direction === 1 ? 1 : 0,
+        });
+      }
+      return;
+    }
+  }, []);
   React.useEffect(() => {
     if (scrollToRow < 0) return;
     // `FlatList.scrollToIndex` throws on an index past the data, and the old
@@ -1556,7 +1650,6 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   // the list's own top edge, not the frame's -- a capsule anchored to the frame
   // started inside the header and, at the end of a list, stopped a whole header
   // (30 pt) short of the bottom, which reads as a scroll that cannot finish.
-  const frameNode = React.useRef<HTMLElement | null>(null);
   const setFrameRef = React.useCallback((instance: unknown) => {
     frameNode.current = Platform.OS === "web" && instance instanceof HTMLElement ? instance : null;
   }, []);
@@ -1601,7 +1694,6 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
     index={index}
     rowHeight={rowHeight}
     columns={laidOutColumns}
-    compact={compact}
     sourceList={sourceList}
     stripedRows={stripedRows}
     selected={item.key === selectedKey}
@@ -1617,7 +1709,10 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
     cellPadding={cellHorizontalPadding}
     firstColumnPadding={firstColumnHorizontalPadding}
     onSelect={select}
-  />, [alertKeys, cellHorizontalPadding, laidOutColumns, compact, disabledKeys, firstColumnHorizontalPadding, rowDetails, rowImageNames, rowSymbols, rowSymbolColors, secondaryKeys, secondaryRowKeysSet, selectableSpanningKeys, select, selectedKey, sourceList, stripedRows]);
+    onNavigate={Platform.OS === "web" ? navigateRow : undefined}
+    onRowFocus={Platform.OS === "web" ? setFocusedRow : undefined}
+    onRowNode={Platform.OS === "web" ? onRowNode : undefined}
+  />, [alertKeys, cellHorizontalPadding, laidOutColumns, disabledKeys, firstColumnHorizontalPadding, navigateRow, onRowNode, rowDetails, rowHeight, rowImageNames, rowSymbols, rowSymbolColors, secondaryKeys, secondaryRowKeysSet, selectableSpanningKeys, select, selectedKey, setFocusedRow, sourceList, stripedRows]);
   const keyExtractor = React.useCallback((row: TableRow): string => row.key, []);
   const body = <View style={[windowsTableStyles.horizontalBody, !sourceList && { minWidth: totalWidth }]}>
     {!sourceList ? <View style={[windowsTableStyles.header, { minWidth: totalWidth }]}>
@@ -1651,6 +1746,7 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
       keyExtractor={keyExtractor}
       style={windowsTableStyles.verticalList}
       contentContainerStyle={windowsTableStyles.body}
+      {...(Platform.OS === "web" && { tabIndex: -1 })}
       nestedScrollEnabled
       initialNumToRender={24}
       maxToRenderPerBatch={24}
@@ -1685,12 +1781,32 @@ function WindowsTable({ columns, rows, selectedKey, stripedRows, compact, follow
   const scrollThumb = scrollMetrics.overflow && scrollMetrics.height > 0
     ? <View pointerEvents="none" style={[windowsTableStyles.tableScrollThumb, { top: scrollMetrics.top + 2, height: scrollMetrics.height, transform: [{ translateY: scrollMetrics.offset }] }]} />
     : null;
-  return <View ref={setFrameRef} style={[windowsTableStyles.root, !framed && windowsTableStyles.borderless, style]}>
+  const frameFocus = Platform.OS === "web" ? {
+    tabIndex: rows.length > 0 ? 0 : -1,
+    onFocus: (event: React.FocusEvent<HTMLElement>) => {
+      if (event.target !== event.currentTarget) return;
+      const row = rowNodes.current.get(selectedKey);
+      if (!row || row.getAttribute("aria-disabled") === "true") return;
+      const visible = listNode.current?.getBoundingClientRect();
+      const bounds = row.getBoundingClientRect();
+      if (visible && bounds.bottom > visible.top && bounds.top < visible.bottom) row.focus({ preventScroll: true });
+    },
+    onBlur: (event: React.FocusEvent<HTMLElement>) => {
+      if (!event.currentTarget.contains(event.relatedTarget)) {
+        pendingRowFocus.current = null;
+        setFocusedRow(null);
+      }
+    },
+    onKeyDown: (event: React.KeyboardEvent<HTMLElement>) => {
+      if (event.target === event.currentTarget) navigateRow(event, -1);
+    },
+  } as object : undefined;
+  return <View ref={setFrameRef} {...frameFocus} style={[windowsTableStyles.root, !framed && windowsTableStyles.borderless, style]}>
     {/* A source list is a navigation pane, so it lays its rows out at the pane's
         own width and never scrolls horizontally.  Wrapping it in the data
         table's horizontal scroller made the sidebar slide sideways by a
         per-selection amount once a row was a few points too wide. */}
-    {sourceList ? body : <ScrollView horizontal showsHorizontalScrollIndicator style={windowsTableStyles.horizontalScroll} contentContainerStyle={windowsTableStyles.horizontalContent}>{body}</ScrollView>}
+    {sourceList ? body : <ScrollView horizontal showsHorizontalScrollIndicator {...(Platform.OS === "web" && { tabIndex: -1 })} style={windowsTableStyles.horizontalScroll} contentContainerStyle={windowsTableStyles.horizontalContent}>{body}</ScrollView>}
     {scrollThumb}
   </View>;
 }

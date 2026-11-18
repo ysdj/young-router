@@ -114,6 +114,7 @@ from .base import (
     _REQUEST_TIMEOUT_DEFAULT_SECONDS,
     _REQUEST_TIMEOUT_SECONDS_ENV,
     _REQUEST_BODY_SIZE_REJECTED_METADATA_KEY,
+    _ENCRYPTED_REPLAY_STRIPPED_METADATA_KEY,
     _REQUEST_BODY_SIZE_REJECTED_STATUS_CODE,
     _REQUEST_BODY_SIZE_REJECTION_MARKERS,
     _ROUTE_RECOVERY_POLL_METADATA_KEY,
@@ -176,6 +177,7 @@ from .base import (
     _UPSTREAM_TEMPORARY_ERROR_MARKERS,
     _is_upstream_truncated_stream_error,
     _is_upstream_body_read_failure,
+    _value_has_encrypted_content,
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
     _UPSTREAM_URL_SURFACE_DEPLOYMENT_ID_KEY,
     _UPSTREAM_URL_SURFACE_KEY,
@@ -1108,15 +1110,33 @@ def _stream_idle_timeout_seconds_for_request(request_data: Optional[dict]) -> fl
     exceed the ordinary stream-idle cap, so use the compaction start budget for
     the post-first-event wait as well.  An explicit zero stall timeout keeps its
     existing meaning and disables the local idle cap.
+
+    A heavy replay earns the same larger gap for the same reason it earns a
+    larger first-event budget.  The start watchdog only covers a stream that
+    has produced nothing, and LiteLLM announces ``response.created`` locally
+    before the upstream has begun prefilling, so that announcement ends the
+    start window and hands the same wait to this cap.  Observed live
+    2026-11-18: a request replaying 261,000 tokens and 7 MB of signed image
+    prefix announced at 13 s, the station then spent minutes prefilling, and
+    the 120 s idle cap parked the route mid-prefill; every retry met the same
+    cap on a different route.  The total-no-progress cap
+    (``YOUNG_ROUTER_STREAM_NO_PROGRESS_SECONDS``) still bounds the whole
+    request.
     """
     stall_timeout = _stall_timeout_seconds()
     if stall_timeout <= 0:
         return 0.0
-    if not _responses_request_module._request_has_structured_codex_compaction(
+    if _responses_request_module._request_has_structured_codex_compaction(
         request_data
     ):
-        return stall_timeout
-    return max(stall_timeout, _stream_start_timeout_seconds_for_request(request_data))
+        return max(stall_timeout, _stream_start_timeout_seconds_for_request(request_data))
+    heavy_budget = _heavy_replay_stream_start_budget_for_request(request_data)
+    if heavy_budget is not None and heavy_budget > stall_timeout:
+        request_timeout = _request_timeout_seconds()
+        if request_timeout > 0:
+            heavy_budget = min(heavy_budget, request_timeout)
+        return max(stall_timeout, heavy_budget)
+    return stall_timeout
 
 
 def _same_deployment_retries() -> int:
@@ -1499,6 +1519,15 @@ def _recovery_policy_for_exception(exception: Exception) -> str:
         # ``upstream_route_failure`` after every other route had already
         # refused for its own reason.
         return _RECOVERY_POLICY_RECOVERY
+    if _is_encrypted_replay_refused_error(exception):
+        # The history is what this route cannot read, not the request's bytes
+        # and not the route's own health: another account serves the same
+        # replay, while the refusing route keeps serving other traffic.  It is
+        # therefore an ``error`` for *this* body -- the fallback hops through
+        # the siblings inside the attempt, and once every candidate has said it
+        # cannot decrypt, the turn ends with a named stop instead of replaying
+        # the same ciphertext for the recovery window.
+        return _RECOVERY_POLICY_ERROR
     if status_code in {400, 401, 404, 405, 409, 422}:
         return _recovery_policy_setting(
             _RECOVERY_POLICY_REQUEST_ERROR_ENV,
@@ -1683,6 +1712,36 @@ def _is_route_recovery_poll_error(exception: Exception) -> bool:
     return _recovery_policy_for_exception(exception) != _RECOVERY_POLICY_ERROR
 
 
+def _is_streaming_error_fallback_eligible(
+    exception: Exception,
+    request_kwargs: Optional[dict],
+) -> bool:
+    """Whether a streaming fallback round can act on this failure at all.
+
+    The one-shot fallback and the recovery poll dispatch through the same
+    round, and that round only asks the router for another deployment for the
+    failures this predicate names.  Anything else returns an empty round
+    immediately -- the poll then records the unchanged exception as a failed
+    attempt, waits five seconds, and does the same thing again.  A seed no
+    round can dispatch must therefore end the turn here, not buy the recovery
+    window: live 2026-11-18 one Codex thread spent seventeen minutes and 213
+    rounds that way, each round failing in milliseconds, while the client sat
+    behind keepalives with no answer.
+    """
+
+    return (
+        _is_request_scoped_priority_deployment_failover_error(
+            exception,
+            request_kwargs,
+        )
+        or _is_no_deployments_available_error(exception)
+        # A route whose thinking replay dropped its own out-of-band field is
+        # retried by ``reasoning_replay`` on the same route; the round is the
+        # hop that reaches it after the repair has marked the request.
+        or _is_thinking_replay_contract_error(exception)
+    )
+
+
 def _should_return_route_recovery_stream(
     exception: Exception,
     request_kwargs: Optional[dict],
@@ -1707,6 +1766,11 @@ def _should_return_route_recovery_stream(
     ):
         return False
     if not _is_route_recovery_poll_error(exception):
+        return False
+    if not _is_streaming_error_fallback_eligible(exception, request_kwargs):
+        # A recovery stream whose every round would be an empty replay is
+        # keepalives with no attempt behind them.  Hand the failure back to the
+        # ordinary path, where its terminal sentence is built.
         return False
     if _recovery_max_seconds_for_request(request_kwargs) <= 0:
         return False
@@ -2103,14 +2167,19 @@ def _with_session_deployment_affinity(
     request_kwargs: Optional[dict],
     model_group: Optional[str],
 ) -> tuple[Any, Optional[str], bool]:
-    """Narrow eligible candidates to the session's cache-affinity deployment.
+    """Narrow this request's candidates to the session's last serving route.
 
-    This callback runs before LiteLLM applies its own route-order filter, so
-    affinity may only choose a deployment in the pool's lowest order tier.
-    Otherwise a warm route at a higher order would hide a newly available,
-    lower-order route and make the configured order ineffective. When the
-    sticky deployment is absent or outside that tier, selection is unchanged;
-    a later success on another deployment re-points the affinity.
+    Affinity is about the upstream's warm prompt cache, and it answers one
+    question only: did some route already serve this conversation, and is it
+    still among the candidates this attempt may use?  It deliberately knows
+    nothing about ``order``, relay multipliers, or the content of the replay --
+    those decide which routes are candidates in the first place, and by the time
+    this runs the answer is already in the list.
+
+    The route that answers re-points the affinity (see
+    ``_record_session_success``), so a conversation follows whichever route
+    actually serves it; when the sticky route is absent, excluded, or cooling,
+    selection is unchanged and the configured order decides.
     """
 
     if not _session_deployment_affinity_enabled():
@@ -2128,31 +2197,7 @@ def _with_session_deployment_affinity(
     if sticky_deployment is None:
         return candidates, sticky, False
 
-    candidate_orders = [
-        order
-        for deployment in candidates
-        if (order := _deployment_configured_order(deployment)) is not None
-    ]
-    if candidate_orders:
-        sticky_order = _deployment_configured_order(sticky_deployment)
-        if sticky_order is None or sticky_order != min(candidate_orders):
-            return candidates, sticky, False
     return [sticky_deployment], sticky, True
-
-
-def _deployment_configured_order(deployment: Any) -> Optional[_RouteOrder]:
-    """The explicit order LiteLLM compares when selecting a route tier."""
-
-    if not isinstance(deployment, dict):
-        return None
-    for section_name in ("litellm_params", "model_info"):
-        section = deployment.get(section_name)
-        if not isinstance(section, dict):
-            continue
-        order = _coerce_order(section.get("order"))
-        if order is not None:
-            return order
-    return None
 
 
 _CODEX_COMPACTION_CAPABILITY_PROBE_TIMEOUT_SECONDS = 15.0
@@ -6347,6 +6392,12 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         reason = "thinking-tool-choice-refused"
     elif _is_upstream_tool_history_rejected_error(exception):
         reason = "upstream-tool-history-rejected"
+    elif _is_encrypted_replay_refused_error(exception):
+        # The one cause the reader can act on is which history was sent, and
+        # ``other`` hid exactly that: a station's raw envelope read as an
+        # unclassified stop while the route had named the encrypted items it
+        # could not decrypt.
+        reason = "encrypted-replay-refused"
     elif _is_upstream_request_field_rejected_error(exception):
         reason = "upstream-request-field-rejected"
     elif _is_image_generation_tool_runtime_fallback_error(exception):
@@ -6534,6 +6585,17 @@ def _recovery_diagnostic(exception: Exception) -> dict[str, Any]:
                 "The upstream refused this replay because a tool call has no "
                 "matching output. Start a new task so the history sent upstream "
                 "is smaller than the upstream limit."
+            ),
+        }
+    elif _is_encrypted_replay_refused_error(exception):
+        result = {
+            "kind": "encrypted_replay_refused",
+            "title": "Encrypted history unreadable",
+            "detail": (
+                "The route's upstream account did not mint this conversation's "
+                "encrypted reasoning or subagent messages, so it cannot decrypt "
+                "them. Another route that did mint them answers the same "
+                "history; start a new task if none can."
             ),
         }
     elif status_code in (401, 403) or any(
@@ -8156,6 +8218,32 @@ def _is_priority_deployment_failover_error(exception: Exception) -> bool:
         return True
     if getattr(exception, "stream_incomplete", False):
         return True
+    if _is_route_cut_stream_error(exception):
+        # The route answered and then closed the body mid-framing.  The turn the
+        # reader was consuming is over, but the route is what failed: another
+        # deployment can serve the replay, and the caller must advance to it
+        # (and park this one) instead of ending on the cut.  Without this, a
+        # stream read error never reached the failover path at all -- it had no
+        # deployment marker and no predicate owned it, so the recovery poll
+        # replayed a seed no round could dispatch until the client gave up
+        # (live 2026-11-18: 213 empty rounds, 17 minutes of keepalives).
+        return True
+    if _is_upstream_body_read_failure(exception):
+        # The same fault with the transport detail missing: reading an accepted
+        # response failed and no sentence names framing.  A sibling can serve
+        # the bytes; the read that died cannot.
+        return True
+    if _is_encrypted_replay_refused_error(exception):
+        # This route's account cannot read the signed history it was sent, but
+        # a sibling whose organization minted those items can.  Advance instead
+        # of ending the turn on a stop the user cannot act on.
+        return True
+    if _is_upstream_relay_capacity_error(exception):
+        # The station's channel pool is empty, which the policy already reads as
+        # "another attempt can reach another channel".  Without this the attempt
+        # was not dispatchable: the recovery poll opened on a cooldown-policy
+        # seed and produced empty rounds until the window expired.
+        return True
     if _is_upstream_channel_refused_error(exception):
         # The station's channel can differ per attempt, and a sibling route may
         # answer the same bytes: advance instead of ending the turn here.
@@ -8276,6 +8364,77 @@ def _cooldown_failure_declined(
     )
 
 
+def _is_unfinished_upstream_stream_error(exception: Exception) -> bool:
+    """Whether a route answered, started a stream, and never finished it.
+
+    Three spellings of one fact: the proxy's own incomplete-stream exception,
+    the transport diagnosis of a cut body, and the adapter sentence for a
+    Responses stream that closed without ``response.completed``.
+    """
+
+    if getattr(exception, "stream_incomplete", False):
+        return True
+    if _is_route_cut_stream_error(exception):
+        return True
+    if _is_upstream_body_read_failure(exception):
+        return True
+    text = _exception_text(exception).lower()
+    if not text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "before any terminal event",
+            "responses stream incomplete",
+            "closed the responses stream",
+            "closed this connection while the answer was streaming",
+        )
+    )
+
+
+def _is_repeatable_transient_route_failure(exception: Exception) -> bool:
+    """Whether this transient failure may park its route once it repeats.
+
+    Three shapes are the route's own failure even though one occurrence is
+    written off as ``recovery``: a 5xx it answered before streaming, a host it
+    could not be reached at, and a stream it cut mid-answer.  ``recovery`` is
+    right about the *turn* -- another attempt may complete the same bytes --
+    and wrong as a standing answer.  Live 2026-11-18: one route answered 15 of
+    its 20 attempts with 500s, 502s and connectivity failures and was never
+    parked, so every round of a 261,000-token replay paid it first; the same
+    day another cut stream after stream (``ReadError: connection closed``,
+    ``closed the responses stream before any terminal event``) and was declined
+    for the same reason.
+
+    Counting is all this decides.  The ordinary threshold turns two of them
+    into a cooldown, so a single blip still parks nothing -- which is the
+    2026-11-12 lesson that kept the network policy as ``recovery`` in the first
+    place.  What is *not* counted: the pool's own "no deployments available",
+    this worker's teardown, this proxy's own stream watchdogs (a silent route
+    is not a failing one), a concurrency cap (the route is busy, not broken),
+    and a station's channel refusal (the station picks a channel per attempt).
+    """
+
+    if _is_no_deployments_available_error(exception):
+        return False
+    if _is_local_shutdown_exception(exception):
+        return False
+    if _is_local_stream_timeout_error(exception):
+        return False
+    if _is_model_concurrency_rejection_error(exception):
+        return False
+    if _is_upstream_channel_refused_error(exception):
+        return False
+    if _is_unfinished_upstream_stream_error(exception):
+        return True
+    status_code = _exception_status_code(exception)
+    if status_code is None:
+        status_code = _nested_upstream_status_code(exception)
+    if status_code is not None and status_code >= 500:
+        return True
+    return _exception_indicates_network_connectivity_error(exception)
+
+
 def _should_count_deployment_failure_for_cooldown(
     exception: Exception,
     request_kwargs: Optional[dict] = None,
@@ -8292,7 +8451,12 @@ def _should_count_deployment_failure_for_cooldown(
     del request_kwargs
     if _is_sanitized_upstream_route_failure_error(exception):
         return False
-    return _recovery_policy_for_exception(exception) == _RECOVERY_POLICY_COOLDOWN
+    recovery_policy = _recovery_policy_for_exception(exception)
+    if recovery_policy == _RECOVERY_POLICY_COOLDOWN:
+        return True
+    return recovery_policy == _RECOVERY_POLICY_RECOVERY and (
+        _is_repeatable_transient_route_failure(exception)
+    )
 
 
 def _record_deployment_failure_for_cooldown(
@@ -8321,10 +8485,14 @@ def _record_deployment_failure_for_cooldown(
     # protocol-fallback force path.
     recovery_policy = _recovery_policy_for_exception(exception)
     if recovery_policy != _RECOVERY_POLICY_COOLDOWN:
-        _cooldown_failure_declined(
-            exception, request_kwargs, f"policy:{recovery_policy}"
-        )
-        return
+        if not (
+            recovery_policy == _RECOVERY_POLICY_RECOVERY
+            and _is_repeatable_transient_route_failure(exception)
+        ):
+            _cooldown_failure_declined(
+                exception, request_kwargs, f"policy:{recovery_policy}"
+            )
+            return
     if not force and getattr(
         exception, _DEPLOYMENT_COOLDOWN_FAILURE_RECORDED_ATTR, False
     ):
@@ -10125,6 +10293,203 @@ def _is_thinking_replay_contract_error(exception: Exception) -> bool:
     if "thinking mode" not in text and "reasoning_text" not in text:
         return False
     return "must be passed back" in text or "reasoning_content" in text
+
+
+def _request_encrypted_replay_was_stripped(request_kwargs: Optional[dict]) -> bool:
+    """Whether this turn's replay has already been relieved of its signed items."""
+
+    if not isinstance(request_kwargs, dict):
+        return False
+    if request_kwargs.get(_ENCRYPTED_REPLAY_STRIPPED_METADATA_KEY) is True:
+        return True
+    for metadata_key in ("litellm_metadata", "metadata"):
+        metadata = _request_context_module._request_metadata_dict(
+            request_kwargs,
+            metadata_key,
+        )
+        if (
+            isinstance(metadata, dict)
+            and metadata.get(_ENCRYPTED_REPLAY_STRIPPED_METADATA_KEY) is True
+        ):
+            return True
+    return False
+
+
+def _mark_encrypted_replay_stripped(request_kwargs: dict) -> None:
+    """Record that this replay no longer carries its signed items.
+
+    The marker rides where the other per-turn facts ride, so a hop that rebuilds
+    its kwargs from this request still knows the body was repaired.
+    """
+
+    request_kwargs[_ENCRYPTED_REPLAY_STRIPPED_METADATA_KEY] = True
+    metadata = _request_context_module._request_metadata_dict(
+        request_kwargs,
+        "litellm_metadata",
+    )
+    updated = dict(metadata) if isinstance(metadata, dict) else {}
+    updated[_ENCRYPTED_REPLAY_STRIPPED_METADATA_KEY] = True
+    request_kwargs["litellm_metadata"] = updated
+
+
+def _replay_item_without_encrypted_payload(item: dict) -> Optional[dict]:
+    """This item with its undecryptable payload removed, or ``None`` to drop it.
+
+    A ``reasoning`` item is nothing but the thinking it lost: its remaining
+    ``summary`` is what the client already shows as visible reasoning, and an
+    input reasoning item with no signed payload is the shape a thinking-mode
+    wire refuses, so it is dropped whole.  Every other item keeps its visible
+    parts -- a Codex ``agent_message`` is the subagent's text with one signed
+    attachment -- and only the attached ciphertext is removed.
+    """
+
+    item_type = str(item.get("type") or "")
+    if item_type == "reasoning":
+        return None
+    repaired = dict(item)
+    repaired.pop("encrypted_content", None)
+    content = repaired.get("content")
+    if isinstance(content, list):
+        kept_parts = [
+            part
+            for part in content
+            if not (
+                isinstance(part, dict)
+                and str(part.get("type") or "") == "encrypted_content"
+            )
+        ]
+        if len(kept_parts) != len(content):
+            if kept_parts:
+                repaired["content"] = kept_parts
+            else:
+                repaired.pop("content", None)
+    kept_fields = {
+        key
+        for key, value in repaired.items()
+        if key not in {"type", "id", "status"} and value not in (None, "")
+    }
+    if not kept_fields:
+        return None
+    return repaired
+
+
+def _strip_unreadable_encrypted_replay(
+    request_kwargs: Optional[dict],
+    exception: Exception,
+) -> bool:
+    """Answer a decryption refusal by sending the history without its ciphertext.
+
+    ``encrypted_content`` is bound to the organization that minted it, so a
+    replay assembled from several turns is readable only where every item came
+    from the same account.  A Codex thread served by more than one station --
+    or whose subagent turns were answered elsewhere -- carries items no single
+    route can decrypt, and every candidate answers the same 400.  The fallback
+    then has nowhere to go and the turn ends on a history that is perfectly
+    replayable without the opaque blobs (live 2026-11-18: eight turns died this
+    way while the same session served 1,300 requests).
+
+    The ciphertext is a cache of the model's own thinking, not the
+    conversation: the client's messages, function calls, function outputs and
+    visible reasoning summaries are all kept byte for byte, so the turn can be
+    answered anywhere at the cost of the route re-thinking what those blobs
+    held.  That trade is made only after a route refused to decrypt this exact
+    replay, and only once per turn.
+
+    The ``input`` list is edited in place: every hop of this attempt derives its
+    kwargs from it, and a hop that resent the unreadable ciphertext would pay
+    the same refusal again.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return False
+    if not _is_encrypted_replay_refused_error(exception):
+        return False
+    if _request_encrypted_replay_was_stripped(request_kwargs):
+        return False
+    items = request_kwargs.get("input")
+    if not isinstance(items, list) or not items:
+        return False
+    kept: List[Any] = []
+    dropped: Dict[str, int] = {}
+    repaired = 0
+    for item in items:
+        if not (isinstance(item, dict) and _value_has_encrypted_content(item)):
+            kept.append(item)
+            continue
+        replacement = _replay_item_without_encrypted_payload(item)
+        if replacement is None:
+            item_type = str(item.get("type") or "unknown")
+            dropped[item_type] = dropped.get(item_type, 0) + 1
+            continue
+        repaired += 1
+        kept.append(replacement)
+    if not dropped and not repaired:
+        return False
+    items[:] = kept
+    _mark_encrypted_replay_stripped(request_kwargs)
+    _trace_module._route_trace(
+        "responses_encrypted_replay_stripped",
+        request_id=_trace_request_id(request_kwargs),
+        session=_trace_session_context(request_kwargs),
+        model_group=_responses_execution_module._request_model_group(request_kwargs),
+        dropped_items=sum(dropped.values()),
+        dropped_by_type=dropped,
+        repaired_items=repaired,
+        exception=_trace_exception(exception),
+    )
+    return True
+
+
+def _is_encrypted_replay_refused_error(exception: Exception) -> bool:
+    """Whether a route says it cannot decrypt the history it was sent.
+
+    OpenAI's Responses wire binds ``encrypted_content`` -- a reasoning item, or
+    the payload of a Codex ``agent_message`` -- to the organization that minted
+    it.  A replay carrying items from another organization is answered with
+    ``Encrypted function output content could not be decrypted or decoded``,
+    sometimes followed by OpenAI's own explanation about load balancing across
+    API keys.  A station may pass the sentence through in its own envelope, so
+    the wording, not the status, is what identifies it.
+
+    The refusal is about *this history at this route*, not about the request's
+    bytes and not about the route being broken: a sibling whose account minted
+    those items serves the same replay, and the refusing route's next request
+    is unaffected.  Read as an unclassified request error it ended the turn on
+    the first route and told the client nothing it could act on (live
+    2026-11-18: a Codex thread carrying subagent messages died with the
+    station's raw envelope after one sibling timed out).  Classified here, the
+    command names its cause and the router keeps looking for a route that can
+    read the history.
+    """
+
+    text = _exception_text(exception).lower()
+    if not text:
+        return False
+    if _is_request_body_size_rejection_error(exception):
+        return False
+    return (
+        "encrypted function output content could not be decrypted or decoded"
+        in text
+        or "encrypted content is tied to the organization that created it"
+        in text
+    )
+
+
+def _upstream_encrypted_replay_refused_message(model_group: str) -> str:
+    """The one sentence for a history no candidate route could decrypt.
+
+    Shared by the Responses terminal event and the native chunk.  The signed
+    items are bound to the organization that produced them, so the action that
+    changes the outcome is a new task -- minted by whichever route serves it --
+    and not another resend of the same history.
+    """
+
+    return (
+        "No candidate route could decrypt this conversation's encrypted "
+        f"history for {model_group}: the signed items were produced by a "
+        "different upstream organization. Start a new task so the history is "
+        "minted again on one route."
+    )
 
 
 def _is_responses_schema_unsupported_error(exception: Exception) -> bool:

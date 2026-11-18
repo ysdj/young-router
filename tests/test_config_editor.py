@@ -1634,7 +1634,7 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         self.assertRegex(reloaded_model["deployment_id"], r"^[0-9a-f]{8}$")
         saved = config_schema._load_yaml(path)["model_list"][0]
         self.assertEqual(
-            "model=balanced-chat / provider=compat_provider / upstream=openai/default-chat / host=example.com / key=key-two / order=2",
+            "model=balanced-chat / provider=compat_provider / upstream=openai/default-chat / host=example.com / key=key-two / order=0",
             saved["model_info"]["route_key"],
         )
         self.assertEqual("key-two", saved["model_info"]["api_key_name"])
@@ -1945,8 +1945,8 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         )
         self.assertEqual(
             [
-                "model=default-chat / provider=compat_provider / upstream=openai/default-chat / host=example.com / key=key-two / order=2",
-                "model=default-chat / provider=compat_provider / upstream=openai/default-chat / host=example.com / key=key-two / order=2",
+                "model=default-chat / provider=compat_provider / upstream=openai/default-chat / host=example.com / key=key-two / order=0",
+                "model=default-chat / provider=compat_provider / upstream=openai/default-chat / host=example.com / key=key-two / order=0",
             ],
             [entry["model_info"]["route_key"] for entry in saved],
         )
@@ -1993,8 +1993,8 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
         route_keys = [entry["model_info"]["route_key"] for entry in saved]
         self.assertEqual(
             [
-                "model=vendor-chat / provider=openrouter / upstream=openai/vendor/vendor-chat / host=openrouter.ai / key=default / order=1",
-                "model=llmwebsearch / provider=openrouter / upstream=openai/vendor/vendor-chat / host=openrouter.ai / key=default / order=1",
+                "model=vendor-chat / provider=openrouter / upstream=openai/vendor/vendor-chat / host=openrouter.ai / key=default / order=0",
+                "model=llmwebsearch / provider=openrouter / upstream=openai/vendor/vendor-chat / host=openrouter.ai / key=default / order=0",
             ],
             route_keys,
         )
@@ -2240,14 +2240,22 @@ class ConfigEditorProviderKeyTests(unittest.TestCase):
 
         config_api.save_config(payload["providers"], path)
         saved = config_schema._load_yaml(path)["model_list"]
-        self.assertEqual([-2.5, 0.25], [entry["litellm_params"]["order"] for entry in saved])
+        # LiteLLM compares an integer tier, so the config states the order on a
+        # hundredths ladder; the number the user set stays on ``model_info``.
+        # LiteLLM compares an integer tier, so the two distinct orders become
+        # ranks 0 and 1 -- exact however many decimal places the order states.
+        self.assertEqual([0, 1], [entry["litellm_params"]["order"] for entry in saved])
+        self.assertEqual([-2.5, 0.25], [entry["model_info"]["order"] for entry in saved])
         self.assertEqual(
             [
-                "model=default-chat / provider=compat_provider / upstream=openai/negative / host=example.com / key=default / order=-2.5",
-                "model=default-chat / provider=compat_provider / upstream=openai/fractional / host=example.com / key=default / order=0.25",
+                "model=default-chat / provider=compat_provider / upstream=openai/negative / host=example.com / key=default / order=0",
+                "model=default-chat / provider=compat_provider / upstream=openai/fractional / host=example.com / key=default / order=1",
             ],
             [entry["model_info"]["route_key"] for entry in saved],
         )
+        # And the editor reads the user's number back, not the ladder.
+        round_tripped = config_load.load_config(path)["providers"][0]["models"]
+        self.assertEqual(["-2.5", "0.25"], [model["order"] for model in round_tripped])
 
     def test_non_numeric_order_is_rejected(self) -> None:
         path = self.write_config(

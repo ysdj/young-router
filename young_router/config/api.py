@@ -407,6 +407,7 @@ def save_config(
         _replace_top_level_sections,
         _unique_model_groups,
         _write_atomic,
+        order_tier_map,
     )
 
     source_document = (
@@ -415,6 +416,10 @@ def save_config(
         else normalize_config_document(document)
     )
 
+    # One ladder for the whole document: every public model's distinct orders,
+    # ranked, so LiteLLM's integer comparison reproduces the ordering the
+    # decimal orders stated.
+    order_tiers = order_tier_map(providers)
     active_entries: list[dict[str, Any]] = []
     disabled_entries: list[dict[str, Any]] = []
     provider_count = 0
@@ -492,6 +497,7 @@ def save_config(
                 and scoped.get("api_base") == provider.get("api_base"),
                 effective_enabled=effective_enabled,
                 seen_deployment_ids=seen_deployment_ids,
+                order_tiers=order_tiers,
             )
             if enabled:
                 active_entries.append(entry)

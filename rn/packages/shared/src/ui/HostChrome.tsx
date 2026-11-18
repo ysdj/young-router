@@ -19,7 +19,7 @@ import React from "react";
 import { Platform, ScrollView, StyleProp, StyleSheet, Text, View, ViewStyle } from "react-native";
 import { NativeBusySpinner, NativeButton, NativeCheckbox, NativeTextField, WINDOWS_CONTROL } from "./NativeControls";
 import { UI_FONT_SIZE, UI_TIP_FONT_SIZE } from "./typography";
-import { pushPresentation, trapWithin } from "../platform/presentationStack";
+import { focusFirstWithin, pushPresentation, trapWithin } from "../platform/presentationStack";
 import {
   dismissalFor,
   hostChromeSnapshot,
@@ -46,93 +46,79 @@ const COLOR = {
 /** Where a menu is anchored, in viewport coordinates. */
 const MENU_MIN_WIDTH = 180;
 
-/**
- * The card of the dialog currently drawn.
- *
- * `trapWithin` needs the card element itself, not the scrim around it, and the
- * surfaces own their own JSX (`DialogFrame`, and the viewer's own frame), so
- * the element arrives here through a callback ref rather than a prop threaded
- * through every surface.  Only one surface is drawn at a time, so one slot is
- * enough.  The assignment ignores React's `null` detach: the effect below
- * re-reads the slot for every request, so a detached card is never the one a
- * new trap is installed for.
- */
-let currentCard: HTMLElement | null = null;
-
-function rememberCard(node: unknown): void {
-  // Only the page mounts this component and only its refs are elements; a
-  // host instance from a native bundle has no `HTMLElement` to test against.
-  if (Platform.OS === "web" && node instanceof HTMLElement) currentCard = node;
-}
-
-const FOCUSABLE = "button, input, select, textarea, [tabindex]:not([tabindex='-1'])";
-
-/**
- * Put the caret on the card's first control when the dialog opens.
- *
- * Without this the opener behind the scrim kept focus, so Return re-fired the
- * button that asked the question while the question was still up.  A surface
- * that already focused a field (the prompt, the picker's search) keeps it: its
- * `autoFocus` runs first, and moving focus away would undo it.
- */
-function focusFirst(card: HTMLElement): void {
-  if (card.contains(document.activeElement)) return;
-  const control = Array.from(card.querySelectorAll<HTMLElement>(FOCUSABLE)).find((element) => !element.hasAttribute("disabled") && element.tabIndex !== -1);
-  (control ?? card).focus();
-}
-
-export function HostChromeHost(): React.JSX.Element | null {
+export function HostChromeHost(): React.JSX.Element {
   const requests = React.useSyncExternalStore(subscribeHostChrome, hostChromeSnapshot, hostChromeSnapshot);
-  // Only the topmost surface is drawn: two answers are never asked at once, and
-  // a menu over a dialog must not compete with that dialog's keys.
-  const request = requests[requests.length - 1];
+  const modalOpen = requests.some((request) => request.kind !== "menu");
+  React.useLayoutEffect(() => {
+    if (!modalOpen) return;
+    const root = document.getElementById("root");
+    // A child window can already own this lock. Release only the one we set.
+    if (!root || root.inert) return;
+    root.inert = true;
+    return () => { root.inert = false; };
+  }, [modalOpen]);
+  // Keep earlier surfaces mounted while a new question sits above them. The
+  // model picker can ask for name-case confirmation mid-save; unmounting it
+  // here discarded its search and checked rows before a failed write could be
+  // retried.
+  return <>{requests.map((request, index) => <HostChromeSurface
+    key={request.id}
+    request={request}
+    topmost={index === requests.length - 1}
+  />)}</>;
+}
 
-  React.useEffect(() => {
-    if (request === undefined) return undefined;
-    // A menu is anchored to its opener and is not modal: locking the page
-    // behind it would dim and disable the very control it belongs to.  Every
-    // other surface is a dialog that owns the page while it is up.
-    const modal = request.kind !== "menu";
-    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const root = modal ? document.getElementById("root") : null;
-    if (root) root.inert = true;
-    const card = modal ? currentCard : null;
-    if (card) focusFirst(card);
-    // The same stack the child layers use: Escape answering here is Escape
-    // answering the surface on top of whatever is behind it.
+function HostChromeSurface({ request, topmost }: { request: HostChromeRequest; topmost: boolean }): React.JSX.Element {
+  const layerRef = React.useRef<HTMLDivElement>(null);
+  // Capture before this layer's input can autofocus during the commit.
+  const [opener] = React.useState(() => document.activeElement);
+  const dismiss = React.useEffectEvent(() => settleHostChrome(request, dismissalFor(request)));
+
+  React.useLayoutEffect(() => {
+    const layer = layerRef.current!;
     const release = pushPresentation({
-      dismiss: () => settleHostChrome(request, dismissalFor(request)),
-      ...(card ? { trap: trapWithin(card) } : {}),
+      dismiss: () => dismiss(),
+      trap: trapWithin(layer, layer),
     });
     return () => {
       release();
-      if (root) root.inert = false;
-      // Back to what asked the question, so the dialog closes without dropping
-      // the person at the top of the page.  A surface that was replaced by
-      // another one during this render leaves its own effect in charge.
-      if (opener?.isConnected) opener.focus();
+      // Wait for the commit to remove the layer and unlock what it covered.
+      queueMicrotask(() => {
+        if (!layer.isConnected && document.activeElement === document.body && opener instanceof HTMLElement && opener.isConnected) opener.focus();
+      });
     };
-  }, [request]);
+  }, [opener]);
 
-  if (request === undefined) return null;
+  React.useLayoutEffect(() => {
+    if (!topmost) return;
+    const layer = layerRef.current!;
+    // Give the closing layer a chance to restore its opener first.
+    queueMicrotask(() => {
+      if (layer.isConnected && !layer.inert && !layer.contains(document.activeElement)) focusFirstWithin(layer);
+    });
+  }, [topmost]);
+
+  let surface: React.ReactNode;
   switch (request.kind) {
-    case "confirm": return <DecisionSurface request={request} />;
-    case "prompt": return <PromptSurface request={request} />;
-    case "viewer": return <ViewerSurface request={request} />;
-    case "picker": return <PickerSurface request={request} />;
-    case "relaySignIn": return <RelaySignInSurface request={request} />;
-    case "relayBrowser": return <RelayBrowserSurface request={request} />;
-    case "notice": return <NoticeSurface request={request} />;
-    case "menu": return <MenuSurface request={request} />;
+    case "confirm": surface = <DecisionSurface request={request} />; break;
+    case "prompt": surface = <PromptSurface request={request} />; break;
+    case "viewer": surface = <ViewerSurface request={request} />; break;
+    case "picker": surface = <PickerSurface request={request} />; break;
+    case "relaySignIn": surface = <RelaySignInSurface request={request} />; break;
+    case "relayBrowser": surface = <RelayBrowserSurface request={request} />; break;
+    case "notice": surface = <NoticeSurface request={request} />; break;
+    case "menu": surface = <MenuSurface request={request} />; break;
   }
+
+  return <div ref={layerRef} style={{ position: "absolute", inset: 0 }} tabIndex={-1} inert={!topmost}>
+    {surface}
+  </div>;
 }
 
 /** The frame every dialog shares: scrim, card, title, body, footer. */
 function DialogFrame({ title, children, footer, cardStyle }: { title: string; children: React.ReactNode; footer: React.ReactNode; cardStyle?: StyleProp<ViewStyle> }): React.JSX.Element {
   return <View style={styles.scrim} {...({ role: "dialog", "aria-modal": true, "aria-label": title } as object)}>
-    {/* `tabIndex` -1: a card with no focusable control of its own is still the
-        dialog, and focusing it beats leaving the caret on the page behind. */}
-    <View ref={rememberCard} tabIndex={-1} style={[styles.card, cardStyle]}>
+    <View style={[styles.card, cardStyle]}>
       <Text style={styles.cardTitle}>{title}</Text>
       {children}
       <View style={styles.footer}>{footer}</View>
@@ -435,9 +421,7 @@ function NoticeSurface({ request }: { request: Extract<HostChromeRequest, { kind
 
 function ViewerSurface({ request }: { request: Extract<HostChromeRequest, { kind: "viewer" }> }): React.JSX.Element {
   return <View style={styles.scrim} {...({ role: "dialog", "aria-modal": true, "aria-label": request.title } as object)}>
-    {/* The viewer states its own frame instead of using `DialogFrame`, so it
-        registers that frame with the same trap the other dialogs use. */}
-    <View ref={rememberCard} tabIndex={-1} style={styles.viewerCard}>
+    <View style={styles.viewerCard}>
       <View style={styles.viewerHeader}>
         <Text numberOfLines={1} style={styles.viewerTitle}>{request.title}</Text>
         <NativeButton title={request.closeLabel} compact onPress={() => settleHostChrome(request, undefined)} />
@@ -506,7 +490,7 @@ function PickerSurface({ request }: { request: Extract<HostChromeRequest, { kind
           them again in a second notation two lines below. */}
       <Text numberOfLines={1} style={styles.pickerStatus}>{request.status}</Text>
       <View style={styles.footerSpacer} />
-      <NativeButton title={request.cancelLabel} compact disabled={saving} onPress={() => request.resolve()} />
+      <NativeButton title={request.cancelLabel} compact disabled={saving} onPress={request.resolve} />
       {/* Both native hosts disable their Add button until something is
           selected; an enabled one here would hand back an empty list.  It is
           also where the write reports itself, exactly as the native choosers'
@@ -529,8 +513,8 @@ function PickerSurface({ request }: { request: Extract<HostChromeRequest, { kind
         style={styles.pickerSearch}
       />
       <View style={styles.pickerControls}>
-        <NativeButton title={labels.selectAll} compact disabled={saving || visible.length === 0} onPress={selectAllVisible} />
-        <NativeButton title={labels.invert} compact disabled={saving || visible.length === 0} onPress={invertVisible} />
+        <NativeButton title={labels.selectAll} accessibilityLabel={labels.selectAllLabel} compact disabled={saving || visible.length === 0} onPress={selectAllVisible} />
+        <NativeButton title={labels.invert} accessibilityLabel={labels.invertLabel} compact disabled={saving || visible.length === 0} onPress={invertVisible} />
         <View style={styles.footerSpacer} />
         <Text numberOfLines={1} style={styles.pickerCount}>{summary}</Text>
       </View>

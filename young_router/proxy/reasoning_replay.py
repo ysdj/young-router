@@ -590,6 +590,13 @@ async def call_with_replay_repair(
     except Exception as exc:
         retry_kwargs = retry_request_kwargs(exc, kwargs)
         if retry_kwargs is None:
+            if _routing_module._strip_unreadable_encrypted_replay(kwargs, exc):
+                # A route refused to decrypt this history, and the repair is to
+                # stop sending the ciphertext: every visible item stays, so the
+                # same route can answer the replay it just turned down.  The
+                # strip is in place, which is also how the hops after this one
+                # stop paying the same refusal.
+                return await call()
             raise
         _trace_module._route_trace(
             "responses_reasoning_text_replay_start",
@@ -615,6 +622,14 @@ async def call_with_replay_repair(
         try:
             response = await call()
         except Exception as retry_exc:
+            if _routing_module._strip_unreadable_encrypted_replay(
+                kwargs,
+                retry_exc,
+            ):
+                # The repaired thinking answered one refusal; this one is about
+                # the ciphertext beside it.  Both repairs are per turn, so the
+                # stripped body is sent once more instead of failing the hop.
+                return await call()
             _trace_module._route_trace(
                 "responses_reasoning_text_replay_error",
                 request_id=_routing_module._trace_request_id(kwargs),

@@ -790,7 +790,7 @@ class BrowserPageAddressTests(unittest.TestCase):
         self.assertIn("if (!isKnownRoute(next)) return DEFAULT_ROUTE;", entry)
         self.assertIn("function adoptRouteAddress(): void {", entry)
         self.assertIn("adoptRouteAddress();\nlet currentRoute = routeFromHash();", entry)
-        self.assertIn("isKnownRoute(canonicalWindowRoute(route) as AppRoute)", entry)
+        self.assertIn("isKnownRoute(canonicalPageRoute(route))", entry)
 
     def test_the_tab_title_uses_the_localized_service_word(self) -> None:
         leaf = (self.shared / "platform/browserLeaf.ts").read_text(encoding="utf-8")

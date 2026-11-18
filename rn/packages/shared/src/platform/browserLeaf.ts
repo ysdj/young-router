@@ -1215,9 +1215,9 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
         keyLabel: strings?.modelChooserKey ?? "",
         search: strings?.modelChooserSearch ?? "",
         selectAll: strings?.modelChooserAll ?? "",
-        selectAllToolTip: strings?.modelChooserSelectAllVisible ?? "",
+        selectAllLabel: strings?.modelChooserSelectAllVisible ?? "",
         invert: strings?.modelChooserInvert ?? "",
-        invertToolTip: strings?.modelChooserInvertVisible ?? "",
+        invertLabel: strings?.modelChooserInvertVisible ?? "",
         count: strings?.modelChooserCount ?? "",
         countFiltered: strings?.modelChooserCountFiltered ?? "",
         countSelected: strings?.modelChooserCountSelected ?? "",
@@ -1225,7 +1225,7 @@ export function createBrowserLeafBridge(core: BrowserCoreBridge, options: {
         noMatches: strings?.modelChooserNoMatches ?? "",
       },
     }, strings?.childSaving ?? ""),
-    finishModelsToAdd: (status, close) => finishModelPick(status, close),
+    finishModelsToAdd: finishModelPick,
     editSecret: async () => undefined,
     clearSecret: async (domain, field, target) => {
       // Clearing is the same two host-only exchanges as staging, with the

@@ -175,6 +175,75 @@ def _provider_key_anchor(provider_name: str, key_name: str) -> str:
     return _make_anchor_name(provider_name, f"api_key_{key_name}")
 
 
+def _model_order_value(model: dict[str, Any]) -> Any:
+    """The order this route states, as the selector has to compare it."""
+
+    order_mode = str(model.get("order_mode", "manual")).strip() or "manual"
+    try:
+        if order_mode == "relay_multiplier":
+            effective = model.get("effective_order")
+            if effective is None or str(effective).strip() == "":
+                return None
+            return _numeric_order(effective)
+        return _numeric_order(model.get("manual_order", model.get("order", "")))
+    except (TypeError, ValueError):
+        return None
+
+
+def order_tier_map(providers: Any) -> dict[tuple[str, float], int]:
+    """Rank every public model's distinct orders onto integer tiers.
+
+    LiteLLM 1.110 compares ``order`` as an integer tier and treats any
+    non-integral value as *no order at all*: a group whose cheap routes carry
+    relay multipliers (``0.09`` ...) then has exactly one ordered route -- the
+    manual last-resort ``100`` -- and every request is pinned to it (measured
+    live 2026-11-18: 53 of 69 requests on the ``order: 100`` line).
+
+    Ranking, rather than rescaling, is what keeps the ordering exact however
+    many decimal places a multiplier carries: the distinct orders of one public
+    model are sorted the way the old float comparison sorted them and numbered
+    from one.  ``0.091`` and ``0.094`` stay two tiers apart, ``0.09`` stays
+    before ``0.5``, and a manual ``0`` stays before both.
+    """
+
+    orders: dict[str, set[float]] = {}
+    for provider in providers if isinstance(providers, list) else []:
+        for model in (provider.get("models") or []) if isinstance(provider, dict) else []:
+            if not isinstance(model, dict):
+                continue
+            name = public_name_key(model.get("model_name", ""))
+            value = _model_order_value(model)
+            if not name or value is None:
+                continue
+            try:
+                orders.setdefault(name, set()).add(float(value))
+            except (TypeError, ValueError):
+                continue
+    tiers: dict[tuple[str, float], int] = {}
+    for name, values in orders.items():
+        for rank, value in enumerate(sorted(values)):
+            tiers[(name, value)] = rank
+    return tiers
+
+
+def _order_tier(
+    order: Any,
+    model_name: str,
+    tiers: Any,
+) -> int | None:
+    """The integer tier for one route, or ``None`` when it states no order."""
+
+    try:
+        value = float(order)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(tiers, dict):
+        tier = tiers.get((public_name_key(model_name), value))
+        if isinstance(tier, int):
+            return tier
+    return int(round(value * 100))
+
+
 def _deployment_route_key(
     *,
     model_name: str = "",
@@ -435,6 +504,7 @@ def _entry_from_editor(
     use_provider_aliases: bool,
     effective_enabled: bool,
     seen_deployment_ids: set[str] | None = None,
+    order_tiers: Any = None,
 ) -> tuple[bool, dict[str, Any]]:
     model_enabled = _bool_value(model.get("model_enabled"), _bool_value(model.get("enabled"), True))
     enabled = effective_enabled
@@ -574,7 +644,20 @@ def _entry_from_editor(
         order = _numeric_order(effective_order_value)
     else:
         order = manual_order
-    params["order"] = order
+    # LiteLLM compares a route's ``order`` as an integer tier and treats any
+    # non-integral value as "no order": a group whose cheap routes carry relay
+    # multipliers (0.09 ... 0.5) and whose last-resort route carries the manual
+    # integer 100 therefore has exactly one ordered route, and every request is
+    # pinned to it (live 2026-11-18: 53 of 69 requests served by the order-100
+    # line while the cheap lines idled).  The ladder it compares is these
+    # integers; the number a person reads stays on ``model_info.order``.
+    tier = _order_tier(order, model_name, order_tiers)
+    if tier is not None:
+        params["order"] = tier
+        # The rank is what LiteLLM compares; the number a person set stays
+        # beside it so the editor reads the value it wrote.
+        if str(tier) != str(order):
+            model_info["order"] = order
     # The route's transport trust is part of the entry, not of the editor's own
     # fields: the loader lifts `ssl_verify` out of the extras bucket and the
     # pane reads it, so a save has to put it back or an Apply silently
@@ -617,7 +700,9 @@ def _entry_from_editor(
         provider_name=provider_name,
         api_base=api_base,
         api_key_name=api_key_name,
-        order=order,
+        # The tier LiteLLM compares, so a route key read back (fallback target
+        # orders) names a tier the router can actually select.
+        order=params["order"],
     )
     if api_key_name:
         model_info[MENU_API_KEY_NAME_KEY] = api_key_name

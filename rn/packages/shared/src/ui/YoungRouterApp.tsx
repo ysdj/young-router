@@ -5,7 +5,7 @@ import { createTranslator } from "../i18n";
 import { assistantSettingOptions, type AssistantSettingOption } from "../i18n/assistantSettingsI18n";
 import { runtimeCategoryLabel, runtimeFieldHelp, runtimeFieldLabel, runtimeOptionLabel, runtimeUnitLabel } from "../i18n/runtimeSettingsI18n";
 import { canonicalWindowRoute, isSettingsPaneRoute, isSettingsShellRoute, LOG_TABS, routeMenuActions, ROUTES, SETTINGS_PANES, SETTINGS_PANE_PRESENTATION } from "../routes";
-import { NativeButton, NativeBusySpinner, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeRadio, NativeSecureTextInput, NativeSegmentedControl, NativeTable, NativeTextField, NativeToggle, WINDOWS_CONTROL, nativeControlTextWidth } from "./NativeControls";
+import { NativeButton, NativeBusySpinner, NativeCheckbox, NativePersistentScrollIndicator, NativePicker, NativeRadio, NativeSecureTextInput, NativeSegmentedControl, NativeTable, NativeTextField, NativeToggle, WINDOWS_CONTROL, nativeControlTextWidth, webTextHoverProps } from "./NativeControls";
 import { CodeEditorWebView, editorMenuLabels, readOnlyCodeEditorHtml, type CodeEditorLanguage } from "./code-editor/CodeEditorWebView";
 import { modelGroupRowKey, modelIDFromRowKey, modelRowKey } from "./modelRowKeys";
 import { orderedModelGroupIDs } from "./modelGroupOrder";
@@ -856,7 +856,16 @@ function textFaceStyle(style: React.ComponentProps<typeof Text>["style"]): TextS
  * the pane has not laid out yet has no verdict to give, so both keep their
  * words away from the pointer rather than guessing.
  */
-function TooltipText({ tooltip, children, style, numberOfLines, onLayout, ...props }: React.ComponentProps<typeof Text> & { tooltip?: string }): React.JSX.Element {
+type TooltipTextProps = React.ComponentProps<typeof Text> & { tooltip?: string };
+
+function TooltipText({ tooltip, numberOfLines, ...props }: TooltipTextProps): React.JSX.Element {
+  if (Platform.OS === "web") {
+    return <Text {...props} numberOfLines={numberOfLines} {...webTextHoverProps(undefined, numberOfLines === 1 ? tooltip : undefined)} />;
+  }
+  return <MeasuredTooltipText {...props} tooltip={tooltip} numberOfLines={numberOfLines} />;
+}
+
+function MeasuredTooltipText({ tooltip, children, style, numberOfLines, onLayout, ...props }: TooltipTextProps): React.JSX.Element {
   const full = textContentOf(children);
   const [drawn, setDrawn] = useState(0);
   const [measured, setMeasured] = useState<{ text: string; width: number }>();
@@ -1569,6 +1578,12 @@ function isApplyResult(value: unknown): value is IpcResults["apply"] {
     && typeof result.completed_operations === "number"
     && typeof result.pending_operations === "number"
     && Array.isArray(result.issues);
+}
+
+type ApplyOutcome = IpcResults["apply"] | { cancelled: true; empty?: true } | { failure: string } | undefined;
+
+function stagedApplyKey(domains: readonly ConfigDomain[], revision: number): string {
+  return domains.length ? `${domains.join(",")}@${revision}` : "";
 }
 
 function applyResultMessage(result: IpcResults["apply"], translate: Translate, appliedKey?: string | null, serviceState?: ServiceStatus["state"]): string {
@@ -3311,13 +3326,11 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     keepControlsEnabled = false,
     refreshAfter = true,
     dataManagementTab?: DataManagementTab,
-    // A child surface's own apply: it states the outcome in its own status
-    // bar, so this window publishes nothing at all — not the wait, not the
-    // result, and not the failure.
-    quiet = false,
+    // A child surface reports its own outcome, including the failure.
+    reportQuietFailure?: (message: string) => T,
   ): Promise<T | undefined> => {
     const publishResult = (next: string | undefined): void => {
-      if (quiet) return;
+      if (reportQuietFailure) return;
       if (dataManagementTab) {
         setDataManagementStatuses((current) => ({ ...current, [dataManagementTab]: next }));
         return;
@@ -3371,7 +3384,14 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       // One action, one answer: when the channel is delivering and the answer
       // is the revision this pane holds, Core's patch for that revision is the
       // read.  Everything else keeps the read as the fallback it always was.
-      if (refreshAfter && !cancelled && postActionRefreshNeeded({ channel: eventChannel.current, revisionBefore, revisionAfter, localRevision: revision.current })) await refresh();
+      if (refreshAfter && !cancelled && postActionRefreshNeeded({ channel: eventChannel.current, revisionBefore, revisionAfter, localRevision: revision.current })) {
+        try {
+          await refresh();
+        } catch (reason) {
+          // A later snapshot read cannot change the commit Core acknowledged.
+          if (!isApplyResult(value)) throw reason;
+        }
+      }
       return value as T;
     } catch (reason: unknown) {
       const validationStatus = await validationStatusAfterFailure(reason);
@@ -3392,7 +3412,9 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
         }
       }
       const bindingStatus = relayBindingFailureStatus(reason, failureSnapshot, translate);
-      publishResult(validationStatus ?? bindingStatus ?? errorMessage(reason, translate));
+      const failure = validationStatus ?? bindingStatus ?? errorMessage(reason, translate);
+      if (reportQuietFailure) return reportQuietFailure(failure);
+      publishResult(failure);
       return undefined;
     } finally {
       activeRuns.current -= 1;
@@ -3760,14 +3782,14 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   // snapshot move the revision under each other: one lands, the other meets a
   // moving revision through every retry and reports the save it just made as
   // 更改未生效.  A second caller joins the write already in flight.
-  const applyInFlight = useRef<Promise<IpcResults["apply"] | { cancelled: true } | undefined> | undefined>(undefined);
-  const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string }): Promise<IpcResults["apply"] | { cancelled: true } | undefined> => {
+  const applyInFlight = useRef<Promise<ApplyOutcome> | undefined>(undefined);
+  const applyOutcome = (options?: { silent?: boolean; quiet?: boolean; message?: string }): Promise<ApplyOutcome> => {
     // The data-management pane owns no single domain: an import stages several
     // package sections at once, so its Apply writes every dirty one.
     if ((!settingsRoute && !domain && route !== "data-management") || domain === "logs") return Promise.resolve(undefined);
     const running = applyInFlight.current;
     if (running) return running;
-    const started = runOutcome<IpcResults["apply"] | { cancelled: true }>(async () => {
+    const started = runOutcome<ApplyOutcome>(async () => {
       await flushPendingFields();
       // Inline relay edits stage through the shared dispatch queue when their
       // fields lose focus. Wait for that queue before taking the apply
@@ -3783,7 +3805,9 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       const plan = await readCommitPlan();
       revision.current = plan.revision;
       const domains = stagedDomainsForRoute(plan);
-      if (domains.length === 0) return { cancelled: true };
+      if (domains.length === 0) return { cancelled: true, empty: true };
+      // This child action owns the same draft the shell's debounce would write.
+      if (options?.quiet) autoAppliedKey.current = stagedApplyKey(domains, plan.revision);
       const risks = domains.includes("claude") ? plan.risks.claude ?? [] : [];
       const diskConflicts = domains.filter((name) => plan.disk[name]?.changed);
       const unacknowledgedDiskConflicts = diskConflicts.filter((name) => !isEditableDiskDomain(name) || keptDiskGeneration[name] !== plan.disk[name]?.generation);
@@ -3895,24 +3919,36 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       // What the commit changed still arrives as its own patch.
       if (result) revision.current = result.revision;
       return result;
-    }, options?.silent ? null : (options?.message ?? "common.saved"), true, true, undefined, options?.quiet === true);
-    applyInFlight.current = started;
-    void started.finally(() => {
+    }, options?.silent ? null : (options?.message ?? "common.saved"), true, true, undefined, options?.quiet ? (failure) => ({ failure }) : undefined).finally(() => {
       if (applyInFlight.current === started) applyInFlight.current = undefined;
     });
+    applyInFlight.current = started;
     return started;
   };
-  const apply = async (options?: { silent?: boolean; quiet?: boolean; message?: string }): Promise<void> => {
+  const apply = async (options?: { silent?: boolean; message?: string }): Promise<void> => {
     await applyOutcome(options);
   };
-  // A child surface applies the draft it wrote itself (分组管理's 保存并关闭):
-  // the pane it was opened from must stay silent about work it did not start,
-  // and the child reports the outcome in its own status bar.
-  // A child surface's own commit is background work for the pane underneath
-  // it: the sheet is already gone when the write lands, so holding that pane
-  // disabled for it is the same unexplained freeze the navigation flush used
-  // to produce.
-  const applyStagedQuietly = (): Promise<void> => apply({ quiet: true });
+  // A child surface reports its own save, including a refusal to apply.
+  const applyStagedQuietly = async (): Promise<void> => {
+    // The write in flight may have read its plan before this child staged.
+    await applyInFlight.current;
+    const result = await applyOutcome({ quiet: true });
+    if (result && "failure" in result) throw new Error(result.failure);
+    if (result && !("cancelled" in result)) {
+      if (result.status === "applied") return;
+      throw new Error(applyResultMessage(result, translate));
+    }
+    if (!result?.empty) throw new Error(translate("common.notApplied"));
+  };
+  const [modelPickerSaves, setModelPickerSaves] = useState(0);
+  const withModelPickSave = async (save: () => Promise<void>): Promise<void> => {
+    setModelPickerSaves((count) => count + 1);
+    try {
+      await save();
+    } finally {
+      setModelPickerSaves((count) => count - 1);
+    }
+  };
   // The settings shell commits as the user changes controls. Wait for the
   // route's serial dispatch queue, then apply the staged domains; the debounce
   // coalesces a burst of toggles into one Core apply. A failed apply keeps its
@@ -3934,13 +3970,8 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   // that keeps conflicting would otherwise turn the debounce into a loop.
   const autoRetriedKey = useRef("");
   const immediateApplyBlocked = useImmediateApplyBlocked();
-  const autoApplyKey = shell && actionSnapshot && !immediateApplyBlocked
-    ? (() => {
-      const domains = stagedDomainsForRoute(actionSnapshot);
-      if (domains.length === 0) return "";
-      const dirty = domains.filter((name) => actionSnapshot.drafts[name]?.dirty === true);
-      return dirty.length === 0 ? "" : `${dirty.join(",")}@${actionSnapshot.revision}`;
-    })()
+  const autoApplyKey = shell && actionSnapshot && !immediateApplyBlocked && modelPickerSaves === 0
+    ? stagedApplyKey(stagedDomainsForRoute(actionSnapshot), actionSnapshot.revision)
     : "";
   useEffect(() => {
     if (!shell) return;
@@ -3956,8 +3987,12 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
     const savingMessage = translate("common.saving");
     setResult(savingMessage);
     let started = false;
+    const clearSaving = (): void => setResult((current) => current === savingMessage ? undefined : current);
     const timer = setTimeout(() => {
-      if (autoAppliedKey.current === autoApplyKey) return;
+      if (autoAppliedKey.current === autoApplyKey) {
+        clearSaving();
+        return;
+      }
       started = true;
       autoAppliedKey.current = autoApplyKey;
       // Keep the pane interactive while the background apply runs; the
@@ -3970,9 +4005,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
       // before it ever calls Apply.  Leaving 正在保存 up in that case is the
       // one state that looks like a frozen window while Core is idle: the
       // argument that set it is gone, and nothing else will clear it.
-      if (!started) {
-        setResult((current) => (current === savingMessage ? undefined : current));
-      }
+      if (!started) clearSaving();
     };
   }, [autoApplyKey, busy, hasPendingFieldEdits, pendingFieldRevision, shell, translate]);
   // The shell owns the window-close path; expose one flush so it can commit a
@@ -4592,7 +4625,7 @@ function RouteSurface({ route, shell = false, initialClient, windowRoute, snapsh
   return <TranslationContext.Provider value={settingsRoute ? translate : undefined}><PendingFieldContext.Provider value={fieldRegistry}><View style={[styles.windowSurface, shell && isWindowsShell && styles.windowSurfaceShellWindows]}>
     {!shell && route !== "providers-models" && route !== "logs" && route !== "provider-wizard" && route !== "file-editor" && route !== "data-management" && route !== "webdav-settings" ? <WindowTitle title={windowTitle} /> : null}
     {route === "providers-models" || route === "provider-wizard" || route === "file-editor" || route === "webdav-settings" || settingsRoute || route === "logs" || route === "runtime-settings" || route === "data-management" || route === "general-settings" ? <View style={[styles.windowContent, compactStyles.windowContent, styles.windowContentFixed, route === "file-editor" && styles.fileEditorRouteContent, route === "providers-models" && styles.providersContent, (route === "provider-wizard" || route === "webdav-settings") && styles.childRouteContent, (settingsRoute || route === "runtime-settings" || route === "data-management" || route === "general-settings") && SETTINGS_PANE_ROUTE, route === "logs" && styles.logsContent]}>
-    {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} applyStagedQuietly={applyStagedQuietly} onOpenWizard={() => { native.window.open("provider-wizard"); native.window.focus("provider-wizard"); }} relay={relayBridge} /> : null}
+    {route === "providers-models" ? <ProviderWorkspace snapshot={snapshot} ipc={ipc} onSnapshot={onSnapshot} native={native} busy={busy} translate={translate} dispatch={dispatch} dispatchWithOutcome={dispatchWithOutcome} dispatchModelPick={(type, payload) => enqueueDispatch(type, payload, "providers_models")} withModelPickSave={withModelPickSave} onStatus={setResult} onSecretState={onSecretState} applyProbedSurface={applyProbedSurface} applyStagedQuietly={applyStagedQuietly} onOpenWizard={() => { native.window.open("provider-wizard"); native.window.focus("provider-wizard"); }} relay={relayBridge} /> : null}
     {route === "file-editor" ? <FileEditorWorkspace file={inlineEditorFile} fileId={fileIdRequest} nativeAction={nativeAction} ipc={ipc} native={native} translate={translate} busy={busy} onEditorConflict={resolveRawEditorConflict} reloadToken={settingsRawReloadToken} baselineToken={settingsRawBaselineToken} syncRevision={snapshot?.revision} onFlushPendingFields={flushPendingFields} onClose={closeRoute} /> : null}
     {route === "provider-wizard" ? <ProviderSetupWizard snapshot={snapshot} native={native} providers={providerWizardProviders} relaySources={providerWizardRelaySources} relayStations={providerWizardRelayStations} busy={busy} translate={translate} dispatchWithOutcome={dispatchWithOutcome} onSecretState={onSecretState} onClose={closeRoute} onKeyToken={registerProviderWizardKeyToken} relay={relayBridge} addOfficialAccount={addOfficialAccount} /> : null}
     {route === "webdav-settings" ? <WebDavSettingsPanel snapshot={snapshot} busy={busy} status={dataManagementStatuses.webdav} translate={translate} onSecretState={onSecretState} onFlushPendingFields={flushPendingFields} onProbe={probeWebDavDetails} onSave={saveWebDavDetails} onSync={syncWebDavAndReadState} onCompareConflict={compareWebDavConflict} onResolveConflict={resolveWebDavConflictAndReadState} onSetContentSize={(width, height) => { void native.window.setContentSize?.("webdav-settings", width, height); }} onClose={closeRoute} /> : null}
@@ -4656,21 +4689,6 @@ type ServiceProviderKind = "openai_login" | "workbuddy_login" | "workbuddy_globa
  * create answered from, and a lookup that filtered by kind would report a
  * create it never saw as "nothing happened".
  */
-/**
- * The rows a snapshot gained for one provider since `known` was read.
- *
- * The pane selects the first of them, and the import answers the chooser with
- * whether there was one at all: a pick Core skipped as already present is not a
- * failed write, and it is not a new row either.
- */
-function appearedModelIDs(snapshot: CoreSnapshot | undefined, providerID: string, known: ReadonlySet<string>): string[] {
-  const target = snapshotProviderRecords(snapshot).find((entry) => editorIdentifier(entry) === providerID);
-  if (!target) return [];
-  return asRecords(target.models)
-    .map(modelRecord)
-    .map((entry) => editorIdentifier(entry))
-    .filter((id) => !known.has(id));
-}
 function snapshotProviderRecords(snapshot: CoreSnapshot | undefined): UnknownRecord[] {
   const state = domainState(snapshot, "providers_models");
   const details = asRecords(state.providers);
@@ -7248,7 +7266,7 @@ const ProviderListTable = React.memo(function ProviderListTable({ translate, sel
   return <NativeTable columns={[{ label: translate("providers.provider"), width: 112 }]} rows={rows} secondaryRowKeys={secondaryRowKeys} alertRowKeys={alertRowKeys} selectedKey={selectedProviderId} compact firstColumnHorizontalPadding={0} onSelectionChange={(key) => { if (key) onSelect(key); }} style={styles.nativeProviderTable} />;
 });
 
-function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate, dispatch, dispatchWithOutcome, onStatus, onSecretState, applyProbedSurface, applyStagedQuietly, onOpenWizard, relay }: { snapshot?: CoreSnapshot; ipc: IpcClient; onSnapshot: (next: CoreSnapshot) => void; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; onStatus: (status?: string) => void; onSecretState: (state: SecretState) => void; applyProbedSurface: ApplyProbedSurface; applyStagedQuietly: () => Promise<void>; onOpenWizard: () => void; relay: RelayWorkspaceBridge }): React.JSX.Element {
+function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate, dispatch, dispatchWithOutcome, dispatchModelPick, withModelPickSave, onStatus, onSecretState, applyProbedSurface, applyStagedQuietly, onOpenWizard, relay }: { snapshot?: CoreSnapshot; ipc: IpcClient; onSnapshot: (next: CoreSnapshot) => void; native: NativeLeafAdapter; busy: boolean; translate: Translate; dispatch: Dispatch; dispatchWithOutcome: (type: string, payload?: UnknownRecord, domain?: ConfigDomain, keepControlsEnabled?: boolean) => Promise<CoreSnapshot | undefined>; dispatchModelPick: (type: string, payload: UnknownRecord) => Promise<IpcResults["dispatch"]>; withModelPickSave: (save: () => Promise<void>) => Promise<void>; onStatus: (status?: string) => void; onSecretState: (state: SecretState) => void; applyProbedSurface: ApplyProbedSurface; applyStagedQuietly: () => Promise<void>; onOpenWizard: () => void; relay: RelayWorkspaceBridge }): React.JSX.Element {
   const [modelTableWidth, setModelTableWidth] = useState(0);
   const [routeTableWidth, setRouteTableWidth] = useState(0);
   const state = domainState(snapshot, "providers_models");
@@ -7322,7 +7340,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       if (!activeKeys.has(selectionKey)) autoRelaySelectionKeys.current.delete(selectionKey);
     }
   }, [busy, dispatch, providers, relayStations]);
-  const pendingModelIds = useRef<{ providerId: string; ids: Set<string> } | undefined>(undefined);
+  const pendingModelIds = useRef<({ providerId: string } & ({ ids: Set<string> } | { id: string })) | undefined>(undefined);
   // A pick that staged nothing new — the model the fetch offered is the row
   // already on that key, which Core now refuses to duplicate — must not leave
   // its ids waiting: the next unrelated row to appear would otherwise steal the
@@ -7330,7 +7348,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   // so the add's own answer is what releases a no-op pick.
   const settlePendingModels = (next: unknown, targetProviderId: string): void => {
     const pending = pendingModelIds.current;
-    if (!pending || pending.providerId !== targetProviderId) return;
+    if (!pending || pending.providerId !== targetProviderId || !("ids" in pending)) return;
     const added = snapshotProviderRecords(next as CoreSnapshot | undefined)
       .find((entry) => editorIdentifier(entry) === targetProviderId);
     const appeared = added
@@ -7719,7 +7737,9 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
   useEffect(() => {
     const pending = pendingModelIds.current;
     if (pending?.providerId === providerId) {
-      const added = models.find((item) => !pending.ids.has(editorIdentifier(item)));
+      const added = models.find((item) => "id" in pending
+        ? editorIdentifier(item) === pending.id
+        : !pending.ids.has(editorIdentifier(item)));
       if (added) {
         const addedId = editorIdentifier(added);
         setSelectedModel(addedId);
@@ -7823,55 +7843,62 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
    * same two steps 分组管理 makes.  `offered` is the roster the chooser listed: a
    * name it never offered is not part of this pick.
    */
-  const importPickedModels = async (
+  const importPickedModels = (
     offered: readonly string[],
     handedOver: readonly string[],
-    write: (models: string[]) => Promise<CoreSnapshot | undefined>,
-  ): Promise<void> => {
+    write: (models: string[]) => Promise<IpcResults["dispatch"]>,
+  ): Promise<void> => withModelPickSave(async () => {
     const roster = new Set(offered);
-    const accepted = (models: readonly string[]): string[] => models.filter(
-      (model, index, all) => roster.has(model) && all.indexOf(model) === index,
-    );
+    const accepted = (models: readonly string[]): string[] => [...new Set(models)].filter((model) => roster.has(model));
+    // Pre-existing selections are recorded without an ID and never discarded.
+    const submitted = new Map<string, string | undefined>();
+    const removeChooserRows = async (selected: readonly string[]): Promise<void> => {
+      const kept = new Set(selected);
+      const removed = [...submitted].filter(([name, id]) => id && !kept.has(name));
+      if (removed.length === 0) return;
+      await dispatchModelPick("model.discard_added", { provider_id: providerId, model_ids: removed.map(([, id]) => id) });
+      for (const [name] of removed) submitted.delete(name);
+    };
     let picked = accepted(handedOver);
     while (picked.length > 0) {
-      // Every attempt names the rows the pane already had, so the selection the
-      // effect makes is the attempt's own new row and never a row an earlier
-      // try added.
-      const known = new Set(models.map(editorIdentifier));
-      pendingModelIds.current = { providerId, ids: known };
-      const next = await write(picked).catch((reason: unknown) => {
-        onStatus(errorMessage(reason, translate));
-        return undefined;
-      });
-      if (!next) {
-        // The dispatch refused and states its own cause in the pane's strip.
-        pendingModelIds.current = undefined;
-        picked = await answerModelPick(translate("common.notApplied"), false);
-        continue;
-      }
-      if (!appearedModelIDs(next, providerId, known).length) {
-        // Core keeps one route per (public name, upstream, key) and skips the
-        // rest of a pick that names rows the provider already carries.  Nothing
-        // appeared, so there is nothing to select and nothing to retry: the
-        // chooser states it and closes.
-        pendingModelIds.current = undefined;
-        await answerModelPick(translate("providers.fetchNothingNew"), true);
-        return;
-      }
       try {
-        // Saved before the chooser closes: 已保存 is a claim about rows in the
-        // document, not about a draft an autosave may still fail to write.
-        await applyStagedQuietly();
+        await removeChooserRows(picked);
+        const newNames = picked.filter((model) => !submitted.has(model));
+        if (newNames.length > 0) {
+          const result = await write(newNames);
+          for (const name of newNames) submitted.set(name, undefined);
+          for (const row of asRecords(result.action_summary?.added_rows)) {
+            const name = newNames[numberValue(row.index, -1)];
+            const modelID = stringValue(row.id);
+            if (name !== undefined && modelID) submitted.set(name, modelID);
+          }
+        }
+        // A failed Apply leaves the rows staged. Retry the write without
+        // dispatching them again or asking about their spelling again.
+        const id = picked.map((name) => submitted.get(name)).find(Boolean);
+        if (id) {
+          pendingModelIds.current = { providerId, id };
+          setSelectedModel(id);
+          setProviderSourceModel(undefined);
+          await applyStagedQuietly();
+        }
+        await answerModelPick(translate(id ? "common.saved" : "providers.fetchNothingNew"), true);
+        return;
       } catch (reason) {
         const message = errorMessage(reason, translate);
-        onStatus(message);
-        picked = await answerModelPick(message, false);
-        continue;
+        if (!native.finishModelsToAdd) onStatus(message);
+        picked = accepted(await answerModelPick(message, false));
       }
-      await answerModelPick(translate("common.saved"), true);
-      return;
     }
-  };
+    // Cancel after a failed Apply must discard this chooser's additions from
+    // the draft, or the shell's ordinary debounce can save unchecked rows.
+    try {
+      await removeChooserRows([]);
+    } catch (reason) {
+      onStatus(errorMessage(reason, translate));
+    }
+    pendingModelIds.current = undefined;
+  });
   // The model pane's own listing handler, for a provider whose models are read
   // the generic ``/v1/models`` way.
   const handleFetchedModels = (summary: UnknownRecord, requested?: ProviderKeyChoice): void => {
@@ -7906,7 +7933,6 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
       return;
     }
     onStatus(undefined);
-    const candidateSet = new Set(candidates);
     const modelCapabilities = asRecord(summary.model_capabilities);
     const providerName = provider ? providerDisplayName(provider) : providerId;
     const apiKeyName = stringValue(summary.api_key_name);
@@ -7936,13 +7962,13 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         // clients would have to type that way (Core files every picked row under
         // the same answer).
         const nameCase = await importNameCaseAnswer(native, translate, picked);
-        return dispatchWithOutcome("model.add_many", {
+        return dispatchModelPick("model.add_many", {
           provider_id: providerId,
           models: picked.map((upstreamModel) => ({ name: upstreamModel, upstream_model: upstreamModel, imported: true, imported_name_case: nameCase, api_key_name: apiKeyName, ...(apiKeyID ? { provider_key_id: apiKeyID } : {}), enabled: true, order: 0 })).map((model) => ({
             ...model,
             ...modelRecordCapabilityChanges(modelCapabilities[model.upstream_model]),
           })),
-        }, "providers_models");
+        });
       });
     }).catch(() => undefined);
   };
@@ -7994,7 +8020,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         // One spelling decision for the whole pick: the labels are what the user
         // just read in the chooser, and Core files each row under this answer.
         const nameCase = await importNameCaseAnswer(native, translate, chosen);
-        return dispatchWithOutcome("model.import_service_catalog", { provider_id: providerId, models: chosen, public_name_case: nameCase }, "providers_models");
+      return dispatchModelPick("model.import_service_catalog", { provider_id: providerId, models: chosen, public_name_case: nameCase });
       });
     }).catch(() => undefined);
   };
@@ -8066,7 +8092,7 @@ function ProviderWorkspace({ snapshot, ipc, onSnapshot, native, busy, translate,
         // press asked a station for a roster, and 已保存 is the answer to an
         // edit.  `applyStagedQuietly` is the shell's ordinary background write
         // (the same one a child surface uses), so the pane stays usable.
-        void applyStagedQuietly().catch(() => undefined);
+        void applyStagedQuietly().catch((reason: unknown) => onStatus(errorMessage(reason, translate)));
       }
       // A roster that lands after the picker moved is not this pane's answer:
       // the chooser it would open names a key the user has already left, and

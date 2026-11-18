@@ -2289,10 +2289,24 @@ def _ordered_deployment_fallback_entry(
         and _responses_request_module._deployment_id(deployment) in excluded_ids
         for deployment in all_deployments
     )
+    # A same-order retry must land on a *cool* peer of the failed route.  Without
+    # this filter the retry targeted the failed route's own tier, and a tier with
+    # one route answered with that same route -- parked and just cut -- turn
+    # after turn.  Live 2026-11-18: one order-100 route failed a thread's replays
+    # ten times in a row, each round pinned to ``order=100`` by the previous
+    # round's fallback.
+    peer_candidates = available_deployments
+    if failed_order is not None:
+        peer_candidates, _peer_cooling, _peer_cooling_filtered = (
+            _routing_module._with_active_deployment_cooldowns(
+                peer_candidates,
+                request_kwargs=request_kwargs,
+            )
+        ) or (peer_candidates, [], False)
     peer_deployments = (
         [
             deployment
-            for deployment in available_deployments
+            for deployment in peer_candidates
             if _responses_request_module._deployment_order(deployment) == failed_order
         ]
         if failed_id is not None or constrained_no_deployments

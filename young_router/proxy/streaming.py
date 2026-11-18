@@ -2353,6 +2353,26 @@ def _synthesized_failed_response_event(
         # client and the Codex code for "no resend changes this".
         error_type = "invalid_request_error"
         error_code = "invalid_prompt"
+    elif _routing_module._is_encrypted_replay_refused_error(exception):
+        # Every candidate said it cannot read the signed history.  The items are
+        # bound to the organization that minted them, so the reader's action is
+        # a new task -- but the stop still names the cause instead of falling
+        # through to the unclassified sentence, which is what the station's raw
+        # envelope used to become.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        message = _routing_module._upstream_encrypted_replay_refused_message(
+            model_group
+        )
+        # ``server_error`` keeps a retry possible: the same history is readable
+        # on the route whose account minted it, and the session's affinity now
+        # steers a resend there.  ``invalid_prompt`` would end the conversation
+        # on a history the client can still get answered.
+        error_type = "server_error"
+        error_code = "encrypted_replay_unreadable"
     elif _routing_module._is_upstream_request_field_rejected_error(exception):
         # The route refused the *fields* this proxy sent, not the conversation:
         # an ``extra_body`` container, a ``litellm_params`` container, or one of
@@ -2792,6 +2812,11 @@ def _native_stream_error_code(
         # The replayed thinking is gone from this history and no resend adds it
         # back, so the client must not reconnect over the same body.
         return "invalid_prompt"
+    if _routing_module._is_encrypted_replay_refused_error(exception):
+        # A resend can be answered by the route that minted the signed items, so
+        # this stop is retryable; it still gets a code of its own so the trace
+        # and the client say what the route could not read.
+        return "encrypted_replay_unreadable"
     if _routing_module._is_upstream_tool_history_rejected_error(exception):
         return "invalid_prompt"
     if _routing_module._is_upstream_request_field_rejected_error(exception):
@@ -2921,6 +2946,17 @@ def _native_stream_error_message(
             or "the requested model"
         )
         return _routing_module._upstream_thinking_replay_rejected_message(model_group)
+    if _routing_module._is_encrypted_replay_refused_error(exception):
+        # Same reading as the Responses branch: no candidate route could read
+        # the signed items, and the client has to start a new task.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        return _routing_module._upstream_encrypted_replay_refused_message(
+            model_group
+        )
     if _routing_module._is_upstream_tool_history_rejected_error(exception):
         # The replay cannot be repaired on the client's side by sending it
         # again: the interrupted tool call stays in the history forever.
@@ -4361,7 +4397,16 @@ def _apply_streaming_error_fallback_constraints(
     *,
     route_recovery_poll: bool = False,
 ) -> None:
-    _routing_module._sync_failed_deployment_exclusions(request_data, exception)
+    # A route that refused the *ciphertext* is not excluded: this attempt's body
+    # has already been repaired, and the repaired replay belongs in the same
+    # pool.  Every other exclusion in the request stays.
+    repaired_route = (
+        _responses_execution_module._failed_deployment_id(exception)
+        if _routing_module._request_encrypted_replay_was_stripped(request_data)
+        else None
+    )
+    if not repaired_route:
+        _routing_module._sync_failed_deployment_exclusions(request_data, exception)
 
     def cumulative_excluded_ids() -> set[str]:
         excluded_ids = set(_CURRENT_EXCLUDED_DEPLOYMENT_IDS.get() or ())
@@ -4371,6 +4416,8 @@ def _apply_streaming_error_fallback_constraints(
         excluded_ids.update(
             _responses_request_module._request_excluded_deployment_ids(request_data)
         )
+        if repaired_route:
+            excluded_ids.discard(repaired_route)
         return excluded_ids
 
     def preserve_cumulative_exclusions(*additional_sources: dict) -> set[str]:
@@ -4453,10 +4500,19 @@ def _apply_streaming_error_fallback_constraints(
         failed_id = _routing_module._deployment_id_from_request(request_data)
     if failed_id and not retry_same_deployment and not _routing_module._is_local_stream_timeout_error(exception):
         excluded_ids.add(failed_id)
+    if repaired_route:
+        excluded_ids.discard(repaired_route)
     if excluded_ids:
         preserve_cumulative_exclusions(
             {"_excluded_deployment_ids": sorted(excluded_ids)}
         )
+    elif repaired_route:
+        # The repaired body carries no verdict against the route that refused
+        # the ciphertext, so the exclusion this hop inherited is dropped from
+        # both containers -- otherwise the retry still cannot see that route.
+        for container in (request_data, payload):
+            if container.get("_excluded_deployment_ids") == [repaired_route]:
+                container.pop("_excluded_deployment_ids", None)
 
 async def _streaming_error_fallback_response(
     request_data: dict,
@@ -4486,18 +4542,13 @@ async def _streaming_error_fallback_response(
         and _responses_request_module._request_already_attempted_streaming_error_fallback(request_data)
     ):
         return None
-    if not (
-        _routing_module._is_request_scoped_priority_deployment_failover_error(
-            exception,
-            request_data,
-        )
-        or _routing_module._is_no_deployments_available_error(exception)
-        # A route that refuses the replayed thinking is not a group-wide
-        # failure: the same history is answerable on a sibling.  Without this
-        # the poll excluded the refusing route but the next round returned an
-        # empty stream before selecting anything, so it excluded it forever.
-        or _routing_module._is_thinking_replay_contract_error(exception)
+    if not _routing_module._is_streaming_error_fallback_eligible(
+        exception,
+        request_data,
     ):
+        # One predicate owns "can a round act on this": the recovery poll uses
+        # the same answer before opening its window, so the two cannot disagree
+        # about a seed that produces empty rounds.
         return None
 
     method_name = _streaming_error_fallback_method_name(request_data)
@@ -4514,6 +4565,10 @@ async def _streaming_error_fallback_response(
             request_data,
         )
         and not _routing_module._should_retry_same_deployment_before_fallback(exception)
+        # A refusal about the ciphertext says nothing about the route: the body
+        # has just been repaired, and the repaired replay goes back to the same
+        # pool.  Marking it here would exclude the route the order would pick.
+        and not _routing_module._request_encrypted_replay_was_stripped(request_data)
     ):
         _routing_module._mark_exception_for_deployment_failover(exception, request_data)
     payload = _build_streaming_error_fallback_payload(
@@ -6867,6 +6922,33 @@ async def _yield_streaming_error_fallback_or_raise(
     # generic-call exception path, so record the route-local compaction
     # capability evidence before any recovery/fallback policy is evaluated.
     _routing_module._apply_current_selected_deployment_to_request(request_data)
+    if (
+        (
+            _routing_module._is_route_cut_stream_error(exception)
+            or _routing_module._is_upstream_body_read_failure(exception)
+        )
+        and not _routing_module._is_network_recovery_exception(exception)
+    ):
+        # A body that fails while it is being read never passes through
+        # LiteLLM's failure callbacks, and the wrapper that consumed it has
+        # already reset the selected-route marker by the time the exception
+        # arrives here.  This is the last place that can still name the route:
+        # without the mark, the fallback excludes nothing and the recovery poll
+        # replays the same bytes at the same deployment forever (live
+        # 2026-11-18: 213 rounds, every one with a null failed_deployment_id).
+        _routing_module._mark_exception_for_deployment_failover(
+            exception,
+            request_data,
+        )
+    # A route that could not decrypt this history is answering about the bytes,
+    # not about itself: the same conversation is readable once the ciphertext no
+    # route can read is gone.  So the repair is a resend, not a hop -- the failed
+    # route goes back into the pool and the repaired body is sent again at once
+    # (order decides which route that is).  Dropping the ciphertext here, before
+    # the fallback and the recovery poll rebuild their requests, is what makes
+    # every later hop carry the repaired body too.
+    if _routing_module._strip_unreadable_encrypted_replay(request_data, exception):
+        _routing_module._allow_the_failed_deployment_again(exception, request_data)
     _routing_module._mark_real_compaction_failure_capability_unsupported(
         request_data,
         exception,

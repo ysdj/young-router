@@ -6825,6 +6825,8 @@ class CoreStore:
                             "qoder_logout": "qoder_logout",
                             "our_free_model_status": "our_free_model_status",
                             "our_free_model_models": "our_free_model_models",
+                            "model_add_many": "model_add_many",
+                            "add_models": "model_add_many",
                             "model_import_service_catalog": "model_import_service_catalog",
                         }.get(normalized_action)
                         if (

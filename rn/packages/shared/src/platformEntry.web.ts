@@ -30,7 +30,7 @@ import { askCloseRelayGroupSheet, closeRelayGroupSheet, relayGroupSheetState, se
 import { HostChromeHost } from "./ui/HostChrome";
 import { RelayGroupSheet } from "./ui/RelayGroupSheet";
 import { registerYoungRouter } from "./bootstrap";
-import { canonicalPageRoute, canonicalWindowRoute, DESKTOP_ROUTES, ROUTES } from "./routes";
+import { canonicalPageRoute, DESKTOP_ROUTES, ROUTES } from "./routes";
 import type { AppRoute } from "./types";
 
 /**

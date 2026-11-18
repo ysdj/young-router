@@ -950,6 +950,102 @@ def _cooldown_until_for_deployment(
     return min(ends) if ends else float("inf")
 
 
+def _with_integer_order_tiers(model_list: Any) -> Any:
+    """The same routes with every ``order`` on the integer tier ladder.
+
+    LiteLLM 1.110 compares integer tiers and drops a fractional order, and a
+    dropped order is not neutral: in a group that also states one integer
+    order, those routes leave that single route as the only ordered tier, so
+    every request is pinned to it.  The distinct orders of one public model are
+    therefore ranked the way the old float comparison sorted them, which is
+    exact however many decimal places a multiplier carries, and the number the
+    user set is preserved on ``model_info.order`` for the editor.
+    """
+
+    if not isinstance(model_list, list):
+        return model_list
+    orders: dict[str, set[float]] = {}
+    for entry in model_list:
+        if not isinstance(entry, dict):
+            continue
+        params = entry.get("litellm_params")
+        if not isinstance(params, dict):
+            continue
+        value = params.get("order")
+        if isinstance(value, bool) or value is None:
+            continue
+        try:
+            ordered = float(value)
+        except (TypeError, ValueError):
+            continue
+        orders.setdefault(str(entry.get("model_name") or ""), set()).add(ordered)
+    ranks = {
+        (name, value): rank
+        for name, values in orders.items()
+        for rank, value in enumerate(sorted(values))
+    }
+    for entry in model_list:
+        if not isinstance(entry, dict):
+            continue
+        params = entry.get("litellm_params")
+        if not isinstance(params, dict):
+            continue
+        value = params.get("order")
+        if isinstance(value, bool) or value is None:
+            continue
+        try:
+            ordered = float(value)
+        except (TypeError, ValueError):
+            continue
+        rank = ranks.get((str(entry.get("model_name") or ""), ordered))
+        if rank is None or rank == value:
+            continue
+        info = entry.get("model_info")
+        if isinstance(info, dict) and "order" not in info:
+            info["order"] = value
+        params["order"] = rank
+    return model_list
+
+
+def _install_integer_order_tiers_patch() -> None:
+    """Hand LiteLLM the integer tier its selector actually compares.
+
+    LiteLLM reads a deployment's ``order`` as an integer and treats a
+    non-integral float as *no order at all*.  This app's relay-multiplier routes
+    carry fractional orders (``0.09`` ... ``0.5``), so a group whose only
+    integer order was the manual last-resort ``100`` had exactly one ordered
+    route and every request was pinned to it -- measured live 2026-11-18: 53 of
+    69 requests on the ``order: 100`` line, 16 on the ``order: 0.09`` one, and a
+    fresh request with no session at all still landed on the last tier (the
+    upstream socket went to the order-100 station).
+
+    The Core writes the hundredths ladder itself, so this is for the file that
+    predates that write and for routes added before the next Apply: the same
+    number, on the scale the selector reads.
+    """
+
+    try:
+        from litellm.router import Router
+    except Exception:
+        return
+    original_init = getattr(Router, "__init__", None)
+    if original_init is None or getattr(
+        original_init, "_young_router_integer_order", False
+    ):
+        return
+
+    def patched_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        if "model_list" in kwargs:
+            kwargs["model_list"] = _with_integer_order_tiers(kwargs["model_list"])
+        elif args and isinstance(args[0], list):
+            args = (_with_integer_order_tiers(args[0]),) + tuple(args[1:])
+        return original_init(self, *args, **kwargs)
+
+    setattr(patched_init, "_young_router_integer_order", True)
+    setattr(patched_init, "_young_router_original", original_init)
+    Router.__init__ = patched_init
+
+
 def _install_routing_constraint_patch() -> None:
     try:
         from litellm.router import Router
@@ -3879,6 +3975,7 @@ def install_all() -> None:
     _claude_desktop_listing.install_patch()
     _install_chatgpt_account_credential_patch()
     _install_pre_call_token_count_patch()
+    _install_integer_order_tiers_patch()
     _install_routing_constraint_patch()
     _install_selected_deployment_marker_patch()
     _install_order_peer_failover_patch()

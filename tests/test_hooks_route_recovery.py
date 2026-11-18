@@ -33,6 +33,88 @@ class HookRouteRecoveryTests(HookTestCase):
                 [chunk async for chunk in response],
             )
 
+    def test_a_repeated_stream_cut_is_charged_to_its_route(self) -> None:
+        """A route that keeps cutting streams is parked after the threshold.
+
+        Live 2026-11-18: one route cut turn after turn -- ``ReadError:
+        connection closed``, then ``closed the responses stream before any
+        terminal event`` -- and every one of those failures was declined with
+        ``policy:recovery``, so the next request picked it first again.  One
+        cut still parks nothing: the ordinary threshold decides.
+
+        The 5xx answer needs no rule of its own here: it already carries the
+        server policy, so two of them park the route exactly as before.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "2")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        deployment = {
+            "litellm_params": {"model": "openai/x-cheap"},
+            "model_info": {"id": "x-cheap"},
+        }
+        request_kwargs = {
+            "model": "default-chat",
+            "litellm_params": dict(deployment["litellm_params"]),
+            "model_info": dict(deployment["model_info"]),
+        }
+        server_error = type("InternalServerError", (Exception,), {})(
+            "OpenAIException - The service is temporarily unavailable"
+        )
+        server_error.status_code = 500
+        self.assertTrue(
+            hooks._should_count_deployment_failure_for_cooldown(server_error)
+        )
+
+        def cut_stream() -> Exception:
+            exception = type("APIConnectionError", (Exception,), {})(
+                "openai closed the responses stream before any terminal event "
+                "(response.completed, response.incomplete or response.failed)"
+            )
+            exception.status_code = 500
+            return exception
+
+        first = cut_stream()
+        self.assertTrue(hooks._is_repeatable_transient_route_failure(first))
+        self.assertTrue(
+            hooks._should_count_deployment_failure_for_cooldown(first)
+        )
+        hooks._mark_exception_for_deployment_failover(first, request_kwargs)
+        available, cooled, _filtered = hooks._with_active_deployment_cooldowns(
+            [deployment],
+            request_kwargs={},
+        )
+        self.assertEqual([deployment], available)
+        self.assertEqual([], cooled)
+
+        hooks._mark_exception_for_deployment_failover(cut_stream(), request_kwargs)
+        available, cooled, filtered = hooks._with_active_deployment_cooldowns(
+            [deployment],
+            request_kwargs={},
+        )
+        self.assertEqual([], available)
+        self.assertTrue(filtered)
+        self.assertEqual(1, len(cooled))
+
+    def test_a_station_channel_refusal_still_recovers_without_cooling(self) -> None:
+        """The 2026-11-12 reading is untouched: this is not the route's failure.
+
+        A station picks a channel per attempt, so the same route can answer the
+        next request; parking it emptied a single-route group and answered every
+        retry locally with "no deployments available".
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        exception = type("BadRequestError", (Exception,), {})(
+            "Upstream access forbidden, please contact administrator"
+        )
+        exception.status_code = 400
+
+        self.assertFalse(hooks._is_repeatable_transient_route_failure(exception))
+        self.assertFalse(
+            hooks._should_count_deployment_failure_for_cooldown(exception)
+        )
+
     def test_a_server_refusal_hidden_in_a_connection_error_cools_the_route(self) -> None:
         """A refused route is cooled down; a body that was cut keeps recovering.
 
@@ -5332,6 +5414,319 @@ class HookRouteRecoveryTests(HookTestCase):
         self.assertEqual(
             hooks._trace_exception(exc)["reason"], "upstream-stream-incomplete"
         )
+
+    def test_a_route_that_cannot_decrypt_the_signed_history_is_named(self) -> None:
+        """The station's envelope is a route answer about the replayed history.
+
+        ``encrypted_content`` is readable only by the organization that minted
+        it, so this 400 says nothing about the request's bytes: the sibling
+        whose account produced them serves the same history.  Landing in
+        ``other``/``error`` ended the turn on the first route and reported it as
+        a stop the router could not classify (live 2026-11-18).
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class BadRequestError(Exception):
+            status_code = 400
+
+        exc = BadRequestError(
+            "litellm.BadRequestError: OpenAIException - "
+            '{"error":{"message":"Encrypted function output content could '
+            'not be decrypted or decoded.","type":"upstream_error",'
+            '"param":"","code":null}}'
+        )
+        exc.failed_deployment_id = "10199ae0"
+        request = {
+            "model": "default-chat",
+            "input": [
+                {
+                    "type": "agent_message",
+                    "content": [
+                        {
+                            "type": "encrypted_content",
+                            "encrypted_content": "gAAAA-signed",
+                        }
+                    ],
+                }
+            ],
+            "stream": True,
+        }
+
+        self.assertTrue(hooks._is_encrypted_replay_refused_error(exc))
+        self.assertFalse(hooks._is_request_body_size_rejection_error(exc))
+        self.assertEqual(
+            hooks._trace_exception(exc)["reason"], "encrypted-replay-refused"
+        )
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exc),
+            hooks._RECOVERY_POLICY_ERROR,
+        )
+        self.assertEqual(
+            hooks._recovery_diagnostic(exc)["kind"], "encrypted_replay_refused"
+        )
+        # The turn advances through the siblings inside the attempt; the policy
+        # stays ``error`` so the poll does not replay the same ciphertext for
+        # the whole recovery window once every candidate has refused it.
+        self.assertTrue(hooks._is_priority_deployment_failover_error(exc))
+        self.assertTrue(
+            hooks._is_request_scoped_priority_deployment_failover_error(
+                exc,
+                request,
+            )
+        )
+        self.assertTrue(
+            hooks._is_streaming_error_fallback_eligible(exc, request)
+        )
+
+    def test_the_explanation_openai_appends_is_the_same_refusal(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+
+        class BadRequestError(Exception):
+            status_code = 400
+
+        exc = BadRequestError(
+            "OpenAIException - Encrypted function output content could not be "
+            "decrypted or decoded. This error occurs when load balancing "
+            "Responses API across deployments with different API keys. "
+            "Encrypted content is tied to the organization that created it "
+            "and cannot be decrypted by other organizations."
+        )
+
+        self.assertTrue(hooks._is_encrypted_replay_refused_error(exc))
+        self.assertEqual(
+            hooks._trace_exception(exc)["reason"], "encrypted-replay-refused"
+        )
+
+    def test_a_body_read_failure_is_what_a_fallback_round_can_act_on(self) -> None:
+        """A cut body has to name its route, or no round can move past it.
+
+        The stream wrapper resets the selected-route marker while it unwinds, so
+        the read error that started the 2026-11-18 recovery poll carried a null
+        ``failed_deployment_id``.  Every round then selected the same deployment
+        and replayed identical bytes behind keepalives.  The class has to be
+        failover-eligible as well: the fallback round refuses to dispatch for an
+        exception no predicate owns.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+
+        class ReadError(Exception):
+            pass
+
+        exc = ReadError(
+            "response payload is not completed: <transferencodingerror: 400, "
+            "message='not enough data to satisfy transfer length header.'>"
+        )
+        exc.failed_deployment_id = "c52c205f"
+        request = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+        }
+
+        self.assertTrue(hooks._is_route_cut_stream_error(exc))
+        self.assertTrue(hooks._is_priority_deployment_failover_error(exc))
+        self.assertTrue(
+            hooks._is_streaming_error_fallback_eligible(exc, request)
+        )
+
+    async def test_a_cut_body_names_the_route_before_the_failover_decides(self) -> None:
+        """A body read failure never passes through LiteLLM's callbacks.
+
+        The wrapper that consumes the stream resets the selected-route marker
+        as it unwinds, so the exception reaches this module with no
+        ``failed_deployment_id``.  This path is the one place that still holds
+        the marker; without naming the route here the fallback excludes nothing
+        and every recovery round re-selects the upstream that cut the turn.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = sys.modules["young_router.proxy.streaming"]
+        original_fallback = streaming_module._stream_streaming_error_fallback
+        self.addCleanup(
+            setattr,
+            streaming_module,
+            "_stream_streaming_error_fallback",
+            original_fallback,
+        )
+        seen: list[tuple] = []
+
+        async def stop_after_inspecting(_request_data, exception):
+            seen.append((exception.failed_deployment_id,))
+            raise AssertionError("stop the generator here")
+            yield None
+
+        streaming_module._stream_streaming_error_fallback = stop_after_inspecting
+
+        class ReadError(Exception):
+            pass
+
+        exc = ReadError(
+            "response payload is not completed: <transferencodingerror: 400, "
+            "message='not enough data to satisfy transfer length header.'>"
+        )
+        hooks._remember_selected_deployment(
+            {
+                "model_info": {"id": "c52c205f", "order": 0.1},
+                "litellm_params": {
+                    "api_base": "https://route.test/v1",
+                    "model": "vendor-chat",
+                },
+            }
+        )
+        request = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+        }
+
+        # The generator turns the fallback's failure into a terminal event for
+        # this stream, so it consumes the AssertionError instead of raising it.
+        # What matters is what the fallback was handed.
+        async for _chunk in hooks._yield_streaming_error_fallback_or_raise(
+            request,
+            exc,
+        ):
+            pass
+
+        self.assertEqual(seen[0][0], "c52c205f")
+        self.assertEqual(
+            hooks._trace_exception(exc)["reason"], "upstream-truncated-stream"
+        )
+
+
+class RouteRecoverySeedTests(HookTestCase):
+    """A recovery window needs a round that can actually run.
+
+    Every round replays the seed exception through the same fallback that just
+    declined it.  When the seed is not dispatchable the round ends in
+    milliseconds without contacting an upstream, and the loop below it waits out
+    the whole recovery budget emitting keepalives -- the client sees a turn that
+    never answers.
+    """
+
+    async def test_a_seed_no_round_can_dispatch_ends_the_turn(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._SLOW_FAILURE_RECOVERY_SECONDS_ENV, "60")
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "600")
+
+        exception = RuntimeError("invalid request")
+        exception.status_code = 400
+        token = hooks._CURRENT_ATTEMPT_STARTED_AT.set(
+            hooks.time.monotonic() - 61
+        )
+        self.addCleanup(hooks._CURRENT_ATTEMPT_STARTED_AT.reset, token)
+        request = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+        }
+
+        self.assertEqual(
+            hooks._recovery_policy_for_exception(exception),
+            hooks._RECOVERY_POLICY_COOLDOWN,
+        )
+        self.assertFalse(
+            hooks._is_streaming_error_fallback_eligible(exception, request)
+        )
+
+        chunks = []
+        with self.assertRaises(RuntimeError):
+            async for chunk in hooks._stream_route_recovery_poll(
+                request,
+                exception,
+            ):
+                chunks.append(chunk)
+        self.assertEqual(chunks, [])
+
+    def test_a_recovery_stream_is_not_handed_out_for_an_inert_seed(self) -> None:
+        hooks, _proxy_server = load_hook_module()
+        self.set_env(hooks._SLOW_FAILURE_RECOVERY_SECONDS_ENV, "60")
+
+        exception = RuntimeError("invalid request")
+        exception.status_code = 400
+        token = hooks._CURRENT_ATTEMPT_STARTED_AT.set(
+            hooks.time.monotonic() - 61
+        )
+        self.addCleanup(hooks._CURRENT_ATTEMPT_STARTED_AT.reset, token)
+        request = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+        }
+
+        self.assertTrue(hooks._is_route_recovery_poll_error(exception))
+        self.assertFalse(
+            hooks._should_return_route_recovery_stream(exception, request)
+        )
+
+    async def test_a_cut_body_seed_opens_a_window_that_can_dispatch(self) -> None:
+        """The guard must not close the window for a seed a round can replay."""
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = sys.modules["young_router.proxy.streaming"]
+        self.set_env(hooks._RECOVERY_MAX_SECONDS_ENV, "600")
+        attempts: list[int] = []
+        original_native_attempt = (
+            streaming_module._stream_native_route_recovery_poll_attempt
+        )
+        original_attempt = streaming_module._stream_route_recovery_poll_attempt
+        self.addCleanup(
+            setattr,
+            streaming_module,
+            "_stream_native_route_recovery_poll_attempt",
+            original_native_attempt,
+        )
+        self.addCleanup(
+            setattr,
+            streaming_module,
+            "_stream_route_recovery_poll_attempt",
+            original_attempt,
+        )
+
+        async def answering_attempt(
+            _request_data,
+            _exception,
+            *,
+            attempt,
+            deadline=None,
+        ):
+            attempts.append(attempt)
+            yield {"type": "response.completed", "response": {"id": "resp-recovered"}}
+
+        streaming_module._stream_native_route_recovery_poll_attempt = (
+            answering_attempt
+        )
+        streaming_module._stream_route_recovery_poll_attempt = answering_attempt
+
+        class ReadError(Exception):
+            pass
+
+        exception = ReadError(
+            "response payload is not completed: <transferencodingerror: 400>"
+        )
+        exception.failed_deployment_id = "c52c205f"
+        request = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+        }
+
+        chunks = [
+            chunk
+            async for chunk in hooks._stream_route_recovery_poll(
+                request,
+                exception,
+            )
+        ]
+
+        self.assertTrue(attempts)
+        self.assertEqual(chunks[-1]["type"], "response.completed")
 
 
 class RouteRecoveryKeepaliveWaitTests(HookTestCase):

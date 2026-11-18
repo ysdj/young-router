@@ -66,7 +66,12 @@ export function dismissTopPresentation(): void {
   stack[stack.length - 1]?.dismiss();
 }
 
-const FOCUSABLE = "button, input, select, textarea, [tabindex]:not([tabindex='-1'])";
+const FOCUSABLE = "button, input, select, textarea, a[href], [tabindex]";
+
+function focusableControls(container: HTMLElement): HTMLElement[] {
+  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE))
+    .filter((element) => element.tabIndex >= 0 && !element.matches(":disabled, [aria-disabled='true']"));
+}
 
 /**
  * Keep Tab inside one element while it is the topmost layer.
@@ -82,7 +87,7 @@ const FOCUSABLE = "button, input, select, textarea, [tabindex]:not([tabindex='-1
  */
 export function trapWithin(container: HTMLElement, fallback?: HTMLElement | null): (event: KeyboardEvent) => void {
   return (event: KeyboardEvent): void => {
-    const controls = Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((element) => !element.hasAttribute("disabled"));
+    const controls = focusableControls(container);
     const first = controls[0] ?? fallback ?? null;
     const last = controls[controls.length - 1] ?? fallback ?? null;
     const active = document.activeElement;
@@ -95,4 +100,9 @@ export function trapWithin(container: HTMLElement, fallback?: HTMLElement | null
       first.focus();
     }
   };
+}
+
+/** Focus the first usable control in a newly presented layer. */
+export function focusFirstWithin(container: HTMLElement): void {
+  (focusableControls(container)[0] ?? container).focus();
 }

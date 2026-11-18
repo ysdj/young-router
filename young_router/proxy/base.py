@@ -40,6 +40,7 @@ _STREAM_ERROR_FALLBACK_METADATA_KEY = "streaming_error_fallback_attempted"
 _DSH_VISION_ROUTER_ATTEMPTED_METADATA_KEY = "dsh_vision_router_attempted"
 _ROUTE_RECOVERY_POLL_METADATA_KEY = "route_recovery_poll_attempt"
 _REQUEST_BODY_SIZE_REJECTED_METADATA_KEY = "request_body_size_rejected"
+_ENCRYPTED_REPLAY_STRIPPED_METADATA_KEY = "encrypted_replay_stripped"
 _REQUEST_BODY_SIZE_REJECTED_STATUS_CODE = 413
 _STREAM_IDLE_TIMEOUT_METADATA_KEY = "stream_idle_timeout_triggered"
 _STREAM_START_TIMEOUT_METADATA_KEY = "stream_start_timeout_triggered"

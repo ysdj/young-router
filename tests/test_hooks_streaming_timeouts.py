@@ -2017,6 +2017,83 @@ class HookStreamingTimeoutTests(HookTestCase):
             0.7,
         )
 
+    async def test_a_heavy_replay_keeps_its_idle_cap_after_the_local_announcement(
+        self,
+    ) -> None:
+        """The announced ``response.created`` must not shrink the heavy budget.
+
+        LiteLLM emits ``response.created`` locally before the upstream starts
+        prefilling, so the first real wait is measured against the idle cap
+        while ``saw_chunk`` is already true.  Live 2026-11-18: a request
+        replaying 261,000 tokens announced at 13 s, the station prefilled for
+        minutes, and the 120 s idle cap parked it mid-prefill -- every retry
+        met the same cap on a different route, so the thread never finished a
+        turn.
+        """
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._STALL_TIMEOUT_SECONDS_ENV, "0.05")
+        self.set_env(hooks._REQUEST_TIMEOUT_SECONDS_ENV, "0")
+        self.set_env(hooks._HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS_ENV, "0.6")
+        self.set_env(hooks._HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV, "1024")
+
+        heavy_request = {
+            "model": "default-chat",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "x" * 4096}],
+                }
+            ],
+            "stream": True,
+        }
+        ordinary_request = {
+            "model": "default-chat",
+            "input": [{"role": "user", "content": "continue"}],
+            "stream": True,
+        }
+
+        self.assertEqual(
+            hooks._stream_idle_timeout_seconds_for_request(heavy_request),
+            0.6,
+        )
+        self.assertEqual(
+            hooks._stream_idle_timeout_seconds_for_request(ordinary_request),
+            0.05,
+        )
+
+        async def announces_then_prefills():
+            yield {"type": "response.created", "response": {"id": "resp-heavy"}}
+            await asyncio.sleep(0.2)
+            yield {"type": "response.output_text.delta", "delta": "done"}
+
+        chunks = [
+            chunk
+            async for chunk in hooks._stream_with_idle_timeout(
+                announces_then_prefills(),
+                heavy_request,
+            )
+        ]
+        self.assertEqual(
+            [chunk["type"] for chunk in chunks],
+            ["response.created", "response.output_text.delta"],
+        )
+
+        # The ordinary request still stops on the same upstream shape.
+        with self.assertRaises(TimeoutError) as captured:
+            [
+                chunk
+                async for chunk in hooks._stream_with_idle_timeout(
+                    announces_then_prefills(),
+                    ordinary_request,
+                )
+            ]
+        self.assertEqual(
+            getattr(captured.exception, "body", {}).get("reason"),
+            "stream_idle_timeout",
+        )
+
     def test_request_replay_payload_bytes_is_cached_in_existing_metadata(self) -> None:
         hooks, _ = load_hook_module()
         request = {

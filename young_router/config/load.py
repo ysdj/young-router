@@ -377,7 +377,12 @@ def _model_to_editor(
     }
     # The app's automatic order starts at 0: a value the entry states nowhere
     # takes the same first slot a new model or a renumbered group uses.
-    order = _string_value(params.get("order") if params.get("order") is not None else 0).strip() or "0"
+    # The number a person set lives on ``model_info.order``; ``litellm_params``
+    # carries the integer tier LiteLLM compares (see ``dump._litellm_order_tier``).
+    order_value = model_info.get("order")
+    if order_value is None or str(order_value).strip() == "":
+        order_value = params.get("order") if params.get("order") is not None else 0
+    order = _string_value(order_value).strip() or "0"
     manual_order = _string_value(model_info.get(MENU_MANUAL_ORDER_KEY)).strip() or order
     order_mode = _string_value(model_info.get(MENU_ORDER_MODE_KEY)).strip() or "manual"
     catalog_mode = _string_value(model_info.get(MENU_RELAY_CATALOG_MODE_KEY)).strip() or "independent"

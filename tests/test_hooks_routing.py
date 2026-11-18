@@ -177,10 +177,14 @@ class HookRoutingTests(HookTestCase):
         self.assertEqual(hooks._recovery_policy_for_exception(rejected), "recovery_cooldown")
         self.assertEqual(hooks._recovery_diagnostic(rejected)["kind"], "authentication")
         self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(network))
-        # A body that was already flowing is not this route's absence, so it
-        # still only waits: parking it would take a healthy route out of the
-        # pool for a drop another attempt may survive.
-        self.assertFalse(hooks._should_count_deployment_failure_for_cooldown(dropped_body))
+        # A body that was already flowing still keeps the network policy for the
+        # turn -- another attempt may resume it -- but it counts as this route's
+        # failure, and the ordinary threshold is what parks a route: one drop
+        # leaves it in the pool, two park it for the window.  Cooling only on a
+        # repeat is what stops a route that cuts every long answer from being
+        # selected first forever (live 2026-11-18: 15 of 20 attempts failed on
+        # one route and no cooldown was ever recorded).
+        self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(dropped_body))
         # The default now counts a rate limit against the route's cooldown, so
         # two consecutive refusals park it exactly as a 5xx does.
         self.assertTrue(hooks._should_count_deployment_failure_for_cooldown(rate_limit))
@@ -1815,15 +1819,25 @@ class HookRoutingTests(HookTestCase):
 
         dropped_routes = deployments("cut")
         dropped = request_kwargs("cut")
-        error = RuntimeError(
-            "InternalServerError: OpenAIException - Server disconnected"
-        )
-        error.status_code = 500
-        hooks._mark_exception_for_deployment_failover(error, dropped)
-        filtered = await hook.async_filter_deployments(
-            "default-chat", dropped_routes, messages=None, request_kwargs={}
-        )
-        self.assertEqual(filtered, dropped_routes)
+        # A body that was cut counts as this route's failure, but it keeps the
+        # network policy, so one drop still only waits: the ordinary threshold
+        # (two) is what parks a route.  That is the "cool on repeat" rule --
+        # one blip leaves the pool untouched, while a route that cuts turn
+        # after turn stops being selected first.
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "2")
+        for attempt in range(2):
+            error = RuntimeError(
+                "InternalServerError: OpenAIException - Server disconnected"
+            )
+            error.status_code = 500
+            hooks._mark_exception_for_deployment_failover(error, dropped)
+            filtered = await hook.async_filter_deployments(
+                "default-chat", dropped_routes, messages=None, request_kwargs={}
+            )
+            if attempt == 0:
+                self.assertEqual(filtered, dropped_routes)
+            else:
+                self.assertEqual(filtered, [dropped_routes[1]])
         self.assertNotIn("_excluded_deployment_ids", dropped)
 
     def test_network_connectivity_error_is_retryable_but_not_hard_deployment_failure(self) -> None:

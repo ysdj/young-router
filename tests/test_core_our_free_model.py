@@ -588,7 +588,7 @@ class OurFreeModelProviderTests(unittest.TestCase):
         directory, domain, _config = self._domain()
         with directory:
             provider = domain.dispatch(
-                "service_provider.add", {"kind": "our_free_model_login"}
+                "service_provider.add", {"kind": "our_free_model_login", "models": []}
             )["providers"][0]
             summary = domain.dispatch(
                 "model.import_service_catalog",
@@ -604,6 +604,10 @@ class OurFreeModelProviderTests(unittest.TestCase):
                 self.assertEqual(model["upstream_model"], entry["id"])
                 self.assertEqual(model["api_key_name"], our_free_model.API_KEY_NAME)
                 self.assertTrue(model["provider_key_id"])
+            self.assertEqual(
+                [{"index": index, "id": model["editor_id"]} for index, model in enumerate(models)],
+                summary["added_rows"],
+            )
 
     def test_a_pick_does_not_pay_for_a_second_full_catalog_refresh(self) -> None:
         """The picker was painted by a read, so the write must not repeat it.

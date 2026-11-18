@@ -1376,6 +1376,21 @@ async def _stream_route_recovery_poll(
     ignore_local_constraints = bool(
         request_data.pop("_route_recovery_ignore_local_constraints", False)
     )
+    if not _routing_module._is_streaming_error_fallback_eligible(
+        exception,
+        request_data,
+    ):
+        # Every round below is a dispatch through the same fallback that just
+        # refused this exception, so no round can change the outcome.  Opening
+        # the window anyway is keepalives with no attempt behind them: the
+        # client waits out the whole recovery budget for a stop that was
+        # already final.  Hand the failure back to the caller instead, where the
+        # terminal sentence for its cause is built.
+        _trace_module._request_route_trace(
+            "route_recovery_poll_not_actionable", request_data,
+            exception=_routing_module._trace_exception(exception),
+        )
+        raise exception
     recovery_state_key = _streaming_module._route_recovery_state_upsert(
         request_data,
         exception,
@@ -1715,6 +1730,42 @@ async def _stream_route_recovery_poll(
                         exception=_routing_module._trace_exception(poll_exception),
                     )
                     raise
+                if (
+                    (
+                        _routing_module._is_route_cut_stream_error(poll_exception)
+                        or _routing_module._is_upstream_body_read_failure(poll_exception)
+                    )
+                    and not _routing_module._is_network_recovery_exception(
+                        poll_exception
+                    )
+                ):
+                    # The round's own stream body failed while it was being read,
+                    # so the exception names no route: the wrapper that consumed
+                    # it resets the selected-route marker as it unwinds.  The
+                    # round's box is still set here, and this is the only place
+                    # left that can attribute the cut.  Unattributed, the same
+                    # deployment is selected for every later round and the poll
+                    # replays identical bytes until the client gives up (live
+                    # 2026-11-18: 213 rounds in 17 minutes, each failing in
+                    # milliseconds).
+                    _routing_module._mark_exception_for_deployment_failover(
+                        poll_exception,
+                        request_data,
+                    )
+                if _routing_module._strip_unreadable_encrypted_replay(
+                    request_data,
+                    poll_exception,
+                ):
+                    # Every round has been resending ciphertext no route can
+                    # read.  The reporter above already dropped it from the
+                    # list this request carries, so the next round replays a
+                    # history any candidate can serve instead of the same 400.
+                    _trace_module._request_route_trace(
+                        "route_recovery_poll_encrypted_replay_stripped", request_data,
+                        poll_attempt=attempt,
+                        elapsed_seconds=round(time.monotonic() - started_at_monotonic, 3),
+                        exception=_routing_module._trace_exception(poll_exception),
+                    )
                 if _routing_module._is_thinking_replay_contract_error(poll_exception):
                     _routing_module._sync_failed_deployment_exclusions(
                         request_data,

@@ -3287,6 +3287,60 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         self.assertEqual("upstream_stream_truncated", chunk["error"]["code"])
         self.assertNotIn("could not classify", chunk["error"]["message"])
 
+    def test_a_history_no_route_can_decrypt_states_its_cause(self) -> None:
+        """The station's encrypted-history envelope must not read as unclassified.
+
+        ``encrypted_content`` is bound to the organization that minted it, so a
+        route's "could not be decrypted" answer is about this history at that
+        route.  Falling through to the unclassified stop reported a stop the
+        router had never named, and the client could not tell it apart from a
+        transport failure it should reconnect over.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+
+        class BadRequestError(Exception):
+            pass
+
+        exception = BadRequestError(
+            "litellm.BadRequestError: OpenAIException - "
+            '{"error":{"message":"Encrypted function output content could '
+            'not be decrypted or decoded.","type":"upstream_error",'
+            '"param":"","code":null}}'
+        )
+        exception.status_code = 400
+        request_data = {
+            "model": "gpt-6.2-astra",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+        }
+
+        event = streaming_module._synthesized_failed_response_event(
+            request_data,
+            exception,
+        )
+        payload = event if isinstance(event, dict) else json.loads(event.data or "{}")
+        error = payload["response"]["error"]
+
+        self.assertEqual("server_error", error["type"])
+        self.assertEqual("encrypted_replay_unreadable", error["code"])
+        self.assertIn("encrypted", error["message"])
+        self.assertIn("gpt-6.2-astra", error["message"])
+        self.assertNotIn("could not classify", error["message"])
+        self.assertTrue(getattr(event, "_young_router_terminal_failure", False))
+
+        chunk = streaming_module._synthesized_native_stream_error_chunk(
+            {
+                "model": "gpt-6.2-astra",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+            exception,
+        )
+        self.assertEqual("encrypted_replay_unreadable", chunk["error"]["code"])
+        self.assertIn("encrypted", chunk["error"]["message"])
+
     def test_a_refused_route_credential_reaches_the_client_as_a_sentence(self) -> None:
         """A message function may never return a policy constant.
 
