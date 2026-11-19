@@ -159,6 +159,38 @@ def with_inserted_thinking_blocks(request_kwargs: Any) -> Optional[Dict[str, Any
     return repaired
 
 
+def _body_thinking_summary(messages: Any) -> Dict[str, int]:
+    """What the body holds, so the trace can say what the repair changed.
+
+    The endpoint's rule is about tool turns, and a thread's history is written
+    by several clients, so "how many tool turns and how many of them carry
+    thinking" is the only useful account of a body that was refused for it.
+    """
+
+    summary = {
+        "assistant_messages": 0,
+        "tool_turns": 0,
+        "tool_turns_without_thinking": 0,
+    }
+    if not isinstance(messages, list):
+        return summary
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role") or "").lower() != "assistant":
+            continue
+        summary["assistant_messages"] += 1
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        if not any(_block_is_tool_call(block) for block in content):
+            continue
+        summary["tool_turns"] += 1
+        if not any(_block_is_thinking(block) for block in content):
+            summary["tool_turns_without_thinking"] += 1
+    return summary
+
+
 def _requirement_cache_key(request_kwargs: Any) -> Optional[str]:
     """The session and route a learned repair belongs to."""
 
@@ -315,6 +347,7 @@ async def call_with_thinking_block_repair(call: Any, kwargs: dict) -> Any:
             model_group=_request_context_module._request_model_group(retry_kwargs),
             deployment_id=_routing_module._deployment_id_from_request(retry_kwargs),
             route_key=_routing_module._deployment_route_key_from_request(retry_kwargs),
+            body=_body_thinking_summary(retry_kwargs.get("messages")),
             exception=_routing_module._trace_exception(exc),
         )
         kwargs.clear()
@@ -330,6 +363,7 @@ async def call_with_thinking_block_repair(call: Any, kwargs: dict) -> Any:
                 model_group=_request_context_module._request_model_group(kwargs),
                 deployment_id=_routing_module._deployment_id_from_request(kwargs),
                 route_key=_routing_module._deployment_route_key_from_request(kwargs),
+                body=_body_thinking_summary(kwargs.get("messages")),
                 exception=_routing_module._trace_exception(retry_exc),
             )
             raise
