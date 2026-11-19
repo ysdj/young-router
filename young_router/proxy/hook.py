@@ -221,6 +221,13 @@ class YoungRouterHook(CustomLogger):
         terminal_failure = None
         if isinstance(kwargs, dict):
             terminal_failure = kwargs.pop(_TERMINAL_FAILURE_REQUEST_KEY, None)
+        if terminal_failure is None:
+            # This callback receives a copy of the request that never carried
+            # the flag above; the turn's verdict is held under its request
+            # identifiers so that both copies can find it.
+            terminal_failure = _routing_module._take_terminal_failure_for_request(
+                kwargs
+            )
         if terminal_failure is not None:
             previous_exception = kwargs.get("exception")
             if not isinstance(previous_exception, Exception):

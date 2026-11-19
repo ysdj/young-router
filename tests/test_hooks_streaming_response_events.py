@@ -4610,3 +4610,42 @@ class StreamNoProgressWatchdogTests(HookTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TerminalFailureHandoffTests(HookTestCase):
+    async def test_the_terminal_verdict_is_found_by_the_logging_copy(self) -> None:
+        """A failure has to reach the callback that decides it was a success.
+
+        Live 2026-11-19 09:18: the turn ended in a ``response.failed`` this
+        proxy built for route ``a4603dc0``, and 0.4 s later the same request id
+        logged ``deployment_success`` and cleared the cooldown just set -- so
+        the client's retry went back to the route that cut the turn.  The flag
+        on the streaming request copy never reached the callback, which is
+        handed a different dict; the verdict has to travel under the turn's
+        request identifiers.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+        hooks._TERMINAL_FAILURE_REQUESTS.clear()
+        self.addCleanup(hooks._TERMINAL_FAILURE_REQUESTS.clear)
+
+        exception = RuntimeError("upstream ended the turn without a terminal event")
+        exception.status_code = 502
+        request_data = {
+            "model": "gpt-6.2-astra",
+            "input": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "litellm_params": {"litellm_call_id": "call-terminal-1"},
+        }
+        streaming_module._synthesized_failed_response_event(
+            request_data, exception, after_visible_output=True
+        )
+
+        logging_copy = {
+            "model": "gpt-6.2-astra",
+            "litellm_params": {"litellm_call_id": "call-terminal-1", "model": "openai/gpt"},
+        }
+        self.assertIs(
+            exception, hooks._take_terminal_failure_for_request(logging_copy)
+        )

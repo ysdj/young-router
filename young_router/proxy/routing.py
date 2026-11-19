@@ -5374,6 +5374,80 @@ def _lease_identifier_candidates(request_kwargs: Optional[dict]) -> list[str]:
     return names
 
 
+# A turn's client-visible outcome has to reach LiteLLM's success callback, and
+# the request is a different dict there than the one the stream was wrapped
+# with: a flag set on one copy is simply absent from the other.  Live
+# 2026-11-19 09:18 the gateway logged ``deployment_success`` 0.4 s after it had
+# logged this attempt's terminal failure, and cleared the cooldown the failure
+# had just set, so the client's retry went straight back to the route that cut
+# the turn.  The verdict is therefore kept where both copies can name it: keyed
+# by the turn's own request identifiers, the same names the concurrency lease
+# uses, and consumed by whichever callback logs the outcome.
+_TERMINAL_FAILURE_REQUESTS: dict[str, tuple[float, BaseException]] = {}
+_TERMINAL_FAILURE_REQUESTS_LOCK = threading.Lock()
+_TERMINAL_FAILURE_REQUEST_TTL_SECONDS = 6 * 60 * 60.0
+_TERMINAL_FAILURE_REQUEST_LIMIT = 4096
+
+
+def _prune_terminal_failure_requests(now: float) -> None:
+    expired = [
+        name
+        for name, (marked_at, _failure) in _TERMINAL_FAILURE_REQUESTS.items()
+        if now - marked_at > _TERMINAL_FAILURE_REQUEST_TTL_SECONDS
+    ]
+    for name in expired:
+        _TERMINAL_FAILURE_REQUESTS.pop(name, None)
+    # A callback that never came must not grow this without bound; the oldest
+    # entries are the ones no live turn can still be waiting on.
+    if len(_TERMINAL_FAILURE_REQUESTS) > _TERMINAL_FAILURE_REQUEST_LIMIT:
+        oldest = sorted(
+            _TERMINAL_FAILURE_REQUESTS.items(), key=lambda item: item[1][0]
+        )
+        for name, _entry in oldest[: len(_TERMINAL_FAILURE_REQUESTS) - _TERMINAL_FAILURE_REQUEST_LIMIT]:
+            _TERMINAL_FAILURE_REQUESTS.pop(name, None)
+
+
+def _mark_terminal_failure_for_request(
+    request_kwargs: Optional[dict],
+    exception: Optional[BaseException],
+) -> None:
+    """Record that this turn's client-visible terminal is a failure.
+
+    Written on every name the turn is known by, because the copy that logs the
+    outcome may carry only one of them.
+    """
+
+    if exception is None:
+        return
+    names = _lease_identifier_candidates(request_kwargs)
+    if not names:
+        return
+    now = time.time()
+    with _TERMINAL_FAILURE_REQUESTS_LOCK:
+        _prune_terminal_failure_requests(now)
+        for name in names:
+            _TERMINAL_FAILURE_REQUESTS[name] = (now, exception)
+
+
+def _take_terminal_failure_for_request(
+    request_kwargs: Optional[dict],
+) -> Optional[BaseException]:
+    """Consume this turn's recorded terminal failure, if it has one."""
+
+    names = _lease_identifier_candidates(request_kwargs)
+    if not names:
+        return None
+    now = time.time()
+    with _TERMINAL_FAILURE_REQUESTS_LOCK:
+        _prune_terminal_failure_requests(now)
+        found: Optional[BaseException] = None
+        for name in names:
+            entry = _TERMINAL_FAILURE_REQUESTS.pop(name, None)
+            if entry is not None and found is None:
+                found = entry[1]
+    return found
+
+
 def _attempt_lease_key(request_kwargs: Optional[dict], deployment: Any) -> Optional[str]:
     """The lease naming one turn's hold on one deployment, or ``None``."""
 

@@ -2740,6 +2740,12 @@ def _synthesized_failed_response_event(
             request_data.setdefault("exception", exception)
         except Exception:
             pass
+    # The dict above only reaches a callback handed *this* copy, and LiteLLM
+    # hands the logging callback a different one.  Live 2026-11-19 09:18 the
+    # gateway still recorded a success and cleared the cooldown 0.4 s after the
+    # failure.  The verdict therefore also goes to the shared registry, keyed by
+    # the turn's request identifiers.
+    _routing_module._mark_terminal_failure_for_request(request_data, exception)
     return terminal_event
 
 def _synthesized_native_stream_error_chunk(
@@ -5039,6 +5045,10 @@ async def _stream_streaming_error_fallback_round(
     # keep its route parked).
     if isinstance(request_data, dict):
         failed_attempt = request_data.pop(_TERMINAL_FAILURE_REQUEST_KEY, None)
+        if failed_attempt is None:
+            # The previous attempt may have logged its verdict through the
+            # shared registry instead of this dict; a new round starts clean.
+            _routing_module._take_terminal_failure_for_request(request_data)
         if failed_attempt is not None and request_data.get("exception") is failed_attempt:
             request_data.pop("exception", None)
         if _routing_module._is_local_stream_start_timeout_error(exception):

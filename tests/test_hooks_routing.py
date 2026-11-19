@@ -1209,6 +1209,88 @@ class HookRoutingTests(HookTestCase):
         )
         self.assertEqual(filtered, deployments)
 
+    def test_a_terminal_failure_is_found_by_the_copy_that_logs_it(self) -> None:
+        """The verdict has to survive LiteLLM's copies of one turn.
+
+        Live 2026-11-19 09:18 on the gateway: the turn's stream ended in a
+        ``response.failed`` this proxy built for route ``a4603dc0``, and 0.4 s
+        later the same request id logged ``deployment_success`` and cleared the
+        cooldown.  The flag lived on the streaming copy of the request; the
+        callback was handed a different dict that never had it.
+        """
+
+        hooks, _ = load_hook_module()
+        hooks._TERMINAL_FAILURE_REQUESTS.clear()
+        self.addCleanup(hooks._TERMINAL_FAILURE_REQUESTS.clear)
+        failure = RuntimeError("upstream ended the turn")
+        streaming_copy = {"litellm_params": {"litellm_call_id": "call-hedge-1"}}
+        logging_copy = {
+            "model": "default-chat",
+            "litellm_params": {"litellm_call_id": "call-hedge-1", "model": "openai/x"},
+        }
+
+        hooks._mark_terminal_failure_for_request(streaming_copy, failure)
+
+        self.assertIs(
+            failure, hooks._take_terminal_failure_for_request(logging_copy)
+        )
+        # Consumed once: the next turn with this id is judged on its own.
+        self.assertIsNone(hooks._take_terminal_failure_for_request(logging_copy))
+        self.assertIsNone(hooks._take_terminal_failure_for_request({"model": "x"}))
+
+    async def test_logged_success_does_not_clear_a_route_this_turn_cut(self) -> None:
+        hooks, _ = load_hook_module()
+        hooks._TERMINAL_FAILURE_REQUESTS.clear()
+        self.addCleanup(hooks._TERMINAL_FAILURE_REQUESTS.clear)
+        hook = hooks.YoungRouterHook()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        deployments = [
+            {"litellm_params": {"model": "openai/x-cheap"}, "model_info": {"id": "x-cheap"}},
+            {"litellm_params": {"model": "openai/x-pro"}, "model_info": {"id": "x-pro"}},
+        ]
+        error = RuntimeError("stream ended without its own terminal event")
+        error.status_code = 503
+        hooks._mark_exception_for_deployment_failover(
+            error,
+            {
+                "model": "default-chat",
+                "litellm_params": {"model": "openai/x-cheap", "litellm_call_id": "call-cut-1"},
+                "model_info": {"id": "x-cheap"},
+            },
+        )
+        filtered = await hook.async_filter_deployments(
+            "default-chat",
+            deployments,
+            messages=None,
+            request_kwargs={},
+        )
+        self.assertEqual(filtered, [deployments[1]])
+        # The stream copy names the failure; the callback only sees the ids.
+        hooks._mark_terminal_failure_for_request(
+            {"litellm_params": {"litellm_call_id": "call-cut-1"}}, error
+        )
+
+        await hook.async_log_success_event(
+            {
+                "model": "default-chat",
+                "litellm_params": {"model": "openai/x-cheap", "litellm_call_id": "call-cut-1"},
+                "model_info": {"id": "x-cheap"},
+                "stream": True,
+            },
+            {"ok": True},
+            datetime.now(timezone.utc),
+            datetime.now(timezone.utc),
+        )
+
+        filtered = await hook.async_filter_deployments(
+            "default-chat",
+            deployments,
+            messages=None,
+            request_kwargs={},
+        )
+        self.assertEqual(filtered, [deployments[1]])
+
     async def test_stream_start_does_not_clear_deployment_cooldown(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()
