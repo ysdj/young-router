@@ -9418,8 +9418,9 @@ def _upstream_request_field_rejected_message(model_group: str) -> str:
     return (
         "The upstream rejected this request's field layout for "
         f"{model_group}, and no other candidate route accepted it. This is a "
-        "payload-compatibility defect in the route, not something about the "
-        "conversation; the route trace records the field the upstream named."
+        "payload-compatibility defect in the request this router sent, not "
+        "something about the conversation; the route trace records the field "
+        "the upstream named."
     )
 
 
