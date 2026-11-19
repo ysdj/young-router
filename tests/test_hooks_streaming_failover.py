@@ -4849,3 +4849,70 @@ class ResponsesReasoningElisionStreamTests(HookTestCase):
         # Replaying here would duplicate the part the reader already has.
         self.assertEqual([], calls)
         self.assertIn("partial", [chunk.get("delta") for chunk in chunks])
+
+
+class ReplayLadderTests(HookTestCase):
+    """A refused thread walks down the ladder, keeping as much history as fits."""
+
+    def _request(self, thread: str) -> dict:
+        items: list = [{"type": "additional_tools"}]
+        for turn in range(6):
+            items.append({"role": "user", "type": "message", "content": f"task {turn}"})
+            for k in range(200):
+                items.append({"type": "function_call", "call_id": f"c{turn}_{k}"})
+                items.append(
+                    {"type": "function_call_output", "call_id": f"c{turn}_{k}"}
+                )
+        return {
+            "model": "gpt-6.2-astra",
+            "input": items,
+            "client_metadata": {"thread_id": thread},
+        }
+
+    def test_reasoning_goes_first_then_whole_turns(self) -> None:
+        hooks, _ = load_hook_module()
+        hooks._REPLAY_TOO_LARGE_SESSIONS.clear()
+        self.addCleanup(hooks._REPLAY_TOO_LARGE_SESSIONS.clear)
+        request = self._request("thread-ladder")
+
+        # Nothing happens until a route has refused this thread.
+        self.assertIsNone(hooks._session_replay_shortening(request))
+        self.assertIsNone(
+            hooks._with_session_replay_reasoning_elided(request)
+        )
+
+        hooks._remember_replay_too_large(request)
+        self.assertEqual((8, None), hooks._session_replay_shortening(request))
+
+        shortened: list = []
+        for _stage in range(3):
+            hooks._remember_replay_too_large(request)
+            out = hooks._with_session_replay_reasoning_elided(request)
+            shortened.append(len(out["input"]))
+
+        # 2000, 1200, 700 -- each the largest tail of whole turns that fits.
+        self.assertEqual([1606, 804, 403], shortened)
+        out = hooks._with_session_replay_reasoning_elided(request)
+        # Every cut happened at a user message: the first one (the task) and
+        # the newest turns survive, and no call is separated from its output.
+        roles = [item.get("role") for item in out["input"] if item.get("type") == "message"]
+        self.assertEqual("user", roles[0])
+        calls = [item["call_id"] for item in out["input"] if item.get("type") == "function_call"]
+        outputs = [
+            item["call_id"]
+            for item in out["input"]
+            if item.get("type") == "function_call_output"
+        ]
+        self.assertEqual(calls, outputs)
+
+    def test_another_thread_is_not_shortened(self) -> None:
+        hooks, _ = load_hook_module()
+        hooks._REPLAY_TOO_LARGE_SESSIONS.clear()
+        self.addCleanup(hooks._REPLAY_TOO_LARGE_SESSIONS.clear)
+        refused = self._request("thread-refused")
+        hooks._remember_replay_too_large(refused)
+
+        other = self._request("thread-untouched")
+
+        self.assertIsNone(hooks._session_replay_shortening(other))
+        self.assertIsNone(hooks._with_session_replay_reasoning_elided(other))

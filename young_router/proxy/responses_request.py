@@ -1295,8 +1295,32 @@ def _responses_input_with_elided_reasoning_items(
     dropped = len(reasoning_indexes) - keep
     if dropped <= 0:
         return None
-    elided = set(reasoning_indexes[:dropped])
+    # An encrypted reasoning item is a signed link in the replay: the client
+    # sends it back for the upstream to verify, and a body with one of them
+    # missing is not the history that was refused.  Signed items are therefore
+    # never dropped -- the oldest *unsigned* ones are, which on a Codex replay
+    # is the whole difference, since its reasoning arrives as plain text.
+    # The newest ``keep`` reasoning items always stay; the drop candidates are
+    # the ones before them, and only the unsigned of those go.
+    elided = set()
+    for index in reasoning_indexes[: len(reasoning_indexes) - keep]:
+        if len(elided) >= dropped:
+            break
+        if _responses_reasoning_item_is_signed(items[index]):
+            continue
+        elided.add(index)
+    if not elided:
+        return None
     return [item for index, item in enumerate(items) if index not in elided]
+
+
+def _responses_reasoning_item_is_signed(item: Any) -> bool:
+    """Whether this reasoning item carries upstream-verified ciphertext."""
+
+    if not isinstance(item, dict):
+        return False
+    value = item.get("encrypted_content")
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _responses_input_with_elided_history(
@@ -1328,9 +1352,15 @@ def _responses_input_with_elided_history(
     prefix = items[: first_user + 1]
     if len(prefix) >= target_items:
         return None
-    # Walk the turn boundaries from newest to oldest and take the first one that
-    # fits; the tail from a boundary onwards is one contiguous block.
-    for start in reversed(user_indexes[1:]):
+    # Walk the turn boundaries oldest-first and take the first tail that fits:
+    # candidates only shrink as the start moves newer, so the first one under
+    # the target keeps the most history.  (Walking newest-first would keep a
+    # single turn whenever that alone fit, throwing away context for nothing.)
+    for start in user_indexes[1:]:
+        if any(_responses_reasoning_item_is_signed(item) for item in items[first_user + 1 : start]):
+            # A signed reasoning item inside the dropped range would leave a
+            # chain the upstream cannot verify; cut later, or not at all.
+            continue
         candidate = prefix + items[start:]
         if len(candidate) <= target_items:
             return candidate
