@@ -1686,6 +1686,15 @@ _RESPONSES_STREAM_INCOMPLETE_TYPES = {
     "response.incomplete",
     "response.cancelled",
 }
+# A turn whose client-visible terminal is a failure this proxy built.  The
+# upstream call it rode ended with an ordinary HTTP body close, so LiteLLM's own
+# success callback reports a delivered answer -- success row, cleared cooldown,
+# fresh affinity -- for a turn the reader was told failed.  The request carries
+# the failure under this key so that callback can read the outcome instead of
+# the transport: observed live 2026-11-19, a route that cut a Codex turn ended
+# as a success row and had the cooldown it had just earned cleared 0.4 s later,
+# so the next replay selected the same cutting route.
+_TERMINAL_FAILURE_REQUEST_KEY = "_young_router_terminal_failure"
 _RESPONSES_STREAM_INCOMPLETE_STATUSES = {"failed", "incomplete", "cancelled"}
 # OpenAI's Hosted Responses tools use the first two wire types. OpenRouter's
 # server-side web-search tool is provider-native but still participates in the

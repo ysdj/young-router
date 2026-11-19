@@ -2937,6 +2937,84 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         self.assertIn("field layout", error["message"])
         self.assertNotIn("ended without", error["message"].lower())
 
+    def test_an_upstream_incomplete_terminal_names_what_the_route_did(self) -> None:
+        """The route ended the turn; it did not fall silent.
+
+        Live 2026-11-19 on the gateway (Codex thread 01a1ee1d): the route sent a
+        ``response.incomplete`` terminal after the reasoning phase, so no answer
+        existed.  The synthesized stop took the generic recovery branch and told
+        the reader the route had "stopped answering while this turn was
+        streaming", which it never did -- and the trace could not say which
+        terminal ended the turn either.  This shape names the outcome, keeps the
+        one action that continues the turn, and leaves a named upstream error to
+        the classifiers that own it.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+        responses_request = {
+            "model": "gpt-6.2-astra",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+        }
+        incomplete = streaming_module._responses_incomplete_stream_exception(
+            "terminal response event before response.completed",
+            buffer=[
+                {
+                    "type": "response.incomplete",
+                    "response": {
+                        "status": "incomplete",
+                        "incomplete_details": {"reason": "max_output_tokens"},
+                    },
+                }
+            ],
+            request_data=responses_request,
+        )
+
+        self.assertTrue(hooks._is_upstream_incomplete_terminal_error(incomplete))
+        self.assertEqual(
+            hooks._trace_exception(incomplete)["reason"],
+            "upstream-incomplete-terminal",
+        )
+
+        event = streaming_module._synthesized_failed_response_event(
+            dict(responses_request),
+            incomplete,
+            after_visible_output=True,
+        )
+        payload = event if isinstance(event, dict) else json.loads(event.data or "{}")
+        error = payload["response"]["error"]
+
+        self.assertEqual("server_error", error["type"])
+        self.assertEqual("upstream_stream_incomplete", error["code"])
+        self.assertIn("incomplete response of its own", error["message"])
+        self.assertNotIn("stopped answering", error["message"])
+        # Pi retries on this phrase, and a resend is what continues the turn.
+        self.assertIn("ended without", error["message"].lower())
+
+        # An upstream terminal that names its own error is not this shape: the
+        # classifiers for that cause (quota, content policy, rate limit) own it,
+        # and a generic sentence here would replace a readable refusal.
+        named = streaming_module._responses_incomplete_stream_exception(
+            "terminal response event before response.completed",
+            buffer=[
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "status": "failed",
+                        "error": {
+                            "type": "upstream_error",
+                            "code": "rate_limit_exceeded",
+                            "message": "slow down",
+                        },
+                    },
+                }
+            ],
+            request_data=responses_request,
+        )
+        self.assertFalse(hooks._is_upstream_incomplete_terminal_error(named))
+
     def test_an_incomplete_tool_history_stop_names_the_new_task(self) -> None:
         """The stop a cut tool record produces must name the only fix.
 

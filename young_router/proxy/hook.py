@@ -32,6 +32,7 @@ from .base import (
     Dict,
     List,
     Optional,
+    _TERMINAL_FAILURE_REQUEST_KEY,
     _without_internal_request_keys,
     asyncio,
 )
@@ -205,12 +206,41 @@ class YoungRouterHook(CustomLogger):
         # ``_is_local_control_plane_read``.
         if _routing_module._is_local_control_plane_read(kwargs):
             return
-        _trace_codex_fast_tier_result(kwargs, response_obj, outcome="success")
         streaming = kwargs.get("stream") is True
         completed_stream = (
             "async_complete_streaming_response" in kwargs
             or _streaming_module._responses_stream_chunk_is_completed(response_obj)
         )
+        # The transport said this turn's HTTP body closed normally -- but the
+        # body was a ``response.failed`` this proxy built, because the route cut
+        # the turn.  Reading that as a delivered answer logged a success row and
+        # cleared the cooldown the same attempt had just earned, 0.4 s later
+        # (live 2026-11-19 on the gateway), so the next replay selected the
+        # route that had just cut one.  The terminal that ends the client's turn
+        # decides this, not the shape of the close.
+        terminal_failure = None
+        if isinstance(kwargs, dict):
+            terminal_failure = kwargs.pop(_TERMINAL_FAILURE_REQUEST_KEY, None)
+        if terminal_failure is not None:
+            previous_exception = kwargs.get("exception")
+            if not isinstance(previous_exception, Exception):
+                kwargs["exception"] = terminal_failure
+            try:
+                _trace_codex_fast_tier_result(
+                    kwargs, response_obj, outcome="failure"
+                )
+                _state_module._append_recent_request(
+                    _routing_module._request_log_record(
+                        "failure", kwargs, response_obj, start_time, end_time
+                    )
+                )
+            finally:
+                if previous_exception is None:
+                    kwargs.pop("exception", None)
+                else:
+                    kwargs["exception"] = previous_exception
+            return
+        _trace_codex_fast_tier_result(kwargs, response_obj, outcome="success")
         # A completed stream is a delivered answer: it clears the route's
         # failure count exactly like a whole-body success.  Only the stream's
         # start is not evidence -- the attempt may still fail after the first

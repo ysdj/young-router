@@ -6422,6 +6422,12 @@ def _trace_exception(exception: Exception) -> dict[str, Any]:
         reason = "upstream-model-not-found"
     elif _is_deployment_compatible_bad_request_error(exception):
         reason = "upstream-compatible-bad-request"
+    elif _is_upstream_incomplete_terminal_error(exception):
+        # The route ended the turn with its own terminal and no error attached.
+        # Naming it here separates "the upstream stated an outcome" from a body
+        # that simply stopped, which is a different cause to triage and a
+        # different sentence for the reader.
+        reason = "upstream-incomplete-terminal"
     elif getattr(exception, "stream_incomplete", False) and status_code is None:
         reason = "upstream-stream-incomplete"
     elif _is_route_cut_stream_error(exception):
@@ -7192,6 +7198,45 @@ def _is_route_cut_stream_error(exception: Exception) -> bool:
         # This worker closed the body, not the upstream.
         return False
     return not _is_network_recovery_exception(exception)
+
+
+def _is_upstream_incomplete_terminal_error(exception: Exception) -> bool:
+    """Whether the route *ended* the turn with its own incomplete terminal.
+
+    A Responses upstream can stop a stream at ``response.incomplete`` or
+    ``response.cancelled`` instead of ``response.completed``.  That is not a
+    silent route: the upstream stated an outcome, and
+    ``streaming._responses_incomplete_stream_exception`` keeps that frame in
+    ``exception.body["terminal_event"]``.
+
+    The distinction matters twice.  Read as a generic retryable cut, the turn
+    reached the reader as "the route stopped answering while streaming", which
+    is false -- it answered, with an outcome.  Read as an ordinary failed frame,
+    it could overwrite a *named* upstream refusal (an error frame carries its
+    own type/code/message, and the classifiers for those already exist), so a
+    terminal that names an error is deliberately not this shape.
+    """
+
+    if not (
+        getattr(exception, "responses_stream_incomplete", False)
+        or getattr(exception, "stream_incomplete", False)
+    ):
+        return False
+    body = getattr(exception, "body", None)
+    terminal = body.get("terminal_event") if isinstance(body, dict) else None
+    if not isinstance(terminal, dict):
+        return False
+    if (
+        terminal.get("error_code")
+        or terminal.get("error_type")
+        or terminal.get("error_message")
+    ):
+        return False
+    return (
+        terminal.get("type") in {"response.incomplete", "response.cancelled"}
+        or str(terminal.get("status") or "").strip().lower()
+        in {"incomplete", "cancelled"}
+    )
 
 
 def _is_ssl_verification_error(exception: Exception) -> bool:

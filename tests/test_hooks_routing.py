@@ -1311,6 +1311,72 @@ class HookRoutingTests(HookTestCase):
         )
         self.assertFalse(hooks._DEPLOYMENT_COOLDOWNS)
 
+    async def test_a_synthesized_failed_terminal_is_not_a_delivered_answer(self) -> None:
+        """The close is normal; the outcome is not.
+
+        Live 2026-11-19 on the gateway: a route ended a Codex turn with a
+        terminal this proxy had to synthesize (the upstream stopped at
+        ``response.incomplete`` after only reasoning).  The HTTP body then
+        closed normally, so the success callback logged a delivered answer and
+        cleared the cooldown the same attempt had earned 0.4 s earlier.  The
+        next replay therefore selected the route that had just cut one, and the
+        request log showed 成功 for a turn the reader had been told failed.
+        """
+
+        hooks, _ = load_hook_module()
+        hook = hooks.YoungRouterHook()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "1")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        request_kwargs = {
+            "model": "default-chat",
+            "stream": True,
+            "litellm_params": {"model": "openai/gpt-x"},
+            "model_info": {"id": "cut-route"},
+        }
+        error = RuntimeError("temporary upstream failure")
+        error.status_code = 503
+        hooks._mark_exception_for_deployment_failover(error, request_kwargs)
+        self.assertTrue(hooks._DEPLOYMENT_COOLDOWNS)
+
+        incomplete = hooks._responses_incomplete_stream_exception(
+            "terminal response event before response.completed",
+            buffer=[
+                {
+                    "type": "response.incomplete",
+                    "response": {"status": "incomplete"},
+                }
+            ],
+            request_data=request_kwargs,
+        )
+        failed = hooks._synthesized_failed_response_event(
+            request_kwargs, incomplete
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "recent-requests.jsonl"
+            self.set_log_env(log_path)
+            now = datetime.now(timezone.utc)
+            await hook.async_log_success_event(
+                {
+                    **request_kwargs,
+                    "async_complete_streaming_response": {"type": "response"},
+                },
+                failed,
+                now,
+                now,
+            )
+            rows = [
+                json.loads(line)
+                for line in runtime_store.read_records(log_path, limit=100)
+                if line.strip()
+            ]
+
+        self.assertTrue(hooks._DEPLOYMENT_COOLDOWNS)
+        self.assertEqual([row.get("status") for row in rows], ["failure"])
+        self.assertEqual(
+            rows[0]["error"]["reason"], "upstream-incomplete-terminal"
+        )
+
     async def test_deployment_cooldown_does_not_count_sanitized_wrapper(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()

@@ -47,6 +47,7 @@ from .base import (
     _STREAM_FALLBACK_METADATA_KEY,
     _STREAM_IDLE_TIMEOUT_METADATA_KEY,
     _STREAM_START_TIMEOUT_METADATA_KEY,
+    _TERMINAL_FAILURE_REQUEST_KEY,
     _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
     _normalize_response_completed_event_usage,
@@ -2469,6 +2470,26 @@ def _synthesized_failed_response_event(
         # vocabulary, not ours: an unrepresentable refusal here is a turn the
         # client reconnects over.  The sentence still names our cause.
         error_code = "context_length_exceeded"
+    elif _routing_module._is_upstream_incomplete_terminal_error(exception):
+        # The route did not fall silent: it *ended* the turn with its own
+        # terminal event and no error -- a Responses stream that reports the
+        # response incomplete (or cancelled) before ``response.completed``.
+        # The generic sentence this shape used to reach said the route
+        # "stopped answering while this turn was streaming", which is not what
+        # happened: the upstream answered with an outcome, and the reader is
+        # owed that outcome plus the one action that continues the turn.
+        model_group = (
+            _responses_execution_module._request_model_group(request_data)
+            or request_data.get("model")
+            or "the requested model"
+        )
+        message = (
+            f"{model_group} ended this turn with an incomplete response of its "
+            "own, so the stream ended without a terminal response event. Send "
+            "the message again and it will continue on a working route."
+        )
+        error_type = "server_error"
+        error_code = "upstream_stream_incomplete"
     elif _routing_module._is_route_cut_stream_error(exception):
         # The upstream started this answer and then closed the body before its
         # own framing finished.  The turn is over -- the bytes the client
@@ -2707,6 +2728,17 @@ def _synthesized_failed_response_event(
         terminal_event._young_router_terminal_failure = True  # type: ignore[attr-defined]
     except Exception:
         pass
+    if isinstance(request_data, dict):
+        # This turn's client-visible outcome is a failure this proxy built, and
+        # the upstream call underneath it closes normally.  LiteLLM's success
+        # callback is what would otherwise record a delivered answer -- a
+        # success row and a cleared cooldown for a route that just cut the turn.
+        # The callback reads both keys instead of the transport.
+        try:
+            request_data[_TERMINAL_FAILURE_REQUEST_KEY] = exception
+            request_data.setdefault("exception", exception)
+        except Exception:
+            pass
     return terminal_event
 
 def _synthesized_native_stream_error_chunk(
@@ -4737,6 +4769,14 @@ async def _stream_streaming_error_fallback_round(
     allow_repeated_attempt: bool = False,
     route_recovery_poll: bool = False,
 ) -> AsyncIterator[Any]:
+    # This round is a new attempt in the same client turn: from here the turn's
+    # outcome is whatever this route delivers.  The marker the failed attempt
+    # left would otherwise make a successful replay log itself as a failure (and
+    # keep its route parked).
+    if isinstance(request_data, dict):
+        failed_attempt = request_data.pop(_TERMINAL_FAILURE_REQUEST_KEY, None)
+        if failed_attempt is not None and request_data.get("exception") is failed_attempt:
+            request_data.pop("exception", None)
     selected_deployment_box = _CURRENT_SELECTED_DEPLOYMENT_BOX.get()
     if not isinstance(selected_deployment_box, dict):
         selected_deployment_box = {}
@@ -4768,6 +4808,14 @@ async def _stream_streaming_error_fallback_round(
                     failure_request,
                     failed_exception,
                 )
+                # The turn's client-visible terminal is a failure, and the
+                # caller's request object is the one LiteLLM's own callbacks
+                # hold.  Without this the replay's HTTP close still reads as a
+                # delivered answer -- success row, cleared cooldown.
+                if isinstance(request_data, dict):
+                    request_data[_TERMINAL_FAILURE_REQUEST_KEY] = (
+                        failed_exception
+                    )
                 return
         if not _responses_output_module._response_is_async_iterable(
             fallback_response
@@ -6350,6 +6398,15 @@ async def _yield_guarded_original_stream(
             "responses_active_stream_failed_terminal_event", request_data,
             exception=_routing_module._trace_exception(failure),
             reason=reason,
+            # The frame that ended this turn is the only evidence of *why* the
+            # route cut it, and it used to live only inside a truncated
+            # exception text.  Name it here: type, status, the reason the
+            # upstream stated, and any error it attached.
+            terminal=(
+                _responses_incomplete_terminal_summary(event_tail[-1])
+                if event_tail
+                else None
+            ),
             already_yielded_visible_output=True,
         )
         # This terminal is only built once the stream has already delivered part
