@@ -1299,6 +1299,99 @@ def _responses_input_with_elided_reasoning_items(
     return [item for index, item in enumerate(items) if index not in elided]
 
 
+def _responses_input_with_elided_history(
+    items: list,
+    *,
+    target_items: int,
+) -> Optional[list]:
+    """Drop whole old turns until the replay fits ``target_items``.
+
+    A turn starts at a user message, so cutting there can never separate a
+    ``function_call`` from its output -- both live inside the same turn.  What
+    is never dropped is the context the thread is defined by: everything before
+    the first user message (the developer instructions and the tool registry)
+    and the first user message itself, which is the task being carried out.
+    """
+
+    if not isinstance(items, list) or target_items <= 0:
+        return None
+    if len(items) <= target_items:
+        return None
+    user_indexes = [
+        index
+        for index, item in enumerate(items)
+        if isinstance(item, dict) and str(item.get("role") or "").lower() == "user"
+    ]
+    if len(user_indexes) < 2:
+        return None
+    first_user = user_indexes[0]
+    prefix = items[: first_user + 1]
+    if len(prefix) >= target_items:
+        return None
+    # Walk the turn boundaries from newest to oldest and take the first one that
+    # fits; the tail from a boundary onwards is one contiguous block.
+    for start in reversed(user_indexes[1:]):
+        candidate = prefix + items[start:]
+        if len(candidate) <= target_items:
+            return candidate
+    return None
+
+
+def _with_session_replay_reasoning_elided(
+    request_kwargs: Optional[dict],
+) -> Optional[dict]:
+    """Shorten a replay for a thread a route already refused as too large.
+
+    The refusal happened on an earlier turn of this same thread, so nothing is
+    guessed here either: the proxy is applying what a route has already said
+    about this exact history.  Returns None when the thread is not marked, the
+    switch is off, or there is nothing old enough to drop.
+    """
+
+    if not isinstance(request_kwargs, dict):
+        return None
+    if not _routing_module._replay_reasoning_elision_enabled():
+        return None
+    shortening = _routing_module._session_replay_shortening(request_kwargs)
+    if shortening is None:
+        return None
+    keep, target_items = shortening
+    items = request_kwargs.get("input")
+    if not isinstance(items, list):
+        return None
+    elided_items = _responses_input_with_elided_reasoning_items(items, keep=keep)
+    if target_items is not None:
+        shortened_history = _responses_input_with_elided_history(
+            elided_items if elided_items is not None else items,
+            target_items=target_items,
+        )
+        if shortened_history is not None:
+            elided_items = shortened_history
+    if elided_items is None:
+        return None
+    modified_kwargs = request_kwargs.copy()
+    modified_kwargs["input"] = elided_items
+    # The dispatch budget is derived from the serialized weight, and that value
+    # is cached on the request: a body this much smaller must not be charged
+    # for the bytes it no longer carries.
+    for container_key in ("litellm_metadata", "metadata"):
+        container = modified_kwargs.get(container_key)
+        if not isinstance(container, dict):
+            continue
+        updated_container = container.copy()
+        updated_container.pop(_REPLAY_PAYLOAD_BYTES_METADATA_KEY, None)
+        modified_kwargs[container_key] = updated_container
+    _trace_module._request_route_trace(
+        "responses_replay_reasoning_elision_applied",
+        modified_kwargs,
+        before_items=len(items),
+        after_items=len(elided_items),
+        kept_reasoning=keep,
+        target_items=target_items,
+    )
+    return modified_kwargs
+
+
 def _responses_reasoning_elision_fallback_kwargs(
     exception: Exception,
     request_kwargs: Optional[dict],
@@ -2637,6 +2730,7 @@ def _codex_declared_tool_names(request_kwargs: Optional[dict]) -> set[str]:
 # that need them, and ``young_router.proxy.codex_contract`` prepends the Codex
 # contract steps (tool registry, descendant barrier, progress-message rule).
 _CODEX_REQUEST_INSTRUCTION_STEPS = (
+    _with_session_replay_reasoning_elided,
     _with_empty_tool_controls_removed,
     _with_codex_compaction_controls,
     _with_responses_native_extra_body,

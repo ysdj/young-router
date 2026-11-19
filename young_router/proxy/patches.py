@@ -22,6 +22,7 @@ from . import responses_output as _responses_output_module
 from . import web_search_native as _web_search_native_module
 from . import reasoning as _reasoning_module
 from . import reasoning_replay as _reasoning_replay_module
+from . import thinking_block_replay as _thinking_block_replay_module
 from . import thinking_signature_replay as _thinking_signature_replay_module
 from . import routing as _routing_module
 from . import streaming as _streaming_module
@@ -2007,6 +2008,18 @@ def _install_generic_deployment_failover_patch() -> None:
         # proof the route is the right one for that history.
         wrapped_original_function = (
             _thinking_signature_replay_module.wrap_deployment_function(
+                wrapped_original_function
+            )
+        )
+        # A route in thinking mode refuses a history whose tool turns carry no
+        # thinking block, and a thread served by more than one route always has
+        # some: the other route answered through a wire without that block.
+        # Live 2026-11-19 one Claude Code session had 92 assistant turns, 85
+        # with thinking, and every replay of it was refused in under two
+        # seconds until the missing blocks were restored.  Outside the
+        # signature repair: that one rewrites signatures, this one adds blocks.
+        wrapped_original_function = (
+            _thinking_block_replay_module.wrap_deployment_function(
                 wrapped_original_function
             )
         )

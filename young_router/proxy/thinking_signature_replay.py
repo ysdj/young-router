@@ -212,6 +212,14 @@ def _retry_is_worth_it(exception: Exception) -> bool:
     status_code = _routing_module._exception_status_code(exception)
     if status_code in (413, 429):
         return False
+    from . import thinking_block_replay as _thinking_block_replay_module
+
+    if _thinking_block_replay_module.is_thinking_required_error(exception):
+        # A route in thinking mode refused the *history*: some tool turn
+        # carries no thinking block.  Blanking signatures does not add one, so
+        # that repair would spend a second identical body and record the
+        # session as having declined a rewrite it never needed.
+        return False
     return True
 
 

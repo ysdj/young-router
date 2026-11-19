@@ -5528,6 +5528,97 @@ def _prune_terminal_failure_requests(now: float) -> None:
             _TERMINAL_FAILURE_REQUESTS.pop(name, None)
 
 
+# A thread that a route refused as too large keeps being refused, because the
+# client replays the same history on every turn: live 2026-11-19 the Codex
+# thread grew to 4,123 items (620 of them reasoning), the relay ended a turn
+# with ``response.incomplete`` ``max_messages``, and the retry the client was
+# told to send carried the identical body -- the inline retry cannot help a
+# turn that had already shown text, so the reconnect hit the same cap.  The
+# refusal is therefore remembered against the *thread*, and the next turn's
+# replay is shortened before it is dispatched.  Each further refusal walks one
+# step down ``_REPLAY_TOO_LARGE_SHORTENING_LADDER`` below, so the history
+# converges on something the route accepts instead of failing once per turn.
+_REPLAY_TOO_LARGE_SESSIONS: dict[str, tuple[float, int]] = {}
+# The ladder a refused thread walks down, one refusal per turn.  Reasoning
+# items are the first thing to go because they are what the client re-synthesises
+# (620 of them in the live thread), but they are not enough on their own: that
+# same replay carried ~3,350 function-call items, so the later stages cut whole
+# old turns.  Nothing is applied until a route has actually refused.
+_REPLAY_TOO_LARGE_SHORTENING_LADDER: tuple[tuple[int, Optional[int]], ...] = (
+    (_REPLAY_REASONING_ELISION_KEEP_DEFAULT, None),
+    (0, 2000),
+    (0, 1200),
+    (0, 700),
+)
+_REPLAY_TOO_LARGE_SESSIONS_LOCK = threading.Lock()
+_REPLAY_TOO_LARGE_SESSION_TTL_SECONDS = 2 * 60 * 60.0
+_REPLAY_TOO_LARGE_SESSION_LIMIT = 2048
+
+
+def _replay_session_key(request_kwargs: Optional[dict]) -> Optional[str]:
+    """This turn's thread, as the client names it, plus its model group."""
+
+    session = _trace_session_context(request_kwargs or {})
+    session_id = session.get("id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None
+    model_group = _responses_execution_module._request_model_group(request_kwargs)
+    return f"{session_id.strip()}|{model_group or ''}"
+
+
+def _remember_replay_too_large(request_kwargs: Optional[dict]) -> None:
+    """Remember that this thread's replay was refused as too large.
+
+    Called where the refusal is *known* -- the terminal event that names an item
+    cap, whether or not this turn can still retry -- so the client's own next
+    turn is the one that gets the shorter history.
+    """
+
+    key = _replay_session_key(request_kwargs)
+    if key is None:
+        return
+    now = time.time()
+    with _REPLAY_TOO_LARGE_SESSIONS_LOCK:
+        for name, (marked_at, _keep) in list(_REPLAY_TOO_LARGE_SESSIONS.items()):
+            if now - marked_at > _REPLAY_TOO_LARGE_SESSION_TTL_SECONDS:
+                _REPLAY_TOO_LARGE_SESSIONS.pop(name, None)
+        previous_stage = _REPLAY_TOO_LARGE_SESSIONS.get(key, (now, -1))[1]
+        stage = min(previous_stage + 1, len(_REPLAY_TOO_LARGE_SHORTENING_LADDER) - 1)
+        _REPLAY_TOO_LARGE_SESSIONS[key] = (now, stage)
+        if len(_REPLAY_TOO_LARGE_SESSIONS) > _REPLAY_TOO_LARGE_SESSION_LIMIT:
+            oldest = sorted(
+                _REPLAY_TOO_LARGE_SESSIONS.items(), key=lambda item: item[1][0]
+            )
+            for name, _entry in oldest[
+                : len(_REPLAY_TOO_LARGE_SESSIONS)
+                - _REPLAY_TOO_LARGE_SESSION_LIMIT
+            ]:
+                _REPLAY_TOO_LARGE_SESSIONS.pop(name, None)
+
+
+def _session_replay_shortening(
+    request_kwargs: Optional[dict],
+) -> Optional[tuple[int, Optional[int]]]:
+    """How much of this thread's replay to keep: (reasoning items, total cap).
+
+    ``None`` means the thread has not been refused, so nothing is removed.
+    """
+
+    key = _replay_session_key(request_kwargs)
+    if key is None:
+        return None
+    with _REPLAY_TOO_LARGE_SESSIONS_LOCK:
+        entry = _REPLAY_TOO_LARGE_SESSIONS.get(key)
+        if entry is None:
+            return None
+        marked_at, stage = entry
+        if time.time() - marked_at > _REPLAY_TOO_LARGE_SESSION_TTL_SECONDS:
+            _REPLAY_TOO_LARGE_SESSIONS.pop(key, None)
+            return None
+        stage = max(0, min(int(stage), len(_REPLAY_TOO_LARGE_SHORTENING_LADDER) - 1))
+        return _REPLAY_TOO_LARGE_SHORTENING_LADDER[stage]
+
+
 # One turn may elide its replay's old reasoning only once, and the turn is
 # represented by several dict copies (the fallback round rebuilds the payload
 # from the original body), so the flag has to live where the id does -- the same

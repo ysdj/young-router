@@ -3129,6 +3129,10 @@ def _responses_incomplete_stream_exception(
             # verdict from "this conversation no longer fits" -- Codex must not
             # be told to compact over a cap that a shorter replay clears.
             setattr(exception, _UPSTREAM_INPUT_ITEM_LIMIT_ATTR, True)
+            # Whatever this turn can still do about it, the thread is now known
+            # to be too large for this route -- and the client replays the same
+            # history on its next turn.
+            _routing_module._remember_replay_too_large(request_data)
     except Exception:
         pass
     try:
