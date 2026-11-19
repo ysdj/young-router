@@ -1576,17 +1576,6 @@ _UPSTREAM_DEFERRED_TOOL_LAYOUT_MARKERS = (
     "tools.defer_loading",
     "tools.tool_search",
 )
-# A Messages route in thinking mode refuses a replay whose assistant turns carry
-# no ``thinking`` block.  The block is a field this proxy's own conversion
-# builds (Responses history -> Messages wire), so when the repair that adds it
-# has already been refused once, the verdict is about the body this
-# installation shaped -- not about the route being temporarily unwell, which is
-# what a 503 told the reader on 2026-11-19 while every retry resends it.
-_UPSTREAM_THINKING_REPLAY_MARKERS = (
-    "content[].thinking",
-    "thinking mode must be passed back",
-    "reasoning_content in the thinking mode",
-)
 _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES = {
     "APIConnectionError",
     "APIError",

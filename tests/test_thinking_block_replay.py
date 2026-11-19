@@ -188,15 +188,31 @@ class ThinkingBlockReplayTests(HookTestCase):
 
 
 class ThinkingReplayClassificationTests(HookTestCase):
+    """A refused replay is a 400 about the body, not a transient 503."""
+
     def test_the_refusal_is_a_body_verdict_not_a_temporary_route_failure(self) -> None:
         hooks, _ = load_hook_module()
+        exception = _ThinkingRequiredRefusal()
+        request = {"model": "deepseek-v4.1-flash"}
 
-        self.assertTrue(
-            hooks._is_upstream_request_field_rejected_error(
-                _ThinkingRequiredRefusal()
-            )
+        self.assertTrue(hooks._is_thinking_replay_contract_error(exception))
+
+        sanitized = hooks._sanitized_upstream_route_exception(
+            "deepseek-v4.1-flash", exception, request
         )
-        # An ordinary 400 about the conversation keeps its own branch.
-        other = Exception('litellm.BadRequestError: {"error":{"message":"bad model"}}')
-        other.status_code = 400
-        self.assertFalse(hooks._is_upstream_request_field_rejected_error(other))
+        self.assertEqual(400, sanitized.status_code)
+        self.assertEqual("BadRequestError", type(sanitized).__name__)
+        # The sentence names the cause instead of advertising a retry.
+        self.assertIn("replayed thinking", str(sanitized))
+        self.assertNotIn("temporary", str(sanitized).lower())
+
+    def test_another_route_failure_still_reports_the_service_as_unavailable(self) -> None:
+        hooks, _ = load_hook_module()
+        outage = Exception("litellm.InternalServerError: boom")
+        outage.status_code = 500
+
+        sanitized = hooks._sanitized_upstream_route_exception(
+            "gpt-6.2-astra", outage, {"model": "gpt-6.2-astra"}
+        )
+
+        self.assertEqual(503, sanitized.status_code)

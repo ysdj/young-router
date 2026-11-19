@@ -183,7 +183,6 @@ from .base import (
     _UPSTREAM_TOOL_HISTORY_REJECTION_MARKERS,
     _UPSTREAM_DUPLICATE_TOOL_NAME_MARKERS,
     _UPSTREAM_DEFERRED_TOOL_LAYOUT_MARKERS,
-    _UPSTREAM_THINKING_REPLAY_MARKERS,
     _UPSTREAM_FIELD_REJECTION_MARKERS,
     _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES,
     _UPSTREAM_TEMPORARY_ERROR_MARKERS,
@@ -9848,8 +9847,6 @@ def _is_upstream_request_field_rejected_error(exception: Exception) -> bool:
         return True
     if any(marker in text for marker in _UPSTREAM_DEFERRED_TOOL_LAYOUT_MARKERS):
         return True
-    if any(marker in text for marker in _UPSTREAM_THINKING_REPLAY_MARKERS):
-        return True
     if not any(marker in text for marker in _UPSTREAM_FIELD_REJECTION_MARKERS):
         return False
     return any(
@@ -10040,6 +10037,13 @@ def _sanitized_upstream_route_failure_message(
         # Same rule: only a new task changes this verdict, so a retry tip would
         # send the client back with the identical history.
         return _upstream_tool_history_rejected_message(model_group)
+    if _is_thinking_replay_contract_error(exception):
+        # Every route that could answer this history has been asked, and this
+        # one refused it for reasoning the replay no longer carries.  The
+        # generic tail ("temporary upstream route failure ... try again in a
+        # moment") names a transport fault that does not exist and invites the
+        # identical body -- what the reader saw on 2026-11-19 18:41.
+        return _upstream_thinking_replay_rejected_message(model_group)
     if _is_upstream_request_field_rejected_error(exception):
         # Same rule again, and the one this proxy is most likely to produce
         # itself: a field layout this installation built is refused the same
@@ -10165,11 +10169,17 @@ def _sanitized_upstream_route_exception(
 ) -> Exception:
     message = _sanitized_upstream_route_failure_message(model, exception, request_kwargs)
     model_group = model or _responses_execution_module._request_model_group(request_kwargs) or ""
-    error_cls = getattr(
-        litellm,
-        "ServiceUnavailableError",
-        getattr(litellm, "InternalServerError", RuntimeError),
-    )
+    if _is_thinking_replay_contract_error(exception):
+        # A refusal of this replay is a 400 on the wire that reported it: no
+        # route can answer this history as it stands, and a 503 told clients
+        # to retry the same bytes (live 2026-11-19).
+        error_cls = getattr(litellm, "BadRequestError", RuntimeError)
+    else:
+        error_cls = getattr(
+            litellm,
+            "ServiceUnavailableError",
+            getattr(litellm, "InternalServerError", RuntimeError),
+        )
     try:
         sanitized = error_cls(
             message=message,
@@ -10219,11 +10229,20 @@ def _sanitized_upstream_route_exception(
         except Exception:
             pass
     try:
-        sanitized.status_code = (  # type: ignore[attr-defined]
-            _REQUEST_BODY_SIZE_REJECTED_STATUS_CODE
-            if _request_body_size_rejected(request_kwargs)
-            else _SANITIZED_UPSTREAM_ROUTE_FAILURE_STATUS_CODE
-        )
+        if _is_thinking_replay_contract_error(exception):
+            # The wire that refused this replay said 400.  Forcing the
+            # sanitized 503 onto it told every client the turn had hit a
+            # transient route fault (live 2026-11-19), and a client that
+            # retries a 503 resends the identical history.
+            sanitized.status_code = getattr(  # type: ignore[attr-defined]
+                litellm.BadRequestError, "status_code", 400
+            )
+        else:
+            sanitized.status_code = (  # type: ignore[attr-defined]
+                _REQUEST_BODY_SIZE_REJECTED_STATUS_CODE
+                if _request_body_size_rejected(request_kwargs)
+                else _SANITIZED_UPSTREAM_ROUTE_FAILURE_STATUS_CODE
+            )
     except Exception:
         pass
     for attr in (
