@@ -127,7 +127,19 @@ _HEAVY_REPLAY_STREAM_START_TIMEOUT_DEFAULT_SECONDS = 300.0
 _STREAM_START_TIMEOUT_COOLDOWN_SECONDS_ENV = (
     "YOUNG_ROUTER_STREAM_START_TIMEOUT_COOLDOWN_SECONDS"
 )
-_STREAM_START_TIMEOUT_COOLDOWN_DEFAULT_SECONDS = 1800.0
+_STREAM_START_TIMEOUT_COOLDOWN_DEFAULT_SECONDS = 300.0
+# Whether a streaming attempt that has not produced its first frame starts a
+# second route in parallel and lets the first answer win.  This is a hedge, not
+# a deadline: the first attempt is never abandoned because the delay passed, so
+# a route that legitimately takes a minute to prefill (measured: this gateway's
+# gpt-6.2-astra group p50 15 s, p90 46 s, p99 94 s) still answers.  What the
+# hedge does is stop a *dead* route from holding the turn for its whole budget:
+# live 2026-11-19 one turn spent 300 s on a route that never sent a byte, then
+# 300 s on the next, and the client reconnected before either answered.
+# ``0`` (or ``YOUNG_ROUTER_STREAM_HEDGE_ENABLED=0``) turns it off.
+_STREAM_HEDGE_ENABLED_ENV = "YOUNG_ROUTER_STREAM_HEDGE_ENABLED"
+_STREAM_HEDGE_DELAY_SECONDS_ENV = "YOUNG_ROUTER_STREAM_HEDGE_DELAY_SECONDS"
+_STREAM_HEDGE_DELAY_DEFAULT_SECONDS = 30.0
 # Set on a request once one attempt has spent the heavy-replay first-event
 # budget.  A turn earns that budget once: the delay it exists for is the same
 # prefix on every route, so after one route has had its five minutes the next

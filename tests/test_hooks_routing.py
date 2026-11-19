@@ -1392,6 +1392,10 @@ class HookRoutingTests(HookTestCase):
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "3")
         self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
         self.set_env(hooks._HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV, "10")
+        # The tunable park; its default is the ordinary cooldown, because the
+        # hedge (below) is what stops a dead route from costing the turn.
+        self.assertEqual(hooks._STREAM_START_TIMEOUT_COOLDOWN_DEFAULT_SECONDS, 300.0)
+        self.set_env(hooks._STREAM_START_TIMEOUT_COOLDOWN_SECONDS_ENV, "1800")
         request_kwargs = {
             "model": "default-chat",
             "call_type": "aresponses",
@@ -1424,6 +1428,21 @@ class HookRoutingTests(HookTestCase):
             float(state["cooldown_until"]) - time.time(),
             25 * 60.0,
         )
+
+    def test_the_first_frame_hedge_has_a_default_and_a_switch(self) -> None:
+        """On by default at 30 s, and a user can turn it off either way."""
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._STREAM_HEDGE_ENABLED_ENV, None)
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, None)
+        self.assertEqual(hooks._stream_hedge_delay_seconds(), 30.0)
+        self.set_env(hooks._STREAM_HEDGE_ENABLED_ENV, "0")
+        self.assertEqual(hooks._stream_hedge_delay_seconds(), 0.0)
+        self.set_env(hooks._STREAM_HEDGE_ENABLED_ENV, "1")
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "45")
+        self.assertEqual(hooks._stream_hedge_delay_seconds(), 45.0)
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0")
+        self.assertEqual(hooks._stream_hedge_delay_seconds(), 0.0)
 
     def test_the_heavy_start_budget_is_spent_once_per_turn(self) -> None:
         """The prefix is the same on every route, so its wait is not repeated.

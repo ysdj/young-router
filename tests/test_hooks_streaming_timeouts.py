@@ -2346,3 +2346,190 @@ class HookStreamingTimeoutTests(HookTestCase):
             chat_three_mb,
             places=2,
         )
+
+
+class _HedgeStream:
+    """One fake upstream response: an async iterable with a route marker."""
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+        self.closed = False
+
+    def __aiter__(self):
+        async def generator():
+            for chunk in self._chunks:
+                await asyncio.sleep(0)
+                yield chunk
+        return generator()
+
+    async def aclose(self):
+        self.closed = True
+
+
+class HookStreamingHedgeTests(HookTestCase):
+    def _request(self):
+        return {
+            "model": "default-chat",
+            "call_type": "aresponses",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+            "model_info": {"id": "order1-a", "order": 1},
+            "litellm_params": {"model": "openai/gpt-x"},
+        }
+
+    async def test_a_silent_first_attempt_is_overtaken_by_a_sibling(self) -> None:
+        """The hedge answers while the first route is still silent.
+
+        Live 2026-11-19: a turn spent 300 s on a route that never sent a byte,
+        then 300 s on the next one, and the client reconnected before either
+        answered.  Waiting is not wrong by itself -- this group's healthy turns
+        prefilled for 15-94 s -- so the first attempt is never abandoned; a
+        sibling is simply asked too, and the first frame decides.
+        """
+
+        hooks, proxy_server = load_hook_module()
+        calls = []
+        hedge_stream = _HedgeStream(
+            [
+                {"type": "response.output_text.delta", "delta": "hedge answer"},
+                {"type": "response.completed", "response": {"id": "resp-hedge"}},
+            ]
+        )
+        hedge_stream._young_router_selected_deployment_marker = {
+            "deployment_id": "order1-b",
+            "model_info": {"id": "order1-b", "order": 1},
+        }
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return hedge_stream
+
+        proxy_server.llm_router = FakeRouter()
+        hook = hooks.YoungRouterHook()
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.05")
+
+        async def original_stream():
+            await asyncio.sleep(1.0)
+            yield {"type": "response.output_text.delta", "delta": "slow primary"}
+            yield {"type": "response.completed", "response": {"id": "resp-original"}}
+
+        request_data = self._request()
+        chunks = [
+            chunk
+            async for chunk in hook.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=original_stream(),
+                request_data=request_data,
+            )
+        ]
+
+        deltas = [chunk.get("delta") for chunk in chunks if chunk.get("delta")]
+        self.assertIn("hedge answer", deltas)
+        self.assertNotIn("slow primary", deltas)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("order1-a", calls[0]["_excluded_deployment_ids"])
+        # The turn belongs to the route that actually answered.
+        self.assertEqual(
+            hooks._request_model_info(request_data).get("id"), "order1-b"
+        )
+
+    async def test_a_primary_that_answers_first_never_dispatches_a_hedge(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return _HedgeStream([])
+
+        proxy_server.llm_router = FakeRouter()
+        hook = hooks.YoungRouterHook()
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.05")
+
+        async def original_stream():
+            yield {"type": "response.output_text.delta", "delta": "primary answer"}
+            yield {"type": "response.completed", "response": {"id": "resp-original"}}
+
+        chunks = [
+            chunk
+            async for chunk in hook.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=original_stream(),
+                request_data=self._request(),
+            )
+        ]
+
+        self.assertEqual(calls, [])
+        self.assertIn(
+            "primary answer",
+            [chunk.get("delta") for chunk in chunks if chunk.get("delta")],
+        )
+
+    async def test_the_hedge_switch_turns_the_sibling_dispatch_off(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                return _HedgeStream([])
+
+        proxy_server.llm_router = FakeRouter()
+        hook = hooks.YoungRouterHook()
+        self.set_env(hooks._STREAM_HEDGE_ENABLED_ENV, "0")
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.01")
+
+        async def original_stream():
+            await asyncio.sleep(0.05)
+            yield {"type": "response.output_text.delta", "delta": "primary answer"}
+            yield {"type": "response.completed", "response": {"id": "resp-original"}}
+
+        chunks = [
+            chunk
+            async for chunk in hook.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=original_stream(),
+                request_data=self._request(),
+            )
+        ]
+
+        self.assertEqual(calls, [])
+        self.assertIn(
+            "primary answer",
+            [chunk.get("delta") for chunk in chunks if chunk.get("delta")],
+        )
+
+    async def test_a_failed_hedge_leaves_the_first_attempt_running(self) -> None:
+        hooks, proxy_server = load_hook_module()
+        calls = []
+
+        class FakeRouter:
+            async def aresponses(self, **payload):
+                calls.append(payload)
+                raise RuntimeError("sibling route unavailable")
+
+        proxy_server.llm_router = FakeRouter()
+        hook = hooks.YoungRouterHook()
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.01")
+
+        async def original_stream():
+            await asyncio.sleep(0.05)
+            yield {"type": "response.output_text.delta", "delta": "primary answer"}
+            yield {"type": "response.completed", "response": {"id": "resp-original"}}
+
+        chunks = [
+            chunk
+            async for chunk in hook.async_post_call_streaming_iterator_hook(
+                user_api_key_dict=None,
+                response=original_stream(),
+                request_data=self._request(),
+            )
+        ]
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn(
+            "primary answer",
+            [chunk.get("delta") for chunk in chunks if chunk.get("delta")],
+        )

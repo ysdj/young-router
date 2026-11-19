@@ -3765,6 +3765,255 @@ def _resolved_stream_timeout_seconds(
                 return explicit
     return default_resolver(request_data)
 
+async def _dispatch_stream_hedge(
+    request_data: dict,
+) -> Optional[tuple[Any, dict]]:
+    """Start the same turn on a sibling route, keeping the first attempt alive.
+
+    This is the hedge the first-frame wait uses: a route that has sent nothing
+    looks exactly like a route that is thinking, so the answer is to *also* ask
+    a sibling and let the first frame decide -- never to decide on the first
+    route's behalf.  The sibling is chosen the ordinary way with this attempt's
+    deployment excluded; nothing is marked failed here, because this attempt
+    has not failed.
+    """
+
+    try:
+        from litellm.proxy.proxy_server import llm_router
+    except Exception:
+        return None
+    if llm_router is None:
+        return None
+    method_name = _streaming_error_fallback_method_name(request_data)
+    if method_name is None:
+        return None
+    payload = _build_streaming_error_fallback_payload(
+        request_data,
+        method_name=method_name,
+        allow_repeated_attempt=True,
+    )
+    if payload is None:
+        return None
+    excluded = set(
+        _responses_request_module._request_excluded_deployment_ids(payload)
+    )
+    current_id = _routing_module._deployment_id_from_request(request_data)
+    if current_id:
+        excluded.add(current_id)
+    if not excluded:
+        # Without a route to exclude the "sibling" would be the same deployment,
+        # which is a second paid prefill for this route and not a hedge.
+        return None
+    payload["_excluded_deployment_ids"] = sorted(excluded)
+    # The point of the hedge is the healthiest route, not the next order: a
+    # slow order-0 route is exactly what the hedge is there to overtake.
+    payload.pop("_target_order", None)
+    router_method = getattr(llm_router, method_name, None)
+    if router_method is None:
+        return None
+    _trace_module._request_route_trace(
+        "stream_hedge_start", request_data,
+        excluded_deployment_ids=sorted(excluded),
+    )
+    try:
+        response = await _await_upstream_dispatch(
+            router_method(**_streaming_error_fallback_dispatch_kwargs(payload)),
+            payload,
+            fallback_budget_seconds=_routing_module._stream_start_timeout_seconds_for_request(
+                payload
+            ),
+        )
+    except Exception as exc:
+        _trace_module._request_route_trace(
+            "stream_hedge_error", request_data,
+            exception=_routing_module._trace_exception(exc),
+        )
+        return None
+    return response, payload
+
+
+def _stream_hedge_eligible(request_data: dict) -> bool:
+    if not isinstance(request_data, dict):
+        return False
+    if request_data.get("stream") is not True:
+        return False
+    if not _responses_request_module._request_is_responses_api(request_data):
+        return False
+    if _routing_module._stream_hedge_delay_seconds() <= 0:
+        return False
+    # One hedge belongs to the turn's first attempt.  A fallback or recovery
+    # round is already a second route, and hedging it would pay two more
+    # prefills for the same frame.
+    if _responses_request_module._request_already_attempted_streaming_error_fallback(
+        request_data
+    ):
+        return False
+    metadata = _request_context_module._request_metadata_dict(
+        request_data, "litellm_metadata"
+    ) or {}
+    if metadata.get(_ROUTE_RECOVERY_POLL_METADATA_KEY) is True:
+        return False
+    # A group of one has no sibling to hedge with; asking twice would only pay
+    # this route's prefill twice.
+    return _routing_module._request_group_deployment_count(request_data) != 1
+
+
+async def _await_first_frame(
+    task: "asyncio.Task[Any]",
+    budget: Optional[float],
+) -> Any:
+    if budget is None:
+        return await task
+    return await asyncio.wait_for(task, timeout=budget)
+
+
+async def _settle_task(task: Optional["asyncio.Task[Any]"]) -> None:
+    if task is None or task.done():
+        return
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def _hedged_first_chunk(
+    iterator: Any,
+    request_data: dict,
+    *,
+    start_timeout_seconds: float,
+) -> tuple[Any, Any, Optional[dict]]:
+    """Read the first frame, hedging onto a sibling once the delay passes.
+
+    Returns the iterator the rest of this attempt must read (the first one, or
+    the hedge that won), that first frame, and the hedge's payload when the
+    hedge won -- its route identity is applied to the request there.
+
+    The hedge is dispatched *concurrently* with this attempt: its own dispatch
+    (upload plus the wait for the response head) is the same slow phase, so
+    awaiting it here would stop reading the attempt that may answer first.  A
+    hedge that cannot be dispatched, raises, or ends without a frame is not a
+    turn failure: the first attempt is still running and the caller keeps
+    waiting on it.
+    """
+
+    delay = _routing_module._stream_hedge_delay_seconds()
+    current_deployment_id = _routing_module._deployment_id_from_request(request_data)
+    started_at = time.monotonic()
+
+    def remaining() -> Optional[float]:
+        if start_timeout_seconds <= 0:
+            return None
+        return max(0.0, start_timeout_seconds - (time.monotonic() - started_at))
+
+    primary_task: asyncio.Task[Any] = asyncio.ensure_future(iterator.__anext__())
+    hedge_dispatch_task: Optional[asyncio.Task[Any]] = None
+    hedge_task: Optional[asyncio.Task[Any]] = None
+    hedge_iterator = None
+    hedge_response = None
+    hedge_payload: Optional[dict] = None
+    hedge_handed_over = False
+
+    async def abandon_hedge() -> None:
+        nonlocal hedge_iterator, hedge_payload, hedge_task
+        await _settle_task(hedge_task)
+        if hedge_iterator is not None:
+            await _close_async_iterator_safely(hedge_iterator)
+        if hedge_payload is not None:
+            _routing_module._release_request_concurrency_slots(hedge_payload)
+        hedge_iterator = None
+        hedge_payload = None
+        hedge_task = None
+
+    try:
+        # Phase one: wait the hedge delay (never past this attempt's own first
+        # frame budget) for the attempt that is already running.
+        budget = remaining()
+        first_wait = min(delay, budget) if budget is not None else delay
+        if first_wait > 0:
+            done, _pending = await asyncio.wait({primary_task}, timeout=first_wait)
+            if done:
+                return iterator, primary_task.result(), None
+        hedge_dispatch_task = asyncio.ensure_future(
+            _dispatch_stream_hedge(request_data)
+        )
+        pending: set = {primary_task, hedge_dispatch_task}
+        while True:
+            budget = remaining()
+            if budget is not None and budget <= 0:
+                raise asyncio.TimeoutError()
+            done, _pending = await asyncio.wait(
+                pending,
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=budget,
+            )
+            if not done:
+                raise asyncio.TimeoutError()
+            if primary_task in done:
+                await abandon_hedge()
+                return iterator, primary_task.result(), None
+            if hedge_dispatch_task in done:
+                pending.discard(hedge_dispatch_task)
+                hedge = None
+                try:
+                    hedge = hedge_dispatch_task.result()
+                except Exception as exc:
+                    _trace_module._request_route_trace(
+                        "stream_hedge_error", request_data,
+                        exception=_routing_module._trace_exception(exc),
+                    )
+                if hedge is None:
+                    # Nothing to race with; the first attempt still owns the
+                    # turn and its remaining budget is unchanged.
+                    continue
+                hedge_response, hedge_payload = hedge
+                hedge_iterator = hedge_response.__aiter__()
+                hedge_task = asyncio.ensure_future(hedge_iterator.__anext__())
+                pending.add(hedge_task)
+                continue
+            if hedge_task is not None and hedge_task in done:
+                pending.discard(hedge_task)
+                hedge_error = (
+                    None if hedge_task.cancelled() else hedge_task.exception()
+                )
+                if hedge_error is None:
+                    chunk = hedge_task.result()
+                    marker = _routing_module._selected_deployment_marker_from_response(
+                        hedge_response
+                    )
+                    _routing_module._apply_selected_deployment_marker_to_request(
+                        request_data, marker
+                    )
+                    if isinstance(marker, dict):
+                        # This task's context still names the first attempt; the
+                        # frames that follow belong to the hedge, so the context
+                        # has to say so as well.
+                        _routing_module._remember_selected_deployment(
+                            marker,
+                            surface=str(marker.get("surface") or ""),
+                        )
+                    await _settle_task(primary_task)
+                    await _close_async_iterator_safely(iterator)
+                    hedge_handed_over = True
+                    _trace_module._request_route_trace(
+                        "stream_hedge_won", request_data,
+                        hedge_deployment_id=_routing_module._deployment_id_from_request(
+                            hedge_payload or {}
+                        ),
+                        primary_deployment_id=current_deployment_id,
+                    )
+                    return hedge_iterator, chunk, hedge_payload
+                # The hedge's own failure says nothing about this turn.
+                _trace_module._request_route_trace(
+                    "stream_hedge_error", request_data,
+                    exception=_routing_module._trace_exception(hedge_error),
+                )
+                await abandon_hedge()
+                continue
+    finally:
+        await _settle_task(hedge_dispatch_task)
+        await _settle_task(primary_task)
+        if not hedge_handed_over:
+            await abandon_hedge()
+
+
 async def _stream_with_idle_timeout(
     response: Any,
     request_data: dict,
@@ -3784,6 +4033,7 @@ async def _stream_with_idle_timeout(
     iterator = response.__aiter__()
     chunk_count = max(0, initial_chunk_count)
     saw_chunk = chunk_count > 0
+    hedge_pending = (not saw_chunk) and _stream_hedge_eligible(request_data)
     idle_deadline = (
         time.monotonic() + idle_timeout_seconds
         if saw_chunk and idle_timeout_seconds > 0
@@ -3801,7 +4051,20 @@ async def _stream_with_idle_timeout(
             timeout_seconds = start_timeout_seconds
             effective_timeout = timeout_seconds if timeout_seconds > 0 else None
         try:
-            if effective_timeout is not None:
+            if hedge_pending:
+                hedge_pending = False
+                # The first frame decides between this attempt and the hedge;
+                # the helper owns the delay, the race and the loser's cleanup.
+                iterator, chunk, hedge_payload = await _hedged_first_chunk(
+                    iterator,
+                    request_data,
+                    start_timeout_seconds=start_timeout_seconds,
+                )
+                if hedge_payload is not None:
+                    _routing_module._apply_current_selected_deployment_to_request(
+                        request_data,
+                    )
+            elif effective_timeout is not None:
                 chunk = await asyncio.wait_for(iterator.__anext__(), timeout=effective_timeout)
             else:
                 chunk = await iterator.__anext__()

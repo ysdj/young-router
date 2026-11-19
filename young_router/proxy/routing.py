@@ -154,6 +154,9 @@ from .base import (
     _HEAVY_REPLAY_STREAM_START_DEFAULT_THRESHOLD_BYTES,
     _HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV,
     _START_TIMEOUT_OBSERVED_KEY,
+    _STREAM_HEDGE_DELAY_DEFAULT_SECONDS,
+    _STREAM_HEDGE_DELAY_SECONDS_ENV,
+    _STREAM_HEDGE_ENABLED_ENV,
     _STREAM_START_TIMEOUT_COOLDOWN_DEFAULT_SECONDS,
     _STREAM_START_TIMEOUT_COOLDOWN_SECONDS_ENV,
     _STREAM_ROUTE_EXHAUSTION_RETRY_AFTER_MAX_SECONDS,
@@ -1891,6 +1894,28 @@ def _deployment_cooldown_seconds() -> float:
 
 def _deployment_cooldown_enabled() -> bool:
     return _deployment_cooldown_failure_threshold() > 0 and _deployment_cooldown_seconds() > 0
+
+
+def _stream_hedge_delay_seconds() -> float:
+    """How long the first frame is awaited before a sibling joins the race.
+
+    ``0`` disables the hedge, and so does
+    ``YOUNG_ROUTER_STREAM_HEDGE_ENABLED=0``.  The delay is not a deadline: the
+    first attempt keeps running either way, so a route that legitimately
+    prefills for a minute still answers.
+    """
+
+    enabled = os.getenv(_STREAM_HEDGE_ENABLED_ENV, "").strip().lower()
+    if enabled in {"0", "false", "off", "no", "disabled"}:
+        return 0.0
+    value = os.getenv(_STREAM_HEDGE_DELAY_SECONDS_ENV, "").strip()
+    if not value:
+        return _STREAM_HEDGE_DELAY_DEFAULT_SECONDS
+    try:
+        parsed = float(value)
+    except ValueError:
+        return _STREAM_HEDGE_DELAY_DEFAULT_SECONDS
+    return max(0.0, parsed)
 
 
 def _stream_start_timeout_cooldown_seconds() -> float:
