@@ -191,6 +191,61 @@ def _body_thinking_summary(messages: Any) -> Dict[str, int]:
     return summary
 
 
+def _body_shape_summary(messages: Any, *, sample_limit: int = 4) -> Dict[str, Any]:
+    """The content shapes in a refused body, so the next attempt can name one.
+
+    The endpoint's sentence says a tool turn carries no thinking, and a body
+    where every tool turn visibly does carry one therefore says the sentence is
+    about something this counter does not model -- a different block spelling, a
+    string content, a role the wire reads differently.  Only the refusal path
+    pays for this, and only the shapes (never the text) are recorded.
+    """
+
+    shapes: Dict[str, int] = {}
+    positions: Dict[str, int] = {}
+    samples: List[Dict[str, Any]] = []
+    if not isinstance(messages, list):
+        return {"shapes": shapes, "positions": positions, "samples": samples}
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "")
+        content = message.get("content")
+        if isinstance(content, str):
+            key = f"{role}:str"
+        elif isinstance(content, list):
+            kinds = [
+                str(block.get("type") or "?") if isinstance(block, dict) else "?"
+                for block in content
+            ]
+            key = f"{role}:{'+'.join(kinds) or 'empty'}"
+        else:
+            key = f"{role}:{type(content).__name__}"
+        shapes[key] = shapes.get(key, 0) + 1
+        if role == "assistant" and key.startswith("assistant:") and "tool_use" in key:
+            positions[str(index)] = positions.get(str(index), 0) + 1
+        if role != "assistant" and isinstance(content, str):
+            samples.append({"index": index, "role": role, "keys": sorted(message)})
+        elif role == "assistant" and isinstance(content, list) and "thinking" not in key:
+            if len(samples) < sample_limit:
+                samples.append(
+                    {
+                        "index": index,
+                        "role": role,
+                        "keys": sorted(message),
+                        "block_keys": [
+                            sorted(block) if isinstance(block, dict) else None
+                            for block in content
+                        ][:3],
+                    }
+                )
+    return {
+        "shapes": dict(sorted(shapes.items(), key=lambda item: -item[1])[:8]),
+        "positions": dict(list(positions.items())[-3:]),
+        "samples": samples[:sample_limit],
+    }
+
+
 def _requirement_cache_key(request_kwargs: Any) -> Optional[str]:
     """The session and route a learned repair belongs to."""
 
@@ -364,6 +419,7 @@ async def call_with_thinking_block_repair(call: Any, kwargs: dict) -> Any:
                 deployment_id=_routing_module._deployment_id_from_request(kwargs),
                 route_key=_routing_module._deployment_route_key_from_request(kwargs),
                 body=_body_thinking_summary(kwargs.get("messages")),
+                body_shape=_body_shape_summary(kwargs.get("messages")),
                 exception=_routing_module._trace_exception(retry_exc),
             )
             raise
