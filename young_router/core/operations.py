@@ -1139,6 +1139,22 @@ class CoreServiceController:
         return 3
 
     @staticmethod
+    def _inherited_gateway_port(fd: int) -> int | None:
+        """The port the inherited descriptor is bound to, when it says."""
+
+        try:
+            family = socket.AF_INET6 if socket.has_ipv6 else socket.AF_INET
+            with socket.socket(fileno=os.dup(fd)) as probe:
+                address = probe.getsockname()
+        except OSError:
+            return None
+        if isinstance(address, tuple) and len(address) >= 2:
+            port = address[1]
+            if isinstance(port, int) and 1 <= port <= 65535:
+                return port
+        return None
+
+    @staticmethod
     def _port_available(port: int) -> bool:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1616,6 +1632,14 @@ class CoreServiceController:
         configured_port = self._configured_port(environment)
         stated_port = _host_profile.stated_port()
         listen_fd = self._inherited_gateway_socket()
+        if listen_fd is not None:
+            # The descriptor names the port; stepping forward from an occupied
+            # one would report and health-check a port nothing listens on while
+            # the inherited listener answers on the real one (measured: it
+            # recorded 4402 and served 4401).
+            inherited_port = self._inherited_gateway_port(listen_fd)
+            if inherited_port is not None:
+                stated_port = inherited_port
         if stated_port is not None and listen_fd is None:
             if not self._port_available(stated_port):
                 raise RuntimeError(

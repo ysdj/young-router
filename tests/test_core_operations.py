@@ -3056,3 +3056,26 @@ class InheritedGatewaySocketTests(unittest.TestCase):
         self.os.environ["LISTEN_PID"] = str(self.os.getpid() + 1)
 
         self.assertIsNone(controller._inherited_gateway_socket())
+
+    def test_the_reported_port_is_the_one_the_descriptor_names(self) -> None:
+        """A stepped-forward port is a port nothing listens on.
+
+        With socket activation the listener is already bound (it is systemd's),
+        so the free-port search found 4402, recorded it and health-checked it
+        while the inherited descriptor answered on 4401.
+        """
+
+        import socket
+
+        operations = self._controller()
+        controller = operations.CoreServiceController.__new__(
+            operations.CoreServiceController
+        )
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        port = listener.getsockname()[1]
+
+        self.assertEqual(port, controller._inherited_gateway_port(listener.fileno()))
+        self.assertIsNone(controller._inherited_gateway_port(-1))
