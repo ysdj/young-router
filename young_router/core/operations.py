@@ -1108,6 +1108,37 @@ class CoreServiceController:
         return self._configured_port()
 
     @staticmethod
+    def _inherited_gateway_socket() -> int | None:
+        """The listening socket systemd handed this process, if it did.
+
+        A host publishes one port, and the proxy that answers on it takes ~18 s
+        to boot with eight workers.  A restart therefore closed the listener for
+        that long, and nginx -- which only holds a request when the connection is
+        established -- answered every client with its own 502 in the meantime
+        (measured 2026-11-20: 316 of them across one restart, and Codex spent
+        its whole reconnect budget in seconds).
+
+        With a socket unit the listener belongs to systemd, so it is never
+        closed: connections wait in the backlog while the new proxy boots and are
+        served as soon as it binds.  systemd passes the descriptor as fd 3 with
+        ``LISTEN_FDS``/``LISTEN_PID``; this returns the number to hand to the
+        child, or ``None`` when the app was started without socket activation.
+        """
+
+        if os.name == "nt":
+            return None
+        try:
+            listen_pid = int(os.environ.get("LISTEN_PID") or 0)
+            listen_fds = int(os.environ.get("LISTEN_FDS") or 0)
+        except ValueError:
+            return None
+        if listen_pid != os.getpid() or listen_fds < 1:
+            return None
+        # The descriptors systemd passes are 3..3+listen_fds-1; the gateway is
+        # the first (and, on this host, the only) one.
+        return 3
+
+    @staticmethod
     def _port_available(port: int) -> bool:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1584,7 +1615,8 @@ class CoreServiceController:
 
         configured_port = self._configured_port(environment)
         stated_port = _host_profile.stated_port()
-        if stated_port is not None:
+        listen_fd = self._inherited_gateway_socket()
+        if stated_port is not None and listen_fd is None:
             if not self._port_available(stated_port):
                 raise RuntimeError(
                     "The port this host publishes is occupied: %d" % stated_port
@@ -1593,6 +1625,14 @@ class CoreServiceController:
         else:
             port = self._first_free_port(configured_port)
         environment["LITELLM_PORT"] = str(port)
+        if listen_fd is not None:
+            # The child serves the descriptor systemd owns instead of binding a
+            # new one, so the port keeps accepting while it boots.  The systemd
+            # bookkeeping variables are cleared: the proxy gets an explicit
+            # number and must not try to read them for itself.
+            environment["YOUNG_ROUTER_PROXY_LISTEN_FD"] = str(listen_fd)
+        for inherited_key in ("LISTEN_FDS", "LISTEN_PID", "LISTEN_FDNAMES"):
+            environment.pop(inherited_key, None)
         workers = environment.get("LITELLM_NUM_WORKERS", MACOS_DEFAULT_WORKERS if sys.platform == "darwin" else "16")
         launcher = [self.litellm_bin]
         if os.name == "nt" and Path(self.litellm_bin).suffix.lower() in {".cmd", ".bat"}:
@@ -1655,6 +1695,7 @@ class CoreServiceController:
                     stderr=subprocess.STDOUT,
                     start_new_session=os.name != "nt",
                     close_fds=True,
+                    pass_fds=(listen_fd,) if listen_fd is not None else (),
                 )
             _note("proxy launched: pid %d on port %d" % (process.pid, port))
             self._write_owner_record(process, owner_token)

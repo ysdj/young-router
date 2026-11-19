@@ -337,11 +337,19 @@ def run(argv: list[str] | None = None) -> int:
 
     # The one handover that can lose the whole start: see the guard.
     _install_worker_handover_guard()
+    # A host whose listener belongs to systemd (``lv-core.socket``) hands the
+    # descriptor down this environment: the port then keeps accepting while this
+    # process boots its workers, which is what lets a reverse proxy hold the
+    # client's request across a restart instead of answering 502.  Without the
+    # variable every other launch binds host/port exactly as before.
+    listen_fd = os.environ.get("YOUNG_ROUTER_PROXY_LISTEN_FD", "").strip()
+    listen_fd_number = int(listen_fd) if listen_fd.isdigit() else None
     try:
         uvicorn.run(
             PROXY_APP,
-            host=args.host,
-            port=args.port,
+            host=None if listen_fd_number is not None else args.host,
+            port=None if listen_fd_number is not None else args.port,
+            fd=listen_fd_number,
             workers=args.workers,
             loop="uvloop",
             # Uvicorn otherwise cancels a still-streaming request after its 30 s

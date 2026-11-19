@@ -2999,3 +2999,60 @@ class OwnershipTokenMemoTests(unittest.TestCase):
 if __name__ == "__main__":
 
     unittest.main()
+
+
+class InheritedGatewaySocketTests(unittest.TestCase):
+    """A socket unit's descriptor is what the proxy is told to serve.
+
+    Measured 2026-11-20: a restart closed the published port for 18 s (eight
+    workers importing LiteLLM), and nginx -- which only holds a request when the
+    connection is established -- answered 316 of them with its own 502.  With
+    the listener owned by systemd the port never closes, connections wait in the
+    backlog, and a reverse proxy holds the client until the answer arrives.
+    """
+
+    def setUp(self) -> None:
+        import os
+
+        self.os = os
+        self.saved = {key: os.environ.get(key) for key in ("LISTEN_FDS", "LISTEN_PID", "LISTEN_FDNAMES")}
+        for key in self.saved:
+            os.environ.pop(key, None)
+
+    def tearDown(self) -> None:
+        for key, value in self.saved.items():
+            if value is None:
+                self.os.environ.pop(key, None)
+            else:
+                self.os.environ[key] = value
+
+    def _controller(self):
+        return operations_module
+
+    def test_no_descriptor_without_socket_activation(self) -> None:
+        operations = self._controller()
+        controller = operations.CoreServiceController.__new__(
+            operations.CoreServiceController
+        )
+
+        self.assertIsNone(controller._inherited_gateway_socket())
+
+    def test_the_first_systemd_descriptor_is_the_gateway(self) -> None:
+        operations = self._controller()
+        controller = operations.CoreServiceController.__new__(
+            operations.CoreServiceController
+        )
+        self.os.environ["LISTEN_FDS"] = "1"
+        self.os.environ["LISTEN_PID"] = str(self.os.getpid())
+
+        self.assertEqual(3, controller._inherited_gateway_socket())
+
+    def test_a_descriptor_addressed_to_another_process_is_not_ours(self) -> None:
+        operations = self._controller()
+        controller = operations.CoreServiceController.__new__(
+            operations.CoreServiceController
+        )
+        self.os.environ["LISTEN_FDS"] = "1"
+        self.os.environ["LISTEN_PID"] = str(self.os.getpid() + 1)
+
+        self.assertIsNone(controller._inherited_gateway_socket())
