@@ -1377,6 +1377,83 @@ class HookRoutingTests(HookTestCase):
             rows[0]["error"]["reason"], "upstream-incomplete-terminal"
         )
 
+    def test_a_zero_byte_start_timeout_parks_the_route_at_once(self) -> None:
+        """Five minutes of silence is not a slow answer worth a second chance.
+
+        Live 2026-11-19: two deployments of one group answered no request for
+        ninety minutes, and every selection spent the full heavy-replay start
+        budget (300 s) before the walk moved on, so one Codex turn sat through
+        three of them before the client reconnected.  A route that accepted the
+        socket and produced no first byte is parked by that one attempt and for
+        longer than the ordinary five-minute cooldown.
+        """
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_FAILURES_ENV, "3")
+        self.set_env(hooks._DEPLOYMENT_COOLDOWN_SECONDS_ENV, "300")
+        self.set_env(hooks._HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV, "10")
+        request_kwargs = {
+            "model": "default-chat",
+            "call_type": "aresponses",
+            "input": [{"role": "user", "content": "x" * 4096}],
+            "stream": True,
+            "litellm_params": {"model": "openai/gpt-x"},
+            "model_info": {"id": "dead-route", "order": 2},
+        }
+        self.assertTrue(hooks._request_is_heavy_replay(request_kwargs))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.set_log_env(Path(tmp) / "recent-requests.jsonl")
+            exception = hooks._stream_start_timeout_exception(
+                request_kwargs,
+                start_seconds=300.0,
+                saw_chunk=False,
+                buffered_chunks=0,
+            )
+
+        self.assertTrue(hooks._is_local_stream_start_timeout_error(exception))
+        keys = [
+            key
+            for key in hooks._DEPLOYMENT_COOLDOWNS
+            if key.startswith("id:dead-route")
+        ]
+        self.assertEqual(keys, ["id:dead-route"])
+        state = hooks._DEPLOYMENT_COOLDOWNS["id:dead-route"]
+        self.assertEqual(state["failures"], 1)
+        self.assertGreater(
+            float(state["cooldown_until"]) - time.time(),
+            25 * 60.0,
+        )
+
+    def test_the_heavy_start_budget_is_spent_once_per_turn(self) -> None:
+        """The prefix is the same on every route, so its wait is not repeated.
+
+        The heavy first-event budget exists because a multi-megabyte replay
+        takes longer to prefill on *every* route.  Spending it again on the next
+        route does not buy a slower answer; it buys another five minutes of
+        silence on a route that may simply be dead.
+        """
+
+        hooks, _ = load_hook_module()
+        self.set_env(hooks._HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV, "10")
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "120")
+        request_kwargs = {
+            "model": "default-chat",
+            "call_type": "aresponses",
+            "input": [{"role": "user", "content": "x" * 4096}],
+            "stream": True,
+        }
+
+        self.assertEqual(
+            hooks._stream_start_timeout_seconds_for_request(request_kwargs),
+            300.0,
+        )
+        request_kwargs[hooks._START_TIMEOUT_OBSERVED_KEY] = True
+        self.assertEqual(
+            hooks._stream_start_timeout_seconds_for_request(request_kwargs),
+            120.0,
+        )
+
     async def test_deployment_cooldown_does_not_count_sanitized_wrapper(self) -> None:
         hooks, _ = load_hook_module()
         hook = hooks.YoungRouterHook()

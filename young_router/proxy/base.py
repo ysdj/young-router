@@ -117,6 +117,24 @@ _HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS_ENV = (
     "YOUNG_ROUTER_HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS"
 )
 _HEAVY_REPLAY_STREAM_START_TIMEOUT_DEFAULT_SECONDS = 300.0
+# How long a deployment stays out of rotation after it accepted the socket and
+# sent no first byte for a heavy replay's whole budget.  A route that has not
+# produced a byte in five minutes is not slow, it is dead for this request, and
+# a five-minute cooldown puts it right back in front of the next turn: live
+# 2026-11-19 two deployments of one group answered no request in ninety minutes
+# while every selection cost the reader the full start budget and then a
+# reconnect.
+_STREAM_START_TIMEOUT_COOLDOWN_SECONDS_ENV = (
+    "YOUNG_ROUTER_STREAM_START_TIMEOUT_COOLDOWN_SECONDS"
+)
+_STREAM_START_TIMEOUT_COOLDOWN_DEFAULT_SECONDS = 1800.0
+# Set on a request once one attempt has spent the heavy-replay first-event
+# budget.  A turn earns that budget once: the delay it exists for is the same
+# prefix on every route, so after one route has had its five minutes the next
+# one gets the ordinary budget instead of another five.  Without this, a group
+# whose dead routes sit on three orders spends fifteen minutes of silence
+# before the reader is told anything.
+_START_TIMEOUT_OBSERVED_KEY = "_young_router_start_timeout_observed"
 _HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV = (
     "YOUNG_ROUTER_HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES"
 )

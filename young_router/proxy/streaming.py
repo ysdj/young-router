@@ -47,6 +47,7 @@ from .base import (
     _STREAM_FALLBACK_METADATA_KEY,
     _STREAM_IDLE_TIMEOUT_METADATA_KEY,
     _STREAM_START_TIMEOUT_METADATA_KEY,
+    _START_TIMEOUT_OBSERVED_KEY,
     _TERMINAL_FAILURE_REQUEST_KEY,
     _VERIFIED_FALLBACK_DEPLOYMENT_IDS_KEY,
     _UPSTREAM_URL_SURFACE_ANTHROPIC,
@@ -4777,6 +4778,12 @@ async def _stream_streaming_error_fallback_round(
         failed_attempt = request_data.pop(_TERMINAL_FAILURE_REQUEST_KEY, None)
         if failed_attempt is not None and request_data.get("exception") is failed_attempt:
             request_data.pop("exception", None)
+        if _routing_module._is_local_stream_start_timeout_error(exception):
+            # One attempt spent the heavy-replay first-event budget and produced
+            # nothing.  The routes after it get the ordinary budget: the prefix
+            # that earned the larger one is the same on every route, so another
+            # five-minute silence is a dead route, not a slow replay.
+            request_data[_START_TIMEOUT_OBSERVED_KEY] = True
     selected_deployment_box = _CURRENT_SELECTED_DEPLOYMENT_BOX.get()
     if not isinstance(selected_deployment_box, dict):
         selected_deployment_box = {}

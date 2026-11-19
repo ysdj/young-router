@@ -153,6 +153,9 @@ from .base import (
     _HEAVY_REPLAY_STREAM_START_TIMEOUT_SECONDS_ENV,
     _HEAVY_REPLAY_STREAM_START_DEFAULT_THRESHOLD_BYTES,
     _HEAVY_REPLAY_STREAM_START_THRESHOLD_BYTES_ENV,
+    _START_TIMEOUT_OBSERVED_KEY,
+    _STREAM_START_TIMEOUT_COOLDOWN_DEFAULT_SECONDS,
+    _STREAM_START_TIMEOUT_COOLDOWN_SECONDS_ENV,
     _STREAM_ROUTE_EXHAUSTION_RETRY_AFTER_MAX_SECONDS,
     _SUPPORTS_RESPONSES_CLIENT_TOOLS_KEY,
     _SUPPORTS_RESPONSES_HOSTED_TOOLS_KEY,
@@ -1041,10 +1044,34 @@ def _heavy_replay_stream_start_budget_for_request(
     threshold = _heavy_replay_stream_start_threshold_bytes()
     if threshold <= 0:
         return None
-    weight = _responses_request_module._request_replay_payload_bytes(request_data)
-    if weight is None or weight < threshold:
+    if isinstance(request_data, dict) and request_data.get(
+        _START_TIMEOUT_OBSERVED_KEY
+    ):
+        # This turn already spent the heavy budget on a route that sent
+        # nothing.  The next routes get the ordinary budget: the delay the
+        # heavy budget exists for is the same prefix everywhere, so a route
+        # that did not use the five minutes at all is dead rather than slow.
+        return None
+    if not _request_is_heavy_replay(request_data):
         return None
     return _heavy_replay_stream_start_timeout_seconds()
+
+
+def _request_is_heavy_replay(request_data: Optional[dict]) -> bool:
+    """Whether this replay is large enough to earn the heavy start budget.
+
+    The question the cooldown asks is what the *request* weighs, not how much
+    of its budget a previous attempt already spent, so this reads the bytes
+    only.
+    """
+
+    if not _responses_request_module._request_has_responses_shape(request_data):
+        return False
+    threshold = _heavy_replay_stream_start_threshold_bytes()
+    if threshold <= 0:
+        return False
+    weight = _responses_request_module._request_replay_payload_bytes(request_data)
+    return weight is not None and weight >= threshold
 
 
 def _codex_compaction_stream_start_timeout_seconds() -> float:
@@ -1864,6 +1891,16 @@ def _deployment_cooldown_seconds() -> float:
 
 def _deployment_cooldown_enabled() -> bool:
     return _deployment_cooldown_failure_threshold() > 0 and _deployment_cooldown_seconds() > 0
+
+
+def _stream_start_timeout_cooldown_seconds() -> float:
+    """How long a route that never sent a first byte stays out of rotation."""
+
+    return _env_float_seconds(
+        _STREAM_START_TIMEOUT_COOLDOWN_SECONDS_ENV,
+        _STREAM_START_TIMEOUT_COOLDOWN_DEFAULT_SECONDS,
+        minimum=0.0,
+    )
 
 
 def _deployment_cooldown_recording_enabled_for_request(
@@ -8579,13 +8616,24 @@ def _record_deployment_failure_for_cooldown(
     # first occurrence regardless of the client protocol.  A body the upstream
     # closed mid-stream is the same evidence: the route cut a turn the reader
     # was already consuming, and the next request must not select it again.
+    start_timeout = _is_local_stream_start_timeout_error(exception)
     threshold = (
         1
         if getattr(exception, "stream_incomplete", False)
         or _is_route_cut_stream_error(exception)
+        # A route that accepted the socket and sent no first byte for the
+        # whole budget is not a slow answer.  Live 2026-11-19: two deployments
+        # of one group answered no request in ninety minutes, and each
+        # selection cost the reader the full heavy-replay budget before the
+        # walk moved on.  One such silence parks it.
+        or start_timeout
         else _deployment_cooldown_failure_threshold()
     )
-    cooldown_seconds = _deployment_cooldown_seconds()
+    cooldown_seconds = (
+        _stream_start_timeout_cooldown_seconds()
+        if start_timeout and _request_is_heavy_replay(request_kwargs)
+        else _deployment_cooldown_seconds()
+    )
     request_log = _request_log_record("cooldown", request_kwargs)
 
     def record(cooldowns: dict[str, Any], now: float) -> list[tuple[str, int, float]]:
