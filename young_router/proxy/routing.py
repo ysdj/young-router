@@ -172,6 +172,7 @@ from .base import (
     _UPSTREAM_RELAY_CAPACITY_MARKERS,
     _UPSTREAM_TOOL_HISTORY_REJECTION_MARKERS,
     _UPSTREAM_DUPLICATE_TOOL_NAME_MARKERS,
+    _UPSTREAM_DEFERRED_TOOL_LAYOUT_MARKERS,
     _UPSTREAM_FIELD_REJECTION_MARKERS,
     _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES,
     _UPSTREAM_TEMPORARY_ERROR_MARKERS,
@@ -9365,6 +9366,15 @@ def _is_upstream_request_field_rejected_error(exception: Exception) -> bool:
     a tool this installation added to the body (the bridge's provider search is
     named ``web_search``), so the sentence names a field it built even though it
     never writes the words ``extra`` or ``unexpected``.
+
+    A deferred tool whose hosted ``tool_search`` declaration the tool adapter
+    rewrote belongs here for the same reason.  ``defer_loading`` is a flag this
+    proxy copied onto a rebuilt tool list after converting (or dropping) the
+    ``tool_search`` it depends on, so the validator's ``Deferred tools require
+    tools.tool_search`` is a verdict on a body this installation shaped -- and
+    the route trace used to record it as ``other`` while the reader was told the
+    router could not classify the stop, which made Codex reconnect five times
+    over a body it would send again unchanged (2026-11-19, ``gpt-6.2-astra``).
     """
 
     status_code = _exception_status_code(exception)
@@ -9379,6 +9389,8 @@ def _is_upstream_request_field_rejected_error(exception: Exception) -> bool:
         return False
     text = _exception_text(exception)
     if any(marker in text for marker in _UPSTREAM_DUPLICATE_TOOL_NAME_MARKERS):
+        return True
+    if any(marker in text for marker in _UPSTREAM_DEFERRED_TOOL_LAYOUT_MARKERS):
         return True
     if not any(marker in text for marker in _UPSTREAM_FIELD_REJECTION_MARKERS):
         return False

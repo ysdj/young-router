@@ -1080,6 +1080,36 @@ def _append_unique_chat_tool(
     return True
 
 
+def _responses_bridge_drop_unpaired_defer_loading(tools: list[dict]) -> int:
+    """Remove ``defer_loading`` from tools whose ``tool_search`` did not survive.
+
+    ``defer_loading`` is not a property of one tool: it tells the upstream to
+    hold that definition back until the model calls the hosted ``tool_search``
+    tool.  A validator that implements that pair refuses the flag on its own --
+    measured live 2026-11-19 against ``gpt-6.2-astra``:
+
+    * ``defer_loading: true`` without a ``tools`` entry of type ``tool_search``
+      answered HTTP 400 ``Invalid Value: 'tools.defer_loading'. Deferred tools
+      require tools.tool_search.``
+    * a *function* named ``tool_search`` did not satisfy it; only the hosted
+      ``{"type": "tool_search"}`` declaration did.
+
+    This sanitizer always rewrites that hosted declaration into an ordinary
+    function (or drops it once its result is already in the history), so the
+    pair cannot travel -- and the adapter emits plain functions the upstream
+    sees outright, which means deferred loading bought nothing: the flag only
+    claimed the definitions were hidden.  Keeping it sent a body no strict
+    route accepts, so every turn of that Codex session ended 400 and the
+    client reconnected five times over a body it would send again unchanged.
+    """
+
+    dropped = 0
+    for tool in tools:
+        if tool.pop("defer_loading", None) is not None:
+            dropped += 1
+    return dropped
+
+
 def _responses_chat_bridge_sanitize_tools(
     tools: Any,
     *,
@@ -1179,12 +1209,26 @@ def _responses_chat_bridge_sanitize_tools(
             ):
                 bridged_tool_search_output_tools += 1
 
+    # A hosted ``tool_search`` that survived this pass (a provider-native
+    # declaration, not the bridged function) keeps the pair valid; anything
+    # else leaves ``defer_loading`` naming a tool that is not in the body.
+    hosted_tool_search_present = any(
+        isinstance(tool, dict) and tool.get("type") == "tool_search"
+        for tool in sanitized
+    )
+    dropped_defer_loading_tools = (
+        0
+        if hosted_tool_search_present
+        else _responses_bridge_drop_unpaired_defer_loading(sanitized)
+    )
+
     changed = (
         sanitized != tools
         or any(_responses_chat_bridge_tool_schema_has_empty_enum(tool) for tool in tools)
         or dropped_web_search_tools > 0
         or suppressed_tool_search_tools > 0
         or bridged_tool_search_output_tools > 0
+        or dropped_defer_loading_tools > 0
     )
     stats = {
         "changed": changed,
@@ -1198,6 +1242,7 @@ def _responses_chat_bridge_sanitize_tools(
         "bridged_custom_tools": bridged_custom_tools,
         "bridged_tool_search_output_tools": bridged_tool_search_output_tools,
         "dropped_web_search_tools": dropped_web_search_tools,
+        "dropped_defer_loading_tools": dropped_defer_loading_tools,
         "tool_search_output_tool_names": tool_search_output_tool_names[:40],
         "kept_tool_names": _trace_module._trace_tool_names(sanitized),
     }

@@ -46,6 +46,121 @@ class HookResponsesToolBridgeTests(HookTestCase):
         self.assertEqual(bridged["tools"][1]["name"], "list_agents")
         self.assertNotIn("web_search", {tool.get("name") for tool in bridged["tools"]})
 
+    def test_tool_adapter_drops_defer_loading_with_the_tool_search_it_needs(self) -> None:
+        """A rebuilt tool list may not keep a flag whose tool did not survive.
+
+        Live 2026-11-19 on ``gpt-6.2-astra``: Codex declared a hosted
+        ``tool_search``, 58 namespace tools, and ``defer_loading`` on the
+        deferred ones, while its history already carried a
+        ``tool_search_output`` -- so the adapter suppressed the bridge function
+        and kept the flags.  Every turn of that session answered HTTP 400
+        ``Invalid Value: 'tools.defer_loading'. Deferred tools require
+        tools.tool_search.``, and Codex reconnected five times over a body it
+        would send again unchanged.
+
+        Measured against that route: only the hosted ``{"type":
+        "tool_search"}`` declaration satisfies the validator; a function named
+        ``tool_search`` does not, and the flag alone is refused.  The adapter
+        emits plain functions, so the flag has to go with the declaration it
+        cannot carry -- and the caller's own structures stay untouched.
+        """
+
+        hooks, _ = load_hook_module()
+        deferred = {
+            "type": "function",
+            "name": "list_agents",
+            "defer_loading": True,
+            "parameters": {"type": "object", "properties": {}},
+        }
+        request = {
+            "call_type": "aresponses",
+            "model": "gpt-6.2-astra",
+            "input": [
+                {
+                    "type": "tool_search_output",
+                    "id": "ts_1",
+                    "call_id": "call_1",
+                    "status": "completed",
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "collaboration",
+                            "tools": [
+                                {
+                                    "type": "function",
+                                    "name": "spawn_agent",
+                                    "defer_loading": True,
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {},
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                },
+                {"role": "user", "content": "Continue."},
+            ],
+            "tools": [
+                {"type": "tool_search"},
+                deferred,
+            ],
+            "client_metadata": {
+                "x-codex-turn-metadata": "{\"request_kind\":\"turn\"}",
+            },
+            "model_info": {
+                "provider": "youyangai",
+                "upstream_url_surface": "openai/responses",
+                "supports_responses_function_tools": True,
+            },
+        }
+
+        bridged = hooks._responses_tool_adapter_preemptive_kwargs(request)
+
+        self.assertIsNotNone(bridged)
+        assert bridged is not None
+        tools = bridged["tools"]
+        self.assertEqual(
+            [tool.get("name") for tool in tools],
+            ["list_agents", "spawn_agent"],
+        )
+        self.assertTrue(all("defer_loading" not in tool for tool in tools))
+        stats = bridged["litellm_metadata"][
+            "responses_tool_adapter_tool_sanitized"
+        ]
+        self.assertEqual(stats["suppressed_tool_search_tools"], 1)
+        self.assertEqual(stats["dropped_defer_loading_tools"], 2)
+        # The request this caller handed in is not the body the adapter owns.
+        self.assertTrue(deferred["defer_loading"])
+
+    def test_tool_adapter_drops_unpaired_defer_loading_after_bridging_tool_search(self) -> None:
+        """The bridged ``tool_search`` function does not satisfy the flag."""
+
+        hooks, _ = load_hook_module()
+
+        sanitized, _options, stats = hooks._responses_chat_bridge_sanitize_tools(
+            [
+                {
+                    "type": "function",
+                    "name": "spawn_agent",
+                    "defer_loading": True,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                {"type": "tool_search"},
+            ],
+            keep_hosted_web_search=True,
+        )
+
+        self.assertIsNotNone(sanitized)
+        assert sanitized is not None
+        self.assertEqual(
+            [tool.get("name") for tool in sanitized],
+            ["spawn_agent", "tool_search"],
+        )
+        self.assertTrue(all("defer_loading" not in tool for tool in sanitized))
+        self.assertEqual(stats["bridged_tool_search_tools"], 1)
+        self.assertEqual(stats["dropped_defer_loading_tools"], 1)
+
     def test_hosted_bridge_does_not_replace_provider_native_search(self) -> None:
         hooks, _ = load_hook_module()
         native_search = {"type": "openrouter:web_search"}

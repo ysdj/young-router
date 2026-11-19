@@ -2882,6 +2882,61 @@ class ContextWindowRefusalTerminalTests(HookTestCase):
         self.assertIn("field layout", error["message"])
         self.assertNotIn("ended without", error["message"].lower())
 
+    def test_a_deferred_tool_layout_stop_names_the_payload_defect(self) -> None:
+        """A rebuilt tool list that lost its ``tool_search`` is readable too.
+
+        Live 2026-11-19 on ``gpt-6.2-astra``: the tool adapter rewrote Codex's
+        hosted ``tool_search`` into a function (or dropped it once its result
+        was already in the history) and kept ``defer_loading`` on the tools, so
+        every turn answered HTTP 400 ``Invalid Value: 'tools.defer_loading'.
+        Deferred tools require tools.tool_search.``  Nothing owned that answer,
+        so the reader was shown ``upstream_route_failure`` / "the router could
+        not classify the stop" and Codex reconnected five times over a body it
+        would send again unchanged.
+
+        The refusal names a field this installation wrote, so it takes the
+        field-layout branch: no resend meets a different validator.
+        """
+
+        hooks, _proxy_server = load_hook_module()
+        streaming_module = importlib.import_module("young_router.proxy.streaming")
+
+        class BadRequestError(Exception):
+            pass
+
+        exception = BadRequestError(
+            "litellm.BadRequestError: OpenAIException - {\"error\":{\"message\":"
+            "\"Invalid Value: 'tools.defer_loading'. Deferred tools require "
+            "tools.tool_search.\",\"type\":\"upstream_error\",\"param\":\"\","
+            "\"code\":null}}"
+        )
+        exception.status_code = 400
+        responses_request = {
+            "model": "gpt-6.2-astra",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+        }
+
+        self.assertTrue(hooks._is_upstream_request_field_rejected_error(exception))
+        self.assertEqual(
+            hooks._trace_exception(exception)["reason"],
+            "upstream-request-field-rejected",
+        )
+
+        event = streaming_module._synthesized_failed_response_event(
+            responses_request,
+            exception,
+        )
+        payload = event if isinstance(event, dict) else json.loads(event.data or "{}")
+        error = payload["response"]["error"]
+
+        self.assertEqual("invalid_request_error", error["type"])
+        self.assertEqual("invalid_prompt", error["code"])
+        self.assertNotIn("could not classify", error["message"])
+        self.assertIn("field layout", error["message"])
+        self.assertNotIn("ended without", error["message"].lower())
+
     def test_an_incomplete_tool_history_stop_names_the_new_task(self) -> None:
         """The stop a cut tool record produces must name the only fix.
 

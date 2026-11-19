@@ -86,6 +86,7 @@
 - 模型名册的 `client_version` 是道闸，不是本应用的身份：ChatGPT 名册对过时版本回 200 + `{"models": []}`，读起来就是一个什么都不提供的账号，所以它取装着的客户端版本（`native_codex_client_version`），只有宿主不装客户端时才回落地板值。
 - 保留 LiteLLM 的路由、Responses 流语义、工具顺序、id、显式终止错误和元数据驱动的兼容桥；不做针对某个请求或 provider 的路由 hack。冷却只有存在另一个可用兄弟时才能移除失败路由，不能把唯一配置的部署从新请求里擦掉。
 - 本路由不跑 computer-use 执行器：hosted `computer` 工具只由支持它的上游服务，否则在尝试之前就明确回答不可用。带 hosted `computer` 的请求绝不桥进 chat，除非客户端自带 computer/browser 工具（桥会把声明丢掉，然后像没被问过一样作答）。Codex 把这些命名空间放在开头的 `additional_tools` 输入项里，所以 `_request_has_browser_computer_client_tool` 要同时看 `additional_tools` 和 `tools`。
+- **`defer_loading` 不是单个工具的字段，它和 hosted `tool_search` 是一对声明。** 实测 2026-11-19 对 `gpt-6.2-astra` 的中转：只有 `defer_loading` 时回 400 `Invalid Value: 'tools.defer_loading'. Deferred tools require tools.tool_search.`；补上 hosted `{"type": "tool_search"}` 才通过，而一个**名为** `tool_search` 的 function 不满足它。工具适配器总把 hosted `tool_search` 改写成 function（历史里已有 `tool_search_output` 时按 `suppress_tool_search_bridge` 直接丢掉），所以 `_responses_chat_bridge_sanitize_tools` 在出站集合没有 hosted `tool_search` 时必须把 `defer_loading` 一起摘掉（计数在 trace 的 `responses_tool_adapter_tool_sanitized.dropped_defer_loading_tools`）：适配器已经把每个工具摊成普通 function，懒加载在这里不省任何东西，留下的只是上游要拒的字段。那句 400 由 `_UPSTREAM_DEFERRED_TOOL_LAYOUT_MARKERS` 归进 field-rejection 分支（`invalid_prompt`，不邀请重发）；归到它之前这里是「无法归类」那支，Codex 对 `upstream_route_failure` 一路重连五次，整轮就死在这条自己造出来的非法请求体上。
 
 ## 运行时与安装
 

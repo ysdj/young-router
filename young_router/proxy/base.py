@@ -1510,6 +1510,20 @@ _UPSTREAM_DUPLICATE_TOOL_NAME_MARKERS = (
     "tool names must be unique",
     "duplicate tool name",
 )
+# A deferred tool whose hosted ``tool_search`` declaration the compatibility
+# bridge rewrote (or dropped).  ``defer_loading`` only means something next to
+# ``{"type": "tool_search"}``, and a strict Responses validator says so itself:
+# ``Invalid Value: 'tools.defer_loading'. Deferred tools require
+# tools.tool_search.``  It names a field this side wrote -- the adapter rebuilt
+# the whole tool list -- so the refusal is a payload-compatibility defect no
+# resend changes, not an unexplained stop.  Measured live 2026-11-19 on
+# ``gpt-6.2-astra``: a function *named* ``tool_search`` does not satisfy the
+# check; only the hosted declaration does.
+_UPSTREAM_DEFERRED_TOOL_LAYOUT_MARKERS = (
+    "deferred tools require",
+    "tools.defer_loading",
+    "tools.tool_search",
+)
 _UPSTREAM_TEMPORARY_ERROR_CLASS_NAMES = {
     "APIConnectionError",
     "APIError",
