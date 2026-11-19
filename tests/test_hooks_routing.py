@@ -5419,3 +5419,86 @@ class HookRoutingTests(HookTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AttemptRouteIdentityTests(HookTestCase):
+    """A failure that lost its route identity still names the route it cut."""
+
+    def _deployment(self) -> dict:
+        return {
+            "model_name": "gpt-6.2-astra",
+            "litellm_params": {
+                "model": "openai/gpt-6.2-astra",
+                "api_base": "https://relay.example/v1",
+                "api_key": "sk-route",
+                "order": 3,
+            },
+            "model_info": {
+                "id": "a4603dc0",
+                "provider": "relay",
+                "api_key_name": "relay-key",
+                "route_key": "model=gpt-6.2-astra / provider=relay / order=3",
+            },
+        }
+
+    def _request(self) -> dict:
+        return {
+            "call_type": "aresponses",
+            "model": "gpt-6.2-astra",
+            "input": [{"role": "user", "content": "go"}],
+            "stream": True,
+            "litellm_params": {"litellm_call_id": "call-route-identity"},
+        }
+
+    def test_a_midstream_500_is_charged_to_the_route_that_served_it(self) -> None:
+        hooks, _ = load_hook_module()
+        request = self._request()
+        hooks._remember_selected_deployment_for_request(request, self._deployment())
+
+        # LiteLLM's own mid-stream failover rebuilds the request from a peer
+        # entry: no model_info, no marker, nothing but the call id.
+        rebuilt = {
+            "call_type": "aresponses",
+            "model": "gpt-6.2-astra",
+            "stream": True,
+            "litellm_params": {"litellm_call_id": "call-route-identity"},
+        }
+        exception = RuntimeError(
+            "litellm.midstreamfallbackerror: litellm.internalservererror: "
+            "the service is temporarily unavailable"
+        )
+        exception.status_code = 500
+
+        hooks._mark_exception_for_deployment_failover(exception, rebuilt)
+
+        self.assertEqual("a4603dc0", exception.failed_deployment_id)
+        self.assertEqual(
+            "model=gpt-6.2-astra / provider=relay / order=3",
+            exception.failed_deployment_route_key,
+        )
+        self.assertEqual(3, exception.failed_deployment_order)
+        keys = hooks._deployment_cooldown_keys(
+            deployment_id=hooks._failed_deployment_id(exception),
+            route_key=hooks._failed_deployment_route_key(exception),
+        )
+        self.assertTrue(keys)
+
+    def test_a_request_that_never_chose_a_route_still_names_nothing(self) -> None:
+        hooks, _ = load_hook_module()
+        rebuilt = {
+            "call_type": "aresponses",
+            "model": "gpt-6.2-astra",
+            "stream": True,
+            "litellm_params": {"litellm_call_id": "call-without-a-route"},
+        }
+        exception = RuntimeError("the service is temporarily unavailable")
+
+        hooks._mark_exception_for_deployment_failover(exception, rebuilt)
+
+        self.assertIsNone(getattr(exception, "failed_deployment_id", None))
+        self.assertFalse(
+            hooks._deployment_cooldown_keys(
+                deployment_id=hooks._deployment_id_from_request(rebuilt),
+                route_key=hooks._deployment_route_key_from_request(rebuilt),
+            )
+        )

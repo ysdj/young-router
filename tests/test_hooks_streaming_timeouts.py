@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest import mock
+
 from hook_test_utils import *
 
 from young_router import runtime_store
@@ -2533,3 +2535,173 @@ class HookStreamingHedgeTests(HookTestCase):
             "primary answer",
             [chunk.get("delta") for chunk in chunks if chunk.get("delta")],
         )
+
+
+class HookHeadHedgeTests(HookTestCase):
+    """The dispatch itself is raced, because the head is where the silence is."""
+
+    def _request(self) -> dict:
+        return {
+            "model": "default-chat",
+            "call_type": "aresponses",
+            "input": [{"role": "user", "content": "Continue."}],
+            "stream": True,
+            "proxy_server_request": {"path": "/v1/responses"},
+            "model_info": {"id": "order1-a", "order": 1},
+            "litellm_params": {"model": "openai/gpt-x", "litellm_call_id": "call-head-hedge"},
+        }
+
+    def _hedge_response(self, deployment_id: str):
+        stream = _HedgeStream([])
+        stream._young_router_selected_deployment_marker = {
+            "model_info": {"id": deployment_id, "order": 1},
+        }
+        return stream, {"model_info": {"id": deployment_id, "order": 1}}
+
+    async def test_a_slow_head_is_raced_by_a_sibling_dispatch(self) -> None:
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.05")
+        request = self._request()
+        calls: list = []
+        hedge_response, hedge_payload = self._hedge_response("order1-b")
+
+        async def slow_dispatch():
+            await asyncio.sleep(5)
+            return "primary-response"
+
+        async def dispatch(request_data, *, stage="first_frame"):
+            calls.append(stage)
+            return hedge_response, hedge_payload
+
+        with mock.patch.object(streaming, "_dispatch_stream_hedge", dispatch):
+            response = await asyncio.wait_for(
+                streaming._await_upstream_dispatch_with_head_hedge(
+                    slow_dispatch(), request
+                ),
+                2,
+            )
+
+        self.assertIs(hedge_response, response)
+        self.assertEqual(["head"], calls)
+        # The turn belongs to the route whose head arrived first.
+        self.assertEqual("order1-b", hooks._request_model_info(request).get("id"))
+        self.assertEqual(
+            "order1-b", hooks._remembered_attempt_route(request).get("deployment_id")
+        )
+
+    async def test_a_head_that_answers_first_never_asks_a_sibling(self) -> None:
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "5")
+        request = self._request()
+        calls: list = []
+
+        async def dispatch(request_data, *, stage="first_frame"):
+            calls.append(stage)
+            return None
+
+        async def fast_dispatch():
+            return "primary-response"
+
+        with mock.patch.object(streaming, "_dispatch_stream_hedge", dispatch):
+            response = await asyncio.wait_for(
+                streaming._await_upstream_dispatch_with_head_hedge(
+                    fast_dispatch(), request
+                ),
+                2,
+            )
+
+        self.assertEqual("primary-response", response)
+        self.assertEqual([], calls)
+
+    async def test_a_failed_head_hedge_leaves_the_primary_running(self) -> None:
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.01")
+        request = self._request()
+
+        async def dispatch(request_data, *, stage="first_frame"):
+            return None
+
+        async def primary():
+            await asyncio.sleep(0.2)
+            return "primary-response"
+
+        with mock.patch.object(streaming, "_dispatch_stream_hedge", dispatch):
+            response = await asyncio.wait_for(
+                streaming._await_upstream_dispatch_with_head_hedge(primary(), request),
+                2,
+            )
+
+        self.assertEqual("primary-response", response)
+
+    async def test_the_hedge_switch_turns_the_head_race_off(self) -> None:
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0")
+        request = self._request()
+        calls: list = []
+
+        async def dispatch(request_data, *, stage="first_frame"):
+            calls.append(stage)
+            return self._hedge_response("order1-b")
+
+        async def primary():
+            return "primary-response"
+
+        with mock.patch.object(streaming, "_dispatch_stream_hedge", dispatch):
+            response = await streaming._await_upstream_dispatch_with_head_hedge(
+                primary(), request
+            )
+
+        self.assertEqual("primary-response", response)
+        self.assertEqual([], calls)
+
+    async def test_a_hedged_dispatch_does_not_hedge_again(self) -> None:
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.01")
+        request = self._request()
+        request["litellm_metadata"] = {hooks._HEAD_HEDGE_METADATA_KEY: True}
+        calls: list = []
+
+        async def dispatch(request_data, *, stage="first_frame"):
+            calls.append(stage)
+            return self._hedge_response("order1-b")
+
+        async def primary():
+            await asyncio.sleep(0.05)
+            return "primary-response"
+
+        with mock.patch.object(streaming, "_dispatch_stream_hedge", dispatch):
+            response = await streaming._await_upstream_dispatch_with_head_hedge(
+                primary(), request
+            )
+
+        self.assertEqual("primary-response", response)
+        self.assertEqual([], calls)
+
+    async def test_a_head_that_never_arrives_is_cut_by_the_dispatch_budget(self) -> None:
+        hooks, _ = load_hook_module()
+        streaming = sys.modules["young_router.proxy.streaming"]
+        self.set_env(hooks._UPSTREAM_CONNECT_TIMEOUT_SECONDS_ENV, "0.2")
+        self.set_env(hooks._STREAM_HEDGE_DELAY_SECONDS_ENV, "0.01")
+        self.set_env(hooks._STREAM_START_TIMEOUT_SECONDS_ENV, "1")
+        request = self._request()
+
+        async def dispatch(request_data, *, stage="first_frame"):
+            return None
+
+        async def never_answers():
+            await asyncio.sleep(30)
+            return "too late"
+
+        with mock.patch.object(streaming, "_dispatch_stream_hedge", dispatch):
+            with self.assertRaisesRegex(TimeoutError, "stream start timeout"):
+                await asyncio.wait_for(
+                    streaming._await_upstream_dispatch_with_head_hedge(
+                        never_answers(), request
+                    ),
+                    5,
+                )

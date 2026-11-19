@@ -140,6 +140,10 @@ _STREAM_START_TIMEOUT_COOLDOWN_DEFAULT_SECONDS = 300.0
 _STREAM_HEDGE_ENABLED_ENV = "YOUNG_ROUTER_STREAM_HEDGE_ENABLED"
 _STREAM_HEDGE_DELAY_SECONDS_ENV = "YOUNG_ROUTER_STREAM_HEDGE_DELAY_SECONDS"
 _STREAM_HEDGE_DELAY_DEFAULT_SECONDS = 30.0
+# Marked on a request that was dispatched *as* a hedge.  The hedge is a real
+# attempt through this proxy's own router, so without the mark each one would
+# hedge again and one slow turn would fan out into a pool of prefills.
+_HEAD_HEDGE_METADATA_KEY = "_young_router_head_hedge_attempt"
 # Set on a request once one attempt has spent the heavy-replay first-event
 # budget.  A turn earns that budget once: the delay it exists for is the same
 # prefix on every route, so after one route has had its five minutes the next

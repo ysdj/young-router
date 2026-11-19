@@ -5417,6 +5417,84 @@ def _lease_identifier_candidates(request_kwargs: Optional[dict]) -> list[str]:
     return names
 
 
+# Which route this turn's *current* attempt was sent to, keyed by the turn's
+# own request identifiers.  A failure that arrives without one can still name
+# the route it cut: LiteLLM's own mid-stream failover rebuilds the request from
+# a peer entry, and the rebuilt dict carries neither ``model_info`` nor the
+# selected-deployment marker, so live 2026-11-19 15:38 the gateway logged
+# ``deployment_failover_marked`` with no deployment id at all, declined the
+# cooldown for "no route identity on the request", and the next reconnect went
+# straight back to the route that had just answered HTTP 500.
+_ATTEMPT_ROUTE_REQUESTS: dict[str, tuple[float, dict[str, Any]]] = {}
+_ATTEMPT_ROUTE_REQUESTS_LOCK = threading.Lock()
+_ATTEMPT_ROUTE_REQUEST_LIMIT = 4096
+
+
+def _remember_attempt_route(
+    request_kwargs: Optional[dict],
+    marker: Any,
+) -> None:
+    """Record the route this attempt was dispatched to, for failures that lose it."""
+
+    if not isinstance(request_kwargs, dict) or not isinstance(marker, dict):
+        return
+    names = _lease_identifier_candidates(request_kwargs)
+    if not names:
+        return
+    model_info = marker.get("model_info")
+    deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
+    if not isinstance(deployment_id, str) or not deployment_id.strip():
+        return
+    order = model_info.get("order") if isinstance(model_info, dict) else None
+    if order is None:
+        litellm_params = marker.get("litellm_params")
+        if isinstance(litellm_params, dict):
+            order = litellm_params.get("order")
+    route = {
+        "deployment_id": deployment_id.strip(),
+        "route_key": (
+            model_info.get("route_key") if isinstance(model_info, dict) else None
+        ),
+        "order": order,
+        "surface": marker.get(_CURRENT_UPSTREAM_URL_SURFACE_KEY),
+        "litellm_params": marker.get("litellm_params"),
+    }
+    now = time.time()
+    with _ATTEMPT_ROUTE_REQUESTS_LOCK:
+        for name, (marked_at, _route) in list(_ATTEMPT_ROUTE_REQUESTS.items()):
+            if now - marked_at > _TERMINAL_FAILURE_REQUEST_TTL_SECONDS:
+                _ATTEMPT_ROUTE_REQUESTS.pop(name, None)
+        if len(_ATTEMPT_ROUTE_REQUESTS) > _ATTEMPT_ROUTE_REQUEST_LIMIT:
+            oldest = sorted(
+                _ATTEMPT_ROUTE_REQUESTS.items(), key=lambda item: item[1][0]
+            )
+            for name, _entry in oldest[
+                : len(_ATTEMPT_ROUTE_REQUESTS) - _ATTEMPT_ROUTE_REQUEST_LIMIT
+            ]:
+                _ATTEMPT_ROUTE_REQUESTS.pop(name, None)
+        for name in names:
+            _ATTEMPT_ROUTE_REQUESTS[name] = (now, route)
+
+
+def _remembered_attempt_route(request_kwargs: Optional[dict]) -> Optional[dict]:
+    """The route last dispatched for this turn, when the request cannot say."""
+
+    names = _lease_identifier_candidates(request_kwargs)
+    if not names:
+        return None
+    with _ATTEMPT_ROUTE_REQUESTS_LOCK:
+        for name in names:
+            entry = _ATTEMPT_ROUTE_REQUESTS.get(name)
+            if entry is None:
+                continue
+            marked_at, route = entry
+            if time.time() - marked_at > _TERMINAL_FAILURE_REQUEST_TTL_SECONDS:
+                _ATTEMPT_ROUTE_REQUESTS.pop(name, None)
+                continue
+            return dict(route)
+    return None
+
+
 # A turn's client-visible outcome has to reach LiteLLM's success callback, and
 # the request is a different dict there than the one the stream was wrapped
 # with: a flag set on one copy is simply absent from the other.  Live
@@ -6470,6 +6548,11 @@ def _remember_selected_deployment_for_request(
         marker,
         update_top_level=True,
     )
+    # A failure can arrive in a copy of this request that kept none of the
+    # marker (LiteLLM's own mid-stream failover rebuilds it from a peer entry),
+    # so the route this attempt was sent to is also kept where the turn's own
+    # request ids can name it.
+    _remember_attempt_route(request_kwargs, marker)
 
 
 def _trace_request_id(request_kwargs: Optional[dict]) -> Optional[str]:
@@ -8226,6 +8309,12 @@ def _mark_exception_for_deployment_failover(
     _release_request_concurrency_slots(request_kwargs)
     deployment_id = _deployment_id_from_request(request_kwargs)
     route_key = _deployment_route_key_from_request(request_kwargs)
+    remembered_route = None
+    if not deployment_id:
+        remembered_route = _remembered_attempt_route(request_kwargs)
+        if remembered_route:
+            deployment_id = remembered_route.get("deployment_id")
+            route_key = route_key or remembered_route.get("route_key")
     # The pool answering "nothing available" is not a route failure: the
     # deployment the request was last pointed at was never contacted, so naming
     # it here would exclude the only route of a single-route group on every
@@ -8246,7 +8335,13 @@ def _mark_exception_for_deployment_failover(
         except Exception:
             pass
     deployment_order = _deployment_order_from_request(request_kwargs)
-    deployment_surface = _request_current_upstream_surface(request_kwargs)
+    if isinstance(remembered_route, dict) and remembered_route.get("order") is not None:
+        # The rebuilt request carries no deployment context, so the order read
+        # above is this proxy's default rather than the route's own.
+        deployment_order = _coerce_order(remembered_route.get("order"))
+    deployment_surface = _request_current_upstream_surface(request_kwargs) or (
+        remembered_route.get("surface") if isinstance(remembered_route, dict) else None
+    )
     if deployment_surface and not getattr(
         exception, "failed_deployment_surface", None
     ):
@@ -8766,6 +8861,10 @@ def _record_deployment_failure_for_cooldown(
     route_key = _responses_execution_module._failed_deployment_route_key(exception) or _deployment_route_key_from_request(
         request_kwargs
     )
+    if not deployment_id:
+        remembered_route = _remembered_attempt_route(request_kwargs) or {}
+        deployment_id = remembered_route.get("deployment_id")
+        route_key = route_key or remembered_route.get("route_key")
     cooldown_keys = _deployment_cooldown_keys(
         deployment_id=deployment_id,
         route_key=route_key,

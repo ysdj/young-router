@@ -2027,7 +2027,10 @@ def _install_generic_deployment_failover_patch() -> None:
                     **kwargs,
                 )
                 if kwargs.get("stream") is True:
-                    response = await _streaming_module._await_upstream_dispatch(
+                    # The head is where this gateway's heavy replays spend
+                    # their silence, so the hedge has to race the dispatch and
+                    # not the first frame.
+                    response = await _streaming_module._await_upstream_dispatch_with_head_hedge(
                         dispatch,
                         kwargs,
                     )

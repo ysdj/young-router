@@ -40,6 +40,7 @@ from .base import (
     _RESPONSES_STREAM_INCOMPLETE_STATUSES,
     _RESPONSES_STREAM_INCOMPLETE_TYPES,
     _RESPONSES_CHAT_BRIDGE_ORIGINAL_MODEL_GROUP_KEY,
+    _HEAD_HEDGE_METADATA_KEY,
     _ROUTE_RECOVERY_POLL_METADATA_KEY,
     _RouteOrder,
     _STREAM_ERROR_FALLBACK_METADATA_KEY,
@@ -3799,6 +3800,8 @@ def _resolved_stream_timeout_seconds(
 
 async def _dispatch_stream_hedge(
     request_data: dict,
+    *,
+    stage: str = "first_frame",
 ) -> Optional[tuple[Any, dict]]:
     """Start the same turn on a sibling route, keeping the first attempt alive.
 
@@ -3840,11 +3843,18 @@ async def _dispatch_stream_hedge(
     # The point of the hedge is the healthiest route, not the next order: a
     # slow order-0 route is exactly what the hedge is there to overtake.
     payload.pop("_target_order", None)
+    hedge_metadata = _request_context_module._request_metadata_dict(
+        payload, "litellm_metadata"
+    ) or {}
+    updated_hedge_metadata = hedge_metadata.copy()
+    updated_hedge_metadata[_HEAD_HEDGE_METADATA_KEY] = True
+    payload["litellm_metadata"] = updated_hedge_metadata
     router_method = getattr(llm_router, method_name, None)
     if router_method is None:
         return None
     _trace_module._request_route_trace(
         "stream_hedge_start", request_data,
+        stage=stage,
         excluded_deployment_ids=sorted(excluded),
     )
     try:
@@ -3858,10 +3868,176 @@ async def _dispatch_stream_hedge(
     except Exception as exc:
         _trace_module._request_route_trace(
             "stream_hedge_error", request_data,
+            stage=stage,
             exception=_routing_module._trace_exception(exc),
         )
         return None
     return response, payload
+
+
+def _head_hedge_eligible(request_data: dict) -> bool:
+    """Whether this attempt's *dispatch* may be raced with a sibling's.
+
+    The frame hedge below only sees a route that has already answered with a
+    response head, and that is not where this gateway waits: measured over 25
+    minutes of the live 1.17 MB Codex replay, selection-to-head was p50 10 s /
+    p95 23 s / max 232 s while head-to-first-frame was p50 1 s.  So the silence
+    a turn actually pays happens before the timer the frame hedge starts.  This
+    hedge races the dispatch itself: after ``YOUNG_ROUTER_STREAM_HEDGE_DELAY_SECONDS``
+    of no head a sibling is asked as well, and the first head wins.
+    """
+
+    if not isinstance(request_data, dict):
+        return False
+    if request_data.get("stream") is not True:
+        return False
+    if not _responses_request_module._request_is_responses_api(request_data):
+        return False
+    if _routing_module._stream_hedge_delay_seconds() <= 0:
+        return False
+    metadata = _request_context_module._request_metadata_dict(
+        request_data, "litellm_metadata"
+    ) or {}
+    if metadata.get(_HEAD_HEDGE_METADATA_KEY) is True:
+        # This attempt *is* the hedge. One slow turn must not fan out.
+        return False
+    if _responses_request_module._request_already_attempted_streaming_error_fallback(
+        request_data
+    ):
+        return False
+    if metadata.get(_ROUTE_RECOVERY_POLL_METADATA_KEY) is True:
+        return False
+    return _routing_module._request_group_deployment_count(request_data) != 1
+
+
+async def _head_hedge_after(delay: float, request_data: dict) -> Optional[tuple[Any, dict]]:
+    await asyncio.sleep(delay)
+    return await _dispatch_stream_hedge(request_data, stage="head")
+
+
+def _adopt_head_hedge_winner(
+    request_data: dict,
+    response: Any,
+    payload: dict,
+) -> None:
+    """Make the sibling that answered first this turn's route.
+
+    The winning dispatch ran in its own task, so the route it selected lives on
+    the response's marker rather than in this context.  Everything downstream --
+    cooldowns, exclusions, the request log's route key -- reads that identity
+    from the request, so it is written back onto this turn here.
+    """
+
+    marker = _routing_module._selected_deployment_marker_from_response(response)
+    if marker is None:
+        marker = _routing_module._selected_deployment_marker_from_box()
+    if isinstance(marker, dict):
+        _routing_module._merge_request_routing_state_into_selected_deployment_marker(
+            marker,
+            payload,
+        )
+        _routing_module._apply_selected_deployment_marker_to_request(
+            request_data,
+            marker,
+        )
+        _routing_module._remember_attempt_route(request_data, marker)
+    _trace_module._request_route_trace(
+        "stream_hedge_won",
+        request_data,
+        stage="head",
+        deployment_id=_routing_module._deployment_id_from_request(request_data),
+    )
+
+
+async def _await_upstream_dispatch_with_head_hedge(
+    awaitable: Any,
+    request_data: dict,
+    *,
+    fallback_budget_seconds: float = 0.0,
+) -> Any:
+    """Await one attempt's dispatch, racing a sibling once the delay passes.
+
+    The first *response head* wins, not the first frame: for this gateway's
+    heavy replays the head is the whole wait.  The attempt that loses is closed
+    and its concurrency slot released; it was never a failure, so no route is
+    parked and nothing is charged to it beyond the prefill it spent.
+    """
+
+    delay = _routing_module._stream_hedge_delay_seconds()
+    budget_seconds = _routing_module._upstream_dispatch_budget_seconds(request_data)
+    if budget_seconds <= 0:
+        budget_seconds = fallback_budget_seconds
+    if (
+        delay <= 0
+        or budget_seconds <= 0
+        or not _head_hedge_eligible(request_data)
+    ):
+        return await _await_upstream_dispatch(
+            awaitable,
+            request_data,
+            fallback_budget_seconds=fallback_budget_seconds,
+        )
+
+    # Keep the attempt's marker where this task can still read it: the primary
+    # below runs in a child task, whose context is a copy.
+    if not isinstance(_CURRENT_SELECTED_DEPLOYMENT_BOX.get(), dict):
+        _CURRENT_SELECTED_DEPLOYMENT_BOX.set({})
+    primary = asyncio.ensure_future(awaitable)
+    hedge: Optional["asyncio.Future[Any]"] = asyncio.ensure_future(
+        _head_hedge_after(delay, request_data)
+    )
+    try:
+        async with asyncio.timeout(budget_seconds):
+            while True:
+                done, _pending = await asyncio.wait(
+                    {task for task in (primary, hedge) if task is not None},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if hedge is not None and hedge in done:
+                    hedge_result = hedge.result()
+                    hedge = None
+                    if hedge_result is not None:
+                        winner_response, winner_payload = hedge_result
+                        primary.cancel()
+                        await asyncio.gather(primary, return_exceptions=True)
+                        # The loser's slot is not released here: the release
+                        # this proxy has is keyed by the turn, and the winner
+                        # shares that key.  Its own completion gives the slot
+                        # back, and a lease that outlives that ages out -- the
+                        # documented cost of a hop this proxy did not observe.
+                        _adopt_head_hedge_winner(
+                            request_data,
+                            winner_response,
+                            winner_payload,
+                        )
+                        return winner_response
+                if primary in done:
+                    return primary.result()
+    except TimeoutError as exc:
+        for task in (primary, hedge):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(
+            *[task for task in (primary, hedge) if task is not None],
+            return_exceptions=True,
+        )
+        if _is_dispatch_budget_expiry(exc):
+            raise _stream_start_timeout_exception(
+                request_data,
+                start_seconds=budget_seconds,
+                saw_chunk=False,
+                buffered_chunks=0,
+            ) from None
+        raise
+    except BaseException:
+        for task in (primary, hedge):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(
+            *[task for task in (primary, hedge) if task is not None],
+            return_exceptions=True,
+        )
+        raise
 
 
 def _stream_hedge_eligible(request_data: dict) -> bool:
