@@ -1640,7 +1640,13 @@ class CoreServiceController:
             inherited_port = self._inherited_gateway_port(listen_fd)
             if inherited_port is not None:
                 stated_port = inherited_port
-        if stated_port is not None and listen_fd is None:
+        if listen_fd is not None:
+            # Already bound: this is the port, and there is nothing to step
+            # forward from.  Searching here recorded 4402 while the inherited
+            # listener answered on 4401, so every health check probed a port
+            # nothing was listening on.
+            port = stated_port if stated_port is not None else configured_port
+        elif stated_port is not None:
             if not self._port_available(stated_port):
                 raise RuntimeError(
                     "The port this host publishes is occupied: %d" % stated_port
